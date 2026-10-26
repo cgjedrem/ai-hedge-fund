@@ -89,6 +89,12 @@ from hedge_fund.tui.shared import BACKTEST_WEEKS
 
 
 def main() -> None:
+    # Persona/LLM text is arbitrary unicode; a Windows console defaults to
+    # cp1252 and would crash on it. Force UTF-8 (with replacement) on both
+    # streams before anything prints.
+    for stream in (sys.stdout, sys.stderr):
+        if stream is not None and hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
     apply_credentials()
     ensure_mandates_dir()
     parser = _parser()

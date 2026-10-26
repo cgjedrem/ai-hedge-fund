@@ -98,6 +98,16 @@ def test_kimi_accepts_moonshot_key(monkeypatch):
     assert make_llm(_BY_PROVIDER["Kimi"]).model == _BY_PROVIDER["Kimi"]
 
 
+def test_ollama_needs_no_key(monkeypatch):
+    """The free local path runs with every API key unset."""
+    monkeypatch.delenv("HEDGE_FUND_LLM_MODEL", raising=False)
+    for env_var in (*PROVIDER_ENV_VARS.values(), "MOONSHOT_API_KEY"):
+        monkeypatch.delenv(env_var, raising=False)
+    llm = make_llm(_BY_PROVIDER["Ollama"])
+    assert llm.model == _BY_PROVIDER["Ollama"]
+    assert hasattr(llm, "complete")
+
+
 def test_provider_for_reads_the_registry():
     assert provider_for("claude-opus-5-5") == "Anthropic"
     assert provider_for("claude-fable-5-1") == "Anthropic"

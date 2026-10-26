@@ -335,8 +335,11 @@ def test_snapshot_is_none_when_yahoo_has_no_price(monkeypatch):
 def test_ttm_metrics_sum_four_quarters(monkeypatch):
     client = _client(monkeypatch, _fundamentals_ticker())
     rows = client.get_financial_metrics("TEST", "2025-04-30", period="ttm", limit=10)
-    # Five quarters on file → ttm computable at i=0 and i=1 only.
-    assert [r.report_period for r in rows] == ["2025-03-31", "2024-12-31"]
+    # Five quarters on file → ttm computable at i=0 and i=1 only; the annual
+    # backfill (here the same frames) tops the history up to five periods.
+    assert [r.report_period for r in rows] == [
+        "2025-03-31", "2024-12-31", "2024-09-30", "2024-06-30", "2024-03-31",
+    ]
     latest = rows[0]
     assert latest.period == "ttm"
     assert latest.filing_date is None  # the not-point-in-time marker
@@ -347,6 +350,69 @@ def test_ttm_metrics_sum_four_quarters(monkeypatch):
     assert latest.current_ratio == pytest.approx(2.0)
     assert latest.debt_to_equity == pytest.approx(0.25)
     assert latest.free_cash_flow_per_share == pytest.approx(12.0)  # (35-5)*4 / 10
+
+
+def test_ttm_history_backfills_with_annual_periods(monkeypatch):
+    """Four quarters on file give one ttm window; annual statements (each a
+    trailing-twelve-month flow window) fill the history up to the four
+    periods the snapshot gate needs, newest first, without duplicating a
+    period the quarterly windows already cover."""
+    quarters = QUARTERS[:4]
+    income_q = _frame(quarters, {
+        "Total Revenue": [100.0, 100.0, 100.0, 100.0],
+        "Gross Profit": [40.0, 40.0, 40.0, 40.0],
+        "Operating Income": [30.0, 30.0, 30.0, 30.0],
+        "Net Income": [20.0, 20.0, 20.0, 20.0],
+        "Diluted EPS": [1.0, 1.0, 1.0, 1.0],
+        "Basic Average Shares": [10.0, 10.0, 10.0, 10.0],
+    })
+    balance_q = _frame(quarters, {"Stockholders Equity": [200.0] * 4,
+                                  "Total Assets": [400.0] * 4,
+                                  "Total Debt": [50.0] * 4,
+                                  "Current Assets": [150.0] * 4,
+                                  "Current Liabilities": [75.0] * 4,
+                                  "Ordinary Shares Number": [10.0] * 4})
+    cashflow_q = _frame(quarters, {"Operating Cash Flow": [35.0] * 4,
+                                   "Capital Expenditure": [-5.0] * 4})
+    years = ["2023-12-31", "2022-12-31", "2021-12-31"]
+    income_a = _frame(years, {"Total Revenue": [400.0, 380.0, 350.0],
+                              "Net Income": [80.0, 76.0, 70.0],
+                              "Diluted EPS": [4.0, 3.8, 3.5],
+                              "Basic Average Shares": [10.0, 10.0, 10.0]})
+    balance_a = _frame(years, {"Stockholders Equity": [200.0, 190.0, 180.0],
+                               "Total Assets": [400.0, 380.0, 360.0],
+                               "Total Debt": [50.0, 50.0, 50.0],
+                               "Current Assets": [150.0, 140.0, 130.0],
+                               "Current Liabilities": [75.0, 70.0, 65.0],
+                               "Ordinary Shares Number": [10.0, 10.0, 10.0]})
+    cashflow_a = _frame(years, {"Operating Cash Flow": [140.0, 130.0, 120.0],
+                                "Capital Expenditure": [-20.0, -18.0, -16.0]})
+    ticker = _fundamentals_ticker(
+        quarterly_financials=income_q, quarterly_balance_sheet=balance_q,
+        quarterly_cashflow=cashflow_q,
+        financials=income_a, balance_sheet=balance_a, cashflow=cashflow_a,
+    )
+    client = _client(monkeypatch, ticker)
+    rows = client.get_financial_metrics("TEST", "2025-04-30", period="ttm", limit=10)
+    assert [r.report_period for r in rows] == [
+        "2025-03-31", "2023-12-31", "2022-12-31", "2021-12-31",
+    ]
+    assert rows[0].period == "ttm"
+    assert all(r.period == "annual" for r in rows[1:])
+    # Annual rows grow against the prior fiscal year, so the backfilled
+    # history carries growth figures the short quarterly window cannot.
+    assert rows[1].revenue_growth == pytest.approx(400.0 / 380.0 - 1)
+    assert rows[2].revenue_growth == pytest.approx(380.0 / 350.0 - 1)
+    assert rows[3].revenue_growth is None  # no fourth year on file
+
+
+def test_ttm_backfill_skipped_when_quarterly_history_is_long(monkeypatch):
+    """A ticker with enough quarters needs no annual rows — the response
+    stays pure quarterly-window ttm."""
+    client = _client(monkeypatch, _fundamentals_ticker())
+    rows = client.get_financial_metrics("TEST", "2025-04-30", period="ttm", limit=2)
+    assert [r.report_period for r in rows] == ["2025-03-31", "2024-12-31"]
+    assert all(r.period == "ttm" for r in rows)
 
 
 def test_metrics_respect_the_end_date_cutoff(monkeypatch):

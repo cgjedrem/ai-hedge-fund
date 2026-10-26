@@ -27,6 +27,7 @@ import requests
 
 from hedge_fund.llm import contract
 from hedge_fund.llm.registry import (
+    KEYLESS_PROVIDERS,
     env_var_for,
     is_supported,
     provider_for,
@@ -280,6 +281,18 @@ def make_llm(
             model=model, api_key=api_key, timeout=timeout, max_retries=1,
             base_url=(os.getenv("MOONSHOT_BASE_URL")
                       or "https://api.moonshot.ai/v1"))
+    elif provider == "Ollama":
+        # Local (or self-hosted) Ollama — no API key. OLLAMA_BASE_URL points
+        # at a non-default host. num_ctx is raised above Ollama's small
+        # default so long persona prompts are not silently truncated, and
+        # OLLAMA_TIMEOUT gives slow local hardware a longer leash.
+        from langchain_ollama import ChatOllama
+        chat = ChatOllama(
+            model=model,
+            base_url=os.getenv("OLLAMA_BASE_URL") or "http://localhost:11434",
+            num_ctx=int(os.getenv("OLLAMA_NUM_CTX") or 8192),
+            client_kwargs={"timeout": float(os.getenv("OLLAMA_TIMEOUT") or timeout)},
+        )
     else:  # pragma: no cover - SUPPORTED_PROVIDERS is checked above
         raise ValueError(f"Unhandled provider {provider}")
 
@@ -319,6 +332,8 @@ def _flatten(content, sep: str = "\n") -> str:
 
 def _require_key(provider: str) -> str:
     """The provider's API key, or a failure that names the variable to set."""
+    if provider in KEYLESS_PROVIDERS:
+        return ""
     env_var = env_var_for(provider)
     # Kimi accepts either name; v1 reads MOONSHOT_API_KEY first.
     key = (os.getenv("MOONSHOT_API_KEY") if provider == "Kimi" else None)

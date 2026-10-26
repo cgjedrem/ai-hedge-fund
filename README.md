@@ -40,7 +40,7 @@ aihf
 The app asks for keys the first time it needs them and saves them to `~/.hedge-fund/.env` — nothing to configure up front. It needs:
 
 - A [Financial Datasets](https://financialdatasets.ai) API key, for prices, fundamentals, and earnings.
-- One model API key for the investor agents. Supported providers: Anthropic, OpenAI, DeepSeek, Google, xAI, Kimi, TypeSafe (Jev).
+- One model API key for the investor agents. Supported providers: Anthropic, OpenAI, DeepSeek, Google, xAI, Kimi, TypeSafe (Jev) — or Ollama, which runs locally and needs no key at all.
 
 Keys exported in your shell always win over the saved file.
 

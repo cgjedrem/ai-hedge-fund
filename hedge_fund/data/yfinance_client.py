@@ -218,9 +218,11 @@ class YFinanceClient:
 
         *period* is "ttm" (flows summed over the trailing four quarters,
         stocks from the latest), "quarterly", or "annual". Yahoo serves
-        only ~4-5 quarters of statements, so few ttm rows and almost no
-        year-ago growth figures are computable; uncomputable fields stay
-        None rather than being invented.
+        only ~4-5 quarters of statements, so few four-quarter windows
+        exist; the ttm history is backfilled with annual-statement rows
+        (each fiscal year is a trailing-twelve-month flow window) so a
+        ticker can still reach the four periods the snapshot gate needs.
+        Uncomputable fields stay None rather than being invented.
         """
         if period not in ("ttm", "quarterly", "annual"):
             raise ValueError(f"period must be ttm|quarterly|annual, not {period!r}")
@@ -230,10 +232,15 @@ class YFinanceClient:
         cutoff = date.fromisoformat(end_date)
         cols = [c for c in income.columns if _col_date(c) is not None and _col_date(c) <= cutoff]
         if period == "ttm":
-            return [m for m in
+            rows = [m for m in
                     (self._ttm_metrics(ticker, income, balance, cashflow, cols, i)
                      for i in range(len(cols)))
-                    if m is not None][:limit]
+                    if m is not None]
+            if len(rows) < limit:
+                rows += self._annual_rows(ticker, cutoff, limit - len(rows),
+                                          seen={m.report_period for m in rows})
+            rows.sort(key=lambda m: m.report_period, reverse=True)
+            return rows[:limit]
         return [self._period_metrics(ticker, income, balance, cashflow, cols, i, period)
                 for i in range(min(limit, len(cols)))]
 
@@ -292,6 +299,20 @@ class YFinanceClient:
             book_value_per_share=_div(s.get("equity"), s.get("shares")),
             free_cash_flow_per_share=_div(f["fcf"], s.get("shares")),
         )
+
+    def _annual_rows(self, ticker, cutoff, limit, seen) -> list[FinancialMetrics]:
+        """Annual-statement rows to backfill a short ttm history: one
+        trailing-twelve-month flow window per fiscal year on file, skipping
+        periods a quarterly window already covers."""
+        if limit <= 0:
+            return []
+        income, balance, cashflow = self._statements(ticker, annual=True)
+        if income is None or income.empty:
+            return []
+        cols = [c for c in income.columns if _col_date(c) is not None and _col_date(c) <= cutoff]
+        rows = [self._period_metrics(ticker, income, balance, cashflow, cols, i, "annual")
+                for i in range(len(cols))]
+        return [m for m in rows if m.report_period not in seen][:limit]
 
     # ------------------------------------------------------------------
     # News
