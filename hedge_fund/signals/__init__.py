@@ -4,14 +4,21 @@ from __future__ import annotations
 
 from typing import cast
 
+from hedge_fund.signals.ackman import AckmanAgent
 from hedge_fund.signals.base import AlphaModel, InvestmentApproach, QuantModel
 from hedge_fund.signals.buffett import BuffettAgent
+from hedge_fund.signals.burry import BurryAgent
+from hedge_fund.signals.damodaran import DamodaranAgent
 from hedge_fund.signals.druckenmiller import DruckenmillerAgent
+from hedge_fund.signals.fisher import FisherAgent
 from hedge_fund.signals.graham import GrahamAgent
+from hedge_fund.signals.jhunjhunwala import JhunjhunwalaAgent
 from hedge_fund.signals.llm_agent import LLMAgent
 from hedge_fund.signals.lynch import LynchAgent
 from hedge_fund.signals.munger import MungerAgent
+from hedge_fund.signals.pabrai import PabraiAgent
 from hedge_fund.signals.pead import PEADModel
+from hedge_fund.signals.wood import WoodAgent
 
 ALPHA_MODEL_REGISTRY: dict[str, type[AlphaModel]] = {
     # Quant models
@@ -22,6 +29,13 @@ ALPHA_MODEL_REGISTRY: dict[str, type[AlphaModel]] = {
     "graham": GrahamAgent,
     "lynch": LynchAgent,
     "druckenmiller": DruckenmillerAgent,
+    "damodaran": DamodaranAgent,
+    "ackman": AckmanAgent,
+    "wood": WoodAgent,
+    "burry": BurryAgent,
+    "pabrai": PabraiAgent,
+    "fisher": FisherAgent,
+    "jhunjhunwala": JhunjhunwalaAgent,
 }
 
 
@@ -49,6 +63,13 @@ __all__ = [
     "GrahamAgent",
     "LynchAgent",
     "DruckenmillerAgent",
+    "DamodaranAgent",
+    "AckmanAgent",
+    "WoodAgent",
+    "BurryAgent",
+    "PabraiAgent",
+    "FisherAgent",
+    "JhunjhunwalaAgent",
     "PEADModel",
     "ALPHA_MODEL_REGISTRY",
     "get_investment_approach",

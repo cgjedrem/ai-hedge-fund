@@ -1,0 +1,18 @@
+# Contrarian value — discretionary long/short on mispriced cash flows.
+# Burry leads (double blend weight): downside first, cheap on the numbers.
+# Pabrai and Ackman keep the long side in protected, quality names;
+# Damodaran's intrinsic-value read arbitrates what the price actually
+# assumes. Edge claimed: the crowd's neglect and euphoria both misprice
+# durable cash flows.
+name: contrarian-value
+display_name: Contrarian Value
+models:
+  - name: burry
+    weight: 2.0
+  - name: pabrai
+  - name: damodaran
+  - name: ackman
+blend:
+  mode: long_short
+  method: conviction_weighted
+  gross_target: 1.0

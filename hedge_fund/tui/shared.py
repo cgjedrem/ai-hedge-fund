@@ -38,6 +38,13 @@ DISPLAY_NAMES = {
     "graham": "Benjamin Graham",
     "lynch": "Peter Lynch",
     "druckenmiller": "Stanley Druckenmiller",
+    "damodaran": "Aswath Damodaran",
+    "ackman": "Bill Ackman",
+    "wood": "Cathie Wood",
+    "burry": "Michael Burry",
+    "pabrai": "Mohnish Pabrai",
+    "fisher": "Phil Fisher",
+    "jhunjhunwala": "Rakesh Jhunjhunwala",
     "pead": "post-earnings drift",
 }
 
@@ -47,6 +54,13 @@ SHORT_NAMES = {
     "graham": "Graham",
     "lynch": "Lynch",
     "druckenmiller": "Druckenmiller",
+    "damodaran": "Damodaran",
+    "ackman": "Ackman",
+    "wood": "Wood",
+    "burry": "Burry",
+    "pabrai": "Pabrai",
+    "fisher": "Fisher",
+    "jhunjhunwala": "Jhunjhunwala",
     "pead": "PEAD",
 }
 

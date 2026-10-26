@@ -10,7 +10,16 @@ from hedge_fund.features.breakpoints import MEBreakpoints
 from hedge_fund.llm import PromptCache, extract_json
 from hedge_fund.llm.client import LLMParseError
 from hedge_fund.models import Signal
-from hedge_fund.signals import BuffettAgent
+from hedge_fund.signals import (
+    AckmanAgent,
+    BuffettAgent,
+    BurryAgent,
+    DamodaranAgent,
+    FisherAgent,
+    JhunjhunwalaAgent,
+    PabraiAgent,
+    WoodAgent,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -304,6 +313,36 @@ def test_llm_personas_share_the_contract(tmp_path):
         prompt = cls(llm=FakeLLM(), cache=PromptCache(tmp_path / "llm")).get_system_prompt()
         assert "most recent filing date" in prompt  # the point-in-time hard rule
         assert '"signal"' in prompt and '"confidence"' in prompt  # the schema
+
+
+# ---------------------------------------------------------------------------
+# Ported personas (the All About AI roster)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("name,cls,voice", [
+    ("damodaran", DamodaranAgent, "Aswath Damodaran"),
+    ("ackman", AckmanAgent, "Bill Ackman"),
+    ("wood", WoodAgent, "Cathie Wood"),
+    ("burry", BurryAgent, "Michael Burry"),
+    ("pabrai", PabraiAgent, "Mohnish Pabrai"),
+    ("fisher", FisherAgent, "Phil Fisher"),
+    ("jhunjhunwala", JhunjhunwalaAgent, "Rakesh Jhunjhunwala"),
+])
+def test_ported_personas_signal_in_voice(tmp_path, name, cls, voice):
+    """Each ported persona folds a canned LLM verdict into a Signal and
+    persists a prompt written in its own voice."""
+    llm = FakeLLM(BULLISH)
+    agent = cls(llm=llm, cache=PromptCache(tmp_path / "llm"))
+
+    sig = agent.predict("TEST", "2025-01-15", MockDataClient(metrics=_history()))
+
+    assert isinstance(sig, Signal)
+    assert sig.model_name == name
+    assert sig.value == pytest.approx(0.8)
+    assert sig.metadata["abstained"] is False
+    record = json.loads(next((tmp_path / "llm").glob("*.json")).read_text())
+    assert record["agent"] == name
+    assert voice in record["system"]
 
 
 # ---------------------------------------------------------------------------

@@ -219,6 +219,13 @@ def test_all_profiles_are_explicit(name):
         ("graham", "long_only"),
         ("lynch", "long_only"),
         ("druckenmiller", "long_short"),
+        ("damodaran", "long_short"),
+        ("ackman", "long_only"),
+        ("wood", "long_only"),
+        ("burry", "long_short"),
+        ("pabrai", "long_only"),
+        ("fisher", "long_only"),
+        ("jhunjhunwala", "long_only"),
         ("pead", "long_short"),
     ],
 )
