@@ -44,6 +44,20 @@ The app asks for keys the first time it needs them and saves them to `~/.hedge-f
 
 Keys exported in your shell always win over the saved file.
 
+### Free market data (optional)
+
+Day-to-day paper trading and iteration can run on free Yahoo Finance data
+instead of spending Financial Datasets credits:
+
+```bash
+pip install aihf[yfinance]        # or: poetry install -E yfinance
+export HEDGE_FUND_DATA_PROVIDER=yfinance
+```
+
+One caveat: Yahoo serves fundamentals as reported *now*, not point-in-time
+— so backtests on the free provider leak the future into the past. Keep
+`HEDGE_FUND_DATA_PROVIDER=fd` (the default) for final backtest validation.
+
 ## How to Run
 
 ### Interactive app

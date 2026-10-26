@@ -31,6 +31,13 @@ from hedge_fund.data.models import (
 )
 
 
+class DataClientError(Exception):
+    """An infrastructure failure from a data provider (auth, rate limit,
+    network, server error). Distinct from "no data exists" — that returns
+    empty. A pipeline must crash on this, not treat it as no-data.
+    """
+
+
 @runtime_checkable
 class DataClient(Protocol):
     """Protocol that all data providers must satisfy.

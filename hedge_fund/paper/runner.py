@@ -48,8 +48,7 @@ from hedge_fund.data.bars import (
     session_date,
     to_key,
 )
-from hedge_fund.data.client import FDClientError
-from hedge_fund.data.protocol import DataClient
+from hedge_fund.data.protocol import DataClient, DataClientError
 from hedge_fund.data.sessions import NEW_YORK
 from hedge_fund.fund import Fund, FundSpec
 from hedge_fund.paper.deployed import load_deployed
@@ -154,7 +153,7 @@ def _run_bars(directory, deployed, data_client, fund, *, stop, build_fund, on_re
         # `_run` the way a daily tick with a missing close does.
         try:
             benchmark = clock.observe([spec.benchmark], bar)[spec.benchmark]
-        except FDClientError as exc:
+        except DataClientError as exc:
             event("gap", **{"from": state.last_session, "to": bar, "reason": f"no prints: {exc}"})
             _wait_for(next_bar(now(), spec.interval_seconds, spec.window), now, sleep)
             continue

@@ -50,7 +50,33 @@ poetry install                          # dependencies
 # .env needs (at repo root):
 #   FINANCIAL_DATASETS_API_KEY=...      # market/fundamentals data
 #   ANTHROPIC_API_KEY=...               # only for LLM agents (Buffett)
+```
 
+### Data provider: paid vs free
+
+Market data comes from one of two providers, chosen with
+`HEDGE_FUND_DATA_PROVIDER` (default `fd`):
+
+- **`fd`** — [Financial Datasets](https://financialdatasets.ai), the paid
+  default. Point-in-time fundamentals (filtered on SEC filing dates), so
+  backtests are safe to validate against.
+- **`yfinance`** — free Yahoo Finance via the optional `yfinance` package
+  (`poetry install -E yfinance`). No API key, no credits — use it for
+  day-to-day paper trading and iteration so you don't burn Financial
+  Datasets credits.
+
+  **Caveat:** Yahoo serves fundamentals *as reported now*, not as filed by
+  a date — `get_financial_metrics` is therefore **not point-in-time**, and
+  a backtest on it leaks the future into the past. Run final backtest
+  validation with `HEDGE_FUND_DATA_PROVIDER=fd`; treat yfinance results as
+  iteration signal only.
+
+```bash
+poetry install -E yfinance                 # one-time, for the free provider
+HEDGE_FUND_DATA_PROVIDER=yfinance poetry run aihf
+```
+
+```bash
 # THE command. No arguments: launch the interactive app (a Textual TUI).
 # Two modes: paper trading (your funds — run the next session behind an
 # approval step, see history, halt/resume, build a new fund) and

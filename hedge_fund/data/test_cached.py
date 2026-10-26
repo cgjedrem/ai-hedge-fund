@@ -107,6 +107,24 @@ def test_snapshot_is_never_cached(tmp_path):
     assert not list(tmp_path.glob("*.json"))
 
 
+def test_cache_is_namespaced_by_provider(tmp_path):
+    """Switching HEDGE_FUND_DATA_PROVIDER must not serve one provider's
+    cached answers as another's — keys carry the wrapped client's class."""
+
+    class OtherClient(CountingClient):
+        pass
+
+    fd = CachedDataClient(CountingClient(), cache_dir=tmp_path)
+    yf = CachedDataClient(OtherClient(), cache_dir=tmp_path)
+
+    fd.get_prices("AAPL", "2024-01-01", "2024-12-31")
+    yf.get_prices("AAPL", "2024-01-01", "2024-12-31")  # same params, other provider
+
+    assert fd._client.calls == 1
+    assert yf._client.calls == 1  # fetched, not served from fd's entry
+    assert len(list(tmp_path.glob("*.json"))) == 2
+
+
 def test_daily_price_entries_without_fetch_metadata_are_refreshed(tmp_path):
     import json
     inner = CountingClient()

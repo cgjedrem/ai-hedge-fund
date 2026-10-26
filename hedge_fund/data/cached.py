@@ -16,6 +16,9 @@ up all day and would otherwise never see a new filing.
 Failure semantics are inherited: only successful responses are cached, and
 errors from the wrapped client propagate (fail-loud preserved). Pass
 refresh=True to ignore existing entries (they are rewritten on fetch).
+
+Cache keys are namespaced by the wrapped client's class, so switching
+HEDGE_FUND_DATA_PROVIDER never serves one provider's answers as another's.
 """
 
 from __future__ import annotations
@@ -127,7 +130,8 @@ class CachedDataClient:
 
     def _key(self, method: str, params: dict) -> str:
         canonical = json.dumps(params, sort_keys=True)
-        return hashlib.sha256(f"{method}|{canonical}".encode()).hexdigest()[:24]
+        provider = type(self._client).__name__
+        return hashlib.sha256(f"{provider}|{method}|{canonical}".encode()).hexdigest()[:24]
 
     def _read(self, key: str) -> dict | None:
         if self._refresh:
