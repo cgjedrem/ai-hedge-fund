@@ -86,17 +86,31 @@ class ChatLLM:
         self.model = model
         self._chat = chat
         self._on_token = on_token
+        self._no_think_chat = None
 
     def complete(self, system: str, user: str) -> str:
         messages = [("system", system), ("human", user)]
+        text = self._generate(self._chat, messages)
+        if text.strip() or not hasattr(self._chat, "reasoning"):
+            return text
+        # Reasoning models whose think-tags Ollama's parser does not recognize
+        # (kimi-k3's <|open|>/<|sep|>/<|close|>) leave content empty with the
+        # whole answer in the thinking field. One retry with thinking off puts
+        # the answer in content; trailing template tokens are harmless because
+        # extract_json() takes the first balanced JSON object.
+        if self._no_think_chat is None:
+            self._no_think_chat = self._chat.model_copy(update={"reasoning": False})
+        return self._generate(self._no_think_chat, messages)
+
+    def _generate(self, chat, messages) -> str:
         if self._on_token is None:
-            return _flatten(self._chat.invoke(messages).content)
+            return _flatten(chat.invoke(messages).content)
 
         # Streaming chunks concatenate into the response, so they flatten
         # without a separator — the "\n" that joins whole-message blocks would
         # land mid-word here.
         parts: list[str] = []
-        for chunk in self._chat.stream(messages):
+        for chunk in chat.stream(messages):
             text = _flatten(chunk.content, sep="")
             if text:
                 parts.append(text)
