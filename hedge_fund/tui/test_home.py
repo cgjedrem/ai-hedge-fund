@@ -74,6 +74,42 @@ def test_missing_key_gate_save_resumes_and_cancel_does_not(monkeypatch, isolated
     asyncio.run(scenario())
 
 
+def test_yfinance_mode_needs_no_fd_key(monkeypatch, isolated_configuration):
+    monkeypatch.setenv("HEDGE_FUND_DATA_PROVIDER", "yfinance")
+    monkeypatch.delenv("FINANCIAL_DATASETS_API_KEY", raising=False)
+    monkeypatch.setenv("HEDGE_FUND_LLM_MODEL", "jev-1.13.0")
+    monkeypatch.setenv("TYPESAFE_API_KEY", "fixture-typesafe-key")
+
+    async def scenario():
+        app = HedgeFundApp()
+        resumed = Mock()
+        async with app.run_test(size=(100, 35)) as pilot:
+            assert home.demand_run_keys(app, resumed) is True
+            resumed.assert_not_called()
+            await pilot.pause()
+            assert not isinstance(app.screen, home.KeyPromptScreen)
+
+    asyncio.run(scenario())
+
+
+def test_fd_mode_still_demands_the_fd_key(monkeypatch, isolated_configuration):
+    monkeypatch.setenv("HEDGE_FUND_DATA_PROVIDER", "fd")
+    monkeypatch.delenv("FINANCIAL_DATASETS_API_KEY", raising=False)
+    monkeypatch.setenv("HEDGE_FUND_LLM_MODEL", "jev-1.13.0")
+    monkeypatch.setenv("TYPESAFE_API_KEY", "fixture-typesafe-key")
+
+    async def scenario():
+        app = HedgeFundApp()
+        resumed = Mock()
+        async with app.run_test(size=(100, 35)) as pilot:
+            assert home.demand_run_keys(app, resumed) is False
+            await pilot.pause()
+            assert isinstance(app.screen, home.KeyPromptScreen)
+            assert app.screen._provider == "Financial Datasets"
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize(
     "exported,local,expected",
     [

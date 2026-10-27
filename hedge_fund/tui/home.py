@@ -14,6 +14,7 @@ from textual.widgets import Footer, Input, OptionList, Static
 from textual.widgets.option_list import Option
 
 from hedge_fund import paths
+from hedge_fund.data import data_provider
 from hedge_fund.llm import is_supported, load_api_models, provider_for
 from hedge_fund.tui.keys import masked, missing_key, PROVIDER_ENV_VARS, save_credential
 from hedge_fund.tui.palette import BRIGHT, GREEN, MUTED, TEXT
@@ -241,12 +242,14 @@ class ModelPickerScreen(ModalScreen[str | None]):
 
 def demand_run_keys(app, resume) -> bool:
     """True if every key a run needs is in the environment: the data key
-    first, then the selected model's LLM key. Otherwise open the prompt for
-    the first missing one; each save calls ``resume``, which should re-enter
-    this gate so the next missing key is asked for in turn. Ask here, not
-    deep inside a worker thread: a run that dies on a missing credential has
-    already spent minutes of warming."""
-    if not os.environ.get("FINANCIAL_DATASETS_API_KEY"):
+    first — only when the configured provider is the paid one, yfinance
+    runs keyless — then the selected model's LLM key. Otherwise open the
+    prompt for the first missing one; each save calls ``resume``, which
+    should re-enter this gate so the next missing key is asked for in
+    turn. Ask here, not deep inside a worker thread: a run that dies on a
+    missing credential has already spent minutes of warming."""
+    if data_provider() in ("fd", "financialdatasets", "financial-datasets") \
+            and not os.environ.get("FINANCIAL_DATASETS_API_KEY"):
         app.push_screen(
             KeyPromptScreen("Financial Datasets",
                             "FINANCIAL_DATASETS_API_KEY"),
