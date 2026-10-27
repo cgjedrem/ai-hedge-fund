@@ -518,14 +518,19 @@ class RunSessionScreen(Screen):
 
     def _warm(self, spec: FundSpec, universe: list[str], dates: list[str]) -> None:
         desks = dict(zip(agent_names(spec), self._desks, strict=True))
+        # A warm prompt must match the tick prompt or the warm calls never hit
+        # the cache the tick reads — so the mandate's model params (e.g.
+        # news=True) flow through here exactly as Fund.__init__ passes them.
+        params = {m.name: m.params for s in spec.strategies for m in s.models}
 
         def warm(agent_name: str) -> None:
             desk = desks[agent_name]
             cls = ALPHA_MODEL_REGISTRY[agent_name]  # own instance per thread
+            kwargs = params.get(agent_name, {})
             # Only LLM agents have anything to stream; a quant model carries
             # no client and simply runs.
-            model = (cls(llm=make_llm(on_token=desk.feed))
-                     if issubclass(cls, LLMAgent) else cls())
+            model = (cls(llm=make_llm(on_token=desk.feed), **kwargs)
+                     if issubclass(cls, LLMAgent) else cls(**kwargs))
             with make_data_client() as raw:
                 fd = CachedDataClient(raw)
                 for as_of in dates:

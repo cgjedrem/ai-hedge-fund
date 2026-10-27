@@ -80,6 +80,16 @@ class FinancialMetrics(BaseModel):
     free_cash_flow_yield: float | None = None
     peg_ratio: float | None = None
 
+    # Absolute figures for the reporting window (ttm or fiscal year) and
+    # its balance-sheet date. The fd metrics endpoint serves ratios only,
+    # so these stay None there; yfinance reconstructs them from the
+    # statements so the valuation ratios above can be derived per row.
+    revenue: float | None = None
+    ebitda: float | None = None
+    free_cash_flow: float | None = None
+    total_debt: float | None = None
+    cash_and_equivalents: float | None = None
+
     # Profitability
     gross_margin: float | None = None
     operating_margin: float | None = None

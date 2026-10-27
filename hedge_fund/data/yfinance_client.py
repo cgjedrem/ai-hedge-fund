@@ -225,9 +225,10 @@ class YFinanceClient:
         ticker can still reach the four periods the snapshot gate needs.
         Uncomputable fields stay None rather than being invented.
 
-        Each row's ``market_cap`` and ``price_to_earnings_ratio`` are
-        reconstructed from Yahoo price and share-count history, which
-        serves no valuation series of its own — see :meth:`_enrich_valuation`.
+        Each row's valuation fields (market cap, P/E, P/B, P/S, FCF yield,
+        enterprise value, EV/EBITDA) are reconstructed from Yahoo price and
+        share-count history plus the row's own statement figures — Yahoo
+        serves no valuation series of its own; see :meth:`_enrich_valuation`.
         """
         if period not in ("ttm", "quarterly", "annual"):
             raise ValueError(f"period must be ttm|quarterly|annual, not {period!r}")
@@ -277,6 +278,11 @@ class YFinanceClient:
             debt_to_assets=_div(s.get("debt"), s.get("assets")),
             revenue_growth=_growth(f.get("revenue"), prior.get("revenue")),
             earnings_growth=_growth(f.get("net_income"), prior.get("net_income")),
+            revenue=f.get("revenue"),
+            ebitda=_ebitda(f.get("operating_income"), f.get("da")),
+            free_cash_flow=f.get("fcf"),
+            total_debt=s.get("debt"),
+            cash_and_equivalents=s.get("cash"),
             earnings_per_share=f.get("eps"),
             book_value_per_share=_div(s.get("equity"), s.get("shares")),
             free_cash_flow_per_share=_div(f.get("fcf"), s.get("shares")),
@@ -288,7 +294,7 @@ class YFinanceClient:
             return None  # fewer than four quarters on file is not a ttm
         flows = [self._flows(income, balance, cashflow, c) for c in window]
         f = {key: _sum(f.get(key) for f in flows)
-             for key in ("revenue", "gross_profit", "operating_income", "net_income", "fcf")}
+             for key in ("revenue", "gross_profit", "operating_income", "net_income", "da", "fcf")}
         eps = _sum(f.get("eps") for f in flows)
         s = self._stocks(balance, window[0])
         return FinancialMetrics(
@@ -304,6 +310,11 @@ class YFinanceClient:
             current_ratio=_div(s.get("current_assets"), s.get("current_liabilities")),
             debt_to_equity=_div(s.get("debt"), s.get("equity")),
             debt_to_assets=_div(s.get("debt"), s.get("assets")),
+            revenue=f["revenue"],
+            ebitda=_ebitda(f["operating_income"], f["da"]),
+            free_cash_flow=f["fcf"],
+            total_debt=s.get("debt"),
+            cash_and_equivalents=s.get("cash"),
             earnings_per_share=eps,
             book_value_per_share=_div(s.get("equity"), s.get("shares")),
             free_cash_flow_per_share=_div(f["fcf"], s.get("shares")),
@@ -326,17 +337,23 @@ class YFinanceClient:
     def _enrich_valuation(
         self, ticker: str, rows: list[FinancialMetrics], end_date: str,
     ) -> list[FinancialMetrics]:
-        """Fill market_cap and price_to_earnings_ratio on every row.
+        """Fill the valuation fields on every row.
 
         Yahoo serves no valuation series, so it is reconstructed: the close
         on or before each row's period end (one daily history call spanning
         the rows) times shares outstanding on or before that date
         (get_shares_full; rows older than that history fall back to the
-        current fast_info count — a documented approximation). P/E is that
-        price over the row's own EPS: trailing-twelve-month EPS on ttm
-        rows, fiscal-year EPS on annual rows. A missing price or share
-        count, or a non-positive EPS, leaves the field None — uncomputable
-        fields are never invented.
+        current fast_info count — a documented approximation) gives the
+        market cap. From it and the row's own statement figures: P/E is
+        that price over the row's EPS (trailing-twelve-month EPS on ttm
+        rows, fiscal-year EPS on annual rows), P/B the price over book
+        value per share, P/S the cap over revenue, and the FCF yield free
+        cash flow over the cap. Enterprise value adds total debt and
+        subtracts cash from the cap; EV/EBITDA divides it by operating
+        income plus depreciation & amortization. A missing input, a
+        non-positive EPS, book value, revenue or EBITDA, or a missing
+        price or share count leaves the field None — uncomputable fields
+        are never invented.
         """
         if not rows:
             return rows
@@ -362,11 +379,27 @@ class YFinanceClient:
             if count is None:
                 count = fallback
             eps = row.earnings_per_share
+            bvps = row.book_value_per_share
+            revenue = row.revenue
+            cap = price * count if price is not None and count is not None else None
+            debt = row.total_debt
+            cash = row.cash_and_equivalents
+            ev = cap + debt - cash \
+                if cap is not None and debt is not None and cash is not None else None
+            ebitda = row.ebitda
             enriched.append(row.model_copy(update={
-                "market_cap": price * count
-                if price is not None and count is not None else None,
+                "market_cap": cap,
                 "price_to_earnings_ratio": _div(price, eps)
                 if eps is not None and eps > 0 else None,
+                "price_to_book_ratio": _div(price, bvps)
+                if bvps is not None and bvps > 0 else None,
+                "price_to_sales_ratio": _div(cap, revenue)
+                if revenue is not None and revenue > 0 else None,
+                "free_cash_flow_yield": _div(row.free_cash_flow, cap)
+                if cap is not None and cap > 0 else None,
+                "enterprise_value": ev,
+                "enterprise_value_to_ebitda_ratio": _div(ev, ebitda)
+                if ev is not None and ebitda is not None and ebitda > 0 else None,
             }))
         return enriched
 
@@ -417,6 +450,16 @@ class YFinanceClient:
             lambda: self._ticker(ticker).get_news(count=min(limit, 100), tab="all"),
             empty=[],
         )
+        if not items:
+            # Some yfinance versions serve an empty list from Ticker.get_news
+            # even when headlines exist; the search endpoint still works, so
+            # fall back to it (its query matches the ticker and related
+            # market stories).
+            items = self._guarded(
+                f"{ticker} news search",
+                lambda: yf.Search(ticker, news_count=min(limit, 100)).news or [],
+                empty=[],
+            )
         news = []
         for item in items or []:
             mapped = _map_news_item(ticker, item)
@@ -712,6 +755,7 @@ class YFinanceClient:
             "operating_income": _cell(income, ("Operating Income", "EBIT"), col),
             "net_income": _cell(income, ("Net Income", "Net Income Common Stockholders"), col),
             "eps": _cell(income, ("Diluted EPS", "Basic EPS"), col),
+            "da": _cell(cashflow, ("Depreciation And Amortization", "Depreciation Amortization Depletion"), col),
             "ocf": ocf,
             "capex": capex,
             "fcf": fcf,
@@ -861,6 +905,14 @@ def _div(a: float | None, b: float | None) -> float | None:
     if a is None or b is None or b == 0:
         return None
     return a / b
+
+
+def _ebitda(operating_income: float | None, da: float | None) -> float | None:
+    """Operating income plus depreciation & amortization; None when either
+    print is missing."""
+    if operating_income is None or da is None:
+        return None
+    return operating_income + da
 
 
 def _growth(now: float | None, then: float | None) -> float | None:

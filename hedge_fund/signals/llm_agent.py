@@ -22,6 +22,12 @@ Failure contract (locked decisions):
 At a bar (a minute fund's session) the prompt also carries the day so far
 — the move since the previous close, results released, headlines — see
 features/intraday.py. It is bucketed so quiet bars stay cache hits.
+
+A daily fund can carry the week's headlines instead: constructed with
+news=True (a mandate's model params), the prompt gains features/news.py's
+block under the fundamentals. Blind backtests never see it — headlines
+name events a model could recall — and intraday bars keep the day-so-far
+context, which already carries headlines.
 """
 
 from __future__ import annotations
@@ -32,6 +38,7 @@ from hedge_fund.data.bars import is_intraday
 from hedge_fund.data.protocol import DataClient
 from hedge_fund.features.breakpoints import MEBreakpoints, shared_breakpoints
 from hedge_fund.features.intraday import build_intraday_context
+from hedge_fund.features.news import build_news_context
 from hedge_fund.features.snapshot import FundamentalsSnapshot, InsufficientData, build_snapshot
 from hedge_fund.llm import LLMCallError, LLMClient, PromptCache, extract_json, make_llm, prompt_key
 from hedge_fund.models import Signal
@@ -52,6 +59,7 @@ class LLMAgent(AlphaModel):
         cache: PromptCache | None = None,
         blind: bool = False,
         breakpoints: MEBreakpoints | None = None,
+        news: bool = False,
     ) -> None:
         self._llm = llm if llm is not None else make_llm()
         self._cache = cache if cache is not None else PromptCache()
@@ -63,6 +71,11 @@ class LLMAgent(AlphaModel):
         # blind; live runs don't and never touch the breakpoints.
         self._blind = blind
         self._breakpoints = breakpoints
+        # Daily funds can read the week's headlines under the fundamentals
+        # (features/news.py). Intraday bars get the day so far instead, and
+        # blind backtests get neither: headlines name events a model could
+        # recall.
+        self._news = news
 
     # ------------------------------------------------------------------
     # AlphaModel interface
@@ -82,6 +95,12 @@ class LLMAgent(AlphaModel):
             # bar renders the same prompt as the last one and costs nothing.
             context = build_intraday_context(ticker, date, data_client)
             user = f"{user}\n\n{context.render(blind=self._blind)}"
+        elif self._news and not self._blind:
+            # A daily session with headlines enabled: the week's news under
+            # the fundamentals. Cache-exact like the intraday block — the
+            # same headlines render identically, so a quiet week is free.
+            context = build_news_context(ticker, date, data_client)
+            user = f"{user}\n\n{context.render()}"
         cache_key = getattr(self._llm, "cache_key", None)
         key = (cache_key(self.name, system, user) if callable(cache_key)
                else prompt_key(self.name, self._llm.model, system, user))

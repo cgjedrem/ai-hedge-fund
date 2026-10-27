@@ -5,7 +5,7 @@ import json
 import pytest
 
 from hedge_fund.data.client import FDClientError
-from hedge_fund.data.models import FinancialMetrics
+from hedge_fund.data.models import CompanyNews, FinancialMetrics
 from hedge_fund.features.breakpoints import MEBreakpoints
 from hedge_fund.llm import PromptCache, extract_json
 from hedge_fund.llm.client import LLMParseError
@@ -35,18 +35,21 @@ class FakeLLM:
         self._response = response
         self._error = error
         self.calls = 0
+        self.prompts = []
 
     def complete(self, system, user):
         self.calls += 1
+        self.prompts.append(user)
         if self._error is not None:
             raise self._error
         return self._response
 
 
 class MockDataClient:
-    def __init__(self, metrics=None, error=None):
+    def __init__(self, metrics=None, error=None, news=None):
         self._metrics = metrics or []
         self._error = error
+        self._news = news
 
     def get_financial_metrics(self, ticker, end_date, period="ttm", limit=10):
         if self._error is not None:
@@ -55,6 +58,9 @@ class MockDataClient:
 
     def get_company_facts(self, ticker):
         return None
+
+    def get_news(self, ticker, end_date, start_date=None, limit=100):
+        return self._news or []
 
 
 def _history(n=8):
@@ -274,6 +280,44 @@ def test_agents_are_not_blind_unless_asked(tmp_path):
     assert "Company: TEST" in record["user"]
     assert "2024-12-31" in record["user"]
     assert "percentile" not in record["user"]  # live prompts never load breakpoints
+
+
+def test_news_enabled_daily_prompt_carries_headlines(tmp_path):
+    """news=True adds the week's headlines under the fundamentals; the
+    default agent's prompt is unchanged."""
+    news_client = MockDataClient(metrics=_history(), news=[
+        CompanyNews(ticker="TEST", title="Chip demand surges", source="Reuters",
+                    date="2025-01-12T15:00:00Z", url="u"),
+    ])
+    agent = BuffettAgent(llm=FakeLLM(BULLISH), cache=PromptCache(tmp_path / "llm"),
+                         news=True)
+    agent.predict("TEST", "2025-01-15", news_client)
+    assert "Recent headlines" in agent._llm.prompts[0]
+    assert "Chip demand surges" in agent._llm.prompts[0]
+
+    plain = MockDataClient(metrics=_history(), news=[
+        CompanyNews(ticker="TEST", title="Chip demand surges", source="Reuters",
+                    date="2025-01-12T15:00:00Z", url="u"),
+    ])
+    default = _agent(tmp_path, FakeLLM(BULLISH))
+    default.predict("TEST", "2025-01-15", plain)
+    assert "Recent headlines" not in default._llm.prompts[0]
+
+
+def test_blind_agent_never_sees_news(tmp_path):
+    """Headlines name events a model could recall — a blind backtest gets
+    neither the block nor even a news call's output."""
+    client = MockDataClient(metrics=_history(), news=[
+        CompanyNews(ticker="TEST", title="Chip demand surges", source="Reuters",
+                    date="2025-01-12T15:00:00Z", url="u"),
+    ])
+    # Nov 2024 thresholds 100M..2000M; the $1B history lands on the 50th.
+    table = MEBreakpoints({"202411": tuple(100.0 * i for i in range(1, 21))})
+    agent = BuffettAgent(llm=FakeLLM(BULLISH), cache=PromptCache(tmp_path / "llm"),
+                         blind=True, breakpoints=table, news=True)
+    agent.predict("TEST", "2025-01-15", client)
+    assert "Recent headlines" not in agent._llm.prompts[0]
+    assert "Chip demand surges" not in agent._llm.prompts[0]
 
 
 def test_failed_parse_still_persists_response(tmp_path):

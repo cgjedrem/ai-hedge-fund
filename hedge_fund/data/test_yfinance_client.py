@@ -179,6 +179,7 @@ def _quarterly_statements() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         "Investing Cash Flow": [-6.0] * 5,
         "Financing Cash Flow": [-2.0] * 5,
         "Changes In Cash": [27.0] * 5,
+        "Depreciation And Amortization": [5.0] * 5,
     })
     return income, balance, cashflow
 
@@ -499,9 +500,29 @@ def test_metrics_rows_carry_period_end_market_cap_and_pe(monkeypatch):
     latest = rows[0]  # ttm ended 2025-03-31, EPS 4.0
     assert latest.market_cap == pytest.approx(10.0 * 11.0)
     assert latest.price_to_earnings_ratio == pytest.approx(10.0 / 4.0)
+    # Statement-derived absolutes (ttm: revenue 400, op income 120 + D&A 20,
+    # FCF 120, debt 50, cash 25) and the ratios they feed at cap 110.
+    assert latest.revenue == pytest.approx(400.0)
+    assert latest.ebitda == pytest.approx(140.0)
+    assert latest.free_cash_flow == pytest.approx(120.0)
+    assert latest.total_debt == pytest.approx(50.0)
+    assert latest.cash_and_equivalents == pytest.approx(25.0)
+    assert latest.price_to_book_ratio == pytest.approx(10.0 / 20.0)
+    assert latest.price_to_sales_ratio == pytest.approx(110.0 / 400.0)
+    assert latest.free_cash_flow_yield == pytest.approx(120.0 / 110.0)
+    assert latest.enterprise_value == pytest.approx(110.0 + 50.0 - 25.0)
+    assert latest.enterprise_value_to_ebitda_ratio == pytest.approx(135.0 / 140.0)
     older = rows[1]  # ttm ended 2024-12-31 — no close on file that early
     assert older.market_cap is None
     assert older.price_to_earnings_ratio is None
+    # Price-derived ratios stay None; statement absolutes still fill.
+    assert older.price_to_book_ratio is None
+    assert older.price_to_sales_ratio is None
+    assert older.free_cash_flow_yield is None
+    assert older.enterprise_value is None
+    assert older.enterprise_value_to_ebitda_ratio is None
+    assert older.revenue == pytest.approx(390.0)  # 100*3 + 90 (older window)
+    assert older.ebitda == pytest.approx(137.0)   # 30*3 + 27 op income + 20 D&A
 
 
 def test_pe_stays_none_when_earnings_are_negative(monkeypatch):
@@ -560,6 +581,54 @@ def test_price_lookup_uses_last_close_on_or_before_period_end(monkeypatch):
     rows = client.get_financial_metrics("TEST", "2025-05-31", period="quarterly")
     assert rows[0].market_cap == pytest.approx(9.5 * 11.0)
     assert rows[0].price_to_earnings_ratio == pytest.approx(9.5 / 2.0)
+    assert rows[0].revenue == pytest.approx(100.0)
+
+
+def test_ev_ebitda_stays_none_without_depreciation(monkeypatch):
+    """EBITDA needs operating income AND D&A; a missing D&A print leaves
+    EV/EBITDA None while EV itself still fills."""
+    income, balance, cashflow = _quarterly_statements()
+    cashflow = cashflow.drop(index="Depreciation And Amortization")
+    history = _prices_df([("2025-03-31", 9.0, 11.0, 8.5, 10.0, 1_000)])
+    shares = pd.Series([11.0], index=pd.DatetimeIndex([pd.Timestamp("2025-01-02")]))
+    client = _client(monkeypatch, _fundamentals_ticker(
+        quarterly_cashflow=cashflow, cashflow=cashflow, history=history,
+        shares_full=shares))
+    rows = client.get_financial_metrics("TEST", "2025-04-30", period="ttm", limit=1)
+    assert rows[0].ebitda is None
+    assert rows[0].enterprise_value == pytest.approx(135.0)
+    assert rows[0].enterprise_value_to_ebitda_ratio is None
+
+
+def test_ev_stays_none_without_debt_or_cash(monkeypatch):
+    """EV = cap + debt − cash; a missing balance-sheet side leaves EV and
+    EV/EBITDA None rather than assuming zero."""
+    income, balance, cashflow = _quarterly_statements()
+    balance = balance.drop(index="Total Debt")
+    history = _prices_df([("2025-03-31", 9.0, 11.0, 8.5, 10.0, 1_000)])
+    shares = pd.Series([11.0], index=pd.DatetimeIndex([pd.Timestamp("2025-01-02")]))
+    client = _client(monkeypatch, _fundamentals_ticker(
+        quarterly_balance_sheet=balance, balance_sheet=balance, history=history,
+        shares_full=shares))
+    rows = client.get_financial_metrics("TEST", "2025-04-30", period="ttm", limit=1)
+    assert rows[0].total_debt is None
+    assert rows[0].enterprise_value is None
+    assert rows[0].enterprise_value_to_ebitda_ratio is None
+
+
+def test_ev_ebitda_stays_none_when_ebitda_is_not_positive(monkeypatch):
+    """A negative or zero EBITDA makes the multiple meaningless — the field
+    stays None while EV still fills."""
+    income, balance, cashflow = _quarterly_statements()
+    income.loc["Operating Income"] = [-10.0] * len(QUARTERS)
+    history = _prices_df([("2025-03-31", 9.0, 11.0, 8.5, 10.0, 1_000)])
+    shares = pd.Series([11.0], index=pd.DatetimeIndex([pd.Timestamp("2025-01-02")]))
+    client = _client(monkeypatch, _fundamentals_ticker(
+        quarterly_financials=income, history=history, shares_full=shares))
+    rows = client.get_financial_metrics("TEST", "2025-04-30", period="ttm", limit=1)
+    assert rows[0].ebitda == pytest.approx(-40.0 + 20.0)
+    assert rows[0].enterprise_value == pytest.approx(135.0)
+    assert rows[0].enterprise_value_to_ebitda_ratio is None
 
 
 # ---------------------------------------------------------------------------
@@ -595,6 +664,24 @@ def test_news_maps_both_yahoo_shapes(monkeypatch):
     assert flat.date == "2025-01-09T17:00:00+00:00"
 
 
+def test_news_falls_back_to_search_when_ticker_news_is_empty(monkeypatch):
+    """Some yfinance versions serve an empty list from Ticker.get_news even
+    when headlines exist; the search endpoint still works."""
+    ticker = FakeTicker("TEST", news=[])
+    fake = _install(monkeypatch, ticker)
+
+    class FakeSearch:
+        news = [FLAT_NEWS]
+
+        def __init__(self, query, news_count=10):
+            assert query == "TEST"
+
+    fake.Search = FakeSearch
+    client = YFinanceClient()
+    news = client.get_news("TEST", "2025-01-11")
+    assert [n.title for n in news] == ["Flat headline"]
+
+
 def test_news_filters_to_the_window(monkeypatch):
     old = {"title": "Old", "publisher": "X", "link": "u", "providerPublishTime": 1733504400}
     undated = {"title": "Undated", "publisher": "X", "link": "u"}
@@ -607,7 +694,9 @@ def test_news_filters_to_the_window(monkeypatch):
 
 
 def test_news_empty_means_no_news(monkeypatch):
-    client = _client(monkeypatch, FakeTicker("TEST", news=[]))
+    fake = _install(monkeypatch, FakeTicker("TEST", news=[]))
+    fake.Search = lambda query, news_count=10: SimpleNamespace(news=[])
+    client = YFinanceClient()
     assert client.get_news("TEST", "2025-01-11") == []
 
 

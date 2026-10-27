@@ -141,6 +141,24 @@ def test_render_contains_the_facts():
     assert "publicly filed" in text
 
 
+def test_render_carries_valuation_columns():
+    """The history table shows the valuation ratios per period; a period
+    without them renders dashes, never invented numbers."""
+    metrics = _history()
+    metrics[0].price_to_earnings_ratio = 20.0
+    metrics[0].price_to_book_ratio = 2.5
+    metrics[0].price_to_sales_ratio = 4.0
+    metrics[0].enterprise_value_to_ebitda_ratio = 12.0
+    metrics[0].free_cash_flow_yield = 0.05
+    snap = build_snapshot("TEST", "2025-01-15", MockDataClient(metrics=metrics))
+    text = snap.render()
+    assert "P/B | P/S | EV/EBITDA | FCFy" in text
+    t0 = _cells(next(line for line in text.splitlines() if line.startswith("2024-12-31")))
+    assert t0[:8] == ["2024-12-31", "2024-12-31", "1.0B", "20.00", "2.50", "4.00", "12.00", "0.05"]
+    t1 = _cells(next(line for line in text.splitlines() if line.startswith("2024-09-30")))
+    assert t1[3:8] == ["-", "-", "-", "-", "-"]
+
+
 def test_blind_render_withholds_ticker_dates_and_dollars():
     """Blind mode drops what lets a model recall the outcome: the ticker,
     every report/filing date, absolute size, and per-share dollar values.
@@ -175,8 +193,8 @@ def test_blind_render_withholds_ticker_dates_and_dollars():
     assert "eps_idx" in text and "bvps_idx" in text and "fcf_idx" in text
     t0 = _cells(next(line for line in text.splitlines() if line.startswith("t-0 |")))
     t7 = _cells(next(line for line in text.splitlines() if line.startswith("t-7 |")))
-    assert t0[9:13] == ["250.0", "100.0", "100.0", "1.00"]  # eps yoy only on t-0
-    assert t7[9:13] == ["100.0", "100.0", "100.0", "-"]
+    assert t0[13:17] == ["250.0", "100.0", "100.0", "1.00"]  # eps yoy only on t-0
+    assert t7[13:17] == ["100.0", "100.0", "100.0", "-"]
     assert "Market cap (latest filed): 3200.0B" in shown
 
 
@@ -246,7 +264,7 @@ def test_blind_index_dashes_without_a_positive_base_and_keeps_sign():
     metrics[0].earnings_per_share = -1.0  # sign survives: -1 / 2 * 100
     text = build_snapshot("TEST", "2025-01-15", MockDataClient(metrics=metrics)).render(blind=True)
     t0 = _cells(next(line for line in text.splitlines() if line.startswith("t-0 |")))
-    assert t0[9:12] == ["-50.0", "-", "-"]
+    assert t0[13:16] == ["-50.0", "-", "-"]
 
 
 def _cells(line: str) -> list[str]:
