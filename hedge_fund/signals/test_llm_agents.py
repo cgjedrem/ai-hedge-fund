@@ -27,13 +27,18 @@ from hedge_fund.signals import (
 # ---------------------------------------------------------------------------
 
 class FakeLLM:
-    """Canned-response LLM; counts calls; can raise instead."""
+    """Canned-response LLM; counts calls; can raise instead.
+
+    `responses` serves a sequence (one per call, popped in order) for
+    ensemble tests; `response` serves the same answer every call.
+    """
 
     model = "fake-model"
 
-    def __init__(self, response="", error=None):
+    def __init__(self, response="", error=None, responses=None):
         self._response = response
         self._error = error
+        self._responses = list(responses) if responses is not None else None
         self.calls = 0
         self.prompts = []
 
@@ -42,6 +47,10 @@ class FakeLLM:
         self.prompts.append(user)
         if self._error is not None:
             raise self._error
+        if self._responses is not None:
+            if not self._responses:
+                raise AssertionError("FakeLLM ran out of canned responses")
+            return self._responses.pop(0)
         return self._response
 
 
@@ -408,3 +417,151 @@ def test_extract_json_embedded():
 def test_extract_json_raises_on_garbage():
     with pytest.raises(LLMParseError):
         extract_json("no json here at all")
+
+
+# ---------------------------------------------------------------------------
+# Self-consistency ensemble (samples / temperature)
+# ---------------------------------------------------------------------------
+
+def _bullish(confidence, reasoning="r"):
+    return json.dumps({"signal": "bullish", "confidence": confidence, "reasoning": reasoning})
+
+
+def _bearish(confidence, reasoning="r"):
+    return json.dumps({"signal": "bearish", "confidence": confidence, "reasoning": reasoning})
+
+
+def test_ensemble_averages_samples_and_reports_spread(tmp_path):
+    """Three samples fold to the mean value; reasoning comes from the
+    median-valued sample; metadata carries the ensemble facts."""
+    llm = FakeLLM(responses=[
+        _bullish(80, "strong buy"),     # +0.8
+        _bearish(60, "too expensive"),  # -0.6
+        _bullish(60, "fair price"),     # +0.6  <- median
+    ])
+    agent = BuffettAgent(llm=llm, cache=PromptCache(tmp_path / "llm"), samples=3)
+
+    sig = agent.predict("TEST", "2025-01-15", MockDataClient(metrics=_history()))
+
+    assert llm.calls == 3
+    assert sig.value == pytest.approx((0.8 - 0.6 + 0.6) / 3)
+    assert sig.reasoning == "fair price"  # median sample's voice
+    assert sig.metadata["signal"] == "bullish" and sig.metadata["confidence"] == 60
+    assert sig.metadata["samples_requested"] == 3
+    assert sorted(sig.metadata["sample_values"]) == pytest.approx([-0.6, 0.6, 0.8])
+    assert sig.metadata["sample_spread"] == pytest.approx(1.4)
+    assert len(sig.metadata["prompt_keys"]) == 3
+    assert len(set(sig.metadata["prompt_keys"])) == 3  # every sample keyed apart
+    assert "temperature" not in sig.metadata
+    assert sig.metadata["cached"] is False
+
+
+def test_ensemble_second_predict_serves_all_samples_from_cache(tmp_path):
+    llm = FakeLLM(responses=[_bullish(80), _bearish(60), _bullish(60)])
+    client = MockDataClient(metrics=_history())
+    agent = BuffettAgent(llm=llm, cache=PromptCache(tmp_path / "llm"), samples=3)
+
+    first = agent.predict("TEST", "2025-01-15", client)
+    second = agent.predict("TEST", "2025-01-15", client)
+
+    assert llm.calls == 3  # no new calls on the replay
+    assert first.value == second.value
+    assert second.metadata["cached"] is True
+    assert second.metadata["prompt_keys"] == first.metadata["prompt_keys"]
+
+
+def test_ensemble_persists_one_record_per_sample(tmp_path):
+    agent = BuffettAgent(llm=FakeLLM(responses=[_bullish(80), _bearish(60), _bullish(60)]),
+                         cache=PromptCache(tmp_path / "llm"), samples=3)
+    agent.predict("TEST", "2025-01-15", MockDataClient(metrics=_history()))
+
+    records = [json.loads(p.read_text()) for p in (tmp_path / "llm").glob("*.json")]
+    assert len(records) == 3
+    assert sorted(r["sample"] for r in records) == [0, 1, 2]
+
+
+def test_single_sample_keeps_legacy_shape(tmp_path):
+    """samples=1, no temperature: metadata carries no ensemble keys."""
+    agent = _agent(tmp_path, FakeLLM(BULLISH))
+    sig = agent.predict("TEST", "2025-01-15", MockDataClient(metrics=_history()))
+
+    assert sig.value == pytest.approx(0.8)
+    assert set(sig.metadata) == {"signal", "confidence", "model", "prompt_key",
+                                 "snapshot_hash", "cached", "abstained"}
+
+
+def test_single_sample_prompt_key_is_legacy(tmp_path):
+    from hedge_fund.llm import prompt_key
+    agent = _agent(tmp_path, FakeLLM(BULLISH))
+    sig = agent.predict("TEST", "2025-01-15", MockDataClient(metrics=_history()))
+
+    record = json.loads(next((tmp_path / "llm").glob("*.json")).read_text())
+    assert sig.metadata["prompt_key"] == prompt_key(
+        "buffett", "fake-model", record["system"], record["user"])
+
+
+def test_temperature_salts_cache_key(tmp_path):
+    """Same prompt, different temperature → different cache entries; each
+    agent replays its own."""
+    client = MockDataClient(metrics=_history())
+    hot = BuffettAgent(llm=FakeLLM(BULLISH), cache=PromptCache(tmp_path / "llm"),
+                       temperature=0.7)
+    cold = BuffettAgent(llm=FakeLLM(BULLISH), cache=PromptCache(tmp_path / "llm"))
+
+    hot_sig = hot.predict("TEST", "2025-01-15", client)
+    cold_sig = cold.predict("TEST", "2025-01-15", client)
+    hot_again = hot.predict("TEST", "2025-01-15", client)
+
+    assert hot_sig.metadata["prompt_key"] != cold_sig.metadata["prompt_key"]
+    assert hot_sig.metadata["temperature"] == 0.7
+    assert "temperature" not in cold_sig.metadata
+    assert hot_again.metadata["cached"] is True  # hot replays its own entry
+    records = [json.loads(p.read_text()) for p in (tmp_path / "llm").glob("*.json")]
+    assert len(records) == 2
+    assert any(r.get("temperature") == 0.7 for r in records)
+
+
+def test_ensemble_proceeds_with_successful_samples(tmp_path):
+    """One unparseable sample of three: the fund uses the two good ones."""
+    llm = FakeLLM(responses=[_bullish(80), "garbage", _bullish(40)])
+    agent = BuffettAgent(llm=llm, cache=PromptCache(tmp_path / "llm"), samples=3)
+
+    sig = agent.predict("TEST", "2025-01-15", MockDataClient(metrics=_history()))
+
+    assert llm.calls == 3
+    assert sig.metadata["abstained"] is False
+    assert sig.value == pytest.approx((0.8 + 0.4) / 2)
+    assert sig.metadata["samples_requested"] == 3
+    assert sig.metadata["sample_values"] == pytest.approx([0.8, 0.4])
+    assert sig.metadata["sample_spread"] == pytest.approx(0.4)
+
+
+def test_ensemble_abstains_only_when_every_sample_fails(tmp_path):
+    llm = FakeLLM(responses=["garbage", "still garbage", "nope"])
+    agent = BuffettAgent(llm=llm, cache=PromptCache(tmp_path / "llm"), samples=3)
+
+    sig = agent.predict("TEST", "2025-01-15", MockDataClient(metrics=_history()))
+
+    assert sig.value == 0.0
+    assert sig.metadata["abstained"] is True
+    assert "parse failed" in sig.metadata["abstain_reason"]
+
+
+def test_ensemble_call_error_abstains_with_last_key(tmp_path):
+    llm = FakeLLM(error=TimeoutError("llm timed out"))
+    agent = BuffettAgent(llm=llm, cache=PromptCache(tmp_path / "llm"), samples=3)
+
+    sig = agent.predict("TEST", "2025-01-15", MockDataClient(metrics=_history()))
+
+    assert sig.metadata["abstained"] is True
+    assert "timed out" in sig.metadata["abstain_reason"]
+
+
+def test_ensemble_params_validate():
+    with pytest.raises(ValueError):
+        BuffettAgent(llm=FakeLLM(), samples=0)
+    with pytest.raises(ValueError):
+        BuffettAgent(llm=FakeLLM(), temperature=3)
+    with pytest.raises(ValueError):
+        BuffettAgent(llm=FakeLLM(), temperature=-0.1)
+    BuffettAgent(llm=FakeLLM(), samples=1, temperature=2)  # boundary is fine

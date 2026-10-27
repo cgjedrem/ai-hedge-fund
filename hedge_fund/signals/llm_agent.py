@@ -28,6 +28,18 @@ news=True (a mandate's model params), the prompt gains features/news.py's
 block under the fundamentals. Blind backtests never see it — headlines
 name events a model could recall — and intraday bars keep the day-so-far
 context, which already carries headlines.
+
+Self-consistency ensemble (mandate params `samples` and `temperature`):
+with samples=N the same prompt is asked N times and the folded values are
+averaged into one Signal — the reasoning comes from the median-valued
+sample, and metadata carries sample_values/sample_spread so the spread
+reads as an uncertainty signal. temperature adds sampling creativity
+(0 = deterministic, up to 2 = creative). Both salt the cache key, so a
+changed temperature or a different sample never replays another sample's
+cached answer; the default single-sample, no-temperature run keeps the
+legacy keys, so existing funds' caches stay valid. Failures are
+per-sample: a fund proceeds with the samples that succeeded and abstains
+only when none did.
 """
 
 from __future__ import annotations
@@ -40,7 +52,15 @@ from hedge_fund.features.breakpoints import MEBreakpoints, shared_breakpoints
 from hedge_fund.features.intraday import build_intraday_context
 from hedge_fund.features.news import build_news_context
 from hedge_fund.features.snapshot import FundamentalsSnapshot, InsufficientData, build_snapshot
-from hedge_fund.llm import LLMCallError, LLMClient, PromptCache, extract_json, make_llm, prompt_key
+from hedge_fund.llm import (
+    LLMCallError,
+    LLMClient,
+    PromptCache,
+    extract_json,
+    make_llm,
+    prompt_key,
+    salted_key,
+)
 from hedge_fund.models import Signal
 from hedge_fund.signals.base import AlphaModel
 
@@ -60,8 +80,14 @@ class LLMAgent(AlphaModel):
         blind: bool = False,
         breakpoints: MEBreakpoints | None = None,
         news: bool = False,
+        samples: int = 1,
+        temperature: float | None = None,
     ) -> None:
-        self._llm = llm if llm is not None else make_llm()
+        if samples < 1:
+            raise ValueError(f"samples must be >= 1, got {samples}")
+        if temperature is not None and not 0 <= temperature <= 2:
+            raise ValueError(f"temperature must be within [0, 2], got {temperature}")
+        self._llm = llm if llm is not None else make_llm(temperature=temperature)
         self._cache = cache if cache is not None else PromptCache()
         # Blind prompts withhold the ticker, industry, calendar dates and
         # dollar values so a backtest can't lean on what the LLM remembers
@@ -76,6 +102,16 @@ class LLMAgent(AlphaModel):
         # blind backtests get neither: headlines name events a model could
         # recall.
         self._news = news
+        # Self-consistency ensemble: samples > 1 asks the same prompt N times
+        # and averages the folded values into one Signal (reasoning comes from
+        # the median sample). temperature adds sampling creativity. Both are
+        # mandate params (fund YAML `params:`) and both salt the cache key —
+        # a changed temperature or a different sample must never replay
+        # another sample's cached answer. When `llm` is injected, the caller
+        # must build it with the same temperature (paper._warm does); the
+        # agent trusts the param for keying.
+        self._samples = int(samples)
+        self._temperature = temperature
 
     # ------------------------------------------------------------------
     # AlphaModel interface
@@ -101,48 +137,68 @@ class LLMAgent(AlphaModel):
             # same headlines render identically, so a quiet week is free.
             context = build_news_context(ticker, date, data_client)
             user = f"{user}\n\n{context.render()}"
-        cache_key = getattr(self._llm, "cache_key", None)
-        key = (cache_key(self.name, system, user) if callable(cache_key)
-               else prompt_key(self.name, self._llm.model, system, user))
+        samples: list[tuple[str, dict, bool]] = []  # (key, parsed, cached)
+        last_failure = ""
+        last_failed_key = ""
+        for index in range(self._samples):
+            salt = self._salt(index)
+            cache_key = getattr(self._llm, "cache_key", None)
+            base = (cache_key(self.name, system, user) if callable(cache_key)
+                    else prompt_key(self.name, self._llm.model, system, user))
+            key = salted_key(base, salt) if salt else base
 
-        cached = self._cache.get(key)
-        if cached is not None and "parsed" in cached:
-            return self._to_signal(ticker, date, cached["parsed"], key, snapshot, cached=True)
+            cached = self._cache.get(key)
+            if cached is not None and "parsed" in cached:
+                samples.append((key, cached["parsed"], True))
+                continue
 
-        record = {
-            "agent": self.name,
-            "model": self._llm.model,
-            "ticker": ticker,
-            "as_of": date,
-            "snapshot_hash": snapshot.content_hash,
-            "system": system,
-            "user": user,
-        }
+            record = {
+                "agent": self.name,
+                "model": self._llm.model,
+                "ticker": ticker,
+                "as_of": date,
+                "snapshot_hash": snapshot.content_hash,
+                "system": system,
+                "user": user,
+            }
+            if salt:
+                record["sample"] = index
+                if self._temperature is not None:
+                    record["temperature"] = self._temperature
 
-        try:
-            response = self._llm.complete(system, user)
-        except Exception as exc:
-            if isinstance(exc, LLMCallError) and exc.diagnostic_record is not None:
-                self._cache.put(key, {**record, "call_error": str(exc),
-                                      "diagnostics": exc.diagnostic_record})
-                signal = self._abstain(ticker, date, f"LLM call failed: {exc}")
-                signal.metadata["prompt_key"] = key
-            else:
-                signal = self._abstain(ticker, date, f"LLM call failed: {exc}")
-            logger.warning("%s LLM call failed for %s@%s: %s", self.name, ticker, date, exc)
+            try:
+                response = self._llm.complete(system, user)
+            except Exception as exc:
+                if isinstance(exc, LLMCallError) and exc.diagnostic_record is not None:
+                    self._cache.put(key, {**record, "call_error": str(exc),
+                                          "diagnostics": exc.diagnostic_record})
+                    last_failed_key = key
+                last_failure = f"LLM call failed: {exc}"
+                logger.warning("%s LLM call failed for %s@%s (sample %d): %s",
+                               self.name, ticker, date, index, exc)
+                continue
+
+            record["response"] = response
+            try:
+                parsed = self._parse(response)
+            except Exception as exc:
+                # Persist the raw response even when unparseable — the debug trail.
+                self._cache.put(key, {**record, "parse_error": str(exc)})
+                logger.warning("%s parse failed for %s@%s (sample %d): %s",
+                               self.name, ticker, date, index, exc)
+                last_failure = f"parse failed: {exc}"
+                continue
+
+            self._cache.put(key, {**record, "parsed": parsed})
+            samples.append((key, parsed, False))
+
+        if not samples:
+            signal = self._abstain(ticker, date, last_failure or "no samples completed")
+            if last_failed_key:
+                signal.metadata["prompt_key"] = last_failed_key
             return signal
 
-        record["response"] = response
-        try:
-            parsed = self._parse(response)
-        except Exception as exc:
-            # Persist the raw response even when unparseable — the debug trail.
-            self._cache.put(key, {**record, "parse_error": str(exc)})
-            logger.warning("%s parse failed for %s@%s: %s", self.name, ticker, date, exc)
-            return self._abstain(ticker, date, f"parse failed: {exc}")
-
-        self._cache.put(key, {**record, "parsed": parsed})
-        return self._to_signal(ticker, date, parsed, key, snapshot, cached=False)
+        return self._combine(ticker, date, samples, snapshot)
 
     # ------------------------------------------------------------------
     # Subclass surface
@@ -194,33 +250,57 @@ class LLMAgent(AlphaModel):
             parsed["provider_metadata"] = data["provider_metadata"]
         return parsed
 
-    def _to_signal(
-        self,
-        ticker: str,
-        date: str,
-        parsed: dict,
-        key: str,
-        snapshot: FundamentalsSnapshot,
-        cached: bool,
-    ) -> Signal:
-        value = _SIGNAL_TO_SIGN[parsed["signal"]] * parsed["confidence"] / 100.0
+    def _salt(self, index: int) -> str:
+        """Request semantics the prompts don't carry, for the cache key.
+
+        Empty for the default single-sample, provider-default-temperature
+        run — those keys stay byte-identical to the legacy ones.
+        """
+        parts = []
+        if self._temperature is not None:
+            parts.append(f"temperature={self._temperature}")
+        if self._samples > 1:
+            parts.append(f"sample={index}")
+        return "|".join(parts)
+
+    def _combine(self, ticker: str, date: str, samples, snapshot: FundamentalsSnapshot) -> Signal:
+        """Fold N sample parses into one Signal: mean value, median voice.
+
+        With one sample this is exactly the old single-response fold — same
+        metadata keys, same value. With more, the ensemble facts ride along
+        in metadata and the reasoning comes from the median-valued sample.
+        """
+        values = [_SIGNAL_TO_SIGN[parsed["signal"]] * parsed["confidence"] / 100.0
+                  for _, parsed, _ in samples]
+        ranked = sorted(zip(samples, values), key=lambda pair: pair[1])
+        (median_key, median_parsed, _), _ = ranked[len(ranked) // 2]
+        metadata = {
+            "signal": median_parsed["signal"],
+            "confidence": median_parsed["confidence"],
+            "model": self._llm.model,
+            "prompt_key": median_key,
+            "snapshot_hash": snapshot.content_hash,
+            "cached": all(cached for _, _, cached in samples),
+            "abstained": False,
+        }
+        if "provider_metadata" in median_parsed:
+            metadata["provider_metadata"] = median_parsed["provider_metadata"]
+        if self._samples > 1:
+            metadata.update(
+                samples_requested=self._samples,
+                sample_values=values,
+                sample_spread=max(values) - min(values),
+                prompt_keys=[key for key, _, _ in samples],
+            )
+        if self._temperature is not None:
+            metadata["temperature"] = self._temperature
         return Signal(
             model_name=self.name,
             ticker=ticker,
             date=date,
-            value=value,
-            reasoning=parsed["reasoning"],
-            metadata={
-                "signal": parsed["signal"],
-                "confidence": parsed["confidence"],
-                "model": self._llm.model,
-                "prompt_key": key,
-                "snapshot_hash": snapshot.content_hash,
-                "cached": cached,
-                "abstained": False,
-                **({"provider_metadata": parsed["provider_metadata"]}
-                   if "provider_metadata" in parsed else {}),
-            },
+            value=sum(values) / len(values),
+            reasoning=median_parsed["reasoning"],
+            metadata=metadata,
         )
 
     def _abstain(self, ticker: str, date: str, reason: str) -> Signal:

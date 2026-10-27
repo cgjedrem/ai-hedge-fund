@@ -1,6 +1,6 @@
 """v2 LLM layer — provider protocol, provider clients, prompt cache."""
 
-from hedge_fund.llm.cache import PromptCache, prompt_key
+from hedge_fund.llm.cache import PromptCache, prompt_key, salted_key
 from hedge_fund.llm.client import (
     DEFAULT_MODEL,
     AnthropicLLM,
@@ -43,4 +43,5 @@ __all__ = [
     "make_llm",
     "prompt_key",
     "provider_for",
+    "salted_key",
 ]

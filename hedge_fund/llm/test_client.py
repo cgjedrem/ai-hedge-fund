@@ -108,6 +108,41 @@ def test_ollama_needs_no_key(monkeypatch):
     assert hasattr(llm, "complete")
 
 
+def test_temperature_reaches_the_chat_model(keyed):
+    """make_llm's temperature lands on the underlying chat model."""
+    llm = make_llm(_BY_PROVIDER["Kimi"], temperature=0.7)
+    assert llm._chat.temperature == 0.7
+
+
+def test_temperature_none_keeps_provider_default(keyed):
+    llm = make_llm(_BY_PROVIDER["Kimi"])
+    assert llm._chat.temperature is None
+
+
+def test_typesafe_accepts_and_ignores_temperature(monkeypatch):
+    """TypeSafe has no sampling knob; the factory takes the kwarg and drops it."""
+    monkeypatch.delenv("HEDGE_FUND_LLM_MODEL", raising=False)
+    monkeypatch.setenv("TYPESAFE_API_KEY", API_KEY)
+    llm = make_llm("jev-1.13.0", temperature=0.7)
+    assert isinstance(llm, JevLLM)
+
+
+def test_prompt_key_salt_is_legacy_compatible():
+    """An empty salt reproduces the legacy key; any salt namespaces it."""
+    assert prompt_key("a", "m", "s", "u") == prompt_key("a", "m", "s", "u", "")
+    assert prompt_key("a", "m", "s", "u") != prompt_key("a", "m", "s", "u", "sample=1")
+    assert prompt_key("a", "m", "s", "u", "temperature=0.7") != \
+        prompt_key("a", "m", "s", "u", "sample=1")
+
+
+def test_salted_key_namespaces_a_provider_key():
+    from hedge_fund.llm import salted_key
+    base = "abcdef1234567890abcdef12"
+    assert salted_key(base, "") != base  # a salted key is never the bare base
+    assert salted_key(base, "sample=1") == salted_key(base, "sample=1")
+    assert salted_key(base, "sample=1") != salted_key(base, "sample=2")
+
+
 def test_provider_for_reads_the_registry():
     assert provider_for("claude-opus-5-5") == "Anthropic"
     assert provider_for("claude-fable-5-1") == "Anthropic"

@@ -22,10 +22,25 @@ from hedge_fund.paths import CACHE_DIR
 DEFAULT_CACHE_DIR = CACHE_DIR / "llm"
 
 
-def prompt_key(agent: str, model: str, system: str, user: str) -> str:
-    """Cache key for one (agent, model, prompt) combination."""
+def prompt_key(agent: str, model: str, system: str, user: str, salt: str = "") -> str:
+    """Cache key for one (agent, model, prompt) combination.
+
+    `salt` namespaces keys that differ in request semantics the prompts
+    don't carry — an ensemble sample index or a sampling temperature. An
+    empty salt (the default) yields the legacy key, so existing cache
+    files stay valid.
+    """
     payload = f"{agent}|{model}|{system}|{user}"
+    if salt:
+        payload = f"{payload}|{salt}"
     return hashlib.sha256(payload.encode()).hexdigest()[:24]
+
+
+def salted_key(base: str, salt: str) -> str:
+    """Namespace an existing cache key (e.g. a provider's own cache_key)
+    with request semantics the prompts don't carry — an ensemble sample
+    index or a sampling temperature."""
+    return hashlib.sha256(f"{base}|{salt}".encode()).hexdigest()[:24]
 
 
 class PromptCache:

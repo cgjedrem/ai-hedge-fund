@@ -528,8 +528,12 @@ class RunSessionScreen(Screen):
             cls = ALPHA_MODEL_REGISTRY[agent_name]  # own instance per thread
             kwargs = params.get(agent_name, {})
             # Only LLM agents have anything to stream; a quant model carries
-            # no client and simply runs.
-            model = (cls(llm=make_llm(on_token=desk.feed), **kwargs)
+            # no client and simply runs. The injected client must carry the
+            # same temperature the agent was built with — the agent salts its
+            # cache keys with it, so a mismatched client would still key
+            # correctly but sample at the wrong creativity.
+            model = (cls(llm=make_llm(on_token=desk.feed,
+                                      temperature=kwargs.get("temperature")), **kwargs)
                      if issubclass(cls, LLMAgent) else cls(**kwargs))
             with make_data_client() as raw:
                 fd = CachedDataClient(raw)

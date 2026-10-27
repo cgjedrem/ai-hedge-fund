@@ -242,12 +242,17 @@ def make_llm(
     timeout: float = 60.0,
     max_tokens: int = 4096,
     on_token: TokenListener = None,
+    temperature: float | None = None,
 ) -> LLMClient:
     """Build the client for a model id, routed by the registry's provider.
 
     The id comes from the caller, else HEDGE_FUND_LLM_MODEL, else DEFAULT_MODEL — the
     same seam the TUI's picker writes to. Raises with the name of the missing
     environment variable, because that is the only thing the user can act on.
+
+    `temperature` (0 = deterministic, up to 2 = creative) is passed to chat
+    providers' constructors; None keeps each provider's default. TypeSafe's
+    typed judgments have no sampling, so it is ignored there.
     """
     model = model or os.environ.get("HEDGE_FUND_LLM_MODEL") or DEFAULT_MODEL
     provider = provider_for(model)
@@ -263,6 +268,11 @@ def make_llm(
 
     api_key = _require_key(provider)
 
+    # Only hand providers a temperature when one was asked for: several
+    # constructors (Google's pydantic model among them) reject an explicit
+    # None, and omitting it keeps each provider's own default.
+    temp = {"temperature": temperature} if temperature is not None else {}
+
     if provider == "TypeSafe":
         # Typed judgments have no generated tokens or output-token budget.
         return JevLLM(api_key=api_key, model=model, timeout=timeout)
@@ -270,23 +280,24 @@ def make_llm(
     if provider == "Anthropic":
         from langchain_anthropic import ChatAnthropic
         chat = ChatAnthropic(model=model, api_key=api_key, timeout=timeout,
-                             max_retries=1, max_tokens=max_tokens)
+                             max_retries=1, max_tokens=max_tokens, **temp)
     elif provider == "OpenAI":
         from langchain_openai import ChatOpenAI
         chat = ChatOpenAI(model=model, api_key=api_key, timeout=timeout,
-                          max_retries=1, base_url=os.getenv("OPENAI_API_BASE"))
+                          max_retries=1, base_url=os.getenv("OPENAI_API_BASE"),
+                          **temp)
     elif provider == "DeepSeek":
         from langchain_deepseek import ChatDeepSeek
         chat = ChatDeepSeek(model=model, api_key=api_key, timeout=timeout,
-                            max_retries=1)
+                            max_retries=1, **temp)
     elif provider == "Google":
         from langchain_google_genai import ChatGoogleGenerativeAI
         chat = ChatGoogleGenerativeAI(model=model, api_key=api_key,
-                                      timeout=timeout, max_retries=1)
+                                      timeout=timeout, max_retries=1, **temp)
     elif provider == "xAI":
         from langchain_xai import ChatXAI
         chat = ChatXAI(model=model, api_key=api_key, timeout=timeout,
-                       max_retries=1)
+                       max_retries=1, **temp)
     elif provider == "Kimi":
         # Moonshot speaks the OpenAI wire format. Default to the international
         # host; mainland users override with MOONSHOT_BASE_URL (v1 does the same).
@@ -294,7 +305,8 @@ def make_llm(
         chat = ChatOpenAI(
             model=model, api_key=api_key, timeout=timeout, max_retries=1,
             base_url=(os.getenv("MOONSHOT_BASE_URL")
-                      or "https://api.moonshot.ai/v1"))
+                      or "https://api.moonshot.ai/v1"),
+            **temp)
     elif provider == "Ollama":
         # Local (or self-hosted) Ollama — no API key. OLLAMA_BASE_URL points
         # at a non-default host. num_ctx is raised above Ollama's small
@@ -306,6 +318,7 @@ def make_llm(
             base_url=os.getenv("OLLAMA_BASE_URL") or "http://localhost:11434",
             num_ctx=int(os.getenv("OLLAMA_NUM_CTX") or 8192),
             client_kwargs={"timeout": float(os.getenv("OLLAMA_TIMEOUT") or timeout)},
+            **temp,
         )
     else:  # pragma: no cover - SUPPORTED_PROVIDERS is checked above
         raise ValueError(f"Unhandled provider {provider}")
