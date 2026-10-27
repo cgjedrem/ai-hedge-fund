@@ -88,7 +88,16 @@ docker run -d --name aihf-watchtower --restart unless-stopped \
 
 Or with compose (`docker-compose.yml` in this repo): `docker compose up -d runner` for the runner, `docker compose run --rm tui` for the app. One runner per fund — copy the service and change the fund name. Do not run the same fund's runner on the host and in a container at the same time: pid files cannot see across that boundary, so both would believe they own the fund.
 
-Ollama models (the keyless ones, e.g. `kimi-k3:cloud`) run on the *host's* Ollama — inside a container, `localhost` is the container itself. Compose sets `OLLAMA_BASE_URL=http://host.docker.internal:11434` for you; with plain `docker run`, add `-e OLLAMA_BASE_URL=http://host.docker.internal:11434`.
+#### Using Ollama models in the container
+
+Ollama models (the keyless ones, e.g. `kimi-k3:cloud`) run on the *host's* Ollama — inside a container, `localhost` is the container itself. Before starting any container:
+
+1. **Run Ollama on the host** — install it and keep the daemon up (`ollama serve` or the desktop app; it listens on `localhost:11434`).
+2. **Check the model answers on the host first**: `ollama run kimi-k3:cloud "hi"` (cloud-hosted models may ask you to sign in once).
+3. **Point the container at the host** — compose sets `OLLAMA_BASE_URL=http://host.docker.internal:11434` on both services; with plain `docker run`, add `-e OLLAMA_BASE_URL=http://host.docker.internal:11434`.
+4. **Sanity-check the wiring** — `curl http://localhost:11434/api/version` on the host should return JSON. If a container's LLM calls fail with "Connection refused", this env var is the first thing to check.
+
+On a Linux host, `host.docker.internal` needs one extra flag: `--add-host=host.docker.internal:host-gateway` for `docker run`, or `extra_hosts: ["host.docker.internal:host-gateway"]` on a compose service.
 
 ## Development
 
