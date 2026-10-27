@@ -29,6 +29,11 @@ COPY pyproject.toml poetry.lock ./
 RUN pip install poetry==2.5.1 \
     && poetry install -E yfinance --only main --no-root
 
+# ttyd serves the TUI to a browser tab — used by the tui-web service in
+# docker-compose.linux.yml (e.g. a home server exposing it over Tailscale).
+RUN python -c "import urllib.request; urllib.request.urlretrieve('https://github.com/tsl0922/ttyd/releases/download/1.7.7/ttyd.x86_64', '/usr/local/bin/ttyd')" \
+    && chmod +x /usr/local/bin/ttyd
+
 COPY hedge_fund ./hedge_fund
 COPY README.md ./
 RUN poetry install -E yfinance --only main

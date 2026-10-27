@@ -10,6 +10,9 @@
 # `command`. Do not run the same fund's runner on the host and in a
 # container at the same time — pid files cannot see across that boundary,
 # so both would believe they own the fund.
+#
+# On a Linux host (home server), use the docker-compose.linux.yml override
+# instead — see the README's "Home server (Linux + Tailscale)" section.
 
 services:
   runner:

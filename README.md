@@ -97,7 +97,26 @@ Ollama models (the keyless ones, e.g. `kimi-k3:cloud`) run on the *host's* Ollam
 3. **Point the container at the host** — compose sets `OLLAMA_BASE_URL=http://host.docker.internal:11434` on both services; with plain `docker run`, add `-e OLLAMA_BASE_URL=http://host.docker.internal:11434`.
 4. **Sanity-check the wiring** — `curl http://localhost:11434/api/version` on the host should return JSON. If a container's LLM calls fail with "Connection refused", this env var is the first thing to check.
 
-On a Linux host, `host.docker.internal` needs one extra flag: `--add-host=host.docker.internal:host-gateway` for `docker run`, or `extra_hosts: ["host.docker.internal:host-gateway"]` on a compose service.
+On a Linux host, `host.docker.internal` needs one extra flag: `--add-host=host.docker.internal:host-gateway` for `docker run`, or `extra_hosts: ["host.docker.internal:host-gateway"]` on a compose service. For a Linux home server, prefer the `docker-compose.linux.yml` override instead — see the next section.
+
+#### Home server (Linux + Tailscale)
+
+On a Linux host, Docker Desktop's `host.docker.internal` doesn't exist. Use the Linux override, which runs the containers on the host's own network — `localhost` inside the container *is* the host, so Ollama needs no extra wiring:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.linux.yml up -d runner   # headless runner
+docker compose -f docker-compose.yml -f docker-compose.linux.yml run --rm tui   # terminal TUI
+```
+
+Moving a fund from another machine: stop the old runner first (one runner per fund, even across machines), copy the state with `rsync -a ~/.hedge-fund/ server:~/.hedge-fund/`, then start the runner on the server. The LLM cache travels with it, so nothing is recomputed.
+
+Remote access over Tailscale:
+
+1. On the server: install Tailscale and run `tailscale up --ssh` (Tailscale SSH is a Linux feature — your tailnet handles auth, no keys to manage).
+2. Terminal TUI from any tailnet device: `ssh <server>`, then `tmux new -s tui` (or `tmux attach -t tui`) and start the TUI with the compose command above. tmux keeps the session alive across disconnects.
+3. Browser TUI: `docker compose -f docker-compose.yml -f docker-compose.linux.yml up -d tui-web` serves the full app on `127.0.0.1:7681`. Publish it to your tailnet with HTTPS: `tailscale serve --bg 7681`, then open `https://<server-name>.<tailnet>.ts.net` from any device. Only devices on your tailnet can reach it.
+
+If Ollama runs on a different machine than the server, point `OLLAMA_BASE_URL` at that machine's tailnet IP (e.g. `http://100.x.y.z:11434`) and run Ollama there with `OLLAMA_HOST=0.0.0.0` so it accepts non-local connections.
 
 ## Development
 
