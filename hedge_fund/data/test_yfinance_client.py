@@ -84,6 +84,12 @@ class FakeTicker:
             raise result
         return result
 
+    def get_shares_full(self, start=None, end=None):
+        result = self._attrs.get("shares_full")
+        if isinstance(result, Exception):
+            raise result
+        return result
+
     def get_news(self, count: int, tab: str):
         result = self._attrs.get("news", [])
         if isinstance(result, Exception):
@@ -474,6 +480,86 @@ def test_metrics_reject_an_unknown_period(monkeypatch):
     client = _client(monkeypatch, _fundamentals_ticker())
     with pytest.raises(ValueError, match="period"):
         client.get_financial_metrics("TEST", "2025-04-30", period="monthly")
+
+
+def test_metrics_rows_carry_period_end_market_cap_and_pe(monkeypatch):
+    """Yahoo serves no valuation series, so the client reconstructs it:
+    the close on or before each period end times shares outstanding on or
+    before that date, and P/E from the row's own EPS."""
+    history = _prices_df([
+        ("2025-03-31", 9.0, 11.0, 8.5, 10.0, 1_000),
+        ("2025-04-15", 11.0, 13.0, 10.5, 12.0, 1_000),
+    ])
+    shares = pd.Series(
+        [10.0, 11.0],
+        index=pd.DatetimeIndex([pd.Timestamp("2024-06-30"), pd.Timestamp("2025-01-02")]),
+    )
+    client = _client(monkeypatch, _fundamentals_ticker(history=history, shares_full=shares))
+    rows = client.get_financial_metrics("TEST", "2025-04-30", period="ttm", limit=2)
+    latest = rows[0]  # ttm ended 2025-03-31, EPS 4.0
+    assert latest.market_cap == pytest.approx(10.0 * 11.0)
+    assert latest.price_to_earnings_ratio == pytest.approx(10.0 / 4.0)
+    older = rows[1]  # ttm ended 2024-12-31 — no close on file that early
+    assert older.market_cap is None
+    assert older.price_to_earnings_ratio is None
+
+
+def test_pe_stays_none_when_earnings_are_negative(monkeypatch):
+    """A negative P/E is meaningless — the field stays None while the
+    market cap still fills."""
+    income, balance, cashflow = _quarterly_statements()
+    income.loc["Diluted EPS"] = [-1.0] * len(QUARTERS)
+    history = _prices_df([("2025-03-31", 9.0, 11.0, 8.5, 10.0, 1_000)])
+    shares = pd.Series([11.0], index=pd.DatetimeIndex([pd.Timestamp("2025-01-02")]))
+    client = _client(monkeypatch, _fundamentals_ticker(
+        quarterly_financials=income, history=history, shares_full=shares))
+    rows = client.get_financial_metrics("TEST", "2025-04-30", period="ttm", limit=1)
+    assert rows[0].market_cap == pytest.approx(110.0)
+    assert rows[0].price_to_earnings_ratio is None
+
+
+def test_valuation_fields_stay_none_without_price_history(monkeypatch):
+    """No price on file means no valuation — fields stay None rather than
+    being invented from the current quote."""
+    client = _client(monkeypatch, _fundamentals_ticker())
+    rows = client.get_financial_metrics("TEST", "2025-04-30", period="ttm", limit=2)
+    assert all(r.market_cap is None and r.price_to_earnings_ratio is None
+               for r in rows)
+
+
+def test_market_cap_falls_back_to_current_shares(monkeypatch):
+    """Rows older than Yahoo's share-count history use the current
+    fast_info count — a documented approximation."""
+    history = _prices_df([("2025-03-31", 9.0, 11.0, 8.5, 10.0, 1_000)])
+    client = _client(monkeypatch, _fundamentals_ticker(
+        history=history,
+        fast_info=SimpleNamespace(last_price=10.0, previous_close=9.0,
+                                  market_cap=100.0, currency="USD", shares=12.0),
+    ))
+    rows = client.get_financial_metrics("TEST", "2025-04-30", period="ttm", limit=1)
+    assert rows[0].market_cap == pytest.approx(10.0 * 12.0)
+
+
+def test_price_lookup_uses_last_close_on_or_before_period_end(monkeypatch):
+    """2025-05-03 is a Saturday: the Friday close prices the period."""
+    quarters = ["2025-05-03"]
+    income = _frame(quarters, {"Total Revenue": [100.0], "Diluted EPS": [2.0],
+                               "Basic Average Shares": [10.0]})
+    balance = _frame(quarters, {"Stockholders Equity": [200.0],
+                                "Ordinary Shares Number": [10.0]})
+    cashflow = _frame(quarters, {"Operating Cash Flow": [35.0],
+                                 "Capital Expenditure": [-5.0]})
+    history = _prices_df([
+        ("2025-05-02", 9.0, 11.0, 8.5, 9.5, 1_000),
+        ("2025-05-05", 10.0, 12.0, 9.5, 11.0, 1_000),
+    ])
+    shares = pd.Series([11.0], index=pd.DatetimeIndex([pd.Timestamp("2025-01-02")]))
+    client = _client(monkeypatch, _fundamentals_ticker(
+        quarterly_financials=income, quarterly_balance_sheet=balance,
+        quarterly_cashflow=cashflow, history=history, shares_full=shares))
+    rows = client.get_financial_metrics("TEST", "2025-05-31", period="quarterly")
+    assert rows[0].market_cap == pytest.approx(9.5 * 11.0)
+    assert rows[0].price_to_earnings_ratio == pytest.approx(9.5 / 2.0)
 
 
 # ---------------------------------------------------------------------------

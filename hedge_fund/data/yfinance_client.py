@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import logging
+from bisect import bisect_right
 from datetime import date, datetime, timedelta, timezone
 from math import isfinite
 from typing import Callable, TypeVar
@@ -223,6 +224,10 @@ class YFinanceClient:
         (each fiscal year is a trailing-twelve-month flow window) so a
         ticker can still reach the four periods the snapshot gate needs.
         Uncomputable fields stay None rather than being invented.
+
+        Each row's ``market_cap`` and ``price_to_earnings_ratio`` are
+        reconstructed from Yahoo price and share-count history, which
+        serves no valuation series of its own — see :meth:`_enrich_valuation`.
         """
         if period not in ("ttm", "quarterly", "annual"):
             raise ValueError(f"period must be ttm|quarterly|annual, not {period!r}")
@@ -240,9 +245,13 @@ class YFinanceClient:
                 rows += self._annual_rows(ticker, cutoff, limit - len(rows),
                                           seen={m.report_period for m in rows})
             rows.sort(key=lambda m: m.report_period, reverse=True)
-            return rows[:limit]
-        return [self._period_metrics(ticker, income, balance, cashflow, cols, i, period)
-                for i in range(min(limit, len(cols)))]
+            return self._enrich_valuation(ticker, rows[:limit], end_date)
+        return self._enrich_valuation(
+            ticker,
+            [self._period_metrics(ticker, income, balance, cashflow, cols, i, period)
+             for i in range(min(limit, len(cols)))],
+            end_date,
+        )
 
     def _period_metrics(
         self, ticker, income, balance, cashflow, cols, i, period,
@@ -313,6 +322,81 @@ class YFinanceClient:
         rows = [self._period_metrics(ticker, income, balance, cashflow, cols, i, "annual")
                 for i in range(len(cols))]
         return [m for m in rows if m.report_period not in seen][:limit]
+
+    def _enrich_valuation(
+        self, ticker: str, rows: list[FinancialMetrics], end_date: str,
+    ) -> list[FinancialMetrics]:
+        """Fill market_cap and price_to_earnings_ratio on every row.
+
+        Yahoo serves no valuation series, so it is reconstructed: the close
+        on or before each row's period end (one daily history call spanning
+        the rows) times shares outstanding on or before that date
+        (get_shares_full; rows older than that history fall back to the
+        current fast_info count — a documented approximation). P/E is that
+        price over the row's own EPS: trailing-twelve-month EPS on ttm
+        rows, fiscal-year EPS on annual rows. A missing price or share
+        count, or a non-positive EPS, leaves the field None — uncomputable
+        fields are never invented.
+        """
+        if not rows:
+            return rows
+        prices = self.get_prices(ticker, min(r.report_period for r in rows), end_date)
+        if not prices:
+            return rows
+        closes = [(date.fromisoformat(p.time), p.close) for p in prices]
+        close_days = [day for day, _ in closes]
+        shares = self._shares_history(ticker, close_days[0], end_date)
+        share_days = [day for day, _ in shares]
+        fallback = None
+        fallback_fetched = False
+        enriched = []
+        for row in rows:
+            day = date.fromisoformat(row.report_period)
+            i = bisect_right(close_days, day) - 1
+            price = closes[i][1] if i >= 0 else None
+            j = bisect_right(share_days, day) - 1
+            count = shares[j][1] if j >= 0 else None
+            if count is None and not fallback_fetched:
+                fallback = self._current_shares(ticker)
+                fallback_fetched = True
+            if count is None:
+                count = fallback
+            eps = row.earnings_per_share
+            enriched.append(row.model_copy(update={
+                "market_cap": price * count
+                if price is not None and count is not None else None,
+                "price_to_earnings_ratio": _div(price, eps)
+                if eps is not None and eps > 0 else None,
+            }))
+        return enriched
+
+    def _shares_history(self, ticker: str, start: str, end: str) -> list[tuple[date, float]]:
+        """Share-count history as ascending (day, shares) pairs. Empty when
+        Yahoo serves none."""
+        df = self._guarded(
+            f"{ticker} shares history",
+            lambda: self._ticker(ticker).get_shares_full(start=start, end=end),
+            empty=None,
+        )
+        if df is None or len(df) == 0:
+            return []
+        pairs = []
+        for stamp, value in df.items():
+            count = _num(value)
+            day = _day(stamp)
+            if count is not None and count > 0 and day is not None:
+                pairs.append((date.fromisoformat(day), count))
+        pairs.sort(key=lambda pair: pair[0])
+        return pairs
+
+    def _current_shares(self, ticker: str) -> float | None:
+        """Shares outstanding right now (fast_info) — the fallback for rows
+        older than the share-count history."""
+        return self._guarded(
+            f"{ticker} shares outstanding",
+            lambda: _num(getattr(self._ticker(ticker).fast_info, "shares", None)),
+            empty=None,
+        )
 
     # ------------------------------------------------------------------
     # News
