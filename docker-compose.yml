@@ -1,0 +1,28 @@
+# The AI hedge fund in Docker.
+#
+#   Headless runner (survives restarts, runs the daily cadence):
+#     docker compose up -d runner
+#
+#   Interactive TUI:
+#     docker compose run --rm tui
+#
+# One runner per fund: copy the runner service and change the fund name in
+# `command`. Do not run the same fund's runner on the host and in a
+# container at the same time — pid files cannot see across that boundary,
+# so both would believe they own the fund.
+
+services:
+  runner:
+    build: .
+    restart: unless-stopped
+    volumes:
+      - ~/.hedge-fund:/root/.hedge-fund
+    command: paper run watchtower
+
+  tui:
+    profiles: ["tui"]
+    build: .
+    stdin_open: true
+    tty: true
+    volumes:
+      - ~/.hedge-fund:/root/.hedge-fund
