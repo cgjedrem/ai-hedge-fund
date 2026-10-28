@@ -13,7 +13,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from hedge_fund.brokers.models import Fill, Order
+from hedge_fund.brokers.models import Fill, Order, Shares
 from hedge_fund.fund.spec import FundSpec
 from hedge_fund.models import Signal
 from hedge_fund.portfolio.construction import FlatReason
@@ -77,7 +77,7 @@ class CycleRecord(BaseModel):
     cash_before: float
     orders: list[Order]
     fills: list[Fill]
-    positions: dict[str, int]           # signed shares after fills
+    positions: dict[str, Shares]        # signed shares after fills
     cash: float
     nav: float                          # cash + sum(shares * mark)
     risk_scale_factor: float | None = None

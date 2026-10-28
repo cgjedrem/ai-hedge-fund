@@ -61,6 +61,7 @@ from pathlib import Path
 from rich.console import Console
 
 from hedge_fund.backtesting import backtest_fund, save_result
+from hedge_fund.brokers.models import format_shares
 from hedge_fund.data import CachedDataClient, make_data_client
 from hedge_fund.data.bars import is_intraday
 from hedge_fund.data.sessions import completed_through
@@ -345,7 +346,7 @@ def _paper(args, parser: argparse.ArgumentParser, console: Console) -> None:
         if latest is not None and latest.positions:
             print("  book:")
             for ticker, shares in sorted(latest.positions.items()):
-                print(f"    {ticker}: {shares:+d} @ {latest.marks[ticker]:,.2f}")
+                print(f"    {ticker}: {format_shares(shares, signed=True)} @ {latest.marks[ticker]:,.2f}")
         return
 
     if args.action == "scorecard":

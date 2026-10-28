@@ -173,3 +173,41 @@ def test_kill_switch_round_trips_and_logs(tmp_path):
     assert [e["kind"] for e in ledger.events()] == ["halt", "resume"]
     assert ledger.events()[0]["reason"] == "drawdown breach"
     assert all("time" in e for e in ledger.events())
+
+
+def _compat_record(positions: dict[str, float]) -> SessionRecord:
+    record = SessionRecord(
+        fund="compat", session="2024-06-03", universe=["AAPL"], nav=100_000.0, cash=0.0,
+        positions=positions, marks={"AAPL": 200.0}, benchmark="SPY", benchmark_close=100.0,
+        rebalance=True, code_version="test", mandate_hash="m",
+    )
+    record.hash = record.compute_hash()
+    return record
+
+
+def test_integral_positions_serialize_as_ints_so_old_ledgers_still_verify():
+    record = _compat_record({"AAPL": 500})
+    text = record.model_dump_json()
+    assert '"positions":{"AAPL":500' in text and "500.0" not in text
+    # The hash is computed over that same serialization, so a record replayed
+    # from a ledger written before fractional shares re-verifies exactly.
+    assert SessionRecord.model_validate_json(text).compute_hash() == record.hash
+
+
+def test_fractional_positions_round_trip_and_keep_their_hash():
+    record = _compat_record({"AAPL": 0.7881})
+    parsed = SessionRecord.model_validate_json(record.model_dump_json())
+    assert parsed.positions == {"AAPL": 0.7881}
+    assert parsed.compute_hash() == record.hash
+
+
+def test_an_old_integer_share_ledger_replays_cleanly(tmp_path):
+    record = _compat_record({"AAPL": 500})
+    # Hand-write the JSON the way the pre-fractional engine did: int shares.
+    old_style = json.dumps(json.loads(record.model_dump_json()), indent=2)
+    assert '"AAPL": 500' in old_style and "500.0" not in old_style
+    path = tmp_path / "ledger" / "2024-06-03.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(old_style)
+    state = Ledger(tmp_path).replay(100_000)
+    assert state.positions == {"AAPL": 500} and state.cash == 0

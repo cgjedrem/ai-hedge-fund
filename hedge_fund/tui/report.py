@@ -15,6 +15,7 @@ from rich.text import Text
 from textual.widgets.option_list import Option
 
 from hedge_fund.brokers import Fill
+from hedge_fund.brokers.models import format_shares
 from hedge_fund.data.bars import is_intraday
 from hedge_fund.llm import ThesisStream
 from hedge_fund.models import Signal
@@ -317,7 +318,7 @@ def portfolio_detail(record: CycleRecord) -> Group:
         Text(f"Target net ${target_net:+,.2f} · Actual net ${actual_net:+,.2f} · Difference ${actual_net - target_net:+,.2f}", style=MUTED),
     ]
     if any(s.blend.mode == "dollar_neutral" for s in record.spec.strategies):
-        details.append(Text("Dollar-neutral rules apply to strategy targets. Whole-share holdings can differ; other strategies can add net exposure.", style=MUTED))
+        details.append(Text("Dollar-neutral rules apply to strategy targets. Holdings can differ from strategy targets; other strategies can add net exposure.", style=MUTED))
     if record.risk_scale_factor is not None and record.risk_scale_factor < 1:
         details.append(Text(f"Risk limits scaled all strategy targets to {record.risk_scale_factor:.1%} of their requested exposure.", style=MUTED))
     for strategy in record.strategies:
@@ -338,7 +339,7 @@ def portfolio_detail(record: CycleRecord) -> Group:
                 else Text("SHORT", style=f"bold {RED}"))
         tone = GREEN if value >= 0 else RED
         table.add_row(
-            ticker, side, f"{shares:+d}",
+            ticker, side, format_shares(shares, signed=True),
             Text(f"${value:+,.0f}", style=tone),
             Text(f"{value / record.nav:+.1%}", style=tone),
         )
@@ -410,7 +411,7 @@ def session_overview(record: SessionRecord) -> Group:
             tone = GREEN if fill.side == "buy" else RED
             parts.append(Text.assemble(
                 (f"  {fill.side.upper():<4} ", f"bold {tone}"),
-                (f"{fill.quantity:,} {fill.ticker}", TEXT),
+                (f"{format_shares(fill.quantity)} {fill.ticker}", TEXT),
                 (f" @ ${fill.price:,.2f}", MUTED)))
         if len(x.fills) > 8:
             parts.append(Text(f"  … {len(x.fills) - 8} more", style=MUTED))
@@ -443,7 +444,7 @@ def cost_line(trading_cost: float, traded_notional: float) -> str:
     return f"costs ${trading_cost:,.0f} · {bps:.1f} bps of ${traded_notional:,.0f} traded"
 
 
-def tape_table(tape: list[tuple[str, Fill, int]]) -> Table:
+def tape_table(tape: list[tuple[str, Fill, float]]) -> Table:
     """The running trade tape: every fill of the replay so far, newest first.
     Each row is one execution — date, ticker, side, size, price, notional —
     and the book it left behind (LONG/SHORT/FLAT that ticker)."""
@@ -458,14 +459,14 @@ def tape_table(tape: list[tuple[str, Fill, int]]) -> Table:
     for as_of, fill, shares in list(reversed(tape))[:_TAPE_ROWS]:
         side = (Text("BUY ", style=f"bold {GREEN}") if fill.side == "buy"
                 else Text("SELL", style=f"bold {RED}"))
-        book = (Text(f"→ long {shares}", style=GREEN) if shares > 0
-                else Text(f"→ short {-shares}", style=RED) if shares < 0
+        book = (Text(f"→ long {format_shares(shares)}", style=GREEN) if shares > 0
+                else Text(f"→ short {format_shares(-shares)}", style=RED) if shares < 0
                 else Text("→ flat", style=MUTED))
         table.add_row(
             Text(as_of, style=MUTED),
             Text(fill.ticker, style=f"bold {CYAN}"),
             side,
-            f"{fill.quantity:,}",
+            format_shares(fill.quantity),
             f"@ ${fill.price:,.2f}",
             Text(f"${fill.quantity * fill.price:,.0f}", style=TEXT),
             book,
@@ -550,7 +551,7 @@ def _session_book(record: SessionRecord) -> Group:
         side = (Text("LONG", style=f"bold {GREEN}") if shares > 0
                 else Text("SHORT", style=f"bold {RED}"))
         tone = GREEN if value >= 0 else RED
-        table.add_row(ticker, side, f"{shares:+d}",
+        table.add_row(ticker, side, format_shares(shares, signed=True),
                       Text(f"${value:+,.0f}", style=tone),
                       Text(f"{value / record.nav:+.1%}", style=tone))
     return Group(*head, Text(""), table)
@@ -614,7 +615,7 @@ def _orders_detail(record: CycleRecord) -> Group:
         tone = f"bold {GREEN}" if o.side == "buy" else f"bold {RED}"
         table.add_row(
             Text(o.side.upper(), style=tone),
-            Text(f"{o.quantity:,}", style=tone),
+            Text(format_shares(o.quantity), style=tone),
             o.ticker,
             f"${o.price:,.2f}",
             f"${fill.price:,.2f}",

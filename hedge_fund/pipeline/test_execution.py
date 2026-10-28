@@ -8,11 +8,12 @@ def _positions(**shares):
     return {t: Position(ticker=t, shares=s) for t, s in shares.items()}
 
 
-def test_floor_sizing_never_overshoots():
+def test_truncated_sizing_never_overshoots():
     orders = build_orders({"AAPL": 0.25}, {}, {"AAPL": 300.0}, equity=10_000.0)
     assert len(orders) == 1
     assert orders[0].side == "buy"
-    assert orders[0].quantity == 8  # 2500 / 300 = 8.33 -> 8
+    assert orders[0].quantity == 8.3333  # 2500 / 300 = 8.3333... -> 8.3333
+    assert orders[0].quantity * 300.0 <= 2_500.0  # never overshoots the allocation
 
 
 def test_delta_against_existing_position():
@@ -32,8 +33,25 @@ def test_held_name_missing_from_targets_is_closed():
 
 
 def test_subshare_delta_emits_nothing():
+    orders = build_orders({"AAPL": 0.0000001}, {}, {"AAPL": 100.0}, equity=10_000.0)
+    assert orders == []  # 0.00001 shares: below the 4dp sizing precision
+
+
+def test_fractional_target_emits_a_fractional_order():
     orders = build_orders({"AAPL": 0.005}, {}, {"AAPL": 100.0}, equity=10_000.0)
-    assert orders == []  # 50 dollars / 100 = 0.5 shares -> floor 0
+    assert len(orders) == 1
+    assert orders[0].side == "buy"
+    assert orders[0].quantity == 0.5  # 50 dollars / 100 = 0.5 shares
+
+
+def test_high_priced_name_buys_a_fraction_instead_of_nothing():
+    # The watchtower bug: 0.244 * 3000 / 928.76 = 0.78813... used to floor to
+    # 0 shares and silently emit no order.
+    orders = build_orders({"AAPL": 0.244}, {}, {"AAPL": 928.76}, equity=3_000.0)
+    assert len(orders) == 1
+    assert orders[0].side == "buy"
+    assert orders[0].quantity == 0.7881
+    assert orders[0].quantity * 928.76 <= 732.0  # never overshoots the allocation
 
 
 def test_sells_before_buys_alphabetical():

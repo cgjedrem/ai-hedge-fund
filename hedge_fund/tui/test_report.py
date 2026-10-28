@@ -75,7 +75,7 @@ def test_portfolio_report_explains_rounding_scaling_and_flat_strategies():
     assert "Actual net $-100.00" in text
     assert "Difference $-100.00" in text
     assert "scaled all strategy targets to 50.0%" in text
-    assert "Whole-share holdings can differ" in text
+    assert "Holdings can differ from strategy targets" in text
     record.positions = {}
     record.final_weights = {"A": 0, "B": 0}
     record.strategies[0].flat_reason = "missing_short_side"
@@ -83,6 +83,16 @@ def test_portfolio_report_explains_rounding_scaling_and_flat_strategies():
     assert "no eligible shorts to balance the longs" in text
     assert "Allocated capital remains unused" in text
     assert "flat — no positions" in text
+
+
+def test_portfolio_report_formats_fractional_shares():
+    record = make_cycle(make_signal())
+    record.equity_before = record.nav = 10_000
+    record.final_weights = {"A": .5}
+    record.positions = {"A": 0.7891}
+    record.marks = {"A": 300}
+    text = render(report.portfolio_detail(record))
+    assert "+0.7891" in text
 
 
 def test_orders_report_shows_the_fill_beside_the_mark_and_what_it_cost():

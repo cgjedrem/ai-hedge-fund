@@ -8,7 +8,7 @@ the same book.
 
 Margin is not modeled: cash may go negative and stays visible. With an
 unlevered mandate (gross_target <= 1), sells-before-buys ordering, and
-floor-toward-zero sizing, a long book rarely gets there — the spread and
+truncation-toward-zero sizing, a long book rarely gets there — the spread and
 commission can take it a few dollars below zero when the share-rounding
 dust is small — but nothing here pretends to enforce it.
 """
@@ -28,7 +28,7 @@ class SimBroker:
     def __init__(self, cash: float, costs: TradingCosts | None = None) -> None:
         self._cash = cash
         self._costs = costs
-        self._shares: dict[str, int] = {}
+        self._shares: dict[str, float] = {}
 
     def positions(self) -> dict[str, Position]:
         return {
@@ -57,7 +57,10 @@ class SimBroker:
             self._shares[order.ticker] = self._shares.get(order.ticker, 0) - order.quantity
             self._cash += order.quantity * price - commission
 
-        if self._shares[order.ticker] == 0:
+        # Sub-4dp float dust (0.1 + 0.2 - 0.3 leaves 5.5e-17) is not a
+        # position: drop anything that rounds to zero at the 4dp sizing
+        # precision. An exact close (x - x == 0.0) rounds to zero too.
+        if round(self._shares[order.ticker], 4) == 0:
             del self._shares[order.ticker]
 
         return Fill(

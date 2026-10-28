@@ -86,7 +86,7 @@ def test_a_day_of_bars_decides_fills_and_checkpoints(tmp_path):
     first, second, third = loop.records
     assert first.decision is not None and first.executed is None
     assert second.executed is not None and second.executed.fills[0].price == 101.0
-    assert second.executed.execution_policy == "next_bar" and second.positions == {"AAPL": 990}
+    assert second.executed.execution_policy == "next_bar" and second.positions == {"AAPL": 990.099}
     assert third.marks == {"AAPL": 102.0} and third.snapshot_times["AAPL"] == "2024-06-04T17:10:00Z"
     assert ledger.checkpoint_path(DAY).exists()
     assert [k for k, _ in loop.events] == [] and [e["kind"] for e in ledger.events()] == ["tick", "tick", "tick", "checkpoint"]
@@ -107,7 +107,7 @@ def test_a_late_start_skips_to_the_current_bar_and_logs_the_gap(tmp_path):
     # The pending decision from yesterday's close was refreshed at 13:00 today, then executed.
     assert record.executed.original_assessment.as_of == f"{DAY}T13:10:00"
     assert record.executed.refreshed_assessment.as_of == f"{NEXT}T13:00:00"
-    assert record.executed.fills == [] and record.positions == {"AAPL": 990}  # same view, same book
+    assert record.executed.fills == [] and record.positions == {"AAPL": 990.099}  # same view, same book
     assert Ledger(directory).replay(100_000).last_session == record.session
 
 

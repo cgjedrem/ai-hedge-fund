@@ -178,7 +178,7 @@ def test_advance_on_bars_decides_at_one_bar_and_fills_at_the_next_with_prints():
     tape.now = _at(13, 5)
     second = advance(fund, state, "2024-06-04T13:05:00", broker, tape, ["AAPL"], clock)
     assert second.executed is not None and second.executed.execution_policy == "next_bar"
-    assert second.executed.fills[0].price == 102.0 and second.positions == {"AAPL": 980}
+    assert second.executed.fills[0].price == 102.0 and second.positions == {"AAPL": 980.3921}
     assert second.executed.refreshed_assessment.as_of == "2024-06-04T13:00:00"  # not stale: no re-ask
     assert second.snapshot_times == {"AAPL": "2024-06-04T17:05:00Z", "SPY": "2024-06-04T17:05:00Z"}
     assert second.hash == second.compute_hash() and second.prev_hash == first.hash

@@ -63,7 +63,7 @@ def _decision(as_of: str, marks: dict[str, float], strategies: dict[str, list[Si
 
 
 def _cycle(as_of: str, marks: dict[str, float], contributions: dict[str, dict[str, float]],
-           equity_before: float, positions: dict[str, int], cash: float, spec=SPEC) -> CycleRecord:
+           equity_before: float, positions: dict[str, float], cash: float, spec=SPEC) -> CycleRecord:
     return CycleRecord(
         fund="test", as_of=as_of, spec=spec, universe=sorted(marks), marks=marks, skipped=[],
         strategies=[StrategyRecord(name=n, slice=0.5, signals=[], convictions={}, weights={}, final_contribution=c)
@@ -75,7 +75,7 @@ def _cycle(as_of: str, marks: dict[str, float], contributions: dict[str, dict[st
 
 
 def _session(session: str, *, decision: DecisionRecord | None = None, executed: CycleRecord | None = None,
-             marks: dict[str, float] | None = None, positions: dict[str, int] | None = None,
+             marks: dict[str, float] | None = None, positions: dict[str, float] | None = None,
              benchmark_close: float = 100.0) -> SessionRecord:
     marks = marks or {}
     positions = positions or {}
@@ -255,9 +255,37 @@ def test_strategy_attribution_by_hand():
     assert momo.max_drawdown_pct == 0.0
     assert (value.n_periods, momo.n_periods) == (1, 1)
     assert card.fund_pnl == pytest.approx(499.0)       # 454 * 5.5 - 222 * 9
-    assert card.unattributed == pytest.approx(-1.0)    # whole-share rounding
+    assert card.unattributed == pytest.approx(-1.0)    # share rounding
     assert value.share_of_pnl == pytest.approx(-500 / 499)
     assert momo.share_of_pnl == pytest.approx(1000 / 499)
+
+
+def test_exact_fractional_fills_leave_nothing_unattributed():
+    """Fractional shares make positions that match the sleeves' contributions
+    exactly reachable, so every dollar of fund P&L attributes."""
+    e1_marks = {"AAA": 100.0, "BBB": 50.0}
+    e2_marks = {"AAA": 150.0, "BBB": 25.0}
+    # Net weights {AAA: 0.5055, BBB: -0.10} sized exactly at the marks:
+    # 0.5055 * 100_000 / 100 and -0.10 * 100_000 / 50. The fixture states
+    # the exact 505.5 directly — not a build_orders output, which truncates
+    # that quotient to 505.4999 (float artifact) — so the attribution
+    # arithmetic here stays exact.
+    positions = {"AAA": 505.5, "BBB": -200.0}
+    contributions = {"value": {"AAA": 0.30, "BBB": -0.10}, "momo": {"AAA": 0.2055}}
+    cash = 59_450.0  # 100_000 - (505.5 * 100 - 200 * 50)
+    card = score([
+        _session(D1, decision=_decision(D1, MARKS[D1], {})),
+        _session(D2, executed=_cycle(D1, e1_marks, contributions, 100_000.0, positions, cash),
+                 marks=e1_marks, positions=positions),
+        _session(D3, executed=_cycle(D2, e2_marks, contributions, 130_275.0, positions, cash),
+                 marks=e2_marks, positions=positions),
+    ])
+    value, momo = card.strategies
+    # AAA doubles (+50%), BBB halves (-50%): value .30 * +50% + (-.10) * -50%.
+    assert value.pnl == pytest.approx(20_000.0)
+    assert momo.pnl == pytest.approx(10_275.0)
+    assert card.fund_pnl == pytest.approx(30_275.0)
+    assert card.unattributed == pytest.approx(0.0, abs=1e-6)
 
 
 def test_unfilled_target_is_priced_from_the_next_decision_on_a_daily_fund():

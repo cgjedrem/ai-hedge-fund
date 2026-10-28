@@ -37,6 +37,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from hedge_fund.brokers.models import Shares, format_shares
 from hedge_fund.brokers.protocol import Broker
 from hedge_fund.data.bars import is_intraday
 from hedge_fund.data.protocol import DataClient
@@ -49,8 +50,8 @@ from hedge_fund.signals import LLMAgent
 
 __all__ = ["Cadence"]  # re-exported for callers that typed against the engine
 
-# Cash is compared to the cent: fills are whole shares at a float price, so
-# two honest books can differ by float noise, never by money.
+# Cash is compared to the cent: fills can be fractional shares at a float
+# price, so two honest books can differ by float noise, never by money.
 _CASH_TOLERANCE = 0.01
 
 
@@ -66,7 +67,7 @@ class FundState(BaseModel):
     """What the fund carries between sessions. Derived by folding
     `next_state` over the ledger; never edited by hand."""
 
-    positions: dict[str, int] = Field(default_factory=dict)  # signed shares
+    positions: dict[str, Shares] = Field(default_factory=dict)  # signed shares
     cash: float
     last_session: str | None = None
     pending: DecisionRecord | None = None       # assessed, awaiting execution
@@ -89,7 +90,7 @@ class SessionRecord(BaseModel):
     universe: list[str]
     nav: float                          # cash + sum(shares * mark) at this close
     cash: float
-    positions: dict[str, int]           # signed shares after this session
+    positions: dict[str, Shares]        # signed shares after this session
     marks: dict[str, float]             # closes used to value the book
     benchmark: str
     benchmark_close: float
@@ -218,7 +219,8 @@ def reconcile(state: FundState, broker: Broker, name: str) -> None:
     for ticker in sorted(set(held) | set(expected)):
         if held.get(ticker, 0) != expected.get(ticker, 0):
             problems.append(
-                f"{ticker}: broker {held.get(ticker, 0):+d} vs ledger {expected.get(ticker, 0):+d}"
+                f"{ticker}: broker {format_shares(held.get(ticker, 0), signed=True)}"
+                f" vs ledger {format_shares(expected.get(ticker, 0), signed=True)}"
             )
     if not isclose(broker.cash(), state.cash, rel_tol=0, abs_tol=_CASH_TOLERANCE):
         problems.append(f"cash: broker {broker.cash():,.2f} vs ledger {state.cash:,.2f}")

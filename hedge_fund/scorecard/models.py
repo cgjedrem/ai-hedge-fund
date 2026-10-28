@@ -49,6 +49,6 @@ class Scorecard(BaseModel):
     @computed_field
     @property
     def unattributed(self) -> float:
-        """Fund P&L no sleeve explains: whole-share rounding, cash, and (once
-        a cost model exists) trading costs. Reported, never hidden."""
+        """Fund P&L no sleeve explains: share rounding to 4 decimal places,
+        cash, and (once a cost model exists) trading costs. Reported, never hidden."""
         return self.fund_pnl - sum(s.pnl for s in self.strategies)

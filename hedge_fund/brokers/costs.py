@@ -36,5 +36,5 @@ class TradingCosts(BaseModel):
         spread = mark * self.spread_bps / 10_000
         return mark + spread if side == "buy" else mark - spread
 
-    def commission(self, quantity: int) -> float:
+    def commission(self, quantity: float) -> float:
         return quantity * self.commission_per_share

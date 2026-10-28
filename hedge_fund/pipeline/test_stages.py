@@ -374,12 +374,14 @@ def test_clipping_attribution_preserves_exactly_offset_contributions():
     assert record.strategies[1].final_contribution == {"A": -.25, "B": .1}
 
 
-def test_whole_share_rounding_keeps_target_neutral_without_changing_orders():
+def test_fractional_rounding_keeps_target_neutral_without_changing_orders():
     fund = _rule_fund("dollar_neutral", max_position_pct=1)
     record = _cycle(fund, "2024-06-03", SimBroker(10_000), FakeDataClient({"A": 300, "B": 700}), ["A", "B"])
     assert record.final_weights == {"A": .5, "B": -.5}
-    assert [(o.ticker, o.side, o.quantity) for o in record.orders] == [("B", "sell", 7), ("A", "buy", 16)]
-    assert sum(record.positions[t] * record.marks[t] for t in record.positions) == -100
+    # 0.5 * 10_000 / 700 = 7.142857... -> 7.1428 ; 0.5 * 10_000 / 300 = 16.666... -> 16.6666
+    assert [(o.ticker, o.side, o.quantity) for o in record.orders] == [("B", "sell", 7.1428), ("A", "buy", 16.6666)]
+    # The residual is 4dp sizing dust, not a whole share: 16.6666 * 300 - 7.1428 * 700 = 0.02.
+    assert sum(record.positions[t] * record.marks[t] for t in record.positions) == pytest.approx(0.02)
 
 
 @pytest.mark.parametrize("case,expected", [

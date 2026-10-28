@@ -6,7 +6,7 @@ a fraction of fund equity per name) times each name's move to the next
 execution, at the exact prices both executions were filled at. Dollars are
 that return on the equity the weights were sized against.
 
-The sleeves are target weights, not the whole-share positions that were
+The sleeves are target weights, not the rounded positions that were
 actually bought, so they do not sum to the fund. The gap is reported as the
 scorecard's `unattributed`, never spread over the sleeves.
 """

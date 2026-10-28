@@ -19,7 +19,7 @@ import json
 from pathlib import Path
 
 from hedge_fund.brokers.costs import TradingCosts
-from hedge_fund.brokers.models import Fill, Order
+from hedge_fund.brokers.models import Fill, Order, as_json_shares
 from hedge_fund.brokers.sim import SimBroker
 from hedge_fund.paths import write_atomic
 
@@ -35,8 +35,8 @@ class PaperBroker(SimBroker):
             raise ValueError(f"{self._path}: cannot read the paper broker's book: {exc}") from exc
         super().__init__(cash=float(data["cash"]), costs=costs)
         self._shares = {
-            ticker: int(shares) for ticker, shares in data.get("shares", {}).items()
-            if int(shares) != 0
+            ticker: float(shares) for ticker, shares in data.get("shares", {}).items()
+            if float(shares) != 0
         }
 
     @classmethod
@@ -51,13 +51,14 @@ class PaperBroker(SimBroker):
 
     @classmethod
     def restore(
-        cls, path: str | Path, cash: float, shares: dict[str, int], costs: TradingCosts | None = None,
+        cls, path: str | Path, cash: float, shares: dict[str, float], costs: TradingCosts | None = None,
     ) -> PaperBroker:
         """Rewrite the book wholesale to a known state. Only a redo does this,
         to put the book back where the ledger says it was before the session
         being run again; the fills of that session are discarded with it."""
         write_atomic(Path(path), json.dumps({
-            "cash": cash, "shares": {t: s for t, s in sorted(shares.items()) if s != 0},
+            "cash": cash,
+            "shares": {t: as_json_shares(s) for t, s in sorted(shares.items()) if s != 0},
         }, indent=2))
         return cls(path, costs)
 
@@ -73,5 +74,5 @@ class PaperBroker(SimBroker):
     def _save(self) -> None:
         write_atomic(self._path, json.dumps({
             "cash": self._cash,
-            "shares": dict(sorted(self._shares.items())),
+            "shares": {t: as_json_shares(s) for t, s in sorted(self._shares.items())},
         }, indent=2))

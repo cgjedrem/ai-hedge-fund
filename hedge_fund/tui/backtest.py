@@ -80,7 +80,7 @@ class BacktestScreen(Screen):
         self._dates: list[str] = []
         self._nav: list[float] = []
         self._n_cycles = 0
-        self._tape: list[tuple[str, Fill, int]] = []  # (as_of, fill, shares after)
+        self._tape: list[tuple[str, Fill, float]] = []  # (as_of, fill, shares after)
 
     def compose(self) -> ComposeResult:
         with ContentSwitcher(initial="bt-pick", id="bt-panes"):

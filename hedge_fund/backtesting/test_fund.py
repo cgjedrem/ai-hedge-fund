@@ -163,17 +163,20 @@ def test_metrics_report_what_the_fills_cost():
     first = result.cycles[0]
     assert first.fills[0].price == pytest.approx(200.10)
     assert first.trading_cost == pytest.approx(52.50) and first.traded_notional == pytest.approx(100_050.0)
-    # Cycle 2 re-sizes 1.0 of equity (now 99,947.50) at 200: 499 shares, so
-    # one share is sold at 199.90 less $0.005 to pay for the first cycle.
+    # Cycle 2 re-sizes 1.0 of equity (now 99,947.50) at 200: 499.7375 shares,
+    # so 0.2625 of a share is sold at 199.90 less $0.005 to pay for the first cycle.
     second = result.cycles[1]
-    assert [(f.side, f.quantity, f.price) for f in second.fills] == [("sell", 1, pytest.approx(199.90))]
-    assert second.trading_cost == pytest.approx(0.105)
-    assert result.cycles[2].fills == []
+    assert [(f.side, f.quantity, f.price) for f in second.fills] == [("sell", 0.2625, pytest.approx(199.90))]
+    assert second.trading_cost == pytest.approx(0.0275625)
+    # Cycle 3 re-sizes at 210: the target moves 499.7375 -> 499.7373, so 0.0002
+    # of a share of 4dp dust is sold at 209.895.
+    third = result.cycles[2]
+    assert [(f.side, f.quantity, f.price) for f in third.fills] == [("sell", 0.0002, pytest.approx(209.895))]
     m = result.metrics
-    assert m.trading_cost == pytest.approx(52.605, abs=0.01)
-    assert m.traded_notional == pytest.approx(100_249.90, abs=0.01)
-    # NAV is net of every cost: 147.395 cash + 499 × 190.
-    assert result.nav[-1] == pytest.approx(94_957.395)
+    assert m.trading_cost == pytest.approx(52.53, abs=0.01)
+    assert m.traded_notional == pytest.approx(100_102.52, abs=0.01)
+    # NAV is net of every cost: 0.0144155 cash + 499.7373 × 190.
+    assert result.nav[-1] == pytest.approx(94_950.1014155)
     # A result saved before costs existed reads back as free.
     free = FundBacktestMetrics.model_validate({**m.model_dump(exclude={"trading_cost", "traded_notional"})})
     assert free.trading_cost == 0.0 and free.traded_notional == 0.0

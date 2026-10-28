@@ -3,7 +3,7 @@
 import pytest
 
 from hedge_fund.brokers.costs import TradingCosts
-from hedge_fund.brokers.models import Order
+from hedge_fund.brokers.models import Order, format_shares
 from hedge_fund.brokers.sim import SimBroker
 
 
@@ -29,6 +29,34 @@ def test_position_removed_at_zero():
     broker.place_order(Order(ticker="AAPL", side="buy", quantity=5, price=100.0))
     broker.place_order(Order(ticker="AAPL", side="sell", quantity=5, price=100.0))
     assert broker.positions() == {}
+
+
+def test_a_round_trip_leaving_float_dust_deletes_the_position():
+    # 0.1 + 0.2 - 0.3 leaves 5.55e-17 in float math; that is not a position.
+    broker = SimBroker(cash=1_000.0)
+    broker.place_order(Order(ticker="AAPL", side="buy", quantity=0.1, price=100.0))
+    broker.place_order(Order(ticker="AAPL", side="buy", quantity=0.2, price=100.0))
+    broker.place_order(Order(ticker="AAPL", side="sell", quantity=0.3, price=100.0))
+    assert broker.positions() == {}
+    assert broker.cash() == pytest.approx(1_000.0)
+
+
+def test_selling_the_exact_held_fractional_quantity_closes_the_position():
+    broker = SimBroker(cash=1_000.0)
+    broker.place_order(Order(ticker="AAPL", side="buy", quantity=0.1234, price=100.0))
+    broker.place_order(Order(ticker="AAPL", side="sell", quantity=0.1234, price=100.0))
+    assert broker.positions() == {}
+
+
+def test_format_shares_renders_sub_4dp_dust_as_zero():
+    assert format_shares(5.551115123125783e-17) == "0"
+    assert format_shares(5.551115123125783e-17, signed=True) == "+0"
+    assert format_shares(0.00004) == "0"
+    assert format_shares(0.00004, signed=True) == "+0"
+    assert format_shares(-0.00004) == "0"
+    assert format_shares(0.0001) == "0.0001"          # a real 4dp position still renders
+    assert format_shares(0.0001, signed=True) == "+0.0001"
+    assert format_shares(0) == "0" and format_shares(0, signed=True) == "+0"
 
 
 def test_sell_past_zero_creates_short():

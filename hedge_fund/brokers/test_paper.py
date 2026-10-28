@@ -59,3 +59,37 @@ def test_costs_are_charged_whichever_way_the_book_is_opened(tmp_path):
     restored = PaperBroker.restore(path, cash=1_000, shares={}, costs=costs)
     restored.place_order(Order(ticker="A", side="buy", quantity=1, price=100))
     assert restored.cash() == pytest.approx(1_000 - 100.05 - 0.005)
+
+
+def test_fractional_shares_round_trip_through_the_file(tmp_path):
+    path = tmp_path / "broker.json"
+    broker = PaperBroker.create(path, cash=1_000)
+    broker.place_order(Order(ticker="A", side="buy", quantity=0.7881, price=928.76))
+    assert json.loads(path.read_text()) == {
+        "cash": pytest.approx(1_000 - 0.7881 * 928.76), "shares": {"A": 0.7881},
+    }
+
+    reopened = PaperBroker(path)
+    assert reopened.cash() == pytest.approx(1_000 - 0.7881 * 928.76)
+    assert {t: p.shares for t, p in reopened.positions().items()} == {"A": 0.7881}
+
+    # Selling exactly what is held deletes the entry: x - x == 0.0 for floats too.
+    reopened.place_order(Order(ticker="A", side="sell", quantity=0.7881, price=928.76))
+    assert json.loads(path.read_text()) == {"cash": pytest.approx(1_000), "shares": {}}
+    assert PaperBroker(path).positions() == {}
+
+
+def test_restore_round_trips_a_fractional_book(tmp_path):
+    path = tmp_path / "broker.json"
+    restored = PaperBroker.restore(path, cash=1_000 - 0.7881 * 928.76, shares={"A": 0.7881})
+    assert json.loads(path.read_text())["shares"] == {"A": 0.7881}
+    assert restored.cash() == pytest.approx(1_000 - 0.7881 * 928.76)
+    assert {t: p.shares for t, p in restored.positions().items()} == {"A": 0.7881}
+
+
+def test_integral_shares_save_as_ints_so_old_books_stay_byte_identical(tmp_path):
+    path = tmp_path / "broker.json"
+    broker = PaperBroker.create(path, cash=10_000)
+    broker.place_order(Order(ticker="A", side="buy", quantity=10, price=100))
+    text = path.read_text()
+    assert '"A": 10' in text and "10.0" not in text
