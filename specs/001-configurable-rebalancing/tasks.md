@@ -29,6 +29,7 @@ Single package: `hedge_fund/` at repo root; tests co-located next to code (const
 **Purpose**: Establish the baseline so regressions are attributable.
 
 - [ ] T001 Record baseline test state: run `python -m poetry run pytest hedge_fund/test_run.py hedge_fund/fund -q`, then `hedge_fund/pipeline -q`, `hedge_fund/tui -q`, `hedge_fund/backtesting -q`, `hedge_fund/paper -q` as separate short chunks; note pass/fail counts per chunk and confirm the only failures are the six documented Windows baseline failures (features intraday `%-d`, 2× paper redo `os.rename`, paper sigterm `os.kill`, tui home file-mode, tui paper_view `%-d`).
+  - Baseline evidence: CLI+fund 85 passed (Poetry command returned 1 after the summary); pipeline 74 passed; backtesting 26 passed; paper 34 passed, 3 documented failures; features 36 passed, 1 documented failure. TUI full run was interrupted after 45 passed and 1 documented failure. File chunks: 63 passed, 2 documented failures; 2 runner-screen cases remain blocked in `asyncio.run()` executor shutdown. Observed assertion failures match the six documented Windows failures.
 
 **Checkpoint**: Baseline recorded; any pre-existing failure beyond the six is investigated before feature work.
 
@@ -48,8 +49,8 @@ None required. No shared infrastructure changes: FundSpec, the scheduler, and th
 
 ### Implementation for User Story 1
 
-- [ ] T002 [P] [US1] Update the cadence comment on the `rebalance` line in hedge_fund/fund/example.yaml to list all four supported values (`minute | daily | weekly | monthly`) and note that `interval`/`window` apply only to minute funds (FR-013). Preserve the file's existing comment style and UTF-8 no-BOM encoding.
-- [ ] T003 [US1] Verify mandate-cadence coverage is green with no code changes: run `python -m poetry run pytest hedge_fund/fund hedge_fund/pipeline hedge_fund/backtesting -q`; if anything beyond the six baseline failures fails, stop and investigate before continuing (FR-001/002/004/005 pinned by fund/test_spec.py, pipeline/test_session.py, backtesting/test_fund.py).
+- [X] T002 [P] [US1] Update the cadence comment on the `rebalance` line in hedge_fund/fund/example.yaml to list all four supported values (`minute | daily | weekly | monthly`) and note that `interval`/`window` apply only to minute funds (FR-013). Preserve the file's existing comment style and UTF-8 no-BOM encoding.
+- [X] T003 [US1] Verify mandate-cadence coverage is green with no code changes: run `python -m poetry run pytest hedge_fund/fund hedge_fund/pipeline hedge_fund/backtesting -q`; if anything beyond the six baseline failures fails, stop and investigate before continuing (FR-001/002/004/005 pinned by fund/test_spec.py, pipeline/test_session.py, backtesting/test_fund.py). **Evidence**: 174 passed.
 
 **Checkpoint**: Mandate surface accurate and pinned.
 
