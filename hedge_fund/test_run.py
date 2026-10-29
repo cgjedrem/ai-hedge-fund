@@ -140,10 +140,14 @@ def test_backtest_defaults_end_to_the_latest_completed_session(tmp_path, monkeyp
 
 
 def test_backtest_without_rebalance_key_defaults_to_weekly(tmp_path, monkeypatch, capsys, offline):
+    from hedge_fund.pipeline import session as pipeline_session
+
     path = _mandate(tmp_path)
     mandate = yaml.safe_load(path.read_text())
     mandate.pop("rebalance")
     path.write_text(yaml.safe_dump(mandate))
+    # Freeze revision stamp → compare CLI JSON across commits.
+    monkeypatch.setattr(pipeline_session, "code_version", lambda: "2.6.1+cd662f4")
 
     _main(monkeypatch, "backtest", str(path), "--universe", "AAPL,MSFT", "--start", "2025-01-06", "--end", "2025-01-13")
     output = capsys.readouterr()
@@ -151,7 +155,130 @@ def test_backtest_without_rebalance_key_defaults_to_weekly(tmp_path, monkeypatch
 
     assert result["rebalance"] == "weekly"
     assert "1 rebalances" in output.err
-    assert hashlib.sha256(output.out.encode()).hexdigest() == "1174e04b649dd3fbcec8896e6cc4af0e4424118e9f471021923507f362888f9a"
+    assert hashlib.sha256(output.out.encode()).hexdigest() == "8dbc24919e7ae535220364a45f9f9c8b04863f6afa4ad07c1db1872275f38623"
+
+
+def test_backtest_rebalance_override_changes_monthly_cycle_count(tmp_path, monkeypatch, capsys, offline):
+    from hedge_fund.backtesting.test_fund import FakeDataClient
+
+    dates = ["2025-01-06", "2025-01-07", "2025-01-08", "2025-01-13", "2025-02-03", "2025-02-04", "2025-02-10", "2025-03-03"]
+    series = {ticker: {day: 100.0 + index for index, day in enumerate(dates)} for ticker in ("AAPL", "MSFT", "SPY")}
+
+    class MultiMonthClient(FakeDataClient):
+        def __init__(self):
+            super().__init__(series)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    monkeypatch.setattr(run, "make_data_client", MultiMonthClient)
+    path = _mandate(tmp_path)
+    original = path.read_bytes()
+    args = ("backtest", str(path), "--universe", "AAPL,MSFT", "--start", dates[0], "--end", dates[-1])
+    offline("2025-03-04")
+
+    _main(monkeypatch, *args)
+    weekly = json.loads(capsys.readouterr().out)
+    _main(monkeypatch, *args, "--rebalance", "monthly")
+    monthly = json.loads(capsys.readouterr().out)
+
+    assert weekly["rebalance"] == "weekly"
+    assert monthly["rebalance"] == "monthly"
+    assert monthly["metrics"]["n_cycles"] < weekly["metrics"]["n_cycles"]
+    assert path.read_bytes() == original
+
+
+def test_paper_create_rebalance_override_is_frozen_and_reported(tmp_path, monkeypatch, capsys, offline):
+    path = _mandate(tmp_path)
+    original = path.read_bytes()
+
+    _main(monkeypatch, "paper", "create", "alpha", "--mandate", str(path), "--universe", "AAPL", "--rebalance", "daily")
+    output = capsys.readouterr()
+    deployed = yaml.safe_load((tmp_path / "paper" / "alpha" / "fund.yaml").read_text())
+
+    assert output.out == ""
+    assert "daily" in output.err
+    assert deployed["spec"]["rebalance"] == "daily"
+    assert path.read_bytes() == original
+
+
+@pytest.mark.parametrize("command", ["backtest", "create"])
+def test_invalid_rebalance_override_is_usage_error_before_engine_work(tmp_path, monkeypatch, capsys, offline, command):
+    forbidden = Mock(side_effect=AssertionError("engine work ran before argument validation"))
+    monkeypatch.setattr(run, "load_spec", forbidden)
+    monkeypatch.setattr(run, "Fund", forbidden)
+    monkeypatch.setattr(run, "make_data_client", forbidden)
+    monkeypatch.setattr(run, "deploy", forbidden)
+    argv = (
+        ["backtest", "unused.yaml", "--universe", "AAPL", "--rebalance", "hourly"]
+        if command == "backtest"
+        else ["paper", "create", "alpha", "--mandate", "unused.yaml", "--universe", "AAPL", "--rebalance", "hourly"]
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        _main(monkeypatch, *argv)
+
+    output = capsys.readouterr()
+    assert exc.value.code == 2
+    assert output.out == ""
+    assert "hourly" in output.err
+    assert all(value in output.err for value in ("minute", "daily", "weekly", "monthly"))
+    assert forbidden.call_count == 0
+
+
+def test_paper_create_overrides_minute_to_daily_without_minute_fields(tmp_path, monkeypatch, capsys, offline):
+    path = _mandate(tmp_path)
+    mandate = yaml.safe_load(path.read_text())
+    mandate.update(rebalance="minute", interval=0.5, window={"start": "09:30", "end": "12:00"})
+    path.write_text(yaml.safe_dump(mandate))
+    original = path.read_bytes()
+
+    _main(monkeypatch, "paper", "create", "fast", "--mandate", str(path), "--universe", "AAPL", "--rebalance", "daily")
+    output = capsys.readouterr()
+    deployed = yaml.safe_load((tmp_path / "paper" / "fast" / "fund.yaml").read_text())
+    deployed_spec = deployed["spec"]
+
+    assert output.out == ""
+    assert "daily" in output.err
+    assert deployed_spec["rebalance"] == "daily"
+    assert "interval" not in deployed_spec and "window" not in deployed_spec
+    assert path.read_bytes() == original
+
+
+def test_paper_create_overrides_day_grid_to_minute_with_standard_defaults(tmp_path, monkeypatch, capsys, offline):
+    path = _mandate(tmp_path)
+    mandate = yaml.safe_load(path.read_text())
+    mandate["rebalance"] = "daily"
+    mandate.pop("interval", None)
+    mandate.pop("window", None)
+    path.write_text(yaml.safe_dump(mandate))
+    original = path.read_bytes()
+
+    _main(monkeypatch, "paper", "create", "fast", "--mandate", str(path), "--universe", "AAPL", "--rebalance", "minute")
+    output = capsys.readouterr()
+    deployed = yaml.safe_load((tmp_path / "paper" / "fast" / "fund.yaml").read_text())
+    deployed_spec = deployed["spec"]
+
+    assert output.out == ""
+    assert "every 1m" in output.err and "09:30–16:00 ET" in output.err
+    assert deployed_spec["rebalance"] == "minute"
+    assert deployed_spec["interval"] == 1.0
+    assert deployed_spec["window"] == {"start": "09:30", "end": "16:00"}
+    assert path.read_bytes() == original
+
+
+@pytest.mark.parametrize("action", ["tick", "run"])
+def test_deployed_fund_commands_do_not_accept_rebalance_override(capsys, action):
+    parser = run._parser()
+
+    with pytest.raises(SystemExit) as exc:
+        parser.parse_args(["paper", action, "alpha", "--rebalance", "daily"])
+
+    assert exc.value.code == 2
+    assert "unrecognized arguments: --rebalance daily" in capsys.readouterr().err
 
 
 def test_paper_flow_create_tick_status_halt_resume(tmp_path, monkeypatch, capsys, offline):

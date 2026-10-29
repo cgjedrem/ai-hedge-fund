@@ -65,7 +65,7 @@ from hedge_fund.brokers.models import format_shares
 from hedge_fund.data import CachedDataClient, make_data_client
 from hedge_fund.data.bars import is_intraday
 from hedge_fund.data.sessions import completed_through
-from hedge_fund.fund import Fund, load_spec, normalize_universe
+from hedge_fund.fund import Cadence, Fund, FundSpec, load_spec, normalize_universe
 from hedge_fund.paper import (
     deploy,
     is_running,
@@ -153,6 +153,7 @@ def _parser() -> argparse.ArgumentParser:
     backtest.add_argument("--start", help=f"first session YYYY-MM-DD (default: {BACKTEST_WEEKS} weeks before --end)")
     backtest.add_argument("--end", help="last session YYYY-MM-DD (default: the latest completed session)")
     backtest.add_argument("--out", help="also write the result JSON to this file")
+    backtest.add_argument("--rebalance", choices=("minute", "daily", "weekly", "monthly"), help="override the mandate cadence for this backtest")
 
     paper = commands.add_parser("paper", help="deploy and advance a paper fund")
     actions = paper.add_subparsers(dest="action", required=True)
@@ -161,6 +162,7 @@ def _parser() -> argparse.ArgumentParser:
     create.add_argument("name", help="fund name; becomes ~/.hedge-fund/paper/<name>/")
     create.add_argument("--mandate", required=True, help="path to a mandate YAML")
     create.add_argument("--universe", required=True, help=_UNIVERSE_HELP)
+    create.add_argument("--rebalance", choices=("minute", "daily", "weekly", "monthly"), help="override the mandate cadence before deployment")
 
     advance = actions.add_parser("tick", help="advance the fund by one session")
     advance.add_argument("name")
@@ -202,6 +204,17 @@ def _universe(text: str, parser: argparse.ArgumentParser) -> list[str]:
         parser.error(str(exc))
 
 
+def _override_rebalance(spec: FundSpec, cadence: Cadence | None) -> FundSpec:
+    if cadence is None:
+        return spec
+    data = spec.model_dump()
+    if cadence != "minute":
+        data.pop("interval", None)
+        data.pop("window", None)
+    data["rebalance"] = cadence
+    return FundSpec.model_validate(data)
+
+
 def _fund_dir(name: str, parser: argparse.ArgumentParser) -> Path:
     try:
         validate_fund_name(name)
@@ -223,6 +236,7 @@ def _backtest(args, parser: argparse.ArgumentParser, console: Console) -> None:
         spec = load_spec(args.mandate)
     except ValueError as exc:
         parser.error(str(exc))
+    spec = _override_rebalance(spec, args.rebalance)
     end = args.end or completed_through()
     start = args.start or (_date.fromisoformat(end) - timedelta(weeks=BACKTEST_WEEKS)).isoformat()
     # A backtest blinds the investor agents' prompts (no ticker, industry or
@@ -271,6 +285,7 @@ def _paper(args, parser: argparse.ArgumentParser, console: Console) -> None:
             spec = load_spec(args.mandate)
         except ValueError as exc:
             parser.error(str(exc))
+        spec = _override_rebalance(spec, args.rebalance)
         try:
             directory = deploy(args.name, spec, universe, root=PAPER_DIR)
         except FileExistsError as exc:
