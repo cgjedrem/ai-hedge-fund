@@ -100,6 +100,7 @@ None required. No shared infrastructure changes: FundSpec, the scheduler, and th
 **Independent Test**: `pytest hedge_fund/tui -q` green (minus the two documented tui baseline failures).
 
 - [ ] T009 [US4] Verify the builder's cadence-picker coverage is green with no code changes: run `python -m poetry run pytest hedge_fund/tui -q`; the existing tests already drive the real screen through all four cadences including the minute sub-steps (FR-012 pinned by tui/test_builder.py). Only the tui home file-mode and tui paper_view `%-d` baseline failures are tolerated.
+  - **Evidence (partial)**: `test_builder.py`: 13 passed. Full TUI attempt: 45 passed, 1 known home file-mode failure, then `KeyboardInterrupt` after 28.73s during runner-screen tests. Excluding the two blocked runner parameter cases: 63 passed, 2 known Windows failures, 2 deselected. Full TUI completion remains unverified; no TUI code changed.
 
 **Checkpoint**: All four surfaces (mandate, spec, scheduler, TUI) verified consistent.
 
