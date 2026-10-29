@@ -1,5 +1,6 @@
 """The CLI: configuration preflight, the backtest command, and the paper flow."""
 
+import hashlib
 import json
 import sys
 from datetime import datetime
@@ -136,6 +137,21 @@ def test_backtest_defaults_end_to_the_latest_completed_session(tmp_path, monkeyp
     _main(monkeypatch, "backtest", str(path), "--universe", "AAPL", "--start", "2025-01-06")
     result = json.loads(capsys.readouterr().out)
     assert result["end"] == "2025-01-13"
+
+
+def test_backtest_without_rebalance_key_defaults_to_weekly(tmp_path, monkeypatch, capsys, offline):
+    path = _mandate(tmp_path)
+    mandate = yaml.safe_load(path.read_text())
+    mandate.pop("rebalance")
+    path.write_text(yaml.safe_dump(mandate))
+
+    _main(monkeypatch, "backtest", str(path), "--universe", "AAPL,MSFT", "--start", "2025-01-06", "--end", "2025-01-13")
+    output = capsys.readouterr()
+    result = json.loads(output.out)
+
+    assert result["rebalance"] == "weekly"
+    assert "1 rebalances" in output.err
+    assert hashlib.sha256(output.out.encode()).hexdigest() == "1174e04b649dd3fbcec8896e6cc4af0e4424118e9f471021923507f362888f9a"
 
 
 def test_paper_flow_create_tick_status_halt_resume(tmp_path, monkeypatch, capsys, offline):

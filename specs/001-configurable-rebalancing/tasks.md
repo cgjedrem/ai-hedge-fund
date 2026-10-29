@@ -64,8 +64,8 @@ None required. No shared infrastructure changes: FundSpec, the scheduler, and th
 
 ### Implementation for User Story 2
 
-- [ ] T004 [US2] Add a pinning test to hedge_fund/test_run.py: a mandate with no `rebalance` key, invoked with no `--rebalance` flag, produces a weekly-cadence backtest result (and, if the existing offline paper fixtures allow it cheaply, a `paper create` whose deployed spec is weekly). This test must pass immediately — it pins the default path, it does not change behavior (FR-003, FR-006; spec US2 scenario 1).
-- [ ] T005 [US2] Verify serialization invariants hold: run `python -m poetry run pytest hedge_fund/fund/test_spec.py -q` and confirm the default-applied and serializer-exclusion tests pass unchanged (day-grid mandates serialize without `interval`/`window`; default costs omit the `costs` block) — no code changes in this task (FR-006; spec US2 scenarios 2–3).
+- [X] T004 [US2] Add a pinning test to hedge_fund/test_run.py: a mandate with no `rebalance` key, invoked with no `--rebalance` flag, produces a weekly-cadence backtest result (and, if the existing offline paper fixtures allow it cheaply, a `paper create` whose deployed spec is weekly). This test must pass immediately — it pins the default path, it does not change behavior (FR-003, FR-006; spec US2 scenario 1). **Evidence**: 1 passed; stdout SHA-256 `1174e04b649dd3fbcec8896e6cc4af0e4424118e9f471021923507f362888f9a`.
+- [X] T005 [US2] Verify serialization invariants hold: run `python -m poetry run pytest hedge_fund/fund/test_spec.py -q` and confirm the default-applied and serializer-exclusion tests pass unchanged (day-grid mandates serialize without `interval`/`window`; default costs omit the `costs` block) — no code changes in this task (FR-006; spec US2 scenarios 2–3). **Evidence**: 71 passed; no spec changes.
 
 **Checkpoint**: Default path proven at both model and CLI surfaces.
 
