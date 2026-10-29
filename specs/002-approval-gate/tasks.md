@@ -160,3 +160,5 @@ Single package: `hedge_fund/` at repo root; tests co-located next to code (const
 | Rejected-weekly lapsed text | Deferred; UI copy polish, execution/rejection behavior unchanged. |
 | Second-guard test coverage | Deferred; direct-call coverage for the TUI action guard is outside the identity/replay changes; enabled-action tests remain. |
 | FR-014 wording | Deferred; kill-switch behavior and tests remain untouched. |
+
+**Coordinator independent verification (2026-10-29, post-commit `e3d0a78`, clean tree, Poetry env `aihf-0Qkf8biM-py3.13`)**: re-ran affected chunks — paper+fund 138 passed + 3 documented baseline failures; tui paper_view 5 passed + 1 baseline; tui builder 15 passed; tui paper 24 passed, 2 runner cases deselected (blocked, see T013); test_paths+test_run 33 passed. Style on the 11 non-run.py hardening files: black clean, isort clean, flake8 `--max-line-length=420` zero findings; run.py black-diff hunks verified to be the pre-existing string-concat flaky regions (the `return (...)` join predates the feature at `d25de7b`; the feature only appended `{approval_state}` inside it).
