@@ -71,6 +71,21 @@ With no arguments, this launches the interactive terminal app. It has two modes:
 - **Paper trading** — your funds, each with a ledger of real market days and fake money. Highlight a fund to see what its next run will do; press enter to run it through the next completed session (an approval step shows the exact decision about to execute before anything trades), `s` for its full session history, `h`/`r` for the kill switch. Build a new fund from the same list: strategies, capital, cadence, tickers, and it is live. Every session is appended to a hash-chained ledger in `~/.hedge-fund/paper/<name>/`, so NAV is a track record, not a reset.
 - **Backtesting** — replay a fund over history and watch its equity curve draw against its benchmark. Results are saved to `~/.hedge-fund/research/`. Fund definitions live in `~/.hedge-fund/mandates/` and carry no tickers; you pick the universe per backtest.
 
+### Mandate cadence
+
+The `rebalance` field accepts `minute`, `daily`, `weekly`, or `monthly`
+(default: `weekly`). Daily, weekly, and monthly funds rebalance on the first
+session of each period; minute funds rebalance every eligible bar.
+`interval` and `window` apply only to minute funds.
+
+Override cadence for a backtest or when creating a paper fund; the mandate
+file stays unchanged:
+
+```bash
+aihf backtest ~/.hedge-fund/mandates/example.yaml --universe AAPL,MSFT --rebalance monthly
+aihf paper create alpha --mandate ~/.hedge-fund/mandates/example.yaml --universe AAPL,MSFT --rebalance daily
+```
+
 ### Docker
 
 The same app in a container. All state — funds, ledgers, caches, and the `.env` key file — stays in `~/.hedge-fund`, which is mounted as a volume; nothing is baked into the image.

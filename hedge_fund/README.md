@@ -96,6 +96,8 @@ poetry run aihf backtest ~/.hedge-fund/mandates/example.yaml \
 poetry run aihf paper create alpha --mandate ~/.hedge-fund/mandates/example.yaml --universe AAPL,MSFT
 poetry run aihf paper tick alpha
 poetry run aihf paper tick alpha --again   # redo the latest session; the old record moves to ledger/superseded/
+# Override cadence at deployment without editing the mandate:
+poetry run aihf paper create fast --mandate ~/.hedge-fund/mandates/example.yaml --universe AAPL,MSFT --rebalance minute
 poetry run aihf paper run fast             # a minute fund (`rebalance: minute`): stays up, one bar per interval
 poetry run aihf paper stop fast            #   ...and stops it after the bar in flight
 poetry run aihf paper status alpha

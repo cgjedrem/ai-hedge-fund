@@ -112,8 +112,10 @@ None required. No shared infrastructure changes: FundSpec, the scheduler, and th
 
 **Independent Test**: Read README.md's mandate section cold; the cadence field, its values/default/meaning, and the CLI override are all documented and match actual behavior.
 
-- [ ] T010 [P] [US5] Add a short mandate-field reference to README.md (near the existing TUI/fund blurb): the `rebalance` field with its four values, default `weekly`, meaning (first session of each period / every bar), minute-only `interval`/`window`, and one-line `--rebalance` override examples for `backtest` and `paper create` (FR-014).
-- [ ] T011 [P] [US5] Mention the `--rebalance` override in hedge_fund/README.md where cadence/minute funds are introduced (near the `paper run fast` example), keeping the existing doc voice (FR-014).
+- [X] T010 [P] [US5] Add a short mandate-field reference to README.md (near the existing TUI/fund blurb): the `rebalance` field with its four values, default `weekly`, meaning (first session of each period / every bar), minute-only `interval`/`window`, and one-line `--rebalance` override examples for `backtest` and `paper create` (FR-014).
+  - **Evidence**: README lists four values, `weekly` default, period/bar semantics, minute-only fields, and backtest/paper-create override commands.
+- [X] T011 [P] [US5] Mention the `--rebalance` override in hedge_fund/README.md where cadence/minute funds are introduced (near the `paper run fast` example), keeping the existing doc voice (FR-014).
+  - **Evidence**: Added a `paper create --rebalance minute` deployment example immediately before the `paper run fast` command; run command remains override-free.
 
 **Checkpoint**: Documentation matches behavior on all surfaces.
 
