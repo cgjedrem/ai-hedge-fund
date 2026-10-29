@@ -3,6 +3,7 @@
 import hashlib
 import json
 import sys
+from contextlib import nullcontext
 from datetime import datetime
 from unittest.mock import Mock
 
@@ -409,3 +410,146 @@ def test_paper_minute_fund_ticks_and_runs_like_a_daily_one(tmp_path, monkeypatch
     monkeypatch.setattr(run, "stop_runner", lambda directory: True)
     _main(monkeypatch, "paper", "stop", "fast")
     assert "asked to stop" in capsys.readouterr().err
+
+
+def _offline_tick(directory):
+    with run.make_data_client() as raw:
+        run.tick(directory, run.CachedDataClient(raw))
+
+
+def _disable_status_animation(monkeypatch):
+    monkeypatch.setattr(run.Console, "status", lambda *args, **kwargs: nullcontext())
+
+
+def test_paper_create_approval_and_approve_commands_show_status(tmp_path, monkeypatch, capsys, offline):
+    set_today = offline
+    path = _mandate(tmp_path)
+    set_today("2025-01-07")
+
+    _main(monkeypatch, "paper", "create", "alpha", "--mandate", str(path), "--universe", "AAPL", "--approval")
+    created = capsys.readouterr()
+    directory = tmp_path / "paper" / "alpha"
+    deployed = yaml.safe_load((directory / "fund.yaml").read_text())
+    assert deployed["spec"]["approval_required"] is True
+    assert "approval" in created.err.lower()
+
+    _offline_tick(directory)
+    _main(monkeypatch, "paper", "status", "alpha")
+    status = capsys.readouterr().out
+    assert "awaiting approval" in status and "AAPL:" in status
+    _main(monkeypatch, "paper", "list")
+    assert "awaiting approval" in capsys.readouterr().out
+
+    _main(monkeypatch, "paper", "approve", "alpha")
+    approved = capsys.readouterr()
+    mailbox = json.loads((directory / "pending-approval.json").read_text())
+    events = [json.loads(line) for line in (directory / "events.jsonl").read_text().splitlines()]
+    assert mailbox["verdict"] == "approve" and mailbox["by"] == "cli"
+    assert [event["kind"] for event in events] == ["tick", "approve"]
+    assert "approved" in approved.err.lower()
+
+
+def test_paper_approve_now_executes_when_a_session_is_due(tmp_path, monkeypatch, capsys, offline):
+    set_today = offline
+    path = _mandate(tmp_path)
+    set_today("2025-01-07")
+    _main(monkeypatch, "paper", "create", "alpha", "--mandate", str(path), "--universe", "AAPL", "--approval")
+    capsys.readouterr()
+    directory = tmp_path / "paper" / "alpha"
+    _offline_tick(directory)
+
+    set_today("2025-01-08")
+    _disable_status_animation(monkeypatch)
+    _main(monkeypatch, "paper", "approve", "alpha", "--now")
+    output = capsys.readouterr()
+
+    record = json.loads(output.out)
+    assert record["session"] == "2025-01-07"
+    assert record["executed"] is not None
+    assert not (directory / "pending-approval.json").exists()
+    assert "executed" in output.err.lower()
+
+
+def test_paper_approve_now_without_a_due_session_schedules_next_close(tmp_path, monkeypatch, capsys, offline):
+    path = _mandate(tmp_path)
+    _main(monkeypatch, "paper", "create", "alpha", "--mandate", str(path), "--universe", "AAPL", "--approval")
+    capsys.readouterr()
+    directory = tmp_path / "paper" / "alpha"
+    _offline_tick(directory)
+
+    _disable_status_animation(monkeypatch)
+    _main(monkeypatch, "paper", "approve", "alpha", "--now")
+    output = capsys.readouterr()
+
+    assert output.out == ""
+    assert "will execute at the next close" in output.err.lower()
+    assert json.loads((directory / "pending-approval.json").read_text())["verdict"] == "approve"
+
+
+def test_paper_reject_records_verdict_and_event(tmp_path, monkeypatch, capsys, offline):
+    set_today = offline
+    path = _mandate(tmp_path)
+    set_today("2025-01-07")
+    _main(monkeypatch, "paper", "create", "alpha", "--mandate", str(path), "--universe", "AAPL", "--approval")
+    capsys.readouterr()
+    directory = tmp_path / "paper" / "alpha"
+    _offline_tick(directory)
+
+    _main(monkeypatch, "paper", "reject", "alpha")
+    rejected = capsys.readouterr()
+
+    assert json.loads((directory / "pending-approval.json").read_text())["verdict"] == "reject"
+    events = [json.loads(line) for line in (directory / "events.jsonl").read_text().splitlines()]
+    assert [event["kind"] for event in events] == ["tick", "reject"]
+    assert "rejected" in rejected.err.lower()
+
+
+@pytest.mark.parametrize("action", ["approve", "reject"])
+def test_paper_approval_commands_refuse_when_gate_is_off(tmp_path, monkeypatch, capsys, offline, action):
+    set_today = offline
+    path = _mandate(tmp_path)
+    set_today("2025-01-07")
+    _main(monkeypatch, "paper", "create", "alpha", "--mandate", str(path), "--universe", "AAPL")
+    capsys.readouterr()
+    _offline_tick(tmp_path / "paper" / "alpha")
+
+    with pytest.raises(SystemExit) as exc:
+        _main(monkeypatch, "paper", action, "alpha")
+
+    assert exc.value.code == 2
+    assert "approval gate is not enabled for 'alpha'" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("action", ["approve", "reject"])
+def test_paper_approval_commands_refuse_when_nothing_is_pending(tmp_path, monkeypatch, capsys, offline, action):
+    path = _mandate(tmp_path)
+    _main(monkeypatch, "paper", "create", "alpha", "--mandate", str(path), "--universe", "AAPL", "--approval")
+    capsys.readouterr()
+
+    with pytest.raises(SystemExit) as exc:
+        _main(monkeypatch, "paper", action, "alpha")
+
+    assert exc.value.code == 2
+    assert "nothing is awaiting approval for 'alpha'" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("action", ["approve", "reject"])
+def test_paper_approval_commands_refuse_halted_funds_without_touching_control(tmp_path, monkeypatch, capsys, offline, action):
+    set_today = offline
+    path = _mandate(tmp_path)
+    set_today("2025-01-07")
+    _main(monkeypatch, "paper", "create", "alpha", "--mandate", str(path), "--universe", "AAPL", "--approval")
+    capsys.readouterr()
+    directory = tmp_path / "paper" / "alpha"
+    _offline_tick(directory)
+    _main(monkeypatch, "paper", "halt", "alpha", "--reason", "operator review")
+    capsys.readouterr()
+    control_before = (directory / "control.json").read_bytes()
+
+    with pytest.raises(SystemExit) as exc:
+        _main(monkeypatch, "paper", action, "alpha")
+
+    assert exc.value.code == 1
+    assert "alpha is halted: operator review" in capsys.readouterr().err
+    assert (directory / "control.json").read_bytes() == control_before
+    assert not (directory / "pending-approval.json").exists()

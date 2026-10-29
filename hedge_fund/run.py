@@ -163,6 +163,7 @@ def _parser() -> argparse.ArgumentParser:
     create.add_argument("--mandate", required=True, help="path to a mandate YAML")
     create.add_argument("--universe", required=True, help=_UNIVERSE_HELP)
     create.add_argument("--rebalance", choices=("minute", "daily", "weekly", "monthly"), help="override the mandate cadence before deployment")
+    create.add_argument("--approval", action="store_true", help="require approval before executing pending decisions")
 
     advance = actions.add_parser("tick", help="advance the fund by one session")
     advance.add_argument("name")
@@ -191,6 +192,13 @@ def _parser() -> argparse.ArgumentParser:
 
     resume = actions.add_parser("resume", help="clear the kill switch")
     resume.add_argument("name")
+
+    approve = actions.add_parser("approve", help="approve a pending decision")
+    approve.add_argument("name")
+    approve.add_argument("--now", action="store_true", help="run a session now when one is due")
+
+    reject = actions.add_parser("reject", help="reject a pending decision")
+    reject.add_argument("name")
     return parser
 
 
@@ -286,14 +294,17 @@ def _paper(args, parser: argparse.ArgumentParser, console: Console) -> None:
         except ValueError as exc:
             parser.error(str(exc))
         spec = _override_rebalance(spec, args.rebalance)
+        if args.approval:
+            spec = spec.model_copy(update={"approval_required": True})
         try:
             directory = deploy(args.name, spec, universe, root=PAPER_DIR)
         except FileExistsError as exc:
             parser.error(str(exc))
         cadence = f"{spec.cadence_label}, {spec.window.label}" if spec.is_intraday else spec.cadence_label
+        approval_note = "  ·  approval required" if spec.approval_required else ""
         console.print(
             f"[bold]{args.name}[/] deployed at {directory}  ·  mandate {spec.name}  ·  "
-            f"{', '.join(universe)}  ·  ${spec.capital:,.0f}  ·  {cadence}"
+            f"{', '.join(universe)}  ·  ${spec.capital:,.0f}  ·  {cadence}{approval_note}"
         )
         console.print(f"[dim]next: `aihf paper tick {args.name}` to run one session, `aihf paper run "
                       f"{args.name}` to leave it running, `aihf paper status {args.name}` any time[/]")
@@ -354,8 +365,17 @@ def _paper(args, parser: argparse.ArgumentParser, console: Console) -> None:
         ledger = Ledger(directory)
         latest = ledger.latest()
         if latest is not None and latest.decision is not None:
-            when = "bar" if load_deployed(directory).spec.is_intraday else "close"
-            print(f"  pending decision, to execute at the next {when}:")
+            deployed = load_deployed(directory)
+            when = "bar" if deployed.spec.is_intraday else "close"
+            if deployed.spec.approval_required:
+                approval = ledger.approval()
+                if approval is not None and approval["decision_as_of"] == latest.decision.as_of:
+                    state = "approved for execution" if approval["verdict"] == "approve" else "rejected; execution will be skipped"
+                    print(f"  pending decision, {state} at the next {when}:")
+                else:
+                    print(f"  pending decision, awaiting approval before the next {when}:")
+            else:
+                print(f"  pending decision, to execute at the next {when}:")
             for ticker, weight in sorted(latest.decision.final_weights.items()):
                 print(f"    {ticker}: {weight:+.2%}")
         if latest is not None and latest.positions:
@@ -373,6 +393,34 @@ def _paper(args, parser: argparse.ArgumentParser, console: Console) -> None:
         print(card.model_dump_json(indent=2))
         console.print(analyst_table(card))
         console.print(strategy_table(card))
+        return
+
+    if args.action in {"approve", "reject"}:
+        deployed = load_deployed(directory)
+        ledger = Ledger(directory)
+        state = ledger.replay(deployed.spec.capital)
+        if state.halted is not None:
+            raise FundHalted(f"{args.name} is halted: {state.halted}")
+        if not deployed.spec.approval_required:
+            parser.error(f"approval gate is not enabled for '{args.name}'")
+        if state.pending is None:
+            parser.error(f"nothing is awaiting approval for '{args.name}'")
+        ledger.set_approval(args.action, state.pending.as_of, "cli")
+        if args.action == "approve":
+            console.print(f"[green]{args.name}[/] approved decision from {state.pending.as_of}")
+        else:
+            console.print(f"[yellow]{args.name}[/] rejected decision from {state.pending.as_of}")
+        if args.action == "approve" and args.now:
+            try:
+                with make_data_client() as raw:
+                    fd = CachedDataClient(raw, live=deployed.spec.is_intraday)
+                    with console.status(f"[cyan]{deployed.name}: advancing one session…", spinner="dots"):
+                        record = tick(directory, fd)
+            except NothingDue:
+                console.print(f"{args.name}: will execute at the next close")
+                return
+            print(record.model_dump_json(indent=2))
+            console.print(_tick_summary(deployed.name, record))
         return
 
     ledger = Ledger(directory)
@@ -400,8 +448,15 @@ def _status_line(directory: Path) -> str:
                  f"NAV ${latest.nav:,.2f} ({ret:+.2%})")
     flag = f"  ·  HALTED: {halted}" if halted else ""
     running = "  ·  running" if is_running(directory) else ""
+    approval_state = ""
+    if deployed.spec.approval_required and latest is not None and latest.decision is not None:
+        approval = ledger.approval()
+        if approval is not None and approval["decision_as_of"] == latest.decision.as_of:
+            approval_state = f"  ·  {approval['verdict']} recorded"
+        else:
+            approval_state = "  ·  awaiting approval"
     return (f"{deployed.name:<18} {deployed.spec.name}  ·  {' '.join(deployed.universe)}  ·  "
-            f"{deployed.spec.cadence_label}{running}  ·  {state}{flag}")
+            f"{deployed.spec.cadence_label}{running}  ·  {state}{flag}{approval_state}")
 
 
 def _tick_summary(name: str, record: SessionRecord) -> str:
