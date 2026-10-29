@@ -188,14 +188,14 @@ class BuilderScreen(Screen):
                     with Vertical(id="step-approval", classes="pane"):
                         yield Label("Require approval before executing decisions?", classes="q")
                         yield OptionList(
-                            Option(Text.assemble(
-                                ("Automatic ", "bold"),
-                                ("pending decisions run at the next close", MUTED),
-                            ), id="approval-off"),
-                            Option(Text.assemble(
-                                ("Require approval ", "bold"),
-                                ("decisions wait for your yes or no", MUTED),
-                            ), id="approval-on"),
+                            Option(
+                                Text.assemble(("Automatic ", "bold"), ("pending decisions run at the next close", MUTED)),
+                                id="approval-off",
+                            ),
+                            Option(
+                                Text.assemble(("Require approval ", "bold"), ("decisions wait for your yes or no", MUTED)),
+                                id="approval-on",
+                            ),
                             id="approval-list",
                         )
                         yield Static(
@@ -281,9 +281,7 @@ class BuilderScreen(Screen):
                 self.CADENCES.index(picked)
             )
         if pane_id == "step-approval":
-            self.query_one("#approval-list", OptionList).highlighted = int(
-                self._state.get("approval_required", False)
-            )
+            self.query_one("#approval-list", OptionList).highlighted = int(self._state.get("approval_required", False))
         if pane_id == "step-interval":
             self._refresh_interval_line()
         if pane_id == "step-window":
@@ -548,12 +546,7 @@ class BuilderScreen(Screen):
             ])
             menu.highlighted = 0
             if spec.approval_required:
-                first = (
-                    f"Its first session marks the book at the {'current bar' if intraday else 'latest completed close'} and "
-                    f"makes the first decision; the {'next bar' if intraday else 'next session'} waits for approval. "
-                    "Without a verdict, that decision lapses and the fund keeps running. "
-                    "Run one session at a time, or leave a runner on it from the paper screen (space)."
-                )
+                first = f"Its first session marks the book at the {'current bar' if intraday else 'latest completed close'} and " f"makes the first decision; the {'next bar' if intraday else 'next session'} waits for approval. " "Without a verdict, that decision lapses and the fund keeps running. " "Run one session at a time, or leave a runner on it from the paper screen (space)."
             else:
                 first = (
                     f"Its first session marks the book at the {'current bar' if intraday else 'latest completed close'} and "
@@ -607,8 +600,7 @@ class BuilderScreen(Screen):
             2: (f"${self._state['capital']:,.0f}"
                 if "capital" in self._state else None),
             3: self._short_cadence(),
-            4: ("approval required" if self._state.get("approval_required")
-                else "automatic execution" if "approval_required" in self._state else None),
+            4: ("approval required" if self._state.get("approval_required") else "automatic execution" if "approval_required" in self._state else None),
             5: (short_tickers(self._state["universe"], 3)
                 if "universe" in self._state else None),
         }

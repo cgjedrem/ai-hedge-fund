@@ -94,8 +94,7 @@ class PaperSnapshot:
         except (OSError, ValueError):
             return None
         expired = next(
-            (event for event in reversed(events)
-             if isinstance(event, dict) and event.get("kind") == "expire"),
+            (event for event in reversed(events) if isinstance(event, dict) and event.get("kind") == "expire"),
             None,
         )
         if expired is None:
@@ -404,13 +403,7 @@ def run_plan(name: str, state: FundState, due: str | None, spec: FundSpec,
                     style=MUTED)
         return body
     at = _at_phrase(due, moment)
-    approved = (
-        spec.approval_required
-        and approval is not None
-        and approval.get("verdict") == "approve"
-        and state.pending is not None
-        and approval.get("decision_as_of") == state.pending.as_of
-    )
+    approved = spec.approval_required and approval is not None and approval.get("verdict") == "approve" and state.pending is not None and approval.get("decision_as_of") == state.pending.as_of
     if state.pending is not None and spec.approval_required and not approved:
         body.append("Mark the book at the ", style=TEXT)
         body.append_text(at)

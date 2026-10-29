@@ -584,12 +584,8 @@ class RunSessionScreen(Screen):
     ) -> None:
         doing = []
         if pending is not None:
-            matching_approval = (
-                approval is not None and approval.get("decision_as_of") == pending.as_of
-            )
-            if not deployed.spec.approval_required or (
-                matching_approval and approval.get("verdict") == "approve"
-            ):
+            matching_approval = approval is not None and approval.get("decision_as_of") == pending.as_of
+            if not deployed.spec.approval_required or (matching_approval and approval.get("verdict") == "approve"):
                 doing.append(f"executing the {pending.as_of} decision")
             elif matching_approval and approval.get("verdict") == "reject":
                 doing.append(f"skipping the rejected {pending.as_of} decision; it lapses")
