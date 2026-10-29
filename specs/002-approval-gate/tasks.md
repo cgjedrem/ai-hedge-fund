@@ -103,9 +103,11 @@ Single package: `hedge_fund/` at repo root; tests co-located next to code (const
 
 **Goal**: Discoverability and the shipped example stay truthful.
 
-- [ ] T014 [P] [US1] Add a commented `approval_required` documentation line to hedge_fund/fund/example.yaml (parsed content unchanged — the shipped example's behavior must not change; UTF-8 no BOM; preserve comment style) (FR-001).
-- [ ] T015 [P] [US6] Document approval mode in README.md (and hedge_fund/README.md if it carries the fund-settings reference): default off, the three creation surfaces, `approve`/`reject` commands with `--now`, expiry-skip-not-halt semantics, and kill-switch orthogonality (FR-016).
-- [ ] T016 [US6] Verify docs match behavior: every documented key/command/flag exists and behaves as documented (spot-check against the implemented CLI help output); no documented value the engine rejects. **Evidence**: _(fill)_
+- [x] T014 [P] [US1] Add a commented `approval_required` documentation line to hedge_fund/fund/example.yaml (parsed content unchanged — the shipped example's behavior must not change; UTF-8 no BOM; preserve comment style) (FR-001).
+  - **Evidence**: `example.yaml` decodes as UTF-8 without BOM; `yaml.safe_load` output equals `HEAD:hedge_fund/fund/example.yaml`.
+- [x] T015 [P] [US6] Document approval mode in README.md (and hedge_fund/README.md if it carries the fund-settings reference): default off, the three creation surfaces, `approve`/`reject` commands with `--now`, expiry-skip-not-halt semantics, and kill-switch orthogonality (FR-016).
+  - **Evidence**: README.md and hedge_fund/README.md document default-off, mandate/TUI/CLI creation, approve/reject/`--now`, expiry skip without halt, and kill-switch independence; the package README also documents the mailbox and audit events.
+- [x] T016 [US6] Verify docs match behavior: every documented key/command/flag exists and behaves as documented (spot-check against the implemented CLI help output); no documented value the engine rejects. **Evidence**: `aihf paper create --help` exposes `--approval`; `aihf paper approve --help` exposes `--now`; `aihf paper reject --help` accepts the name and exposes no unsupported flag. Approval CLI tests: 10 passed, 20 deselected; YAML example parses unchanged.
 
 **Checkpoint**: Surfaces consistent (constitution V).
 

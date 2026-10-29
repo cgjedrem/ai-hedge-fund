@@ -33,4 +33,5 @@ costs:                        # what every fill costs; these are the defaults
   commission_per_share: 0.005 # dollars a share; zero on both means free fills
 capital: 100000
 rebalance: weekly             # minute | daily | weekly | monthly — interval/window apply only to minute funds
+# approval_required: true      # optional; default false
 benchmark: SPY                # measured against; also the backtest's trading-day grid

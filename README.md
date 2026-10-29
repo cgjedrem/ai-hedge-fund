@@ -68,7 +68,7 @@ aihf
 
 With no arguments, this launches the interactive terminal app. It has two modes:
 
-- **Paper trading** — your funds, each with a ledger of real market days and fake money. Highlight a fund to see what its next run will do; press enter to run it through the next completed session (an approval step shows the exact decision about to execute before anything trades), `s` for its full session history, `h`/`r` for the kill switch. Build a new fund from the same list: strategies, capital, cadence, tickers, and it is live. Every session is appended to a hash-chained ledger in `~/.hedge-fund/paper/<name>/`, so NAV is a track record, not a reset.
+- **Paper trading** — your funds, each with a ledger of real market days and fake money. Highlight a fund to see what its next run will do; press enter to review and run the next session, `y`/`n` to approve or reject a gated decision, `s` for history, and `h`/`r` for the kill switch. Build a new fund from the same list: strategies, capital, cadence, approval mode, tickers, and it is live. Every session is appended to a hash-chained ledger in `~/.hedge-fund/paper/<name>/`, so NAV is a track record, not a reset.
 - **Backtesting** — replay a fund over history and watch its equity curve draw against its benchmark. Results are saved to `~/.hedge-fund/research/`. Fund definitions live in `~/.hedge-fund/mandates/` and carry no tickers; you pick the universe per backtest.
 
 ### Mandate cadence
@@ -85,6 +85,32 @@ file stays unchanged:
 aihf backtest ~/.hedge-fund/mandates/example.yaml --universe AAPL,MSFT --rebalance monthly
 aihf paper create alpha --mandate ~/.hedge-fund/mandates/example.yaml --universe AAPL,MSFT --rebalance daily
 ```
+
+### Per-fund approval gate
+
+Approval is opt-in. `approval_required` defaults to `false`; without it, pending
+decisions execute as they do today. Enable the gate on a new paper fund with
+`approval_required: true` in its mandate, the Approval step in the TUI paper
+builder, or `--approval` at CLI creation:
+
+```bash
+aihf paper create alpha --mandate ~/.hedge-fund/mandates/example.yaml --universe AAPL,MSFT --approval
+aihf paper approve alpha             # queue approval for the next session
+aihf paper approve alpha --now       # execute now if a session is due
+aihf paper reject alpha
+```
+
+In the TUI fund screen, `y` approves and `n` rejects a pending decision. A
+matching approval executes at the next session; `--now` executes immediately
+when one is due. If no session is due, `--now` keeps the verdict and reports
+that it will execute at the next close.
+
+The verdict lives in `pending-approval.json` in the fund directory, keyed to
+the decision. A rejected, missing, or stale verdict skips execution at the
+next session, records an audit event, marks the book, and lets the decision
+lapse. The fund keeps running; weekly/monthly funds remain mark-only until
+their next decision period. The gate is separate from the kill switch:
+`halt`/`resume` behavior is unchanged.
 
 ### Docker
 

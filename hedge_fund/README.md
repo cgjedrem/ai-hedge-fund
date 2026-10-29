@@ -78,8 +78,8 @@ HEDGE_FUND_DATA_PROVIDER=yfinance poetry run aihf
 
 ```bash
 # THE command. No arguments: launch the interactive app (a Textual TUI).
-# Two modes: paper trading (your funds — run the next session behind an
-# approval step, see history, halt/resume, build a new fund) and
+# Two modes: paper trading (your funds — review each run, approve/reject gated
+# decisions with y/n, see history, halt/resume, build a new fund) and
 # backtesting (replay a fund over history).
 poetry run aihf       # or, equivalently: python -m hedge_fund.tui
 
@@ -109,6 +109,27 @@ poetry run aihf paper resume alpha
 poetry run pytest hedge_fund/
 ```
 
+### Per-fund approval gate
+
+The gate defaults off, preserving automatic execution. Set
+`approval_required: true` in a mandate, choose Require approval in the TUI paper builder, or add
+`--approval` to `paper create`. The setting is frozen into the deployed fund.
+
+```bash
+poetry run aihf paper create gated --mandate ~/.hedge-fund/mandates/example.yaml \
+    --universe AAPL,MSFT --approval
+# After a decision is pending:
+poetry run aihf paper approve gated
+poetry run aihf paper approve gated --now   # runs now if a session is due
+poetry run aihf paper reject gated
+```
+
+In the paper fund screen, `y` approves and `n` rejects while a gated decision
+is pending and the fund is not halted. A rejection or missing/stale verdict
+skips execution; missing/stale verdicts record `expire`. The book is marked,
+the decision lapses, and the fund keeps running. `halt`/`resume` remain an
+independent kill switch.
+
 All API responses cache to disk (`~/.hedge-fund/cache/`), so reruns are fast,
 free, and work offline once warmed.
 
@@ -124,7 +145,8 @@ paper/<name>/
   ledger/<date>/<HHMMSS>.json   a minute fund's records, one directory per day
   ledger/<date>/checkpoint.json the state after that day's last bar; replay starts here
   control.json                  the kill switch (halted, reason, since)
-  events.jsonl                  ticks, failures, halts, resumes, gaps, checkpoints
+  pending-approval.json         the optional verdict mailbox
+  events.jsonl                  ticks, approvals, rejections, expiries, halts, resumes
   runner.pid                    the `aihf paper run` process holding a minute fund
 ```
 
