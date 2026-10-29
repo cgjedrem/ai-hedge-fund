@@ -1,6 +1,7 @@
 """tick — deploy, advance one session at a time, and halt on failure."""
 
 import json
+import os
 from datetime import datetime
 
 import pytest
@@ -27,6 +28,38 @@ from hedge_fund.paper import (
 )
 from hedge_fund.pipeline import DecisionRecord, FundState
 from hedge_fund.pipeline.session import FundHalted
+
+LEGACY_FUND_YAML = """schema_version: 2
+name: alpha
+spec:
+  schema_version: 2
+  name: paper-fund
+  strategies:
+  - name: solo
+    display_name: null
+    weight: 1.0
+    models:
+    - name: a
+      weight: 1.0
+      params: {}
+    blend:
+      method: conviction_weighted
+      gross_target: 1.0
+      mode: long_short
+  risk:
+    max_position_pct: 1.0
+    max_gross_exposure: 1.0
+  costs:
+    spread_bps: 0.0
+    commission_per_share: 0.0
+  capital: 100000.0
+  rebalance: weekly
+  benchmark: SPY
+universe:
+- AAPL
+broker: paper
+created: '{created}'
+"""
 
 
 @pytest.fixture(autouse=True)
@@ -82,6 +115,14 @@ def test_deploy_lays_out_the_fund_directory(tmp_path, SPEC):
     assert list_deployed(tmp_path / "nowhere") == []
     with pytest.raises(FileExistsError, match="already exists"):
         deploy("alpha", SPEC, ["AAPL"], root=tmp_path)
+
+
+def test_default_approval_deploy_yaml_matches_pre_feature_bytes(tmp_path, SPEC):
+    assert not SPEC.approval_required
+    directory = deploy("alpha", SPEC, ["AAPL"], root=tmp_path)
+    expected = LEGACY_FUND_YAML.replace("{created}", datetime.now().date().isoformat()).replace("\n", os.linesep).encode("utf-8")
+
+    assert (directory / "fund.yaml").read_bytes() == expected
 
 
 @pytest.mark.parametrize("bad", ["", ".", "..", "a/b", "-lead", ".hidden", "sp ace"])

@@ -1,6 +1,7 @@
 """The ledger: append-only, hash-chained, replayable; and the kill switch."""
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -276,3 +277,21 @@ def test_an_old_integer_share_ledger_replays_cleanly(tmp_path):
     path.write_text(old_style)
     state = Ledger(tmp_path).replay(100_000)
     assert state.positions == {"AAPL": 500} and state.cash == 0
+
+
+def test_pre_approval_ledger_fixture_replays_with_full_hash_verification(tmp_path):
+    fixture = Path(__file__).parent / "fixtures" / "pre_approval_record.json"
+    record = fixture.read_bytes()
+    assert b'"approval_required"' not in record
+    ledger = Ledger(tmp_path)
+    path = ledger.path("2025-01-21")
+    path.parent.mkdir(parents=True)
+    path.write_bytes(record)
+
+    state = ledger.replay(100_000, full=True)
+
+    assert state.last_session == "2025-01-21"
+    assert state.prev_hash == "b5c627cd3d54021fff9d25e18a9710245e48c12bff752f8341d34e515b2615e3"
+    assert state.pending is not None and state.pending.as_of == "2025-01-21"
+    assert not state.pending.spec.approval_required
+    assert "approval_required" not in state.pending.spec.model_dump()

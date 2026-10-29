@@ -1,0 +1,71 @@
+{
+  "schema_version": 2,
+  "fund": "test-fund",
+  "session": "2025-01-21",
+  "universe": [
+    "AAPL"
+  ],
+  "nav": 100000.0,
+  "cash": 100000.0,
+  "positions": {},
+  "marks": {
+    "AAPL": 100.0
+  },
+  "benchmark": "SPY",
+  "benchmark_close": 500.0,
+  "rebalance": true,
+  "executed": null,
+  "decision": {
+    "schema_version": 2,
+    "fund": "test-fund",
+    "as_of": "2025-01-21",
+    "spec": {
+      "schema_version": 2,
+      "name": "test-fund",
+      "strategies": [
+        {
+          "name": "event",
+          "display_name": null,
+          "weight": 1.0,
+          "models": [
+            {
+              "name": "pead",
+              "weight": 1.0,
+              "params": {}
+            }
+          ],
+          "blend": {
+            "method": "conviction_weighted",
+            "gross_target": 1.0,
+            "mode": "long_short"
+          }
+        }
+      ],
+      "risk": {
+        "max_position_pct": 0.25,
+        "max_gross_exposure": 1.0
+      },
+      "capital": 100000.0,
+      "rebalance": "weekly",
+      "benchmark": "SPY"
+    },
+    "universe": [
+      "AAPL"
+    ],
+    "marks": {
+      "AAPL": 100.0
+    },
+    "skipped": [],
+    "strategies": [],
+    "target_weights": {},
+    "clamps": [],
+    "final_weights": {},
+    "risk_scale_factor": null
+  },
+  "prev_hash": null,
+  "hash": "b5c627cd3d54021fff9d25e18a9710245e48c12bff752f8341d34e515b2615e3",
+  "code_version": "legacy-fixture",
+  "mandate_hash": "fee07a2f0facb38f50ec5fe974e9991de35d3a4e6c37a5598dd4a112521127f3",
+  "llm_model": null,
+  "snapshot_times": null
+}
