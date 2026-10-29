@@ -17,6 +17,7 @@ from hedge_fund.tui.app import HedgeFundApp
 from hedge_fund.tui.fixtures import (
     executed_and_decided,
     make_minute_spec,
+    make_pending,
     make_quote,
     make_session,
     make_spec,
@@ -44,6 +45,67 @@ def test_all_modes_can_be_backtested_and_paper_traded(mode, size):
             detail = render(app.screen.query_one("#detail-body", Static).content)
             assert "● new" in detail and "NEXT RUN" in detail
             assert load_deployed(directory).spec == spec
+    asyncio.run(scenario())
+
+
+def test_paper_screen_records_approval_verdicts_from_y_and_n():
+    spec = make_spec(["pead"], "alpha").model_copy(update={"approval_required": True})
+    directory = deploy("alpha", spec, ["TEST"], root=paths.PAPER_DIR)
+    ledger = Ledger(directory)
+    pending = make_pending("2025-01-20")
+    ledger.append(make_session("2025-01-20", decision=pending))
+
+    async def scenario():
+        app = HedgeFundApp()
+        async with app.run_test(size=(140, 50)) as pilot:
+            await app.push_screen(paper.PaperScreen())
+            screen = app.screen
+            assert screen.check_action("approve", ()) and screen.check_action("reject", ())
+            detail = render(screen.query_one("#detail-body", Static).content)
+            assert "awaiting approval — y approve · n reject" in detail
+
+            await pilot.press("y")
+            await pilot.pause()
+            approval = ledger.approval()
+            assert approval is not None
+            assert approval["verdict"] == "approve" and approval["by"] == "tui"
+            assert approval["decision_as_of"] == pending.as_of
+            assert [event["kind"] for event in ledger.events()] == ["approve"]
+            detail = render(screen.query_one("#detail-body", Static).content)
+            assert "approved for execution" in detail
+
+            await pilot.press("n")
+            await pilot.pause()
+            rejection = ledger.approval()
+            assert rejection is not None
+            assert rejection["verdict"] == "reject" and rejection["by"] == "tui"
+            assert [event["kind"] for event in ledger.events()] == ["approve", "reject"]
+            assert "rejected; decision will lapse" in render(screen.query_one("#detail-body", Static).content)
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "gate,pending,halted",
+    [(False, True, False), (True, False, False), (True, True, True)],
+)
+def test_paper_screen_disables_approval_actions_outside_the_gate(gate, pending, halted):
+    spec = make_spec(["pead"], "alpha").model_copy(update={"approval_required": gate})
+    directory = deploy("alpha", spec, ["TEST"], root=paths.PAPER_DIR)
+    ledger = Ledger(directory)
+    if pending:
+        ledger.append(make_session("2025-01-20", decision=make_pending("2025-01-20")))
+    if halted:
+        ledger.halt("operator review")
+
+    async def scenario():
+        app = HedgeFundApp()
+        async with app.run_test(size=(140, 50)) as pilot:
+            await app.push_screen(paper.PaperScreen())
+            screen = app.screen
+            assert not screen.check_action("approve", ())
+            assert not screen.check_action("reject", ())
+            await pilot.press("y", "n")
+            assert ledger.approval() is None
     asyncio.run(scenario())
 
 

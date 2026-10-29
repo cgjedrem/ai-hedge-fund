@@ -72,6 +72,44 @@ class PaperSnapshot:
     def intraday(self) -> bool:
         return self.spec.is_intraday
 
+    @property
+    def gate(self) -> bool:
+        return self.spec.approval_required
+
+    @property
+    def approval(self) -> dict[str, str] | None:
+        if not self.gate or self.pending is None:
+            return None
+        approval = self.ledger.approval()
+        if approval is None or approval["decision_as_of"] != self.pending.as_of:
+            return None
+        return approval
+
+    @property
+    def lapsed(self) -> str | None:
+        if not self.gate or self.pending is not None or self.error:
+            return None
+        try:
+            events = self.ledger.events()
+        except (OSError, ValueError):
+            return None
+        expired = next(
+            (event for event in reversed(events)
+             if isinstance(event, dict) and event.get("kind") == "expire"),
+            None,
+        )
+        if expired is None:
+            return None
+        decision_as_of = expired.get("decision_as_of")
+        if not isinstance(decision_as_of, str) or not decision_as_of:
+            return None
+        newer = any(
+            (record.decision is not None and record.decision.as_of > decision_as_of)
+            or (record.executed is not None and record.executed.as_of > decision_as_of)
+            for record in self.records
+        )
+        return None if newer else decision_as_of
+
     def today(self, today: str | None = None) -> list[SessionRecord]:
         """A minute fund's records from *today* (NY date; default: now)."""
         today = today or datetime.now(NEW_YORK).date().isoformat()
@@ -182,12 +220,26 @@ def next_run_rows(snap: PaperSnapshot, now: datetime | None = None) -> list[tupl
         ("   ● running · space to stop" if snap.running else "   ○ idle · space to start a runner",
          GREEN if snap.running else MUTED)))]
     if snap.pending is not None:
-        rows.append(("First", Text.assemble(
-            "execute the ", (session_label(snap.pending.as_of), BRIGHT), " decision")))
+        if snap.gate:
+            approval = snap.approval
+            if approval is None:
+                status = Text("awaiting approval — y approve · n reject", style=BRIGHT)
+            elif approval["verdict"] == "approve":
+                status = Text("approved for execution · y approve · n reject", style=GREEN)
+            else:
+                status = Text("rejected; decision will lapse · y approve · n reject", style=RED)
+            rows.append(("First", status))
+        else:
+            rows.append(("First", Text.assemble(
+                "execute the ", (session_label(snap.pending.as_of), BRIGHT), " decision")))
         rows.append(("", weights_line(snap.pending)))
     elif snap.last_session is None:
         rows.append(("First", "mark the book at the first bar's prints" if snap.intraday
                      else "mark the book at the latest completed close"))
+    elif snap.lapsed is not None:
+        rows.append(("First", Text.assemble(
+            ("mark the book · ", TEXT), ("decision lapsed", MUTED),
+            (f" ({session_label(snap.lapsed)})", MUTED))))
     else:
         rows.append(("First", "mark the book"))
     cadence = snap.spec.rebalance
@@ -319,7 +371,7 @@ def fetch_snapshots(tickers: list[str]) -> dict[str, PriceSnapshot]:
 
 
 def run_plan(name: str, state: FundState, due: str | None, spec: FundSpec,
-             now: datetime | None = None) -> Text:
+             now: datetime | None = None, *, approval: dict[str, str] | None = None) -> Text:
     """What pressing enter will do, in plain words, from the ledger state and
     the session that is due. Pure: the confirm modal renders it, tests read it.
 
@@ -352,7 +404,22 @@ def run_plan(name: str, state: FundState, due: str | None, spec: FundSpec,
                     style=MUTED)
         return body
     at = _at_phrase(due, moment)
-    if state.pending is not None:
+    approved = (
+        spec.approval_required
+        and approval is not None
+        and approval.get("verdict") == "approve"
+        and state.pending is not None
+        and approval.get("decision_as_of") == state.pending.as_of
+    )
+    if state.pending is not None and spec.approval_required and not approved:
+        body.append("Mark the book at the ", style=TEXT)
+        body.append_text(at)
+        body.append(".  No trades.\n", style=TEXT)
+        body.append("Skip execution; the ", style=MUTED)
+        body.append(session_label(state.pending.as_of), style=f"bold {BRIGHT}")
+        body.append(" decision lapses.\n", style=MUTED)
+        then = "Then "
+    elif state.pending is not None:
         body.append("Execute the ", style=TEXT)
         body.append(session_label(state.pending.as_of), style=f"bold {BRIGHT}")
         body.append(" decision at the ", style=TEXT)

@@ -88,11 +88,9 @@ class BuilderScreen(Screen):
 
     Backtest mode asks four things (name, strategies, capital, cadence) and
     offers to backtest the result; what it trades is chosen per run. Paper
-    mode adds the tickers as a fifth step, because a paper fund trades the
-    same universe every session, and ends with "Run its first session" (or
-    "Start running" for a minute fund). Choosing the minute cadence opens two
-    sub-steps under Cadence, the interval and the trading window, the way
-    "Build your own" opens the agent picker under Strategies.
+    mode adds approval and tickers after cadence, then offers "Run its first
+    session" (or "Start running" for a minute fund). Minute cadence opens two
+    sub-steps under Cadence, interval and trading window.
     """
 
     CADENCES = ["minute", "daily", "weekly", "monthly"]
@@ -115,8 +113,8 @@ class BuilderScreen(Screen):
         self.STEP_IDS = ["step-name", "step-strategies", "step-capital", "step-cadence"]
         self.STEP_TITLES = ["Name", "Strategies", "Capital", "Cadence"]
         if mode == "paper":
-            self.STEP_IDS.append("step-tickers")
-            self.STEP_TITLES.append("Tickers")
+            self.STEP_IDS.extend(["step-approval", "step-tickers"])
+            self.STEP_TITLES.extend(["Approval", "Tickers"])
         # Library sorted like the CLI: discretionary pods first, then by name.
         self._library = sorted(
             (load_strategy(p) for p in STRATEGY_DIR.glob("*.yaml")),
@@ -186,6 +184,24 @@ class BuilderScreen(Screen):
                           for cadence in self.CADENCES),
                         id="cadence-list",
                     )
+                if self.mode == "paper":
+                    with Vertical(id="step-approval", classes="pane"):
+                        yield Label("Require approval before executing decisions?", classes="q")
+                        yield OptionList(
+                            Option(Text.assemble(
+                                ("Automatic ", "bold"),
+                                ("pending decisions run at the next close", MUTED),
+                            ), id="approval-off"),
+                            Option(Text.assemble(
+                                ("Require approval ", "bold"),
+                                ("decisions wait for your yes or no", MUTED),
+                            ), id="approval-on"),
+                            id="approval-list",
+                        )
+                        yield Static(
+                            Text("A missed decision lapses; the fund keeps running.", style=MUTED),
+                            classes="hint",
+                        )
                 with VerticalScroll(id="step-interval", classes="pane"):
                     yield Label("Interval between sessions (minutes)", classes="q")
                     yield Input(value="1", id="interval-input")
@@ -244,12 +260,15 @@ class BuilderScreen(Screen):
         self.query_one("#panes", ContentSwitcher).current = pane_id
         if pane_id in self.STEP_IDS:
             self._step = self.STEP_IDS.index(pane_id)
+        elif pane_id in ("step-interval", "step-window"):
+            self._step = self.STEP_IDS.index("step-cadence")
         focus = {
             "step-name": "#name-input",
             "step-strategies": "#strategy-list",
             "step-agents": "#agent-list",
             "step-capital": "#capital-input",
             "step-cadence": "#cadence-list",
+            "step-approval": "#approval-list",
             "step-interval": "#interval-input",
             "step-window": "#window-start-input",
             "step-tickers": "#tickers-input",
@@ -260,6 +279,10 @@ class BuilderScreen(Screen):
             picked = self._state.get("rebalance", "weekly")
             self.query_one("#cadence-list", OptionList).highlighted = (
                 self.CADENCES.index(picked)
+            )
+        if pane_id == "step-approval":
+            self.query_one("#approval-list", OptionList).highlighted = int(
+                self._state.get("approval_required", False)
             )
         if pane_id == "step-interval":
             self._refresh_interval_line()
@@ -300,8 +323,11 @@ class BuilderScreen(Screen):
             self._goto("step-cadence")
         elif pane == "step-window":
             self._goto("step-interval")
-        elif pane in ("step-tickers", "step-done") and self._state.get("rebalance") == "minute" \
-                and (pane == "step-tickers" or self.mode == "backtest"):
+        elif pane == "step-tickers":
+            self._goto("step-approval")
+        elif pane == "step-approval" and self._state.get("rebalance") == "minute":
+            self._goto("step-window")
+        elif pane == "step-done" and self._state.get("rebalance") == "minute" and self.mode == "backtest":
             self._goto("step-window")
         elif pane == "step-done":
             self._goto(self.STEP_IDS[-1])
@@ -387,9 +413,14 @@ class BuilderScreen(Screen):
 
     def _after_cadence(self) -> None:
         if self.mode == "paper":
-            self._goto("step-tickers")
+            self._goto("step-approval")
         else:
             self._finish_build()
+
+    @on(OptionList.OptionSelected, "#approval-list")
+    def _submit_approval(self, event: OptionList.OptionSelected) -> None:
+        self._state["approval_required"] = event.option_index == 1
+        self._goto("step-tickers")
 
     # ---- the minute sub-steps: interval, then window ------------------------
 
@@ -473,6 +504,7 @@ class BuilderScreen(Screen):
             risk=DEFAULT_RISK,
             capital=self._state["capital"],
             rebalance=self._state["rebalance"],
+            approval_required=self._state.get("approval_required", False),
             **({"interval": self._state["interval"], "window": self._state["window"]} if intraday else {}),
         )
         # The user said yes to replacing the fund that held this name: clear
@@ -515,11 +547,19 @@ class BuilderScreen(Screen):
                 Option("Back", id="go-back"),
             ])
             menu.highlighted = 0
-            first = (
-                f"Its first session marks the book at the {'current bar' if intraday else 'latest completed close'} and "
-                f"makes the first decision; the {'next bar' if intraday else 'session after'} executes it. "
-                "Run it a session at a time, or leave a runner on it from the paper screen (space)."
-            )
+            if spec.approval_required:
+                first = (
+                    f"Its first session marks the book at the {'current bar' if intraday else 'latest completed close'} and "
+                    f"makes the first decision; the {'next bar' if intraday else 'next session'} waits for approval. "
+                    "Without a verdict, that decision lapses and the fund keeps running. "
+                    "Run one session at a time, or leave a runner on it from the paper screen (space)."
+                )
+            else:
+                first = (
+                    f"Its first session marks the book at the {'current bar' if intraday else 'latest completed close'} and "
+                    f"makes the first decision; the {'next bar' if intraday else 'session after'} executes it. "
+                    "Run it a session at a time, or leave a runner on it from the paper screen (space)."
+                )
             self.query_one("#done-summary", Static).update(Group(
                 Text.assemble((spec.name, f"bold {GREEN}"), (" is live.", f"bold {BRIGHT}")),
                 Text(""),
@@ -567,7 +607,9 @@ class BuilderScreen(Screen):
             2: (f"${self._state['capital']:,.0f}"
                 if "capital" in self._state else None),
             3: self._short_cadence(),
-            4: (short_tickers(self._state["universe"], 3)
+            4: ("approval required" if self._state.get("approval_required")
+                else "automatic execution" if "approval_required" in self._state else None),
+            5: (short_tickers(self._state["universe"], 3)
                 if "universe" in self._state else None),
         }
         active = self._step if self._pane() != "step-done" else -1

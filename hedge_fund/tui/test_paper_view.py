@@ -78,6 +78,62 @@ def test_run_plan_on_a_bar_names_the_print_and_how_late_it_is_taken():
         "No bar to run yet.  Next: 13:00:00 ET.")
 
 
+def test_approval_snapshot_rows_and_run_plan_show_gate_state():
+    spec = make_spec(["pead"], "gated").model_copy(update={"approval_required": True})
+    directory = deploy("gated", spec, ["TEST"], root=paths.PAPER_DIR)
+    ledger = Ledger(directory)
+    pending = make_pending("2025-01-20")
+    ledger.append(make_session("2025-01-20", decision=pending))
+    snap = paper_view.PaperSnapshot(directory)
+    assert snap.gate and snap.approval is None
+    state = snap.state
+    assert state is not None
+
+    rows = dict(paper_view.next_run_rows(snap, now=datetime(2025, 1, 21, 12, 0, tzinfo=NEW_YORK)))
+    assert render(rows["First"]) == "awaiting approval — y approve · n reject\n"
+    skipped = paper_view.run_plan("gated", state, "2025-01-21", spec).plain
+    assert "Mark the book at the 2025-01-21 close.  No trades." in skipped
+    assert "Skip execution; the 2025-01-20 decision lapses." in skipped
+
+    ledger.set_approval("approve", pending.as_of, "tui")
+    approval = snap.approval
+    assert approval is not None and approval["verdict"] == "approve"
+    approved = paper_view.run_plan("gated", state, "2025-01-21", spec, approval=approval).plain
+    assert "Execute the 2025-01-20 decision at the 2025-01-21 close" in approved
+    rows = dict(paper_view.next_run_rows(snap, now=datetime(2025, 1, 21, 12, 0, tzinfo=NEW_YORK)))
+    assert "approved for execution" in render(rows["First"])
+
+    ledger.set_approval("reject", pending.as_of, "tui")
+    rejected = paper_view.run_plan("gated", state, "2025-01-21", spec, approval=snap.approval).plain
+    assert "Skip execution" in rejected and "decision lapses" in rejected
+    rows = dict(paper_view.next_run_rows(snap, now=datetime(2025, 1, 21, 12, 0, tzinfo=NEW_YORK)))
+    assert "rejected; decision will lapse" in render(rows["First"])
+
+
+def test_next_run_names_the_expired_decision_until_a_new_decision_exists():
+    spec = make_spec(["pead"], "gated").model_copy(update={"approval_required": True})
+    directory = deploy("gated", spec, ["TEST"], root=paths.PAPER_DIR)
+    ledger = Ledger(directory)
+    expired = make_pending("2025-01-20")
+    first = make_session("2025-01-20", decision=expired)
+    second = make_session("2025-01-21", prev_hash=first.hash)
+    ledger.append(first)
+    ledger.append(second)
+    ledger.log_event("expire", decision_as_of=expired.as_of, reason="no verdict")
+    ledger.log_event("tick", session=second.session, executed=False, decided=False)
+    snap = paper_view.PaperSnapshot(directory)
+
+    assert snap.pending is None and snap.lapsed == expired.as_of
+    rows = dict(paper_view.next_run_rows(snap, now=datetime(2025, 1, 22, 12, 0, tzinfo=NEW_YORK)))
+    assert "decision lapsed" in render(rows["First"])
+
+    fresh = make_pending("2025-01-27")
+    ledger.append(make_session("2025-01-27", decision=fresh, prev_hash=second.hash))
+    snap = paper_view.PaperSnapshot(directory)
+    assert snap.pending is not None and snap.pending.as_of == fresh.as_of
+    assert snap.lapsed is None
+
+
 def test_live_rows_value_the_book_at_the_latest_prints():
     spec = make_spec(["pead"], "alpha")
     directory = deploy("alpha", spec, ["TEST"], root=paths.PAPER_DIR)

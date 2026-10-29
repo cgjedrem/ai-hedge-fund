@@ -81,11 +81,9 @@ from hedge_fund.tui.widgets import first_selectable, StatTiles
 class PaperScreen(Screen):
     """Paper trading. The fund list is the home of the fund: every deployed
     fund on the left, the highlighted one's state and its next run on the
-    right. Enter runs its next session (through the approval step); `space`
-    starts or stops its runner, the detached loop that does the same thing
-    unattended; `s` opens its history; `h`/`r` work the kill switch; the
-    last row builds a new fund. Every verb means the same thing at every
-    cadence; the cadence only decides when the next session is.
+    right. Enter runs its next session; `y`/`n` approve or reject gated
+    decisions. `space` starts or stops its runner; `s` opens history; `h`/`r`
+    work the kill switch. The last row builds a fund.
     """
 
     BINDINGS = [
@@ -93,6 +91,8 @@ class PaperScreen(Screen):
         Binding("enter", "run", "run next session", priority=True),
         Binding("space", "runner", "start/stop runner"),
         Binding("s", "sessions", "sessions"),
+        Binding("y", "approve", "approve"),
+        Binding("n", "reject", "reject"),
         Binding("h", "halt", "halt"),
         Binding("r", "resume", "resume"),
         Binding("d", "delete", "delete"),
@@ -247,6 +247,8 @@ class PaperScreen(Screen):
             return snap.halted is None
         if action == "resume":
             return snap.halted is not None
+        if action in ("approve", "reject"):
+            return snap.gate and snap.pending is not None and snap.halted is None
         if action == "runner":
             return snap.halted is None or snap.running  # a halted fund's runner can still be stopped
         return True
@@ -332,6 +334,22 @@ class PaperScreen(Screen):
         self.notify(f"{snap.deployed.name} resumed")
         self._populate(snap.deployed.name)
 
+    def action_approve(self) -> None:
+        self._record_approval("approve")
+
+    def action_reject(self) -> None:
+        self._record_approval("reject")
+
+    def _record_approval(self, verdict: str) -> None:
+        snap = self._current()
+        if snap is None or snap.error or not snap.gate or snap.pending is None or snap.halted is not None:
+            return
+        name = snap.deployed.name
+        snap.ledger.set_approval(verdict, snap.pending.as_of, "tui")
+        action = "approved" if verdict == "approve" else "rejected"
+        self.notify(f"{name} decision {action} from {snap.pending.as_of}")
+        self._populate(name)
+
     def action_delete(self) -> None:
         snap = self._current()
         if snap is None:
@@ -410,7 +428,9 @@ class RunConfirmScreen(ModalScreen[str | None]):
             (f" through {session_label(due)}?" if due else
              f" again through {session_label(state.last_session)}?" if self._verdict == "redo" else "?",
              f"bold {BRIGHT}")))
-        self.query_one("#run-body", Static).update(run_plan(deployed.name, state, due, deployed.spec))
+        approval = Ledger(self._directory).approval() if deployed.spec.approval_required else None
+        self.query_one("#run-body", Static).update(
+            run_plan(deployed.name, state, due, deployed.spec, approval=approval))
         keys = Text()
         if self._verdict is not None:
             keys.append("enter", style=f"bold {GREEN}")

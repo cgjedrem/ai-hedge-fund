@@ -114,7 +114,7 @@ def test_builder_paper_mode_builds_a_live_fund_and_refuses_taken_names():
             await pilot.press("end", "enter")  # the + row
             screen = app.screen
             assert isinstance(screen, builder.BuilderScreen) and screen.mode == "paper"
-            assert screen.STEP_TITLES == ["Name", "Strategies", "Capital", "Cadence", "Tickers"]
+            assert screen.STEP_TITLES == ["Name", "Strategies", "Capital", "Cadence", "Approval", "Tickers"]
             for taken in ("taken", "saved"):  # paper funds and saved definitions both count
                 screen.query_one("#name-input", Input).value = taken
                 await pilot.press("enter")
@@ -127,6 +127,7 @@ def test_builder_paper_mode_builds_a_live_fund_and_refuses_taken_names():
             await pilot.press("enter")
             screen.query_one("#agent-list", SelectionList).select("pead")
             await pilot.press("enter", "enter", "enter")
+            await pilot.press("enter")
             assert screen.query_one("#panes", ContentSwitcher).current == "step-tickers"
             tickers = screen.query_one("#tickers-input", Input)
             assert tickers.value == "NVDA, AMD"  # prefilled from the newest paper fund
@@ -149,6 +150,39 @@ def test_builder_paper_mode_builds_a_live_fund_and_refuses_taken_names():
             rail = fund_list.query_one("#paper-menu", OptionList)
             assert rail.get_option_at_index(rail.highlighted).id == "paper:0"
             assert "alpha" in render(rail.get_option("paper:0").prompt)
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("approval_required", [False, True])
+def test_builder_paper_mode_sets_approval_required(approval_required):
+    name = "approval-on" if approval_required else "approval-off"
+
+    async def scenario():
+        app = HedgeFundApp()
+        async with app.run_test(size=(120, 45)) as pilot:
+            await app.push_screen(builder.BuilderScreen(mode="paper"))
+            screen = app.screen
+            screen.query_one("#name-input", Input).value = name
+            await pilot.press("enter")
+            screen.query_one("#strategy-list", SelectionList).select(builder.CUSTOM)
+            await pilot.press("enter")
+            screen.query_one("#agent-list", SelectionList).select("pead")
+            await pilot.press("enter", "enter")
+            await pilot.press("enter")
+            assert screen.query_one("#panes", ContentSwitcher).current == "step-approval"
+            choices = screen.query_one("#approval-list", OptionList)
+            choices.highlighted = int(approval_required)
+            await pilot.press("enter")
+            assert screen.query_one("#panes", ContentSwitcher).current == "step-tickers"
+            screen.query_one("#tickers-input", Input).value = "TEST"
+            await pilot.press("enter")
+            await pilot.pause()
+
+            deployed = load_deployed(paths.PAPER_DIR / name)
+            saved = load_spec(paths.MANDATES_DIR / f"{name}.yaml")
+            assert deployed.spec.approval_required is approval_required
+            assert saved.approval_required is approval_required
+
     asyncio.run(scenario())
 
 
@@ -207,16 +241,21 @@ def test_builder_minute_path_sets_interval_and_window_and_offers_start_running()
                 screen.query_one("#window-line", Static).content)
             end.focus()
             await pilot.press("enter")
+            assert screen.query_one("#panes", ContentSwitcher).current == "step-approval"
+            await pilot.press("enter")
             assert screen.query_one("#panes", ContentSwitcher).current == "step-tickers"
             rail = render(screen.query_one("#rail-3", Static).content)
             assert "every 30s" in rail and "09:00–12:00 ET" in rail
-            await pilot.press("escape")  # back from tickers lands on the window, not the cadence list
+            await pilot.press("escape")
+            assert screen.query_one("#panes", ContentSwitcher).current == "step-approval"
+            await pilot.press("escape")
             assert screen.query_one("#panes", ContentSwitcher).current == "step-window"
             await pilot.press("escape", "escape")
             assert screen.query_one("#panes", ContentSwitcher).current == "step-cadence"
             assert cadences.highlighted == 0
             await pilot.press("enter", "enter")  # interval and window remembered
             end.focus()
+            await pilot.press("enter")
             await pilot.press("enter")
             screen.query_one("#tickers-input", Input).value = "TEST"
             await pilot.press("enter")
@@ -303,6 +342,7 @@ def test_builder_replaces_a_taken_name_only_after_yes_and_only_at_the_end():
             await pilot.press("enter")
             screen.query_one("#agent-list", SelectionList).select("pead")
             await pilot.press("enter", "enter", "enter")
+            await pilot.press("enter")
             screen.query_one("#tickers-input", Input).value = "TEST"
             await pilot.press("enter")
             await pilot.pause()
@@ -336,6 +376,7 @@ def test_builder_paper_mode_run_its_first_session_opens_the_approval_step(monkey
             await pilot.press("enter")
             screen.query_one("#agent-list", SelectionList).select("pead")
             await pilot.press("enter", "enter", "enter")
+            await pilot.press("enter")
             screen.query_one("#tickers-input", Input).value = "TEST"
             await pilot.press("enter")
             await pilot.pause()
