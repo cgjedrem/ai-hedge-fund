@@ -6,7 +6,7 @@
 
 ## Summary
 
-Add a per-fund approval gate: when `approval_required` is set on a fund (mandate YAML, TUI builder step, or `aihf paper create --approval`), the paper layer stops auto-executing the pending decision at the next close. The owner yay/nays it via `aihf paper approve|reject <name>` (CLI) or the `y`/`n` actions on the TUI fund screen; the verdict is a small mailbox file (`pending-approval.json`) in the fund dir — visible to both the runner and TUI containers over the shared volume — keyed to the decision it refers to. An unapproved decision is skipped at the next session (audit event, book marked, session recorded, fund NOT halted) and the next decision cycle proceeds normally. The gate lives entirely in the paper layer (`paper/tick.py::_run`, the single choke point shared by `tick`, `redo`, and both runner loops); the engine (`pipeline/session.py`) is untouched. Default OFF keeps byte-identical serialization for existing funds (the new FundSpec field joins the pop-when-default serializer list) so every existing ledger still verifies.
+Add a per-fund approval gate: when `approval_required` is set on a fund (mandate YAML, TUI builder step, or `aihf paper create --approval`), the paper layer stops auto-executing the pending decision at the next close. The owner yay/nays it via `aihf paper approve|reject <name>` (CLI) or the `y`/`n` actions on the TUI fund screen; the verdict is a small mailbox file (`pending-approval.json`) in the fund dir — visible to both the runner and TUI containers over the shared volume — keyed by the decision's `as_of` and source-record hash. An unapproved decision is skipped at the next session (audit event, book marked, session recorded, fund NOT halted) and the next decision cycle proceeds normally. Redo of the deciding session invalidates its verdict; redo of the execution session replays its consumed verdict from the matching `tick` event. The gate lives entirely in the paper layer (`paper/tick.py::_run`, the single choke point shared by `tick`, `redo`, and both runner loops); the engine (`pipeline/session.py`) is untouched. Default OFF keeps byte-identical serialization for existing funds (the new FundSpec field joins the pop-when-default serializer list) so every existing ledger still verifies.
 
 ## Technical Context
 
@@ -14,7 +14,7 @@ Add a per-fund approval gate: when `approval_required` is set on a fund (mandate
 
 **Primary Dependencies**: pydantic v2 (FundSpec), argparse (CLI), Textual 8.x (TUI), PyYAML
 
-**Storage**: filesystem — verdict mailbox `pending-approval.json` in the fund dir (atomic write via `paths.write_atomic`); hash-chained ledgers untouched; `events.jsonl` gains `approve`/`reject`/`expire` kinds (append-only, not hash-chained)
+**Storage**: filesystem — verdict mailbox `pending-approval.json` in the fund dir (atomic write via `paths.write_atomic`); hash-chained ledgers untouched; `events.jsonl` records approval identity, expiry, unlink failures, and consumed-verdict identity on `tick` events (append-only, not hash-chained)
 
 **Testing**: pytest, co-located under `hedge_fund/` (`python -m poetry run pytest hedge_fund -q`); fixtures only — no network, no `~/.hedge-fund` touches, no Docker
 
@@ -34,14 +34,14 @@ Add a per-fund approval gate: when `approval_required` is set on a fund (mandate
 
 | Principle | Status | Notes |
 |-----------|--------|-------|
-| I. Ledger integrity first (MUST) | PASS | No `SessionRecord`/chain changes. New FundSpec field pops from serialization when default (byte-parity test mandatory). The verdict mailbox is keyed to `decision_as_of` so a stale verdict after `redo` is ignored, never honored. The pending decision is never duplicated — the ledger stays the single source of truth. |
+| I. Ledger integrity first (MUST) | PASS | No `SessionRecord`/chain changes. New FundSpec field pops from serialization when default (byte-parity test mandatory). The verdict mailbox binds `decision_as_of` to the source-record hash; source-session redo invalidates it, and execution-session redo replays only the consumed verdict for that identity. The pending decision is never duplicated — the ledger stays the single source of truth. |
 | II. Paper only (MUST) | PASS | No data-provider changes; tests use offline fixtures per existing conftest guards. |
 | III. Tests co-located and green (MUST) | PASS | New tests co-located; suite run in directory chunks on Windows; only the six documented baseline failures tolerated. |
 | IV. Determinism (SHOULD) | PASS | Gate decisions derive from ledger state + verdict file only; tests inject clocks/series per existing conventions. |
 | V. User-visible surfaces stay consistent (SHOULD) | PASS | Approval mode is settable in mandate, validated in spec, honored by the paper scheduler path, selectable in the TUI builder, operable via CLI and TUI, and documented. |
 | VI. Style (MUST) | PASS | black line-length 420 (no reformatting of pre-existing flaky regions in run.py/test_run.py), isort black profile, flake8; all writes BOM-free. |
 
-**Post-design re-check**: PASS — design adds one FundSpec field (popped at default), one mailbox file, three event kinds; no engine, chain, or scheduler changes.
+**Post-design re-check**: PASS — design adds one FundSpec field (popped at default), one mailbox file, identity-bearing audit events, and redo replay; no engine or hash-chain changes.
 
 ## Project Structure
 

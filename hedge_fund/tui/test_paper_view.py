@@ -93,15 +93,16 @@ def test_approval_snapshot_rows_and_run_plan_show_gate_state():
     assert "Mark the book at the 2025-01-21 close.  No trades." in skipped
     assert "Skip execution; the 2025-01-20 decision lapses." in skipped
 
-    ledger.set_approval("approve", pending.as_of, "tui")
+    ledger.set_approval("approve", pending.as_of, state.prev_hash, "tui")
     approval = snap.approval
     assert approval is not None and approval["verdict"] == "approve"
+    assert approval["decision_hash"] == state.prev_hash
     approved = paper_view.run_plan("gated", state, "2025-01-21", spec, approval=approval).plain
     assert "Execute the 2025-01-20 decision at the 2025-01-21 close" in approved
     rows = dict(paper_view.next_run_rows(snap, now=datetime(2025, 1, 21, 12, 0, tzinfo=NEW_YORK)))
     assert "approved for execution" in render(rows["First"])
 
-    ledger.set_approval("reject", pending.as_of, "tui")
+    ledger.set_approval("reject", pending.as_of, state.prev_hash, "tui")
     rejected = paper_view.run_plan("gated", state, "2025-01-21", spec, approval=snap.approval).plain
     assert "Skip execution" in rejected and "decision lapses" in rejected
     rows = dict(paper_view.next_run_rows(snap, now=datetime(2025, 1, 21, 12, 0, tzinfo=NEW_YORK)))

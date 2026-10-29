@@ -17,7 +17,7 @@ Yay the fund's pending decision.
 | a decision is pending | `nothing is awaiting approval for '<name>'` |
 | not halted | halted ⇒ existing halt refusal path (gate adds nothing) |
 
-- Writes the verdict mailbox (`verdict=approve`, keyed to the pending decision's `as_of`, `by="cli"`) + `approve` audit event.
+- Writes the verdict mailbox (`verdict=approve`, keyed to the pending decision's `as_of` and source-record hash, `by="cli"`) + `approve` audit event.
 - Default: the decision executes at the next session close.
 - `--now`: chains one `tick()` immediately; if a session is due the decision executes right away; if none is due (`NothingDue`) the command reports the decision will execute at the next close and exits 0.
 
@@ -25,7 +25,7 @@ Yay the fund's pending decision.
 
 Nay the fund's pending decision. Same preconditions/refusals as approve (no `--now`).
 
-- Writes the verdict mailbox (`verdict=reject`, keyed, `by="cli"`) + `reject` audit event.
+- Writes the verdict mailbox (`verdict=reject`, keyed to the pending decision identity, `by="cli"`) + `reject` audit event.
 - The next session skips execution; the book is unchanged; the verdict is consumed.
 
 ## Changed subcommands

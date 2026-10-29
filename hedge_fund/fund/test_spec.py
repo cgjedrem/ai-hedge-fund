@@ -149,6 +149,15 @@ def test_mandate_without_approval_setting_loads_unchanged(tmp_path):
     assert spec.model_dump_json() == LEGACY_DEFAULT_JSON
 
 
+def test_explicit_false_approval_mandate_preserves_pre_feature_hash(tmp_path):
+    path = tmp_path / "fund.yaml"
+    path.write_text(yaml.safe_dump({**MINIMAL, "approval_required": False}))
+
+    spec = load_spec(path)
+
+    assert spec.model_dump_json() == LEGACY_DEFAULT_JSON
+
+
 @pytest.mark.parametrize("value", [1, "yes"])
 def test_non_boolean_approval_setting_is_rejected_with_field_name(tmp_path, value):
     path = tmp_path / "bad.yaml"

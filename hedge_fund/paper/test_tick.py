@@ -3,6 +3,8 @@
 import json
 import os
 from datetime import datetime
+from importlib import import_module
+from pathlib import Path
 
 import pytest
 import yaml
@@ -33,6 +35,8 @@ from hedge_fund.paper import (
 )
 from hedge_fund.pipeline import DecisionRecord, FundState
 from hedge_fund.pipeline.session import FundHalted
+
+paper_tick_module = import_module("hedge_fund.paper.tick")
 
 LEGACY_FUND_YAML = """schema_version: 2
 name: alpha
@@ -238,7 +242,7 @@ def test_gate_executes_matching_approval_once(tmp_path, clock, SPEC):
     directory = deploy("alpha", spec, ["AAPL"], root=tmp_path)
     first = _tick(directory)
     ledger = Ledger(directory)
-    ledger.set_approval("approve", first.decision.as_of, "cli")
+    ledger.set_approval("approve", first.decision.as_of, first.hash, "cli")
 
     clock("2024-06-05")
     executed = _tick(directory)
@@ -250,6 +254,103 @@ def test_gate_executes_matching_approval_once(tmp_path, clock, SPEC):
     assert [event["kind"] for event in ledger.events()] == ["tick", "approve", "tick"]
 
 
+def test_weekly_redo_invalidates_approval_for_changed_decision(tmp_path, clock, SPEC):
+    spec = SPEC.model_copy(update={"approval_required": True})
+    clock("2024-06-04")
+    directory = deploy("alpha", spec, ["AAPL"], root=tmp_path)
+    ledger = Ledger(directory)
+    original = _tick(directory)
+    assert original.session == "2024-06-03" and original.decision is not None
+    ledger.set_approval("approve", original.decision.as_of, original.hash, "cli")
+
+    bearish = redo(
+        directory,
+        FakeDataClient(SERIES),
+        build_fund=lambda fund_spec: Fund(
+            fund_spec,
+            models={"solo": [FakeAnalyst("a", {"AAPL": -1})]},
+        ),
+    )
+
+    assert bearish.decision is not None
+    assert bearish.decision.final_weights == {"AAPL": -1.0}
+    assert bearish.hash != original.hash
+    assert ledger.approval() is None
+
+    clock("2024-06-05")
+    skipped = _tick(directory)
+
+    assert skipped.session == "2024-06-04"
+    assert skipped.executed is None
+    assert skipped.positions == {}
+    assert ledger.halted() is None
+    assert any(event.get("reason") == "decision redone" for event in ledger.events() if event["kind"] == "expire")
+
+
+def test_redo_expiry_blocks_mailbox_when_unlink_fails(tmp_path, clock, SPEC, monkeypatch):
+    spec = SPEC.model_copy(update={"approval_required": True})
+    clock("2024-06-04")
+    directory = deploy("alpha", spec, ["AAPL"], root=tmp_path)
+    ledger = Ledger(directory)
+    original = _tick(directory)
+    ledger.set_approval("approve", original.decision.as_of, original.hash, "cli")
+    unlink = Path.unlink
+
+    def fail_approval_unlink(path, *args, **kwargs):
+        if path == ledger.approval_path:
+            raise PermissionError("mailbox is held")
+        return unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_approval_unlink)
+
+    redone = redo(directory, FakeDataClient(SERIES), build_fund=build_fund)
+
+    assert redone.hash == original.hash
+    assert ledger.approval() is not None
+    assert any(event.get("reason") == "decision redone" for event in ledger.events() if event["kind"] == "expire")
+    assert any(event["kind"] == "approval_clear_failed" for event in ledger.events())
+
+    clock("2024-06-05")
+    skipped = _tick(directory)
+
+    assert skipped.executed is None
+    assert ledger.halted() is None
+
+
+def test_redo_replays_consumed_gated_approval_for_same_decision(tmp_path, clock, SPEC):
+    spec = SPEC.model_copy(update={"approval_required": True})
+    clock("2024-06-04")
+    directory = deploy("alpha", spec, ["AAPL"], root=tmp_path)
+    ledger = Ledger(directory)
+    monday = _tick(directory)
+    assert monday.decision is not None
+    ledger.set_approval("approve", monday.decision.as_of, monday.hash, "cli")
+
+    clock("2024-06-05")
+    tuesday = _tick(directory)
+    assert tuesday.executed is not None
+    assert tuesday.positions == {"AAPL": 500}
+    assert ledger.approval() is None
+
+    clock("2024-06-06")
+    redone = redo(
+        directory,
+        FakeDataClient(SERIES),
+        build_fund=lambda fund_spec: Fund(
+            fund_spec,
+            models={"solo": [FakeAnalyst("a", {"AAPL": -1})]},
+        ),
+    )
+
+    assert redone.executed is not None
+    assert redone.executed.execution_as_of == tuesday.session
+    assert redone.positions == tuesday.positions
+    tick_events = [event for event in ledger.events() if event["kind"] == "tick"]
+    assert tick_events[-1]["approval_verdict"] == "approve"
+    assert tick_events[-1]["decision_as_of"] == monday.decision.as_of
+    assert tick_events[-1]["decision_hash"] == monday.hash
+
+
 def test_gate_rejects_matching_verdict_without_trading(tmp_path, clock, SPEC):
     spec = SPEC.model_copy(update={"approval_required": True, "rebalance": "daily"})
     clock("2024-06-04")
@@ -257,7 +358,7 @@ def test_gate_rejects_matching_verdict_without_trading(tmp_path, clock, SPEC):
     first = _tick(directory)
     book_before = json.loads((directory / "broker.json").read_text())
     ledger = Ledger(directory)
-    ledger.set_approval("reject", first.decision.as_of, "tui")
+    ledger.set_approval("reject", first.decision.as_of, first.hash, "tui")
 
     clock("2024-06-05")
     rejected = _tick(directory)
@@ -276,7 +377,7 @@ def test_gate_ignores_and_clears_stale_approval(tmp_path, clock, SPEC):
     directory = deploy("alpha", spec, ["AAPL"], root=tmp_path)
     first = _tick(directory)
     ledger = Ledger(directory)
-    ledger.set_approval("approve", "2024-06-02", "cli")
+    ledger.set_approval("approve", "2024-06-02", first.hash, "cli")
 
     clock("2024-06-05")
     skipped = _tick(directory)
@@ -289,18 +390,18 @@ def test_gate_ignores_and_clears_stale_approval(tmp_path, clock, SPEC):
     assert expiry["reason"] == "stale verdict"
 
 
-def test_verdict_written_during_session_waits_for_next_session(tmp_path, clock, SPEC, monkeypatch):
+def test_verdict_written_after_gate_read_cannot_authorize_replacement_decision(tmp_path, clock, SPEC, monkeypatch):
     spec = SPEC.model_copy(update={"approval_required": True, "rebalance": "daily"})
     clock("2024-06-04")
     directory = deploy("alpha", spec, ["AAPL"], root=tmp_path)
-    _tick(directory)
+    first = _tick(directory)
     ledger = Ledger(directory)
     read_approval = Ledger.approval
 
     def write_after_read(current):
         approval = read_approval(current)
         if current.directory == directory and approval is None:
-            current.set_approval("approve", "2024-06-04", "tui")
+            current.set_approval("approve", first.decision.as_of, first.hash, "tui")
         return approval
 
     monkeypatch.setattr(Ledger, "approval", write_after_read)
@@ -309,15 +410,19 @@ def test_verdict_written_during_session_waits_for_next_session(tmp_path, clock, 
 
     assert skipped.session == "2024-06-04" and skipped.executed is None
     assert skipped.decision is not None
-    assert ledger.approval()["decision_as_of"] == skipped.decision.as_of
+    assert ledger.approval()["decision_as_of"] == first.decision.as_of
+    assert ledger.approval()["decision_hash"] == first.hash
 
     monkeypatch.setattr(Ledger, "approval", read_approval)
     clock("2024-06-06")
-    executed = _tick(directory)
+    next_session = _tick(directory)
 
-    assert executed.executed is not None
-    assert executed.executed.as_of == skipped.decision.as_of
+    assert next_session.executed is None
     assert ledger.approval() is None
+    expiry = ledger.events()[-2]
+    assert expiry["kind"] == "expire"
+    assert expiry["reason"] == "stale verdict"
+    assert expiry["decision_hash"] == skipped.hash
 
 
 def test_gate_off_keeps_auto_execution_without_reading_mailbox(tmp_path, clock, SPEC, monkeypatch):
@@ -434,6 +539,37 @@ def test_failure_inside_advance_halts_the_fund_and_a_resume_clears_it(tmp_path, 
         _tick(directory)  # data is fine again, but nobody has looked yet
     ledger.resume()
     assert _tick(directory).session == "2024-06-05"
+
+
+def test_gated_approval_survives_failed_advance_and_retries(tmp_path, clock, SPEC, monkeypatch):
+    spec = SPEC.model_copy(update={"approval_required": True, "rebalance": "daily"})
+    clock("2024-06-04")
+    directory = deploy("alpha", spec, ["AAPL"], root=tmp_path)
+    first = _tick(directory)
+    ledger = Ledger(directory)
+    ledger.set_approval("approve", first.decision.as_of, first.hash, "cli")
+    verdict = ledger.approval()
+    real_advance = paper_tick_module.advance
+
+    def fail_advance(*args, **kwargs):
+        raise ValueError("fixture advance failure")
+
+    monkeypatch.setattr(paper_tick_module, "advance", fail_advance)
+    clock("2024-06-05")
+    with pytest.raises(ValueError, match="fixture advance failure"):
+        _tick(directory)
+
+    assert ledger.halted() is not None
+    assert ledger.approval() == verdict
+    assert ledger.sessions() == ["2024-06-03"]
+
+    ledger.resume()
+    monkeypatch.setattr(paper_tick_module, "advance", real_advance)
+    retried = _tick(directory)
+
+    assert retried.executed is not None
+    assert retried.positions == {"AAPL": 500}
+    assert ledger.approval() is None
 
 
 def test_broker_drift_between_ticks_is_caught_and_halts(tmp_path, clock, SPEC):

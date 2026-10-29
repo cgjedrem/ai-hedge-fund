@@ -335,10 +335,10 @@ class PaperScreen(Screen):
 
     def _record_approval(self, verdict: str) -> None:
         snap = self._current()
-        if snap is None or snap.error or not snap.gate or snap.pending is None or snap.halted is not None:
+        if snap is None or snap.error or not snap.gate or snap.pending is None or snap.halted is not None or snap.state is None or snap.state.prev_hash is None:
             return
         name = snap.deployed.name
-        snap.ledger.set_approval(verdict, snap.pending.as_of, "tui")
+        snap.ledger.set_approval(verdict, snap.pending.as_of, snap.state.prev_hash, "tui")
         action = "approved" if verdict == "approve" else "rejected"
         self.notify(f"{name} decision {action} from {snap.pending.as_of}")
         self._populate(name)
@@ -415,7 +415,9 @@ class RunConfirmScreen(ModalScreen[str | None]):
         self._verdict = "run" if due is not None else "redo" if state.last_session else None
         self._ready = True
         self.query_one("#run-q", Static).update(Text.assemble(("Run ", f"bold {BRIGHT}"), (deployed.name, f"bold {GREEN}"), (f" through {session_label(due)}?" if due else f" again through {session_label(state.last_session)}?" if self._verdict == "redo" else "?", f"bold {BRIGHT}")))
-        approval = Ledger(self._directory).approval() if deployed.spec.approval_required else None
+        approval = None
+        if deployed.spec.approval_required and state.pending is not None:
+            approval, _ = Ledger(self._directory).resolve_approval(state.pending.as_of, state.prev_hash)
         self.query_one("#run-body", Static).update(run_plan(deployed.name, state, due, deployed.spec, approval=approval))
         keys = Text()
         if self._verdict is not None:
@@ -512,8 +514,10 @@ class RunSessionScreen(Screen):
                     if due is None:  # the session slipped out from under the approval step
                         raise NothingDue(f"nothing due after {state.last_session}")
                 dates = assessment_dates(state, due, spec)
-                approval = ledger.approval() if spec.approval_required and state.pending is not None else None
-                app.call_from_thread(self._begin_board, deployed, due, dates, state.pending, approval)
+                approval = None
+                if spec.approval_required and state.pending is not None:
+                    approval, _ = ledger.resolve_approval(state.pending.as_of, state.prev_hash)
+                app.call_from_thread(self._begin_board, deployed, due, dates, state.pending, state.prev_hash, approval)
                 if dates:
                     self._warm(spec, deployed.universe, dates)
                 record = redo(directory, data) if self._redo else tick(directory, data)
@@ -562,11 +566,12 @@ class RunSessionScreen(Screen):
         due: str,
         dates: list[str],
         pending: DecisionRecord | None,
+        pending_hash: str | None,
         approval: dict[str, str] | None = None,
     ) -> None:
         doing = []
         if pending is not None:
-            matching_approval = approval is not None and approval.get("decision_as_of") == pending.as_of
+            matching_approval = approval is not None and approval.get("decision_as_of") == pending.as_of and approval.get("decision_hash") == pending_hash
             if not deployed.spec.approval_required or (matching_approval and approval.get("verdict") == "approve"):
                 doing.append(f"executing the {pending.as_of} decision")
             elif matching_approval and approval.get("verdict") == "reject":

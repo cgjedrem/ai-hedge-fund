@@ -16,6 +16,8 @@ from hedge_fund.fund import Fund, FundSpec
 from hedge_fund.paper.ledger import Ledger, LedgerError
 from hedge_fund.pipeline.session import FundState, SessionRecord
 
+_DECISION_HASH = "0" * 64
+
 
 @pytest.fixture(autouse=True)
 def registered_fakes(monkeypatch):
@@ -193,17 +195,19 @@ def test_kill_switch_round_trips_and_logs(tmp_path):
 def test_approval_mailbox_round_trips_and_logs(tmp_path):
     ledger = Ledger(tmp_path)
 
-    ledger.set_approval("approve", "2026-10-05", "cli")
+    ledger.set_approval("approve", "2026-10-05", _DECISION_HASH, "cli")
     approved = ledger.approval()
     assert approved is not None
     assert approved["verdict"] == "approve"
     assert approved["decision_as_of"] == "2026-10-05"
+    assert approved["decision_hash"] == _DECISION_HASH
     assert approved["by"] == "cli"
-    assert set(approved) == {"verdict", "decision_as_of", "decided_at", "by"}
+    assert set(approved) == {"verdict", "decision_as_of", "decision_hash", "decided_at", "by"}
     assert [event["kind"] for event in ledger.events()] == ["approve"]
     assert ledger.events()[0]["decision_as_of"] == "2026-10-05"
+    assert ledger.events()[0]["decision_hash"] == _DECISION_HASH
 
-    ledger.set_approval("reject", "2026-10-06", "tui")
+    ledger.set_approval("reject", "2026-10-06", "1" * 64, "tui")
     rejected = ledger.approval()
     assert rejected is not None and rejected["verdict"] == "reject"
     assert [event["kind"] for event in ledger.events()] == ["approve", "reject"]
@@ -218,7 +222,7 @@ def test_approval_mailbox_missing_corrupt_and_wrong_verdict_are_absent(tmp_path)
     path.write_text("{broken")
     assert ledger.approval() is None
 
-    path.write_text(json.dumps({"verdict": "yay", "decision_as_of": "2026-10-05", "decided_at": "2026-10-29T22:00:00+00:00", "by": "cli"}))
+    path.write_text(json.dumps({"verdict": "yay", "decision_as_of": "2026-10-05", "decision_hash": _DECISION_HASH, "decided_at": "2026-10-29T22:00:00+00:00", "by": "cli"}))
     assert ledger.approval() is None
 
 
@@ -229,9 +233,9 @@ def test_approval_mailbox_unreadable_file_is_absent(tmp_path):
 
 def test_approval_clear_preserves_a_newer_verdict(tmp_path):
     ledger = Ledger(tmp_path)
-    ledger.set_approval("approve", "2026-10-05", "cli")
+    ledger.set_approval("approve", "2026-10-05", _DECISION_HASH, "cli")
     original = ledger.approval()
-    ledger.set_approval("reject", "2026-10-06", "tui")
+    ledger.set_approval("reject", "2026-10-06", "1" * 64, "tui")
     newer = ledger.approval()
 
     ledger.clear_approval(expected=original)
@@ -241,18 +245,39 @@ def test_approval_clear_preserves_a_newer_verdict(tmp_path):
     assert ledger.approval() is None
 
 
+def test_approval_clear_logs_unlink_error(tmp_path, monkeypatch):
+    ledger = Ledger(tmp_path)
+    ledger.set_approval("approve", "2026-10-05", _DECISION_HASH, "cli")
+    approval = ledger.approval()
+    unlink = Path.unlink
+
+    def fail_approval_unlink(path, *args, **kwargs):
+        if path == ledger.approval_path:
+            raise PermissionError("mailbox is held")
+        return unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_approval_unlink)
+
+    assert ledger.clear_approval(expected=approval) is False
+    assert ledger.approval() == approval
+    event = ledger.events()[-1]
+    assert event["kind"] == "approval_clear_failed"
+    assert event["error"] == "PermissionError"
+
+
 @pytest.mark.parametrize(
-    "verdict,decision_as_of,by",
+    "verdict,decision_as_of,decision_hash,by",
     [
-        ("yay", "2026-10-05", "cli"),
-        ("approve", "", "cli"),
-        ("reject", "2026-10-05", "runner"),
-        (None, "2026-10-05", "cli"),
+        ("yay", "2026-10-05", _DECISION_HASH, "cli"),
+        ("approve", "", _DECISION_HASH, "cli"),
+        ("approve", "2026-10-05", "not-a-hash", "cli"),
+        ("reject", "2026-10-05", _DECISION_HASH, "runner"),
+        (None, "2026-10-05", _DECISION_HASH, "cli"),
     ],
 )
-def test_set_approval_validates_mailbox_values(tmp_path, verdict, decision_as_of, by):
+def test_set_approval_validates_mailbox_values(tmp_path, verdict, decision_as_of, decision_hash, by):
     with pytest.raises(ValueError):
-        Ledger(tmp_path).set_approval(verdict, decision_as_of, by)
+        Ledger(tmp_path).set_approval(verdict, decision_as_of, decision_hash, by)
 
 
 def _compat_record(positions: dict[str, float]) -> SessionRecord:

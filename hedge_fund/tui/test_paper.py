@@ -56,6 +56,7 @@ def test_paper_screen_records_approval_verdicts_from_y_and_n():
     ledger = Ledger(directory)
     pending = make_pending("2025-01-20")
     ledger.append(make_session("2025-01-20", decision=pending))
+    state = ledger.replay(spec.capital)
 
     async def scenario():
         app = HedgeFundApp()
@@ -72,6 +73,7 @@ def test_paper_screen_records_approval_verdicts_from_y_and_n():
             assert approval is not None
             assert approval["verdict"] == "approve" and approval["by"] == "tui"
             assert approval["decision_as_of"] == pending.as_of
+            assert approval["decision_hash"] == state.prev_hash
             assert [event["kind"] for event in ledger.events()] == ["approve"]
             detail = render(screen.query_one("#detail-body", Static).content)
             assert "approved for execution" in detail
@@ -93,6 +95,7 @@ def test_run_session_board_reports_a_gated_skip(monkeypatch):
     ledger = Ledger(directory)
     pending = make_pending("2025-01-20")
     ledger.append(make_session("2025-01-20", decision=pending))
+    pending_hash = ledger.latest().hash
     deployed = load_deployed(directory)
     monkeypatch.setattr(paper.RunSessionScreen, "_run", lambda self: None)
 
@@ -101,12 +104,12 @@ def test_run_session_board_reports_a_gated_skip(monkeypatch):
         async with app.run_test(size=(140, 50)):
             screen = paper.RunSessionScreen(directory)
             await app.push_screen(screen)
-            screen._begin_board(deployed, "2025-01-21", [], pending)
+            screen._begin_board(deployed, "2025-01-21", [], pending, pending_hash)
             phase = render(screen.query_one("#run-phase", Static).content)
             assert "skipping execution of the 2025-01-20 decision; it lapses" in phase
 
-            approval = ledger.set_approval("approve", pending.as_of, "tui")
-            screen._begin_board(deployed, "2025-01-21", [], pending, approval)
+            approval = ledger.set_approval("approve", pending.as_of, pending_hash, "tui")
+            screen._begin_board(deployed, "2025-01-21", [], pending, pending_hash, approval)
             phase = render(screen.query_one("#run-phase", Static).content)
             assert "executing the 2025-01-20 decision" in phase
 

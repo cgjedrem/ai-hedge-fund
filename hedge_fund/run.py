@@ -368,8 +368,8 @@ def _paper(args, parser: argparse.ArgumentParser, console: Console) -> None:
             deployed = load_deployed(directory)
             when = "bar" if deployed.spec.is_intraday else "close"
             if deployed.spec.approval_required:
-                approval = ledger.approval()
-                if approval is not None and approval["decision_as_of"] == latest.decision.as_of:
+                approval, _ = ledger.resolve_approval(latest.decision.as_of, latest.hash)
+                if approval is not None:
                     state = "approved for execution" if approval["verdict"] == "approve" else "rejected; execution will be skipped"
                     print(f"  pending decision, {state} at the next {when}:")
                 else:
@@ -405,7 +405,9 @@ def _paper(args, parser: argparse.ArgumentParser, console: Console) -> None:
             parser.error(f"approval gate is not enabled for '{args.name}'")
         if state.pending is None:
             parser.error(f"nothing is awaiting approval for '{args.name}'")
-        ledger.set_approval(args.action, state.pending.as_of, "cli")
+        if state.prev_hash is None:
+            parser.error(f"pending decision for '{args.name}' has no source record hash")
+        ledger.set_approval(args.action, state.pending.as_of, state.prev_hash, "cli")
         if args.action == "approve":
             console.print(f"[green]{args.name}[/] approved decision from {state.pending.as_of}")
         else:
@@ -450,8 +452,8 @@ def _status_line(directory: Path) -> str:
     running = "  ·  running" if is_running(directory) else ""
     approval_state = ""
     if deployed.spec.approval_required and latest is not None and latest.decision is not None:
-        approval = ledger.approval()
-        if approval is not None and approval["decision_as_of"] == latest.decision.as_of:
+        approval, _ = ledger.resolve_approval(latest.decision.as_of, latest.hash)
+        if approval is not None:
             approval_state = f"  ·  {approval['verdict']} recorded"
         else:
             approval_state = "  ·  awaiting approval"

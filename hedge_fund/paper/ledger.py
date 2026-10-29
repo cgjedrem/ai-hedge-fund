@@ -22,6 +22,9 @@ does. A checkpoint is a cache of the chain, never a substitute for it.
 control.json is the kill switch. It is read into FundState.halted by
 `replay`, and `advance` checks it first — so no client of the engine (CLI,
 TUI, cron) can trade a halted fund by forgetting to look.
+
+Corrupt `control.json` raises; a broken halt must fail loud. Corrupt
+`pending-approval.json` means no verdict; a broken vote must never become yay.
 """
 
 from __future__ import annotations
@@ -44,6 +47,7 @@ EVENTS_FILE = "events.jsonl"
 
 _DAY = re.compile(r"\d{4}-\d{2}-\d{2}")
 _BAR_FILE = re.compile(r"(\d{2})(\d{2})(\d{2})")
+_HASH = re.compile(r"[0-9a-f]{64}")
 
 
 class LedgerError(RuntimeError):
@@ -252,16 +256,19 @@ class Ledger:
             value = json.loads(self.approval_path.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError):
             return None
-        fields = {"verdict", "decision_as_of", "decided_at", "by"}
+        fields = {"verdict", "decision_as_of", "decision_hash", "decided_at", "by"}
         if not isinstance(value, dict) or set(value) != fields:
             return None
         verdict = value["verdict"]
         decision_as_of = value["decision_as_of"]
+        decision_hash = value["decision_hash"]
         decided_at = value["decided_at"]
         by = value["by"]
         if not isinstance(verdict, str) or verdict not in {"approve", "reject"}:
             return None
         if not isinstance(decision_as_of, str) or not decision_as_of.strip():
+            return None
+        if not isinstance(decision_hash, str) or _HASH.fullmatch(decision_hash) is None:
             return None
         if not isinstance(decided_at, str) or not isinstance(by, str) or by not in {"cli", "tui"}:
             return None
@@ -273,30 +280,106 @@ class Ledger:
             return None
         return value
 
-    def set_approval(self, verdict: str, decision_as_of: str, by: str) -> dict[str, str]:
+    def resolve_approval(self, decision_as_of: str, decision_hash: str) -> tuple[dict[str, str] | None, dict[str, str] | None]:
+        mailbox = self.approval()
+        if mailbox is None:
+            return self._consumed_approval(decision_as_of, decision_hash), None
+        if mailbox["decision_as_of"] != decision_as_of or mailbox["decision_hash"] != decision_hash:
+            return None, mailbox
+        event = self._latest_approval_event(decision_as_of, decision_hash)
+        if event is not None:
+            kind = event.get("kind")
+            if kind == "expire":
+                return None, mailbox
+            if kind in {"approve", "reject"} and (kind != mailbox["verdict"] or event.get("by") != mailbox["by"]):
+                return None, mailbox
+            if kind == "tick" and (event.get("approval_verdict") != mailbox["verdict"] or event.get("approval_by") != mailbox["by"]):
+                return None, mailbox
+        return mailbox, mailbox
+
+    def _consumed_approval(self, decision_as_of: str, decision_hash: str) -> dict[str, str] | None:
+        try:
+            self.approval_path.stat()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            return None
+        else:
+            return None
+        event = self._latest_approval_event(decision_as_of, decision_hash)
+        if event is None or event.get("kind") != "tick":
+            return None
+        verdict = event.get("approval_verdict")
+        by = event.get("approval_by")
+        decided_at = event.get("time")
+        if verdict not in {"approve", "reject"} or by not in {"cli", "tui"} or not isinstance(decided_at, str):
+            return None
+        return {
+            "verdict": verdict,
+            "decision_as_of": decision_as_of,
+            "decision_hash": decision_hash,
+            "decided_at": decided_at,
+            "by": by,
+        }
+
+    def _latest_approval_event(self, decision_as_of: str, decision_hash: str) -> dict | None:
+        try:
+            events = self.events()
+        except (OSError, UnicodeError, ValueError):
+            return None
+        for event in reversed(events):
+            if not isinstance(event, dict):
+                continue
+            if event.get("decision_as_of") != decision_as_of or event.get("decision_hash") != decision_hash:
+                continue
+            kind = event.get("kind")
+            if kind in {"approve", "reject", "expire"}:
+                return event
+            if kind == "tick" and event.get("approval_verdict") in {"approve", "reject"}:
+                return event
+        return None
+
+    def set_approval(self, verdict: str, decision_as_of: str, decision_hash: str, by: str) -> dict[str, str]:
         if not isinstance(verdict, str) or verdict not in {"approve", "reject"}:
             raise ValueError("verdict must be 'approve' or 'reject'")
         if not isinstance(decision_as_of, str) or not decision_as_of.strip():
             raise ValueError("decision_as_of must be a non-empty string")
+        if not isinstance(decision_hash, str) or _HASH.fullmatch(decision_hash) is None:
+            raise ValueError("decision_hash must be a lowercase SHA-256 hash")
         if not isinstance(by, str) or by not in {"cli", "tui"}:
             raise ValueError("by must be 'cli' or 'tui'")
         value = {
             "verdict": verdict,
             "decision_as_of": decision_as_of,
+            "decision_hash": decision_hash,
             "decided_at": _now(),
             "by": by,
         }
         write_atomic(self.approval_path, json.dumps(value, indent=2))
-        self.log_event(verdict, decision_as_of=decision_as_of, by=by)
+        self.log_event(verdict, decision_as_of=decision_as_of, decision_hash=decision_hash, by=by)
         return value
 
-    def clear_approval(self, expected: dict[str, str] | None = None) -> None:
+    def clear_approval(self, expected: dict[str, str] | None = None) -> bool:
+        """Clear expected verdict. Read/compare/unlink race accepted at human voting speed."""
         if expected is not None and self.approval() != expected:
-            return
+            return False
         try:
             self.approval_path.unlink()
         except FileNotFoundError:
-            pass
+            return False
+        except OSError as exc:
+            fields = {}
+            if expected is not None:
+                fields = {
+                    "decision_as_of": expected["decision_as_of"],
+                    "decision_hash": expected["decision_hash"],
+                }
+            try:
+                self.log_event("approval_clear_failed", error=type(exc).__name__, **fields)
+            except OSError:
+                pass
+            return False
+        return True
 
     # ---- events -----------------------------------------------------------
 

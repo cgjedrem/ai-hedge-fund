@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import uuid
 from pathlib import Path
 
 USER_DIR = Path.home() / ".hedge-fund"
@@ -44,6 +45,6 @@ def write_atomic(path: Path, text: str) -> None:
     """Write *text* to *path* via a sibling temp file and rename, so a crash
     mid-write leaves the old file intact rather than a truncated one."""
     path = Path(path)
-    tmp = path.with_name(f".{path.name}.tmp")
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
     tmp.write_text(text, encoding="utf-8")
     os.replace(tmp, path)

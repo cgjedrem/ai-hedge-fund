@@ -116,14 +116,15 @@ A reader of the top-level documentation can find what approval mode is, that it 
 
 ### Edge Cases
 
-- What happens when a verdict is written while a session is mid-run? It applies at the next session; the current session is unaffected.
-- What happens when the deciding session is redone (`paper tick --again`) while a verdict is pending? The verdict is keyed to the decision it approved; a replaced decision makes the verdict stale and it is ignored, never honored.
+- What happens when a verdict is written while a session is mid-run? It cannot alter the in-flight session. At the next gate, it is honored only if both its decision date and source-record hash still match; a replaced decision makes it stale.
+- What happens when the deciding session is redone (`paper tick --again`) while a verdict is pending? The verdict is keyed to the decision's date and source-record hash; redo invalidates it, and a replacement decision needs a new verdict even when its date is unchanged.
+- What happens when an execution session is redone after consuming a verdict? The original `tick` audit event carries the consumed verdict identity; redo replays it only for that same source decision.
 - What happens when approval mode is toggled on a deployed fund while a decision is pending? There is no live-edit path for deployed funds; the CLI and TUI refuse to change approval-adjacent state while a decision is pending, and the deployed configuration is frozen at creation by design.
 - What happens when approve is requested with the immediate option but no session is due? The command reports the decision will execute at the next close instead of failing.
 - What happens when a gated fund is also halted? The kill switch wins exactly as today; the gate neither adds nor removes halt behavior, and never writes the kill-switch file.
 - What happens when a gated weekly/monthly fund's decision is skipped mid-period? The fund stays mark-only until the next period's decision; the UI copy says the decision lapsed rather than silently vanishing.
 - What happens when the verdict file is corrupt or unreadable? It is treated as absent (fail-safe for a mailbox), never as a yay.
-- What happens when two surfaces (runner container and TUI container) touch the verdict at once? Writes are atomic file replacements; last writer wins at human decision speed; a verdict written mid-session applies next session.
+- What happens when two surfaces (runner container and TUI container) touch the verdict at once? Writes use unique temporary paths and atomic replacement; last writer wins at human decision speed. A late verdict cannot be rebound to a different source record.
 
 ## Requirements *(mandatory)*
 
@@ -134,7 +135,7 @@ A reader of the top-level documentation can find what approval mode is, that it 
 - **FR-003**: The system MUST reject a non-boolean approval setting in the mandate with a clear validation error.
 - **FR-004**: The system MUST keep the stored configuration of funds without approval mode byte-identical to the current system's output, so existing ledgers remain verifiable.
 - **FR-005**: The system MUST store the approval verdict as a file in the fund directory, readable and writable by both the runner and TUI containers sharing the fund volume.
-- **FR-006**: The system MUST key the verdict to the decision it refers to, and MUST ignore (never honor) a verdict that does not match the currently pending decision.
+- **FR-006**: The system MUST key the verdict to both the pending decision's `as_of` and the hash of the record that produced it, and MUST ignore (never honor) a verdict that does not match both values.
 - **FR-007**: The system MUST NOT auto-execute a pending decision at the next close for a gated fund; the session proceeds (book marked, value computed, session recorded) without executing the unapproved decision.
 - **FR-008**: The system MUST continue operating a gated fund after a skipped decision: the next decision cycle proceeds normally and the fund is not halted.
 - **FR-009**: The system MUST provide `aihf paper approve <name>` and `aihf paper reject <name>` commands that record the verdict and an audit event, refusing with clear messages when approval mode is off or nothing is pending.
@@ -149,7 +150,7 @@ A reader of the top-level documentation can find what approval mode is, that it 
 ### Key Entities *(include if feature involves data)*
 
 - **Approval mode**: A per-fund setting, fixed at fund creation, recorded in the fund's frozen configuration. Default off.
-- **Approval verdict**: The owner's yay/nay for one specific pending decision, stored in the fund directory, carrying which decision it refers to, when it was decided, and by which surface. Consumed exactly once.
+- **Approval verdict**: The owner's yay/nay for one specific pending decision, stored in the fund directory, carrying its `as_of`, source-record hash, decision time, and surface. Consumed once; redo of its execution session replays the same verdict from the tick audit event.
 - **Pending decision**: The fund's most recent assessed decision awaiting execution — already lives in the session ledger; this feature adds no second copy of it.
 - **Audit events**: The fund's append-only event log, extended with approval, rejection, and expiry/skip kinds.
 
@@ -167,7 +168,7 @@ A reader of the top-level documentation can find what approval mode is, that it 
 ## Assumptions
 
 - **Decision stays in the ledger.** The pending decision already lives in the hash-chained session ledger; this feature adds only the verdict as new on-disk state. No decision duplication, no chain changes.
-- **Verdict consumed once.** An approve verdict is consumed by the session that executes the decision; a reject verdict by the session that skips it. The verdict file is cleared after consumption.
+- **Verdict consumed once per recorded execution session.** An approve verdict is consumed by the session that executes the decision; a reject verdict by the session that skips it. The verdict file is cleared after a successful append; redo replays the recorded verdict for the same source decision.
 - **Setting fixed at creation.** Deployed fund configurations are frozen by design (mandate-hash guard); approval mode is set on the creation surfaces and not live-toggled on a deployed fund. Approval-adjacent operations refuse while a decision is pending.
 - **Expiry is per-session, not time-based.** "No approval by the next session" is the expiry rule; there is no separate timeout clock.
 - **Gate lives in the paper layer.** Backtests are unaffected: approval mode has no meaning for backtesting, and the engine's shared session path is not altered.

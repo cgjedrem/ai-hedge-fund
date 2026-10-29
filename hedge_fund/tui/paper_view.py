@@ -89,11 +89,9 @@ class PaperSnapshot:
 
     @property
     def approval(self) -> dict[str, str] | None:
-        if not self.gate or self.pending is None:
+        if not self.gate or self.pending is None or self.state is None:
             return None
-        approval = self.ledger.approval()
-        if approval is None or approval["decision_as_of"] != self.pending.as_of:
-            return None
+        approval, _ = self.ledger.resolve_approval(self.pending.as_of, self.state.prev_hash)
         return approval
 
     @property
@@ -401,7 +399,7 @@ def run_plan(name: str, state: FundState, due: str | None, spec: FundSpec, now: 
         body.append(f"The analysts look again and the book is sized again at the {at}. " "The recorded session is replaced; the old record is kept aside, off the chain.", style=MUTED)
         return body
     at = _at_phrase(due, moment)
-    approved = spec.approval_required and approval is not None and approval.get("verdict") == "approve" and state.pending is not None and approval.get("decision_as_of") == state.pending.as_of
+    approved = spec.approval_required and approval is not None and approval.get("verdict") == "approve" and state.pending is not None and approval.get("decision_as_of") == state.pending.as_of and approval.get("decision_hash") == state.prev_hash
     if state.pending is not None and spec.approval_required and not approved:
         body.append("Mark the book at the ", style=TEXT)
         body.append_text(at)

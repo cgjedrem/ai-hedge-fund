@@ -19,7 +19,7 @@ All scenarios run against fixture funds in a scratch home (tests) — never `~/.
 ## Scenario 3 — Approve (yay) (US3.1–3.2, SC-003)
 
 1. Gated fund with a pending decision → `aihf paper approve <name>`.
-2. **Expect**: verdict file written (`verdict=approve`, keyed to the pending `as_of`), `approve` audit event; the next session executes the decision.
+2. **Expect**: verdict file written (`verdict=approve`, keyed to the pending `as_of` and source-record hash), `approve` audit event; the next session executes the decision.
 3. With a session due → `aihf paper approve <name> --now` executes immediately.
 4. With no session due → `--now` reports "will execute at the next close", exit 0.
 

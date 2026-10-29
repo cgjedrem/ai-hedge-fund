@@ -245,9 +245,18 @@ def redo(
         raise NothingDue(f"{deployed.name}: no session recorded yet, nothing to run again")
 
     before = ledger.replay(deployed.spec.capital, before=state.last_session)
+    mailbox = ledger.approval() if deployed.spec.approval_required else None
     superseded = ledger.rewind()
     PaperBroker.restore(directory / BROKER_FILE, before.cash, before.positions, deployed.spec.costs)
     ledger.log_event("redo", session=superseded.session, superseded=superseded.hash)
+    if mailbox is not None and (mailbox["decision_as_of"] == superseded.session or mailbox["decision_hash"] == superseded.hash):
+        ledger.clear_approval(expected=mailbox)
+        ledger.log_event(
+            "expire",
+            decision_as_of=mailbox["decision_as_of"],
+            decision_hash=mailbox["decision_hash"],
+            reason="decision redone",
+        )
     clock = None
     if deployed.spec.is_intraday:  # a bar's prints are gone; run it at the ones it kept
         clock = RecordedClock(superseded, deployed.spec.interval_seconds, deployed.spec.window)
@@ -275,17 +284,19 @@ def _run(
     fund = fund or (build_fund or Fund)(deployed.spec)
     run_state = state
     clear_verdict = None
+    consumed_verdict = None
     audit = None
     if deployed.spec.approval_required and state.pending is not None:
-        approval = ledger.approval()
-        if approval is not None and approval["decision_as_of"] == state.pending.as_of:
-            clear_verdict = approval
+        approval, clear_verdict = ledger.resolve_approval(state.pending.as_of, state.prev_hash)
+        if approval is not None:
+            consumed_verdict = approval
             if approval["verdict"] == "reject":
                 run_state = state.model_copy(update={"pending": None})
                 audit = (
                     "reject",
                     {
                         "decision_as_of": state.pending.as_of,
+                        "decision_hash": state.prev_hash,
                         "by": approval["by"],
                         "consumed": True,
                         "session": session,
@@ -293,12 +304,12 @@ def _run(
                 )
         else:
             run_state = state.model_copy(update={"pending": None})
-            clear_verdict = approval
             audit = (
                 "expire",
                 {
                     "decision_as_of": state.pending.as_of,
-                    "reason": "stale verdict" if approval is not None else "no verdict",
+                    "decision_hash": state.prev_hash,
+                    "reason": "stale verdict" if clear_verdict is not None else "no verdict",
                 },
             )
     try:
@@ -311,18 +322,27 @@ def _run(
         ledger.log_event("tick_failed", session=session, error=f"{type(exc).__name__}: {exc}")
         ledger.halt(reason)
         raise
-    if clear_verdict is not None:
-        ledger.clear_approval(expected=clear_verdict)
     if audit is not None:
         kind, fields = audit
         ledger.log_event(kind, **fields)
-    ledger.log_event(
-        "tick",
-        session=session,
-        nav=record.nav,
-        executed=record.executed is not None,
-        decided=record.decision is not None,
-    )
+    tick_fields = {
+        "session": session,
+        "nav": record.nav,
+        "executed": record.executed is not None,
+        "decided": record.decision is not None,
+    }
+    if consumed_verdict is not None:
+        tick_fields.update(
+            {
+                "decision_as_of": consumed_verdict["decision_as_of"],
+                "decision_hash": consumed_verdict["decision_hash"],
+                "approval_verdict": consumed_verdict["verdict"],
+                "approval_by": consumed_verdict["by"],
+            }
+        )
+    ledger.log_event("tick", **tick_fields)
+    if clear_verdict is not None:
+        ledger.clear_approval(expected=clear_verdict)
     if is_intraday(session) and is_last_bar(session, deployed.spec.window):
         ledger.checkpoint(next_state(state, record))
     return record
