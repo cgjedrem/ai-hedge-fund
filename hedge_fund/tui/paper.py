@@ -528,7 +528,8 @@ class RunSessionScreen(Screen):
                     if due is None:  # the session slipped out from under the approval step
                         raise NothingDue(f"nothing due after {state.last_session}")
                 dates = assessment_dates(state, due, spec)
-                app.call_from_thread(self._begin_board, deployed, due, dates, state.pending)
+                approval = ledger.approval() if spec.approval_required and state.pending is not None else None
+                app.call_from_thread(self._begin_board, deployed, due, dates, state.pending, approval)
                 if dates:
                     self._warm(spec, deployed.universe, dates)
                 record = redo(directory, data) if self._redo else tick(directory, data)
@@ -573,11 +574,27 @@ class RunSessionScreen(Screen):
 
     # ---- UI-thread updates ------------------------------------------------
 
-    def _begin_board(self, deployed: DeployedFund, due: str, dates: list[str],
-                     pending: DecisionRecord | None) -> None:
+    def _begin_board(
+        self,
+        deployed: DeployedFund,
+        due: str,
+        dates: list[str],
+        pending: DecisionRecord | None,
+        approval: dict[str, str] | None = None,
+    ) -> None:
         doing = []
         if pending is not None:
-            doing.append(f"executing the {pending.as_of} decision")
+            matching_approval = (
+                approval is not None and approval.get("decision_as_of") == pending.as_of
+            )
+            if not deployed.spec.approval_required or (
+                matching_approval and approval.get("verdict") == "approve"
+            ):
+                doing.append(f"executing the {pending.as_of} decision")
+            elif matching_approval and approval.get("verdict") == "reject":
+                doing.append(f"skipping the rejected {pending.as_of} decision; it lapses")
+            else:
+                doing.append(f"skipping execution of the {pending.as_of} decision; it lapses")
         if due in dates:
             doing.append("assessing the next decision")
         if not doing:

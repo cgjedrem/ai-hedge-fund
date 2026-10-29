@@ -84,6 +84,31 @@ def test_paper_screen_records_approval_verdicts_from_y_and_n():
     asyncio.run(scenario())
 
 
+def test_run_session_board_reports_a_gated_skip(monkeypatch):
+    spec = make_spec(["pead"], "alpha").model_copy(update={"approval_required": True})
+    directory = deploy("alpha", spec, ["TEST"], root=paths.PAPER_DIR)
+    ledger = Ledger(directory)
+    pending = make_pending("2025-01-20")
+    ledger.append(make_session("2025-01-20", decision=pending))
+    deployed = load_deployed(directory)
+    monkeypatch.setattr(paper.RunSessionScreen, "_run", lambda self: None)
+
+    async def scenario():
+        app = HedgeFundApp()
+        async with app.run_test(size=(140, 50)):
+            screen = paper.RunSessionScreen(directory)
+            await app.push_screen(screen)
+            screen._begin_board(deployed, "2025-01-21", [], pending)
+            phase = render(screen.query_one("#run-phase", Static).content)
+            assert "skipping execution of the 2025-01-20 decision; it lapses" in phase
+
+            approval = ledger.set_approval("approve", pending.as_of, "tui")
+            screen._begin_board(deployed, "2025-01-21", [], pending, approval)
+            phase = render(screen.query_one("#run-phase", Static).content)
+            assert "executing the 2025-01-20 decision" in phase
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize(
     "gate,pending,halted",
     [(False, True, False), (True, False, False), (True, True, True)],
