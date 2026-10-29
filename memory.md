@@ -1,0 +1,2 @@
+[2026-10-29] [high] Source: hedge_fund/pipeline/session.py; SessionRecord.code_version embeds the repo revision, so byte-parity checks across commits must pin the revision stamp.
+[2026-10-29] [high] Source: hedge_fund/fund/spec.py and hedge_fund/run.py; day-grid serialization omits minute-only interval/window, so cadence transforms drop those keys before model validation and allow minute defaults to return.

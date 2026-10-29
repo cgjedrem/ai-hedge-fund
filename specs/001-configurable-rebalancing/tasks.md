@@ -124,8 +124,11 @@ None required. No shared infrastructure changes: FundSpec, the scheduler, and th
 ## Phase 8: Polish & Cross-Cutting Concerns
 
 - [ ] T012 Run the full suite in directory chunks (`test_run.py`+`fund`, `pipeline`, `tui`, `backtesting`, `paper`, `features`, remaining dirs) and sum results: only the six documented Windows baseline failures tolerated (SC-006).
+  - **Evidence (partial; HEAD `5f71f2b`, clean worktree during runs)**: CLI+fund 94 passed (pytest summary; process exit 1, same post-summary anomaly observed at T001); pipeline 74 passed; TUI full attempt 45 passed, 1 known failure, then `KeyboardInterrupt` after 27.63s in runner-screen tests; excluding the two blocked runner parameter cases: 63 passed, 2 known failures, 2 deselected; backtesting 26 passed; paper 34 passed, 3 known failures; features 36 passed, 1 known failure; data 108 passed, 37 skipped; brokers 28 passed; llm 291 passed; portfolio 42 passed; risk 17 passed; scorecard 17 passed; signals 56 passed; root paths 2 passed; strategies and validation contained no tests (pytest exit 5). Completed chunks sum to 888 passed, 37 skipped, 6 documented Windows failures, 2 deselected. Full TUI completion remains unverified.
 - [ ] T013 Style gate on touched files: `black --check --line-length 420`, `isort --check-only` (black profile), `flake8` (constitution VI).
-- [ ] T014 Verify no UTF-8 BOM in touched YAML/spec files and run the quickstart.md validation scenarios; clean up any temp artifacts.
+  - **Evidence (partial)**: Current Black check says both touched Python files would reformat; isort flags `test_run.py`; default flake8 reports line-length/style diagnostics. All three failures reproduce on pre-feature source `dd4c7c7`. With flake8 line length set to the project’s 420, `run.py` has 0 diagnostics and `test_run.py` has the same 6 pre-existing E306 findings before and after. No broad reformat applied; T013 remains incomplete.
+- [X] T014 Verify no UTF-8 BOM in touched YAML/spec files and run the quickstart.md validation scenarios; clean up any temp artifacts.
+  - **Evidence**: No BOM in `hedge_fund/fund/example.yaml` or this task file. Quickstart smoke copied the example mandate to a temporary directory, used synthetic offline prices, and confirmed monthly output (2 cycles), unchanged source bytes, and `hourly` usage error before engine work. Temporary directory removed on exit; no live provider or `~/.hedge-fund` access.
 
 ---
 
