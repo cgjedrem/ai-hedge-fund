@@ -1,0 +1,20 @@
+# Subsession Delegation Configuration
+# Read by /speckit-* skills with a Delegation section.
+# Missing or invalid file -> skills fall back silently to defaults.
+
+# This repo runs speckit flows inside a single coordinator session
+# (coordinator + dev loop). Subsession spawning is disabled; review
+# steps run as subagents or inline.
+mode: inline
+
+# overrides:
+#   analyze: subagent
+#   checklist: subagent
+#   red-team-run: subagent
+#   red-team-gate: inline
+#   plan-review-gate-check: inline
+#   bugfix-verify: subagent
+#   trace-build: subagent
+#   trace-gaps: subagent
+#   trace-orphans: subagent
+#   trace-report: subagent
