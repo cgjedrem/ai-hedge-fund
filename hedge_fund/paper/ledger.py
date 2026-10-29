@@ -39,6 +39,7 @@ LEDGER_SUBDIR = "ledger"
 SUPERSEDED_SUBDIR = "superseded"  # records taken off the chain by a redo, kept
 CHECKPOINT_FILE = "checkpoint.json"
 CONTROL_FILE = "control.json"
+APPROVAL_FILE = "pending-approval.json"
 EVENTS_FILE = "events.jsonl"
 
 _DAY = re.compile(r"\d{4}-\d{2}-\d{2}")
@@ -54,6 +55,7 @@ class Ledger:
         self.directory = Path(directory)
         self.records_dir = self.directory / LEDGER_SUBDIR
         self.control_path = self.directory / CONTROL_FILE
+        self.approval_path = self.directory / APPROVAL_FILE
         self.events_path = self.directory / EVENTS_FILE
 
     # ---- records ----------------------------------------------------------
@@ -241,6 +243,60 @@ class Ledger:
         write_atomic(self.control_path, json.dumps({
             "halted": halted, "reason": reason, "since": _now(),
         }, indent=2))
+
+    # ---- approval mailbox ------------------------------------------------
+
+    def approval(self) -> dict[str, str] | None:
+        """Return a valid verdict; unreadable or malformed mailbox means none."""
+        try:
+            value = json.loads(self.approval_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return None
+        fields = {"verdict", "decision_as_of", "decided_at", "by"}
+        if not isinstance(value, dict) or set(value) != fields:
+            return None
+        verdict = value["verdict"]
+        decision_as_of = value["decision_as_of"]
+        decided_at = value["decided_at"]
+        by = value["by"]
+        if not isinstance(verdict, str) or verdict not in {"approve", "reject"}:
+            return None
+        if not isinstance(decision_as_of, str) or not decision_as_of.strip():
+            return None
+        if not isinstance(decided_at, str) or not isinstance(by, str) or by not in {"cli", "tui"}:
+            return None
+        try:
+            stamp = datetime.fromisoformat(decided_at.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if stamp.tzinfo is None:
+            return None
+        return value
+
+    def set_approval(self, verdict: str, decision_as_of: str, by: str) -> dict[str, str]:
+        if not isinstance(verdict, str) or verdict not in {"approve", "reject"}:
+            raise ValueError("verdict must be 'approve' or 'reject'")
+        if not isinstance(decision_as_of, str) or not decision_as_of.strip():
+            raise ValueError("decision_as_of must be a non-empty string")
+        if not isinstance(by, str) or by not in {"cli", "tui"}:
+            raise ValueError("by must be 'cli' or 'tui'")
+        value = {
+            "verdict": verdict,
+            "decision_as_of": decision_as_of,
+            "decided_at": _now(),
+            "by": by,
+        }
+        write_atomic(self.approval_path, json.dumps(value, indent=2))
+        self.log_event(verdict, decision_as_of=decision_as_of, by=by)
+        return value
+
+    def clear_approval(self, expected: dict[str, str] | None = None) -> None:
+        if expected is not None and self.approval() != expected:
+            return
+        try:
+            self.approval_path.unlink()
+        except FileNotFoundError:
+            pass
 
     # ---- events -----------------------------------------------------------
 

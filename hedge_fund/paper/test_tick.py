@@ -159,6 +159,149 @@ def test_ticks_advance_one_session_each_and_match_the_backtest(tmp_path, clock, 
     assert kinds == ["tick", "tick", "tick"]
 
 
+def test_gate_expires_unapproved_decision_and_continues(tmp_path, clock, SPEC):
+    spec = SPEC.model_copy(update={"approval_required": True, "rebalance": "daily"})
+    clock("2024-06-04")
+    directory = deploy("alpha", spec, ["AAPL"], root=tmp_path)
+    first = _tick(directory)
+    book_before = json.loads((directory / "broker.json").read_text())
+
+    clock("2024-06-05")
+    skipped = _tick(directory)
+
+    ledger = Ledger(directory)
+    assert skipped.executed is None
+    assert skipped.decision is not None and skipped.decision.as_of == skipped.session
+    assert json.loads((directory / "broker.json").read_text()) == book_before
+    assert ledger.sessions() == ["2024-06-03", "2024-06-04"]
+    assert ledger.replay(spec.capital).pending == skipped.decision
+    assert ledger.halted() is None
+    assert [event["kind"] for event in ledger.events()] == ["tick", "expire", "tick"]
+    expiry = ledger.events()[1]
+    assert expiry["decision_as_of"] == first.decision.as_of
+    assert expiry["reason"] == "no verdict"
+
+
+def test_gate_executes_matching_approval_once(tmp_path, clock, SPEC):
+    spec = SPEC.model_copy(update={"approval_required": True, "rebalance": "daily"})
+    clock("2024-06-04")
+    directory = deploy("alpha", spec, ["AAPL"], root=tmp_path)
+    first = _tick(directory)
+    ledger = Ledger(directory)
+    ledger.set_approval("approve", first.decision.as_of, "cli")
+
+    clock("2024-06-05")
+    executed = _tick(directory)
+
+    assert executed.executed is not None
+    assert executed.executed.execution_as_of == "2024-06-04"
+    assert executed.positions == {"AAPL": 500}
+    assert ledger.approval() is None
+    assert [event["kind"] for event in ledger.events()] == ["tick", "approve", "tick"]
+
+
+def test_gate_rejects_matching_verdict_without_trading(tmp_path, clock, SPEC):
+    spec = SPEC.model_copy(update={"approval_required": True, "rebalance": "daily"})
+    clock("2024-06-04")
+    directory = deploy("alpha", spec, ["AAPL"], root=tmp_path)
+    first = _tick(directory)
+    book_before = json.loads((directory / "broker.json").read_text())
+    ledger = Ledger(directory)
+    ledger.set_approval("reject", first.decision.as_of, "tui")
+
+    clock("2024-06-05")
+    rejected = _tick(directory)
+
+    assert rejected.executed is None
+    assert rejected.decision is not None and rejected.decision.as_of == rejected.session
+    assert json.loads((directory / "broker.json").read_text()) == book_before
+    assert ledger.approval() is None
+    assert [event["kind"] for event in ledger.events()] == ["tick", "reject", "reject", "tick"]
+    assert ledger.events()[2]["consumed"] is True
+
+
+def test_gate_ignores_and_clears_stale_approval(tmp_path, clock, SPEC):
+    spec = SPEC.model_copy(update={"approval_required": True, "rebalance": "daily"})
+    clock("2024-06-04")
+    directory = deploy("alpha", spec, ["AAPL"], root=tmp_path)
+    first = _tick(directory)
+    ledger = Ledger(directory)
+    ledger.set_approval("approve", "2024-06-02", "cli")
+
+    clock("2024-06-05")
+    skipped = _tick(directory)
+
+    assert skipped.executed is None
+    assert skipped.decision is not None
+    assert ledger.approval() is None
+    expiry = next(event for event in ledger.events() if event["kind"] == "expire")
+    assert expiry["decision_as_of"] == first.decision.as_of
+    assert expiry["reason"] == "stale verdict"
+
+
+def test_verdict_written_during_session_waits_for_next_session(tmp_path, clock, SPEC, monkeypatch):
+    spec = SPEC.model_copy(update={"approval_required": True, "rebalance": "daily"})
+    clock("2024-06-04")
+    directory = deploy("alpha", spec, ["AAPL"], root=tmp_path)
+    _tick(directory)
+    ledger = Ledger(directory)
+    read_approval = Ledger.approval
+
+    def write_after_read(current):
+        approval = read_approval(current)
+        if current.directory == directory and approval is None:
+            current.set_approval("approve", "2024-06-04", "tui")
+        return approval
+
+    monkeypatch.setattr(Ledger, "approval", write_after_read)
+    clock("2024-06-05")
+    skipped = _tick(directory)
+
+    assert skipped.session == "2024-06-04" and skipped.executed is None
+    assert skipped.decision is not None
+    assert ledger.approval()["decision_as_of"] == skipped.decision.as_of
+
+    monkeypatch.setattr(Ledger, "approval", read_approval)
+    clock("2024-06-06")
+    executed = _tick(directory)
+
+    assert executed.executed is not None
+    assert executed.executed.as_of == skipped.decision.as_of
+    assert ledger.approval() is None
+
+
+def test_gate_off_keeps_auto_execution_without_reading_mailbox(tmp_path, clock, SPEC, monkeypatch):
+    spec = SPEC.model_copy(update={"rebalance": "daily"})
+    clock("2024-06-04")
+    directory = deploy("alpha", spec, ["AAPL"], root=tmp_path)
+    _tick(directory)
+    monkeypatch.setattr(Ledger, "approval", lambda self: pytest.fail("gate-off path read approval mailbox"))
+
+    clock("2024-06-05")
+    executed = _tick(directory)
+
+    assert executed.executed is not None
+    assert executed.positions == {"AAPL": 500}
+    assert [event["kind"] for event in Ledger(directory).events()] == ["tick", "tick"]
+
+
+def test_halt_precedes_approval_gate(tmp_path, clock, SPEC, monkeypatch):
+    spec = SPEC.model_copy(update={"approval_required": True})
+    clock("2024-06-04")
+    directory = deploy("alpha", spec, ["AAPL"], root=tmp_path)
+    _tick(directory)
+    ledger = Ledger(directory)
+    ledger.halt("manual review")
+    control_before = ledger.control_path.read_bytes()
+    monkeypatch.setattr(Ledger, "approval", lambda self: pytest.fail("halted path read approval mailbox"))
+
+    with pytest.raises(FundHalted, match="manual review"):
+        _tick(directory)
+
+    assert ledger.control_path.read_bytes() == control_before
+    assert not ledger.approval_path.exists()
+
+
 def test_explicit_session_is_idempotent_and_must_be_the_next_one(tmp_path, clock, SPEC):
     clock("2024-06-06")
     directory = deploy("alpha", SPEC, ["AAPL"], root=tmp_path)

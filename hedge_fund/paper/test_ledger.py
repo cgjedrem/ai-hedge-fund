@@ -175,6 +175,71 @@ def test_kill_switch_round_trips_and_logs(tmp_path):
     assert all("time" in e for e in ledger.events())
 
 
+def test_approval_mailbox_round_trips_and_logs(tmp_path):
+    ledger = Ledger(tmp_path)
+
+    ledger.set_approval("approve", "2026-10-05", "cli")
+    approved = ledger.approval()
+    assert approved is not None
+    assert approved["verdict"] == "approve"
+    assert approved["decision_as_of"] == "2026-10-05"
+    assert approved["by"] == "cli"
+    assert set(approved) == {"verdict", "decision_as_of", "decided_at", "by"}
+    assert [event["kind"] for event in ledger.events()] == ["approve"]
+    assert ledger.events()[0]["decision_as_of"] == "2026-10-05"
+
+    ledger.set_approval("reject", "2026-10-06", "tui")
+    rejected = ledger.approval()
+    assert rejected is not None and rejected["verdict"] == "reject"
+    assert [event["kind"] for event in ledger.events()] == ["approve", "reject"]
+    assert ledger.events()[1]["by"] == "tui"
+
+
+def test_approval_mailbox_missing_corrupt_and_wrong_verdict_are_absent(tmp_path):
+    ledger = Ledger(tmp_path)
+    path = tmp_path / "pending-approval.json"
+    assert ledger.approval() is None
+
+    path.write_text("{broken")
+    assert ledger.approval() is None
+
+    path.write_text(json.dumps({"verdict": "yay", "decision_as_of": "2026-10-05", "decided_at": "2026-10-29T22:00:00+00:00", "by": "cli"}))
+    assert ledger.approval() is None
+
+
+def test_approval_mailbox_unreadable_file_is_absent(tmp_path):
+    (tmp_path / "pending-approval.json").mkdir()
+    assert Ledger(tmp_path).approval() is None
+
+
+def test_approval_clear_preserves_a_newer_verdict(tmp_path):
+    ledger = Ledger(tmp_path)
+    ledger.set_approval("approve", "2026-10-05", "cli")
+    original = ledger.approval()
+    ledger.set_approval("reject", "2026-10-06", "tui")
+    newer = ledger.approval()
+
+    ledger.clear_approval(expected=original)
+
+    assert ledger.approval() == newer
+    ledger.clear_approval()
+    assert ledger.approval() is None
+
+
+@pytest.mark.parametrize(
+    "verdict,decision_as_of,by",
+    [
+        ("yay", "2026-10-05", "cli"),
+        ("approve", "", "cli"),
+        ("reject", "2026-10-05", "runner"),
+        (None, "2026-10-05", "cli"),
+    ],
+)
+def test_set_approval_validates_mailbox_values(tmp_path, verdict, decision_as_of, by):
+    with pytest.raises(ValueError):
+        Ledger(tmp_path).set_approval(verdict, decision_as_of, by)
+
+
 def _compat_record(positions: dict[str, float]) -> SessionRecord:
     record = SessionRecord(
         fund="compat", session="2024-06-03", universe=["AAPL"], nav=100_000.0, cash=0.0,

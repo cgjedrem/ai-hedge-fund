@@ -1,5 +1,6 @@
 """FundSpec + StrategySpec + Fund tests — YAML loading, validation, staffing."""
 
+import json
 from copy import deepcopy
 from unittest.mock import Mock
 
@@ -27,6 +28,15 @@ MINIMAL = {
     "strategies": [{"name": "event", "models": [{"name": "pead"}], "blend": {"mode": "long_short"}}],
     "risk": {"max_position_pct": 0.25, "max_gross_exposure": 1.0},
 }
+
+LEGACY_DEFAULT_JSON = (
+    '{"schema_version":2,"name":"test-fund","strategies":'
+    '[{"name":"event","display_name":null,"weight":1.0,'
+    '"models":[{"name":"pead","weight":1.0,"params":{}}],'
+    '"blend":{"method":"conviction_weighted","gross_target":1.0,"mode":"long_short"}}],'
+    '"risk":{"max_position_pct":0.25,"max_gross_exposure":1.0},'
+    '"capital":100000.0,"rebalance":"weekly","benchmark":"SPY"}'
+)
 
 
 def test_yaml_load_happy_path(tmp_path):
@@ -124,6 +134,45 @@ def test_costs_default_to_a_real_cost_model_and_serialize_only_when_changed():
     assert FundSpec.model_validate(free.model_dump()) == free
     with pytest.raises(ValidationError):
         FundSpec(**{**MINIMAL, "costs": {"spread_bps": -1}})
+
+
+def test_approval_default_preserves_pre_feature_serialization():
+    spec = FundSpec(**MINIMAL)
+    assert spec.model_dump_json() == LEGACY_DEFAULT_JSON
+
+
+def test_approval_true_is_serialized():
+    spec = FundSpec(**{**MINIMAL, "approval_required": True})
+    assert json.loads(spec.model_dump_json())["approval_required"] is True
+
+
+def test_mandate_without_approval_setting_loads_unchanged(tmp_path):
+    path = tmp_path / "fund.yaml"
+    path.write_text(yaml.safe_dump(MINIMAL))
+
+    spec = load_spec(path)
+
+    assert spec == FundSpec(**MINIMAL)
+    assert spec.model_dump_json() == LEGACY_DEFAULT_JSON
+
+
+@pytest.mark.parametrize("value", [1, "yes"])
+def test_non_boolean_approval_setting_is_rejected_with_field_name(tmp_path, value):
+    path = tmp_path / "bad.yaml"
+    path.write_text(yaml.safe_dump({**MINIMAL, "approval_required": value}))
+
+    with pytest.raises(ValueError) as exc:
+        load_spec(path)
+
+    assert str(path) in str(exc.value)
+    assert "approval_required" in str(exc.value)
+    assert "Input should be a valid boolean" in str(exc.value)
+
+
+def test_approval_near_miss_key_is_rejected():
+    with pytest.raises(ValidationError) as exc:
+        FundSpec(**{**MINIMAL, "approval_requird": True})
+    assert "approval_requird" in str(exc.value)
 
 
 def test_typo_key_rejected():

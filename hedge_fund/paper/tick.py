@@ -259,8 +259,36 @@ def _run(
     replay starts from tonight."""
     broker = PaperBroker(directory / BROKER_FILE, deployed.spec.costs)
     fund = fund or (build_fund or Fund)(deployed.spec)
+    run_state = state
+    clear_verdict = None
+    audit = None
+    if deployed.spec.approval_required and state.pending is not None:
+        approval = ledger.approval()
+        if approval is not None and approval["decision_as_of"] == state.pending.as_of:
+            clear_verdict = approval
+            if approval["verdict"] == "reject":
+                run_state = state.model_copy(update={"pending": None})
+                audit = (
+                    "reject",
+                    {
+                        "decision_as_of": state.pending.as_of,
+                        "by": approval["by"],
+                        "consumed": True,
+                        "session": session,
+                    },
+                )
+        else:
+            run_state = state.model_copy(update={"pending": None})
+            clear_verdict = approval
+            audit = (
+                "expire",
+                {
+                    "decision_as_of": state.pending.as_of,
+                    "reason": "stale verdict" if approval is not None else "no verdict",
+                },
+            )
     try:
-        record = advance(fund, state, session, broker, data_client, deployed.universe, clock)
+        record = advance(fund, run_state, session, broker, data_client, deployed.universe, clock)
         ledger.append(record)
     except FundHalted:
         raise
@@ -269,6 +297,11 @@ def _run(
         ledger.log_event("tick_failed", session=session, error=f"{type(exc).__name__}: {exc}")
         ledger.halt(reason)
         raise
+    if clear_verdict is not None:
+        ledger.clear_approval(expected=clear_verdict)
+    if audit is not None:
+        kind, fields = audit
+        ledger.log_event(kind, **fields)
     ledger.log_event(
         "tick", session=session, nav=record.nav,
         executed=record.executed is not None, decided=record.decision is not None,

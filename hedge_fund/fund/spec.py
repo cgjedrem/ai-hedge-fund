@@ -154,6 +154,7 @@ class FundSpec(BaseModel):
         default_factory=TradingCosts,
         description="what every fill costs: half-spread per side and commission per share",
     )
+    approval_required: bool = Field(default=False, strict=True, description="require approval before executing pending decisions")
     capital: float = Field(default=100_000.0, gt=0)
     rebalance: Cadence = Field(
         default="weekly",
@@ -216,6 +217,8 @@ class FundSpec(BaseModel):
             data.pop("window", None)
         if self.costs == TradingCosts():
             data.pop("costs", None)
+        if not self.approval_required:
+            data.pop("approval_required", None)
         return data
 
     @property
