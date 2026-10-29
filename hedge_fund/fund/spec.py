@@ -18,7 +18,7 @@ from pydantic import (
 
 from hedge_fund.brokers.costs import TradingCosts
 from hedge_fund.risk.limits import RiskLimits
-from hedge_fund.signals import ALPHA_MODEL_REGISTRY, LLMAgent, get_investment_approach
+from hedge_fund.signals import ALPHA_MODEL_REGISTRY, get_investment_approach, LLMAgent
 from hedge_fund.signals.base import AlphaModel
 
 PortfolioMode: TypeAlias = Literal["long_only", "long_short", "dollar_neutral"]
@@ -161,7 +161,8 @@ class FundSpec(BaseModel):
         description="how often the fund decides: every bar (minute), or the first session of each day/week/month",
     )
     interval: float = Field(
-        default=1.0, gt=0,
+        default=1.0,
+        gt=0,
         description="minutes between sessions; read only when rebalance is minute",
     )
     window: TradingWindow = Field(
@@ -195,13 +196,9 @@ class FundSpec(BaseModel):
                 raise ValueError(f"{', '.join(stray)}: only a minute fund has these; this one is {self.rebalance}")
             return self
         if self.interval_seconds < MIN_INTERVAL_SECONDS:
-            raise ValueError(
-                f"interval: floor is {MIN_INTERVAL_SECONDS} second — sessions are stamped to the second"
-            )
+            raise ValueError(f"interval: floor is {MIN_INTERVAL_SECONDS} second — sessions are stamped to the second")
         if self.interval_seconds > self.window.end_seconds - self.window.start_seconds:
-            raise ValueError(
-                f"interval: {format_interval(self.interval_seconds)} is longer than the {self.window.label} window"
-            )
+            raise ValueError(f"interval: {format_interval(self.interval_seconds)} is longer than the {self.window.label} window")
         return self
 
     @model_serializer(mode="wrap")

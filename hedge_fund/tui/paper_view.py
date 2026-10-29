@@ -19,11 +19,22 @@ from rich.table import Table
 from rich.text import Text
 
 from hedge_fund.backtesting import performance_metrics
-from hedge_fund.data import DataClientError, data_provider, make_data_client, PriceSnapshot
+from hedge_fund.data import (
+    data_provider,
+    DataClientError,
+    make_data_client,
+    PriceSnapshot,
+)
 from hedge_fund.data.bars import bar_time, bars_per_day, is_intraday
 from hedge_fund.data.sessions import NEW_YORK
 from hedge_fund.fund import FundSpec
-from hedge_fund.paper import following_session, is_running, Ledger, LedgerError, load_deployed
+from hedge_fund.paper import (
+    following_session,
+    is_running,
+    Ledger,
+    LedgerError,
+    load_deployed,
+)
 from hedge_fund.pipeline import (
     DecisionRecord,
     FundState,
@@ -102,11 +113,7 @@ class PaperSnapshot:
         decision_as_of = expired.get("decision_as_of")
         if not isinstance(decision_as_of, str) or not decision_as_of:
             return None
-        newer = any(
-            (record.decision is not None and record.decision.as_of > decision_as_of)
-            or (record.executed is not None and record.executed.as_of > decision_as_of)
-            for record in self.records
-        )
+        newer = any((record.decision is not None and record.decision.as_of > decision_as_of) or (record.executed is not None and record.executed.as_of > decision_as_of) for record in self.records)
         return None if newer else decision_as_of
 
     def today(self, today: str | None = None) -> list[SessionRecord]:
@@ -214,10 +221,7 @@ def next_run_rows(snap: PaperSnapshot, now: datetime | None = None) -> list[tupl
             rows.append(("", Text(snap.halted, style=MUTED)))
         return rows
     moment = now or datetime.now(NEW_YORK)
-    rows: list[tuple[str, Text | str]] = [("Next bar" if snap.intraday else "Next close", Text.assemble(
-        (following_session(snap.spec, snap.last_session, moment).removesuffix(" close"), BRIGHT),
-        ("   ● running · space to stop" if snap.running else "   ○ idle · space to start a runner",
-         GREEN if snap.running else MUTED)))]
+    rows: list[tuple[str, Text | str]] = [("Next bar" if snap.intraday else "Next close", Text.assemble((following_session(snap.spec, snap.last_session, moment).removesuffix(" close"), BRIGHT), ("   ● running · space to stop" if snap.running else "   ○ idle · space to start a runner", GREEN if snap.running else MUTED)))]
     if snap.pending is not None:
         if snap.gate:
             approval = snap.approval
@@ -229,16 +233,12 @@ def next_run_rows(snap: PaperSnapshot, now: datetime | None = None) -> list[tupl
                 status = Text("rejected; decision will lapse · y approve · n reject", style=RED)
             rows.append(("First", status))
         else:
-            rows.append(("First", Text.assemble(
-                "execute the ", (session_label(snap.pending.as_of), BRIGHT), " decision")))
+            rows.append(("First", Text.assemble("execute the ", (session_label(snap.pending.as_of), BRIGHT), " decision")))
         rows.append(("", weights_line(snap.pending)))
     elif snap.last_session is None:
-        rows.append(("First", "mark the book at the first bar's prints" if snap.intraday
-                     else "mark the book at the latest completed close"))
+        rows.append(("First", "mark the book at the first bar's prints" if snap.intraday else "mark the book at the latest completed close"))
     elif snap.lapsed is not None:
-        rows.append(("First", Text.assemble(
-            ("mark the book · ", TEXT), ("decision lapsed", MUTED),
-            (f" ({session_label(snap.lapsed)})", MUTED))))
+        rows.append(("First", Text.assemble(("mark the book · ", TEXT), ("decision lapsed", MUTED), (f" ({session_label(snap.lapsed)})", MUTED))))
     else:
         rows.append(("First", "mark the book"))
     cadence = snap.spec.rebalance
@@ -267,15 +267,15 @@ def today_rows(snap: PaperSnapshot, now: datetime | None = None) -> list[tuple[s
     change = bars[-1].nav / opened_at - 1 if opened_at else 0.0
     fills = sum(len(r.executed.fills) for r in bars if r.executed is not None)
     return [
-        ("Bars", Text.assemble((f"{len(bars)} / {total}", TEXT),
-                               (f"   last {bar_time(bars[-1].session):%H:%M:%S} ET", MUTED))),
-        ("Since open", Text.assemble((f"{change:+.2%}", GREEN if change >= 0 else RED),
-                                     (f"   {fills} {'fill' if fills == 1 else 'fills'}", MUTED))),
+        ("Bars", Text.assemble((f"{len(bars)} / {total}", TEXT), (f"   last {bar_time(bars[-1].session):%H:%M:%S} ET", MUTED))),
+        ("Since open", Text.assemble((f"{change:+.2%}", GREEN if change >= 0 else RED), (f"   {fills} {'fill' if fills == 1 else 'fills'}", MUTED))),
     ]
 
 
 def live_rows(
-    snap: PaperSnapshot, quotes: dict[str, PriceSnapshot], today: str | None = None,
+    snap: PaperSnapshot,
+    quotes: dict[str, PriceSnapshot],
+    today: str | None = None,
 ) -> list[tuple[str, Text | str]]:
     """The book at the latest prints: value, change since the last close,
     and when the newest print was. Empty unless every held name has a quote;
@@ -293,14 +293,13 @@ def live_rows(
     stale = newest.date().isoformat() < today
     tone = MUTED if stale else GREEN if change >= 0 else RED
     when = newest.strftime("%b %-d %H:%M") if stale else newest.strftime("%H:%M")
-    return [("Live", Text.assemble(
-        (f"${value:,.0f}", MUTED if stale else TEXT),
-        (f"   {change:+.2%}", tone),
-        (f"   as of {when} ET", MUTED)))]
+    return [("Live", Text.assemble((f"${value:,.0f}", MUTED if stale else TEXT), (f"   {change:+.2%}", tone), (f"   as of {when} ET", MUTED)))]
 
 
 def paper_detail(
-    snap: PaperSnapshot, width: int = 60, quotes: dict[str, PriceSnapshot] | None = None,
+    snap: PaperSnapshot,
+    width: int = 60,
+    quotes: dict[str, PriceSnapshot] | None = None,
     now: datetime | None = None,
 ) -> Group:
     """The right pane, top to bottom: who the fund is, what the next run
@@ -312,8 +311,7 @@ def paper_detail(
     staff = ", ".join(s.title for s in spec.strategies)
     parts: list = [
         Text.assemble((snap.deployed.name, f"bold {BRIGHT}"), "   ", snap.badge()),
-        Text(f"{staff} · {cadence_identity(spec)} · ${spec.capital:,.0f} · {' '.join(snap.deployed.universe)}",
-             style=MUTED),
+        Text(f"{staff} · {cadence_identity(spec)} · ${spec.capital:,.0f} · {' '.join(snap.deployed.universe)}", style=MUTED),
         Text(""),
     ]
     if snap.error:
@@ -328,14 +326,18 @@ def paper_detail(
         _, nav, bench = snap.curves()
         n = len(snap.records)
         ret, bench_ret = m.total_return_pct, m.benchmark_return_pct
-        parts += [Text(""), _section("PERFORMANCE"), _facts([
-            ("Value", f"${snap.nav:,.0f}"),
-            ("Return", Text.assemble((f"{ret:+.1%}", GREEN if ret >= 0 else RED),
-                                     (f"   {spec.benchmark} {bench_ret:+.1%}", MUTED))),
-            ("Since", Text(f"{snap.records[0].session} · {n} {'session' if n == 1 else 'sessions'}"
-                           f" · {m.n_orders} {'order' if m.n_orders == 1 else 'orders'}", style=MUTED)),
-            *(live_rows(snap, quotes) if quotes else []),
-        ])]
+        parts += [
+            Text(""),
+            _section("PERFORMANCE"),
+            _facts(
+                [
+                    ("Value", f"${snap.nav:,.0f}"),
+                    ("Return", Text.assemble((f"{ret:+.1%}", GREEN if ret >= 0 else RED), (f"   {spec.benchmark} {bench_ret:+.1%}", MUTED))),
+                    ("Since", Text(f"{snap.records[0].session} · {n} {'session' if n == 1 else 'sessions'}" f" · {m.n_orders} {'order' if m.n_orders == 1 else 'orders'}", style=MUTED)),
+                    *(live_rows(snap, quotes) if quotes else []),
+                ]
+            ),
+        ]
         if n >= 2:  # one point is a flat block, not a curve
             parts.append(Text(""))
             parts.extend(render_area_chart(nav, bench, spec.capital, width))
@@ -355,8 +357,7 @@ def fetch_snapshots(tickers: list[str]) -> dict[str, PriceSnapshot]:
     and nothing else, which is the honest fallback."""
     if not tickers:
         return {}
-    if data_provider() in ("fd", "financialdatasets", "financial-datasets") \
-            and not os.environ.get("FINANCIAL_DATASETS_API_KEY"):
+    if data_provider() in ("fd", "financialdatasets", "financial-datasets") and not os.environ.get("FINANCIAL_DATASETS_API_KEY"):
         return {}
     quotes: dict[str, PriceSnapshot] = {}
     try:
@@ -369,8 +370,7 @@ def fetch_snapshots(tickers: list[str]) -> dict[str, PriceSnapshot]:
     return quotes
 
 
-def run_plan(name: str, state: FundState, due: str | None, spec: FundSpec,
-             now: datetime | None = None, *, approval: dict[str, str] | None = None) -> Text:
+def run_plan(name: str, state: FundState, due: str | None, spec: FundSpec, now: datetime | None = None, *, approval: dict[str, str] | None = None) -> Text:
     """What pressing enter will do, in plain words, from the ledger state and
     the session that is due. Pure: the confirm modal renders it, tests read it.
 
@@ -398,9 +398,7 @@ def run_plan(name: str, state: FundState, due: str | None, spec: FundSpec,
         body.append(session_label(state.last_session), style=f"bold {BRIGHT}")
         body.append(" again?  ", style=TEXT)
         at = "prints it saw" if spec.is_intraday else "same close"
-        body.append(f"The analysts look again and the book is sized again at the {at}. "
-                    "The recorded session is replaced; the old record is kept aside, off the chain.",
-                    style=MUTED)
+        body.append(f"The analysts look again and the book is sized again at the {at}. " "The recorded session is replaced; the old record is kept aside, off the chain.", style=MUTED)
         return body
     at = _at_phrase(due, moment)
     approved = spec.approval_required and approval is not None and approval.get("verdict") == "approve" and state.pending is not None and approval.get("decision_as_of") == state.pending.as_of
@@ -427,10 +425,7 @@ def run_plan(name: str, state: FundState, due: str | None, spec: FundSpec,
         body.append(".  No trades.\n", style=TEXT)
         then = ""
     if is_rebalance_session(due, state.last_session, spec.rebalance):
-        why = ("the fund's first decision" if state.last_session is None
-               else "every bar" if spec.rebalance == "minute"
-               else "every session" if spec.rebalance == "daily"
-               else f"first session of the {_PERIOD_WORD[spec.rebalance]}")
+        why = "the fund's first decision" if state.last_session is None else "every bar" if spec.rebalance == "minute" else "every session" if spec.rebalance == "daily" else f"first session of the {_PERIOD_WORD[spec.rebalance]}"
         body.append(f"{then}make a new decision", style=TEXT)
         body.append(f"  ({why})", style=MUTED)
     elif then:

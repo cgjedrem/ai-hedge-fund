@@ -35,11 +35,7 @@ from hedge_fund.paper import (
     stop_runner,
     tick,
 )
-from hedge_fund.pipeline import (
-    DecisionRecord,
-    FundState,
-    SessionRecord,
-)
+from hedge_fund.pipeline import DecisionRecord, FundState, SessionRecord
 from hedge_fund.scorecard import score
 from hedge_fund.signals import ALPHA_MODEL_REGISTRY, LLMAgent
 from hedge_fund.tui.builder import BuilderScreen
@@ -101,7 +97,7 @@ class PaperScreen(Screen):
     def __init__(self, select: str | None = None, run: bool = False) -> None:
         super().__init__()
         self._snaps: list[PaperSnapshot | None] = []
-        self._select = select   # highlight this fund on first paint
+        self._select = select  # highlight this fund on first paint
         self._run_on_mount = run  # ...and open its approval step right away
         self._quotes: dict[str, dict[str, PriceSnapshot]] = {}  # fund name -> latest prints
         self._quote_timer: Timer | None = None
@@ -143,19 +139,16 @@ class PaperScreen(Screen):
                 snap = PaperSnapshot(directory)
             except ValueError as exc:
                 self._snaps.append(None)
-                menu.add_option(Option(
-                    Text(f" {directory.name} — Unavailable\n     {exc}", style=MUTED), disabled=True))
+                menu.add_option(Option(Text(f" {directory.name} — Unavailable\n     {exc}", style=MUTED), disabled=True))
                 continue
             self._snaps.append(snap)
             menu.add_option(Option(paper_slot(i, snap), id=f"paper:{i}"))
         if self._snaps:
             menu.add_option(None)
-        menu.add_option(Option(Text.assemble(
-            ("  +  ", GREEN), ("Build a new fund", TEXT)), id="build"))
+        menu.add_option(Option(Text.assemble(("  +  ", GREEN), ("Build a new fund", TEXT)), id="build"))
         # Options added after mount leave `highlighted` unset — pin it to the
         # asked-for fund, else the first readable one, else the build row.
-        wanted = next((f"paper:{i}" for i, s in enumerate(self._snaps)
-                       if s is not None and s.deployed.name == select), None)
+        wanted = next((f"paper:{i}" for i, s in enumerate(self._snaps) if s is not None and s.deployed.name == select), None)
         first = wanted or next((f"paper:{i}" for i, s in enumerate(self._snaps) if s is not None), "build")
         menu.highlighted = menu.get_option_index(first)
         menu.focus()
@@ -196,7 +189,9 @@ class PaperScreen(Screen):
                 "book and a kill switch of its own under\n" + str(paths.PAPER_DIR) + "\n\n"
                 "Then run it a session at a time with enter, or leave it running with "
                 "space (`aihf paper run <name>` from a shell). Whatever its cadence, "
-                "the next session is the next close or the next bar.", style=MUTED)
+                "the next session is the next close or the next bar.",
+                style=MUTED,
+            )
             detail.update(blurb)
 
     # ---- live quotes ------------------------------------------------------
@@ -209,9 +204,7 @@ class PaperScreen(Screen):
         snap = self._current()
         if snap is None:
             return
-        if snap.error is None and (
-                is_running(snap.directory) != snap.running
-                or (snap.ledger.sessions() or [None])[-1] != snap.last_session):
+        if snap.error is None and (is_running(snap.directory) != snap.running or (snap.ledger.sessions() or [None])[-1] != snap.last_session):
             self._populate(snap.deployed.name)
             return
         if snap.state is not None and snap.state.positions:
@@ -270,15 +263,14 @@ class PaperScreen(Screen):
             self.notify(f"{snap.deployed.name} is halted — r to resume first.", severity="warning")
             return
         if snap.running:
-            self.notify(f"{snap.deployed.name}'s runner is advancing it — space to stop it first.",
-                        severity="warning")
+            self.notify(f"{snap.deployed.name}'s runner is advancing it — space to stop it first.", severity="warning")
             return
         directory = snap.directory
 
         def resume() -> None:
             if demand_run_keys(self.app, resume):
-                self.app.push_screen(RunConfirmScreen(directory),
-                                     lambda verdict: self._after_confirm(directory, verdict))
+                self.app.push_screen(RunConfirmScreen(directory), lambda verdict: self._after_confirm(directory, verdict))
+
         resume()
 
     def action_runner(self) -> None:
@@ -307,6 +299,7 @@ class PaperScreen(Screen):
                     return
                 self.notify(f"{name} running · {cadence_identity(snap.spec)}")
                 self._populate(name)
+
         resume()
 
     def _after_confirm(self, directory: Path, verdict: str | None) -> None:
@@ -393,9 +386,7 @@ class RunConfirmScreen(ModalScreen[str | None]):
             yield Static("", id="run-keys")
 
     def on_mount(self) -> None:
-        self.query_one("#run-q", Static).update(
-            Text.assemble(("Run ", f"bold {BRIGHT}"), (self._directory.name, f"bold {GREEN}"),
-                          ("?", f"bold {BRIGHT}")))
+        self.query_one("#run-q", Static).update(Text.assemble(("Run ", f"bold {BRIGHT}"), (self._directory.name, f"bold {GREEN}"), ("?", f"bold {BRIGHT}")))
         self.query_one("#run-keys", Static).update(Text("esc  cancel", style=MUTED))
         self._resolve()
 
@@ -423,14 +414,9 @@ class RunConfirmScreen(ModalScreen[str | None]):
     def _show(self, deployed: DeployedFund, state: FundState, due: str | None) -> None:
         self._verdict = "run" if due is not None else "redo" if state.last_session else None
         self._ready = True
-        self.query_one("#run-q", Static).update(Text.assemble(
-            ("Run ", f"bold {BRIGHT}"), (deployed.name, f"bold {GREEN}"),
-            (f" through {session_label(due)}?" if due else
-             f" again through {session_label(state.last_session)}?" if self._verdict == "redo" else "?",
-             f"bold {BRIGHT}")))
+        self.query_one("#run-q", Static).update(Text.assemble(("Run ", f"bold {BRIGHT}"), (deployed.name, f"bold {GREEN}"), (f" through {session_label(due)}?" if due else f" again through {session_label(state.last_session)}?" if self._verdict == "redo" else "?", f"bold {BRIGHT}")))
         approval = Ledger(self._directory).approval() if deployed.spec.approval_required else None
-        self.query_one("#run-body", Static).update(
-            run_plan(deployed.name, state, due, deployed.spec, approval=approval))
+        self.query_one("#run-body", Static).update(run_plan(deployed.name, state, due, deployed.spec, approval=approval))
         keys = Text()
         if self._verdict is not None:
             keys.append("enter", style=f"bold {GREEN}")
@@ -442,8 +428,7 @@ class RunConfirmScreen(ModalScreen[str | None]):
 
     def _show_error(self, exc: Exception) -> None:
         self._ready = True
-        self.query_one("#run-body", Static).update(
-            Text.assemble(("✗ ", f"bold {RED}"), (f"{type(exc).__name__}: {exc}", RED)))
+        self.query_one("#run-body", Static).update(Text.assemble(("✗ ", f"bold {RED}"), (f"{type(exc).__name__}: {exc}", RED)))
         self.refresh_bindings()
 
 
@@ -485,8 +470,7 @@ class RunSessionScreen(Screen):
         yield Footer()
 
     def on_mount(self) -> None:
-        self.query_one("#run-phase", Static).update(
-            Text(f"Starting {self._directory.name}…", style=MUTED))
+        self.query_one("#run-phase", Static).update(Text(f"Starting {self._directory.name}…", style=MUTED))
         self._run()
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool:
@@ -553,9 +537,7 @@ class RunSessionScreen(Screen):
             # same temperature the agent was built with — the agent salts its
             # cache keys with it, so a mismatched client would still key
             # correctly but sample at the wrong creativity.
-            model = (cls(llm=make_llm(on_token=desk.feed,
-                                      temperature=kwargs.get("temperature")), **kwargs)
-                     if issubclass(cls, LLMAgent) else cls(**kwargs))
+            model = cls(llm=make_llm(on_token=desk.feed, temperature=kwargs.get("temperature")), **kwargs) if issubclass(cls, LLMAgent) else cls(**kwargs)
             with make_data_client() as raw:
                 fd = CachedDataClient(raw)
                 for as_of in dates:
@@ -595,11 +577,13 @@ class RunSessionScreen(Screen):
             doing.append("assessing the next decision")
         if not doing:
             doing.append("marking the book")
-        self.query_one("#run-phase", Static).update(Text.assemble(
-            (f"Running {deployed.name} {'again through' if self._redo else 'through'} ", f"bold {BRIGHT}"),
-            (session_label(due), f"bold {RED}"),
-            ("  ·  " + " · ".join(doing), MUTED),
-        ))
+        self.query_one("#run-phase", Static).update(
+            Text.assemble(
+                (f"Running {deployed.name} {'again through' if self._redo else 'through'} ", f"bold {BRIGHT}"),
+                (session_label(due), f"bold {RED}"),
+                ("  ·  " + " · ".join(doing), MUTED),
+            )
+        )
         if not dates:
             return
         self._desks = [Desk(DISPLAY_NAMES.get(n, n)) for n in agent_names(deployed.spec)]
@@ -623,11 +607,12 @@ class RunSessionScreen(Screen):
         self._phase = "done"
         self._record = record
         self.query_one("#report-head", Static).update(session_headline(deployed.name, record))
-        self.query_one("#report-foot", Static).update(Group(
-            book_summary(record),
-            Text.assemble(("✓ ", f"bold {GREEN}"), ("Recorded ", MUTED),
-                          (str(Ledger(self._directory).path(record.session)), MUTED)),
-        ))
+        self.query_one("#report-foot", Static).update(
+            Group(
+                book_summary(record),
+                Text.assemble(("✓ ", f"bold {GREEN}"), ("Recorded ", MUTED), (str(Ledger(self._directory).path(record.session)), MUTED)),
+            )
+        )
         self.refresh_bindings()  # phase changed: esc is offered again
         nav = self.query_one("#report-nav", OptionList)
         nav.clear_options()
@@ -641,13 +626,9 @@ class RunSessionScreen(Screen):
         self._phase = "failed"
         phase = self.query_one("#run-phase", Static)
         if isinstance(exc, NothingDue):
-            phase.update(Text.assemble(
-                ("Nothing due  ", f"bold {BRIGHT}"), (f"{exc}", MUTED),
-                ("\n\nThe fund is up to date. Run it again when the next session is in. esc to go back.", MUTED)))
+            phase.update(Text.assemble(("Nothing due  ", f"bold {BRIGHT}"), (f"{exc}", MUTED), ("\n\nThe fund is up to date. Run it again when the next session is in. esc to go back.", MUTED)))
         else:
-            phase.update(Text.assemble(
-                ("✗ ", f"bold {RED}"), (f"{type(exc).__name__}: {exc}", RED),
-                ("\n\nesc to go back", MUTED)))
+            phase.update(Text.assemble(("✗ ", f"bold {RED}"), (f"{type(exc).__name__}: {exc}", RED), ("\n\nesc to go back", MUTED)))
             self.notify(str(exc), title="Run failed", severity="error")
         self.refresh_bindings()
 
@@ -702,11 +683,12 @@ class SessionsScreen(Screen):
         self._snap = snap
         spec = snap.spec
         staff = ", ".join(s.title for s in spec.strategies)
-        self.query_one("#pf-head", Static).update(Group(
-            Text.assemble((snap.deployed.name, f"bold {BRIGHT}"), ("  ·  paper", MUTED)),
-            Text(f"{staff}  ·  {cadence_identity(spec)}  ·  ${spec.capital:,.0f}"
-                 f"  ·  {' '.join(snap.deployed.universe)}", style=MUTED),
-        ))
+        self.query_one("#pf-head", Static).update(
+            Group(
+                Text.assemble((snap.deployed.name, f"bold {BRIGHT}"), ("  ·  paper", MUTED)),
+                Text(f"{staff}  ·  {cadence_identity(spec)}  ·  ${spec.capital:,.0f}" f"  ·  {' '.join(snap.deployed.universe)}", style=MUTED),
+            )
+        )
         self.query_one("#pf-status", Static).update(snap.status())
         self._render_numbers(snap)
         self._render_sessions(snap)
@@ -718,14 +700,11 @@ class SessionsScreen(Screen):
         if not snap.records:
             self.query_one("#stats", StatTiles).add_class("hidden")
             self.query_one("#scorecard", Static).add_class("hidden")
-            self.query_one("#curve", Static).update(
-                Text("The curve starts with the first session.", style=MUTED))
+            self.query_one("#curve", Static).update(Text("The curve starts with the first session.", style=MUTED))
             return
         self.query_one("#stats", StatTiles).remove_class("hidden")
         m = snap.metrics()
-        self.query_one("#stats", StatTiles).update(
-            snap.spec.benchmark, snap.nav, m.total_return_pct, m.benchmark_return_pct,
-            m.excess_return_pct, m.sharpe_ratio, m.max_drawdown_pct)
+        self.query_one("#stats", StatTiles).update(snap.spec.benchmark, snap.nav, m.total_return_pct, m.benchmark_return_pct, m.excess_return_pct, m.sharpe_ratio, m.max_drawdown_pct)
         _, nav, bench = snap.curves()
         curve_widget = self.query_one("#curve", Static)
         width = curve_widget.content_size.width or 80
@@ -740,10 +719,7 @@ class SessionsScreen(Screen):
         menu.clear_options()
         self._shown = list(reversed(snap.records))
         if not self._shown:
-            self.query_one("#detail-pane", Static).update(Text(
-                "No sessions recorded yet.\n\nThe first run values the book at the most "
-                "recent completed close and makes the first decision; the run after "
-                "executes it.", style=MUTED))
+            self.query_one("#detail-pane", Static).update(Text("No sessions recorded yet.\n\nThe first run values the book at the most " "recent completed close and makes the first decision; the run after " "executes it.", style=MUTED))
             return
         navs = [snap.spec.capital, *(r.nav for r in snap.records)]
         day: str | None = None

@@ -55,8 +55,7 @@ def test_run_plan_says_exactly_what_the_run_will_do():
     assert plan.startswith("Up to date through 2025-01-17.  Next session: 2025-01-20 close.")
     assert "Run 2025-01-17 again?" in plan and "recorded session is replaced" in plan
     friday = datetime(2025, 1, 17, 18, 0, tzinfo=NEW_YORK)
-    assert paper_view.run_plan("alpha", make_state(), None, spec, now=friday).plain == (
-        "No completed SPY session to run yet.  Next: 2025-01-20 close.")
+    assert paper_view.run_plan("alpha", make_state(), None, spec, now=friday).plain == ("No completed SPY session to run yet.  Next: 2025-01-20 close.")
 
 
 def test_run_plan_on_a_bar_names_the_print_and_how_late_it_is_taken():
@@ -74,8 +73,7 @@ def test_run_plan_on_a_bar_names_the_print_and_how_late_it_is_taken():
     plan = paper_view.run_plan("fast", make_state(last_session="2025-01-21T13:05:00"), None, spec, now=at(13, 7)).plain
     assert plan.startswith("Up to date through 2025-01-21 13:05:00 ET.  Next session: 13:10:00 ET.")
     assert "sized again at the prints it saw" in plan
-    assert paper_view.run_plan("fast", make_state(), None, spec, now=at(12, 0)).plain == (
-        "No bar to run yet.  Next: 13:00:00 ET.")
+    assert paper_view.run_plan("fast", make_state(), None, spec, now=at(12, 0)).plain == ("No bar to run yet.  Next: 13:00:00 ET.")
 
 
 def test_approval_snapshot_rows_and_run_plan_show_gate_state():
@@ -173,8 +171,7 @@ def test_minute_fund_rows_are_pure(monkeypatch):
 
     record, decided = executed_and_decided()
     first = make_session("2025-01-21T13:00:00", decision=decided, nav=100000)
-    second = make_session("2025-01-21T13:05:00", executed=record, nav=101000, positions={"TEST": 10},
-                      marks={"TEST": 100}, prev_hash=first.hash)
+    second = make_session("2025-01-21T13:05:00", executed=record, nav=101000, positions={"TEST": 10}, marks={"TEST": 100}, prev_hash=first.hash)
     ledger.append(first)
     ledger.append(second)
     (directory / PID_FILE).write_text(str(os.getpid()))

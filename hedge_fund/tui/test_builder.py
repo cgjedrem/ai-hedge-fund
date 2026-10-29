@@ -28,11 +28,14 @@ def test_mixed_description_identifies_short_analysts():
     assert "Long-only" in builder.BuilderScreen._agent_prompt("buffett", ALPHA_MODEL_REGISTRY["buffett"]).plain
 
 
-@pytest.mark.parametrize("names,mode", [
-    (["buffett"], "long_only"),
-    (["buffett", "druckenmiller"], "long_short"),
-    (["druckenmiller"], "long_short"),
-])
+@pytest.mark.parametrize(
+    "names,mode",
+    [
+        (["buffett"], "long_only"),
+        (["buffett", "druckenmiller"], "long_short"),
+        (["druckenmiller"], "long_short"),
+    ],
+)
 @pytest.mark.parametrize("size", [(120, 45), (80, 24)])
 def test_builder_derives_rules_and_back_navigation_does_not_duplicate(names, mode, size):
     async def scenario():
@@ -66,6 +69,7 @@ def test_builder_derives_rules_and_back_navigation_does_not_duplicate(names, mod
             assert screen.query_one("#done-menu", OptionList).region.intersection(screen.region).height > 0
             text = render(screen.query_one("#done-summary", Static).content)
             assert MODE_LABELS[mode] in text
+
     asyncio.run(scenario())
 
 
@@ -99,6 +103,7 @@ def test_builder_existing_name_and_save_race_never_overwrite():
             await pilot.press("enter")
             assert screen.query_one("#panes", ContentSwitcher).current == "step-name"
             assert competing_path.read_text() == original
+
     asyncio.run(scenario())
 
 
@@ -150,6 +155,7 @@ def test_builder_paper_mode_builds_a_live_fund_and_refuses_taken_names():
             rail = fund_list.query_one("#paper-menu", OptionList)
             assert rail.get_option_at_index(rail.highlighted).id == "paper:0"
             assert "alpha" in render(rail.get_option("paper:0").prompt)
+
     asyncio.run(scenario())
 
 
@@ -206,8 +212,7 @@ def test_builder_minute_path_sets_interval_and_window_and_offers_start_running()
             cadences.highlighted = 0
             await pilot.press("enter")
             assert screen.query_one("#panes", ContentSwitcher).current == "step-interval"
-            assert "every 1m · 09:30–16:00 ET · 391 sessions a day" in render(
-                screen.query_one("#interval-line", Static).content)
+            assert "every 1m · 09:30–16:00 ET · 391 sessions a day" in render(screen.query_one("#interval-line", Static).content)
 
             interval = screen.query_one("#interval-input", Input)
             interval.value = "0.005"
@@ -237,8 +242,7 @@ def test_builder_minute_path_sets_interval_and_window_and_offers_start_running()
             assert screen.query_one("#panes", ContentSwitcher).current == "step-window"
             start.value, end.value = "09:00", "12:00"
             await pilot.pause()
-            assert "every 30s · 09:00–12:00 ET · 361 sessions a day" in render(
-                screen.query_one("#window-line", Static).content)
+            assert "every 30s · 09:00–12:00 ET · 361 sessions a day" in render(screen.query_one("#window-line", Static).content)
             end.focus()
             await pilot.press("enter")
             assert screen.query_one("#panes", ContentSwitcher).current == "step-approval"
@@ -270,6 +274,7 @@ def test_builder_minute_path_sets_interval_and_window_and_offers_start_running()
             assert saved.rebalance == "minute" and saved.interval == 0.5
             assert saved.window.start == "09:00" and saved.window.end == "12:00"
             assert load_deployed(paths.PAPER_DIR / "fast").spec == saved
+
     asyncio.run(scenario())
 
 
@@ -285,14 +290,10 @@ def test_builder_minute_helpers_are_pure():
     assert builder.fast_caveat(0.1) and builder.fast_caveat(1 / 6) is None  # 6s warns, 10s does not
 
     today = datetime(2025, 7, 1, tzinfo=NEW_YORK)  # summer: ET is UTC-4
-    assert builder.window_lines(window, 1, today=today, local_zone=NEW_YORK) == [
-        "every 1m · 09:30–16:00 ET · 391 sessions a day"]
-    assert builder.window_lines(window, 1, today=today, local_zone=ZoneInfo("America/Los_Angeles"))[1] == \
-        "that is 06:30–13:00 PDT where you are"
-    assert builder.window_lines(window, 1, today=today, local_zone=ZoneInfo("Asia/Tokyo"))[1] == \
-        "that is 22:30–05:00 JST where you are (the next day)"
-    assert cadence_identity(FundSpec(**{**make_spec().model_dump(), "rebalance": "minute", "interval": 5})) == \
-        "every 5m · 09:30–16:00 ET"
+    assert builder.window_lines(window, 1, today=today, local_zone=NEW_YORK) == ["every 1m · 09:30–16:00 ET · 391 sessions a day"]
+    assert builder.window_lines(window, 1, today=today, local_zone=ZoneInfo("America/Los_Angeles"))[1] == "that is 06:30–13:00 PDT where you are"
+    assert builder.window_lines(window, 1, today=today, local_zone=ZoneInfo("Asia/Tokyo"))[1] == "that is 22:30–05:00 JST where you are (the next day)"
+    assert cadence_identity(FundSpec(**{**make_spec().model_dump(), "rebalance": "minute", "interval": 5})) == "every 5m · 09:30–16:00 ET"
     assert cadence_identity(make_spec()) == "weekly"
 
 
@@ -301,9 +302,7 @@ def test_builder_replaces_a_taken_name_only_after_yes_and_only_at_the_end():
     old.rebalance = "monthly"
     (paths.MANDATES_DIR / "alpha.yaml").write_text(yaml.safe_dump(old.model_dump()))
     receipt = paths.RESEARCH_DIR / "alpha-backtest-2025-01-01.json"
-    receipt.write_text(json.dumps({"fund": "alpha", "universe": ["NVDA"], "metrics": {
-        "total_return_pct": .1, "annualized_return_pct": .1, "sharpe_ratio": 1, "max_drawdown_pct": -.1,
-        "benchmark_return_pct": 0, "excess_return_pct": .1, "n_cycles": 1}}))
+    receipt.write_text(json.dumps({"fund": "alpha", "universe": ["NVDA"], "metrics": {"total_return_pct": 0.1, "annualized_return_pct": 0.1, "sharpe_ratio": 1, "max_drawdown_pct": -0.1, "benchmark_return_pct": 0, "excess_return_pct": 0.1, "n_cycles": 1}}))
     directory = deploy("alpha", old, ["NVDA"], root=paths.PAPER_DIR)
     ledger = Ledger(directory)
     ledger.append(make_session("2025-01-17", nav=100000))
@@ -354,6 +353,7 @@ def test_builder_replaces_a_taken_name_only_after_yes_and_only_at_the_end():
             assert load_spec(paths.MANDATES_DIR / "alpha.yaml") == fresh.spec
             assert not receipt.exists()
             assert load_deployed(untouched).universe == ["AMD"]  # neighbours untouched
+
     asyncio.run(scenario())
 
 
@@ -393,4 +393,5 @@ def test_builder_paper_mode_run_its_first_session_opens_the_approval_step(monkey
             rail = fund_list.query_one("#paper-menu", OptionList)
             assert rail.get_option_at_index(rail.highlighted).id == "paper:0"
             assert not isinstance(app.screen_stack[-2], builder.BuilderScreen)  # the builder was switched out
+
     asyncio.run(scenario())

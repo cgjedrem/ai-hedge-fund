@@ -30,6 +30,7 @@ from hedge_fund.tui.fixtures import (
 def test_all_modes_can_be_backtested_and_paper_traded(mode, size):
     spec = make_spec()
     spec.strategies[0].blend.mode = mode
+
     async def scenario():
         app = HedgeFundApp()
         async with app.run_test(size=size) as pilot:
@@ -45,6 +46,7 @@ def test_all_modes_can_be_backtested_and_paper_traded(mode, size):
             detail = render(app.screen.query_one("#detail-body", Static).content)
             assert "● new" in detail and "NEXT RUN" in detail
             assert load_deployed(directory).spec == spec
+
     asyncio.run(scenario())
 
 
@@ -81,6 +83,7 @@ def test_paper_screen_records_approval_verdicts_from_y_and_n():
             assert rejection["verdict"] == "reject" and rejection["by"] == "tui"
             assert [event["kind"] for event in ledger.events()] == ["approve", "reject"]
             assert "rejected; decision will lapse" in render(screen.query_one("#detail-body", Static).content)
+
     asyncio.run(scenario())
 
 
@@ -106,6 +109,7 @@ def test_run_session_board_reports_a_gated_skip(monkeypatch):
             screen._begin_board(deployed, "2025-01-21", [], pending, approval)
             phase = render(screen.query_one("#run-phase", Static).content)
             assert "executing the 2025-01-20 decision" in phase
+
     asyncio.run(scenario())
 
 
@@ -131,6 +135,7 @@ def test_paper_screen_disables_approval_actions_outside_the_gate(gate, pending, 
             assert not screen.check_action("reject", ())
             await pilot.press("y", "n")
             assert ledger.approval() is None
+
     asyncio.run(scenario())
 
 
@@ -144,6 +149,7 @@ def test_paper_screen_shows_live_prints_when_they_arrive(monkeypatch):
     def fetch(tickers):
         asked.append(tickers)
         return {"TEST": make_quote("TEST", 120, datetime.now(NEW_YORK).isoformat())}
+
     monkeypatch.setattr(paper, "fetch_snapshots", fetch)
 
     async def scenario():
@@ -156,6 +162,7 @@ def test_paper_screen_shows_live_prints_when_they_arrive(monkeypatch):
                 if "Live" in detail:
                     break
             assert asked and asked[-1] == ["TEST"] and "$101,200" in detail
+
     asyncio.run(scenario())
 
 
@@ -218,6 +225,7 @@ def test_paper_screen_runs_through_the_approval_step(monkeypatch):
             await pilot.pause()
             assert isinstance(app.screen, paper.RunSessionScreen) and app.screen._redo
             assert started == [directory, directory]
+
     asyncio.run(scenario())
 
 
@@ -225,9 +233,7 @@ def test_paper_screen_runs_through_the_approval_step(monkeypatch):
 @pytest.mark.parametrize("what", ["executed", "decided", "both", "neither"])
 def test_session_report_separates_the_executed_cycle_from_the_new_decision(size, what):
     record, decided = executed_and_decided()
-    session = make_session("2025-01-20",
-                       executed=record if what in ("executed", "both") else None,
-                       decision=decided if what in ("decided", "both") else None)
+    session = make_session("2025-01-20", executed=record if what in ("executed", "both") else None, decision=decided if what in ("decided", "both") else None)
 
     async def scenario():
         app = HedgeFundApp()
@@ -260,6 +266,7 @@ def test_session_report_separates_the_executed_cycle_from_the_new_decision(size,
                 menu.highlighted = menu.get_option_index("book")
                 await pilot.pause()
                 assert "flat — no positions" in render(screen.query_one("#detail-pane", Static).content)
+
     asyncio.run(scenario())
 
 
@@ -300,8 +307,7 @@ def test_paper_screen_works_the_kill_switch_and_sessions_reads_the_ledger(tmp_pa
             # back to the screen re-reads them.
             record, decided = executed_and_decided()
             first = make_session("2025-01-17", decision=decided, nav=100000)
-            second = make_session("2025-01-20", executed=record, nav=101000, positions={"TEST": 10},
-                              marks={"TEST": 100}, prev_hash=first.hash)
+            second = make_session("2025-01-20", executed=record, nav=101000, positions={"TEST": 10}, marks={"TEST": 100}, prev_hash=first.hash)
             ledger.append(first)
             ledger.append(second)
             await app.push_screen(paper.SessionReportScreen("alpha", first))
@@ -346,6 +352,7 @@ def test_paper_screen_works_the_kill_switch_and_sessions_reads_the_ledger(tmp_pa
             assert not directory.exists() and not (paths.MANDATES_DIR / "alpha.yaml").exists()
             assert [menu.get_option_at_index(i).id for i in range(menu.option_count)] == ["build"]
             assert not screen.check_action("delete", ()) and not screen.check_action("halt", ())
+
     asyncio.run(scenario())
 
 
@@ -381,6 +388,7 @@ def test_paper_screen_enter_on_a_minute_fund_opens_the_same_approval_step(monkey
             app.screen._phase = "done"
             await pilot.press("escape")
             assert app.screen is screen
+
     asyncio.run(scenario())
 
 
@@ -402,6 +410,7 @@ def test_paper_screen_space_starts_and_stops_a_runner_at_any_cadence(monkeypatch
         stopped.append(path)
         (path / PID_FILE).unlink()
         return True
+
     monkeypatch.setattr(paper, "spawn_runner", spawn)
     monkeypatch.setattr(paper, "stop_runner", stop)
 
@@ -430,6 +439,7 @@ def test_paper_screen_space_starts_and_stops_a_runner_at_any_cadence(monkeypatch
             await pilot.press("space")
             await pilot.pause()
             assert spawned == [directory]
+
     asyncio.run(scenario())
 
 
@@ -438,10 +448,8 @@ def test_sessions_screen_groups_a_minute_funds_bars_by_day():
     ledger = Ledger(directory)
     record, decided = executed_and_decided()
     chain = [make_session("2025-01-21T13:00:00", decision=decided, nav=100000)]
-    chain.append(make_session("2025-01-21T13:05:00", executed=record, nav=101000, positions={"TEST": 10},
-                          marks={"TEST": 100}, prev_hash=chain[-1].hash))
-    chain.append(make_session("2025-01-22T13:00:00", nav=102000, positions={"TEST": 10}, marks={"TEST": 200},
-                          prev_hash=chain[-1].hash))
+    chain.append(make_session("2025-01-21T13:05:00", executed=record, nav=101000, positions={"TEST": 10}, marks={"TEST": 100}, prev_hash=chain[-1].hash))
+    chain.append(make_session("2025-01-22T13:00:00", nav=102000, positions={"TEST": 10}, marks={"TEST": 200}, prev_hash=chain[-1].hash))
     for r in chain:
         ledger.append(r)
 
@@ -453,8 +461,7 @@ def test_sessions_screen_groups_a_minute_funds_bars_by_day():
             await pilot.pause()
             assert "every 5m · 13:00–13:10 ET" in render(screen.query_one("#pf-head", Static).content)
             sessions = screen.query_one("#pf-sessions", OptionList)
-            rows = [(sessions.get_option_at_index(i).id, render(sessions.get_option_at_index(i).prompt).strip())
-                    for i in range(sessions.option_count)]
+            rows = [(sessions.get_option_at_index(i).id, render(sessions.get_option_at_index(i).prompt).strip()) for i in range(sessions.option_count)]
             assert rows[0][0] is None and rows[0][1].startswith("2025-01-22  +0.99%  1 bar")
             assert rows[1] == ("s:0", "13:00:00  +0.99%")
             assert rows[2][0] is None and rows[2][1].startswith("2025-01-21  +1.00%  2 bars")
@@ -462,4 +469,5 @@ def test_sessions_screen_groups_a_minute_funds_bars_by_day():
             assert rows[4][0] == "s:2" and rows[4][1].startswith("13:00:00  +0.00%  decided")
             assert sessions.highlighted == 1  # the newest bar, not its heading
             assert "next bar's close" in render(report.session_overview(chain[0]))
+
     asyncio.run(scenario())

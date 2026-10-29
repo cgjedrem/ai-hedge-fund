@@ -29,14 +29,7 @@ MINIMAL = {
     "risk": {"max_position_pct": 0.25, "max_gross_exposure": 1.0},
 }
 
-LEGACY_DEFAULT_JSON = (
-    '{"schema_version":2,"name":"test-fund","strategies":'
-    '[{"name":"event","display_name":null,"weight":1.0,'
-    '"models":[{"name":"pead","weight":1.0,"params":{}}],'
-    '"blend":{"method":"conviction_weighted","gross_target":1.0,"mode":"long_short"}}],'
-    '"risk":{"max_position_pct":0.25,"max_gross_exposure":1.0},'
-    '"capital":100000.0,"rebalance":"weekly","benchmark":"SPY"}'
-)
+LEGACY_DEFAULT_JSON = '{"schema_version":2,"name":"test-fund","strategies":' '[{"name":"event","display_name":null,"weight":1.0,' '"models":[{"name":"pead","weight":1.0,"params":{}}],' '"blend":{"method":"conviction_weighted","gross_target":1.0,"mode":"long_short"}}],' '"risk":{"max_position_pct":0.25,"max_gross_exposure":1.0},' '"capital":100000.0,"rebalance":"weekly","benchmark":"SPY"}'
 
 
 def test_yaml_load_happy_path(tmp_path):

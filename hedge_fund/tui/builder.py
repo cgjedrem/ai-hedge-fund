@@ -68,11 +68,7 @@ from hedge_fund.tui.shared import (
 CUSTOM = "custom"  # sentinel value in the strategy list for "build your own"
 
 
-_NEWS_SENTENCE = (
-    "Analysts are asked again at every bar and see new headlines as they land (the news "
-    "feed refreshes about every 10 minutes); a bar with nothing new re-marks the book and "
-    "fills what is pending, at no extra model cost."
-)
+_NEWS_SENTENCE = "Analysts are asked again at every bar and see new headlines as they land (the news " "feed refreshes about every 10 minutes); a bar with nothing new re-marks the book and " "fills what is pending, at no extra model cost."
 
 
 _WINDOW_NOTE = f"anywhere inside US extended hours ({EARLIEST_WINDOW}–{LATEST_WINDOW})"
@@ -144,44 +140,35 @@ class BuilderScreen(Screen):
                             ),
                             CUSTOM,
                         ),
-                        *(
-                            Selection(self._strategy_prompt(s), i)
-                            for i, s in enumerate(self._library)
-                        ),
+                        *(Selection(self._strategy_prompt(s), i) for i, s in enumerate(self._library)),
                         id="strategy-list",
                     )
                     yield Static(
-                        Text("space to toggle · a for all · enter to continue",
-                             style=MUTED),
+                        Text("space to toggle · a for all · enter to continue", style=MUTED),
                         classes="hint",
                     )
                 with Vertical(id="step-agents", classes="pane"):
                     yield Label("Staff your desk", classes="q")
                     yield SelectionList(
-                        *(
-                            Selection(self._agent_prompt(key, cls), key)
-                            for key, cls in ALPHA_MODEL_REGISTRY.items()
-                        ),
+                        *(Selection(self._agent_prompt(key, cls), key) for key, cls in ALPHA_MODEL_REGISTRY.items()),
                         id="agent-list",
                     )
                     yield Static(
-                        Text("space to toggle · a for all · enter to continue",
-                             style=MUTED),
+                        Text("space to toggle · a for all · enter to continue", style=MUTED),
                         classes="hint",
                     )
                 with VerticalScroll(id="step-capital", classes="pane"):
                     yield Static("", id="strategy-summary")
                     yield Label("Starting capital ($)", classes="q")
                     yield Input(
-                        value=f"{DEFAULT_CAPITAL:.0f}", type="number",
+                        value=f"{DEFAULT_CAPITAL:.0f}",
+                        type="number",
                         id="capital-input",
                     )
                 with Vertical(id="step-cadence", classes="pane"):
                     yield Label("Rebalance cadence", classes="q")
                     yield OptionList(
-                        *(Option(Text.assemble((f"{cadence:<10}", "bold"),
-                                               (self.CADENCE_TAGLINES[cadence], MUTED)))
-                          for cadence in self.CADENCES),
+                        *(Option(Text.assemble((f"{cadence:<10}", "bold"), (self.CADENCE_TAGLINES[cadence], MUTED))) for cadence in self.CADENCES),
                         id="cadence-list",
                     )
                 if self.mode == "paper":
@@ -215,8 +202,7 @@ class BuilderScreen(Screen):
                         yield Input(value=TradingWindow().end, id="window-end-input")
                     yield Static("", id="window-line")
                     yield Static(
-                        Text(f"New York time, {_WINDOW_NOTE}. The first and last bar fall exactly on these.",
-                             style=MUTED),
+                        Text(f"New York time, {_WINDOW_NOTE}. The first and last bar fall exactly on these.", style=MUTED),
                         classes="hint",
                     )
                 with Vertical(id="step-tickers", classes="pane"):
@@ -277,9 +263,7 @@ class BuilderScreen(Screen):
         self.query_one(focus).focus()
         if pane_id == "step-cadence":
             picked = self._state.get("rebalance", "weekly")
-            self.query_one("#cadence-list", OptionList).highlighted = (
-                self.CADENCES.index(picked)
-            )
+            self.query_one("#cadence-list", OptionList).highlighted = self.CADENCES.index(picked)
         if pane_id == "step-approval":
             self.query_one("#approval-list", OptionList).highlighted = int(self._state.get("approval_required", False))
         if pane_id == "step-interval":
@@ -293,10 +277,7 @@ class BuilderScreen(Screen):
                 if last:
                     tickers.value = ", ".join(last)
         if pane_id == "step-capital":
-            self.query_one("#strategy-summary", Static).update(Group(*(
-                Text(f"{s.title}: {strategy_description(s)}", style=MUTED)
-                for s in self._state.get("strategies", [])
-            )))
+            self.query_one("#strategy-summary", Static).update(Group(*(Text(f"{s.title}: {strategy_description(s)}", style=MUTED) for s in self._state.get("strategies", []))))
         self._refresh_rail()
 
         # Wrapped summaries can move controls below the viewport during layout.
@@ -336,9 +317,7 @@ class BuilderScreen(Screen):
 
     @on(Input.Submitted, "#name-input")
     def _submit_name(self, event: Input.Submitted) -> None:
-        name = (
-            event.value.strip().replace(" ", "-").lower() or "ai-hedge-fund"
-        )
+        name = event.value.strip().replace(" ", "-").lower() or "ai-hedge-fund"
         try:
             validate_fund_name(name)
         except ValueError as exc:
@@ -347,9 +326,7 @@ class BuilderScreen(Screen):
         if fund_name_taken(name) and self._state.get("replace") != name:
             # Taken. Offer to replace it; nothing is removed until the new
             # fund is fully specified, so backing out of the wizard is free.
-            self.app.push_screen(
-                ConfirmWipeScreen(name, replacing=True),
-                lambda ok: self._accept_name(name, replace=True) if ok else None)
+            self.app.push_screen(ConfirmWipeScreen(name, replacing=True), lambda ok: self._accept_name(name, replace=True) if ok else None)
             return
         self._accept_name(name, replace=self._state.get("replace") == name)
 
@@ -359,8 +336,7 @@ class BuilderScreen(Screen):
         self._goto("step-strategies")
 
     def action_toggle_all(self) -> None:
-        picker_id = {"step-strategies": "#strategy-list",
-                     "step-agents": "#agent-list"}[self._pane()]
+        picker_id = {"step-strategies": "#strategy-list", "step-agents": "#agent-list"}[self._pane()]
         picker = self.query_one(picker_id, SelectionList)
         if len(picker.selected) == picker.option_count:
             picker.deselect_all()
@@ -373,9 +349,7 @@ class BuilderScreen(Screen):
             if not picked:
                 self.notify("Select at least one strategy.", severity="error")
                 return
-            self._state["library_strategies"] = [
-                self._library[i] for i in picked if i != CUSTOM
-            ]
+            self._state["library_strategies"] = [self._library[i] for i in picked if i != CUSTOM]
             self._state["custom_selected"] = CUSTOM in picked
             self._state["strategies"] = list(self._state["library_strategies"])
             if CUSTOM in picked:
@@ -425,8 +399,7 @@ class BuilderScreen(Screen):
     def _window_draft(self) -> TradingWindow:
         """The window as typed, or the default while it does not parse yet."""
         try:
-            return TradingWindow(start=self.query_one("#window-start-input", Input).value.strip(),
-                                 end=self.query_one("#window-end-input", Input).value.strip())
+            return TradingWindow(start=self.query_one("#window-start-input", Input).value.strip(), end=self.query_one("#window-end-input", Input).value.strip())
         except ValueError:
             return self._state.get("window") or TradingWindow()
 
@@ -514,15 +487,13 @@ class BuilderScreen(Screen):
         # the way in, but something may have taken it since. Paper mode needs
         # both the saved definition and the fund directory to be free.
         if self.mode == "paper" and (paths.PAPER_DIR / spec.name).exists():
-            self.notify("A paper fund with that name already exists. Choose a different name.",
-                        severity="error")
+            self.notify("A paper fund with that name already exists. Choose a different name.", severity="error")
             self._goto("step-name")
             return
         try:
             path = save_spec(spec, paths.MANDATES_DIR)
         except FileExistsError:
-            self.notify("A fund with that name already exists. Choose a different name.",
-                        severity="error")
+            self.notify("A fund with that name already exists. Choose a different name.", severity="error")
             self._goto("step-name")
             return
         self._built = (spec, path)
@@ -539,49 +510,49 @@ class BuilderScreen(Screen):
             directory = deploy(spec.name, spec, universe, root=paths.PAPER_DIR)
             menu = self.query_one("#done-menu", OptionList)
             menu.clear_options()
-            menu.add_options([
-                Option("▶  Run its first session", id="go-run"),
-                None,
-                Option("Back", id="go-back"),
-            ])
+            menu.add_options(
+                [
+                    Option("▶  Run its first session", id="go-run"),
+                    None,
+                    Option("Back", id="go-back"),
+                ]
+            )
             menu.highlighted = 0
             if spec.approval_required:
                 first = f"Its first session marks the book at the {'current bar' if intraday else 'latest completed close'} and " f"makes the first decision; the {'next bar' if intraday else 'next session'} waits for approval. " "Without a verdict, that decision lapses and the fund keeps running. " "Run one session at a time, or leave a runner on it from the paper screen (space)."
             else:
-                first = (
-                    f"Its first session marks the book at the {'current bar' if intraday else 'latest completed close'} and "
-                    f"makes the first decision; the {'next bar' if intraday else 'session after'} executes it. "
-                    "Run it a session at a time, or leave a runner on it from the paper screen (space)."
+                first = f"Its first session marks the book at the {'current bar' if intraday else 'latest completed close'} and " f"makes the first decision; the {'next bar' if intraday else 'session after'} executes it. " "Run it a session at a time, or leave a runner on it from the paper screen (space)."
+            self.query_one("#done-summary", Static).update(
+                Group(
+                    Text.assemble((spec.name, f"bold {GREEN}"), (" is live.", f"bold {BRIGHT}")),
+                    Text(""),
+                    identity,
+                    Text(" ".join(universe), style=MUTED),
+                    Text(""),
+                    Text.assemble(("✓ ", f"bold {GREEN}"), ("Ledger and book at ", MUTED), (str(directory), MUTED)),
+                    Text.assemble(("✓ ", f"bold {GREEN}"), ("Definition saved to ", MUTED), (str(path), MUTED)),
+                    Text(""),
+                    Text(first, style=MUTED),
                 )
-            self.query_one("#done-summary", Static).update(Group(
-                Text.assemble((spec.name, f"bold {GREEN}"), (" is live.", f"bold {BRIGHT}")),
-                Text(""),
-                identity,
-                Text(" ".join(universe), style=MUTED),
-                Text(""),
-                Text.assemble(("✓ ", f"bold {GREEN}"), ("Ledger and book at ", MUTED),
-                              (str(directory), MUTED)),
-                Text.assemble(("✓ ", f"bold {GREEN}"), ("Definition saved to ", MUTED),
-                              (str(path), MUTED)),
-                Text(""),
-                Text(first, style=MUTED),
-            ))
+            )
         else:
-            self.query_one("#done-summary", Static).update(Group(
-                Text.assemble(("✓ ", f"bold {GREEN}"), ("Saved fund to ", TEXT),
-                              (str(path), f"bold {BRIGHT}")),
-                Text(""),
-                identity,
-                Text(""),
-                Text("Pick the tickers and the window when you backtest it.", style=MUTED),
-                *(Text(f"{s.title}: {strategy_description(s)}", style=MUTED) for s in spec.strategies),
-            ))
+            self.query_one("#done-summary", Static).update(
+                Group(
+                    Text.assemble(("✓ ", f"bold {GREEN}"), ("Saved fund to ", TEXT), (str(path), f"bold {BRIGHT}")),
+                    Text(""),
+                    identity,
+                    Text(""),
+                    Text("Pick the tickers and the window when you backtest it.", style=MUTED),
+                    *(Text(f"{s.title}: {strategy_description(s)}", style=MUTED) for s in spec.strategies),
+                )
+            )
         self._goto("step-done")
 
     @on(OptionList.OptionSelected, "#done-menu")
     def _after_build(self, event: OptionList.OptionSelected) -> None:
         # Imported here, not at the top: the paper screen opens this builder.
         from hedge_fund.tui.paper import PaperScreen
+
         assert self._built is not None
         spec = self._built[0]
         if event.option.id == "go-backtest":
@@ -597,12 +568,10 @@ class BuilderScreen(Screen):
         chosen = {
             0: self._state.get("name"),
             1: self._short_strategies(),
-            2: (f"${self._state['capital']:,.0f}"
-                if "capital" in self._state else None),
+            2: (f"${self._state['capital']:,.0f}" if "capital" in self._state else None),
             3: self._short_cadence(),
             4: ("approval required" if self._state.get("approval_required") else "automatic execution" if "approval_required" in self._state else None),
-            5: (short_tickers(self._state["universe"], 3)
-                if "universe" in self._state else None),
+            5: (short_tickers(self._state["universe"], 3) if "universe" in self._state else None),
         }
         active = self._step if self._pane() != "step-done" else -1
         for i, title in enumerate(self.STEP_TITLES):
@@ -637,9 +606,7 @@ class BuilderScreen(Screen):
 
     @staticmethod
     def _strategy_prompt(strategy: StrategySpec) -> Text:
-        staff = ", ".join(
-            SHORT_NAMES.get(m.name, m.name) for m in strategy.models
-        )
+        staff = ", ".join(SHORT_NAMES.get(m.name, m.name) for m in strategy.models)
         return Text.assemble((f"{strategy.title:<20}", "bold"), (f"{MODE_LABELS[strategy.blend.mode]} · {staff}", MUTED))
 
     @staticmethod
@@ -658,10 +625,7 @@ def parse_interval(text: str) -> float:
     if not isfinite(minutes) or minutes <= 0:
         raise ValueError("Enter the interval in minutes: 1, 5, or 0.5 for every 30 seconds.")
     if round(minutes * 60) < MIN_INTERVAL_SECONDS:
-        raise ValueError(
-            f"The shortest interval is {MIN_INTERVAL_SECONDS}s: sessions are stamped to the second. "
-            "Enter 0.0167 for every second."
-        )
+        raise ValueError(f"The shortest interval is {MIN_INTERVAL_SECONDS}s: sessions are stamped to the second. " "Enter 0.0167 for every second.")
     return minutes
 
 
@@ -678,12 +642,10 @@ def fast_caveat(minutes: float) -> str | None:
     seconds = int(round(minutes * 60))
     if seconds >= _FAST_SECONDS:
         return None
-    return (f"Under {_FAST_SECONDS}s a bar may not fit its price requests (about a second per ticker); "
-            "bars the fund cannot reach in time are skipped and logged as gaps.")
+    return f"Under {_FAST_SECONDS}s a bar may not fit its price requests (about a second per ticker); " "bars the fund cannot reach in time are skipped and logged as gaps."
 
 
-def window_lines(window: TradingWindow, minutes: float = 1.0, *,
-                  today: datetime | None = None, local_zone: tzinfo | None = None) -> list[str]:
+def window_lines(window: TradingWindow, minutes: float = 1.0, *, today: datetime | None = None, local_zone: tzinfo | None = None) -> list[str]:
     """The window as it will run, plus the same hours in the user's own zone
     when that differs from New York (times are always stored in ET)."""
     lines = [interval_line(minutes, window)]
@@ -692,8 +654,7 @@ def window_lines(window: TradingWindow, minutes: float = 1.0, *,
     start_ny = datetime.combine(today.date(), time(*map(int, window.start.split(":"))), tzinfo=NEW_YORK)
     end_ny = datetime.combine(today.date(), time(*map(int, window.end.split(":"))), tzinfo=NEW_YORK)
     start_local, end_local = start_ny.astimezone(local), end_ny.astimezone(local)
-    if (start_local.hour, start_local.minute) != (start_ny.hour, start_ny.minute) \
-            or (end_local.hour, end_local.minute) != (end_ny.hour, end_ny.minute):
+    if (start_local.hour, start_local.minute) != (start_ny.hour, start_ny.minute) or (end_local.hour, end_local.minute) != (end_ny.hour, end_ny.minute):
         day_shift = (end_local.date() - end_ny.date()).days
         suffix = {1: " (the next day)", -1: " (the day before)"}.get(day_shift, "")
         lines.append(f"that is {start_local:%H:%M}–{end_local:%H:%M} {start_local:%Z} where you are{suffix}")

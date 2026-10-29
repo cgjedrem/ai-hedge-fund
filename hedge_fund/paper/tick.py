@@ -26,14 +26,33 @@ from pathlib import Path
 from typing import Callable
 
 from hedge_fund.brokers.paper import PaperBroker
-from hedge_fund.data.bars import current_bar, is_intraday, is_last_bar, next_bar, previous_bar, session_date
+from hedge_fund.data.bars import (
+    current_bar,
+    is_intraday,
+    is_last_bar,
+    next_bar,
+    previous_bar,
+    session_date,
+)
 from hedge_fund.data.protocol import DataClient
-from hedge_fund.data.sessions import completed_through, NEW_YORK, previous_day, session_closes
+from hedge_fund.data.sessions import (
+    completed_through,
+    NEW_YORK,
+    previous_day,
+    session_closes,
+)
 from hedge_fund.fund import Fund, FundSpec, TradingWindow
 from hedge_fund.paper.deployed import BROKER_FILE, load_deployed
 from hedge_fund.paper.ledger import Ledger
 from hedge_fund.pipeline.clock import Clock, LiveClock, Marked
-from hedge_fund.pipeline.session import advance, FundHalted, FundState, is_rebalance_session, next_state, SessionRecord
+from hedge_fund.pipeline.session import (
+    advance,
+    FundHalted,
+    FundState,
+    is_rebalance_session,
+    next_state,
+    SessionRecord,
+)
 
 # A fresh fund starts at the most recent completed session; this is how far
 # back to look for one (covers a long weekend plus a holiday cluster).
@@ -73,10 +92,7 @@ class RecordedClock:
             raise ValueError(f"{session}: only {self._record.session} can be run again at recorded prices")
         missing = sorted(set(tickers) - set(self._prices))
         if missing:
-            raise ValueError(
-                f"{', '.join(missing)}: no recorded print at {session}; a bar can only be run "
-                "again at the prices it saw"
-            )
+            raise ValueError(f"{', '.join(missing)}: no recorded print at {session}; a bar can only be run " "again at the prices it saw")
         return Marked(
             prices={t: self._prices[t] for t in sorted(set(tickers))},
             times={t: self._times[t] for t in sorted(set(tickers)) if t in self._times} or None,
@@ -84,8 +100,11 @@ class RecordedClock:
 
 
 def next_session(
-    data_client: DataClient, spec: FundSpec, last_session: str | None,
-    *, now: Callable[[], datetime] | None = None,
+    data_client: DataClient,
+    spec: FundSpec,
+    last_session: str | None,
+    *,
+    now: Callable[[], datetime] | None = None,
 ) -> str | None:
     """The next session the fund owes, or None when nothing is due yet.
 
@@ -182,9 +201,7 @@ def tick(
         what = "bar" if spec.is_intraday else f"completed {spec.benchmark} session"
         raise NothingDue(f"{deployed.name}: no {what} {after}; next {following_session(spec, state.last_session, now())}")
     if session is not None and session != due:
-        raise ValueError(
-            f"{deployed.name}: session {session} is not the next unrecorded session ({due})"
-        )
+        raise ValueError(f"{deployed.name}: session {session} is not the next unrecorded session ({due})")
     clock = None
     if spec.is_intraday:
         # The benchmark's print says whether the market is trading today; a
@@ -193,10 +210,7 @@ def tick(
         clock = LiveClock(data_client, spec.interval_seconds, spec.window, now=now)
         benchmark = clock.observe([spec.benchmark], due)[spec.benchmark]
         if print_day(benchmark.time) < session_date(due):
-            raise NothingDue(
-                f"{deployed.name}: {spec.benchmark} has not printed today (market closed); "
-                f"next {following_session(spec, state.last_session, now())}"
-            )
+            raise NothingDue(f"{deployed.name}: {spec.benchmark} has not printed today (market closed); " f"next {following_session(spec, state.last_session, now())}")
     return _run(directory, deployed, ledger, state, due, data_client, build_fund, clock=clock)
 
 
@@ -303,8 +317,11 @@ def _run(
         kind, fields = audit
         ledger.log_event(kind, **fields)
     ledger.log_event(
-        "tick", session=session, nav=record.nav,
-        executed=record.executed is not None, decided=record.decision is not None,
+        "tick",
+        session=session,
+        nav=record.nav,
+        executed=record.executed is not None,
+        decided=record.decision is not None,
     )
     if is_intraday(session) and is_last_bar(session, deployed.spec.window):
         ledger.checkpoint(next_state(state, record))

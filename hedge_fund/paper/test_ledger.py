@@ -6,7 +6,12 @@ from pathlib import Path
 import pytest
 
 from hedge_fund.backtesting.fund import backtest_fund
-from hedge_fund.backtesting.test_fund import FakeAnalyst, FakeDataClient, SERIES, WEEKDAYS
+from hedge_fund.backtesting.test_fund import (
+    FakeAnalyst,
+    FakeDataClient,
+    SERIES,
+    WEEKDAYS,
+)
 from hedge_fund.fund import Fund, FundSpec
 from hedge_fund.paper.ledger import Ledger, LedgerError
 from hedge_fund.pipeline.session import FundState, SessionRecord
@@ -15,15 +20,13 @@ from hedge_fund.pipeline.session import FundState, SessionRecord
 @pytest.fixture(autouse=True)
 def registered_fakes(monkeypatch):
     from hedge_fund.signals import ALPHA_MODEL_REGISTRY
+
     monkeypatch.setitem(ALPHA_MODEL_REGISTRY, "a", FakeAnalyst)
 
 
 @pytest.fixture
 def records():
-    spec = FundSpec(schema_version=2, name="ledger-fund",
-                    strategies=[{"name": "solo", "models": [{"name": "a"}], "blend": {"mode": "long_short"}}],
-                    risk={"max_position_pct": 1, "max_gross_exposure": 1}, capital=100_000,
-                    costs={"spread_bps": 0, "commission_per_share": 0})
+    spec = FundSpec(schema_version=2, name="ledger-fund", strategies=[{"name": "solo", "models": [{"name": "a"}], "blend": {"mode": "long_short"}}], risk={"max_position_pct": 1, "max_gross_exposure": 1}, capital=100_000, costs={"spread_bps": 0, "commission_per_share": 0})
     fund = Fund(spec, models={"solo": [FakeAnalyst("a", {"AAPL": 1})]})
     return backtest_fund(fund, WEEKDAYS[0], WEEKDAYS[4], FakeDataClient(SERIES), ["AAPL"]).records
 
@@ -92,9 +95,19 @@ def test_replay_detects_a_missing_link(tmp_path, records):
 def _bar(session, prev=None, nav=100_000.0):
     """A hand-made bar record chained to *prev*."""
     record = SessionRecord(
-        fund="bars", session=session, universe=["AAPL"], nav=nav, cash=nav, positions={},
-        marks={}, benchmark="SPY", benchmark_close=500.0, rebalance=True,
-        prev_hash=prev.hash if prev else None, code_version="test", mandate_hash="m",
+        fund="bars",
+        session=session,
+        universe=["AAPL"],
+        nav=nav,
+        cash=nav,
+        positions={},
+        marks={},
+        benchmark="SPY",
+        benchmark_close=500.0,
+        rebalance=True,
+        prev_hash=prev.hash if prev else None,
+        code_version="test",
+        mandate_hash="m",
         snapshot_times={"SPY": "2026-10-05T14:00:00Z"},
     )
     record.hash = record.compute_hash()
@@ -153,7 +166,8 @@ def test_checkpoint_shortcuts_replay_and_is_ignored_once_the_chain_moves_under_i
     read.clear()
     assert ledger.replay(100_000, before=MONDAY[1]).last_session == MONDAY[0] and read == [MONDAY[0]]
     # Rewinding past the checkpoint drops it; a stale one on disk is ignored.
-    ledger.rewind(); ledger.rewind()
+    ledger.rewind()
+    ledger.rewind()
     assert (tmp_path / "ledger" / "superseded" / f"2026-10-06T093000.{records[3].hash[:12]}.json").exists()
     ledger.rewind()
     assert not path.exists() and ledger.replay(100_000).last_session == MONDAY[1]
@@ -243,9 +257,18 @@ def test_set_approval_validates_mailbox_values(tmp_path, verdict, decision_as_of
 
 def _compat_record(positions: dict[str, float]) -> SessionRecord:
     record = SessionRecord(
-        fund="compat", session="2024-06-03", universe=["AAPL"], nav=100_000.0, cash=0.0,
-        positions=positions, marks={"AAPL": 200.0}, benchmark="SPY", benchmark_close=100.0,
-        rebalance=True, code_version="test", mandate_hash="m",
+        fund="compat",
+        session="2024-06-03",
+        universe=["AAPL"],
+        nav=100_000.0,
+        cash=0.0,
+        positions=positions,
+        marks={"AAPL": 200.0},
+        benchmark="SPY",
+        benchmark_close=100.0,
+        rebalance=True,
+        code_version="test",
+        mandate_hash="m",
     )
     record.hash = record.compute_hash()
     return record

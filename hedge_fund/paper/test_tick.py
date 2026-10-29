@@ -8,7 +8,12 @@ import pytest
 import yaml
 
 from hedge_fund.backtesting.fund import backtest_fund
-from hedge_fund.backtesting.test_fund import FakeAnalyst, FakeDataClient, SERIES, WEEKDAYS
+from hedge_fund.backtesting.test_fund import (
+    FakeAnalyst,
+    FakeDataClient,
+    SERIES,
+    WEEKDAYS,
+)
 from hedge_fund.brokers.paper import PaperBroker
 from hedge_fund.data import sessions
 from hedge_fund.data.sessions import NEW_YORK
@@ -65,28 +70,30 @@ created: '{created}'
 @pytest.fixture(autouse=True)
 def registered_fakes(monkeypatch):
     from hedge_fund.signals import ALPHA_MODEL_REGISTRY
+
     monkeypatch.setitem(ALPHA_MODEL_REGISTRY, "a", FakeAnalyst)
 
 
 @pytest.fixture
 def clock(monkeypatch):
     """Pin 'now' so completed_through() is deterministic; returns a setter."""
+
     def set_today(day: str, hour: int = 12):
         y, m, d = map(int, day.split("-"))
+
         class Clock:
             @staticmethod
             def now(tz):
                 return datetime(y, m, d, hour, tzinfo=tz)
+
         monkeypatch.setattr(sessions, "datetime", Clock)
+
     return set_today
 
 
 @pytest.fixture
 def SPEC(registered_fakes):
-    return FundSpec(schema_version=2, name="paper-fund",
-                    strategies=[{"name": "solo", "models": [{"name": "a"}], "blend": {"mode": "long_short"}}],
-                    risk={"max_position_pct": 1, "max_gross_exposure": 1}, capital=100_000,
-                    costs={"spread_bps": 0, "commission_per_share": 0})
+    return FundSpec(schema_version=2, name="paper-fund", strategies=[{"name": "solo", "models": [{"name": "a"}], "blend": {"mode": "long_short"}}], risk={"max_position_pct": 1, "max_gross_exposure": 1}, capital=100_000, costs={"spread_bps": 0, "commission_per_share": 0})
 
 
 def build_fund(spec):
@@ -100,6 +107,7 @@ def _tick(directory, session=None, data=None):
 # ---------------------------------------------------------------------------
 # deploy
 # ---------------------------------------------------------------------------
+
 
 def test_deploy_lays_out_the_fund_directory(tmp_path, SPEC):
     directory = deploy("alpha", SPEC, ["aapl", "AAPL", "msft"], root=tmp_path)
@@ -147,6 +155,7 @@ def test_load_deployed_reports_the_path_on_bad_files(tmp_path, SPEC):
 # next_session
 # ---------------------------------------------------------------------------
 
+
 def test_next_session_is_latest_completed_for_a_fresh_fund_and_the_next_one_after(clock, SPEC):
     clock("2024-06-13")  # completed through 06-12
     data = FakeDataClient(SERIES)
@@ -158,8 +167,7 @@ def test_next_session_is_latest_completed_for_a_fresh_fund_and_the_next_one_afte
 
 
 def test_next_session_of_a_minute_fund_is_the_latest_bar_passed_and_asks_nothing_of_the_market(SPEC):
-    spec = SPEC.model_copy(update={"rebalance": "minute", "interval": 5.0,
-                                   "window": TradingWindow(start="13:00", end="13:10")})
+    spec = SPEC.model_copy(update={"rebalance": "minute", "interval": 5.0, "window": TradingWindow(start="13:00", end="13:10")})
     at = lambda hhmmss: datetime.fromisoformat(f"2024-06-04T{hhmmss}").replace(tzinfo=NEW_YORK)  # noqa: E731
     assert next_session(None, spec, None, now=lambda: at("12:59:59")) is None
     assert next_session(None, spec, None, now=lambda: at("13:07:30")) == "2024-06-04T13:05:00"
@@ -173,6 +181,7 @@ def test_next_session_of_a_minute_fund_is_the_latest_bar_passed_and_asks_nothing
 # ---------------------------------------------------------------------------
 # tick
 # ---------------------------------------------------------------------------
+
 
 def test_ticks_advance_one_session_each_and_match_the_backtest(tmp_path, clock, SPEC):
     clock("2024-06-04")  # the fund is deployed Tuesday morning: Monday is the latest close
@@ -363,9 +372,9 @@ def test_redo_runs_the_latest_session_again_and_replaces_its_record(tmp_path, cl
     ledger = Ledger(directory)
     with pytest.raises(NothingDue, match="nothing to run again"):
         redo(directory, FakeDataClient(SERIES), build_fund=build_fund)
-    _tick(directory)                         # 06-03: decided, long AAPL
+    _tick(directory)  # 06-03: decided, long AAPL
     clock("2024-06-05")
-    tuesday = _tick(directory)               # 06-04: bought 500 AAPL, decided again
+    tuesday = _tick(directory)  # 06-04: bought 500 AAPL, decided again
     assert tuesday.positions == {"AAPL": 500} and tuesday.decision.final_weights == {"AAPL": 1.0}
     book_before = json.loads((directory / "broker.json").read_text())
 
@@ -381,11 +390,10 @@ def test_redo_runs_the_latest_session_again_and_replaces_its_record(tmp_path, cl
 
     # The analysts changed their minds by the evening: the 06-03 decision is
     # still what gets executed, but the new decision is different.
-    bearish = redo(directory, FakeDataClient(SERIES),
-                   build_fund=lambda s: Fund(s, models={"solo": [FakeAnalyst("a", {"AAPL": -1})]}))
+    bearish = redo(directory, FakeDataClient(SERIES), build_fund=lambda s: Fund(s, models={"solo": [FakeAnalyst("a", {"AAPL": -1})]}))
     assert bearish.session == "2024-06-04" and bearish.prev_hash == tuesday.prev_hash
-    assert bearish.positions == {"AAPL": 500}                    # executed the same pending decision
-    assert bearish.decision.final_weights == {"AAPL": -1.0}      # but decided differently
+    assert bearish.positions == {"AAPL": 500}  # executed the same pending decision
+    assert bearish.decision.final_weights == {"AAPL": -1.0}  # but decided differently
     assert bearish.hash != tuesday.hash
     assert ledger.sessions() == ["2024-06-03", "2024-06-04"] and ledger.latest() == bearish
     assert ledger.replay(spec.capital).pending == bearish.decision  # the chain still verifies
@@ -437,6 +445,7 @@ def test_broker_drift_between_ticks_is_caught_and_halts(tmp_path, clock, SPEC):
     (directory / "broker.json").write_text(json.dumps(book))
     clock("2024-06-06")
     from hedge_fund.pipeline.session import BookMismatch
+
     with pytest.raises(BookMismatch, match="cash"):
         _tick(directory)
     assert "BookMismatch" in Ledger(directory).halted()
@@ -456,8 +465,7 @@ def test_assessment_dates_name_the_refresh_and_the_new_decision(SPEC):
     assert assessment_dates(state, "2025-01-21", SPEC) == []
     assert assessment_dates(FundState(cash=100_000), "2025-01-21", SPEC) == ["2025-01-21"]
     # On bars the refresh cutoff is the bar before, and every bar decides.
-    spec = SPEC.model_copy(update={"rebalance": "minute", "interval": 5.0,
-                                   "window": TradingWindow(start="13:00", end="13:10")})
+    spec = SPEC.model_copy(update={"rebalance": "minute", "interval": 5.0, "window": TradingWindow(start="13:00", end="13:10")})
     stale = DecisionRecord.model_construct(as_of="2025-01-17T13:10:00")
     state = FundState(cash=100_000, last_session="2025-01-17T13:10:00", pending=stale)
     assert assessment_dates(state, "2025-01-21T13:05:00", spec) == ["2025-01-21T13:00:00", "2025-01-21T13:05:00"]

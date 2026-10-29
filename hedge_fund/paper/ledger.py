@@ -112,16 +112,10 @@ class Ledger:
             raise LedgerError(f"{record.fund}: session {record.session} is already recorded")
         latest = self.latest()
         if latest is not None and record.session <= latest.session:
-            raise LedgerError(
-                f"{record.fund}: session {record.session} is not after the last "
-                f"recorded session {latest.session}"
-            )
+            raise LedgerError(f"{record.fund}: session {record.session} is not after the last " f"recorded session {latest.session}")
         expected_prev = latest.hash if latest is not None else None
         if record.prev_hash != expected_prev:
-            raise LedgerError(
-                f"{record.fund}: session {record.session} does not chain to the "
-                f"last recorded session ({latest.session if latest else 'none'})"
-            )
+            raise LedgerError(f"{record.fund}: session {record.session} does not chain to the " f"last recorded session ({latest.session if latest else 'none'})")
         if record.hash != record.compute_hash():
             raise LedgerError(f"{record.fund}: session {record.session} hash does not match its contents")
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -184,9 +178,7 @@ class Ledger:
             raise LedgerError(f"{self.directory.name}: only a minute fund's day is checkpointed")
         latest = self.latest()
         if latest is None or latest.session != state.last_session or latest.hash != state.prev_hash:
-            raise LedgerError(
-                f"{self.directory.name}: checkpoint for {state.last_session} does not match the chain's head"
-            )
+            raise LedgerError(f"{self.directory.name}: checkpoint for {state.last_session} does not match the chain's head")
         path = self.checkpoint_path(session_date(state.last_session))
         write_atomic(path, state.model_dump_json(exclude={"halted"}, indent=2))
         self.log_event("checkpoint", session=state.last_session)
@@ -240,9 +232,17 @@ class Ledger:
         self.log_event("resume")
 
     def _write_control(self, halted: bool, reason: str | None) -> None:
-        write_atomic(self.control_path, json.dumps({
-            "halted": halted, "reason": reason, "since": _now(),
-        }, indent=2))
+        write_atomic(
+            self.control_path,
+            json.dumps(
+                {
+                    "halted": halted,
+                    "reason": reason,
+                    "since": _now(),
+                },
+                indent=2,
+            ),
+        )
 
     # ---- approval mailbox ------------------------------------------------
 
