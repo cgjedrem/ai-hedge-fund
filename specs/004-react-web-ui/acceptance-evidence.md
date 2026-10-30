@@ -1,6 +1,8 @@
 # Acceptance Evidence
 
-Status: QA repair cycle 1 complete for T001–T022. T023 remains partial because protected-root content identity is inconclusive. Independent QA and PR handoff remain with the coordinator.
+Status after QA repair cycle 2: T001–T023 complete at source revision `3d7e44e5e65e4c71764c3a92549eecc5b0c40a88`. T023 real-root browser acceptance is complete for available screens; no saved research reports existed for a live report-detail page. Protected-root content identity remains intentionally INCONCLUSIVE and was not fingerprinted. React/TUI parity remains partial; do not retire the TUI. T024/T025 remain coordinator-owned and unchecked.
+
+The cycle-one status below is historical. Final cycle-two evidence follows.
 
 ## Initial implementation identity (historical)
 
@@ -103,3 +105,50 @@ These chunked outcomes were captured during earlier implementation runs. Exact r
 - Production JS chunk is 893,484 bytes (261.67 kB gzip), above Vite's 500 kB warning threshold. No code splitting was added.
 - Runner lifecycle/manual runs, deletion, redo and live quote fetching remain explicitly deferred. Per-fund locks are process-local. See `parity-checklist.md`.
 - The Playwright server stopped after E2E. No persistent preview remains running. Coordinator owns T024 independent QA and T025 PR/preview handoff; no push or PR update was performed here.
+
+## QA repair cycle 2 final-artifact evidence
+
+### Source and artifact identity
+
+- Source commits: `d054b3ae65031de422e10477090d48cb7e7ec4a7` and `3d7e44e5e65e4c71764c3a92549eecc5b0c40a88`; final source HEAD `3d7e44e5e65e4c71764c3a92549eecc5b0c40a88`, branch `cgjedrem-fictional-winner`. Both source commits include `Co-authored-by: Copilot App <223556219+Copilot@users.noreply.github.com>`. No branch switch, push, PR or merge.
+- Final host environment: Windows_NT; Python 3.13.7; Poetry 2.5.1; Node 22.13.1; npm 10.9.2; Playwright 1.64.1. Linux suite ran in Python 3.13.18 container `sha256:5601137b74cacad0be829711e943e5f6ca4e7609d122676e2d5ebd8bc64c12a2`; Docker 29.9.2.
+- Final `frontend/package-lock.json` SHA-256: `380011feb3bd4ce8888ccc3ecb13db8bfaec6cee2c1eecaf30f5bf97e8f444a0`.
+- Production static tree: 3 files, 942,306 bytes, SHA-256 `19fab09bfa1ff7d71b75884d4bd2618b2f234f053f33e369c7abb50d64f08edd`. JS: 917,598 bytes, SHA-256 `6f27041279303a49c1cc20247c31399ea0d23be1b480507526850b40985a712e`; CSS: 24,240 bytes, SHA-256 `b18090644dad01fb78c587b1bbb616cb72cd1edb235476ad933fed85c13eaaf3`.
+- Synthetic screenshot tree: 17 PNGs, 2,970,533 bytes, SHA-256 `70b3a13c84e8b8870d06cc1cafc3999fc4585c6ee50c7531d5ba9b16037a5451`; 13 files differ from the committed baseline. Hash measured `2026-10-30T21:31:18.6419450Z`–`21:31:20.0598729Z`; tree algorithm matches the cycle-one definition above.
+- Final screenshot-only `git diff --binary`: 3,992,691 bytes, SHA-256 `fb989fdc4b0e4883dbdc40ded4c2b124e35502c821e4a48c10e094aef3f11bed`, measured at the same artifact capture. The diff contained only synthetic PNGs; source code was committed before these checks.
+
+### Final-source checks
+
+| Result | Scenario and provenance | Exact command and observation |
+|---|---|---|
+| PASS | API and affected shared regressions; committed source SHA above; Windows_NT/Python 3.13.7/Poetry 2.5.1; pytest temp roots; `2026-10-30T21:24:51.9157384Z`–`21:25:13.5834425Z`. | `python -m poetry run pytest hedge_fund/web hedge_fund/paper/test_ledger.py hedge_fund/fund/test_spec.py hedge_fund/pipeline/test_session.py -q` — 166 passed in 3.39s; exit 0. |
+| PASS | Frontend unit tests; committed source SHA above; Node 22.13.1/npm 10.9.2; locked dependencies; `2026-10-30T21:24:52.0245977Z`–`21:26:38.0790600Z`. | `cd frontend; npm test` — 7 passed in 72.50s; exit 0. Vitest 4.1.12. |
+| PASS | Changed Python style gates; six explicit changed files; committed source SHA above; `2026-10-30T21:24:52.0204154Z`–`21:25:09.2500652Z`. | `python -m poetry run black --check hedge_fund/web/demo.py hedge_fund/web/schemas.py hedge_fund/web/services.py hedge_fund/web/test_jobs.py hedge_fund/web/test_services.py hedge_fund/web/test_settings.py`; `python -m poetry run isort --check-only hedge_fund/web/demo.py hedge_fund/web/schemas.py hedge_fund/web/services.py hedge_fund/web/test_jobs.py hedge_fund/web/test_services.py hedge_fund/web/test_settings.py`; `python -m poetry run flake8 --max-line-length=420 hedge_fund/web/demo.py hedge_fund/web/schemas.py hedge_fund/web/services.py hedge_fund/web/test_jobs.py hedge_fund/web/test_services.py hedge_fund/web/test_settings.py`; `git diff --check 9131179 3d7e44e5e65e4c71764c3a92549eecc5b0c40a88` — all exit 0; Black left six files unchanged. |
+| PASS | Actual npm registry audits of final lock; only package/version metadata; Node 22.13.1/npm 10.9.2; `2026-10-30T21:24:52.0245977Z`–`21:25:26.3218250Z` (production) and `21:24:52.0229828Z`–`21:25:26.3328911Z` (full). | In `frontend/`: `npm audit --json --omit=dev` and `npm audit --json` — both exit 0; 0 total vulnerabilities in each scope. |
+| PASS | Synthetic production browser E2E; exact loopback origin only; external browser requests aborted; screenshots refreshed; `2026-10-30T21:27:16.6303706Z`–`21:28:43.8952386Z`. | In `frontend/`, with `POETRY_VIRTUALENVS_PATH` set to the existing Poetry cache: `npm run e2e` — `tsc --noEmit` passed; Vite 6.4.5 transformed 2,307 modules and built in 29.13s; five Playwright tests passed in 18.9s. Verified chart paths, two-decimal metrics and `$0.50 + $4.50 = $5.00`, canonical/custom builder semantics, mandate-hash confirmation, cooperative cancel copy, `.json` report and dotted-fund reloads, approval negatives, and zero external requests. JS chunk exceeds Vite's 500 kB warning threshold; no build failure. |
+| PASS | Full co-located suite; final source SHA above; source mount read-only, container root read-only, `/tmp` tmpfs, temporary HOME, `--network none`, Python 3.13.18; `2026-10-30T21:28:57.6178250Z`–`21:30:45.4118861Z`. | `docker run --rm --network none --read-only --mount type=bind,source=<repo>,target=/workspace,readonly --tmpfs /tmp:rw,noexec,nosuid,size=2g --env HOME=/tmp/home --env COLUMNS=240 --env PYTHONDONTWRITEBYTECODE=1 sha256:5601137b74cacad0be829711e943e5f6ca4e7609d122676e2d5ebd8bc64c12a2 --timeout=120 --timeout-method=thread -p no:cacheprovider -q` — 1,125 passed, 37 skipped in 103.93s; exit 0. |
+
+#### Suite width sensitivity
+
+An earlier isolated run at source `d054b3a` without `COLUMNS=240` reported 1,120 passed, 37 skipped, 1 failed. The failure was `hedge_fund/test_run.py::test_paper_create_overrides_day_grid_to_minute_with_standard_defaults`; narrow captured Rich output clipped the expected schedule label. The targeted test passed with `COLUMNS=240`; the final full run above also passed with that setting. Do not infer a default-width full-suite pass.
+
+### Actual real-root read-only browser acceptance
+
+- Final source SHA `3d7e44e5e65e4c71764c3a92549eecc5b0c40a88`; server mode reported `live`, `writes=false`, `network=false`. Browser was restricted to the exact loopback origin and GET-only navigation; no mutation action or POST was issued.
+- Runtime provenance: Poetry's existing interpreter served the default `~/.hedge-fund` root on loopback; an inline Playwright runner performed the GET-only navigation. The ephemeral port and inline script were not retained.
+- Aggregate-only observations: 18 available route navigations returned HTTP 200, with zero UI/API/page/console errors. Coverage included overview, mandates list and both mandate details, builder, paper list and all three paper details, all three session reports and scorecards, research list, backtests, and settings. Two mandates; three paper funds; three ledgers verified; zero ledger/read errors; zero halted funds; zero saved research reports. Runner status remained unknown; no runner PID file was read or probed.
+- No live research-report detail could be opened because the root contained zero saved reports; the synthetic production E2E opened a report detail and tested its `.json` deep link.
+- Eleven screenshots containing live data stayed only in the temporary session-artifacts directory; none were added to the repository. Temporary artifact file writes ended at `2026-10-30T21:17:46.6214946Z`. API server stopped after acceptance.
+- Protected-root content identity remains INCONCLUSIVE. No protected bytes were hashed and no PID contents were read.
+- Focused regressions cover library-roster/weight drift rejection, canonical custom `long_only`/`long_short` semantics, corrupt-ledger report errors with independent halted state, mandate-hash binding, offline read-only startup, `.yaml`/`.yml` canonical mandate lookup, and shutdown waiting for a cooperative cancellation boundary.
+
+### Dependency audit findings and remediation
+
+- At cycle-two start on baseline `9131179`, the actual audit reported 2 production moderate vulnerabilities and 5 total findings in the full graph (3 moderate, 2 critical). Baseline locks resolved `react-router`/`react-router-dom` 6.30.6, `vitest`/`@vitest/mocker` 3.2.7, and transitive `tinypool` 1.1.1.
+- Production React Router findings: `GHSA-wrjc-x8rr-h8h6` and `GHSA-337j-9hxr-rhxg` (moderate; production scope). Development findings included `GHSA-82fw-gwwq-j7x9` and `GHSA-qxg6-89mg-rqv8` for Vitest/mocker packages (moderate), plus `GHSA-5gmw-xhrv-c9v3` and `GHSA-85c8-ppgw-ccpr` for Tinypool 1.1.1 (critical; transitive dev scope).
+- Targeted compatible upgrades resolve React Router packages to 7.18.5 and Vitest/mocker to 4.1.12; Tinypool is absent from the final lock. No broad `npm audit fix --force` was used. Both final actual audits above returned zero findings.
+
+### Safety deviation and limits
+
+- While checking temporary QA-container cleanup, one `docker ps` invocation exposed unrelated active-container metadata. No names or IDs are retained here; no follow-up inspection or interaction with unrelated containers occurred. No unrelated container was stopped, restarted or written. No protected PID-file contents or protected-root bytes were read. The final test container exited under `--rm`. This unnecessary process/container metadata inspection is disclosed as a safety deviation.
+- No live reports or full TUI parity are claimed. TUI retirement is not authorized by this evidence. T024 independent QA and T025 PR/preview handoff remain coordinator-owned.
