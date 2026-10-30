@@ -32,7 +32,7 @@ All design inputs verified against official Saxo sources (developer.saxo, openap
 
 **Decision**: OAuth2 Authorization Code Grant (+PKCE for the native/desktop case). The adapter holds an access token (~20 min lifetime) and refreshes **proactively** (~every 15 min). Refresh tokens are **single-use and rotate on every refresh** — the adapter persists the newest refresh token to 1Password immediately after each successful refresh. If a refresh fails (revoked, expired, logged out via SaxoTraderGO "Application Access"), the adapter raises a clear re-auth error instead of retrying.
 
-**Multi-process coordination**: fund runners are separate OS processes (`paper/runner.py` spawns one per fund), and two Saxo funds may reference the same 1Password item. Naive sharing breaks: process A rotates the token, process B then presents the spent one and halts even though A stored the replacement. The design therefore (a) serializes refresh attempts with a cross-process lock keyed by the secret reference, and (b) **re-reads the latest refresh token from 1Password immediately before every refresh attempt**, so the loser of a rotation race picks up the winner's rotated token. A test exercises two managers sharing one item.
+**Lock scope**: refresh is serialized by an atomic lock directory keyed by the secret reference. Acquisition is bounded to 90 seconds; timeout reports sanitized owner context, remains retryable, and never steals the lock. The default temp directory coordinates processes on that host only. Host/container coordination requires both environments to set `SAXO_REFRESH_LOCK_DIR` to the same mounted filesystem path with atomic directory creation. A process crash can leave a stale lock; operator verifies the recorded PID is no longer active before removing it. Each refresh re-reads the latest refresh token while holding the lock. Interactive re-authentication requires restart of running processes whose token managers entered `REAUTH_REQUIRED`.
 
 **Rationale**: Saxo provides no unattended retail login — Certificate-Based Authentication is institutional-partner-only (retail logins must show MiFID II disclaimers interactively). The practical pattern for a personal bot is a long-lived process refreshing its own token, plus periodic (~weekly) interactive re-auth. The rotating-refresh-token rule makes "persist after every refresh" mandatory, or the next restart fails.
 
@@ -42,11 +42,13 @@ All design inputs verified against official Saxo sources (developer.saxo, openap
 
 ## R4. Secrets storage
 
-**Decision**: 1Password via `op://` references, resolved at startup through the 1Password CLI (same mechanism as the original design). The refresh token is special: it **rotates**, so the adapter writes the new value back to the 1Password item after each refresh (`op item edit`). Plaintext env values remain supported for non-secret configuration only.
+**Decision**: 1Password via `op://` references; app credentials resolve at startup, while the rotating refresh token is read under the refresh lock on initial authorization and each refresh. For rotation, `op item get <item> --format=json --reveal --vault <vault>` supplies the current item template; the provider changes only the referenced field and pipes the full JSON to `op item edit <item> --vault <vault>`. The new token never appears in CLI arguments. Plaintext env values remain supported for non-secret configuration only.
 
-**Rationale**: FR-007/FR-009. A rotating credential cannot sit only in process memory across restarts; 1Password is the one sanctioned secret store (never plaintext files, never the ledger).
+**Rationale**: FR-007/FR-009. 1Password documents JSON templates for sensitive edits and warns that assignment values can be visible in command history/process lists. A rotating credential cannot sit only in process memory across restarts.
 
 **Alternatives considered**: OS keychain directly — rejected (Docker context has no keychain); encrypted local file — rejected (constitution: secrets never in persisted files outside the secret store).
+
+**Source**: `https://developer.1password.com/docs/cli/item-edit/`
 
 ## R5. Order placement semantics
 
@@ -60,11 +62,11 @@ All design inputs verified against official Saxo sources (developer.saxo, openap
 
 ## R6. Fill detection (no dedicated fills endpoint)
 
-**Decision**: After a successful POST, poll `GET /port/v1/orders/{ClientKey}/{OrderId}` until the order **leaves the open-orders list** (404/empty — market orders fill near-instantly when the market is open). Disappearance **triggers inspection, it does not establish a fill**: the adapter then reads the **order-correlated executed quantity and price** from the execution/transaction records tied to that OrderId (`GET /hist/v1/transactions`, or the order's execution data), because a position's `OpenPrice`/`Amount` describe the *holding*, not the *latest execution* — a reducing sale keeps the original acquisition cost, and a full exit leaves no position row at all. The `Fill` returned must reflect the executed quantity/price of *this* order, correct for increases, reductions, and full exits. Bounded deadline (default 120 s) raises with guidance. `trade/v1|v2/trades` endpoints are deal-capture/back-office only — not used.
+**Decision**: After a successful POST, poll `GET /port/v1/orders/{ClientKey}/{OrderId}` until the order leaves the open-orders list. Disappearance triggers inspection, not fill establishment. Query `GET /hist/v1/transactions` with `AccountKeys`, `ClientKey`, `FromDate`, `ToDate`, `TransactionType=Trade`, and `Uics`; do not send unsupported `OrderId`. Paginate using `__next`/`$skip`. Match `Data[].Trades[].OrderId`, then aggregate `TradedQuantity` and weighted `Price`; this covers increases, reductions, and full exits. A bounded deadline raises with guidance.
 
 **Rationale**: Saxo's retail API has no single "get my fill" endpoint; this synthesized pattern uses only documented endpoints and never infers a fill from position state alone.
 
-**Sources**: developer.saxo/openapi/referencedocs/port/v1/orders/get__port__clientkey_orderid, developer.saxo/openapi/referencedocs/port/v1/positions/get__port__me, developer.saxo/openapi/referencedocs/hist/v1/transactions
+**Sources**: developer.saxo/openapi/referencedocs/port/v1/orders/get__port__clientkey_orderid, developer.saxo/openapi/referencedocs/hist/v1/transactions
 
 ## R7. Rate limiting and duplicate protection
 
@@ -76,19 +78,19 @@ All design inputs verified against official Saxo sources (developer.saxo, openap
 
 ## R8. Ticker mapping and universe validation
 
-**Decision**: Resolution is a **two-call** flow, matching Saxo's own stock-order sample: (1) `GET /ref/v1/instruments?Keywords=<TICKER>&AssetTypes=Stock` returns candidate instruments with `Identifier` (mapped to `Uic`), `ExchangeId`, symbol format `TICKER:exchange` (e.g. `KO:xnys`; `AAPL:xnas` inferred — verify on SIM); (2) `GET /ref/v1/instruments/details/{Uic}/{AssetType}` returns the tradability facts the search response does **not** carry: `IsTradable`, `LotSize`, `MinimumOrderValue/Size`, `SupportedOrderTypeSettings`/`SupportedOrderTypes`, `TickSize`. Both responses have distinct shapes and are fixture-tested separately. Resolutions are cached in memory (~1 h). Before the first order of a session, every universe ticker must resolve through both calls to a tradable instrument supporting Market orders; otherwise the session refuses.
+**Decision**: Search `GET /ref/v1/instruments?Keywords=<TICKER>&AssetTypes=Stock`, require an exact ticker prefix and a supported US exchange ID, and choose deterministically (primary listing, exchange priority, identifier). Then request `/ref/v1/instruments/details/{Uic}/Stock`; require `IsTradable`, `Exchange.CountryCode=US`, `CurrencyCode=USD`, and Market order support. Search and details have different response shapes. Resolutions are cached in memory (~1 h).
 
 **Rationale**: FR-006. Saxo identifies instruments by numeric UIC + AssetType, not ticker; expecting tradability fields directly from search would make validation fail against real responses.
 
 ## R9. Book authority, cash semantics, and currency
 
-**Decision**: The external broker's book is authoritative: positions from `GET /port/v1/positions/me` (consume via `NetPositionId` grouping; `PositionBase.Amount` signed, `OpenPrice` acquisition price), cash from `GET /port/v1/balances/me`. **Cash semantics are split by use**: `Broker.cash()` — which the pipeline adds to equity/NAV (`pipeline/stages.py`) and reconciles against ledger cash (`pipeline/session.py`) — returns the **accounting cash balance** (`CashBalance`); buying power (`CashAvailableForTrading`) is consulted separately for order affordability, never returned as `cash()`, so reserved funds cannot misstate equity or trigger false reconciliation mismatches. ClientKey/AccountKey are discovered via `GET /port/v1/users/me` / `GET /port/v1/accounts/me` at startup; **account discovery filters for a trading account whose `Currency` matches the fund's base currency** — the engine has no FX conversion, so a mismatch (EUR account, USD mandate) refuses deployment rather than silently mispricing NAV.
+**Decision**: The external book is authoritative. Read `/port/v1/positions` and `/port/v1/balances` with both discovered `ClientKey` and `AccountKey`; `/me` variants are client-wide and do not provide account scope. Select the first active account with `LegalAssetTypes` including `Stock` and `Currency=USD`. The app mandate convention is fixed USD; startup refuses other account currencies. `cash()` returns `CashBalance`; `CashAvailableForTrading` is used only for affordability.
 
-**Rationale**: FR-005/FR-005a — the same two-books design PaperBroker implements, sourced from the API, with currency compatibility made explicit because the pipeline treats `cash()` as same-currency money throughout.
+**Rationale**: FR-005/FR-005a — the pipeline treats `cash()` as same-currency money. Offline deploy validates the fixed USD mandate convention; live account currency is checked when the broker starts, before trading.
 
 ## R10. Costs model for Saxo funds
 
-**Decision**: Same as the T212 design: fills carry the broker's actual (simulated) price, so the mandate's cost model defaults to zero spread/commission for `broker: saxo` funds; a mandate may override explicitly.
+**Decision**: When `broker: saxo` omits `costs`, default spread and commission to zero because Saxo SIM `Fill.price` already carries simulated execution pricing. Explicit cost values remain honored. Paper default costs and serialized output remain unchanged.
 
 **Rationale**: Double-counting simulated friction on top of real simulated fills would corrupt NAV.
 

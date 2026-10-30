@@ -73,7 +73,7 @@ specs/003-saxo-broker-adapter/
 
 ## Risks & Mitigations
 
-- **SIM quirks** (fractional shares, market-closed behavior, transaction feed latency): flagged as empirical open items; adapter refuses rather than guesses (FR-012, FR-011 deadline).
+- **SIM quirks** (instrument-specific lot size, market-closed behavior, transaction feed latency): fixture-driven handling uses details `LotSize`, rounds order quantities down, and refuses untradable instruments (FR-012, FR-011 deadline).
 - **Token rotation loss** (crash between refresh and write-back): write-back happens immediately after refresh, before the token is used; worst case the user re-authenticates interactively.
 - **Byte-compat regression**: popped-on-default serialization + golden-file test for existing fund.yaml.
 

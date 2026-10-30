@@ -16,19 +16,26 @@
 $env:SAXO_APP_KEY_REF      = "op://<vault>/Saxo OpenAPI SIM/app-key"
 $env:SAXO_APP_SECRET_REF   = "op://<vault>/Saxo OpenAPI SIM/app-secret"
 $env:SAXO_REFRESH_TOKEN_REF= "op://<vault>/Saxo OpenAPI SIM/refresh-token"
-$env:SAXO_REDIRECT_URI     = "http://localhost:port"   # registered redirect (no explicit port in URI per Saxo rules)
+$env:SAXO_REDIRECT_URI     = "http://localhost"   # must exactly match the redirect URI registered for the app
+# Optional: set to one absolute host/container-shared mount path for shared refresh coordination.
+$env:SAXO_REFRESH_LOCK_DIR = "C:\shared\saxo-refresh-locks"
 ```
+
+Mandate currency convention is fixed USD. The account currency is checked when the broker starts; no FX conversion is attempted. Without `SAXO_REFRESH_LOCK_DIR`, locks coordinate only processes using the same host temp directory. Lock acquisition times out after 90 seconds and reports its recorded owner; contention is retryable. A crash can leave a stale lock directory. Verify its recorded host/PID is inactive before removing it; the adapter never steals a lock.
 
 ## First authentication (interactive, ~1 min)
 
 ```powershell
 poetry run python -m hedge_fund.brokers.saxo_auth
 # → opens sim.logonvalidation.net/authorize (auth-code + PKCE) in your browser
-# → logs in with SIM credentials, approves the app
-# → exchanges the code, stores the refresh token into the 1Password item
+# → log in with SIM credentials and approve the app
+# → paste the redirected callback URL when prompted
+# → exchanges the code and stores the refresh token using an item JSON template on stdin
 ```
 
 From here the adapter self-refreshes (~every 15 min) and rotates the refresh token in 1Password. Expect an interactive re-auth roughly weekly (Saxo has no unattended retail login; CBA is institutional-only).
+
+After interactive re-authentication, restart any running fund process. Its existing token manager remains in `REAUTH_REQUIRED` until process restart.
 
 ## Deploy a Saxo fund
 
@@ -38,20 +45,21 @@ poetry run aihf
 # (mandate yaml: broker: saxo)
 ```
 
-**Cadence matters**: Saxo orders only fill while the market is open, but the daily cadence's turn is 00:05 New York (when daily funds look for yesterday's close) — the market is closed then. Saxo mandates therefore require an **in-market intraday cadence** (e.g. hourly during regular trading hours); deploy validation refuses `saxo` + daily with guidance.
+**Cadence matters**: Saxo mandates require minute cadence within regular US market hours (09:30–15:59 ET). The 16:00 closing bar is excluded. Omitted Saxo windows default to 09:30–15:59; explicit windows outside those limits are refused by mandate validation and the setup wizard. The daily cadence turns at 00:05 New York, so Saxo mandates cannot use daily or other non-minute cadences. Paper window defaults remain unchanged.
 
 ## What you should see
 
-- **Pre-session**: reconciliation reads SIM positions (`/port/v1/positions/me`) and the accounting cash balance (`/port/v1/balances/me` → `CashBalance`); a fresh SIM account shows empty positions and the simulated cash. The account's currency must match the fund's base currency — deployment is refused otherwise (no FX conversion).
+- **Pre-session**: reconciliation reads account-scoped SIM positions (`/port/v1/positions` with `ClientKey` + `AccountKey`) and accounting cash (`/port/v1/balances` → `CashBalance`); balances and account must report USD. Mismatch refuses broker startup before trading.
 - **Universe check**: every fund ticker resolves via the two-call flow (instruments search → instrument details) before the first order; unresolved or untradable tickers refuse the session.
 - **Orders**: session decisions place market orders (`ManualOrder: false`); fills appear in the SIM account and the ledger records **Saxo's simulated execution price** for each order (order-correlated from the transaction/execution records — not a yfinance estimate, and not the position's average acquisition cost).
+- **Costs**: omitted Saxo spread and commission default to zero; explicit mandate costs remain honored. Paper costs and serialization stay unchanged.
 - **Sanity check**: compare each fill price against the yfinance price at trade time — SIM fills are simulated, so expect approximate (not exact) agreement.
 
 ## Known SIM limitations (expected, not bugs)
 
 - **No live stock prices on SIM** (only FxSpot) — the engine keeps using yfinance for market data; OpenAPI price endpoints are unused.
-- **Fractional shares unverified** for US stocks on SIM — if a fractional order is rejected, the adapter refuses rather than rounding exposure (FR-012).
-- **Market-closed orders** are rejected synchronously (`MarketClosed` expected) — sessions run at/after close will see this.
+- **Lot precision** comes from instrument details; below-lot rebalance dust is suppressed before submission. Each submitted order still requires a complete correlated fill.
+- **Market-closed orders** are rejected synchronously (`MarketClosed` expected). The unattended Saxo runner does not carry a pending bar past 16:00 ET; manual or other off-schedule order attempts may still receive this error.
 - **SIM resets** are self-service; after a reset, reconciliation reports the mismatch and refuses until you decide.
 - **Token rotation**: if a run crashes between refresh and write-back (should not happen — write-back precedes use), re-run the auth command.
 
