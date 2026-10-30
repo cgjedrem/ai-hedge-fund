@@ -8,7 +8,7 @@ Status: implementation phase complete for T001–T022. T023 is partial because p
 - Worktree: Windows 11, Python 3.13.7, Poetry 2.5.1, Node 22.13.1, npm 10.9.2, Playwright 1.64.1, Chromium build v1248, Docker 29.9.2. GNU Make unavailable.
 - Historical progress-checkpoint SHA-256: `f7eee7fa30a4a341047425bd00671ece8ac3878f911a09064f7fd1472c276bc0` at `2026-10-30T17:17:49.4684515Z`; not final-artifact evidence.
 - Final implementation-input identity before evidence-doc edits: SHA-256 `eec381c33fd1ccce1f55a3341d32000d3f41bd932f3bb8a42ec3be6d4bc04cb2`. Covers 67 changed/untracked non-spec files by sorted path and current bytes; excludes `specs/004-react-web-ui/`, `memory.md`, and generated static assets. Base revision above.
-- Final implementation commit: recorded after the implementation commit; this file is committed separately with evidence.
+- Final implementation commit: `b183ac7b7ad34fdc085526cf8c8a56891a2327dc`, committed `2026-10-30T19:24:07+01:00`. Evidence follow-up contains this source revision.
 - Production static tree: SHA-256 `0da7625137a3aaa59a9034e25cbff6f062317fae4cc3a5eb2068a4e1abc8ea9e`.
 - Temporary wheel `aihf-2.6.1-py3-none-any.whl`: SHA-256 `25edb5fef57c676e1b6e31442a635f993ef46572a0745b3bed2fc3fa4f5a30d0`.
 - Synthetic screenshot tree: 17 PNG files, SHA-256 `3531686516b9d093970cd86da59b793487e943b50f9e876b7644eb775146770b`.
