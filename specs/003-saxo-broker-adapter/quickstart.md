@@ -38,11 +38,13 @@ poetry run aihf
 # (mandate yaml: broker: saxo)
 ```
 
+**Cadence matters**: Saxo orders only fill while the market is open, but the daily cadence's turn is 00:05 New York (when daily funds look for yesterday's close) — the market is closed then. Saxo mandates therefore require an **in-market intraday cadence** (e.g. hourly during regular trading hours); deploy validation refuses `saxo` + daily with guidance.
+
 ## What you should see
 
-- **Pre-session**: reconciliation reads SIM positions (`/port/v1/positions/me`) and buying power (`/port/v1/balances/me` → `CashAvailableForTrading`); a fresh SIM account shows empty positions and the simulated cash.
-- **Universe check**: every fund ticker resolves to a UIC via `/ref/v1/instruments` before the first order; unresolved tickers refuse the session.
-- **Orders**: session decisions place market orders (`ManualOrder: false`); fills appear in the SIM account and the ledger records **Saxo's simulated fill price** (`PositionBase.OpenPrice`), not a yfinance estimate.
+- **Pre-session**: reconciliation reads SIM positions (`/port/v1/positions/me`) and the accounting cash balance (`/port/v1/balances/me` → `CashBalance`); a fresh SIM account shows empty positions and the simulated cash. The account's currency must match the fund's base currency — deployment is refused otherwise (no FX conversion).
+- **Universe check**: every fund ticker resolves via the two-call flow (instruments search → instrument details) before the first order; unresolved or untradable tickers refuse the session.
+- **Orders**: session decisions place market orders (`ManualOrder: false`); fills appear in the SIM account and the ledger records **Saxo's simulated execution price** for each order (order-correlated from the transaction/execution records — not a yfinance estimate, and not the position's average acquisition cost).
 - **Sanity check**: compare each fill price against the yfinance price at trade time — SIM fills are simulated, so expect approximate (not exact) agreement.
 
 ## Known SIM limitations (expected, not bugs)

@@ -32,6 +32,8 @@ All design inputs verified against official Saxo sources (developer.saxo, openap
 
 **Decision**: OAuth2 Authorization Code Grant (+PKCE for the native/desktop case). The adapter holds an access token (~20 min lifetime) and refreshes **proactively** (~every 15 min). Refresh tokens are **single-use and rotate on every refresh** — the adapter persists the newest refresh token to 1Password immediately after each successful refresh. If a refresh fails (revoked, expired, logged out via SaxoTraderGO "Application Access"), the adapter raises a clear re-auth error instead of retrying.
 
+**Multi-process coordination**: fund runners are separate OS processes (`paper/runner.py` spawns one per fund), and two Saxo funds may reference the same 1Password item. Naive sharing breaks: process A rotates the token, process B then presents the spent one and halts even though A stored the replacement. The design therefore (a) serializes refresh attempts with a cross-process lock keyed by the secret reference, and (b) **re-reads the latest refresh token from 1Password immediately before every refresh attempt**, so the loser of a rotation race picks up the winner's rotated token. A test exercises two managers sharing one item.
+
 **Rationale**: Saxo provides no unattended retail login — Certificate-Based Authentication is institutional-partner-only (retail logins must show MiFID II disclaimers interactively). The practical pattern for a personal bot is a long-lived process refreshing its own token, plus periodic (~weekly) interactive re-auth. The rotating-refresh-token rule makes "persist after every refresh" mandatory, or the next restart fails.
 
 **Implication for the watchtower**: fully unattended month-long operation is out of scope by design; the fund owner re-authenticates interactively when prompted.
@@ -58,9 +60,9 @@ All design inputs verified against official Saxo sources (developer.saxo, openap
 
 ## R6. Fill detection (no dedicated fills endpoint)
 
-**Decision**: After a successful POST, poll `GET /port/v1/orders/{ClientKey}/{OrderId}` until the order **leaves the open-orders list** (404/empty — market orders fill near-instantly when the market is open), then read the authoritative fill from the resulting position (`PositionBase.OpenPrice`, `PositionBase.Amount`, `ExecutionTimeOpen`) or `GET /hist/v1/transactions`. Bounded deadline (default 120 s) raises with guidance. `trade/v1|v2/trades` endpoints are deal-capture/back-office only — not used.
+**Decision**: After a successful POST, poll `GET /port/v1/orders/{ClientKey}/{OrderId}` until the order **leaves the open-orders list** (404/empty — market orders fill near-instantly when the market is open). Disappearance **triggers inspection, it does not establish a fill**: the adapter then reads the **order-correlated executed quantity and price** from the execution/transaction records tied to that OrderId (`GET /hist/v1/transactions`, or the order's execution data), because a position's `OpenPrice`/`Amount` describe the *holding*, not the *latest execution* — a reducing sale keeps the original acquisition cost, and a full exit leaves no position row at all. The `Fill` returned must reflect the executed quantity/price of *this* order, correct for increases, reductions, and full exits. Bounded deadline (default 120 s) raises with guidance. `trade/v1|v2/trades` endpoints are deal-capture/back-office only — not used.
 
-**Rationale**: Saxo's retail API has no single "get my fill" endpoint; this synthesized pattern uses only documented endpoints. The position's `OpenPrice` is Saxo's own simulated fill price — exactly what the ledger must record.
+**Rationale**: Saxo's retail API has no single "get my fill" endpoint; this synthesized pattern uses only documented endpoints and never infers a fill from position state alone.
 
 **Sources**: developer.saxo/openapi/referencedocs/port/v1/orders/get__port__clientkey_orderid, developer.saxo/openapi/referencedocs/port/v1/positions/get__port__me, developer.saxo/openapi/referencedocs/hist/v1/transactions
 
@@ -74,15 +76,15 @@ All design inputs verified against official Saxo sources (developer.saxo, openap
 
 ## R8. Ticker mapping and universe validation
 
-**Decision**: Engine tickers resolve to Saxo `(Uic, AssetType=Stock)` via `GET /ref/v1/instruments?Keywords=<TICKER>&AssetTypes=Stock` (symbol format `AAPL:xnas` inferred from documented examples like `KO:xnys` — verify on SIM). Resolutions are cached in memory (~1h). Before the first order of a session, every universe ticker must resolve to a tradable instrument (`IsTradable`, `SupportedOrderTypes` includes Market); otherwise the session refuses.
+**Decision**: Resolution is a **two-call** flow, matching Saxo's own stock-order sample: (1) `GET /ref/v1/instruments?Keywords=<TICKER>&AssetTypes=Stock` returns candidate instruments with `Identifier` (mapped to `Uic`), `ExchangeId`, symbol format `TICKER:exchange` (e.g. `KO:xnys`; `AAPL:xnas` inferred — verify on SIM); (2) `GET /ref/v1/instruments/details/{Uic}/{AssetType}` returns the tradability facts the search response does **not** carry: `IsTradable`, `LotSize`, `MinimumOrderValue/Size`, `SupportedOrderTypeSettings`/`SupportedOrderTypes`, `TickSize`. Both responses have distinct shapes and are fixture-tested separately. Resolutions are cached in memory (~1 h). Before the first order of a session, every universe ticker must resolve through both calls to a tradable instrument supporting Market orders; otherwise the session refuses.
 
-**Rationale**: FR-006. Saxo identifies instruments by numeric UIC + AssetType, not ticker — the mapping is a hard prerequisite for ordering.
+**Rationale**: FR-006. Saxo identifies instruments by numeric UIC + AssetType, not ticker; expecting tradability fields directly from search would make validation fail against real responses.
 
-## R9. Book authority and reconciliation
+## R9. Book authority, cash semantics, and currency
 
-**Decision**: The external broker's book is authoritative: positions from `GET /port/v1/positions/me` (consume via `NetPositionId` grouping; `PositionBase.Amount` signed, `OpenPrice` acquisition price), cash from `GET /port/v1/balances/me` (`CashAvailableForTrading`, `Currency`). The existing pre-session reconciliation runs unchanged; unexplained mismatch refuses the session. ClientKey/AccountKey are discovered via `GET /port/v1/users/me` / `GET /port/v1/accounts/me` at startup.
+**Decision**: The external broker's book is authoritative: positions from `GET /port/v1/positions/me` (consume via `NetPositionId` grouping; `PositionBase.Amount` signed, `OpenPrice` acquisition price), cash from `GET /port/v1/balances/me`. **Cash semantics are split by use**: `Broker.cash()` — which the pipeline adds to equity/NAV (`pipeline/stages.py`) and reconciles against ledger cash (`pipeline/session.py`) — returns the **accounting cash balance** (`CashBalance`); buying power (`CashAvailableForTrading`) is consulted separately for order affordability, never returned as `cash()`, so reserved funds cannot misstate equity or trigger false reconciliation mismatches. ClientKey/AccountKey are discovered via `GET /port/v1/users/me` / `GET /port/v1/accounts/me` at startup; **account discovery filters for a trading account whose `Currency` matches the fund's base currency** — the engine has no FX conversion, so a mismatch (EUR account, USD mandate) refuses deployment rather than silently mispricing NAV.
 
-**Rationale**: FR-005 — the same two-books design PaperBroker implements, sourced from the API.
+**Rationale**: FR-005/FR-005a — the same two-books design PaperBroker implements, sourced from the API, with currency compatibility made explicit because the pipeline treats `cash()` as same-currency money throughout.
 
 ## R10. Costs model for Saxo funds
 

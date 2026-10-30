@@ -30,38 +30,45 @@ Add a second broker backend for deployed paper funds: Saxo Bank OpenAPI against 
 hedge_fund/
   brokers/
     protocol.py          # existing Broker protocol (unchanged)
-    models.py            # existing Order/Fill/Position (unchanged)
+    models.py            # existing Order/Fill/Position (unchanged: Position(ticker, shares), Fill(ticker, side, quantity, price))
     paper.py             # existing PaperBroker (unchanged)
     saxo.py              # NEW: SaxoBroker (protocol impl) + SaxoClient (HTTP) + token manager + pacer
+    saxo_auth.py         # NEW: interactive auth-code+PKCE helper for first login
+    factory.py           # NEW: build_broker(spec) routing paper|saxo (tick/runner construct via this)
   secrets/
-    provider.py          # existing 1Password op:// resolution (extended: write-back for rotating tokens)
+    __init__.py          # NEW: package does not exist yet — created by this feature
+    provider.py          # NEW: 1Password op:// resolution (op read) + write-back (op item edit) for rotating tokens
   paper/
-    deployed.py          # MODIFIED: broker factory gains "saxo"
-    tick.py              # MODIFIED: redo refuses non-paper brokers (already refuses unknown)
+    deployed.py          # MODIFIED: DeployedFund.broker Literal["paper","saxo"]; saxo deployment skips local paper book
+    tick.py              # MODIFIED: broker construction routed through factory; redo refuses non-paper brokers
   fund/
-    spec.py              # MODIFIED: FundSpec.broker Literal["paper","saxo"]="paper", popped-on-default
+    spec.py              # MODIFIED: FundSpec.broker Literal["paper","saxo"]="paper", popped-on-default; cadence validation for saxo
+  tui/
+    builder.py           # MODIFIED: fund-setup broker selector (paper|saxo) alongside approval gate
 specs/003-saxo-broker-adapter/
-  tests/ (co-located under hedge_fund/brokers/test_saxo*.py etc.)
+  tests/ (co-located under hedge_fund/brokers/test_saxo*.py, hedge_fund/secrets/test_*.py etc.)
 ```
 
 **Key decisions** (from research.md):
 - R1 `requests`-only thin client; no SDK.
 - R2 SIM-only endpoints; live URLs absent by construction.
-- R3 OAuth2 auth-code + PKCE; proactive ~15 min refresh; single-use rotating refresh token persisted to 1Password after every refresh; refresh failure → clear re-auth error, no retry loop.
+- R3 OAuth2 auth-code + PKCE; proactive ~15 min refresh; single-use rotating refresh token persisted to 1Password after every refresh; **cross-process refresh coordination** (lock keyed by secret reference + re-read latest token before each refresh) because fund runners are separate processes; refresh failure → clear re-auth error, no retry loop.
 - R5 Market orders, `ManualOrder: false`, unique `x-request-id`; HTTP 200 with `ErrorInfo` = failure.
-- R6 Fill detection: poll open-order until gone → read fill from position (`OpenPrice`/`Amount`) or transactions; bounded deadline.
+- R6 Fill detection: poll open-order until gone → **order-correlated executed quantity/price** from execution/transaction records (correct for increases, reductions, full exits); bounded deadline.
 - R7 Pacer ≥1 order/s; 409 on duplicate window → inspect state, never re-POST.
-- R8 Universe validated against `/ref/v1/instruments` (UIC resolution, cached) before first order.
+- R8 Universe validation via **two calls** (instruments search → details) before first order.
+- R9 `cash()` = accounting `CashBalance` (NAV/reconciliation); `CashAvailableForTrading` separate for affordability; account currency must match fund base currency.
 - R11 No OpenAPI prices; yfinance stays the data path.
 - R12 Default session capabilities (`OrdersOnly`/`Standard`) — never demote the user's own SaxoTraderGO session.
+- R14 `broker` mandate field with popped-on-default serialization; **saxo mandates require an in-market cadence** (daily 00:05 NY turn is refused).
 
 ## Implementation Phases
 
-1. **Foundational**: `SaxoClient` transport abstraction (fake-able), token manager (refresh + rotation write-back), pacer, error taxonomy (`SaxoAuthError`, `SaxoOrderError`, `SaxoReconcileError`).
-2. **US1 book reads**: positions/cash/account-key discovery, UIC resolution + universe validation, reconciliation integration.
-3. **US2 order execution**: place market order, 200-with-ErrorInfo handling, fill detection loop, `Fill` construction, pacer + `x-request-id`, no-re-POST rule.
-4. **US3 secrets**: 1Password item schema (Saxo app credentials + refresh token field), `op item edit` write-back, redaction guarantees (logs/errors/ledger).
-5. **US4 mandate config**: `FundSpec.broker`, factory wiring in `deployed.py`, redo guard in `tick.py`, TUI/status display.
+1. **Foundational**: secrets package creation (test-first `op read` resolution + sanitized failures + `op item edit` write-back), `SaxoClient` transport abstraction (fake-able), token manager (refresh + rotation write-back + cross-process coordination), pacer, error taxonomy (`SaxoAuthError`, `SaxoOrderError`, `SaxoReconcileError`).
+2. **US1 book reads**: positions/cash/account discovery with currency validation, UIC resolution (search + details) + universe validation, reconciliation integration.
+3. **US2 order execution**: place market order, 200-with-ErrorInfo handling, order-correlated fill detection loop, `Fill` construction, pacer + `x-request-id`, no-re-POST rule.
+4. **US3 secrets**: 1Password item schema (Saxo app credentials + refresh token field), write-back, redaction guarantees (logs/errors/ledger).
+5. **US4 mandate config + routing**: `FundSpec.broker` + cadence validation, `DeployedFund.broker` consistency, saxo deployment (no local paper book), `brokers/factory.py` + tick/runner routing, TUI fund-setup broker selector, end-to-end test (select Saxo → deploy → run session through the external adapter).
 6. **Polish**: quickstart smoke test doc, style gate, full chunked pytest.
 
 ## Risks & Mitigations
