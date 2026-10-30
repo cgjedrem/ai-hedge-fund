@@ -2,6 +2,8 @@ import base64
 import hashlib
 from urllib.parse import parse_qs, urlparse
 
+import pytest
+
 from hedge_fund.brokers.saxo_auth import interactive_login
 
 
@@ -65,3 +67,50 @@ def test_interactive_login_uses_pkce_and_persists_rotating_token_under_refresh_l
 
 def _assert_lock_held(lock_path):
     assert (lock_path / "owner").is_file()
+
+
+@pytest.mark.parametrize(
+    "redirect_uri,callback",
+    [
+        ("http://localhost", "http://localhost/?code=auth-code&state=state-123"),
+        ("http://localhost/", "http://localhost?code=auth-code&state=state-123"),
+    ],
+)
+def test_interactive_login_accepts_equivalent_root_paths_without_changing_redirect_uri(tmp_path, redirect_uri, callback):
+    transport = FakeTransport()
+
+    interactive_login(
+        "app-key",
+        "app-secret",
+        redirect_uri,
+        "op://vault/item/token",
+        FakeSecrets(),
+        browser_open=lambda _: None,
+        prompt=lambda _: callback,
+        transport=transport,
+        verifier="v" * 64,
+        state="state-123",
+        lock_dir=tmp_path,
+    )
+
+    assert transport.calls[0][2]["data"]["redirect_uri"] == redirect_uri
+
+
+def test_interactive_login_rejects_a_different_callback_path(tmp_path):
+    transport = FakeTransport()
+
+    with pytest.raises(ValueError, match="callback state"):
+        interactive_login(
+            "app-key",
+            "app-secret",
+            "http://localhost/callback",
+            "op://vault/item/token",
+            FakeSecrets(),
+            browser_open=lambda _: None,
+            prompt=lambda _: "http://localhost/other?code=auth-code&state=state-123",
+            transport=transport,
+            verifier="v" * 64,
+            state="state-123",
+            lock_dir=tmp_path,
+        )
+    assert transport.calls == []

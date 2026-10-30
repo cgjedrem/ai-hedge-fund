@@ -63,7 +63,7 @@ def interactive_login(
     callback = callback.strip()
     callback_uri = urlparse(callback)
     query = parse_qs(callback_uri.query)
-    if not callback or (callback_uri.scheme, callback_uri.netloc, callback_uri.path) != (parsed_uri.scheme, parsed_uri.netloc, parsed_uri.path) or query.get("state", [None])[0] != state:
+    if not callback or (callback_uri.scheme, callback_uri.netloc, callback_uri.path or "/") != (parsed_uri.scheme, parsed_uri.netloc, parsed_uri.path or "/") or query.get("state", [None])[0] != state:
         raise ValueError("Saxo authorization callback state did not match")
     code = query.get("code", [None])[0]
     if not code or query.get("error"):

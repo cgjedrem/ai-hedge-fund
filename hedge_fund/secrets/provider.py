@@ -45,7 +45,7 @@ class SecretProvider:
         return value
 
     def write_back(self, variable: str, reference: str, value: str) -> None:
-        vault, item, field = _reference_parts(variable, reference)
+        vault, item, section, field = _reference_parts(variable, reference)
         if not isinstance(value, str) or not value:
             raise SecretProviderError(f"{variable}: refusing to persist an empty secret")
         try:
@@ -58,7 +58,7 @@ class SecretProvider:
             )
             raw_item = result if isinstance(result, str) else result.stdout
             template = json.loads(raw_item)
-            field_data = _find_field(template, field)
+            field_data = _find_field(template, field, section)
             field_data["value"] = value
             self._runner(
                 ["op", "item", "edit", item, "--vault", vault],
@@ -72,13 +72,18 @@ class SecretProvider:
             raise SecretProviderError(f"{variable}: cannot persist rotated 1Password secret") from None
 
 
-def _find_field(item: object, field: str) -> dict:
+def _find_field(item: object, field: str, section: str | None) -> dict:
     matches: list[dict] = []
+
+    def matches_identifier(value: object, expected: str) -> bool:
+        return isinstance(value, str) and value.casefold() == expected.casefold()
 
     def visit(value: object) -> None:
         if isinstance(value, dict):
             identifiers = (value.get("id"), value.get("label"), value.get("name"))
-            if field in identifiers and "value" in value:
+            section_data = value.get("section")
+            section_matches = section is None or (isinstance(section_data, dict) and any(matches_identifier(section_data.get(key), section) for key in ("id", "label", "name")))
+            if any(matches_identifier(identifier, field) for identifier in identifiers) and section_matches and "value" in value:
                 matches.append(value)
             for child in value.values():
                 visit(child)
@@ -92,11 +97,12 @@ def _find_field(item: object, field: str) -> dict:
     return matches[0]
 
 
-def _reference_parts(variable: str, reference: str) -> tuple[str, str, str]:
+def _reference_parts(variable: str, reference: str) -> tuple[str, str, str | None, str]:
     if not isinstance(reference, str):
         raise SecretProviderError(f"{variable}: expected an op:// reference")
     parsed = urlparse(reference)
     parts = [unquote(part) for part in parsed.path.strip("/").split("/") if part]
-    if parsed.scheme != "op" or not parsed.netloc or len(parts) < 2:
-        raise SecretProviderError(f"{variable}: expected an op://vault/item/field reference")
-    return unquote(parsed.netloc), parts[0], parts[-1]
+    if parsed.scheme != "op" or not parsed.netloc or len(parts) not in (2, 3):
+        raise SecretProviderError(f"{variable}: expected an op://vault/item/[section/]field reference")
+    section = parts[1] if len(parts) == 3 else None
+    return unquote(parsed.netloc), parts[0], section, parts[-1]

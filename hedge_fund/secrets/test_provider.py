@@ -69,3 +69,45 @@ def test_write_back_failure_is_sanitized():
     with pytest.raises(SecretProviderError) as error:
         provider.write_back("SAXO_REFRESH_TOKEN_REF", "op://vault/item/token", "rotated")
     assert "secret echoed" not in str(error.value)
+
+
+@pytest.mark.parametrize("section,field", [("sim", "REFRESH-TOKEN"), ("section-sim", "field-sim")])
+def test_write_back_honors_section_qualified_references(section, field):
+    import json
+
+    item = {
+        "fields": [
+            {"id": "field-sim", "label": "refresh-token", "section": {"id": "section-sim", "label": "SIM"}, "value": "old"},
+            {"id": "field-other", "label": "refresh-token", "section": {"id": "section-other", "label": "Other"}, "value": "other"},
+        ]
+    }
+
+    def runner(args, **kwargs):
+        if args[:3] == ["op", "item", "get"]:
+            return json.dumps(item)
+        if args[:3] == ["op", "item", "edit"]:
+            item.update(json.loads(kwargs["input"]))
+            return ""
+        raise AssertionError(f"unexpected op command: {args}")
+
+    provider = SecretProvider(runner=runner)
+    provider.write_back("SAXO_REFRESH_TOKEN_REF", f"op://vault/item/{section}/{field}", "rotated")
+
+    assert item["fields"][0]["value"] == "rotated"
+    assert item["fields"][1]["value"] == "other"
+
+
+def test_write_back_does_not_fall_back_to_a_field_in_another_section():
+    import json
+
+    item = {"fields": [{"id": "token", "label": "token", "section": {"id": "other", "label": "Other"}, "value": "old"}]}
+    calls = []
+
+    def runner(args, **kwargs):
+        calls.append(args)
+        return json.dumps(item)
+
+    provider = SecretProvider(runner=runner)
+    with pytest.raises(SecretProviderError, match="cannot persist"):
+        provider.write_back("SAXO_REFRESH_TOKEN_REF", "op://vault/item/SIM/token", "rotated")
+    assert len(calls) == 1
