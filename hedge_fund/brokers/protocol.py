@@ -12,6 +12,10 @@ from typing import Protocol, runtime_checkable
 from hedge_fund.brokers.models import Fill, Order, Position
 
 
+class OrderSubmissionDeferred(RuntimeError):
+    """No order was accepted; it can be re-evaluated later."""
+
+
 @runtime_checkable
 class Broker(Protocol):
     """Protocol that all brokers must satisfy.
@@ -29,6 +33,8 @@ class Broker(Protocol):
         """Current holdings keyed by ticker. A copy; no zero-share rows."""
         ...
 
-    def cash(self) -> float: ...
+    def cash(self) -> float:
+        ...
 
-    def place_order(self, order: Order) -> Fill: ...
+    def place_order(self, order: Order) -> Fill:
+        ...

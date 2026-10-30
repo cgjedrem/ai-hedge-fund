@@ -25,6 +25,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable
 
+from hedge_fund.brokers.factory import build_broker
+from hedge_fund.brokers.models import Fill, Order
 from hedge_fund.brokers.paper import PaperBroker
 from hedge_fund.data.bars import (
     current_bar,
@@ -237,6 +239,8 @@ def redo(
     """
     directory = Path(directory)
     deployed = load_deployed(directory)
+    if deployed.broker != "paper":
+        raise ValueError(f"redo is only supported for paper broker funds, not {deployed.broker}")
     ledger = Ledger(directory)
     state = ledger.replay(deployed.spec.capital)  # verifies the whole chain first
     if state.halted is not None:
@@ -274,13 +278,14 @@ def _run(
     *,
     clock: Clock | None = None,
     fund: Fund | None = None,
+    broker=None,
 ) -> SessionRecord:
     """Advance one session from *state* and record it, halting on failure.
     *fund* lets a long-running caller keep one Fund (and its analysts'
     caches) across sessions instead of staffing a new one each time. A
     minute fund's closing bar also checkpoints the day, so tomorrow's
     replay starts from tonight."""
-    broker = PaperBroker(directory / BROKER_FILE, deployed.spec.costs)
+    broker = broker or build_broker(deployed, directory=directory)
     fund = fund or (build_fund or Fund)(deployed.spec)
     run_state = state
     clear_verdict = None
@@ -312,15 +317,21 @@ def _run(
                     "reason": "stale verdict" if clear_verdict is not None else "no verdict",
                 },
             )
+
+    def record_fill(order: Order, fill: Fill) -> None:
+        ledger.log_event("broker_fill", session=session, order=order.model_dump(mode="json"), fill=fill.model_dump(mode="json"))
+
     try:
-        record = advance(fund, run_state, session, broker, data_client, deployed.universe, clock)
+        record = advance(fund, run_state, session, broker, data_client, deployed.universe, clock, on_fill=record_fill if deployed.broker == "saxo" else None)
         ledger.append(record)
     except FundHalted:
         raise
     except Exception as exc:
         reason = f"tick {session} failed: {type(exc).__name__}: {exc}"
-        ledger.log_event("tick_failed", session=session, error=f"{type(exc).__name__}: {exc}")
-        ledger.halt(reason)
+        try:
+            ledger.log_event("tick_failed", session=session, error=f"{type(exc).__name__}: {exc}")
+        finally:
+            ledger.halt(reason)
         raise
     if audit is not None:
         kind, fields = audit

@@ -33,6 +33,8 @@ MIN_INTERVAL_SECONDS = 1
 # US extended hours: the earliest and latest a trading window may reach.
 EARLIEST_WINDOW = "04:00"
 LATEST_WINDOW = "20:00"
+SAXO_REGULAR_OPEN = "09:30"
+SAXO_LAST_BAR = "15:59"
 
 
 def _clock_seconds(hhmm: str) -> int:
@@ -81,6 +83,12 @@ class TradingWindow(BaseModel):
     @property
     def label(self) -> str:
         return f"{self.start}–{self.end} ET"
+
+
+def validate_saxo_window(window: TradingWindow) -> TradingWindow:
+    if window.start_seconds < _clock_seconds(SAXO_REGULAR_OPEN) or window.end_seconds > _clock_seconds(SAXO_LAST_BAR):
+        raise ValueError(f"Saxo minute windows must stay within regular market hours ({SAXO_REGULAR_OPEN}–{SAXO_LAST_BAR} ET)")
+    return window
 
 
 class ModelSpec(BaseModel):
@@ -173,6 +181,7 @@ class FundSpec(BaseModel):
         default="SPY",
         description="what the fund measures itself against; also the source " "of the backtest's trading-day grid",
     )
+    broker: Literal["paper", "saxo"] = Field(default="paper", description="broker book used by deployed paper funds")
 
     @field_validator("benchmark")
     @classmethod
@@ -190,6 +199,14 @@ class FundSpec(BaseModel):
 
     @model_validator(mode="after")
     def _interval_and_window_belong_to_minute_funds(self) -> FundSpec:
+        if self.broker == "saxo" and "costs" not in self.model_fields_set:
+            self.costs = TradingCosts(spread_bps=0, commission_per_share=0)
+        if self.broker == "saxo" and self.rebalance != "minute":
+            raise ValueError("Saxo mandates require an in-market intraday cadence; choose minute")
+        if self.broker == "saxo":
+            if "window" not in self.model_fields_set:
+                self.window = TradingWindow(start=SAXO_REGULAR_OPEN, end=SAXO_LAST_BAR)
+            validate_saxo_window(self.window)
         if self.rebalance != "minute":
             stray = sorted({"interval", "window"} & self.model_fields_set)
             if stray:
@@ -203,19 +220,17 @@ class FundSpec(BaseModel):
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
-        """Daily/weekly/monthly mandates serialize exactly as they did before
-        minute funds existed: `interval` and `window` mean nothing to them,
-        and every ledger record carries a serialized spec in its hash. For
-        the same reason a mandate at the default costs serializes without a
-        `costs` block, as every mandate did before costs existed."""
+        """Omit paper defaults and minute-only fields to preserve ledger hashes."""
         data = handler(self)
         if self.rebalance != "minute":
             data.pop("interval", None)
             data.pop("window", None)
-        if self.costs == TradingCosts():
+        if self.broker == "paper" and self.costs == TradingCosts():
             data.pop("costs", None)
         if not self.approval_required:
             data.pop("approval_required", None)
+        if self.broker == "paper":
+            data.pop("broker", None)
         return data
 
     @property

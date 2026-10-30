@@ -127,26 +127,22 @@ def main() -> None:
 # Argument parsing
 # ---------------------------------------------------------------------------
 
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="aihf",
-        description="Run the AI hedge fund. No arguments: launch the interactive "
-        "app. `backtest` replays a mandate over history; `paper` deploys and "
-        "advances a paper fund.",
+        description="Run the AI hedge fund. No arguments: launch the interactive " "app. `backtest` replays a mandate over history; `paper` deploys and " "advances a paper fund.",
     )
     parser.add_argument(
         "--model",
-        help="LLM the investor agents reason with, e.g. claude-opus-5-5 "
-        "(default: HEDGE_FUND_LLM_MODEL env, else the built-in default); quant "
-        "models ignore it",
+        help="LLM the investor agents reason with, e.g. claude-opus-5-5 " "(default: HEDGE_FUND_LLM_MODEL env, else the built-in default); quant " "models ignore it",
     )
     commands = parser.add_subparsers(dest="command")
 
     backtest = commands.add_parser(
-        "backtest", help="replay a mandate over history",
-        description="Replay a mandate over history: every benchmark session from "
-        "--start to --end, decisions at a rebalance session's close executed at "
-        "the next close. Full result JSON on stdout, a copy in research/.",
+        "backtest",
+        help="replay a mandate over history",
+        description="Replay a mandate over history: every benchmark session from " "--start to --end, decisions at a rebalance session's close executed at " "the next close. Full result JSON on stdout, a copy in research/.",
     )
     backtest.add_argument("mandate", help="path to a mandate YAML, e.g. ~/.hedge-fund/mandates/example.yaml")
     backtest.add_argument("--universe", required=True, help=_UNIVERSE_HELP)
@@ -167,10 +163,8 @@ def _parser() -> argparse.ArgumentParser:
 
     advance = actions.add_parser("tick", help="advance the fund by one session")
     advance.add_argument("name")
-    advance.add_argument("--session", help="the session to record (YYYY-MM-DD, or a bar's YYYY-MM-DDTHH:MM:SS); "
-                                           "must be the next unrecorded one")
-    advance.add_argument("--again", action="store_true",
-                         help="run the latest recorded session again and replace its record")
+    advance.add_argument("--session", help="the session to record (YYYY-MM-DD, or a bar's YYYY-MM-DDTHH:MM:SS); " "must be the next unrecorded one")
+    advance.add_argument("--again", action="store_true", help="run the latest recorded session again and replace its record")
 
     runner = actions.add_parser("run", help="stay up and advance the fund whenever a session is due")
     runner.add_argument("name")
@@ -238,6 +232,7 @@ def _fund_dir(name: str, parser: argparse.ArgumentParser) -> Path:
 # backtest
 # ---------------------------------------------------------------------------
 
+
 def _backtest(args, parser: argparse.ArgumentParser, console: Console) -> None:
     universe = _universe(args.universe, parser)
     try:
@@ -255,9 +250,7 @@ def _backtest(args, parser: argparse.ArgumentParser, console: Console) -> None:
     with make_data_client() as raw:
         fd = CachedDataClient(raw)
         with console.status(
-            f"[cyan]{spec.name}: backtesting {start} → {end} "
-            f"({spec.rebalance} rebalance vs {spec.benchmark}) "
-            f"over {', '.join(universe)}…",
+            f"[cyan]{spec.name}: backtesting {start} → {end} " f"({spec.rebalance} rebalance vs {spec.benchmark}) " f"over {', '.join(universe)}…",
             spinner="dots",
         ):
             result = backtest_fund(fund, start, end, fd, universe)
@@ -268,13 +261,7 @@ def _backtest(args, parser: argparse.ArgumentParser, console: Console) -> None:
     if args.out:
         Path(args.out).write_text(payload)
     m = result.metrics
-    console.print(
-        f"[bold]{spec.name}[/] {result.start} → {result.end}  ·  "
-        f"{len(result.dates)} sessions  ·  {m.n_cycles} rebalances  ·  {m.n_orders} orders  ·  "
-        f"{cost_line(m.trading_cost, m.traded_notional)}  ·  "
-        f"return {m.total_return_pct:+.1%} vs {spec.benchmark} {m.benchmark_return_pct:+.1%}  ·  "
-        f"sharpe {m.sharpe_ratio:.2f}  ·  max drawdown {m.max_drawdown_pct:.1%}"
-    )
+    console.print(f"[bold]{spec.name}[/] {result.start} → {result.end}  ·  " f"{len(result.dates)} sessions  ·  {m.n_cycles} rebalances  ·  {m.n_orders} orders  ·  " f"{cost_line(m.trading_cost, m.traded_notional)}  ·  " f"return {m.total_return_pct:+.1%} vs {spec.benchmark} {m.benchmark_return_pct:+.1%}  ·  " f"sharpe {m.sharpe_ratio:.2f}  ·  max drawdown {m.max_drawdown_pct:.1%}")
     card = score(result.records)
     console.print(analyst_table(card))
     console.print(strategy_table(card))
@@ -284,6 +271,7 @@ def _backtest(args, parser: argparse.ArgumentParser, console: Console) -> None:
 # ---------------------------------------------------------------------------
 # paper
 # ---------------------------------------------------------------------------
+
 
 def _paper(args, parser: argparse.ArgumentParser, console: Console) -> None:
     if args.action == "create":
@@ -302,12 +290,8 @@ def _paper(args, parser: argparse.ArgumentParser, console: Console) -> None:
             parser.error(str(exc))
         cadence = f"{spec.cadence_label}, {spec.window.label}" if spec.is_intraday else spec.cadence_label
         approval_note = "  ·  approval required" if spec.approval_required else ""
-        console.print(
-            f"[bold]{args.name}[/] deployed at {directory}  ·  mandate {spec.name}  ·  "
-            f"{', '.join(universe)}  ·  ${spec.capital:,.0f}  ·  {cadence}{approval_note}"
-        )
-        console.print(f"[dim]next: `aihf paper tick {args.name}` to run one session, `aihf paper run "
-                      f"{args.name}` to leave it running, `aihf paper status {args.name}` any time[/]")
+        console.print(f"[bold]{args.name}[/] deployed at {directory}  ·  mandate {spec.name}  ·  " f"{', '.join(universe)}  ·  ${spec.capital:,.0f}  ·  broker {spec.broker}  ·  {cadence}{approval_note}")
+        console.print(f"[dim]next: `aihf paper tick {args.name}` to run one session, `aihf paper run " f"{args.name}` to leave it running, `aihf paper status {args.name}` any time[/]")
         return
 
     if args.action == "list":
@@ -323,10 +307,10 @@ def _paper(args, parser: argparse.ArgumentParser, console: Console) -> None:
             fd = CachedDataClient(raw, live=deployed.spec.is_intraday)
             verb = "running the latest session again" if args.again else "advancing one session"
             with console.status(
-                f"[cyan]{deployed.name}: {verb} over {', '.join(deployed.universe)}…", spinner="dots",
+                f"[cyan]{deployed.name}: {verb} over {', '.join(deployed.universe)}…",
+                spinner="dots",
             ):
-                record = (redo(directory, fd, build_fund=None) if args.again
-                          else tick(directory, fd, session=args.session))
+                record = redo(directory, fd, build_fund=None) if args.again else tick(directory, fd, session=args.session)
         print(record.model_dump_json(indent=2))
         console.print(_tick_summary(deployed.name, record))
         return
@@ -335,8 +319,7 @@ def _paper(args, parser: argparse.ArgumentParser, console: Console) -> None:
         deployed = load_deployed(directory)
         spec = deployed.spec
         cadence = f"{spec.cadence_label}, {spec.window.label}" if spec.is_intraday else spec.rebalance
-        console.print(f"[bold]{deployed.name}[/] running {cadence}  ·  "
-                      f"{', '.join(deployed.universe)}  ·  Ctrl-C or `aihf paper stop {deployed.name}` to stop")
+        console.print(f"[bold]{deployed.name}[/] running {cadence}  ·  " f"broker {deployed.broker}  ·  {', '.join(deployed.universe)}  ·  Ctrl-C or `aihf paper stop {deployed.name}` to stop")
 
         def _event(kind: str, fields: dict) -> None:
             detail = fields.get("reason") or (f"{fields.get('bars_skipped')} bars skipped" if "bars_skipped" in fields else "")
@@ -344,9 +327,7 @@ def _paper(args, parser: argparse.ArgumentParser, console: Console) -> None:
 
         with make_data_client() as raw:
             try:
-                serve(directory, CachedDataClient(raw, live=spec.is_intraday),
-                      on_record=lambda record: console.print(_tick_summary(deployed.name, record)),
-                      on_event=_event)
+                serve(directory, CachedDataClient(raw, live=spec.is_intraday), on_record=lambda record: console.print(_tick_summary(deployed.name, record)), on_event=_event)
             except RuntimeError as exc:  # already running
                 console.print(f"[red]{exc}[/]")
                 sys.exit(1)
@@ -446,8 +427,7 @@ def _status_line(directory: Path) -> str:
         state = f"not started  ·  ${deployed.spec.capital:,.0f}"
     else:
         ret = latest.nav / deployed.spec.capital - 1
-        state = (f"{len(ledger.sessions())} sessions  ·  last {latest.session}  ·  "
-                 f"NAV ${latest.nav:,.2f} ({ret:+.2%})")
+        state = f"{len(ledger.sessions())} sessions  ·  last {latest.session}  ·  " f"NAV ${latest.nav:,.2f} ({ret:+.2%})"
     flag = f"  ·  HALTED: {halted}" if halted else ""
     running = "  ·  running" if is_running(directory) else ""
     approval_state = ""
@@ -457,8 +437,7 @@ def _status_line(directory: Path) -> str:
             approval_state = f"  ·  {approval['verdict']} recorded"
         else:
             approval_state = "  ·  awaiting approval"
-    return (f"{deployed.name:<18} {deployed.spec.name}  ·  {' '.join(deployed.universe)}  ·  "
-            f"{deployed.spec.cadence_label}{running}  ·  {state}{flag}{approval_state}")
+    return f"{deployed.name:<18} {deployed.spec.name}  ·  {' '.join(deployed.universe)}  ·  " f"broker {deployed.broker}  ·  {deployed.spec.cadence_label}{running}  ·  {state}{flag}{approval_state}"
 
 
 def _tick_summary(name: str, record: SessionRecord) -> str:

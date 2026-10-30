@@ -37,17 +37,13 @@ import signal
 import subprocess
 import sys
 import threading
+from contextlib import nullcontext
 from datetime import datetime, time, timedelta
 from pathlib import Path
 from typing import Callable
 
-from hedge_fund.data.bars import (
-    bar_time,
-    bars_between,
-    next_bar,
-    session_date,
-    to_key,
-)
+from hedge_fund.brokers.factory import build_broker
+from hedge_fund.data.bars import bar_time, bars_between, next_bar, session_date, to_key
 from hedge_fund.data.protocol import DataClient, DataClientError
 from hedge_fund.data.sessions import NEW_YORK
 from hedge_fund.fund import Fund, FundSpec
@@ -58,9 +54,10 @@ from hedge_fund.pipeline.clock import LiveClock
 from hedge_fund.pipeline.session import FundHalted, SessionRecord
 
 PID_FILE = "runner.pid"
-_LATE_SECONDS = 60      # how long after a boundary its prints still count as that bar's
+_LATE_SECONDS = 60  # how long after a boundary its prints still count as that bar's
+_SAXO_MARKET_CLOSE = time(16, 0)
 _DAY_TURNS = time(0, 5)  # when a daily fund's loop first looks for yesterday's close
-_DAY_POLL = 3600         # ...and how often it looks again until the close has landed
+_DAY_POLL = 3600  # ...and how often it looks again until the close has landed
 
 
 def run(
@@ -87,12 +84,12 @@ def run(
     now = now or (lambda: datetime.now(NEW_YORK))
     sleep = sleep or stop.wait
     fund = (build_fund or Fund)(deployed.spec)  # once: the analysts' caches live across sessions
+    broker = build_broker(deployed, directory=directory) if deployed.broker == "saxo" else None
     loop = _run_bars if deployed.spec.is_intraday else _run_days
-    loop(directory, deployed, data_client, fund, stop=stop, build_fund=build_fund,
-         on_record=on_record, on_event=on_event, now=now, sleep=sleep)
+    loop(directory, deployed, data_client, fund, broker=broker, stop=stop, build_fund=build_fund, on_record=on_record, on_event=on_event, now=now, sleep=sleep)
 
 
-def _run_days(directory, deployed, data_client, fund, *, stop, build_fund, on_record, on_event, now, sleep):
+def _run_days(directory, deployed, data_client, fund, *, broker, stop, build_fund, on_record, on_event, now, sleep):
     """A daily fund: every session that has become due, oldest first, then
     sleep to the next turn of the day."""
     spec = deployed.spec
@@ -105,7 +102,7 @@ def _run_days(directory, deployed, data_client, fund, *, stop, build_fund, on_re
         if due is None:
             _wait_for(_next_look(now()), now, sleep)
             continue
-        record = _run(directory, deployed, ledger, state, due, data_client, build_fund, fund=fund)
+        record = _run(directory, deployed, ledger, state, due, data_client, build_fund, fund=fund, broker=broker)
         if on_record is not None:
             on_record(record)
 
@@ -120,7 +117,7 @@ def _next_look(now: datetime) -> datetime:
     return min(turn + timedelta(days=1), local + timedelta(seconds=_DAY_POLL))
 
 
-def _run_bars(directory, deployed, data_client, fund, *, stop, build_fund, on_record, on_event, now, sleep):
+def _run_bars(directory, deployed, data_client, fund, *, broker, stop, build_fund, on_record, on_event, now, sleep):
     """A minute fund: one print per name at each boundary, the bar advanced
     there, gaps logged for the boundaries the loop was not awake for."""
     spec = deployed.spec
@@ -141,7 +138,13 @@ def _run_bars(directory, deployed, data_client, fund, *, stop, build_fund, on_re
         if bar is None:
             _wait_for(next_bar(now(), spec.interval_seconds, spec.window), now, sleep)
             continue
-        if (now() - bar_time(bar)).total_seconds() > max(spec.interval_seconds, _LATE_SECONDS):
+        moment = now()
+        if deployed.broker == "saxo" and moment.astimezone(NEW_YORK).time() >= _SAXO_MARKET_CLOSE:
+            # Never carry a pending order out of the regular-hours session,
+            # even if this bar is still within the generic lateness window.
+            _wait_for(next_bar(moment, spec.interval_seconds, spec.window), now, sleep)
+            continue
+        if (moment - bar_time(bar)).total_seconds() > max(spec.interval_seconds, _LATE_SECONDS):
             # Too late to call this the bar's print (an evening start would
             # otherwise mark today's close at tonight's price): the next bar
             # is the first honest one, and the gap is logged when it runs.
@@ -160,18 +163,30 @@ def _run_bars(directory, deployed, data_client, fund, *, stop, build_fund, on_re
         if print_day(benchmark.time) < session_date(bar):
             if closed_day != session_date(bar):  # a holiday, or the market has not opened yet
                 closed_day = session_date(bar)
-                event("gap", **{"from": state.last_session, "to": bar,
-                                "reason": f"{spec.benchmark} has not printed today; market closed"})
+                event("gap", **{"from": state.last_session, "to": bar, "reason": f"{spec.benchmark} has not printed today; market closed"})
             _wait_for(next_bar(now(), spec.interval_seconds, spec.window), now, sleep)
             continue
 
         if state.last_session is not None:
             expected = to_key(next_bar(bar_time(state.last_session), spec.interval_seconds, spec.window))
             if bar != expected:
-                event("gap", **{"from": state.last_session, "to": bar,
-                                "bars_skipped": bars_between(state.last_session, bar, spec.interval_seconds, spec.window)})
+                event("gap", **{"from": state.last_session, "to": bar, "bars_skipped": bars_between(state.last_session, bar, spec.interval_seconds, spec.window)})
 
-        record = _run(directory, deployed, ledger, state, bar, data_client, build_fund, clock=clock, fund=fund)
+        cutoff = datetime.combine(bar_time(bar).date(), _SAXO_MARKET_CLOSE, tzinfo=NEW_YORK)
+        submission_window = broker.order_submission_window(cutoff, now=now) if deployed.broker == "saxo" else nullcontext()
+        with submission_window:
+            record = _run(
+                directory,
+                deployed,
+                ledger,
+                state,
+                bar,
+                data_client,
+                build_fund,
+                clock=clock,
+                fund=fund,
+                broker=broker,
+            )
         if on_record is not None:
             on_record(record)
         if not stop.is_set():
@@ -187,6 +202,7 @@ def _wait_for(moment: datetime, now: Callable[[], datetime], sleep: Callable[[fl
 # ---------------------------------------------------------------------------
 # The process around the loop
 # ---------------------------------------------------------------------------
+
 
 def serve(
     directory: str | Path,
@@ -247,8 +263,11 @@ def spawn_runner(directory: Path) -> int:
     with log:
         child = subprocess.Popen(
             [sys.executable, "-m", "hedge_fund.run", "paper", "run", directory.name],
-            stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
-            start_new_session=True, cwd=str(directory),
+            stdin=subprocess.DEVNULL,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            cwd=str(directory),
         )
     return child.pid
 

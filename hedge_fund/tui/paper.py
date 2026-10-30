@@ -690,7 +690,7 @@ class SessionsScreen(Screen):
         staff = ", ".join(s.title for s in spec.strategies)
         self.query_one("#pf-head", Static).update(
             Group(
-                Text.assemble((snap.deployed.name, f"bold {BRIGHT}"), ("  ·  paper", MUTED)),
+                Text.assemble((snap.deployed.name, f"bold {BRIGHT}"), (f"  ·  {snap.deployed.broker}", MUTED)),
                 Text(f"{staff}  ·  {cadence_identity(spec)}  ·  ${spec.capital:,.0f}" f"  ·  {' '.join(snap.deployed.universe)}", style=MUTED),
             )
         )

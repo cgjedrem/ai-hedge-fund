@@ -5,62 +5,68 @@
 
 ## Phase 1: Setup
 
-- [ ] T001 Create `hedge_fund/brokers/saxo.py` module skeleton with SIM-only constants (`BASE_URL = "https://gateway.saxobank.com/sim/openapi"`, `AUTH_URL = "https://sim.logonvalidation.net"`) and error taxonomy classes `SaxoAuthError`, `SaxoOrderError`, `SaxoReconcileError` in hedge_fund/brokers/saxo.py
-- [ ] T002 [P] Add fake transport + fake clock + fake `op` runner test doubles in hedge_fund/brokers/test_saxo_doubles.py (Transport protocol recording calls, scripted responses; FakeClock for pacer/token manager; FakeOp for secrets provider)
+- [x] T001 Create `hedge_fund/brokers/saxo.py` module skeleton with SIM-only constants (`BASE_URL = "https://gateway.saxobank.com/sim/openapi"`, `AUTH_URL = "https://sim.logonvalidation.net"`) and error taxonomy classes `SaxoAuthError`, `SaxoOrderError`, `SaxoReconcileError` in hedge_fund/brokers/saxo.py
+- [x] T002 [P] Add fake transport + fake clock test doubles in hedge_fund/brokers/test_saxo_doubles.py (Transport protocol recording calls, scripted responses; FakeClock for pacer/token manager)
 
 ## Phase 2: Foundational (blocking)
 
-- [ ] T003 Test-first: secrets provider tests in hedge_fund/secrets/test_provider.py (**the `hedge_fund/secrets/` package does not exist yet - create it**): `op://` reference resolution via `op read`, missing reference -> error naming the variable never the value, sanitized failure messages, write-back via `op item edit` for rotating tokens, write-back failure raises
-- [ ] T004 Implement `hedge_fund/secrets/provider.py` (resolve + write-back per T003) in hedge_fund/secrets/provider.py
-- [ ] T005 Test-first: token manager refresh + rotation + coordination tests in hedge_fund/brokers/test_saxo_tokens.py (proactive refresh at <120 s margin; single-use rotating refresh token persisted to 1Password BEFORE new access token used; **cross-process lock keyed by secret reference + re-read latest token before every refresh attempt; two managers sharing one item - loser of rotation race re-reads winner token and succeeds**; refresh failure -> SaxoAuthError with re-auth guidance, no retry loop)
-- [ ] T006 Implement `TokenManager` in hedge_fund/brokers/saxo.py (POST {AUTH_URL}/token with grant_type=refresh_token, Basic app auth, lock + re-read + 1Password write-back via secrets provider, state machine UNAUTHENTICATED->AUTHORIZED->REAUTH_REQUIRED)
-- [ ] T007 [P] Test-first: pacer tests in hedge_fund/brokers/test_saxo_pacer.py (orders class >=1.0 s spacing under FakeClock, other classes unpaced)
-- [ ] T008 Implement `Pacer` in hedge_fund/brokers/saxo.py (per-endpoint-class min interval, fake-clock friendly wait)
-- [ ] T009 [P] Test-first: redaction tests in hedge_fund/brokers/test_saxo_redaction.py (no app secret/access/refresh token material in client logs, exception messages, or repr under any failure path)
-- [ ] T010 [P] Test-first: instrument resolution tests in hedge_fund/brokers/test_saxo_universe.py (**two distinct calls with distinct response shapes**: search `GET /ref/v1/instruments?Keywords=...` -> Identifier/Uic + ExchangeId; details `GET /ref/v1/instruments/details/{Uic}/{AssetType}` -> IsTradable/LotSize/SupportedOrderTypes; cache ~1 h TTL; untradable/missing ticker -> SaxoReconcileError before any order; search response lacking tradability fields must not be treated as validation data)
+- [x] T003 Test-first: secrets provider tests in hedge_fund/secrets/test_provider.py: `op://` reference resolution via `op read`, missing reference -> error naming the variable never the value, sanitized failure messages, sensitive write-back via JSON template on stdin with no token in argv, persistent fake item and re-read verification
+- [x] T004 Implement `hedge_fund/secrets/provider.py` (resolve + write-back per T003) in hedge_fund/secrets/provider.py
+- [x] T005 Test-first: token manager refresh + rotation + coordination tests in hedge_fund/brokers/test_saxo_tokens.py (proactive refresh at <120 s margin; rotated token persisted before access token use; reference-keyed atomic lock and latest-token re-read; same-host manager race; shared mount configured via `SAXO_REFRESH_LOCK_DIR`; bounded lock timeout with owner context and no stale-lock stealing; refresh failure -> SaxoAuthError)
+- [x] T006 Implement `TokenManager` in hedge_fund/brokers/saxo.py (POST {AUTH_URL}/token with grant_type=refresh_token, Basic app auth, lock + re-read + 1Password write-back via secrets provider, state machine UNAUTHENTICATED->AUTHORIZED->REAUTH_REQUIRED)
+- [x] T007 [P] Test-first: pacer tests in hedge_fund/brokers/test_saxo_pacer.py (orders class >=1.0 s spacing under FakeClock, other classes unpaced)
+- [x] T008 Implement `Pacer` in hedge_fund/brokers/saxo.py (per-endpoint-class min interval, fake-clock friendly wait)
+- [x] T009 [P] Test-first: redaction tests in hedge_fund/brokers/test_saxo_redaction.py (no app secret/access/refresh token material in client logs, exception messages, or repr under any failure path)
+- [x] T010 [P] Test-first: instrument resolution tests in hedge_fund/brokers/test_saxo_universe.py (search `Identifier`/`ExchangeId`; deterministic supported US exchange selection; details require tradable, `Exchange.CountryCode=US`, `CurrencyCode=USD`, and Market order support; cache ~1 h with later-session expiry revalidation; missing/non-US listing refuses)
 
 ## Phase 3: US1 - Connect fund to Saxo SIM book (P1)
 
 **Goal**: A deployed `saxo` fund reads SIM positions/cash and reconciles before trading.
 **Independent test**: with a scripted transport, `SaxoBroker.positions()`/`cash()` return values mapped from fixture payloads; currency mismatch refuses at startup; reconciliation refuses on mismatch.
 
-- [ ] T011 [P] [US1] Test-first: client book-read tests in hedge_fund/brokers/test_saxo_client.py (users/me -> ClientKey; accounts/me -> **first trading account whose Currency matches the fund base currency, mismatch/none-compatible -> startup refusal**; positions/me grouped by NetPositionId mapped to shared `Position(ticker, shares)` with signed Amount; balances/me -> **`CashBalance` for `cash()`**, `CashAvailableForTrading` exposed separately for affordability only)
-- [ ] T012 [US1] Implement `SaxoClient` book reads + startup discovery with currency validation in hedge_fund/brokers/saxo.py (bearer auth on every call, one 401->refresh->retry then SaxoAuthError)
-- [ ] T013 [US1] Implement universe validation + UIC cache in hedge_fund/brokers/saxo.py (FR-006: two-call resolution per T010, validate full fund universe before first order of a session)
-- [ ] T014 [US1] Wire reconciliation to SaxoBroker book in hedge_fund/paper/tick.py (external book authoritative; `cash()` = accounting CashBalance so ledger comparison is apples-to-apples; mismatch refuses session - reuse existing reconcile path)
+- [x] T011 [P] [US1] Test-first: client book-read tests in hedge_fund/brokers/test_saxo_client.py (accounts/me -> first `Active` USD account with `LegalAssetTypes` including Stock; positions and balances use scoped endpoints with ClientKey+AccountKey; `CashBalance` for `cash()`, `CashAvailableForTrading` only for affordability)
+- [x] T012 [US1] Implement `SaxoClient` book reads + startup discovery with currency validation in hedge_fund/brokers/saxo.py (bearer auth on every call, one 401->refresh->retry then SaxoAuthError)
+- [x] T013 [US1] Implement universe validation + UIC cache in hedge_fund/brokers/saxo.py (FR-006: two-call resolution per T010, validate full universe each session and refresh expired entries)
+- [x] T014 [US1] Wire reconciliation to SaxoBroker book in hedge_fund/paper/tick.py (external book authoritative; `cash()` = accounting CashBalance so ledger comparison is apples-to-apples; mismatch refuses session - reuse existing reconcile path)
 
 ## Phase 4: US2 - Order execution with actual SIM fills (P2)
 
 **Goal**: Session orders place market orders and record Saxo actual simulated fills.
 **Independent test**: scripted transport: POST -> OrderId, open-order poll -> gone, transactions -> order-correlated fill; Fill matches fixture for increase, reduction, and full-exit scenarios; ErrorInfo/409/deadline paths raise.
 
-- [ ] T015 [US2] Test-first: order placement tests in hedge_fund/brokers/test_saxo_orders.py (payload shape: Uic/AssetType Stock/Amount shares/BuySell/OrderType Market/DayOrder/ManualOrder false; unique x-request-id per attempt; HTTP 200 with ErrorInfo -> SaxoOrderError carrying Saxo ErrorCode; 409 -> inspect state, never re-POST; poll-until-gone with 120 s deadline -> SaxoOrderError; **fill read from order-correlated transaction/execution records tied to the OrderId - fixtures cover an increase (position grows), a reduction (position shrinks but OpenPrice unchanged), and a full exit (no position row remains); position state alone never establishes a fill**; fill-completely-or-raise; affordability checked against CashAvailableForTrading before placement)
-- [ ] T016 [US2] Implement `SaxoBroker.place_order` + order-correlated fill detection in hedge_fund/brokers/saxo.py (pacer wait before POST, body inspection not status-only, poll open order until gone, read executed quantity/price from transactions tied to the OrderId, bounded deadline, `Fill(ticker, side, quantity, price)` construction)
-- [ ] T017 [US2] Test-first: quantity precision tests in hedge_fund/brokers/test_saxo_precision.py (LotSize rounding from instrument **details** response; fractional rejection -> refuse, never round up exposure - FR-012)
-- [ ] T018 [US2] Implement quantity precision handling in hedge_fund/brokers/saxo.py (round to tradable precision; refuse when rounding would change exposure direction/size materially)
+- [x] T015 [US2] Test-first: order placement tests in hedge_fund/brokers/test_saxo_orders.py (order payload/request id/errors/deadline; transactions filtered by account/client/date/UIC, paginated, nested `Trades[].OrderId` correlated; increases/reductions/full exits; complete-fill-or-raise; buying power checked before placement)
+- [x] T016 [US2] Implement `SaxoBroker.place_order` + order-correlated fill detection in hedge_fund/brokers/saxo.py (pacer wait before POST, body inspection not status-only, poll open order until gone, read executed quantity/price from transactions tied to the OrderId, bounded deadline, `Fill(ticker, side, quantity, price)` construction)
+- [x] T017 [US2] Test-first: quantity precision tests in hedge_fund/brokers/test_saxo_precision.py (LotSize rounding down in copied orders; missing/null LotSize fallback; suppress untradable sub-lot rebalance dust; submitted order remains complete-fill-or-raise; multi-session e2e verifies 3.83→3 fill and continued fund operation; de-risking rounded sells proceed; filters that worsen position/gross exposure refuse before submission)
+- [x] T018 [US2] Implement quantity precision handling in hedge_fund/brokers/saxo.py and post-filter projected-risk validation in hedge_fund/pipeline/stages.py (copy orders rounded down to tradable lot multiples; missing/null `LotSize` defaults to one; omit below-lot dust; record adjusted order in ledger; permit post-filter breaches only when filtered risk does not worsen current-book risk)
 
 ## Phase 5: US3 - Secrets via 1Password, token safety (P2)
 
 **Goal**: No secret ever in plaintext/logs/ledger; rotating refresh token survives restarts and concurrent fund runners.
 **Independent test**: with fake `op` runner, references resolve at startup; missing ref errors name the variable; write-back called after every refresh under the coordination lock; grep-style redaction tests pass.
 
-- [ ] T019 [US3] Test-first: startup secret resolution tests in hedge_fund/secrets/test_saxo_secrets.py (SAXO_APP_KEY_REF/SAXO_APP_SECRET_REF/SAXO_REFRESH_TOKEN_REF resolved via provider; missing -> error naming variable, never value; redirect URI from non-secret env)
-- [ ] T020 [US3] Implement Saxo credential wiring in hedge_fund/brokers/saxo.py + interactive auth helper `hedge_fund/brokers/saxo_auth.py` (auth-code + PKCE in browser for first login, stores refresh token into the 1Password item)
+- [x] T019 [US3] Test-first: startup-secret and interactive-auth lock tests in hedge_fund/secrets/test_saxo_secrets.py and hedge_fund/brokers/test_saxo_auth.py (all env references required; refresh token read under lock on first authenticated request; auth-code exchange and token write-back share the reference lock; missing references are sanitized)
+- [x] T020 [US3] Implement Saxo credential wiring in hedge_fund/brokers/saxo.py + interactive auth helper `hedge_fund/brokers/saxo_auth.py` (auth-code + PKCE exchange and write-back under the refresh-reference lock; cleanup failure after successful persistence is logged and recoverable)
 
 ## Phase 6: US4 - Broker selection, deployment, and routing (P3)
 
 **Goal**: `broker: paper|saxo` end to end: mandate -> deploy -> factory-routed tick/runner -> TUI; existing funds byte-identical.
 **Independent test**: FundSpec/DeployedFund round-trip golden test (paper fund yaml byte-identical); factory builds SaxoBroker for saxo funds; saxo deployment creates no paper book; redo refuses saxo; e2e: selecting Saxo deploys and runs a session through the external adapter.
 
-- [ ] T021 [US4] Test-first: FundSpec broker field + cadence validation tests in hedge_fund/fund/test_spec_broker.py (Literal validation; popped-on-default serialization byte-compat golden file; **saxo + daily cadence refused at validation with in-market-cadence guidance** - FR-014; immutable after deploy) + implement in hedge_fund/fund/spec.py
-- [ ] T022 [US4] Test-first: deployment + factory routing tests in hedge_fund/paper/test_deployed_broker.py (**`DeployedFund.broker` widened to Literal["paper","saxo"] consistently with FundSpec; saxo deployment skips `PaperBroker.create` - no local broker.json book; `hedge_fund/brokers/factory.py` `build_broker(deployed)` routes paper->PaperBroker, saxo->SaxoBroker with resolved secrets; `paper/tick.py` line ~283 and the runner construct brokers only via the factory; redo refuses non-paper brokers; missing secrets fail before trading**) + implement in hedge_fund/paper/deployed.py, hedge_fund/brokers/factory.py, hedge_fund/paper/tick.py
-- [ ] T023 [US4] Test-first: TUI broker selector tests in hedge_fund/tui/test_builder_broker.py (fund-setup broker option paper|saxo alongside approval gate at hedge_fund/tui/builder.py ~line 471; summary line shows choice; saxo+daily cadence blocked in UI) + implement in hedge_fund/tui/builder.py
-- [ ] T024 [US4] End-to-end test: selecting Saxo in the builder deploys a saxo fund and runs a session through the external adapter (fake transport) in hedge_fund/paper/test_saxo_e2e.py - proves mandate -> deploy -> factory routing -> book read -> order -> fill -> ledger recording
+- [x] T021 [US4] Test-first: FundSpec broker field + cadence/window validation tests in hedge_fund/fund/test_spec_broker.py (paper defaults/serialization byte-compatible; Saxo omitted costs default zero, explicit costs honored; non-minute cadence and windows outside 09:30–15:59 refused; omitted Saxo window defaults to 09:30–15:59; immutable after deploy)
+- [x] T022 [US4] Test-first: deployment + factory routing tests in hedge_fund/paper/test_deployed_broker.py (`DeployedFund.broker` matches FundSpec; Saxo deploy skips local broker book; factory routes paper/Saxo; fixed USD policy rejects currency override; broker startup validates actual account; continuous runner reuses Saxo broker/token manager; redo refuses external broker)
+- [x] T023 [US4] Test-first: TUI broker selector tests in hedge_fund/tui/test_builder_broker.py (fund setup option, summary, cadence guard, Saxo regular-hours window validation); rail includes Broker and Tickers steps
+- [x] T024 [US4] End-to-end test: builder deploys Saxo and runs fake SIM book/order/fill/ledger path; multi-session 3.83-share drift rounds down to 3, fills completely, remains ledger-consistent, and fund continues
+
+> T023–T024 runtime validation passes in the designated non-Ollama validation venv.
 
 ## Phase 7: Polish
 
-- [ ] T025 [P] Update quickstart smoke-test steps in specs/003-saxo-broker-adapter/quickstart.md to match implemented CLI (`saxo_auth` module name, env var names, cadence guidance) - doc-only
-- [ ] T026 Run style gate (black/isort/flake8) and chunked full pytest (`hedge_fund/brokers`, `hedge_fund/secrets`, `hedge_fund/fund`, `hedge_fund/paper`, then full suite) - expect green except the 6 documented Windows baseline failures
+- [x] T025 [P] Update quickstart smoke-test steps in specs/003-saxo-broker-adapter/quickstart.md to match implemented CLI (`saxo_auth` module name, env var names, cadence guidance) - doc-only
+- [x] T026 Run style gate (black/isort/flake8) and chunked full pytest (`hedge_fund/brokers`, `hedge_fund/secrets`, `hedge_fund/fund`, `hedge_fund/paper`, then full suite) - expect green except the 6 documented Windows baseline failures
+
+> T026 done (2026-10-30), chunked on Windows: changed Python files pass Black, isort, and Flake8 (repository-wide baseline findings in untouched files left as-is); no UTF-8 BOM. paper+brokers+secrets+fund+pipeline: 304 passed, 3 baseline failures (two redo `os.rename`, stale-PID `os.kill`). tui: 73 passed, 2 baseline failures (home file-mode, paper-view `%-d`). backtesting+features+root: 95 passed, 1 baseline failure (intraday `%-d`). Earlier unaffected chunks: data 185 passed/36 skipped (with pipeline); portfolio/risk/scorecard/signals 132 passed; non-Ollama LLM 147 passed. Total: exactly the 6 documented baseline failures. `tui/test_paper.py::test_paper_screen_space_starts_and_stops_a_runner_at_any_cadence` interrupts the Windows console (`os.kill(pid, 0)` is `CTRL_C_EVENT`) identically on `origin/main`; pre-existing, deselected. The Ollama client tests were excluded per user direction.
+
+> PR #2 review-fix validation, chunked on Windows: 1,043 passed, 36 skipped, and the same 6 baseline failures. Four cases were deselected: two Ollama cases and two parametrizations of the Windows runner-control test that interrupts the test process. Poetry was unavailable, so the existing verification virtualenv was used. Modified Python files pass Black, isort, and Flake8 at 420 columns; repository-wide gates still report pre-existing findings in untouched files. No live Saxo or 1Password requests were made.
 
 ## Dependencies
 

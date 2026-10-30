@@ -16,7 +16,7 @@ Thin HTTP facade over the SIM OpenAPI. Owns the transport, token manager, and pa
 | `tokens` | `TokenManager` | access-token lifecycle + refresh-token rotation |
 | `pacer` | `Pacer` | min-interval enforcement (orders ≥1.0 s), fake-clock friendly |
 | `client_key` | `str` | discovered via `GET /port/v1/users/me` at startup |
-| `account_key` | `str` | discovered via `GET /port/v1/accounts/me` — **first trading account whose `Currency` matches the fund's base currency**; no compatible account ⇒ startup error (no FX conversion in this feature) |
+| `account_key` | `str` | discovered via `GET /port/v1/accounts/me` — first active account with `LegalAssetTypes` including `Stock` and `Currency=USD`; no compatible account ⇒ startup error |
 
 Methods: `positions()`, `balances()`, `search_instrument(ticker)` (→ `Identifier`/`Uic`, `ExchangeId`), `instrument_details(uic, asset_type)` (→ `IsTradable`, `LotSize`, `SupportedOrderTypes` — a distinct second call), `place_order(payload, request_id)`, `get_open_order(order_id)`, `transactions(since)`.
 
@@ -29,7 +29,7 @@ Methods: `positions()`, `balances()`, `search_instrument(ticker)` (→ `Identifi
 | `refresh_token_ref` | `str` | 1Password `op://` reference for the rotating refresh token |
 | `refresh_margin_s` | `float` | refresh when remaining < margin (default 120 s) |
 
-State machine: `UNAUTHENTICATED → AUTHORIZED → (refresh loop) → REAUTH_REQUIRED` (terminal until interactive re-auth). On refresh: **acquire the cross-process lock keyed by the secret reference → re-read the latest refresh token from 1Password → POST `/token` (grant_type=refresh_token) → immediately write the new refresh token back to 1Password → release lock → swap access token**. The re-read step means a process that lost a rotation race to another fund runner picks up the winner's token instead of presenting a spent one. Any refresh failure → `SaxoAuthError` with re-auth guidance; never retried in a loop. A test exercises two managers sharing one 1Password item.
+State machine: `UNAUTHENTICATED → AUTHORIZED → (refresh loop) → REAUTH_REQUIRED` on refresh failure; lock contention is retryable and preserves current state. On refresh: acquire the reference-keyed atomic lock directory → re-read the latest refresh token → POST `/token` → persist rotated token → release lock → expose access token. Interactive authorization holds the same lock across code exchange and token write-back. Cleanup failure after a successful refresh is logged with recoverable owner/path context and does not invalidate the persisted token. Default temp path coordinates only same-host processes. Host/container coordination requires both environments to mount and configure the same `SAXO_REFRESH_LOCK_DIR`; atomic directory creation required. A process crash can leave a stale lock; verify owner is inactive before manual removal.
 
 ### Pacer (new, same module)
 
@@ -46,12 +46,13 @@ State machine: `UNAUTHENTICATED → AUTHORIZED → (refresh loop) → REAUTH_REQ
 |---|---|---|
 | `client` | `SaxoClient` | shared HTTP/token/pacer stack |
 | `uic_cache` | `dict[str, tuple[int, str]]` | ticker → (Uic, AssetType), ~1 h TTL |
-| `universe_validated` | `bool` | set after FR-006 pre-session validation |
 
 Methods (protocol): `positions() -> dict[str, Position]`, `cash() -> float`, `place_order(Order) -> Fill`.
 
-- `positions()`: `GET /port/v1/positions/me` → group by `NetPositionId`, map ticker from instrument lookup, `Amount` signed (long +) → shared model `Position(ticker, shares)`; `OpenPrice`/`CurrentPrice` stay internal metadata (the shared model has no cost field).
-- `cash()`: `GET /port/v1/balances/me` → **`CashBalance`** (accounting cash — this is what NAV/equity and ledger reconciliation consume). `CashAvailableForTrading` (buying power) is read separately and used only for order affordability checks, never returned from `cash()`.
+- `positions()`: `GET /port/v1/positions` with `ClientKey` and `AccountKey` → validate the list-valued `Data` on every page, aggregate all pages, map ticker from instrument lookup, signed `Amount` → shared model `Position(ticker, shares)`. An invalid or failed page fails the whole snapshot.
+- `cash()`: `GET /port/v1/balances` with `ClientKey` and `AccountKey` → **`CashBalance`**. `CashAvailableForTrading` is used only for order affordability. Account and balance currency must be USD.
+- `filter_orders()`: copy orders with quantities rounded down to lot multiples; drop below-lot dust. Cycle ledger records those adjusted orders. Pipeline revalidates projected position and gross limits after filtering, before any POST. `place_order()` returns a complete correlated `Fill` or raises for every submitted order.
+- Post-filter risk gate rejects a position or gross-limit breach only when filtered exposure worsens the same metric versus the current book; de-risking orders may reduce an existing breach without reaching the cap. Saxo keeps sell-first order when safe, but reorders as needed so every projected prefix obeys that same rule at sizing marks.
 - `place_order(order)`: validate universe → build payload (`Uic`, `AssetType: "Stock"`, `Amount` shares, `BuySell`, `OrderType: "Market"`, `DayOrder`, `ManualOrder: false`) → pacer wait → POST with unique `x-request-id` → **inspect body**: `ErrorInfo` present ⇒ `SaxoOrderError` (message includes Saxo's ErrorCode, e.g. `MarketClosed`, `InsufficientCash`); `OrderId` present ⇒ poll open-order until gone (deadline 120 s) → **read the order-correlated executed quantity/price from the execution/transaction records tied to that OrderId** (a position's `OpenPrice`/`Amount` describe the holding, not this execution: reductions keep the old acquisition cost, full exits leave no position row) → return complete `Fill(ticker, side, quantity, price)` or raise. **Never re-POSTs**; 409 ⇒ inspect state, raise if unresolved.
 
 ### Secret references (1Password item schema, `Saxo OpenAPI SIM` item)
@@ -62,15 +63,19 @@ Methods (protocol): `positions() -> dict[str, Position]`, `cash() -> float`, `pl
 | App secret | `Saxo OpenAPI SIM/app-secret` | no |
 | Refresh token | `Saxo OpenAPI SIM/refresh-token` | **yes — written back after every refresh** |
 
-**The `hedge_fund/secrets/` package does not exist yet** — this feature creates it (test-first): `provider.py` resolves `op://` references via `op read` (missing reference ⇒ error naming the variable, never the value; failures sanitized) and adds write-back via `op item edit` for the rotating refresh token. Redirect URI for the interactive auth-code step is non-secret config (env var).
+`provider.py` resolves `op://` references via `op read`. For token write-back, fetch the item JSON template with `op item get --format=json --reveal`, update the referenced field (including an optional section), then pipe JSON to `op item edit`; token never appears in argv. Redirect URI and lock directory are non-secret config.
+
+### Deferred session execution
+
+The unattended runner supplies a scoped 16:00 ET cutoff to the Saxo client. `CycleRecord.orders` and `fills` contain only completed executions; `deferred_orders` and `deferral_reason` record the unsubmitted remainder when the cutoff is reached. The new fields are omitted when empty, preserving historical session hashes. Confirmed Saxo fills are appended as `broker_fill` events before the next order. The next valid bar sizes a newly assessed decision against the reconciled broker book and follows the normal approval gate; it does not replay deferred quantities.
 
 ### FundSpec / DeployedFund / factory / TUI (modified + new)
 
 | Component | Change |
 |---|---|
-| `fund/spec.py` `FundSpec` | `broker: Literal["paper", "saxo"] = "paper"`, popped when equal to default (same pattern as `approval_required`) — existing fund.yaml stays byte-identical; **saxo mandates with a daily cadence refused** (00:05 NY turn is market-closed) |
+| `fund/spec.py` `FundSpec` | `broker: Literal["paper", "saxo"] = "paper"`; paper YAML stays byte-identical; omitted Saxo costs default to zero, explicit costs honored; Saxo requires minute cadence and 09:30–15:59 ET window (omitted window defaults to that range) |
 | `paper/deployed.py` `DeployedFund` | `broker: Literal["paper", "saxo"]` kept consistent with FundSpec; **saxo deployment skips `PaperBroker.create`** (no local broker.json book — the book is external) |
-| `brokers/factory.py` (NEW) | `build_broker(deployed)` routes `"paper"` → `PaperBroker`, `"saxo"` → `SaxoBroker` with secrets resolved at construction; `paper/tick.py` (line ~283) and the runner construct brokers **only** through this factory |
+| `brokers/factory.py` (NEW) | `build_broker(deployed)` routes `"paper"` → `PaperBroker`, `"saxo"` → `SaxoBroker` with secrets resolved at construction; the continuous runner reuses one Saxo broker/token manager across sessions |
 | `paper/tick.py` redo path | refuses non-paper brokers (ledger replay is only defined for the internal book) |
 | `tui/builder.py` fund setup | broker selector (paper \| saxo) alongside the approval gate; summary line shows the choice |
 | End-to-end test | selecting Saxo in the builder deploys a saxo fund and runs a session through the external adapter (fake transport) |
@@ -78,8 +83,9 @@ Methods (protocol): `positions() -> dict[str, Position]`, `cash() -> float`, `pl
 ## Invariants
 
 - **INV-1**: A `Fill` is returned only when order-correlated execution records show the fill; otherwise raise. No partial fills surfaced; position state alone never establishes a fill.
-- **INV-2**: The newest refresh token is persisted to 1Password before any request uses the new access token, under a cross-process lock keyed by the secret reference, with the latest token re-read before every refresh attempt.
+- **INV-2**: Refresh and interactive authorization exchange/write-back share a secret-reference lock. The newest refresh token is persisted before access-token use. Lock acquisition has a 90-second bound and reports sanitized owner context; contention remains retryable and never sets terminal re-auth state or steals locks. Cleanup failure after successful persistence is logged and leaves the token usable. Cross-container coordination exists only when `SAXO_REFRESH_LOCK_DIR` names the same atomic shared filesystem path.
+- **INV-3**: Reused broker instances revalidate the fund universe each session; cached instrument details expire after 3600 seconds.
 - **INV-3**: No secret value (app secret, tokens) ever appears in logs, exceptions, events, or the ledger — redaction at the client boundary.
 - **INV-4**: Order POSTs are spaced ≥1 s and carry unique `x-request-id`s; an order whose outcome is unknown is never re-sent.
 - **INV-5**: Existing paper funds serialize byte-identically; `saxo` funds are immutable after deploy.
-- **INV-6**: `cash()` is same-currency accounting cash; the account currency must match the fund's base currency or deployment is refused.
+- **INV-6**: `cash()` is USD accounting cash; account currency is checked at broker startup. No FX conversion.
