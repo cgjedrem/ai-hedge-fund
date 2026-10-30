@@ -17,6 +17,11 @@ services:
     environment:
       - OLLAMA_BASE_URL=http://127.0.0.1:11434
 
+  runner-weekly:
+    network_mode: host
+    environment:
+      - OLLAMA_BASE_URL=http://127.0.0.1:11434
+
   tui:
     network_mode: host
     environment:

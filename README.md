@@ -127,7 +127,7 @@ docker run -d --name aihf-watchtower --restart unless-stopped \
     -v ~/.hedge-fund:/root/.hedge-fund aihf paper run watchtower
 ```
 
-Or with compose (`docker-compose.yml` in this repo): `docker compose up -d runner` for the runner, `docker compose run --rm tui` for the app. One runner per fund — copy the service and change the fund name. Do not run the same fund's runner on the host and in a container at the same time: pid files cannot see across that boundary, so both would believe they own the fund.
+Or with compose (`docker-compose.yml` in this repo): `docker compose up -d runner` for the runner, `docker compose run --rm tui` for the app. One runner per fund — copy the service and change the fund name; the compose file ships a second one, `runner-weekly`, for the `watchtower-weekly` comparison fund (the same mandate as `watchtower` on a weekly cadence). After a code change, rebuild every runner you use: `docker compose up -d --build runner runner-weekly`. Do not run the same fund's runner on the host and in a container at the same time: pid files cannot see across that boundary, so both would believe they own the fund.
 
 #### Using Ollama models in the container
 
