@@ -46,3 +46,27 @@ services:
       - OLLAMA_BASE_URL=http://host.docker.internal:11434
     volumes:
       - ~/.hedge-fund:/root/.hedge-fund
+
+  web:
+    profiles: ["web"]
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+    ports:
+      - "127.0.0.1:8765:8765"
+    volumes:
+      - ~/.hedge-fund:/root/.hedge-fund
+    command: ["aihf-web", "--port", "8765", "--container-bind"]
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - webdesk
+
+networks:
+  webdesk:
+    driver: bridge

@@ -270,7 +270,7 @@ class Ledger:
             return None
         if not isinstance(decision_hash, str) or _HASH.fullmatch(decision_hash) is None:
             return None
-        if not isinstance(decided_at, str) or not isinstance(by, str) or by not in {"cli", "tui"}:
+        if not isinstance(decided_at, str) or not isinstance(by, str) or by not in {"cli", "tui", "web"}:
             return None
         try:
             stamp = datetime.fromisoformat(decided_at.replace("Z", "+00:00"))
@@ -312,7 +312,7 @@ class Ledger:
         verdict = event.get("approval_verdict")
         by = event.get("approval_by")
         decided_at = event.get("time")
-        if verdict not in {"approve", "reject"} or by not in {"cli", "tui"} or not isinstance(decided_at, str):
+        if verdict not in {"approve", "reject"} or by not in {"cli", "tui", "web"} or not isinstance(decided_at, str):
             return None
         return {
             "verdict": verdict,
@@ -346,8 +346,8 @@ class Ledger:
             raise ValueError("decision_as_of must be a non-empty string")
         if not isinstance(decision_hash, str) or _HASH.fullmatch(decision_hash) is None:
             raise ValueError("decision_hash must be a lowercase SHA-256 hash")
-        if not isinstance(by, str) or by not in {"cli", "tui"}:
-            raise ValueError("by must be 'cli' or 'tui'")
+        if not isinstance(by, str) or by not in {"cli", "tui", "web"}:
+            raise ValueError("by must be 'cli', 'tui' or 'web'")
         value = {
             "verdict": verdict,
             "decision_as_of": decision_as_of,
