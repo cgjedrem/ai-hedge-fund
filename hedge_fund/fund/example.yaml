@@ -30,7 +30,10 @@ risk:
   max_gross_exposure: 1.0     # unlevered, across the netted book
 costs:                        # what every fill costs; these are the defaults
   spread_bps: 5               # half the bid-ask spread, paid on every side
-  commission_per_share: 0.005 # dollars a share; zero on both means free fills
+  commission_per_share: 0.005 # dollars a share (Interactive Brokers' fixed rate)
+  # commission_bps: 8         # percent of the order's value (Saxo-style shops)
+  # min_commission_per_order: 1  # smallest commission per order, in dollars
+  # zero on all of it means free fills
 capital: 100000
 rebalance: weekly             # minute | daily | weekly | monthly — interval/window apply only to minute funds
 # approval_required: true      # optional; default false

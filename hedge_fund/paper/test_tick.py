@@ -61,6 +61,8 @@ spec:
   costs:
     spread_bps: 0.0
     commission_per_share: 0.0
+    commission_bps: 0.0
+    min_commission_per_order: 0.0
   capital: 100000.0
   rebalance: weekly
   benchmark: SPY
