@@ -1,91 +1,77 @@
-# Implementation Plan: Trading 212 Broker Adapter
+# Plan: Saxo OpenAPI Broker Adapter (SIM)
 
-**Branch**: `003-t212-broker-adapter` (worktree branch: `cgjedrem-yfinance-provider-setup`) | **Date**: 2026-10-30 | **Spec**: [spec.md](./spec.md)
-
-**Input**: Feature specification from `/specs/003-t212-broker-adapter/spec.md`
+**Feature**: 003-saxo-broker-adapter | **Branch**: `003-saxo-broker-adapter` | **Date**: 2026-10-30
 
 ## Summary
 
-Add Trading 212 as a pluggable execution broker for paper funds, targeting T212's **demo** environment only. A new `T212Broker` implements the existing three-method `Broker` protocol (`positions()`, `cash()`, `place_order()` — fill-completely-or-raise) against T212's REST API with HTTP Basic auth. API credentials are resolved at startup from 1Password via `op://` secret references (plaintext env values remain supported); secrets are never persisted or logged. Broker selection becomes a per-fund mandate setting (`broker: paper | t212`), byte-compatible with existing deployed funds. The external broker's reported book is authoritative and reconciled before every session; the redo path is refused for externally-brokered funds.
+Add a second broker backend for deployed paper funds: Saxo Bank OpenAPI against the **SIM** environment. The adapter implements the existing `Broker` protocol (`positions()`, `cash()`, `place_order()`), authenticates via OAuth2 with 1Password-stored rotating refresh tokens, places market orders with real SIM fills, and keeps the external broker's book authoritative for reconciliation. Broker selection is a per-fund mandate field, byte-compatible with existing funds.
 
 ## Technical Context
 
-**Language/Version**: Python 3.11 (Poetry)
-
-**Primary Dependencies**: `requests` ^2.32.0 (already a dependency — no new packages), `pydantic` (models), 1Password CLI (`op`) as an external subprocess for secret resolution
-
-**Storage**: No new storage. T212 funds reuse the existing deployed-fund layout (`fund.yaml`, `ledger/`, `events.jsonl`); `broker.json` is not used for T212 funds (the broker's own books are authoritative). Instruments list cached in memory (~1h TTL).
-
-**Testing**: pytest, co-located (`hedge_fund/brokers/test_t212.py`, `hedge_fund/secrets/test_secrets.py`, ...). All HTTP interactions via a fake transport + recorded JSON fixtures — **no test ever touches the network** (constitution II).
-
-**Target Platform**: Windows host + Docker runner (Linux container). The 1Password CLI must be reachable in both contexts: desktop-app unlock interactively on the host, service-account token (`OP_SERVICE_ACCOUNT_TOKEN`) unattended in Docker.
-
-**Project Type**: library + CLI + TUI (existing single-package app `hedge_fund/`)
-
-**Performance Goals**: One session's rebalance (<= ~20 orders) completes within the existing tick budget; per-order fill polling respects T212's 1 req/s order-status limit.
-
-**Constraints**: T212 API is **beta** and **non-idempotent** for order placement (blind retries can duplicate orders); per-account rate limits (market orders 50/min, order status 1/s, positions 1/s, account summary 1/5s, instruments 1/50s); quantities carry at most 4 decimals; demo CSV export is unavailable; live (real-money) environment is hard-out-of-scope.
-
-**Scale/Scope**: One user, a handful of funds, 9-ticker universe, daily cadence. Small surface: one adapter module, one secrets module, spec/CLI/TUI wiring.
+**Language/Version**: Python 3.12 (Poetry-managed)
+**Primary Dependencies**: `requests ^2.32.0` (already present — no new packages), `pydantic` (models), `rich`/`textual` (TUI display only)
+**Storage**: existing ledger + broker book files unchanged; OAuth token state lives in 1Password (rotating refresh token), never on disk
+**Testing**: pytest, network-free (fake transport + fake clock); 6 documented Windows baseline failures elsewhere are unrelated
+**Target Platform**: Windows host + Docker (watchtower); Python only
+**Project Type**: single package (`hedge_fund`), library + TUI
 
 ## Constitution Check
 
-*GATE: Must pass before Phase 0 research. Re-check after Phase 1 design.*
-
-| Principle | Status | Notes |
-|-----------|--------|-------|
-| I. Ledger integrity first | PASS | Fills recorded in the existing hash-chained ledger with actual broker prices; external book is authoritative and reconciled before trading (FR-005); redo path refuses external brokers (cannot rewrite a book we don't own); never-overshoot-cash sizing unchanged. New fund.yaml key `broker` is popped from serialization when it equals the default `"paper"`, preserving byte-compat with existing deployed funds (same pattern as `approval_required`). |
-| II. Paper only, no unattended live risk | PASS | Adapter targets `https://demo.trading212.com` only; the live base URL is not constructible through configuration (demo-only constant). No paid data providers touched; yfinance path unchanged; tests are network-free. |
-| III. Tests co-located and green | PASS | New tests co-located under `hedge_fund/`; suite must stay green apart from the 6 documented Windows baseline failures. |
-| IV. Determinism and reproducibility | PASS | All adapter logic tested against recorded fixtures with a fake clock; live fills are recorded in the ledger like any other fill, so sessions remain replayable from the ledger. |
-| V. User-visible surfaces stay consistent | PASS | `broker` is settable in the mandate, validated in `FundSpec`, honored by the scheduler/tick, and displayed in TUI fund detail + status output. |
-| VI. Style | PASS | black line-length 420, isort black profile, flake8; no BOM in YAML/spec files. |
-
-**Post-design re-check (Phase 1)**: Still passes — see Complexity Tracking (empty; no violations).
+- **I. Ledger integrity**: fills are recorded only after Saxo confirms them (order leaves open orders + position/transaction read); reconciliation keeps the broker book authoritative; never-overshoot-cash enforced against `CashAvailableForTrading`. PASS.
+- **II. Paper only**: SIM endpoints hardcoded; live gateway/auth URLs never appear in code or config; all tests network-free. PASS.
+- **III. Test-First**: every task lists its test first; co-located tests. PASS.
+- **IV. Determinism**: fake clock for pacer/token refresher; fixture-driven fake transport; no wall-clock or network in tests. PASS.
+- **V. Mandate/CLI/TUI consistency**: `broker` field appears in mandate validation, deploy CLI, and TUI status. PASS.
+- **VI. Style**: black (line-length 420), isort (black profile), flake8; files written UTF-8 **without BOM**. PASS.
 
 ## Project Structure
 
-### Documentation (this feature)
-
-```text
-specs/003-t212-broker-adapter/
-├── plan.md              # This file
-├── research.md          # Phase 0 output: T212 API reference + design decisions
-├── data-model.md        # Phase 1 output: entities, config shapes, state machines
-├── quickstart.md        # Phase 1 output: end-to-end validation guide
-├── contracts/
-│   └── t212-adapter.md  # Phase 1 output: Broker protocol contract + T212 API surface + secrets contract
-└── tasks.md             # Phase 2 output (/speckit-tasks)
-```
-
-### Source Code (repository root)
-
 ```text
 hedge_fund/
-├── brokers/
-│   ├── protocol.py        # unchanged — T212Broker satisfies it structurally
-│   ├── models.py          # unchanged — Order/Fill/Position reused as-is
-│   ├── t212.py            # NEW: T212Broker + T212Client (requests-based) + ticker mapping + polling
-│   ├── test_t212.py       # NEW: unit + contract tests over fake transport/fixtures
-│   └── __init__.py        # export T212Broker
-├── secrets/
-│   ├── __init__.py        # NEW: resolve_secret() — op:// references via 1Password CLI, plaintext passthrough
-│   └── test_secrets.py    # NEW
-├── fund/
-│   └── spec.py            # FundSpec: add `broker: Literal["paper","t212"] = "paper"` (popped when default)
-├── paper/
-│   ├── deployed.py        # broker factory: build the right broker from the deployed spec
-│   └── tick.py            # use the factory; refuse redo for external brokers
-├── tui/
-│   └── paper_view.py      # show broker name on fund detail
-└── run.py                 # status output shows broker name
+  brokers/
+    protocol.py          # existing Broker protocol (unchanged)
+    models.py            # existing Order/Fill/Position (unchanged)
+    paper.py             # existing PaperBroker (unchanged)
+    saxo.py              # NEW: SaxoBroker (protocol impl) + SaxoClient (HTTP) + token manager + pacer
+  secrets/
+    provider.py          # existing 1Password op:// resolution (extended: write-back for rotating tokens)
+  paper/
+    deployed.py          # MODIFIED: broker factory gains "saxo"
+    tick.py              # MODIFIED: redo refuses non-paper brokers (already refuses unknown)
+  fund/
+    spec.py              # MODIFIED: FundSpec.broker Literal["paper","saxo"]="paper", popped-on-default
+specs/003-saxo-broker-adapter/
+  tests/ (co-located under hedge_fund/brokers/test_saxo*.py etc.)
 ```
 
-**Structure Decision**: Single-package layout unchanged; the adapter lives beside `sim.py`/`paper.py` in `hedge_fund/brokers/`, and secret resolution is a small standalone module (`hedge_fund/secrets/`) so it is reusable and independently testable. No new top-level directories.
+**Key decisions** (from research.md):
+- R1 `requests`-only thin client; no SDK.
+- R2 SIM-only endpoints; live URLs absent by construction.
+- R3 OAuth2 auth-code + PKCE; proactive ~15 min refresh; single-use rotating refresh token persisted to 1Password after every refresh; refresh failure → clear re-auth error, no retry loop.
+- R5 Market orders, `ManualOrder: false`, unique `x-request-id`; HTTP 200 with `ErrorInfo` = failure.
+- R6 Fill detection: poll open-order until gone → read fill from position (`OpenPrice`/`Amount`) or transactions; bounded deadline.
+- R7 Pacer ≥1 order/s; 409 on duplicate window → inspect state, never re-POST.
+- R8 Universe validated against `/ref/v1/instruments` (UIC resolution, cached) before first order.
+- R11 No OpenAPI prices; yfinance stays the data path.
+- R12 Default session capabilities (`OrdersOnly`/`Standard`) — never demote the user's own SaxoTraderGO session.
 
-## Complexity Tracking
+## Implementation Phases
 
-> No constitution violations — table intentionally empty.
+1. **Foundational**: `SaxoClient` transport abstraction (fake-able), token manager (refresh + rotation write-back), pacer, error taxonomy (`SaxoAuthError`, `SaxoOrderError`, `SaxoReconcileError`).
+2. **US1 book reads**: positions/cash/account-key discovery, UIC resolution + universe validation, reconciliation integration.
+3. **US2 order execution**: place market order, 200-with-ErrorInfo handling, fill detection loop, `Fill` construction, pacer + `x-request-id`, no-re-POST rule.
+4. **US3 secrets**: 1Password item schema (Saxo app credentials + refresh token field), `op item edit` write-back, redaction guarantees (logs/errors/ledger).
+5. **US4 mandate config**: `FundSpec.broker`, factory wiring in `deployed.py`, redo guard in `tick.py`, TUI/status display.
+6. **Polish**: quickstart smoke test doc, style gate, full chunked pytest.
 
-| Violation | Why Needed | Simpler Alternative Rejected Because |
-|-----------|------------|-------------------------------------|
+## Risks & Mitigations
+
+- **SIM quirks** (fractional shares, market-closed behavior, transaction feed latency): flagged as empirical open items; adapter refuses rather than guesses (FR-012, FR-011 deadline).
+- **Token rotation loss** (crash between refresh and write-back): write-back happens immediately after refresh, before the token is used; worst case the user re-authenticates interactively.
+- **Byte-compat regression**: popped-on-default serialization + golden-file test for existing fund.yaml.
+
+## Validation
+
+- `poetry run pytest hedge_fund/brokers hedge_fund/secrets hedge_fund/fund -q` (chunked; network-free)
+- Style gate: `black --check`, `isort --check-only`, `flake8`
+- Manual SIM smoke test per quickstart.md (user-driven, not CI)

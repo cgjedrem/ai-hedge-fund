@@ -1,95 +1,128 @@
-# Research: Trading 212 Broker Adapter
+# Research: Saxo OpenAPI Broker Adapter
 
-**Feature**: 003-t212-broker-adapter | **Date**: 2026-10-30
+**Feature**: 003-saxo-broker-adapter | **Date**: 2026-10-30
 
-All NEEDS CLARIFICATION items from the plan's Technical Context were resolved before planning via two research rounds (broker landscape + T212 API deep dive). Findings below are the design inputs.
+All design inputs verified against official Saxo sources (developer.saxo, openapi.help.saxo) by a dedicated research pass. Each section states the decision, rationale, and alternatives.
+
+## R0. Why Saxo (re-target from Trading 212)
+
+**Decision**: Build the broker adapter against Saxo Bank OpenAPI, SIM environment.
+
+**Rationale**: Trading 212's API terms expressly prohibit using their API for Algorithmic Trading purposes — which covers this engine's automated order placement even with per-decision human approval. Saxo's OpenAPI anticipates programmatic trading: the order payload has a `ManualOrder` boolean ("Indicator for whether order is placed automatically or manually"), trading endpoints require a `Personal: Write` app permission, and Saxo documents a self-service credential request path for direct retail clients. No prohibition against personal algo trading was found anywhere in Saxo's docs.
+
+**Sources**: developer.saxo/openapi/learn/order-placement, developer.saxo/openapi/referencedocs/trade/v2/orders/post__trade, developer.saxo/openapi/learn/direct-clients-request-for-openapi-application-credentials-for-the-live-environ
 
 ## R1. HTTP client library
 
-**Decision**: Use `requests` (already a project dependency, ^2.32.0). No new packages.
+**Decision**: Use `requests` (already a project dependency, ^2.32.0). No new packages, no SDK.
 
-**Rationale**: The adapter needs Basic auth, JSON bodies, timeout control, and header inspection (`x-ratelimit-*`). `requests` does all of this and is already installed; adding `httpx` or the community `t212-sdk` would add a dependency for no capability gain.
+**Rationale**: The adapter needs OAuth token calls, Basic-auth token exchange, JSON bodies, header control (`x-request-id`), and timeouts. Saxo's first-party samples are JavaScript-only; community Python SDKs are unverified. A thin client over `requests` stays auditable and testable.
 
-**Alternatives considered**:
-- `t212-sdk` (community, Fern-generated): full endpoint coverage, but pins its own HTTP stack, adds surface we don't need (CFD endpoints, pies), and the adapter must stay demo-only and auditable — a thin ~200-line client over `requests` is easier to review and test.
-- `urllib` stdlib: workable but clunkier (auth headers, sessions, retries by hand) for zero benefit.
+**Alternatives considered**: `saxo_apy` (community, existence/maintenance unverified) — rejected; `openapi-samples-python` patterns — consulted conceptually only.
 
-## R2. Environment: demo only
+## R2. Environment: SIM only
 
-**Decision**: The client hardcodes `https://demo.trading212.com/api/v0`. The live URL never appears in code or config.
+**Decision**: Hardcode SIM endpoints: REST base `https://gateway.saxobank.com/sim/openapi`, auth server `https://sim.logonvalidation.net`. Live URLs (`gateway.saxobank.com/openapi`, `live.logonvalidation.net`) never appear in code or config.
 
-**Rationale**: FR-002 (constitution II: paper only). A configurable base URL would make a live call one typo away. Demo and live use **separate API keys**, so even a misconfigured key cannot cross environments — a demo key returns 401 on live.
+**Rationale**: Constitution II (paper only). SIM and LIVE use **separate app registrations** (environment-specific AppKey/AppSecret), so SIM credentials cannot reach the live gateway even by misconfiguration. SIM access is self-service: register at developer.saxo, create an app against the SIM environment — no funded account, no approval queue.
 
-**Alternatives considered**: env-var-selectable base URL — rejected as an unnecessary live-risk footgun.
+**Sources**: developer.saxo/openapi/learn/environments, developer.saxo/accounts/sim/signup
 
-## R3. Authentication and secrets
+## R3. Authentication and token lifecycle
 
-**Decision**: HTTP Basic auth (API key = username, secret = password). Credentials come from two env vars — `HEDGE_FUND_T212_API_KEY` and `HEDGE_FUND_T212_API_SECRET` — whose values may be either plaintext or a 1Password `op://` reference. `op://` values are resolved at broker construction via the 1Password CLI (`op read`), never at import time.
+**Decision**: OAuth2 Authorization Code Grant (+PKCE for the native/desktop case). The adapter holds an access token (~20 min lifetime) and refreshes **proactively** (~every 15 min). Refresh tokens are **single-use and rotate on every refresh** — the adapter persists the newest refresh token to 1Password immediately after each successful refresh. If a refresh fails (revoked, expired, logged out via SaxoTraderGO "Application Access"), the adapter raises a clear re-auth error instead of retrying.
 
-**Rationale**: FR-007/FR-009. Resolution-at-construction keeps secrets out of long-lived process env dumps; the `op` CLI works both interactively (desktop-app unlock on the host) and unattended (service-account token `OP_SERVICE_ACCOUNT_TOKEN` in Docker).
+**Rationale**: Saxo provides no unattended retail login — Certificate-Based Authentication is institutional-partner-only (retail logins must show MiFID II disclaimers interactively). The practical pattern for a personal bot is a long-lived process refreshing its own token, plus periodic (~weekly) interactive re-auth. The rotating-refresh-token rule makes "persist after every refresh" mandatory, or the next restart fails.
 
-**Alternatives considered**: SDK keyrings / direct 1Password Connect API — rejected (extra infra for one user); reading secrets from fund.yaml — rejected (FR-009: secrets never in persisted files).
+**Implication for the watchtower**: fully unattended month-long operation is out of scope by design; the fund owner re-authenticates interactively when prompted.
 
-## R4. Order placement semantics
+**Sources**: developer.saxo/openapi/learn/oauth-authorization-code-grant, developer.saxo/openapi/learn/oauth-authorization-code-grant-pkce, openapi.help.saxo/hc/en-us (token lifetime, CBA availability)
 
-**Decision**: Market orders only (`POST /equity/orders/market`), body `{"ticker": "<SYM>_US_EQ", "quantity": <signed float>, "extendedHours": false}`. Quantity sign encodes side (positive buy, negative sell) — T212 has no `side` field. Quantities are rounded to **4 decimals**; sell quantities round **down** (toward zero) to avoid `SellingEquityNotOwned`.
+## R4. Secrets storage
 
-**Rationale**: The engine's sessions rebalance at close with reference prices; market orders at the next open/close match the paper semantics. 4dp is T212's placement precision (positions may hold 8dp). Rounding sells down prevents ordering more shares than `quantityAvailableForTrading`.
+**Decision**: 1Password via `op://` references, resolved at startup through the 1Password CLI (same mechanism as the original design). The refresh token is special: it **rotates**, so the adapter writes the new value back to the 1Password item after each refresh (`op item edit`). Plaintext env values remain supported for non-secret configuration only.
 
-**Alternatives considered**: limit orders — deferred (spec P2 scope is market orders; the API supports them if needed later).
+**Rationale**: FR-007/FR-009. A rotating credential cannot sit only in process memory across restarts; 1Password is the one sanctioned secret store (never plaintext files, never the ledger).
 
-## R5. Fill completion: poll, never blind-retry
+**Alternatives considered**: OS keychain directly — rejected (Docker context has no keychain); encrypted local file — rejected (constitution: secrets never in persisted files outside the secret store).
 
-**Decision**: `place_order` POSTs once, then polls `GET /equity/orders/{id}` (limit 1 req/s) until a terminal status: `FILLED` → return `Fill` with the historical fill's actual price/quantity; `REJECTED`/`CANCELLED` → raise. A bounded overall timeout (default 120s) raises. **A timed-out or ambiguous POST is never retried blindly** — the beta API is non-idempotent and a blind retry can duplicate the order; the caller must inspect pending orders first.
+## R5. Order placement semantics
 
-**Rationale**: The Broker contract is fill-completely-or-raise; partial states must not be returned as fills. Non-idempotency makes retry-on-timeout the single most dangerous operation in the adapter.
+**Decision**: Market orders only: `POST /trade/v2/orders` with `{"AccountKey": ..., "Uic": <int>, "AssetType": "Stock", "Amount": <shares>, "BuySell": "Buy"|"Sell", "OrderType": "Market", "OrderDuration": {"DurationType": "DayOrder"}, "ManualOrder": false}`. Side is an explicit enum (unlike T212's signed quantity). Cash-amount sizing (`AmountType: CurrencyAmount`) is MutualFunds-only — not usable for stocks. Each POST carries a unique `x-request-id` header.
 
-**Alternatives considered**: WebSocket — T212 has none; polling is the only option.
+**Rationale**: Matches the engine's session semantics (rebalance at close, reference prices). `ManualOrder: false` truthfully declares bot placement. DayOrder is the natural duration for market orders that fill immediately when open.
 
-## R6. Rate limiting
+**Critical response rule**: a **200 OK can still be a logical failure** — the body may carry `ErrorInfo` and no `OrderId`. The adapter inspects the body, never just the HTTP status.
 
-**Decision**: A tiny per-endpoint pacer (minimum interval between calls of the same kind) plus 429 handling that sleeps until `x-ratelimit-reset` (Unix seconds) and retries the **read** once. Order POSTs are never auto-retried (R5).
+**Sources**: developer.saxo/openapi/referencedocs/trade/v2/orders/post__trade, developer.saxo/openapi/learn/order-placement
 
-**Rationale**: Known limits: market orders 50/min, order status 1/s, positions 1/s, account summary 1/5s, instruments 1/50s, pending orders 1/5s. A daily 9-ticker session cannot hit these with pacing, but the pacer makes the adapter safe under bursts and testable with a fake clock.
+## R6. Fill detection (no dedicated fills endpoint)
 
-## R7. Ticker mapping and universe validation
+**Decision**: After a successful POST, poll `GET /port/v1/orders/{ClientKey}/{OrderId}` until the order **leaves the open-orders list** (404/empty — market orders fill near-instantly when the market is open), then read the authoritative fill from the resulting position (`PositionBase.OpenPrice`, `PositionBase.Amount`, `ExecutionTimeOpen`) or `GET /hist/v1/transactions`. Bounded deadline (default 120 s) raises with guidance. `trade/v1|v2/trades` endpoints are deal-capture/back-office only — not used.
 
-**Decision**: Engine tickers map to T212 tickers as `{SYMBOL}_US_EQ` (US equities). Before the first order of a session, the adapter validates the fund's universe against `GET /equity/metadata/instruments` (cached ~1h; ~5MB response) and refuses to trade any ticker that is missing or not tradable.
+**Rationale**: Saxo's retail API has no single "get my fill" endpoint; this synthesized pattern uses only documented endpoints. The position's `OpenPrice` is Saxo's own simulated fill price — exactly what the ledger must record.
 
-**Rationale**: FR-006/FR-011. The instruments list is the only authoritative source of tradable tickers; validating up front turns a mid-session surprise into a pre-session refusal.
+**Sources**: developer.saxo/openapi/referencedocs/port/v1/orders/get__port__clientkey_orderid, developer.saxo/openapi/referencedocs/port/v1/positions/get__port__me, developer.saxo/openapi/referencedocs/hist/v1/transactions
 
-## R8. Book authority and reconciliation
+## R7. Rate limiting and duplicate protection
 
-**Decision**: The external broker's `positions()`/`cash()` (from `GET /equity/positions` and `GET /equity/account/summary`) are authoritative. The existing pre-session reconciliation (ledger book vs broker book) runs unchanged; an unexplained mismatch refuses the session. Sells are sized against `quantityAvailableForTrading`, not raw `quantity` (pies/pending orders lock shares).
+**Decision**: Per-endpoint pacer (order placement ≥1/s; reads modestly paced) plus a unique `x-request-id` per attempt. **No automatic re-POST** of an order whose outcome is unknown. Saxo rejects identical repeated order POSTs within a 15-second window with 409 unless `x-request-id` differs — the adapter treats 409 as "inspect state, never resend".
 
-**Rationale**: FR-005. This is exactly the two-books design PaperBroker already implements — T212Broker just sources its book from the API instead of broker.json.
+**Rationale**: Documented limits: ~10,000,000 requests/day per app, 120 req/min per session per service group, 1 order placement/s per session. A daily 9-ticker session cannot hit these, but the pacer + unique request ids make the adapter safe and testable with a fake clock.
 
-## R9. Redo path with an external broker
+**Source**: developer.saxo/openapi/learn/rate-limiting
 
-**Decision**: `redo` on a fund whose broker is not `paper` is refused with a clear error. Restoring broker.json to a pre-session state is meaningless when the book lives at the broker; undoing real demo fills is out of scope.
+## R8. Ticker mapping and universe validation
 
-**Rationale**: Ledger integrity (constitution I) — a redo that cannot restore the broker book would desync the two books by design.
+**Decision**: Engine tickers resolve to Saxo `(Uic, AssetType=Stock)` via `GET /ref/v1/instruments?Keywords=<TICKER>&AssetTypes=Stock` (symbol format `AAPL:xnas` inferred from documented examples like `KO:xnys` — verify on SIM). Resolutions are cached in memory (~1h). Before the first order of a session, every universe ticker must resolve to a tradable instrument (`IsTradable`, `SupportedOrderTypes` includes Market); otherwise the session refuses.
 
-## R10. Costs model for T212 funds
+**Rationale**: FR-006. Saxo identifies instruments by numeric UIC + AssetType, not ticker — the mapping is a hard prerequisite for ordering.
 
-**Decision**: T212 fills carry the broker's actual price, so the mandate's cost model defaults to zero spread/commission for `broker: t212` funds (double-counting real fills with a simulated spread would corrupt NAV). A mandate may still override costs explicitly.
+## R9. Book authority and reconciliation
 
-**Rationale**: `TradingCosts` exists to simulate friction SimBroker can't know; with a real broker the friction is already in the fill price.
+**Decision**: The external broker's book is authoritative: positions from `GET /port/v1/positions/me` (consume via `NetPositionId` grouping; `PositionBase.Amount` signed, `OpenPrice` acquisition price), cash from `GET /port/v1/balances/me` (`CashAvailableForTrading`, `Currency`). The existing pre-session reconciliation runs unchanged; unexplained mismatch refuses the session. ClientKey/AccountKey are discovered via `GET /port/v1/users/me` / `GET /port/v1/accounts/me` at startup.
 
-## R11. Testing strategy
+**Rationale**: FR-005 — the same two-books design PaperBroker implements, sourced from the API.
 
-**Decision**: All adapter tests run against a fake `requests` transport (pre-scripted responses/fixture files) and a fake clock for the pacer/poller. Recorded real response shapes (from research) become fixtures. No test touches the network; the final smoke test against the user's demo account is a manual quickstart step, not a test.
+## R10. Costs model for Saxo funds
 
-**Rationale**: Constitution II (no unattended live risk) and III (green suite); determinism (IV).
+**Decision**: Same as the T212 design: fills carry the broker's actual (simulated) price, so the mandate's cost model defaults to zero spread/commission for `broker: saxo` funds; a mandate may override explicitly.
 
-## R12. Fund configuration and byte-compat
+**Rationale**: Double-counting simulated friction on top of real simulated fills would corrupt NAV.
 
-**Decision**: `FundSpec` gains `broker: Literal["paper", "t212"] = "paper"`. When serializing, the key is popped when it equals the default (same pattern as `approval_required`), so existing deployed `fund.yaml` files remain byte-identical and old funds keep working unchanged.
+## R11. Market data on SIM
 
-**Rationale**: FR-010 (per-fund broker selection) + constitution I (deployed funds immutable; byte-identical replay).
+**Decision**: Do not use OpenAPI price endpoints. SIM supplies **no live prices for stocks** (only FxSpot) — Saxo's own samples fall back to fictive prices. Fill-price sanity checks compare Saxo's simulated fill (`OpenPrice`) against the yfinance price at trade time.
 
-## Open items (empirical, demo-account smoke test)
+**Rationale**: yfinance is already the data path (FR-013); SIM quotes would be `NoAccess` anyway.
 
-- Minimum order size/value: not documented; observe on first demo orders.
-- Explicit error codes for market-closed and unknown ticker: bodies vary; the adapter branches on HTTP status and surfaces the body verbatim in errors (never logging secrets).
-- Whether `extendedHours: true` is needed for the fund's cadence: default false; revisit if fills lag sessions.
+**Source**: SaxoBank/openapi-samples-js orders/stocks/demo.js (NoAccess fallback)
+
+## R12. Session capabilities
+
+**Decision**: The adapter stays at the default session level (`TradeLevel: OrdersOnly`, `DataLevel: Standard`) — it never requests `FullTradingAndChat`/`Premium`.
+
+**Rationale**: Only one session per user may hold the upgraded level; a bot requesting it would forcibly demote/log off the user's own SaxoTraderGO session. The adapter needs no real-time data, so the default level costs nothing.
+
+**Source**: developer.saxo/openapi/learn/session-capabilities
+
+## R13. Testing strategy
+
+**Decision**: All adapter tests run against a fake `requests` transport (pre-scripted responses/fixture files) and a fake clock for the pacer/token refresher. Recorded real response shapes (from research) become fixtures. No test touches the network; the SIM smoke test is a manual quickstart step.
+
+**Rationale**: Constitution II and III; determinism (IV).
+
+## R14. Fund configuration and byte-compat
+
+**Decision**: `FundSpec` gains `broker: Literal["paper", "saxo"] = "paper"`, popped from serialization when equal to the default (same pattern as `approval_required`) — existing deployed fund.yaml files stay byte-identical.
+
+**Rationale**: FR-010 + constitution I.
+
+## Open items (empirical, SIM smoke test)
+
+- `AAPL:xnas` symbol resolution and UIC for the fund's universe (search endpoint).
+- Whether SIM accepts **fractional** `Amount` for US stocks (place a 0.5-share order; FR-012).
+- Market-closed behavior: confirm synchronous `MarketClosed` rejection (inferred from the error-code enum).
+- Real refresh-token lifetime for the user's app registration (docs example shows 2400 s — illustrative, not contractual).
+- Whether `/hist/v1/transactions` populates promptly after a SIM trade (vs batch/EOD).
+- Exact `/ref/v1/exchanges/{ExchangeId}` schedule schema (not needed if using position-level `IsMarketOpen`).
