@@ -5,13 +5,25 @@ import os
 import signal
 import threading
 from datetime import datetime, timedelta
+from importlib import import_module
 
 import pytest
 
 from hedge_fund.backtesting.test_fund import FakeDataClient, SERIES
 from hedge_fund.data.sessions import NEW_YORK
 from hedge_fund.fund import Fund, FundSpec
-from hedge_fund.paper import deploy, is_running, Ledger, NothingDue, PID_FILE, redo, run, serve, stop_runner, tick
+from hedge_fund.paper import (
+    deploy,
+    is_running,
+    Ledger,
+    NothingDue,
+    PID_FILE,
+    redo,
+    run,
+    serve,
+    stop_runner,
+    tick,
+)
 from hedge_fund.paper.test_tick import build_fund
 from hedge_fund.pipeline.session import FundHalted
 from hedge_fund.pipeline.test_clock import Tape
@@ -19,22 +31,31 @@ from hedge_fund.pipeline.test_stages import FakeAnalyst
 
 DAY, NEXT = "2024-06-04", "2024-06-05"
 BARS = ["13:00:00", "13:05:00", "13:10:00"]  # a three-bar window, 13:00–13:10, every 5m
+runner_module = import_module("hedge_fund.paper.runner")
 
 
 @pytest.fixture(autouse=True)
 def registered_fakes(monkeypatch):
     from hedge_fund.signals import ALPHA_MODEL_REGISTRY
+
     monkeypatch.setitem(ALPHA_MODEL_REGISTRY, "a", FakeAnalyst)
 
 
 def _spec(**overrides):
-    return FundSpec(**{
-        "schema_version": 2, "name": "bars",
-        "strategies": [{"name": "solo", "models": [{"name": "a"}], "blend": {"mode": "long_short"}}],
-        "risk": {"max_position_pct": 1, "max_gross_exposure": 1}, "capital": 100_000,
-        "costs": {"spread_bps": 0, "commission_per_share": 0}, "rebalance": "minute", "interval": 5, "window": {"start": "13:00", "end": "13:10"},
-        **overrides,
-    })
+    return FundSpec(
+        **{
+            "schema_version": 2,
+            "name": "bars",
+            "strategies": [{"name": "solo", "models": [{"name": "a"}], "blend": {"mode": "long_short"}}],
+            "risk": {"max_position_pct": 1, "max_gross_exposure": 1},
+            "capital": 100_000,
+            "costs": {"spread_bps": 0, "commission_per_share": 0},
+            "rebalance": "minute",
+            "interval": 5,
+            "window": {"start": "13:00", "end": "13:10"},
+            **overrides,
+        }
+    )
 
 
 def _at(day, hhmmss):
@@ -61,8 +82,7 @@ class Loop:
         self._until = until or _at(NEXT, "23:00:00")
 
     def __call__(self):
-        run(self.directory, self.tape, stop=self.stop, build_fund=build_fund, now=lambda: self.tape.now,
-            sleep=self._sleep, on_record=self._record, on_event=lambda k, f: self.events.append((k, f)))
+        run(self.directory, self.tape, stop=self.stop, build_fund=build_fund, now=lambda: self.tape.now, sleep=self._sleep, on_record=self._record, on_event=lambda k, f: self.events.append((k, f)))
 
     def _sleep(self, seconds):
         self.tape.now += timedelta(seconds=seconds)
@@ -91,6 +111,61 @@ def test_a_day_of_bars_decides_fills_and_checkpoints(tmp_path):
     assert ledger.checkpoint_path(DAY).exists()
     assert [k for k, _ in loop.events] == [] and [e["kind"] for e in ledger.events()] == ["tick", "tick", "tick", "checkpoint"]
     assert ledger.replay(100_000) == ledger.replay(100_000, full=True)
+
+
+def test_saxo_runner_builds_one_broker_for_all_sessions(tmp_path, monkeypatch):
+    directory = deploy("saxo", _spec(broker="saxo"), ["AAPL"], root=tmp_path)
+    broker = object()
+    builds = []
+    seen = []
+    monkeypatch.setattr(runner_module, "build_broker", lambda deployed, directory: builds.append(deployed) or broker)
+
+    def run_bars(*args, **kwargs):
+        seen.append(kwargs["broker"])
+
+    monkeypatch.setattr(runner_module, "_run_bars", run_bars)
+    runner_module.run(
+        directory,
+        _tape(_at(DAY, "12:00:00")),
+        stop=threading.Event(),
+        build_fund=build_fund,
+    )
+
+    assert len(builds) == 1
+    assert seen == [broker]
+
+
+def test_saxo_runner_skips_a_late_closing_bar_after_market_close(tmp_path, monkeypatch):
+    spec = _spec(broker="saxo", interval=30, window={"start": "09:30", "end": "15:59"})
+    directory = deploy("saxo-late-close", spec, ["AAPL"], root=tmp_path)
+    deployed = runner_module.load_deployed(directory)
+    tape = _tape(_at(DAY, "16:10:00"))
+    stop = threading.Event()
+    waits = []
+
+    monkeypatch.setattr(runner_module, "next_session", lambda *args, **kwargs: f"{DAY}T15:59:00")
+    monkeypatch.setattr(runner_module, "_run", lambda *args, **kwargs: pytest.fail("Saxo must not trade after the close"))
+
+    def wait_for(target, now, sleep):
+        waits.append(target)
+        stop.set()
+
+    monkeypatch.setattr(runner_module, "_wait_for", wait_for)
+    runner_module._run_bars(
+        directory,
+        deployed,
+        tape,
+        build_fund,
+        broker=object(),
+        stop=stop,
+        build_fund=None,
+        on_record=None,
+        on_event=None,
+        now=lambda: tape.now,
+        sleep=lambda _: None,
+    )
+
+    assert waits == [runner_module.next_bar(tape.now, spec.interval_seconds, spec.window)]
 
 
 def test_a_late_start_skips_to_the_current_bar_and_logs_the_gap(tmp_path):
@@ -167,6 +242,7 @@ def test_redo_runs_a_bar_again_at_the_prices_it_saw(tmp_path):
 
     def bearish(spec):
         return Fund(spec, models={"solo": [FakeAnalyst("a", {"AAPL": -1})]})
+
     flipped = redo(directory, tape, build_fund=bearish)
     assert flipped.decision.final_weights == {"AAPL": -1.0} and flipped.hash != again.hash
 
@@ -245,6 +321,7 @@ def test_serve_holds_a_pid_file_and_stops_on_sigterm(tmp_path, monkeypatch):
     assert not is_running(directory)  # a stale pid is not a runner
 
     import hedge_fund.paper.runner as runner
+
     seen = {}
 
     def quick(directory, data, *, stop, **kwargs):
@@ -252,6 +329,7 @@ def test_serve_holds_a_pid_file_and_stops_on_sigterm(tmp_path, monkeypatch):
         seen["running"] = is_running(directory)
         threading.Timer(0.05, lambda: os.kill(os.getpid(), signal.SIGTERM)).start()
         seen["stopped"] = stop.wait(5)
+
     monkeypatch.setattr(runner, "run", quick)
 
     serve(directory, _tape(_at(DAY, "12:59:00")))

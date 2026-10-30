@@ -6,8 +6,10 @@ from unittest.mock import Mock
 import pytest
 
 from hedge_fund.backtesting.test_fund import FakeDataClient
-from hedge_fund.brokers.models import Order
+from hedge_fund.brokers.models import Fill, Order, Position
+from hedge_fund.brokers.saxo import SaxoBroker
 from hedge_fund.brokers.sim import SimBroker
+from hedge_fund.brokers.test_saxo_doubles import FakeClock
 from hedge_fund.data import sessions
 from hedge_fund.fund import Fund, FundSpec
 from hedge_fund.models import Signal
@@ -138,6 +140,7 @@ def test_missing_held_price_is_required_even_when_target_is_zero():
 def test_refresh_failure_does_not_fall_back_to_original_targets():
     fund, analyst = make_fund()
     original_predict = analyst.predict
+
     def predict(ticker, date, data):
         if date != FRIDAY:
             raise ConnectionError("refresh failed")
@@ -153,6 +156,7 @@ def test_refresh_failure_does_not_fall_back_to_original_targets():
 
 def test_invalid_projected_orders_fail_before_submission(monkeypatch):
     from importlib import import_module
+
     pipeline = import_module("hedge_fund.pipeline.stages")
     monkeypatch.setattr(pipeline, "build_orders", lambda *args: [
         Order(ticker="A", side="buy", quantity=1000, price=200),
@@ -163,6 +167,151 @@ def test_invalid_projected_orders_fail_before_submission(monkeypatch):
     proposal = assess_fund(fund, FRIDAY, market(), ["A"])
     with pytest.raises(ValueError, match="projected position"):
         execute_decision(fund, proposal, MONDAY, broker, market())
+    broker.place_order.assert_not_called()
+
+
+def test_filtered_de_risking_sell_may_remain_over_position_cap():
+    analyst = DatedAnalyst({FRIDAY: 1, "2024-06-09": 1})
+    fund, _ = make_fund(analyst)
+    risk = fund.spec.risk.model_copy(update={"max_position_pct": 0.25})
+    spec = fund.spec.model_copy(update={"risk": risk})
+    fund = Fund(spec, models={"macro": [analyst]})
+    data = market(price=100)
+    proposal = assess_fund(fund, FRIDAY, data, ["A"])
+    assert proposal.final_weights == {"A": 0.25}
+    assert any(event.limit == "max_position_pct" for event in proposal.clamps)
+
+    broker = Mock()
+    broker.positions.side_effect = [
+        {"A": Position(ticker="A", shares=30.83)},
+        {"A": Position(ticker="A", shares=25.83)},
+    ]
+    broker.cash.side_effect = [6917.0, 6417.0]
+    broker.filter_orders.side_effect = lambda orders: [order.model_copy(update={"quantity": int(order.quantity)}) for order in orders if int(order.quantity) > 0]
+    broker.place_order.return_value = Fill(ticker="A", side="sell", quantity=5, price=100)
+
+    record = execute_decision(fund, proposal, MONDAY, broker, data)
+
+    broker.filter_orders.assert_called_once()
+    assert broker.filter_orders.call_args.args[0][0].quantity == pytest.approx(5.83)
+    broker.place_order.assert_called_once()
+    assert record.orders[0].quantity == 5
+
+
+def test_saxo_lot_rounded_sell_reduces_price_drifted_overweight_position():
+    class FakeSaxoClient:
+        def __init__(self):
+            self.clock = FakeClock()
+            self.execution_timeout_s = 1
+            self.poll_interval_s = 0
+            self.account_key = "account"
+            self.client_key = "client"
+            self.base_currency = "USD"
+            self._ticker_uic = {}
+            self.shares = 30.83
+            self.cash_balance = 6917.0
+            self.orders = []
+
+        def search_instrument(self, ticker):
+            return 42, "Stock"
+
+        def instrument_details(self, uic, asset_type):
+            return {
+                "IsTradable": True,
+                "LotSize": 1,
+                "SupportedOrderTypes": ["Market"],
+                "CurrencyCode": "USD",
+                "Exchange": {"CountryCode": "US"},
+            }
+
+        def positions(self):
+            return {"A": Position(ticker="A", shares=self.shares)}
+
+        def balances(self):
+            return {"CashBalance": self.cash_balance, "CashAvailableForTrading": self.cash_balance}
+
+        def place_order(self, payload):
+            self.orders.append(payload)
+            amount = payload["Amount"]
+            self.shares -= amount
+            self.cash_balance += amount * 120
+            return "order-1", {}
+
+        def wait_for_order(self, order_id, *, deadline):
+            return None
+
+        def order_fill(self, order_id, quantity, *, uic, deadline):
+            return quantity, 120.0
+
+    analyst = DatedAnalyst({FRIDAY: 1, "2024-06-09": 1})
+    fund, _ = make_fund(analyst)
+    risk = fund.spec.risk.model_copy(update={"max_position_pct": 0.25})
+    spec = fund.spec.model_copy(update={"risk": risk})
+    fund = Fund(spec, models={"macro": [analyst]})
+    proposal = assess_fund(fund, FRIDAY, market(), ["A"])
+    client = FakeSaxoClient()
+    broker = SaxoBroker(client, ["A"])
+
+    record = execute_decision(fund, proposal, MONDAY, broker, market(price=120))
+
+    assert client.orders[0]["BuySell"] == "Sell"
+    assert client.orders[0]["Amount"] == 8
+    assert record.orders[0].quantity == 8
+    assert record.fills[0].quantity == 8
+    assert record.positions["A"] == pytest.approx(22.83)
+    assert record.positions["A"] * 120 < 30.83 * 120
+    before_weight = 30.83 * 120 / record.equity_before
+    after_weight = record.positions["A"] * 120 / record.equity_before
+    assert before_weight > after_weight > 0.25
+
+
+def test_filtered_orders_that_worsen_position_risk_fail_before_submission():
+    analyst = DatedAnalyst({FRIDAY: 1, "2024-06-09": 1})
+    fund, _ = make_fund(analyst)
+    risk = fund.spec.risk.model_copy(update={"max_position_pct": 0.25})
+    fund = Fund(fund.spec.model_copy(update={"risk": risk}), models={"macro": [analyst]})
+    data = market(price=100)
+    proposal = assess_fund(fund, FRIDAY, data, ["A"])
+    broker = Mock()
+    broker.positions.return_value = {"A": Position(ticker="A", shares=30.83)}
+    broker.cash.return_value = 6917.0
+    broker.filter_orders.return_value = [Order(ticker="A", side="buy", quantity=1, price=100)]
+
+    with pytest.raises(ValueError, match=r"A: projected position violates max_position_pct after broker order filtering"):
+        execute_decision(fund, proposal, MONDAY, broker, data)
+
+    broker.filter_orders.assert_called_once()
+    broker.place_order.assert_not_called()
+
+
+def test_filtered_orders_that_worsen_gross_exposure_fail_before_submission():
+    analyst = DatedAnalyst({FRIDAY: 1, "2024-06-09": 1})
+    fund, _ = make_fund(analyst)
+    risk = fund.spec.risk.model_copy(update={"max_position_pct": 0.5, "max_gross_exposure": 0.5})
+    spec = fund.spec.model_copy(update={"risk": risk})
+    fund = Fund(spec, models={"macro": [analyst]})
+    data = FakeDataClient(
+        {
+            "SPY": {FRIDAY: 100, MONDAY: 101},
+            "A": {FRIDAY: 100, MONDAY: 100},
+            "B": {FRIDAY: 100, MONDAY: 100},
+        }
+    )
+    proposal = assess_fund(fund, FRIDAY, data, ["A", "B"])
+    assert proposal.final_weights == {"A": 0.25, "B": 0.25}
+
+    broker = Mock()
+    broker.positions.return_value = {
+        "A": Position(ticker="A", shares=25.26),
+        "B": Position(ticker="B", shares=25.26),
+    }
+    broker.cash.return_value = 4948.0
+    broker.filter_orders.return_value = [Order(ticker="A", side="buy", quantity=1, price=100)]
+
+    with pytest.raises(ValueError, match=r"projected portfolio violates max_gross_exposure after broker order filtering"):
+        execute_decision(fund, proposal, MONDAY, broker, data)
+
+    assert [order.quantity for order in broker.filter_orders.call_args.args[0]] == [0.26, 0.26]
     broker.place_order.assert_not_called()
 
 

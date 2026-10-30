@@ -194,6 +194,7 @@ def paper_slot(index: int, snap: PaperSnapshot) -> Text:
     card = Text()
     card.append(f" {index + 1:02d}  ", style=MUTED)
     card.append(snap.deployed.name, style=TEXT)
+    card.append(f"  · {snap.deployed.broker}", style=MUTED)
     glyph, word, tone = snap._state_word()
     if snap.error:
         card.append("   ✗ ledger", style=RED)
@@ -309,7 +310,10 @@ def paper_detail(
     staff = ", ".join(s.title for s in spec.strategies)
     parts: list = [
         Text.assemble((snap.deployed.name, f"bold {BRIGHT}"), "   ", snap.badge()),
-        Text(f"{staff} · {cadence_identity(spec)} · ${spec.capital:,.0f} · {' '.join(snap.deployed.universe)}", style=MUTED),
+        Text(
+            f"{staff} · {cadence_identity(spec)} · ${spec.capital:,.0f} · broker: {snap.deployed.broker} · " f"{' '.join(snap.deployed.universe)}",
+            style=MUTED,
+        ),
         Text(""),
     ]
     if snap.error:

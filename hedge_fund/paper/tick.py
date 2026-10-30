@@ -25,6 +25,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable
 
+from hedge_fund.brokers.factory import build_broker
 from hedge_fund.brokers.paper import PaperBroker
 from hedge_fund.data.bars import (
     current_bar,
@@ -237,6 +238,8 @@ def redo(
     """
     directory = Path(directory)
     deployed = load_deployed(directory)
+    if deployed.broker != "paper":
+        raise ValueError(f"redo is only supported for paper broker funds, not {deployed.broker}")
     ledger = Ledger(directory)
     state = ledger.replay(deployed.spec.capital)  # verifies the whole chain first
     if state.halted is not None:
@@ -274,13 +277,14 @@ def _run(
     *,
     clock: Clock | None = None,
     fund: Fund | None = None,
+    broker=None,
 ) -> SessionRecord:
     """Advance one session from *state* and record it, halting on failure.
     *fund* lets a long-running caller keep one Fund (and its analysts'
     caches) across sessions instead of staffing a new one each time. A
     minute fund's closing bar also checkpoints the day, so tomorrow's
     replay starts from tonight."""
-    broker = PaperBroker(directory / BROKER_FILE, deployed.spec.costs)
+    broker = broker or build_broker(deployed, directory=directory)
     fund = fund or (build_fund or Fund)(deployed.spec)
     run_state = state
     clear_verdict = None

@@ -35,40 +35,43 @@ class DeployedFund(BaseModel):
 
     schema_version: Literal[2] = 2
     name: str
-    spec: FundSpec                      # snapshot of the mandate at deploy time
+    spec: FundSpec  # snapshot of the mandate at deploy time
     universe: list[str]
-    broker: Literal["paper"] = "paper"
-    created: str                        # YYYY-MM-DD
+    broker: Literal["paper", "saxo"] = "paper"
+    created: str  # YYYY-MM-DD
 
 
 def validate_fund_name(name: str) -> str:
     """A fund name is a directory name: no separators, nothing hidden."""
     if not _NAME.fullmatch(name) or name in (".", ".."):
-        raise ValueError(
-            f"invalid fund name {name!r}: use letters, digits, '.', '_' or '-', "
-            "starting with a letter or digit"
-        )
+        raise ValueError(f"invalid fund name {name!r}: use letters, digits, '.', '_' or '-', " "starting with a letter or digit")
     return name
 
 
 def deploy(
-    name: str, spec: FundSpec, universe: list[str], *, root: Path = PAPER_DIR,
+    name: str,
+    spec: FundSpec,
+    universe: list[str],
+    *,
+    root: Path = PAPER_DIR,
 ) -> Path:
-    """Create paper/<name>/ with an empty ledger and a book seeded with the
-    mandate's capital. Returns the fund's directory. Refuses to overwrite."""
+    """Create paper/<name>/ with an empty ledger and broker book if local."""
     validate_fund_name(name)
     universe = normalize_universe(universe)
     directory = Path(root) / name
     if directory.exists():
         raise FileExistsError(f"paper fund {name!r} already exists at {directory}")
     deployed = DeployedFund(
-        name=name, spec=spec, universe=universe, created=_date.today().isoformat(),
+        name=name,
+        spec=spec,
+        universe=universe,
+        broker=spec.broker,
+        created=_date.today().isoformat(),
     )
     directory.mkdir(parents=True)
-    (directory / FUND_FILE).write_text(
-        yaml.safe_dump(deployed.model_dump(), sort_keys=False)
-    )
-    PaperBroker.create(directory / BROKER_FILE, spec.capital, spec.costs)
+    (directory / FUND_FILE).write_text(yaml.safe_dump(deployed.model_dump(), sort_keys=False))
+    if spec.broker == "paper":
+        PaperBroker.create(directory / BROKER_FILE, spec.capital, spec.costs)
     Ledger(directory).init()
     return directory
 
