@@ -1,0 +1,26 @@
+version: v1
+lenses:
+  - name: ledger-and-money
+    description: Challenge financial display correctness and immutable ledger boundaries.
+    core_questions:
+      - Can displayed or submitted state diverge from authoritative records?
+      - Can a browser action rewrite history or bypass execution constraints?
+    trigger_match: [money_path, immutability_audit]
+    severity_weight: 10
+    finding_bound: 5
+  - name: local-boundary
+    description: Challenge localhost, secret handling and interface contracts.
+    core_questions:
+      - Can another origin or an unsafe path cross the local capability boundary?
+      - Are credentials and provider calls constrained and observable?
+    trigger_match: [contracts, regulatory_path]
+    severity_weight: 9
+    finding_bound: 5
+  - name: human-and-model-control
+    description: Challenge approval identity and autonomous model or job side effects.
+    core_questions:
+      - Can stale approvals authorize a different decision?
+      - Can background work escape fixtures or spend paid-provider credits?
+    trigger_match: [multi_party, ai_llm]
+    severity_weight: 10
+    finding_bound: 5
