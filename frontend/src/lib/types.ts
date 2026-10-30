@@ -39,9 +39,15 @@ export interface StrategyOption {
   blend: StrategyBlendOption;
 }
 
+export interface AnalystOption {
+  name: string;
+  approach: "long_only" | "long_short";
+}
+
 export interface Catalog {
   models: ModelOption[];
   strategies: StrategyOption[];
+  analysts: AnalystOption[];
   default_model: string;
 }
 
@@ -54,6 +60,7 @@ export interface MandateStrategy {
 
 export interface MandateSummary {
   name: string;
+  mandate_hash: string;
   agent_count: number;
   strategies: MandateStrategy[];
   cadence: string;

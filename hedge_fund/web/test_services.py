@@ -21,12 +21,12 @@ def test_read_adapters_match_seeded_mandate_paper_ledger_and_report(demo_root):
         research = client.get("/api/research", headers={"host": "127.0.0.1"}).json()
 
     assert mandates["items"][0]["name"] == "demo-quality"
-    assert paper_list["items"][0]["nav"] == 101_000
+    assert paper_list["items"][0]["nav"] == 100_995
     assert detail["ledger"] == {"ok": True, "error": None}
-    assert detail["nav"] == 101_000
-    assert detail["cash"] == 90_000
+    assert detail["nav"] == 100_995
+    assert detail["cash"] == 89_995
     assert detail["positions"] == [{"ticker": "AAPL", "shares": 100, "mark": 110, "market_value": 11_000}]
-    assert [point["nav"] for point in detail["curve"]] == [100_000, 100_500, 101_000]
+    assert [point["nav"] for point in detail["curve"]] == [100_000, 100_495, 100_995]
     assert detail["live_value"]["status"] == "unavailable"
     assert detail["live_value"]["value"] is None
     assert detail["runner"]["available"] is False
@@ -69,6 +69,8 @@ def test_catalog_preserves_canonical_library_models_and_blend(demo_root):
 
 
 def test_corrupt_ledger_is_reported_instead_of_becoming_an_empty_valid_snapshot(demo_root):
+    ledger = Ledger(demo_root / "paper" / "demo-quality")
+    ledger.halt("preserve control state")
     path = demo_root / "paper" / "demo-quality" / "ledger" / "2024-06-04.json"
     payload = json.loads(path.read_text(encoding="utf-8"))
     payload["cash"] = 1
@@ -83,7 +85,25 @@ def test_corrupt_ledger_is_reported_instead_of_becoming_an_empty_valid_snapshot(
     assert detail["nav"] is None
     assert detail["cash"] is None
     assert detail["sessions"] == []
+    assert detail["halted"] == "preserve control state"
     assert papers["errors"][0]["name"] == "demo-quality"
+
+
+def test_session_report_verifies_entire_ledger_before_returning_a_later_record(demo_root):
+    path = demo_root / "paper" / "demo-quality" / "ledger" / "2024-06-03.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["cash"] = 1
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with TestClient(create_app(root=demo_root, demo=True)) as client:
+        response = client.get(
+            "/api/paper/demo-quality/sessions/2024-06-05",
+            headers={"host": "127.0.0.1"},
+        )
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": "Ledger verification failed (LedgerError)."}
+    assert not {"session", "hash", "nav", "executed"} & set(response.json())
 
 
 def test_report_path_traversal_and_symlink_are_denied(demo_root, tmp_path):

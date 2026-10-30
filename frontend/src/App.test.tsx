@@ -101,6 +101,7 @@ const mandates: MandateCollection = {
   items: [
     {
       name: "demo-quality",
+      mandate_hash: "e".repeat(64),
       agent_count: 2,
       strategies: [{ name: "earnings-drift", title: "Earnings Drift", mode: "long_short", weight: 1 }],
       cadence: "daily",
@@ -126,6 +127,11 @@ const catalog: Catalog = {
     mode: "long_only",
     blend: { method: "conviction_weighted", gross_target: 1, mode: "long_only" },
   }],
+  analysts: [
+    { name: "buffett", approach: "long_only" },
+    { name: "munger", approach: "long_only" },
+    { name: "druckenmiller", approach: "long_short" },
+  ],
   default_model: "provider/model",
 };
 
@@ -295,13 +301,33 @@ describe("local desk screens", () => {
     expect(screen.getByText("Executed orders")).toBeInTheDocument();
     expect(screen.getByText("<img src=x onerror=alert(1)>")).toBeInTheDocument();
     expect(document.querySelector("img")).not.toBeInTheDocument();
-    expect(screen.getByText("$10,000")).toBeInTheDocument();
+    expect(screen.getByText("$10,000.00")).toBeInTheDocument();
+    expect(screen.getByText("$0.50")).toBeInTheDocument();
+    expect(screen.getByText("$4.50")).toBeInTheDocument();
+    expect(screen.getByText("$5.00")).toBeInTheDocument();
+    expect(sessionReport.executed?.commission! + sessionReport.executed?.slippage!).toBe(sessionReport.executed?.trading_cost);
 
     await user.click(screen.getByRole("link", { name: "Paper fund" }));
     await screen.findByRole("heading", { name: "demo-quality" });
     await user.click(screen.getByRole("link", { name: /Scorecard/ }));
     expect(await screen.findByRole("heading", { name: "demo-quality scorecard" })).toBeInTheDocument();
     expect(screen.getAllByText("$1,000")).toHaveLength(2);
+    expect(await screen.findByText("$5.00")).toBeInTheDocument();
+  });
+
+  it("shows a verified-ledger error without session metrics", async () => {
+    installApi({
+      override: (path, method) =>
+        path === "/api/paper/demo-quality/sessions/2024-06-04" && method === "GET"
+          ? { status: 409, payload: { detail: "Ledger verification failed (LedgerError)." } }
+          : null,
+    });
+    window.history.replaceState({}, "", "/paper/demo-quality/sessions/2024-06-04");
+    render(<App />);
+
+    expect(await screen.findByText(/Ledger verification failed \(LedgerError\)\./)).toBeInTheDocument();
+    expect(screen.queryByText("Trading cost", { exact: true })).not.toBeInTheDocument();
+    expect(screen.queryByText("$5.00")).not.toBeInTheDocument();
   });
 
   it("submits the exact displayed approval identity and surfaces a stale conflict", async () => {
@@ -370,6 +396,60 @@ describe("local desk screens", () => {
         benchmark: "SPY",
       },
     });
+  });
+
+  it("keeps library rosters fixed and derives custom blend from analyst profiles", async () => {
+    const writeCaps: Capabilities = {
+      ...capabilities,
+      mode: "live",
+      writes: true,
+      read_only: false,
+      mutation_token: "builder-token",
+    };
+    installApi({
+      caps: writeCaps,
+      override: (path, method, body) =>
+        path === "/api/mandates" && method === "POST"
+          ? {
+              status: 201,
+              payload: {
+                name: "custom-test",
+                strategies: [],
+                cadence: "weekly",
+                capital: 100_000,
+                benchmark: "SPY",
+                approval_required: true,
+                broker: "paper",
+                spec: (body as { spec: Record<string, unknown> }).spec,
+              },
+            }
+          : null,
+    });
+    window.history.replaceState({}, "", "/builder");
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findByText("Value");
+
+    expect(screen.queryByRole("checkbox", { name: "Custom analyst buffett" })).not.toBeInTheDocument();
+    await user.type(screen.getByLabelText("Mandate name"), "custom-test");
+    await user.click(screen.getByRole("button", { name: "Add custom sleeve" }));
+    await user.click(screen.getByRole("checkbox", { name: "Custom analyst buffett" }));
+    expect(screen.getAllByText("long only", { exact: true })).toHaveLength(2);
+    await user.click(screen.getByRole("checkbox", { name: "Custom analyst druckenmiller" }));
+    expect(screen.getAllByText("long only", { exact: true })).toHaveLength(1);
+    expect(screen.getByText("long short")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Save new mandate" }));
+    expect(await screen.findByText("Mandate saved")).toBeInTheDocument();
+
+    const request = fetchRequests.find((item) => item.path === "/api/mandates" && item.method === "POST");
+    const savedSpec = (request?.body as { spec: { strategies: { name: string; models: { name: string; weight: number; params: Record<string, unknown> }[]; blend: { mode: string } }[] } }).spec;
+    expect(savedSpec.strategies[0].models).toEqual(catalog.strategies[0].models);
+    const custom = savedSpec.strategies.find((strategy) => strategy.name === "custom");
+    expect(custom?.models).toEqual([
+      { name: "buffett", weight: 1, params: {} },
+      { name: "druckenmiller", weight: 1, params: {} },
+    ]);
+    expect(custom?.blend.mode).toBe("long_short");
   });
 
   it("clears credential input, does not render its value, and leaves Ctrl+K inside text input", async () => {

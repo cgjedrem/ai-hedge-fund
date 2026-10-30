@@ -33,7 +33,7 @@ def test_root_env_is_loaded_without_overriding_process_values(tmp_path, monkeypa
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.delenv("HEDGE_FUND_LLM_MODEL", raising=False)
 
-    service = DeskService(tmp_path)
+    service = DeskService(tmp_path, network_enabled=True)
 
     settings = service.settings()
     anthropic = next(item for item in settings["providers"] if item["provider"] == "Anthropic")
@@ -48,9 +48,26 @@ def test_root_env_is_loaded_without_overriding_process_values(tmp_path, monkeypa
     (second_root / ".env").write_text("ANTHROPIC_API_KEY=FILE_VALUE_MUST_NOT_OVERRIDE\n")
     shell_secret = "SHELL_ENV_SECRET_SENTINEL"
     monkeypatch.setenv("ANTHROPIC_API_KEY", shell_secret)
-    second_service = DeskService(second_root)
+    second_service = DeskService(second_root, network_enabled=True)
     assert os.environ["ANTHROPIC_API_KEY"] == shell_secret
     second_service.close()
+
+
+def test_read_only_offline_startup_skips_root_env_loading(tmp_path, monkeypatch):
+    (tmp_path / ".env").write_text("ANTHROPIC_API_KEY=OFFLINE_ROOT_SENTINEL\n", encoding="utf-8")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+
+    import hedge_fund.web.services as services
+
+    def forbidden(_path):
+        raise AssertionError("read-only offline startup must not read provider credentials")
+
+    monkeypatch.setattr(services, "dotenv_values", forbidden)
+    service = DeskService(tmp_path, allow_writes=False, network_enabled=False)
+
+    assert os.environ.get("ANTHROPIC_API_KEY") is None
+    assert not service.settings()["providers"][0]["configured"]
+    service.close()
 
 
 def test_credential_write_is_allowlisted_write_only_and_control_safe(tmp_path, caplog):

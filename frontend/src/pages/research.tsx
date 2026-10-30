@@ -114,7 +114,7 @@ export function ResearchReportPage() {
           </div>
           <div className="mb-5 grid gap-3 sm:grid-cols-3">
             <MetricCard label="Sharpe ratio" value={report.metrics.sharpe_ratio.toFixed(2)} note="Canonical backtest metric" />
-            <MetricCard label="Trading cost" value={money(report.metrics.trading_cost)} note="Recorded modeled fills" />
+            <MetricCard label="Trading cost" value={money(report.metrics.trading_cost, 2)} note="Recorded modeled fills" />
             <MetricCard label="Orders / sessions" value={`${report.metrics.n_orders} / ${report.session_count}`} note={`${report.metrics.n_cycles} rebalance cycles`} />
           </div>
           <div className="grid gap-5">

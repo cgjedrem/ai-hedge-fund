@@ -35,6 +35,7 @@ def seed_demo(root: str | Path) -> Path:
                 }
             ],
             "risk": {"max_position_pct": 0.25, "max_gross_exposure": 1.0},
+            "costs": {"spread_bps": 4.5, "commission_per_share": 0.005},
             "capital": 100_000,
             "rebalance": "daily",
             "benchmark": "SPY",
@@ -48,11 +49,11 @@ def seed_demo(root: str | Path) -> Path:
     first = _decision(spec, "2024-06-03", 100.0, 0.8)
     second = _decision(spec, "2024-06-04", 105.0, 0.4)
     third = _decision(spec, "2024-06-05", 110.0, -0.2)
-    cycle_one = _cycle(spec, first, "2024-06-04", 100_000, 100_000, 90_000, 100_500, 100.0, 105.0, buy=True)
-    cycle_two = _cycle(spec, second, "2024-06-05", 100_500, 90_000, 90_000, 101_000, 105.0, 110.0)
+    cycle_one = _cycle(spec, first, "2024-06-04", 100_000, 100_000, 89_995, 100_495, 100.0, 105.0, buy=True)
+    cycle_two = _cycle(spec, second, "2024-06-05", 100_495, 89_995, 89_995, 100_995, 105.0, 110.0)
     record_one = _record(spec, first, None, 100_000, 100_000, {}, {}, 500.0, None)
-    record_two = _record(spec, second, cycle_one, 100_500, 90_000, {"AAPL": 100}, {"AAPL": 105.0}, 505.0, record_one)
-    record_three = _record(spec, third, cycle_two, 101_000, 90_000, {"AAPL": 100}, {"AAPL": 110.0}, 502.5, record_two)
+    record_two = _record(spec, second, cycle_one, 100_495, 89_995, {"AAPL": 100}, {"AAPL": 105.0}, 505.0, record_one)
+    record_three = _record(spec, third, cycle_two, 100_995, 89_995, {"AAPL": 100}, {"AAPL": 110.0}, 502.5, record_two)
     records = [record_one, record_two, record_three]
     for record in records:
         ledger.append(record)
@@ -129,7 +130,7 @@ def _cycle(
     buy: bool = False,
 ) -> CycleRecord:
     orders = [Order(ticker="AAPL", side="buy", quantity=100, price=reference_price)] if buy else []
-    fills = [Fill(ticker="AAPL", side="buy", quantity=100, price=reference_price)] if buy else []
+    fills = [Fill(ticker="AAPL", side="buy", quantity=100, price=spec.costs.fill_price("buy", reference_price))] if buy else []
     return CycleRecord(
         fund=spec.name,
         as_of=decision.as_of,

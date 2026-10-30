@@ -1,15 +1,18 @@
 import threading
 import time
+from copy import deepcopy
 
 import pytest
+import yaml
 from fastapi.testclient import TestClient
 
 from hedge_fund.backtesting.test_fund import FakeAnalyst, FakeDataClient, SERIES
 from hedge_fund.data import data_provider
-from hedge_fund.fund import Fund
+from hedge_fund.fund import custom_strategy, Fund, load_spec
 from hedge_fund.llm import DEFAULT_MODEL, load_api_models
 from hedge_fund.llm.registry import is_supported
 from hedge_fund.paper.deployed import load_deployed
+from hedge_fund.pipeline.session import mandate_hash
 from hedge_fund.web.app import create_app
 from hedge_fund.web.jobs import JobCancelled, JobConflict, JobRegistry
 from hedge_fund.web.schemas import BacktestRequest, DeployRequest, ModelRequest
@@ -34,17 +37,24 @@ def _spec(name="research-sample"):
     return {
         "schema_version": 2,
         "name": name,
-        "strategies": [
-            {
-                "name": "earnings-drift",
-                "models": [{"name": "pead"}],
-                "blend": {"mode": "long_short"},
-            }
-        ],
+        "strategies": [custom_strategy(["pead"]).model_dump(mode="json")],
         "risk": {"max_position_pct": 0.25, "max_gross_exposure": 1.0},
         "capital": 100_000,
         "rebalance": "daily",
     }
+
+
+def _write_headers(client):
+    capabilities = client.get("/api/capabilities", headers={"host": "127.0.0.1"}).json()
+    return {
+        "host": "127.0.0.1",
+        "origin": "http://127.0.0.1",
+        "x-csrf-token": capabilities["mutation_token"],
+    }
+
+
+def _mandate_fingerprint(root, name="demo-quality"):
+    return mandate_hash(load_spec(root / "mandates" / f"{name}.yaml"))
 
 
 def test_builder_canonical_validation_conflicts_and_deployment(tmp_path):
@@ -71,6 +81,84 @@ def test_builder_canonical_validation_conflicts_and_deployment(tmp_path):
     service.close()
 
 
+def test_mandate_api_rejects_library_roster_and_model_weight_drift(tmp_path):
+    app = create_app(root=tmp_path, allow_writes=True)
+    with TestClient(app) as client:
+        headers = _write_headers(client)
+        catalog = client.get("/api/catalog", headers={"host": "127.0.0.1"}).json()
+        library = next(strategy for strategy in catalog["strategies"] if len(strategy["models"]) > 1)
+
+        payload = _spec("canonical-library")
+        payload["strategies"] = [
+            {
+                "name": library["name"],
+                "weight": 0.5,
+                "models": library["models"],
+                "blend": library["blend"],
+            }
+        ]
+        accepted = client.post("/api/mandates", headers=headers, json={"spec": payload})
+
+        partial = deepcopy(payload)
+        partial["name"] = "partial-library"
+        partial["strategies"][0]["models"] = partial["strategies"][0]["models"][:-1]
+        partial_response = client.post("/api/mandates", headers=headers, json={"spec": partial})
+
+        changed_weight = deepcopy(payload)
+        changed_weight["name"] = "changed-library-weight"
+        changed_weight["strategies"][0]["models"][0]["weight"] += 0.5
+        weight_response = client.post("/api/mandates", headers=headers, json={"spec": changed_weight})
+
+        changed_params = deepcopy(payload)
+        changed_params["name"] = "changed-library-params"
+        changed_params["strategies"][0]["models"][0]["params"]["unregistered"] = True
+        params_response = client.post("/api/mandates", headers=headers, json={"spec": changed_params})
+
+    assert accepted.status_code == 201
+    assert accepted.json()["spec"]["strategies"][0]["weight"] == 0.5
+    assert partial_response.status_code == 422
+    assert weight_response.status_code == 422
+    assert params_response.status_code == 422
+    assert not (tmp_path / "mandates" / "partial-library.yaml").exists()
+    assert not (tmp_path / "mandates" / "changed-library-weight.yaml").exists()
+    assert not (tmp_path / "mandates" / "changed-library-params.yaml").exists()
+    app.state.service.close()
+
+
+@pytest.mark.parametrize(
+    ("names", "mode"),
+    [
+        (["buffett"], "long_only"),
+        (["buffett", "druckenmiller"], "long_short"),
+    ],
+)
+def test_custom_mandate_api_uses_canonical_registry_mode(tmp_path, names, mode):
+    app = create_app(root=tmp_path, allow_writes=True)
+    with TestClient(app) as client:
+        headers = _write_headers(client)
+        payload = _spec(f"custom-{'-'.join(names)}")
+        payload["strategies"] = [custom_strategy(names).model_dump(mode="json")]
+        response = client.post("/api/mandates", headers=headers, json={"spec": payload})
+
+    assert response.status_code == 201
+    assert response.json()["spec"]["strategies"][0]["blend"]["mode"] == mode
+    app.state.service.close()
+
+
+def test_custom_mandate_api_rejects_dollar_neutral_override(tmp_path):
+    app = create_app(root=tmp_path, allow_writes=True)
+    with TestClient(app) as client:
+        headers = _write_headers(client)
+        payload = _spec("custom-neutral")
+        payload["strategies"] = [custom_strategy(["druckenmiller"]).model_dump(mode="json")]
+        payload["strategies"][0]["blend"]["mode"] = "dollar_neutral"
+        response = client.post("/api/mandates", headers=headers, json={"spec": payload})
+
+    assert response.status_code == 422
+    assert not (tmp_path / "mandates" / "custom-neutral.yaml").exists()
+    app.state.service.close()
+
+
 def test_backtest_job_uses_fake_data_and_persists_report(demo_root):
     data_client = ManagedFakeDataClient(SERIES)
     service = DeskService(
@@ -90,7 +178,7 @@ def test_backtest_job_uses_fake_data_and_persists_report(demo_root):
         end="2024-06-07",
         provider=data_provider(),
         model=service.settings()["model"],
-        agent_count=1,
+        mandate_hash=_mandate_fingerprint(demo_root),
     )
     job = service.submit_backtest(request)
     deadline = time.monotonic() + 5
@@ -137,12 +225,52 @@ def test_network_capability_is_required_before_any_data_adapter(tmp_path):
                 end="2024-06-04",
                 provider=data_provider(),
                 model=DEFAULT_MODEL,
-                agent_count=1,
+                mandate_hash="0" * 64,
             )
         )
     assert blocked.value.status_code == 403
     assert not called
     assert not (tmp_path / "research").exists()
+    service.close()
+
+
+def test_backtest_rejects_same_count_mandate_drift_before_job_or_client(demo_root):
+    called = False
+
+    def forbidden():
+        nonlocal called
+        called = True
+        raise AssertionError("stale mandate must not construct a data client")
+
+    fingerprint = _mandate_fingerprint(demo_root)
+    path = demo_root / "mandates" / "demo-quality.yaml"
+    data = load_spec(path).model_dump(mode="json")
+    data["risk"]["max_position_pct"] = 0.2
+    path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+    service = DeskService(
+        demo_root,
+        allow_writes=True,
+        network_enabled=True,
+        data_client_factory=forbidden,
+    )
+
+    assert service.list_mandates()["items"][0]["agent_count"] == 1
+    with pytest.raises(ServiceError) as changed:
+        service.submit_backtest(
+            BacktestRequest(
+                fund="demo-quality",
+                universe=["AAPL"],
+                start="2024-06-03",
+                end="2024-06-04",
+                provider=data_provider(),
+                model=service.settings()["model"],
+                mandate_hash=fingerprint,
+            )
+        )
+
+    assert changed.value.status_code == 409
+    assert not called
+    assert service.list_jobs()["items"] == []
     service.close()
 
 
@@ -280,7 +408,7 @@ def test_backtest_cancellation_closes_fake_client_and_freezes_job_model(demo_roo
             end="2024-06-04",
             provider=data_provider(),
             model=selected_model,
-            agent_count=1,
+            mandate_hash=_mandate_fingerprint(demo_root),
         )
     )
     assert job["model"] == selected_model
@@ -348,7 +476,7 @@ def test_cancel_endpoint_uses_write_gate_and_cooperative_job_boundary(demo_root,
                     "end": "2024-06-04",
                     "provider": data_provider(),
                     "model": settings["model"],
-                    "agent_count": 1,
+                    "mandate_hash": _mandate_fingerprint(demo_root),
                 },
             )
             assert response.status_code == 202

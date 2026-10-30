@@ -18,6 +18,14 @@ const screenRoutes = [
   { path: "/settings", heading: "Settings", screenshot: "settings" },
 ];
 
+test.beforeEach(async ({ page }) => {
+  const origin = `http://127.0.0.1:${process.env.AIHF_WEB_PORT ?? "8765"}`;
+  await page.route("**/*", (route) => {
+    if (new URL(route.request().url()).origin !== origin) return route.abort();
+    return route.continue();
+  });
+});
+
 async function assertChartPaths(page: Page): Promise<void> {
   const chart = page.getByTestId("equity-chart");
   await expect(chart).toBeVisible();
@@ -31,7 +39,12 @@ async function assertChartPaths(page: Page): Promise<void> {
 
 async function assertCurrencyMetric(page: Page, label: string): Promise<void> {
   const value = page.getByText(label, { exact: true }).locator("xpath=../p[2]");
-  await expect(value).toHaveText(/^\$[0-9,]+(?:\.[0-9]{2})?$/);
+  await expect(value).toHaveText(/^\$[0-9,]+\.[0-9]{2}$/);
+}
+
+async function assertCustomMode(page: Page, mode: string): Promise<void> {
+  const heading = page.getByText("Custom analyst sleeve", { exact: true });
+  await expect(heading.locator("xpath=..").getByText(mode, { exact: true })).toBeVisible();
 }
 
 test("production routes render at desktop and narrow widths without external requests", async ({ page }) => {
@@ -51,12 +64,21 @@ test("production routes render at desktop and narrow widths without external req
     await page.goto(route.path);
     await expect(page.getByRole("heading", { name: route.heading })).toBeVisible();
     await expect(page.locator("body")).not.toContainText("Internal server error.");
+    if (route.screenshot === "builder") {
+      await page.getByRole("button", { name: "Add custom sleeve" }).click();
+      await page.getByRole("checkbox", { name: "Custom analyst buffett" }).check();
+      await page.getByRole("checkbox", { name: "Custom analyst druckenmiller" }).check();
+      await assertCustomMode(page, "long short");
+    }
     if (route.screenshot === "paper-detail") await assertChartPaths(page);
     if (route.screenshot === "session-report") {
       await assertCurrencyMetric(page, "Trading cost");
       await assertCurrencyMetric(page, "Traded notional");
       await assertCurrencyMetric(page, "Commission");
       await assertCurrencyMetric(page, "Slippage");
+      await expect(page.getByText("$0.50", { exact: true })).toBeVisible();
+      await expect(page.getByText("$4.50", { exact: true })).toBeVisible();
+      await expect(page.getByText("$5.00", { exact: true })).toBeVisible();
     }
     await page.screenshot({
       path: resolve(screenshotDir, `desktop-${route.screenshot}.png`),
@@ -160,9 +182,14 @@ test("builder preserves canonical library models, weights, params, and blend pol
   await page.getByLabel("Mandate name").fill("canonical-builder-check");
   await page.getByLabel("Library strategy").first().click();
   await page.getByRole("option", { name: "Deep Value" }).click();
-  await page.getByRole("button", { name: "Add sleeve" }).click();
+  await expect(page.getByRole("checkbox", { name: /graham/ })).toHaveCount(0);
+  await page.getByRole("button", { name: "Add library sleeve" }).click();
   await page.getByLabel("Library strategy").nth(1).click();
   await page.getByRole("option", { name: "Contrarian Value" }).click();
+  await page.getByRole("button", { name: "Add custom sleeve" }).click();
+  await page.getByRole("checkbox", { name: "Custom analyst buffett" }).check();
+  await page.getByRole("checkbox", { name: "Custom analyst druckenmiller" }).check();
+  await assertCustomMode(page, "long short");
   await page.getByRole("button", { name: "Save new mandate" }).click();
   await expect(page.getByText("Mandate saved")).toBeVisible();
 
@@ -179,11 +206,19 @@ test("builder preserves canonical library models, weights, params, and blend pol
   const contrarian = configured.find((strategy) => strategy.name === "contrarian-value");
   expect(deepValue?.models.find((model) => (model as { name: string }).name === "graham")).toMatchObject({ name: "graham", weight: 2 });
   expect(contrarian?.models.find((model) => (model as { name: string }).name === "burry")).toMatchObject({ name: "burry", weight: 2 });
+  const custom = configured.find((strategy) => strategy.name === "custom");
+  expect(custom?.models).toEqual([
+    { name: "buffett", weight: 1, params: {} },
+    { name: "druckenmiller", weight: 1, params: {} },
+  ]);
+  expect(custom?.blend).toMatchObject({ mode: "long_short", method: "conviction_weighted", gross_target: 1 });
 });
 
 test("backtest requires review, captures inputs, and requests cooperative cancellation", async ({ page }) => {
   const capabilities = await (await page.request.get("/api/capabilities")).json();
   const settings = await (await page.request.get("/api/settings")).json();
+  const mandates = await (await page.request.get("/api/mandates")).json();
+  const mandateHash = mandates.items.find((item: { name: string }) => item.name === "demo-quality").mandate_hash as string;
   let submitted: Record<string, unknown> | null = null;
   let cancelRequested = false;
   let cancelCalls = 0;
@@ -229,6 +264,8 @@ test("backtest requires review, captures inputs, and requests cooperative cancel
   await expect(dialog.getByText("Market-data provider")).toBeVisible();
   await expect(dialog.getByText("LLM model")).toBeVisible();
   await expect(dialog.getByText("Agents")).toBeVisible();
+  await expect(dialog.getByText("Mandate hash")).toBeVisible();
+  await expect(dialog.getByText(mandateHash, { exact: true })).toBeVisible();
   await expect(dialog.getByText("AAPL, MSFT")).toBeVisible();
   await expect(dialog.getByText("2024-06-03 → 2024-06-07")).toBeVisible();
   await expect(dialog.getByText("Write capability")).toBeVisible();
@@ -246,11 +283,12 @@ test("backtest requires review, captures inputs, and requests cooperative cancel
     end: "2024-06-07",
     provider: settings.data_provider,
     model: settings.model,
-    agent_count: 1,
+    mandate_hash: mandateHash,
   });
 
   await page.getByRole("button", { name: "Request cancellation" }).click();
   await expect(page.getByText("Cancellation requested…")).toBeVisible();
+  await expect(page.getByText(/in-flight provider\/session step cannot be interrupted/)).toBeVisible();
   expect(cancelCalls).toBe(1);
 });
 

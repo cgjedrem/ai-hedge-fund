@@ -60,7 +60,7 @@ class BacktestRequest(RequestModel):
     end: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
     provider: str = Field(pattern=r"^[a-z0-9_-]{1,32}$")
     model: str = Field(min_length=1, max_length=120)
-    agent_count: int = Field(ge=1, le=100)
+    mandate_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
 
     @field_validator("universe")
     @classmethod

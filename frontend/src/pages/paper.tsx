@@ -482,7 +482,7 @@ export function PaperScorecardPage() {
         <>
           <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
             <MetricCard label="Fund P&L" value={money(card.fund_pnl)} note="Attributed over scored records" tone={card.fund_pnl >= 0 ? "positive" : "negative"} />
-            <MetricCard label="Trading cost" value={money(card.trading_cost)} note="Recorded commissions and slippage" />
+            <MetricCard label="Trading cost" value={money(card.trading_cost, 2)} note="Recorded commissions and slippage" />
             <MetricCard label="Unattributed" value={money(card.unattributed)} note="Residual not assigned to a strategy" />
             <MetricCard label="Score horizon" value={card.horizon ?? "Not enough data"} note={`${dateLabel(card.first_session)} → ${dateLabel(card.last_session)}`} />
           </div>
@@ -541,10 +541,10 @@ export function SessionReportPage() {
           </div>
           {report.executed ? (
             <div className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-              <MetricCard label="Trading cost" value={money(report.executed.trading_cost)} note="Recorded modeled execution cost" />
-              <MetricCard label="Traded notional" value={money(report.executed.traded_notional)} note="Executed quantity × price" />
-              <MetricCard label="Commission" value={money(report.executed.commission)} note="Recorded commission total" />
-              <MetricCard label="Slippage" value={money(report.executed.slippage)} note="Recorded spread and slippage cost" />
+              <MetricCard label="Trading cost" value={money(report.executed.trading_cost, 2)} note="Recorded modeled execution cost" />
+              <MetricCard label="Traded notional" value={money(report.executed.traded_notional, 2)} note="Executed quantity × price" />
+              <MetricCard label="Commission" value={money(report.executed.commission, 2)} note="Recorded commission total" />
+              <MetricCard label="Slippage" value={money(report.executed.slippage, 2)} note="Recorded spread and slippage cost" />
             </div>
           ) : null}
           <div className="mt-5 grid gap-5 xl:grid-cols-2">

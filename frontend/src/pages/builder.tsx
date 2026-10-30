@@ -18,13 +18,14 @@ import {
 } from "@/components/ui/select";
 import { apiPost } from "@/lib/api";
 import { useDesk, useResource } from "@/lib/hooks";
-import type { Catalog, StrategyModelOption, StrategyOption } from "@/lib/types";
+import type { AnalystOption, Catalog, StrategyModelOption, StrategyOption } from "@/lib/types";
 
 interface StrategyDraft {
   id: number;
   name: string;
   models: StrategyModelOption[];
   weight: string;
+  kind: "library" | "custom";
 }
 
 function copyModels(models: StrategyModelOption[]): StrategyModelOption[] {
@@ -47,7 +48,7 @@ export function BuilderPage() {
   const catalogResource = useResource<Catalog>("/api/catalog");
   const [name, setName] = useState("");
   const [strategyDrafts, setStrategyDrafts] = useState<StrategyDraft[]>([
-    { id: 1, name: "", models: [], weight: "1" },
+    { id: 1, name: "", models: [], weight: "1", kind: "library" },
   ]);
   const [nextStrategyId, setNextStrategyId] = useState(2);
   const [capital, setCapital] = useState("100000");
@@ -77,6 +78,7 @@ export function BuilderPage() {
           ? draft
           : {
               ...draft,
+              kind: "library",
               name: catalog.strategies[0].name,
               models: copyModels(catalog.strategies[0].models),
             },
@@ -88,35 +90,45 @@ export function BuilderPage() {
     () => new Map((catalog?.strategies ?? []).map((strategy) => [strategy.name, strategy])),
     [catalog],
   );
+  const analystLookup = useMemo(
+    () => new Map((catalog?.analysts ?? []).map((analyst) => [analyst.name, analyst])),
+    [catalog],
+  );
 
   function changeStrategy(id: number, strategyName: string): void {
     const option = strategyLookup.get(strategyName);
     setStrategyDrafts((drafts) =>
       drafts.map((draft) =>
         draft.id === id
-          ? { ...draft, name: strategyName, models: option ? copyModels(option.models) : [] }
+          ? { ...draft, kind: "library", name: strategyName, models: option ? copyModels(option.models) : [] }
           : draft,
       ),
     );
   }
 
   function addStrategy(): void {
-    const next = catalog?.strategies.find((strategy) => !strategyDrafts.some((draft) => draft.name === strategy.name));
+    const next = catalog?.strategies.find((strategy) => !strategyDrafts.some((draft) => draft.kind === "library" && draft.name === strategy.name));
     if (!next) return;
-    setStrategyDrafts((drafts) => [...drafts, { id: nextStrategyId, name: next.name, models: copyModels(next.models), weight: "1" }]);
+    setStrategyDrafts((drafts) => [...drafts, { id: nextStrategyId, name: next.name, models: copyModels(next.models), weight: "1", kind: "library" }]);
     setNextStrategyId((value) => value + 1);
   }
 
-  function toggleModel(id: number, model: StrategyModelOption): void {
+  function addCustomSleeve(): void {
+    if (strategyDrafts.some((draft) => draft.kind === "custom") || !catalog?.analysts.length) return;
+    setStrategyDrafts((drafts) => [...drafts, { id: nextStrategyId, name: "custom", models: [], weight: "1", kind: "custom" }]);
+    setNextStrategyId((value) => value + 1);
+  }
+
+  function toggleCustomModel(id: number, model: AnalystOption): void {
     setStrategyDrafts((drafts) =>
       drafts.map((draft) =>
-        draft.id !== id
+        draft.id !== id || draft.kind !== "custom"
           ? draft
           : {
               ...draft,
               models: draft.models.some((entry) => entry.name === model.name)
                 ? draft.models.filter((entry) => entry.name !== model.name)
-                : [...draft.models, { ...model, params: { ...model.params } }],
+                : [...draft.models, { name: model.name, weight: 1, params: {} }],
             },
       ),
     );
@@ -139,19 +151,28 @@ export function BuilderPage() {
     }
     const configuredStrategies = strategyDrafts.map((draft) => ({
       draft,
-      option: strategyLookup.get(draft.name),
+      option: draft.kind === "library" ? strategyLookup.get(draft.name) : null,
       weight: Number(draft.weight),
     }));
-    if (configuredStrategies.some(({ option }) => !option)) {
-      setError("Choose a strategy library entry for every strategy.");
+    if (configuredStrategies.some(({ draft, option }) => draft.kind === "library" && !option)) {
+      setError("Choose a strategy library entry for every library sleeve.");
       return;
     }
-    if (new Set(configuredStrategies.map(({ option }) => option?.name.toLowerCase())).size !== configuredStrategies.length) {
+    const strategyNames = configuredStrategies.map(({ draft }) => draft.name.toLowerCase());
+    if (new Set(strategyNames).size !== strategyNames.length) {
       setError("A strategy can be added only once to a mandate.");
       return;
     }
-    if (configuredStrategies.some(({ draft, option, weight }) => !draft.models.length || draft.models.some((model) => !option?.models.some((entry) => entry.name === model.name)) || !Number.isFinite(weight) || weight <= 0)) {
-      setError("Each strategy needs at least one supported analyst and a positive weight.");
+    if (
+      configuredStrategies.some(
+        ({ draft, option, weight }) =>
+          !Number.isFinite(weight) ||
+          weight <= 0 ||
+          (draft.kind === "library" && !option) ||
+          (draft.kind === "custom" && (!draft.models.length || draft.models.some((model) => !analystLookup.has(model.name)))),
+      )
+    ) {
+      setError("Library rosters stay canonical; a custom sleeve needs registered analysts and every sleeve needs a positive weight.");
       return;
     }
     const capitalValue = Number(capital);
@@ -177,13 +198,24 @@ export function BuilderPage() {
     const spec = {
       schema_version: 2,
       name: name.trim(),
-      strategies: configuredStrategies.map(({ draft, option, weight }) => ({
-        name: (option as StrategyOption).name,
-        display_name: (option as StrategyOption).title,
-        weight,
-        models: copyModels(draft.models),
-        blend: { ...(option as StrategyOption).blend },
-      })),
+      strategies: configuredStrategies.map(({ draft, option, weight }) => {
+        if (draft.kind === "custom") {
+          const mode = draft.models.some((model) => analystLookup.get(model.name)?.approach === "long_short") ? "long_short" : "long_only";
+          return {
+            name: "custom",
+            weight,
+            models: draft.models.map((model) => ({ name: model.name, weight: 1, params: {} })),
+            blend: { method: "conviction_weighted", gross_target: 1, mode },
+          };
+        }
+        const libraryStrategy = option as StrategyOption;
+        return {
+          name: libraryStrategy.name,
+          weight,
+          models: copyModels(libraryStrategy.models),
+          blend: { ...libraryStrategy.blend },
+        };
+      }),
       risk: {
         max_position_pct: positionValue,
         max_gross_exposure: grossValue,
@@ -330,23 +362,30 @@ export function BuilderPage() {
             <CardHeader className="flex-row items-start justify-between gap-4">
               <div>
                 <CardTitle>Strategy sleeves</CardTitle>
-                <p className="mt-1 text-xs text-muted-foreground">Start from validated library strategies, then select their registered analysts.</p>
+                <p className="mt-1 text-xs text-muted-foreground">Library analyst rosters stay fixed. Custom sleeves use registered analyst profiles.</p>
               </div>
-              <Button variant="outline" size="sm" onClick={addStrategy} disabled={Boolean(saved) || !catalog || strategyDrafts.length >= catalog.strategies.length}>
-                <Plus className="h-3.5 w-3.5" /> Add sleeve
-              </Button>
+              <div className="flex flex-wrap gap-2">
+                <Button variant="outline" size="sm" onClick={addStrategy} disabled={Boolean(saved) || !catalog || strategyDrafts.filter((draft) => draft.kind === "library").length >= (catalog?.strategies.length ?? 0)}>
+                  <Plus className="h-3.5 w-3.5" /> Add library sleeve
+                </Button>
+                <Button variant="outline" size="sm" onClick={addCustomSleeve} disabled={Boolean(saved) || !catalog?.analysts.length || strategyDrafts.some((draft) => draft.kind === "custom")}>
+                  <Plus className="h-3.5 w-3.5" /> Add custom sleeve
+                </Button>
+              </div>
             </CardHeader>
             <CardContent className="space-y-4">
               {strategyDrafts.map((draft, index) => {
                 const strategy = strategyLookup.get(draft.name);
+                const customMode = draft.models.some((model) => analystLookup.get(model.name)?.approach === "long_short") ? "long_short" : "long_only";
+                const mode = draft.kind === "custom" ? (draft.models.length ? customMode : undefined) : strategy?.mode;
                 const otherNames = new Set(strategyDrafts.filter((item) => item.id !== draft.id).map((item) => item.name));
                 return (
                   <div key={draft.id} className="rounded-xl border border-border bg-black/10 p-4 sm:p-5">
                     <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
                       <div className="flex items-center gap-2">
                         <span className="mono text-[10px] text-accent">0{index + 1}</span>
-                        <span className="text-xs font-semibold text-foreground">Strategy sleeve</span>
-                        {strategy ? <Badge variant="muted">{strategy.mode.replaceAll("_", " ")}</Badge> : null}
+                        <span className="text-xs font-semibold text-foreground">{draft.kind === "custom" ? "Custom analyst sleeve" : "Strategy sleeve"}</span>
+                        {mode ? <Badge variant="muted">{mode.replaceAll("_", " ")}</Badge> : null}
                       </div>
                       {strategyDrafts.length > 1 ? (
                         <Button variant="ghost" size="sm" onClick={() => setStrategyDrafts((drafts) => drafts.filter((item) => item.id !== draft.id))} disabled={Boolean(saved)}>
@@ -355,34 +394,56 @@ export function BuilderPage() {
                       ) : null}
                     </div>
                     <div className="grid gap-4 sm:grid-cols-[minmax(0,1fr)_160px]">
-                      <Field label="Library strategy" htmlFor={`strategy-${draft.id}`}>
-                        <Select value={draft.name} onValueChange={(value) => changeStrategy(draft.id, value)} disabled={Boolean(saved) || !catalog}>
-                          <SelectTrigger id={`strategy-${draft.id}`}><SelectValue placeholder="Choose a strategy" /></SelectTrigger>
-                          <SelectContent>
-                            {(catalog?.strategies ?? []).map((option) => (
-                              <SelectItem key={option.name} value={option.name} disabled={otherNames.has(option.name)}>
-                                {option.title}
-                              </SelectItem>
-                            ))}
-                          </SelectContent>
-                        </Select>
-                      </Field>
+                      {draft.kind === "library" ? (
+                        <Field label="Library strategy" htmlFor={`strategy-${draft.id}`}>
+                          <Select value={draft.name} onValueChange={(value) => changeStrategy(draft.id, value)} disabled={Boolean(saved) || !catalog}>
+                            <SelectTrigger id={`strategy-${draft.id}`}><SelectValue placeholder="Choose a strategy" /></SelectTrigger>
+                            <SelectContent>
+                              {(catalog?.strategies ?? []).map((option) => (
+                                <SelectItem key={option.name} value={option.name} disabled={otherNames.has(option.name)}>
+                                  {option.title}
+                                </SelectItem>
+                              ))}
+                            </SelectContent>
+                          </Select>
+                        </Field>
+                      ) : (
+                        <div className="rounded-lg border border-border bg-black/10 px-3 py-2.5">
+                          <p className="text-[10px] uppercase tracking-[0.13em] text-muted-foreground">Canonical custom roster</p>
+                          <p className="mt-1 text-xs text-foreground">Blend mode derives from registered analyst profiles.</p>
+                        </div>
+                      )}
                       <Field label="Sleeve weight" htmlFor={`weight-${draft.id}`}>
                         <Input id={`weight-${draft.id}`} type="number" min="0.001" step="0.1" value={draft.weight} onChange={(event) => setStrategyDrafts((drafts) => drafts.map((item) => item.id === draft.id ? { ...item, weight: event.target.value } : item))} disabled={Boolean(saved)} />
                       </Field>
                     </div>
                     <div className="mt-4">
-                      <p className="mb-2 text-[10px] uppercase tracking-[0.13em] text-muted-foreground">Registered analysts</p>
-                      {strategy?.models.length ? (
+                      <p className="mb-2 text-[10px] uppercase tracking-[0.13em] text-muted-foreground">{draft.kind === "custom" ? "Registered analysts · selectable" : "Registered analysts · canonical roster"}</p>
+                      {draft.kind === "custom" ? (
                         <div className="grid gap-2 sm:grid-cols-2">
-                          {strategy.models.map((model) => (
-                            <label key={model.name} className="flex cursor-pointer items-center gap-3 rounded-lg border border-border/80 bg-white/[0.02] px-3 py-2.5 text-xs text-foreground has-[:disabled]:cursor-not-allowed has-[:disabled]:opacity-60">
-                              <input type="checkbox" checked={draft.models.some((entry) => entry.name === model.name)} onChange={() => toggleModel(draft.id, model)} disabled={Boolean(saved)} className="h-3.5 w-3.5 accent-cyan-400" />
-                              <span className="mono">{model.name} <span className="text-muted-foreground">· blend weight {model.weight}</span></span>
+                          {(catalog?.analysts ?? []).map((analyst) => (
+                            <label key={analyst.name} className="flex cursor-pointer items-center gap-3 rounded-lg border border-border/80 bg-white/[0.02] px-3 py-2.5 text-xs text-foreground has-[:disabled]:cursor-not-allowed has-[:disabled]:opacity-60">
+                              <input
+                                type="checkbox"
+                                aria-label={`Custom analyst ${analyst.name}`}
+                                checked={draft.models.some((entry) => entry.name === analyst.name)}
+                                onChange={() => toggleCustomModel(draft.id, analyst)}
+                                disabled={Boolean(saved)}
+                                className="h-3.5 w-3.5 accent-cyan-400"
+                              />
+                              <span className="mono">{analyst.name} <span className="text-muted-foreground">· {analyst.approach.replaceAll("_", " ")}</span></span>
                             </label>
                           ))}
                         </div>
-                      ) : <p className="text-xs text-muted-foreground">Choose a strategy to view its registered analysts.</p>}
+                      ) : strategy?.models.length ? (
+                        <div className="grid gap-2 sm:grid-cols-2">
+                          {strategy.models.map((model) => (
+                            <div key={model.name} className="flex items-center gap-3 rounded-lg border border-border/80 bg-white/[0.02] px-3 py-2.5 text-xs text-foreground">
+                              <span className="mono">{model.name} <span className="text-muted-foreground">· blend weight {model.weight}</span></span>
+                            </div>
+                          ))}
+                        </div>
+                      ) : <p className="text-xs text-muted-foreground">Choose a strategy to view its canonical analysts.</p>}
                     </div>
                   </div>
                 );

@@ -17,12 +17,14 @@ from hedge_fund.backtesting.fund import backtest_fund, FundBacktestResult
 from hedge_fund.backtesting.research import save_result
 from hedge_fund.data import CachedDataClient, data_provider, make_data_client
 from hedge_fund.fund import (
+    custom_strategy,
     Fund,
     FundSpec,
     load_spec,
     load_strategy,
     normalize_universe,
     save_spec,
+    StrategySpec,
 )
 from hedge_fund.llm import DEFAULT_MODEL, env_var_for, PROVIDER_ENV_VARS
 from hedge_fund.llm.registry import is_supported, KEYLESS_PROVIDERS, load_api_models
@@ -35,7 +37,7 @@ from hedge_fund.paper.deployed import (
 )
 from hedge_fund.paper.ledger import Ledger, LedgerError
 from hedge_fund.paper.tick import following_session
-from hedge_fund.pipeline.session import SessionRecord
+from hedge_fund.pipeline.session import mandate_hash, SessionRecord
 from hedge_fund.scorecard import score
 from hedge_fund.tui.keys import save_credential
 from hedge_fund.web.jobs import JobCancelled, JobConflict, JobRegistry
@@ -106,16 +108,13 @@ class DeskService:
     def catalog(self) -> dict:
         models = [{"label": label, "id": model_id, "provider": provider} for label, model_id, provider in load_api_models() if is_supported(provider)]
         strategies = []
-        from hedge_fund.signals import ALPHA_MODEL_REGISTRY
+        from hedge_fund.signals import (
+            ALPHA_MODEL_REGISTRY,
+            get_investment_approach,
+            LLMAgent,
+        )
 
-        strategy_dir = Path(__file__).resolve().parents[1] / "strategies"
-        for path in sorted(strategy_dir.glob("*.yaml")):
-            try:
-                strategy = load_strategy(path)
-            except (OSError, ValueError):
-                continue
-            from hedge_fund.signals import LLMAgent
-
+        for strategy in self._strategy_library().values():
             kind = "discretionary" if all(issubclass(ALPHA_MODEL_REGISTRY[model.name], LLMAgent) for model in strategy.models) else "systematic"
             strategies.append(
                 {
@@ -127,7 +126,8 @@ class DeskService:
                     "blend": strategy.blend.model_dump(mode="json"),
                 }
             )
-        return {"models": models, "strategies": strategies, "default_model": DEFAULT_MODEL}
+        analysts = [{"name": name, "approach": get_investment_approach(name)} for name in sorted(ALPHA_MODEL_REGISTRY)]
+        return {"models": models, "strategies": strategies, "analysts": analysts, "default_model": DEFAULT_MODEL}
 
     def home(self) -> dict:
         mandates = self.list_mandates()
@@ -185,6 +185,7 @@ class DeskService:
         except ValueError as exc:
             raise ServiceError(422, f"Mandate validation failed ({type(exc).__name__}).") from None
         _reject_secret_fields(spec.model_dump(mode="python"))
+        self._validate_mandate_strategies(spec)
         name = self._validated_name(spec.name)
         self._guard_protected(name)
         with self._fund_lock(name):
@@ -286,9 +287,19 @@ class DeskService:
         if not directory.is_dir():
             raise ServiceError(404, "Paper fund not found.")
         try:
-            record = Ledger(directory).read(session)
-        except LedgerError as exc:
-            raise ServiceError(404, f"Session report is unavailable ({type(exc).__name__}).") from None
+            deployed = load_deployed(directory)
+        except (OSError, ValueError) as exc:
+            raise ServiceError(409, f"Paper fund is invalid ({type(exc).__name__}).") from None
+        ledger = Ledger(directory)
+        try:
+            ledger.replay(deployed.spec.capital, full=True)
+            if session not in ledger.sessions():
+                raise ServiceError(404, "Session report not found.")
+            record = ledger.read(session)
+        except ServiceError:
+            raise
+        except (LedgerError, OSError, ValueError) as exc:
+            raise ServiceError(409, f"Ledger verification failed ({type(exc).__name__}).") from None
         return self._session_report(record)
 
     def paper_scorecard(self, name: str) -> dict:
@@ -338,13 +349,6 @@ class DeskService:
     def settings(self) -> dict:
         model_options = [{"label": label, "id": model_id, "provider": provider} for label, model_id, provider in load_api_models() if is_supported(provider)]
         selected_model = self._selected_model
-        env_path = self._safe_child(".env")
-        values = {}
-        if env_path.is_file():
-            try:
-                values = dotenv_values(env_path)
-            except (OSError, ValueError):
-                values = {}
         providers = []
         for provider in [*PROVIDER_ENV_VARS, *sorted(KEYLESS_PROVIDERS)]:
             env_var = env_var_for(provider)
@@ -352,7 +356,7 @@ class DeskService:
                 {
                     "provider": provider,
                     "requires_key": env_var is not None,
-                    "configured": bool(os.environ.get(env_var) or values.get(env_var)) if env_var else True,
+                    "configured": bool(os.environ.get(env_var)) if env_var else True,
                 }
             )
         return {
@@ -408,8 +412,7 @@ class DeskService:
             universe = normalize_universe(request.universe)
         except (OSError, ValueError) as exc:
             raise ServiceError(422, f"Backtest request is invalid ({type(exc).__name__}).") from None
-        agent_count = sum(len(strategy.models) for strategy in spec.strategies)
-        if request.agent_count != agent_count:
+        if request.mandate_hash != mandate_hash(spec):
             raise ServiceError(409, "Mandate configuration changed; reload before confirming this backtest.")
 
         def work(progress: Callable[[int], None], cancelled: Callable[[], bool]) -> dict:
@@ -528,6 +531,10 @@ class DeskService:
     def _paper_snapshot(self, deployed: DeployedFund, directory: Path, *, include_records: bool = False) -> dict:
         ledger = Ledger(directory)
         try:
+            halted = ledger.halted()
+        except (LedgerError, OSError, ValueError):
+            halted = None
+        try:
             records = ledger.records()
             state = ledger.replay(deployed.spec.capital, full=True)
             ledger_status = {"ok": True, "error": None}
@@ -591,7 +598,7 @@ class DeskService:
             "pending": self._decision_summary(pending, latest.hash if latest else None) if pending is not None else None,
             "approval": approval,
             "next_run": next_run,
-            "halted": state.halted if state is not None else None,
+            "halted": halted,
             "ledger": ledger_status,
             "runner": self._runner_state(),
             "live_value": {
@@ -713,6 +720,7 @@ class DeskService:
     def _mandate_summary(self, spec: FundSpec, *, include_spec: bool = False) -> dict:
         data = {
             "name": spec.name,
+            "mandate_hash": mandate_hash(spec),
             "strategies": [{"name": strategy.name, "title": strategy.title, "mode": strategy.blend.mode, "weight": strategy.weight} for strategy in spec.strategies],
             "cadence": spec.cadence_label,
             "capital": spec.capital,
@@ -724,6 +732,37 @@ class DeskService:
         if include_spec:
             data["spec"] = spec.model_dump(mode="json")
         return data
+
+    def _strategy_library(self) -> dict[str, StrategySpec]:
+        strategy_dir = Path(__file__).resolve().parents[1] / "strategies"
+        strategies = {}
+        for path in sorted(strategy_dir.glob("*.yaml")):
+            try:
+                strategy = load_strategy(path)
+            except (OSError, ValueError):
+                continue
+            strategies[strategy.name] = strategy
+        return strategies
+
+    def _validate_mandate_strategies(self, spec: FundSpec) -> None:
+        library = self._strategy_library()
+        for strategy in spec.strategies:
+            canonical = library.get(strategy.name)
+            if canonical is not None:
+                if strategy.models != canonical.models or strategy.blend != canonical.blend:
+                    raise ServiceError(
+                        422,
+                        "Library strategies must retain their canonical analyst roster, weights, params, and blend policy.",
+                    )
+                continue
+            if strategy.name != "custom":
+                raise ServiceError(422, "Strategy must use a backend library entry or the canonical custom analyst roster.")
+            try:
+                canonical_custom = custom_strategy([model.name for model in strategy.models])
+            except ValueError:
+                raise ServiceError(422, "Custom analyst roster is invalid.") from None
+            if strategy.models != canonical_custom.models or strategy.blend != canonical_custom.blend:
+                raise ServiceError(422, "Custom strategy must use registered analysts and the canonical blend mode.")
 
     @contextmanager
     def _make_data_client(self) -> Iterator[object]:
@@ -797,6 +836,8 @@ class DeskService:
             raise ServiceError(409, "Settings cannot change while a research job is active.")
 
     def _load_root_environment(self) -> None:
+        if not self.allow_writes and not self.network_enabled:
+            return
         env_path = self._safe_child(".env")
         if not env_path.is_file():
             return

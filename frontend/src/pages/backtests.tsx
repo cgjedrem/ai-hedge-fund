@@ -37,6 +37,7 @@ interface BacktestSubmission {
   end: string;
   provider: string;
   model: string;
+  mandate_hash: string;
   agent_count: number;
 }
 
@@ -124,6 +125,7 @@ export function BacktestsPage() {
       end,
       provider: settings.data.data_provider,
       model: settings.data.model,
+      mandate_hash: selectedMandate.mandate_hash,
       agent_count: selectedMandate.agent_count,
     });
   }
@@ -138,7 +140,15 @@ export function BacktestsPage() {
     setBusy(true);
     setError(null);
     try {
-      const job = await apiPost<Job>("/api/backtests", confirmation);
+      const job = await apiPost<Job>("/api/backtests", {
+        fund: confirmation.fund,
+        universe: confirmation.universe,
+        start: confirmation.start,
+        end: confirmation.end,
+        provider: confirmation.provider,
+        model: confirmation.model,
+        mandate_hash: confirmation.mandate_hash,
+      });
       setJobId(job.id);
       setConfirmation(null);
       jobs.refresh();
@@ -274,7 +284,7 @@ export function BacktestsPage() {
                       {cancelling || activeJob.cancel_requested ? "Cancellation requested…" : "Request cancellation"}
                     </Button>
                     <p className="text-[10px] leading-relaxed text-muted-foreground">
-                      Cancellation is cooperative at valuation boundaries. Closing this page does not cancel the job; server shutdown requests cancellation and waits for active work.
+                      Cancellation is cooperative at valuation boundaries. An in-flight provider/session step cannot be interrupted, so cancel and shutdown latency depends on that step. Closing this page does not cancel the job; shutdown waits for active work.
                     </p>
                   </div>
                 ) : null}
@@ -320,6 +330,7 @@ export function BacktestsPage() {
               <dl className="grid gap-3 rounded-lg border border-border bg-black/10 p-4 text-xs sm:grid-cols-2">
                 <ConfirmationValue label="Mandate" value={confirmation.fund} />
                 <ConfirmationValue label="Agents" value={String(confirmation.agent_count)} />
+                <ConfirmationValue label="Mandate hash" value={confirmation.mandate_hash} />
                 <ConfirmationValue label="Market-data provider" value={confirmation.provider} />
                 <ConfirmationValue
                   label="LLM model"
