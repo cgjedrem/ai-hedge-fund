@@ -334,6 +334,7 @@ test("ungated and halted decisions never present enabled verdict actions", async
 
   paper.spec.approval_required = true;
   paper.halted = "test pause";
+  paper.halt_state = "halted";
   paper.ledger.ok = false;
   paper.ledger.error = "Ledger verification failed (LedgerError).";
   await page.reload();
