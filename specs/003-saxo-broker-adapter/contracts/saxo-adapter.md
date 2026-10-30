@@ -16,12 +16,12 @@ class Broker(Protocol):
 `SaxoBroker` implements this structurally (no `SimBroker` inheritance). The shared models are reused **unchanged and as-is**: `Position(ticker, shares)` and `Fill(ticker, side, quantity, price)` from `hedge_fund/brokers/models.py` — there are no `amount`/`avg_cost`/`ts` fields on them. Saxo-specific data (net-position id, acquisition price `OpenPrice`, current price, execution time) stays internal to the adapter (logs/events only), never forced into the shared models.
 
 **Semantics**:
-- `positions()` → net positions keyed by engine ticker from `/port/v1/positions` scoped by `ClientKey` and `AccountKey`, mapped to `Position(ticker, shares=PositionBase.Amount)`.
+- `positions()` → net positions keyed by engine ticker from every `/port/v1/positions` page, scoped by `ClientKey` and `AccountKey`, mapped to `Position(ticker, shares=PositionBase.Amount)`. Each page requires an explicit list-valued `Data`; invalid or failed pages reject the whole snapshot.
 - `cash()` → **accounting cash balance** (`CashBalance` from `/port/v1/balances` scoped by `ClientKey` and `AccountKey`). Require USD currency. Buying power (`CashAvailableForTrading`) is separate and used only for affordability.
 - `filter_orders(orders)` → copy orders with quantity rounded down to lot multiples; `LotSize: null` or missing uses 1. Remove results below one lot. Cycle ledger records the adjusted order copies. `place_order(order)` → **fill-completely-or-raise** for every submitted order. Never returns a partial fill.
-- Post-filter position/gross-limit breaches are rejected when filtered exposure worsens the corresponding current-book metric. Risk-reducing trades may continue while an existing breach remains.
+- Post-filter position/gross-limit breaches are rejected when filtered exposure worsens the corresponding current-book metric. Risk-reducing trades may continue while an existing breach remains. Saxo preserves the original order where possible, but reorders if needed so every projected prefix satisfies these same limits at the sizing marks; no safe ordering means refusal before any submission.
 - Saxo minute mandates start at or after 09:30 ET and end by 15:59 ET. An omitted Saxo window defaults to 09:30–15:59; paper window defaults stay unchanged.
-- The unattended runner does not execute a pending Saxo bar once 16:00 ET has passed, even if the bar is still within the generic lateness window; it resumes at the next valid bar.
+- The unattended runner does not start a pending Saxo bar once 16:00 ET has passed. It also checks the cutoff immediately before each order POST attempt, after token acquisition and pacing. If the cutoff arrives mid-basket, `OrderSubmissionDeferred` means no order was accepted for that attempt: completed fills are recorded, the unsubmitted remainder and reason are persisted, and the next valid bar re-evaluates against the broker book rather than replaying stale quantities. A new approval remains required when configured. Confirmed Saxo fills are journaled before attempting the next order, and unexpected errors still halt.
 - Universe validation selects a deterministic US-exchange listing and requires instrument details `Exchange.CountryCode=US`, `CurrencyCode=USD`, and market-order support. Reused broker instances revalidate on each session and refresh expired entries after 3600 seconds.
 - Saxo account currency is fixed USD by the app's mandate convention; there is no deploy-time remote account check. Broker construction checks `Active`, `LegalAssetTypes` including `Stock`, account `Currency`, and scoped balance `Currency` before session trading.
 
@@ -40,7 +40,7 @@ Base: `https://gateway.saxobank.com/sim/openapi` · Auth: `https://sim.logonvali
 | Instrument details | `GET /ref/v1/instruments/details/{Uic}/{AssetType}` | **second, distinct call** (per Saxo's stock-order sample): → `IsTradable`, `LotSize`, `MinimumOrderValue/Size`, `SupportedOrderTypeSettings`/`SupportedOrderTypes`, `TickSize`. Both response shapes are fixture-tested separately |
 | Place order | `POST /trade/v2/orders` | body `{"AccountKey","Uic","AssetType":"Stock","Amount":<shares>,"BuySell":"Buy"\|"Sell","OrderType":"Market","OrderDuration":{"DurationType":"DayOrder"},"ManualOrder":false}`; header `x-request-id` unique per attempt; **HTTP 200 may carry `ErrorInfo` instead of `OrderId` — inspect the body** |
 | Open order poll | `GET /port/v1/orders/{ClientKey}/{OrderId}` | poll until 404/gone (market orders fill near-instantly when open); disappearance **triggers inspection, not fill establishment**; deadline 120 s |
-| Transactions | `GET /hist/v1/transactions` | Filter with `AccountKeys`, `ClientKey`, `FromDate`, `ToDate`, `TransactionType=Trade`, `Uics`; paginate using `__next`/`$skip`; match `Data[].Trades[].OrderId`; aggregate `TradedQuantity` and weighted `Price`. `OrderId` is not a supported query filter |
+| Transactions | `GET /hist/v1/transactions` | Filter with `AccountKeys`, `ClientKey`, `FromDate`, `ToDate`, `TransactionType=Trade`, `Uics`; paginate using `__next`/`$skip`, checking the deadline before each page; match `Data[].Trades[].OrderId`; aggregate `TradedQuantity` and weighted `Price`. `OrderId` is not a supported query filter |
 
 **Client obligations**: Bearer access token on every call; proactive refresh at <120 s remaining; pacer ≥1.0 s between order POSTs; unique `x-request-id`; on 409 (15 s duplicate window) inspect state, never re-POST; on 401 attempt exactly one refresh then re-auth error; SIM-only URLs (live gateway/auth never configured).
 
@@ -48,7 +48,7 @@ Base: `https://gateway.saxobank.com/sim/openapi` · Auth: `https://sim.logonvali
 
 Item `Saxo OpenAPI SIM` with fields `app-key`, `app-secret`, `refresh-token` (rotating). Env config (non-secret): `SAXO_APP_KEY_REF`, `SAXO_APP_SECRET_REF`, `SAXO_REFRESH_TOKEN_REF` hold `op://` references; `SAXO_REDIRECT_URI` holds the redirect URI; `SAXO_REFRESH_LOCK_DIR` selects a shared lock directory.
 
-The provider resolves `op://` references via `op read` and sanitizes failures. For write-back it reads the item with `op item get --format=json --reveal`, updates the referenced field in memory, then pipes JSON to `op item edit`; token never appears in argv.
+The provider resolves `op://` references via `op read` and sanitizes failures. For write-back it reads the item with `op item get --format=json --reveal`, updates the referenced field in memory, then pipes JSON to `op item edit`; token never appears in argv. Both field-only and section-qualified references select the same field for reading and writing.
 
 - **Resolve** app credentials at startup via the provider. Read the refresh token under its lock on first authorization and each refresh. Missing reference ⇒ error naming the variable, never the value.
 - **Rotate**: under a reference-keyed atomic lock directory, re-read the latest refresh token, refresh, then persist before using the access token. Acquisition times out after 90 seconds and reports sanitized owner context; contention is retryable, not terminal re-authentication. Never steal locks automatically. Default temp path coordinates same-host processes only. Host/container coordination requires both to use the same mounted path via `SAXO_REFRESH_LOCK_DIR`; atomic directory creation is required. A process crash can leave a stale lock, which requires operator verification and cleanup.
@@ -65,5 +65,6 @@ When Saxo `costs` is omitted, `FundSpec` defaults spread and commission to zero.
 | Error | Raised when | Recovery |
 |---|---|---|
 | `SaxoAuthError` | refresh failed / 401 after one refresh / interactive re-auth needed | user re-authenticates (auth-code + PKCE in browser) |
+| `OrderSubmissionDeferred` | runner cutoff reached before an order could be accepted | record completed fills and recompute remaining work at the next valid bar |
 | `SaxoOrderError` | order rejected (ErrorInfo, 409 unresolved, deadline exceeded) | session halts with Saxo's ErrorCode in the message |
 | `SaxoReconcileError` | universe validation failed / book mismatch | session refuses before trading |

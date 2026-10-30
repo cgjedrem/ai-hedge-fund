@@ -23,6 +23,8 @@ $env:SAXO_REFRESH_LOCK_DIR = "C:\shared\saxo-refresh-locks"
 
 Mandate currency convention is fixed USD. The account currency is checked when the broker starts; no FX conversion is attempted. Without `SAXO_REFRESH_LOCK_DIR`, locks coordinate only processes using the same host temp directory. Lock acquisition times out after 90 seconds and reports its recorded owner; contention is retryable. A crash can leave a stale lock directory. Verify its recorded host/PID is inactive before removing it; the adapter never steals a lock.
 
+Refresh-token references may also include a section: `op://<vault>/<item>/<section>/<field>`. The same section and field are used for both reads and rotated-token write-back.
+
 ## First authentication (interactive, ~1 min)
 
 ```powershell
@@ -52,6 +54,7 @@ poetry run aihf
 - **Pre-session**: reconciliation reads account-scoped SIM positions (`/port/v1/positions` with `ClientKey` + `AccountKey`) and accounting cash (`/port/v1/balances` → `CashBalance`); balances and account must report USD. Mismatch refuses broker startup before trading.
 - **Universe check**: every fund ticker resolves via the two-call flow (instruments search → instrument details) before the first order; unresolved or untradable tickers refuse the session.
 - **Orders**: session decisions place market orders (`ManualOrder: false`); fills appear in the SIM account and the ledger records **Saxo's simulated execution price** for each order (order-correlated from the transaction/execution records — not a yfinance estimate, and not the position's average acquisition cost).
+- **Risk ordering**: Saxo orders keep the usual sell-first order where possible, but are reordered when a projected intermediate book would exceed a limit or worsen an existing breach. This check uses sizing marks; actual fills and prices can differ from the projection.
 - **Costs**: omitted Saxo spread and commission default to zero; explicit mandate costs remain honored. Paper costs and serialization stay unchanged.
 - **Sanity check**: compare each fill price against the yfinance price at trade time — SIM fills are simulated, so expect approximate (not exact) agreement.
 
@@ -59,7 +62,8 @@ poetry run aihf
 
 - **No live stock prices on SIM** (only FxSpot) — the engine keeps using yfinance for market data; OpenAPI price endpoints are unused.
 - **Lot precision** comes from instrument details; below-lot rebalance dust is suppressed before submission. Each submitted order still requires a complete correlated fill.
-- **Market-closed orders** are rejected synchronously (`MarketClosed` expected). The unattended Saxo runner does not carry a pending bar past 16:00 ET; manual or other off-schedule order attempts may still receive this error.
+- **Market-closed orders** are rejected synchronously (`MarketClosed` expected). The unattended Saxo runner checks the cutoff before each order POST. If it arrives mid-basket, completed fills are recorded and the remaining unsent orders are shown as deferred; the next valid bar reassesses against the broker book and follows the normal approval gate. Confirmed fills are also journaled as `broker_fill` events before the next order. Manual or other off-schedule order attempts may still receive this error.
+- **Fill-journal or session-advance failure** stops execution and attempts to persist the halt. Inspect the authoritative SIM book before recovery, especially if the event journal could not be written.
 - **SIM resets** are self-service; after a reset, reconciliation reports the mismatch and refuses until you decide.
 - **Token rotation**: if a run crashes between refresh and write-back (should not happen — write-back precedes use), re-run the auth command.
 

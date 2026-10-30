@@ -49,10 +49,10 @@ State machine: `UNAUTHENTICATED → AUTHORIZED → (refresh loop) → REAUTH_REQ
 
 Methods (protocol): `positions() -> dict[str, Position]`, `cash() -> float`, `place_order(Order) -> Fill`.
 
-- `positions()`: `GET /port/v1/positions` with `ClientKey` and `AccountKey` → group by `NetPositionId`, map ticker from instrument lookup, signed `Amount` → shared model `Position(ticker, shares)`.
+- `positions()`: `GET /port/v1/positions` with `ClientKey` and `AccountKey` → validate the list-valued `Data` on every page, aggregate all pages, map ticker from instrument lookup, signed `Amount` → shared model `Position(ticker, shares)`. An invalid or failed page fails the whole snapshot.
 - `cash()`: `GET /port/v1/balances` with `ClientKey` and `AccountKey` → **`CashBalance`**. `CashAvailableForTrading` is used only for order affordability. Account and balance currency must be USD.
 - `filter_orders()`: copy orders with quantities rounded down to lot multiples; drop below-lot dust. Cycle ledger records those adjusted orders. Pipeline revalidates projected position and gross limits after filtering, before any POST. `place_order()` returns a complete correlated `Fill` or raises for every submitted order.
-- Post-filter risk gate rejects a position or gross-limit breach only when filtered exposure worsens the same metric versus the current book; de-risking orders may reduce an existing breach without reaching the cap.
+- Post-filter risk gate rejects a position or gross-limit breach only when filtered exposure worsens the same metric versus the current book; de-risking orders may reduce an existing breach without reaching the cap. Saxo keeps sell-first order when safe, but reorders as needed so every projected prefix obeys that same rule at sizing marks.
 - `place_order(order)`: validate universe → build payload (`Uic`, `AssetType: "Stock"`, `Amount` shares, `BuySell`, `OrderType: "Market"`, `DayOrder`, `ManualOrder: false`) → pacer wait → POST with unique `x-request-id` → **inspect body**: `ErrorInfo` present ⇒ `SaxoOrderError` (message includes Saxo's ErrorCode, e.g. `MarketClosed`, `InsufficientCash`); `OrderId` present ⇒ poll open-order until gone (deadline 120 s) → **read the order-correlated executed quantity/price from the execution/transaction records tied to that OrderId** (a position's `OpenPrice`/`Amount` describe the holding, not this execution: reductions keep the old acquisition cost, full exits leave no position row) → return complete `Fill(ticker, side, quantity, price)` or raise. **Never re-POSTs**; 409 ⇒ inspect state, raise if unresolved.
 
 ### Secret references (1Password item schema, `Saxo OpenAPI SIM` item)
@@ -63,7 +63,11 @@ Methods (protocol): `positions() -> dict[str, Position]`, `cash() -> float`, `pl
 | App secret | `Saxo OpenAPI SIM/app-secret` | no |
 | Refresh token | `Saxo OpenAPI SIM/refresh-token` | **yes — written back after every refresh** |
 
-`provider.py` resolves `op://` references via `op read`. For token write-back, fetch the item JSON template with `op item get --format=json --reveal`, update the referenced field, then pipe JSON to `op item edit`; token never appears in argv. Redirect URI and lock directory are non-secret config.
+`provider.py` resolves `op://` references via `op read`. For token write-back, fetch the item JSON template with `op item get --format=json --reveal`, update the referenced field (including an optional section), then pipe JSON to `op item edit`; token never appears in argv. Redirect URI and lock directory are non-secret config.
+
+### Deferred session execution
+
+The unattended runner supplies a scoped 16:00 ET cutoff to the Saxo client. `CycleRecord.orders` and `fills` contain only completed executions; `deferred_orders` and `deferral_reason` record the unsubmitted remainder when the cutoff is reached. The new fields are omitted when empty, preserving historical session hashes. Confirmed Saxo fills are appended as `broker_fill` events before the next order. The next valid bar sizes a newly assessed decision against the reconciled broker book and follows the normal approval gate; it does not replay deferred quantities.
 
 ### FundSpec / DeployedFund / factory / TUI (modified + new)
 

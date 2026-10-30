@@ -66,6 +66,8 @@
 
 > T026 done (2026-10-30), chunked on Windows: changed Python files pass Black, isort, and Flake8 (repository-wide baseline findings in untouched files left as-is); no UTF-8 BOM. paper+brokers+secrets+fund+pipeline: 304 passed, 3 baseline failures (two redo `os.rename`, stale-PID `os.kill`). tui: 73 passed, 2 baseline failures (home file-mode, paper-view `%-d`). backtesting+features+root: 95 passed, 1 baseline failure (intraday `%-d`). Earlier unaffected chunks: data 185 passed/36 skipped (with pipeline); portfolio/risk/scorecard/signals 132 passed; non-Ollama LLM 147 passed. Total: exactly the 6 documented baseline failures. `tui/test_paper.py::test_paper_screen_space_starts_and_stops_a_runner_at_any_cadence` interrupts the Windows console (`os.kill(pid, 0)` is `CTRL_C_EVENT`) identically on `origin/main`; pre-existing, deselected. The Ollama client tests were excluded per user direction.
 
+> PR #2 review-fix validation, chunked on Windows: 1,043 passed, 36 skipped, and the same 6 baseline failures. Four cases were deselected: two Ollama cases and two parametrizations of the Windows runner-control test that interrupts the test process. Poetry was unavailable, so the existing verification virtualenv was used. Modified Python files pass Black, isort, and Flake8 at 420 columns; repository-wide gates still report pre-existing findings in untouched files. No live Saxo or 1Password requests were made.
+
 ## Dependencies
 
 - T001 -> T002 -> T003-T010 (foundational; secrets provider T003/T004 before token manager T005/T006) -> US1 (T011-T014) -> US2 (T015-T018) -> US3 (T019-T020) -> US4 (T021-T024) -> Polish (T025-T026)
