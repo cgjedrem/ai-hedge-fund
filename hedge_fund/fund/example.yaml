@@ -34,6 +34,7 @@ costs:                        # what every fill costs; these are the defaults
   # commission_bps: 8         # percent of the order's value (Saxo-style shops)
   # min_commission_per_order: 1  # smallest commission per order, in dollars
   # zero on all of it means free fills
+# min_order_pct_of_equity: 1   # skip orders worth less than 1% of equity; 0 (default) trades everything
 capital: 100000
 rebalance: weekly             # minute | daily | weekly | monthly — interval/window apply only to minute funds
 # approval_required: true      # optional; default false

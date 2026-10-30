@@ -158,7 +158,7 @@ def test_invalid_projected_orders_fail_before_submission(monkeypatch):
     monkeypatch.setattr(
         pipeline,
         "build_orders",
-        lambda *args: [
+        lambda *args, **kwargs: [
             Order(ticker="A", side="buy", quantity=1000, price=200),
         ],
     )

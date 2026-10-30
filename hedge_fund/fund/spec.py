@@ -162,6 +162,11 @@ class FundSpec(BaseModel):
         default_factory=TradingCosts,
         description="what every fill costs: half-spread per side and commission per share",
     )
+    min_order_pct_of_equity: float = Field(
+        default=0.0,
+        ge=0,
+        description="skip rebalance orders worth less than this percent of equity; 0 disables the gate",
+    )
     approval_required: bool = Field(default=False, strict=True, description="require approval before executing pending decisions")
     capital: float = Field(default=100_000.0, gt=0)
     rebalance: Cadence = Field(
@@ -227,6 +232,8 @@ class FundSpec(BaseModel):
             data.pop("window", None)
         if self.broker == "paper" and self.costs == TradingCosts():
             data.pop("costs", None)
+        if self.min_order_pct_of_equity == 0:
+            data.pop("min_order_pct_of_equity", None)
         if not self.approval_required:
             data.pop("approval_required", None)
         if self.broker == "paper":
