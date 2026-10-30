@@ -1,10 +1,12 @@
 import json
 
 import pytest
+import yaml
 from fastapi.testclient import TestClient
 
 from hedge_fund.paper.ledger import Ledger
 from hedge_fund.web.app import create_app
+from hedge_fund.web.schemas import DeployRequest
 from hedge_fund.web.services import DeskService, ServiceError
 
 
@@ -66,6 +68,70 @@ def test_catalog_preserves_canonical_library_models_and_blend(demo_root):
         "gross_target": 1.0,
         "mode": "long_short",
     }
+
+
+def test_mandate_detail_api_resolves_yml_file_by_spec_name(demo_root, tmp_path):
+    payload = yaml.safe_load((demo_root / "mandates" / "demo-quality.yaml").read_text(encoding="utf-8"))
+    payload["name"] = "legacy-mandate"
+    directory = tmp_path / "mandates"
+    directory.mkdir()
+    (directory / "legacy-file.yml").write_text(yaml.safe_dump(payload), encoding="utf-8")
+
+    with TestClient(create_app(root=tmp_path)) as client:
+        headers = {"host": "127.0.0.1"}
+        collection = client.get("/api/mandates", headers=headers)
+        detail = client.get("/api/mandates/legacy-mandate", headers=headers)
+
+    assert collection.status_code == 200
+    assert [item["name"] for item in collection.json()["items"]] == ["legacy-mandate"]
+    assert detail.status_code == 200
+    assert detail.json()["name"] == "legacy-mandate"
+    assert detail.json()["spec"]["name"] == "legacy-mandate"
+
+
+def test_deploy_resolves_yml_file_by_spec_name(demo_root, tmp_path):
+    payload = yaml.safe_load((demo_root / "mandates" / "demo-quality.yaml").read_text(encoding="utf-8"))
+    payload["name"] = "legacy-mandate"
+    directory = tmp_path / "mandates"
+    directory.mkdir()
+    (directory / "legacy-file.yml").write_text(yaml.safe_dump(payload), encoding="utf-8")
+    service = DeskService(tmp_path, allow_writes=True)
+
+    deployed = service.deploy_mandate("legacy-mandate", DeployRequest(universe=["AAPL"]))
+    service.close()
+
+    assert deployed["name"] == "legacy-mandate"
+    assert (tmp_path / "paper" / "legacy-mandate" / "fund.yaml").is_file()
+
+
+def test_mandate_detail_rejects_ambiguous_spec_names(demo_root, tmp_path):
+    payload = yaml.safe_load((demo_root / "mandates" / "demo-quality.yaml").read_text(encoding="utf-8"))
+    directory = tmp_path / "mandates"
+    directory.mkdir()
+    (directory / "first.yaml").write_text(yaml.safe_dump(payload), encoding="utf-8")
+    (directory / "second.yml").write_text(yaml.safe_dump(payload), encoding="utf-8")
+    service = DeskService(tmp_path)
+
+    with pytest.raises(ServiceError) as conflict:
+        service.get_mandate(payload["name"])
+    service.close()
+
+    assert conflict.value.status_code == 409
+    assert conflict.value.detail == "Multiple mandates share this name."
+
+
+def test_mandate_detail_keeps_invalid_exact_file_error(tmp_path):
+    directory = tmp_path / "mandates"
+    directory.mkdir()
+    (directory / "broken.yaml").write_text("schema_version: [", encoding="utf-8")
+    service = DeskService(tmp_path)
+
+    with pytest.raises(ServiceError) as invalid:
+        service.get_mandate("broken")
+    service.close()
+
+    assert invalid.value.status_code == 422
+    assert invalid.value.detail == "Mandate is invalid (ValueError)."
 
 
 def test_corrupt_ledger_is_reported_instead_of_becoming_an_empty_valid_snapshot(demo_root):

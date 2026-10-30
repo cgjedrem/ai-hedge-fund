@@ -168,14 +168,8 @@ class DeskService:
 
     def get_mandate(self, name: str) -> dict:
         normalized = self._validated_name(name)
-        path = self._safe_child("mandates", f"{normalized}.yaml")
-        if not path.is_file():
-            raise ServiceError(404, "Mandate not found.")
-        try:
-            spec = load_spec(path)
-            _reject_secret_fields(spec.model_dump(mode="python"))
-        except (OSError, ValueError) as exc:
-            raise ServiceError(422, f"Mandate is invalid ({type(exc).__name__}).") from None
+        spec = self._load_mandate_by_name(normalized)
+        _reject_secret_fields(spec.model_dump(mode="python"))
         return self._mandate_summary(spec, include_spec=True)
 
     def create_mandate(self, payload: dict) -> dict:
@@ -208,14 +202,8 @@ class DeskService:
         except ValueError:
             raise ServiceError(422, "Deployment universe is invalid.") from None
         with self._fund_lock(normalized):
-            mandate_path = self._safe_child("mandates", f"{normalized}.yaml")
-            if not mandate_path.is_file():
-                raise ServiceError(404, "Mandate not found.")
-            try:
-                spec = load_spec(mandate_path)
-                _reject_secret_fields(spec.model_dump(mode="python"))
-            except (OSError, ValueError) as exc:
-                raise ServiceError(422, f"Mandate is invalid ({type(exc).__name__}).") from None
+            spec = self._load_mandate_by_name(normalized)
+            _reject_secret_fields(spec.model_dump(mode="python"))
             paper_root = self._ensure_dir("paper")
             self._assert_unique(paper_root, normalized)
             try:
@@ -403,12 +391,9 @@ class DeskService:
             raise ServiceError(403, "Network capability is disabled; restart with explicit network consent.")
         name = self._validated_name(request.fund)
         self._guard_protected(name)
-        mandate_path = self._safe_child("mandates", f"{name}.yaml")
-        if not mandate_path.is_file():
-            raise ServiceError(404, "Mandate not found.")
+        spec = self._load_mandate_by_name(name)
+        _reject_secret_fields(spec.model_dump(mode="python"))
         try:
-            spec = load_spec(mandate_path)
-            _reject_secret_fields(spec.model_dump(mode="python"))
             universe = normalize_universe(request.universe)
         except (OSError, ValueError) as exc:
             raise ServiceError(422, f"Backtest request is invalid ({type(exc).__name__}).") from None
@@ -813,6 +798,45 @@ class DeskService:
             return validate_fund_name(name)
         except ValueError:
             raise ServiceError(422, "Fund name is invalid.") from None
+
+    def _load_mandate_by_name(self, name: str) -> FundSpec:
+        directory = self._safe_child("mandates")
+        if not directory.exists():
+            raise ServiceError(404, "Mandate not found.")
+        if not directory.is_dir():
+            raise ServiceError(409, "Mandate storage is not a directory.")
+        name_key = _windows_name_key(name)
+        matches = []
+        invalid_type = None
+        try:
+            paths = sorted(directory.iterdir(), key=lambda entry: entry.name.casefold())
+        except OSError as exc:
+            raise ServiceError(409, f"Mandate storage could not be read ({type(exc).__name__}).") from None
+        for path in paths:
+            if path.suffix.lower() not in {".yaml", ".yml"}:
+                continue
+            try:
+                safe_path = self._safe_child("mandates", path.name)
+                if not safe_path.is_file():
+                    continue
+                spec = load_spec(safe_path)
+            except ServiceError:
+                if _windows_name_key(path.stem) == name_key:
+                    raise
+                continue
+            except (OSError, ValueError) as exc:
+                if _windows_name_key(path.stem) == name_key:
+                    invalid_type = type(exc).__name__
+                continue
+            if _windows_name_key(spec.name) == name_key:
+                matches.append(spec)
+        if len(matches) > 1:
+            raise ServiceError(409, "Multiple mandates share this name.")
+        if matches:
+            return matches[0]
+        if invalid_type is not None:
+            raise ServiceError(422, f"Mandate is invalid ({invalid_type}).")
+        raise ServiceError(404, "Mandate not found.")
 
     def _guard_protected(self, name: str) -> None:
         if _windows_name_key(name) in {_windows_name_key(entry) for entry in PROTECTED_NAMES}:
