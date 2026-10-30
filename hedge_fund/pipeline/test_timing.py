@@ -316,6 +316,56 @@ def test_filtered_orders_that_worsen_gross_exposure_fail_before_submission():
     broker.place_order.assert_not_called()
 
 
+def test_gate_restores_skipped_trims_when_the_gated_basket_would_breach_gross():
+    analyst = DatedAnalyst({FRIDAY: 1, "2024-06-09": 1})
+    fund, _ = make_fund(analyst)
+    spec = fund.spec.model_copy(update={"min_order_pct_of_equity": 1})
+    fund = Fund(spec, models={"macro": [analyst]})
+    data = FakeDataClient(
+        {
+            "SPY": {FRIDAY: 100, MONDAY: 101},
+            "A": {FRIDAY: 100, MONDAY: 100},
+            "B": {FRIDAY: 100, MONDAY: 100},
+        }
+    )
+    proposal = assess_fund(fund, FRIDAY, data, ["A", "B"])
+    assert proposal.final_weights == {"A": 0.5, "B": 0.5}
+    broker = SimBroker(10_000)
+    broker.place_order(Order(ticker="A", side="buy", quantity=50.3, price=100))
+    broker.place_order(Order(ticker="B", side="buy", quantity=40, price=100))
+
+    # Gated alone: the $30 A trim (0.3% of equity) is skipped, the B buy
+    # lifts gross to 100.3% — over the limit. The trim must come back.
+    record = execute_decision(fund, proposal, MONDAY, broker, data)
+
+    assert [(o.ticker, o.side, o.quantity) for o in record.orders] == [("A", "sell", 0.3), ("B", "buy", 10)]
+    assert record.positions == pytest.approx({"A": 50, "B": 50})
+
+
+def test_gate_keeps_skipping_trims_when_the_basket_is_within_limits():
+    analyst = DatedAnalyst({FRIDAY: 1, "2024-06-09": 1})
+    fund, _ = make_fund(analyst)
+    spec = fund.spec.model_copy(update={"min_order_pct_of_equity": 1})
+    fund = Fund(spec, models={"macro": [analyst]})
+    data = FakeDataClient(
+        {
+            "SPY": {FRIDAY: 100, MONDAY: 101},
+            "A": {FRIDAY: 100, MONDAY: 100},
+            "B": {FRIDAY: 100, MONDAY: 100},
+        }
+    )
+    proposal = assess_fund(fund, FRIDAY, data, ["A", "B"])
+    broker = SimBroker(10_000)
+    broker.place_order(Order(ticker="A", side="buy", quantity=50.3, price=100))
+    broker.place_order(Order(ticker="B", side="buy", quantity=60, price=100))
+
+    # Gated basket only de-risks (gross 110.3% -> 100.3%), which the limits
+    # allow, so the $30 A trim stays skipped.
+    record = execute_decision(fund, proposal, MONDAY, broker, data)
+
+    assert [(o.ticker, o.side, o.quantity) for o in record.orders] == [("B", "sell", 10)]
+
+
 def _rotation(broker_name, *, initial_quantity, target_sign, defer_after=None, target_views=None, quantity_caps=None):
     views = target_views or {"B": target_sign}
 

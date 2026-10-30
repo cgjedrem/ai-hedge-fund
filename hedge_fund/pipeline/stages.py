@@ -15,7 +15,7 @@ from datetime import timedelta
 from math import isfinite
 from typing import Callable
 
-from hedge_fund.brokers.models import Fill, Order
+from hedge_fund.brokers.models import Fill, Order, Position
 from hedge_fund.brokers.protocol import Broker, OrderSubmissionDeferred
 from hedge_fund.data.protocol import DataClient
 from hedge_fund.fund import Fund, normalize_universe
@@ -174,7 +174,17 @@ def execute_decision(
         if not isfinite(projected_gross) or violates_limit(projected_gross, current_gross, spec.risk.max_gross_exposure):
             raise ValueError(f"projected portfolio violates max_gross_exposure{suffix}")
 
-    validate_projected_orders(orders)
+    try:
+        validate_projected_orders(orders)
+    except ValueError:
+        if not spec.min_order_pct_of_equity:
+            raise
+        # The cost gate may have skipped trims the risk limits rely on. Put
+        # back every skipped order that shrinks a position — each can only
+        # lower exposure, so this is never less safe than the ungated basket.
+        kept = {order.ticker for order in orders}
+        orders = [order for order in build_orders(targets, held, marks, equity_before) if order.ticker in kept or _shrinks(order, held)]
+        validate_projected_orders(orders)
     filter_orders = getattr(broker, "filter_orders", None)
     if callable(filter_orders):
         orders = filter_orders(orders)
@@ -247,6 +257,13 @@ def mark_lookback_start(as_of: str) -> str:
 # ---------------------------------------------------------------------------
 # Private helpers
 # ---------------------------------------------------------------------------
+
+
+def _shrinks(order: Order, held: dict[str, Position]) -> bool:
+    """Does *order* move its position closer to flat?"""
+    current = held[order.ticker].shares if order.ticker in held else 0
+    delta = order.quantity if order.side == "buy" else -order.quantity
+    return abs(current + delta) < abs(current)
 
 
 def _mark_prices(
