@@ -34,7 +34,8 @@ def build_orders(
     equity are skipped — at per-order-minimum brokers a $1 fee to move $5 of
     dust is pure drag. Applies to closes too: dust below the threshold stays
     in the book and is re-evaluated each cycle, exiting only if it grows past
-    the threshold.
+    the threshold. execute_decision puts skipped trims back when the gated
+    basket alone would breach a risk limit.
 
     Ordering: all sells first, then buys, alphabetical within each group —
     deterministic, and sells free the cash that buys consume within the
