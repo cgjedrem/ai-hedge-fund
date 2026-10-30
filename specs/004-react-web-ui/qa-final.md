@@ -26,4 +26,4 @@ No Critical or Important findings remain in the final bounded review. Three repa
 - All 17 final synthetic screenshots copied from the execution artifact set into `screenshots/`. No real-fund screenshot is committed.
 - Evidence harness copies preserved in the coordinator session's `files/final-runtime/` artifact directory. Exact source/build hashes, timing and environment are in acceptance-evidence.md.
 
-Final merge remains the user's decision. Automated PR review, if not yet available, is a separate open review item, not an implementation acceptance claim.
+Final merge remains the user's decision. Copilot review requested after implementation push; a single poll returned no reviews or inline comments and no CI checks. Awaiting Copilot review is a separate open review item, not an implementation acceptance or automated zero-findings claim.

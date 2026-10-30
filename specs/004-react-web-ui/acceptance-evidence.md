@@ -1,6 +1,6 @@
 # Acceptance Evidence
 
-Latest status after QA repair cycle 3: F1–F3 repairs are committed at `01c62a1e983dcd15c2a199ebbfadb032052f0d05`; final E2E fixture parity is committed at source HEAD `b3c51783e71e14cb3179880c8a98fa6c9607f9a3`. Final checks and detached default-root preview evidence follow below. Independent final QA passed with accepted nonblocking caveats in qa-final.md; T024 is complete. Protected-root content identity remains INCONCLUSIVE; React/TUI parity remains partial; do not retire the TUI. T025 tracks final PR handoff. Cycle-two evidence remains historical.
+Latest status after QA repair cycle 3: F1–F3 repairs are committed at `01c62a1e983dcd15c2a199ebbfadb032052f0d05`; final E2E fixture parity is committed at source HEAD `b3c51783e71e14cb3179880c8a98fa6c9607f9a3`. Final checks and detached default-root preview evidence follow below. Independent final QA passed with accepted nonblocking caveats in qa-final.md; T024/T025 are complete. PR #7 targets main and remains open/unmerged with full run instructions, screenshots and parity/safety limitations. Copilot review was requested; the single post-push poll showed no review or inline comments and no CI checks, so automated review remains awaiting. Protected-root content identity remains INCONCLUSIVE; React/TUI parity remains partial; do not retire the TUI. Cycle-two evidence remains historical.
 
 Cycle-one and cycle-two sections below are historical; cycle-three final-artifact evidence follows them.
 
