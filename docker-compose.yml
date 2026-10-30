@@ -27,6 +27,16 @@ services:
       - ~/.hedge-fund:/root/.hedge-fund
     command: paper run watchtower
 
+  # The weekly comparison copy of watchtower: same mandate, weekly cadence.
+  runner-weekly:
+    build: .
+    restart: unless-stopped
+    environment:
+      - OLLAMA_BASE_URL=http://host.docker.internal:11434
+    volumes:
+      - ~/.hedge-fund:/root/.hedge-fund
+    command: paper run watchtower-weekly
+
   tui:
     profiles: ["tui"]
     build: .
