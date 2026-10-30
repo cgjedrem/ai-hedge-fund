@@ -20,6 +20,7 @@ def build_orders(
     positions: dict[str, Position],
     marks: dict[str, float],
     equity: float,
+    min_order_pct: float = 0.0,
 ) -> list[Order]:
     """Diff the target book against the broker's current book.
 
@@ -28,6 +29,12 @@ def build_orders(
     exceeds its allocation (and a short never grows past its target in
     magnitude); sub-4dp dust stays in cash and is re-evaluated next cycle.
     Orders below the 4dp precision (|quantity| < 0.0001) are not emitted.
+
+    Cost gate: when min_order_pct > 0, orders worth less than that percent of
+    equity are skipped — at per-order-minimum brokers a $1 fee to move $5 of
+    dust is pure drag. Applies to closes too: dust below the threshold stays
+    in the book and is re-evaluated each cycle, exiting only if it grows past
+    the threshold.
 
     Ordering: all sells first, then buys, alphabetical within each group —
     deterministic, and sells free the cash that buys consume within the
@@ -48,6 +55,8 @@ def build_orders(
         # them an ulp off a clean multiple.
         delta = round(target_shares - round(current_shares, 4), 4)
         if delta == 0:
+            continue
+        if min_order_pct > 0 and abs(delta) * mark < equity * min_order_pct / 100.0:
             continue
         order = Order(
             ticker=ticker,

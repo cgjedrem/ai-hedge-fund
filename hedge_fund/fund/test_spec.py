@@ -123,10 +123,29 @@ def test_costs_default_to_a_real_cost_model_and_serialize_only_when_changed():
     explicit = FundSpec(**{**MINIMAL, "costs": {"spread_bps": 5, "commission_per_share": 0.005}})
     assert explicit.model_dump_json() == spec.model_dump_json()
     free = FundSpec(**{**MINIMAL, "costs": {"spread_bps": 0, "commission_per_share": 0}})
-    assert free.model_dump()["costs"] == {"spread_bps": 0.0, "commission_per_share": 0.0}
+    assert free.model_dump()["costs"] == {
+        "spread_bps": 0.0,
+        "commission_per_share": 0.0,
+        "commission_bps": 0.0,
+        "min_commission_per_order": 0.0,
+    }
     assert FundSpec.model_validate(free.model_dump()) == free
     with pytest.raises(ValidationError):
         FundSpec(**{**MINIMAL, "costs": {"spread_bps": -1}})
+
+
+def test_min_order_gate_defaults_off_and_serializes_only_when_set():
+    spec = FundSpec(**MINIMAL)
+    assert spec.min_order_pct_of_equity == 0.0
+    # A mandate at the default serializes exactly as it did before the gate
+    # existed, so every recorded hash still verifies.
+    assert "min_order_pct_of_equity" not in spec.model_dump()
+    assert spec.model_dump_json() == LEGACY_DEFAULT_JSON
+    gated = FundSpec(**{**MINIMAL, "min_order_pct_of_equity": 1.0})
+    assert json.loads(gated.model_dump_json())["min_order_pct_of_equity"] == 1.0
+    assert FundSpec.model_validate(gated.model_dump()) == gated
+    with pytest.raises(ValidationError):
+        FundSpec(**{**MINIMAL, "min_order_pct_of_equity": -0.5})
 
 
 def test_approval_default_preserves_pre_feature_serialization():

@@ -72,3 +72,35 @@ def test_short_target_sells_past_zero():
     assert len(orders) == 1
     assert orders[0].side == "sell"
     assert orders[0].quantity == 20
+
+
+def test_min_order_gate_off_by_default():
+    # no threshold -> a $30 order still trades (pre-gate behavior preserved)
+    orders = build_orders({"AAPL": 0.003}, {}, {"AAPL": 100.0}, equity=10_000.0)
+    assert len(orders) == 1
+
+
+def test_min_order_gate_skips_orders_below_the_threshold():
+    # 0.003 * 10_000 = $30 < 1% of equity ($100) -> skipped
+    orders = build_orders({"AAPL": 0.003}, {}, {"AAPL": 100.0}, equity=10_000.0, min_order_pct=1.0)
+    assert orders == []
+
+
+def test_min_order_gate_passes_meaningful_orders():
+    orders = build_orders({"AAPL": 0.25}, {}, {"AAPL": 100.0}, equity=10_000.0, min_order_pct=1.0)
+    assert len(orders) == 1
+    assert orders[0].side == "buy"
+
+
+def test_min_order_gate_trades_at_the_threshold():
+    # exactly 1% of equity -> trades; the gate is strict less-than
+    orders = build_orders({"AAPL": 0.01}, {}, {"AAPL": 100.0}, equity=10_000.0, min_order_pct=1.0)
+    assert len(orders) == 1
+
+
+def test_min_order_gate_skips_dust_exits_too():
+    # closing a $30 dust position is skipped as well — paying a per-order
+    # minimum to move dust is the waste the gate exists to stop; the dust
+    # stays in the book and exits only if it grows past the threshold
+    orders = build_orders({}, _positions(AAPL=0.3), {"AAPL": 100.0}, equity=10_000.0, min_order_pct=1.0)
+    assert orders == []

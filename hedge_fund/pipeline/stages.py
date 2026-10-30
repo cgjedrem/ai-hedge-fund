@@ -154,7 +154,7 @@ def execute_decision(
     equity_before = cash_before + sum(p.shares * marks[t] for t, p in held.items())
     if not isfinite(equity_before) or equity_before <= 0:
         raise ValueError(f"{spec.name}: equity on {session} must be finite and positive")
-    orders = build_orders(targets, held, marks, equity_before)
+    orders = build_orders(targets, held, marks, equity_before, min_order_pct=spec.min_order_pct_of_equity)
     current_weights = {t: p.shares * marks[t] / equity_before for t, p in held.items()}
     current_gross = sum(abs(weight) for weight in current_weights.values())
 
