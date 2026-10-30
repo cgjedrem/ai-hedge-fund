@@ -27,6 +27,66 @@ from hedge_fund.web.services import DeskService, ServiceError
 
 _SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
 _CSP = "default-src 'self'; " "script-src 'self'; " "style-src 'self' 'unsafe-inline'; " "img-src 'self' data:; " "font-src 'self'; " "connect-src 'self'; " "object-src 'none'; " "base-uri 'self'; " "frame-ancestors 'none'; " "form-action 'self'"
+_MAX_REQUEST_BODY_BYTES = 1_000_000
+
+
+class RequestBodyLimitMiddleware:
+    def __init__(self, app, max_bytes: int = _MAX_REQUEST_BODY_BYTES) -> None:
+        self.app = app
+        self.max_bytes = max_bytes
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        length = next(
+            (value for name, value in scope.get("headers", []) if name.lower() == b"content-length"),
+            None,
+        )
+        if length is not None:
+            try:
+                if int(length) > self.max_bytes:
+                    await self._reject(scope, send)
+                    return
+            except ValueError:
+                pass
+
+        body = bytearray()
+        while True:
+            message = await receive()
+            if message["type"] == "http.disconnect":
+                return
+            if message["type"] != "http.request":
+                continue
+            chunk = message.get("body", b"")
+            if len(body) + len(chunk) > self.max_bytes:
+                await self._reject(scope, send)
+                return
+            body.extend(chunk)
+            if not message.get("more_body", False):
+                break
+
+        payload = bytes(body)
+        replayed = False
+
+        async def replay_receive():
+            nonlocal replayed
+            if replayed:
+                return {"type": "http.disconnect"}
+            replayed = True
+            return {"type": "http.request", "body": payload, "more_body": False}
+
+        await self.app(scope, replay_receive, send)
+
+    async def _reject(self, scope, send) -> None:
+        response = JSONResponse({"detail": "Request body exceeds the 1 MB limit."}, status_code=413)
+        _security_headers(response, scope.get("path", ""))
+        await response(scope, _empty_receive, send)
+
+
+async def _empty_receive():
+    return {"type": "http.disconnect"}
 
 
 def create_app(
@@ -58,6 +118,7 @@ def create_app(
         docs_url=None,
         redoc_url=None,
     )
+    app.add_middleware(RequestBodyLimitMiddleware)
     app.state.service = service
     app.state.capability_token = token
     app.state.static_root = static_root
@@ -80,18 +141,8 @@ def create_app(
             elif request.method.upper() not in _SAFE_METHODS and not _valid_token(request.headers.get("x-csrf-token"), token):
                 response = JSONResponse({"detail": "Mutation token is missing or invalid."}, status_code=403)
             else:
-                content_length = request.headers.get("content-length")
-                if content_length is not None and content_length.isdigit() and int(content_length) > 1_000_000:
-                    response = JSONResponse({"detail": "Request body exceeds the 1 MB limit."}, status_code=413)
-                else:
-                    response = await call_next(request)
-        response.headers["Content-Security-Policy"] = _CSP
-        response.headers["X-Content-Type-Options"] = "nosniff"
-        response.headers["X-Frame-Options"] = "DENY"
-        response.headers["Referrer-Policy"] = "no-referrer"
-        response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
-        if request.url.path.startswith("/api/"):
-            response.headers["Cache-Control"] = "no-store"
+                response = await call_next(request)
+        _security_headers(response, request.url.path)
         return response
 
     @app.exception_handler(ServiceError)
@@ -188,6 +239,10 @@ def create_app(
     def job(job_id: str):
         return service.get_job(job_id)
 
+    @app.post("/api/jobs/{job_id}/cancel")
+    def cancel_job(job_id: str):
+        return service.cancel_job(job_id)
+
     @app.get("/api/settings")
     def settings():
         return service.settings()
@@ -258,6 +313,16 @@ def _valid_token(supplied: str | None, expected: str | None) -> bool:
     return supplied is not None and expected is not None and hmac.compare_digest(supplied, expected)
 
 
+def _security_headers(response: Response, path: str) -> None:
+    response.headers["Content-Security-Policy"] = _CSP
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    if path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-store"
+
+
 def _spa_response(static_root: Path | None, relative: str) -> Response:
     if static_root is None:
         return JSONResponse(
@@ -272,7 +337,7 @@ def _spa_response(static_root: Path | None, relative: str) -> Response:
             resolved = None
         if resolved is not None and resolved != static_root and static_root in resolved.parents and resolved.is_file():
             return FileResponse(resolved)
-        if Path(relative).suffix:
+        if relative.startswith("assets/"):
             return JSONResponse({"detail": "Asset not found."}, status_code=404)
     index = static_root / "index.html"
     if not index.is_file() or index.is_symlink():

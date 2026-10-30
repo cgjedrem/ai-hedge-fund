@@ -58,6 +58,9 @@ class BacktestRequest(RequestModel):
     universe: list[str] = Field(min_length=1, max_length=20)
     start: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
     end: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
+    provider: str = Field(pattern=r"^[a-z0-9_-]{1,32}$")
+    model: str = Field(min_length=1, max_length=120)
+    agent_count: int = Field(ge=1, le=100)
 
     @field_validator("universe")
     @classmethod

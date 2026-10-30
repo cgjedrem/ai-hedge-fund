@@ -3,7 +3,7 @@
 The implementation must publish exact commands in README. Planned workflow:
 
 1. Install Python dependencies through Poetry and frontend dependencies through the lockfile.
-2. Build production frontend; start web UI with one make target or `poetry run aihf-web`.
+2. Build production frontend; use `make web` where GNU Make is available or `poetry run aihf-web --build --demo` on Windows. The plain launcher requires an existing static bundle.
 3. Default startup reads the existing home without writes/network; isolated demo flag supplies synthetic data.
 4. Open loopback URL and inspect home, funds, builder, paper list/detail, session reports, research/backtests, scorecards, settings and command palette.
 5. Test mutations only in a temporary root with fake dependencies. Never enable writes on protected live funds for acceptance.

@@ -1,4 +1,4 @@
-import { AlertCircle, ArrowRight, Clock3, FlaskConical, RefreshCw } from "lucide-react";
+import { AlertCircle, ArrowRight, CircleStop, Clock3, FlaskConical, RefreshCw } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 
@@ -8,6 +8,14 @@ import { Alert } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
@@ -19,8 +27,18 @@ import {
 } from "@/components/ui/select";
 import { apiPost } from "@/lib/api";
 import { useDesk, useResource } from "@/lib/hooks";
-import type { Job, MandateCollection } from "@/lib/types";
+import type { Job, MandateCollection, Settings } from "@/lib/types";
 import { dateLabel } from "@/lib/utils";
+
+interface BacktestSubmission {
+  fund: string;
+  universe: string[];
+  start: string;
+  end: string;
+  provider: string;
+  model: string;
+  agent_count: number;
+}
 
 function isoDate(date: Date): string {
   return date.toISOString().slice(0, 10);
@@ -29,6 +47,7 @@ function isoDate(date: Date): string {
 export function BacktestsPage() {
   const { capabilities } = useDesk();
   const mandates = useResource<MandateCollection>("/api/mandates");
+  const settings = useResource<Settings>("/api/settings");
   const jobs = useResource<{ items: Job[] }>("/api/jobs");
   const [jobId, setJobId] = useState<string | null>(null);
   const currentJob = useResource<Job>(jobId ? `/api/jobs/${encodeURIComponent(jobId)}` : null);
@@ -41,9 +60,15 @@ export function BacktestsPage() {
   });
   const [end, setEnd] = useState(() => isoDate(new Date()));
   const [busy, setBusy] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
+  const [confirmation, setConfirmation] = useState<BacktestSubmission | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const canRun = capabilities?.writes === true && capabilities.network === true;
+  const canWrite = capabilities?.writes === true;
+  const canRun = canWrite && capabilities?.network === true;
   const activeJob = currentJob.data;
+  const selectedMandate = mandates.data?.items.find((item) => item.name === fund) ?? null;
+  const selectedModel = settings.data?.models.find((item) => item.id === settings.data?.model) ?? null;
+  const running = Boolean(activeJob && ["queued", "running"].includes(activeJob.status));
 
   useEffect(() => {
     if (!activeJob || !["queued", "running"].includes(activeJob.status)) return;
@@ -66,7 +91,7 @@ export function BacktestsPage() {
     [],
   );
 
-  async function submit(): Promise<void> {
+  function requestConfirmation(): void {
     setError(null);
     if (!canRun) {
       setError("Backtests require startup write capability and explicit network consent.");
@@ -88,15 +113,54 @@ export function BacktestsPage() {
       setError("Choose valid dates in chronological order within a 730-day maximum range.");
       return;
     }
+    if (!selectedMandate || !settings.data || !selectedModel) {
+      setError("Mandate and provider settings must finish loading before confirmation.");
+      return;
+    }
+    setConfirmation({
+      fund,
+      universe,
+      start,
+      end,
+      provider: settings.data.data_provider,
+      model: settings.data.model,
+      agent_count: selectedMandate.agent_count,
+    });
+  }
+
+  async function submitConfirmed(): Promise<void> {
+    if (!confirmation) return;
+    if (!canRun) {
+      setError("Backtests require both startup write capability and explicit network consent.");
+      setConfirmation(null);
+      return;
+    }
     setBusy(true);
+    setError(null);
     try {
-      const job = await apiPost<Job>("/api/backtests", { fund, universe, start, end });
+      const job = await apiPost<Job>("/api/backtests", confirmation);
       setJobId(job.id);
+      setConfirmation(null);
       jobs.refresh();
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Backtest could not be submitted.");
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function cancelActiveJob(): Promise<void> {
+    if (!activeJob || !running || !canWrite || cancelling) return;
+    setCancelling(true);
+    setError(null);
+    try {
+      await apiPost(`/api/jobs/${encodeURIComponent(activeJob.id)}/cancel`);
+      currentJob.refresh();
+      jobs.refresh();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Cancellation request failed.");
+    } finally {
+      setCancelling(false);
     }
   }
 
@@ -136,7 +200,7 @@ export function BacktestsPage() {
             <div className="grid gap-4 sm:grid-cols-2">
               <div className="space-y-2 sm:col-span-2">
                 <Label htmlFor="backtest-fund">Mandate</Label>
-                <Select value={fund} onValueChange={setFund} disabled={mandates.loading || !mandates.data?.items.length || Boolean(activeJob && ["queued", "running"].includes(activeJob.status))}>
+                <Select value={fund} onValueChange={setFund} disabled={mandates.loading || !mandates.data?.items.length || running}>
                   <SelectTrigger id="backtest-fund"><SelectValue placeholder="Choose a saved mandate" /></SelectTrigger>
                   <SelectContent>
                     {(mandates.data?.items ?? []).map((item) => <SelectItem key={item.name} value={item.name}>{item.name}</SelectItem>)}
@@ -145,20 +209,20 @@ export function BacktestsPage() {
               </div>
               <div className="space-y-2 sm:col-span-2">
                 <Label htmlFor="backtest-universe">Ticker universe</Label>
-                <Input id="backtest-universe" value={universeText} onChange={(event) => setUniverseText(event.target.value)} placeholder="AAPL, MSFT, SPY" disabled={!canRun} />
+                <Input id="backtest-universe" value={universeText} onChange={(event) => setUniverseText(event.target.value)} placeholder="AAPL, MSFT, SPY" disabled={!canRun || running} />
                 <p className="text-[10px] text-muted-foreground">Up to 20 unique symbols · the fund benchmark is included by canonical valuation.</p>
               </div>
               <div className="space-y-2">
                 <Label htmlFor="backtest-start">Start date</Label>
-                <Input id="backtest-start" type="date" value={start} onChange={(event) => setStart(event.target.value)} disabled={!canRun} />
+                <Input id="backtest-start" type="date" value={start} onChange={(event) => setStart(event.target.value)} disabled={!canRun || running} />
               </div>
               <div className="space-y-2">
                 <Label htmlFor="backtest-end">End date</Label>
-                <Input id="backtest-end" type="date" value={end} onChange={(event) => setEnd(event.target.value)} disabled={!canRun} />
+                <Input id="backtest-end" type="date" value={end} onChange={(event) => setEnd(event.target.value)} disabled={!canRun || running} />
               </div>
             </div>
-            <Button className="w-full" onClick={() => void submit()} disabled={!canRun || busy || mandates.loading || !mandates.data?.items.length || Boolean(activeJob && ["queued", "running"].includes(activeJob.status))}>
-              <FlaskConical className="h-3.5 w-3.5" /> {busy ? "Submitting…" : "Submit backtest"}
+            <Button className="w-full" onClick={requestConfirmation} disabled={!canRun || busy || mandates.loading || settings.loading || !selectedMandate || !selectedModel || running}>
+              <FlaskConical className="h-3.5 w-3.5" /> Review backtest
             </Button>
           </CardContent>
         </Card>
@@ -198,6 +262,22 @@ export function BacktestsPage() {
                     <Link to={`/research/${encodeURIComponent(activeJob.report_id)}`}>Open saved report <ArrowRight className="h-3.5 w-3.5" /></Link>
                   </Button>
                 ) : null}
+                {running ? (
+                  <div className="mt-4 space-y-2">
+                    <Button
+                      className="w-full"
+                      variant="danger"
+                      onClick={() => void cancelActiveJob()}
+                      disabled={!canWrite || cancelling || activeJob.cancel_requested}
+                    >
+                      <CircleStop className="h-3.5 w-3.5" />
+                      {cancelling || activeJob.cancel_requested ? "Cancellation requested…" : "Request cancellation"}
+                    </Button>
+                    <p className="text-[10px] leading-relaxed text-muted-foreground">
+                      Cancellation is cooperative at valuation boundaries. Closing this page does not cancel the job; server shutdown requests cancellation and waits for active work.
+                    </p>
+                  </div>
+                ) : null}
               </div>
             ) : (
               <div className="flex min-h-32 flex-col items-center justify-center rounded-lg border border-dashed border-border px-4 text-center">
@@ -227,6 +307,44 @@ export function BacktestsPage() {
           ) : null}
         </CardContent>
       </Card>
+      <Dialog open={confirmation !== null} onOpenChange={(open) => { if (!open && !busy) setConfirmation(null); }}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Confirm historical backtest</DialogTitle>
+            <DialogDescription>
+              One research job will use these inputs. No automatic retry runs if it fails.
+            </DialogDescription>
+          </DialogHeader>
+          {confirmation ? (
+            <div className="space-y-4">
+              <dl className="grid gap-3 rounded-lg border border-border bg-black/10 p-4 text-xs sm:grid-cols-2">
+                <ConfirmationValue label="Mandate" value={confirmation.fund} />
+                <ConfirmationValue label="Agents" value={String(confirmation.agent_count)} />
+                <ConfirmationValue label="Market-data provider" value={confirmation.provider} />
+                <ConfirmationValue
+                  label="LLM model"
+                  value={selectedModel ? `${selectedModel.label} · ${selectedModel.provider}` : confirmation.model}
+                />
+                <ConfirmationValue label="Tickers" value={confirmation.universe.join(", ")} />
+                <ConfirmationValue label="Date range" value={`${confirmation.start} → ${confirmation.end}`} />
+              </dl>
+              <div className="grid gap-2 sm:grid-cols-2" aria-label="Required startup capabilities">
+                <CapabilityBadge label="Write capability" enabled={capabilities?.writes === true} />
+                <CapabilityBadge label="Network capability" enabled={capabilities?.network === true} />
+              </div>
+              <p className="text-[10px] leading-relaxed text-muted-foreground">
+                Confirm only if both capabilities are enabled and this provider/model/range is intended. A report write already underway is not interrupted by cancellation.
+              </p>
+            </div>
+          ) : null}
+          <DialogFooter>
+            <Button variant="ghost" onClick={() => setConfirmation(null)} disabled={busy}>Review later</Button>
+            <Button onClick={() => void submitConfirmed()} disabled={busy || !canRun}>
+              {busy ? "Submitting…" : "Confirm and submit"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </>
   );
 }
@@ -234,4 +352,22 @@ export function BacktestsPage() {
 function JobStatus({ status }: { status: Job["status"] }) {
   const variant = status === "succeeded" ? "positive" : status === "failed" ? "negative" : status === "running" ? "warning" : "muted";
   return <Badge variant={variant}>{status}</Badge>;
+}
+
+function ConfirmationValue({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="min-w-0">
+      <dt className="mono text-[9px] uppercase tracking-[0.14em] text-muted-foreground">{label}</dt>
+      <dd className="mt-1 break-words text-foreground">{value}</dd>
+    </div>
+  );
+}
+
+function CapabilityBadge({ label, enabled }: { label: string; enabled: boolean }) {
+  return (
+    <div className="flex items-center justify-between gap-3 rounded-md border border-border px-3 py-2 text-xs">
+      <span className="text-muted-foreground">{label}</span>
+      <Badge variant={enabled ? "positive" : "negative"}>{enabled ? "Enabled" : "Off"}</Badge>
+    </div>
+  );
 }

@@ -131,6 +131,8 @@ export function PaperDetailPage() {
   const protectedName = capabilities?.protected_names.some((entry) => entry.toLowerCase() === name.toLowerCase()) ?? false;
   const canWrite = capabilities?.writes === true && !protectedName;
   const data = resource.data;
+  const approvalRequired = data?.spec.approval_required === true;
+  const canApprove = canWrite && approvalRequired && !data?.halted && data?.ledger.ok === true;
 
   async function submitAction(): Promise<void> {
     if (!confirmAction) return;
@@ -248,7 +250,12 @@ export function PaperDetailPage() {
                     <Button variant="danger" onClick={() => { setFeedback(null); setHaltDialogOpen(true); }} disabled={!canWrite || Boolean(data.halted)}>
                       <CirclePause className="h-3.5 w-3.5" /> Halt
                     </Button>
-                    <Button variant="secondary" onClick={() => setConfirmAction("resume")} disabled={!canWrite || !data.halted}>
+                    <Button
+                      variant="secondary"
+                      onClick={() => setConfirmAction("resume")}
+                      disabled={!canWrite || !data.halted || !data.ledger.ok}
+                      title={!data.ledger.ok ? "Resume requires a valid, replayable ledger." : undefined}
+                    >
                       <CirclePlay className="h-3.5 w-3.5" /> Resume
                     </Button>
                   </div>
@@ -282,7 +289,9 @@ export function PaperDetailPage() {
               <PendingDecisionCard
                 pending={data.pending}
                 approval={data.approval}
-                enabled={canWrite}
+                approvalRequired={approvalRequired}
+                halted={Boolean(data.halted)}
+                enabled={canApprove}
                 onVerdict={(verdict) => setConfirmAction(verdict)}
               />
             </div>
@@ -346,11 +355,15 @@ function confirmDescription(action: PendingAction | null, pending: PendingDecisi
 function PendingDecisionCard({
   pending,
   approval,
+  approvalRequired,
+  halted,
   enabled,
   onVerdict,
 }: {
   pending: PendingDecision | null;
   approval: Approval | null;
+  approvalRequired: boolean;
+  halted: boolean;
   enabled: boolean;
   onVerdict: (verdict: "approve" | "reject") => void;
 }) {
@@ -358,11 +371,20 @@ function PendingDecisionCard({
     return (
       <Card>
         <CardHeader><CardTitle>Pending decision</CardTitle></CardHeader>
-        <CardContent><EmptyState title="No decision awaiting approval" description="A decision appears here only when it is recorded in the local ledger." /></CardContent>
+        <CardContent>
+          <EmptyState
+            title={approvalRequired ? "No decision awaiting approval" : "No approval gate"}
+            description={approvalRequired
+              ? "A decision appears here only when it is recorded in the local ledger."
+              : "This mandate does not require approval; execution can proceed without a verdict."}
+          />
+        </CardContent>
       </Card>
     );
   }
   const weights = Object.entries(pending.final_weights).sort(([left], [right]) => left.localeCompare(right));
+  const status = !approvalRequired ? "Approval not required" : halted ? "Halted" : approval ? approval.verdict : "Awaiting verdict";
+  const statusVariant = !approvalRequired || halted ? "muted" : approval ? (approval.verdict === "approve" ? "positive" : "negative") : "warning";
   return (
     <Card>
       <CardHeader>
@@ -371,9 +393,7 @@ function PendingDecisionCard({
             <CardTitle>Pending decision</CardTitle>
             <p className="mono mt-1 text-[10px] text-muted-foreground">{pending.decision_as_of}</p>
           </div>
-          <Badge variant={approval ? (approval.verdict === "approve" ? "positive" : "negative") : "warning"}>
-            {approval ? approval.verdict : "Awaiting verdict"}
-          </Badge>
+          <Badge variant={statusVariant}>{status}</Badge>
         </div>
       </CardHeader>
       <CardContent className="space-y-4">
@@ -391,11 +411,13 @@ function PendingDecisionCard({
           )) : <p className="text-xs text-muted-foreground">No non-zero target positions.</p>}
         </div>
         <p className="text-[10px] text-muted-foreground">Strategies: {pending.strategies.join(" · ") || "—"}</p>
+        {!approvalRequired ? <p className="text-[10px] leading-relaxed text-muted-foreground">This mandate does not require approval. Its recorded decision is not waiting for a verdict.</p> : null}
+        {approvalRequired && halted ? <p className="text-[10px] leading-relaxed text-muted-foreground">Halted funds cannot accept a verdict.</p> : null}
         <div className="grid grid-cols-2 gap-2">
           <Button onClick={() => onVerdict("approve")} disabled={!enabled}>Approve</Button>
           <Button variant="danger" onClick={() => onVerdict("reject")} disabled={!enabled}>Reject</Button>
         </div>
-        {!enabled ? <p className="text-[10px] leading-relaxed text-muted-foreground">Verdict writes require startup write capability and a non-protected fund name.</p> : null}
+        {!enabled && approvalRequired && !halted ? <p className="text-[10px] leading-relaxed text-muted-foreground">Verdict writes require startup write capability and a non-protected fund name.</p> : null}
       </CardContent>
     </Card>
   );
@@ -528,11 +550,11 @@ export function SessionReportPage() {
           <div className="mt-5 grid gap-5 xl:grid-cols-2">
             <Card>
               <CardHeader><SectionTitle title="Executed orders" note="Orders persisted in this session's execution record" /></CardHeader>
-              <CardContent><DataTable columns={orderColumns} rows={orders} rowKey={(item, index) => `${item.ticker}-${item.side}-${index}`} emptyTitle="No executed orders" emptyDescription="No order was recorded for this session." /></CardContent>
+              <CardContent><DataTable ariaLabel="Executed orders table" columns={orderColumns} rows={orders} rowKey={(item, index) => `${item.ticker}-${item.side}-${index}`} emptyTitle="No executed orders" emptyDescription="No order was recorded for this session." /></CardContent>
             </Card>
             <Card>
               <CardHeader><SectionTitle title="Executed fills" note="Only filled quantities and prices appear here" /></CardHeader>
-              <CardContent><DataTable columns={orderColumns} rows={fills} rowKey={(item, index) => `${item.ticker}-${item.side}-${index}`} emptyTitle="No fills recorded" emptyDescription="No fill was recorded for this session." /></CardContent>
+              <CardContent><DataTable ariaLabel="Executed fills table" columns={orderColumns} rows={fills} rowKey={(item, index) => `${item.ticker}-${item.side}-${index}`} emptyTitle="No fills recorded" emptyDescription="No fill was recorded for this session." /></CardContent>
             </Card>
           </div>
           <div className="mt-5 grid gap-5 xl:grid-cols-[minmax(0,1fr)_minmax(320px,0.8fr)]">

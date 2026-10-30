@@ -1,3 +1,6 @@
+import json
+
+import yaml
 from fastapi.testclient import TestClient
 
 from hedge_fund.paper.ledger import Ledger
@@ -65,6 +68,50 @@ def test_stale_and_expired_approvals_fail_without_rebinding(write_client, demo_r
     assert not ledger.approval()
 
 
+def test_approval_is_rejected_when_gate_is_disabled(write_client, demo_root):
+    client, headers = write_client
+    fund_path = demo_root / "paper" / "demo-quality" / "fund.yaml"
+    deployed = yaml.safe_load(fund_path.read_text(encoding="utf-8"))
+    deployed["spec"].pop("approval_required", None)
+    fund_path.write_text(yaml.safe_dump(deployed, sort_keys=False), encoding="utf-8")
+    pending = client.get("/api/paper/demo-quality", headers={"host": "127.0.0.1"}).json()["pending"]
+
+    response = client.post(
+        "/api/paper/demo-quality/approval",
+        headers=headers,
+        json={
+            "verdict": "approve",
+            "decision_as_of": pending["decision_as_of"],
+            "source_record_hash": pending["source_record_hash"],
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "This fund does not require approval."
+    assert not (demo_root / "paper" / "demo-quality" / "pending-approval.json").exists()
+
+
+def test_approval_is_rejected_for_halted_fund(write_client, demo_root):
+    client, headers = write_client
+    ledger = Ledger(demo_root / "paper" / "demo-quality")
+    pending = client.get("/api/paper/demo-quality", headers={"host": "127.0.0.1"}).json()["pending"]
+    ledger.halt("test pause")
+
+    response = client.post(
+        "/api/paper/demo-quality/approval",
+        headers=headers,
+        json={
+            "verdict": "approve",
+            "decision_as_of": pending["decision_as_of"],
+            "source_record_hash": pending["source_record_hash"],
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "Halted funds cannot accept a verdict."
+    assert not ledger.approval()
+
+
 def test_halt_and_resume_reuse_the_existing_ledger_control(tmp_path):
     from hedge_fund.web.demo import seed_demo
 
@@ -88,6 +135,28 @@ def test_halt_and_resume_reuse_the_existing_ledger_control(tmp_path):
     assert [event["kind"] for event in ledger.events()][-2:] == ["halt", "resume"]
 
 
+def test_halt_works_for_corrupt_ledger_but_resume_still_requires_valid_replay(demo_root):
+    path = demo_root / "paper" / "demo-quality" / "ledger" / "2024-06-04.json"
+    record = json.loads(path.read_text(encoding="utf-8"))
+    record["cash"] = 1
+    path.write_text(json.dumps(record), encoding="utf-8")
+    with TestClient(create_app(root=demo_root, allow_writes=True, demo=True)) as client:
+        token = client.get("/api/capabilities", headers={"host": "127.0.0.1"}).json()["mutation_token"]
+        headers = {
+            "host": "127.0.0.1",
+            "origin": "http://127.0.0.1",
+            "x-csrf-token": token,
+        }
+        halted = client.post("/api/paper/demo-quality/halt", headers=headers, json={"reason": "ledger review"})
+        resumed = client.post("/api/paper/demo-quality/resume", headers=headers)
+
+    ledger = Ledger(demo_root / "paper" / "demo-quality")
+    assert halted.status_code == 200
+    assert ledger.halted() == "ledger review"
+    assert resumed.status_code == 409
+    assert ledger.halted() == "ledger review"
+
+
 def test_protected_name_guard_runs_before_fund_adapter(tmp_path, monkeypatch):
     app = create_app(root=tmp_path, allow_writes=True)
     service = app.state.service
@@ -98,7 +167,7 @@ def test_protected_name_guard_runs_before_fund_adapter(tmp_path, monkeypatch):
         called = True
         raise AssertionError("protected fund adapter must not run")
 
-    monkeypatch.setattr(service, "_paper_state", forbidden)
+    monkeypatch.setattr(service, "_paper_control_state", forbidden)
     with TestClient(app) as client:
         token = client.get("/api/capabilities", headers={"host": "127.0.0.1"}).json()["mutation_token"]
         response = client.post(
@@ -114,6 +183,46 @@ def test_protected_name_guard_runs_before_fund_adapter(tmp_path, monkeypatch):
     assert response.status_code == 403
     assert not called
     assert not (tmp_path / "paper").exists()
+
+
+def test_protected_windows_aliases_are_rejected_before_control_writes(tmp_path, monkeypatch):
+    root = tmp_path / "temporary-root"
+    fund_dir = root / "paper" / "watchtower"
+    fund_dir.mkdir(parents=True)
+    control = fund_dir / "control.json"
+    events = fund_dir / "events.jsonl"
+    control.write_text('{"halted": false}\n', encoding="utf-8")
+    events.write_text("", encoding="utf-8")
+    before_control = control.read_bytes()
+    before_events = events.read_bytes()
+    app = create_app(root=root, allow_writes=True)
+    service = app.state.service
+    called = False
+
+    def forbidden(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("protected path must not reach a paper adapter")
+
+    monkeypatch.setattr(service, "_paper_control_state", forbidden)
+    with TestClient(app) as client:
+        token = client.get("/api/capabilities", headers={"host": "127.0.0.1"}).json()["mutation_token"]
+        headers = {
+            "host": "127.0.0.1",
+            "origin": "http://127.0.0.1",
+            "x-csrf-token": token,
+        }
+        canonical = client.post("/api/paper/watchtower/halt", headers=headers, json={"reason": "blocked"})
+        trailing_dot = client.post("/api/paper/watchtower./halt", headers=headers, json={"reason": "blocked"})
+        trailing_space = client.post("/api/paper/watchtower%20/halt", headers=headers, json={"reason": "blocked"})
+
+    assert canonical.status_code == 403
+    assert trailing_dot.status_code == 422
+    assert trailing_space.status_code == 422
+    assert not called
+    assert control.read_bytes() == before_control
+    assert events.read_bytes() == before_events
+    assert not (fund_dir / "pending-approval.json").exists()
 
 
 def test_capabilities_explain_deferred_runner_ownership():

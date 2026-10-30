@@ -87,6 +87,20 @@ starts a synthetic demo on `http://127.0.0.1:8765`. Demo files live in a tempora
 directory and are removed when the server exits. Node is needed for the build,
 not for Python to serve an already-built bundle.
 
+On Windows, use the native launcher instead of GNU Make:
+
+```powershell
+poetry install -E web
+poetry run aihf-web --build --demo
+```
+
+`--build` runs `npm ci` from `frontend/package-lock.json`, builds the production
+bundle, then starts the server. It requires Node.js and npm on `PATH`; a clean
+checkout also needs package-registry access for the initial npm install. The
+server does not need Node after the bundle exists. Running `aihf-web` from a
+source checkout without built assets exits with build instructions. Packaged
+wheels serve their included static bundle without Node.
+
 To inspect the configured `~/.hedge-fund` root, build the bundle and start the
 read-only, network-off server:
 
@@ -109,6 +123,12 @@ fetches it automatically. Runner start/stop, manual runs, deletion, ledger redo,
 and live quote fetching remain unavailable in the web desk. See the
 [TUI parity checklist](specs/004-react-web-ui/parity-checklist.md) for all
 supported and deferred workflows.
+
+Backtests show a confirmation of the provider, model, agent count, tickers and
+date range before submission. There are no automatic retries. Cancellation is
+cooperative at valuation boundaries; closing the browser does not cancel a job.
+Server shutdown requests cancellation and waits for active work, including any
+report write already in progress.
 
 #### Docker Compose web service
 

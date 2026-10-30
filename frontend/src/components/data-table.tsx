@@ -13,12 +13,14 @@ export function DataTable<T>({
   columns,
   rows,
   rowKey,
+  ariaLabel = "Scrollable data table",
   emptyTitle = "No records yet",
   emptyDescription = "Saved records will appear here.",
 }: {
   columns: TableColumn<T>[];
   rows: T[];
   rowKey: (row: T, index: number) => string;
+  ariaLabel?: string;
   emptyTitle?: string;
   emptyDescription?: string;
 }) {
@@ -26,7 +28,23 @@ export function DataTable<T>({
     return <EmptyState title={emptyTitle} description={emptyDescription} />;
   }
   return (
-    <div className="overflow-x-auto rounded-lg border border-border/80">
+    <div
+      className="overflow-x-auto rounded-lg border border-border/80"
+      tabIndex={0}
+      role="region"
+      aria-label={ariaLabel}
+      aria-description="Use the left and right arrow keys to scroll horizontally."
+      aria-keyshortcuts="ArrowLeft ArrowRight"
+      onKeyDown={(event) => {
+        if (event.key === "ArrowRight") {
+          event.currentTarget.scrollLeft += 80;
+          event.preventDefault();
+        } else if (event.key === "ArrowLeft") {
+          event.currentTarget.scrollLeft -= 80;
+          event.preventDefault();
+        }
+      }}
+    >
       <table className="w-full min-w-[560px] border-collapse text-left text-xs">
         <thead className="bg-white/[0.025]">
           <tr>

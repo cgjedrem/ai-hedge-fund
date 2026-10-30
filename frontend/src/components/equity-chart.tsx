@@ -84,6 +84,7 @@ export function EquityChart({
                   dot={false}
                   activeDot={{ r: 3 }}
                   connectNulls
+                  isAnimationActive={false}
                 />
                 <Line
                   type="monotone"
@@ -93,6 +94,7 @@ export function EquityChart({
                   strokeWidth={2.2}
                   dot={false}
                   activeDot={{ r: 4, fill: "#28d5bd", stroke: "#071412", strokeWidth: 2 }}
+                  isAnimationActive={false}
                 />
               </LineChart>
             </ResponsiveContainer>

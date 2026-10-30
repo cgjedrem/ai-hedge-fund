@@ -1,17 +1,58 @@
 # Acceptance Evidence
 
-Status: implementation phase complete for T001–T022. T023 is partial because protected-root content identity is inconclusive. Independent QA and PR handoff remain with the coordinator.
+Status: QA repair cycle 1 complete for T001–T022. T023 remains partial because protected-root content identity is inconclusive. Independent QA and PR handoff remain with the coordinator.
 
-## Environment and revision
+## Initial implementation identity (historical)
 
 - Baseline revision: `85e5ec618e40cec2a994faebd16b8717c5888df8`; branch `cgjedrem-fictional-winner`.
 - Worktree: Windows 11, Python 3.13.7, Poetry 2.5.1, Node 22.13.1, npm 10.9.2, Playwright 1.64.1, Chromium build v1248, Docker 29.9.2. GNU Make unavailable.
 - Historical progress-checkpoint SHA-256: `f7eee7fa30a4a341047425bd00671ece8ac3878f911a09064f7fd1472c276bc0` at `2026-10-30T17:17:49.4684515Z`; not final-artifact evidence.
-- Final implementation-input identity before evidence-doc edits: SHA-256 `eec381c33fd1ccce1f55a3341d32000d3f41bd932f3bb8a42ec3be6d4bc04cb2`. Covers 67 changed/untracked non-spec files by sorted path and current bytes; excludes `specs/004-react-web-ui/`, `memory.md`, and generated static assets. Base revision above.
-- Final implementation commit: `b183ac7b7ad34fdc085526cf8c8a56891a2327dc`, committed `2026-10-30T19:24:07+01:00`. Evidence follow-up contains this source revision.
-- Production static tree: SHA-256 `0da7625137a3aaa59a9034e25cbff6f062317fae4cc3a5eb2068a4e1abc8ea9e`.
-- Temporary wheel `aihf-2.6.1-py3-none-any.whl`: SHA-256 `25edb5fef57c676e1b6e31442a635f993ef46572a0745b3bed2fc3fa4f5a30d0`.
-- Synthetic screenshot tree: 17 PNG files, SHA-256 `3531686516b9d093970cd86da59b793487e943b50f9e876b7644eb775146770b`.
+- Initial implementation-input identity before evidence-doc edits: SHA-256 `eec381c33fd1ccce1f55a3341d32000d3f41bd932f3bb8a42ec3be6d4bc04cb2`. Covers 67 changed/untracked non-spec files by sorted path and current bytes; excludes `specs/004-react-web-ui/`, `memory.md`, and generated static assets. Base revision above.
+- Initial implementation commit: `b183ac7b7ad34fdc085526cf8c8a56891a2327dc`, committed `2026-10-30T19:24:07+01:00`. Evidence follow-up contains this source revision.
+- Initial production static tree: SHA-256 `0da7625137a3aaa59a9034e25cbff6f062317fae4cc3a5eb2068a4e1abc8ea9e`.
+- Initial temporary wheel `aihf-2.6.1-py3-none-any.whl`: SHA-256 `25edb5fef57c676e1b6e31442a635f993ef46572a0745b3bed2fc3fa4f5a30d0`.
+- Initial synthetic screenshot tree: 17 PNG files, SHA-256 `3531686516b9d093970cd86da59b793487e943b50f9e876b7644eb775146770b`.
+
+## QA repair cycle 1 final-artifact evidence
+
+### Identity
+
+- Source base: `a4214978c73c6830933f57343cad14ef24208038`; branch `cgjedrem-fictional-winner`; no branch switch.
+- Dirty-source identity: SHA-256 `0941451cda59240f13d0e35cce0c56de65f889e443570435d3ffa1a4019b1946`, measured `2026-10-30T20:05:53.5971864Z`. Covers 29 changed/untracked non-spec files. Algorithm: sorted status byte + UTF-8 path + NUL + 8-byte big-endian size + current file bytes + NUL. Excludes `specs/**`, `memory.md`, and generated `hedge_fund/web/static/**`.
+- Static/screenshot tree hashes use SHA-256 over sorted repository-relative UTF-8 paths, NUL, 8-byte big-endian file size, file bytes, NUL.
+- Environment: Windows 11, Python 3.13.7, Poetry 2.5.1, Node 22.13.1, npm 10.9.2, Playwright 1.64.1 / Chromium v1248, Docker 29.9.2. Test HOME and data roots were temporary. Provider credential variables were cleared; Python dotenv loading was disabled for tests.
+- Production static tree: SHA-256 `c049d76a336f1408d87337b18ce420ca9897a6cf01bf2dd42ff356bfb88b63de`; 3 files, 923,288 bytes. JS: 898,580 bytes, SHA-256 `e1046f73fb8b57f0bea9c7357edb54a5453e3dfd916a3a14127c6379c3600d96`.
+- QA wheel `aihf-2.6.1-py3-none-any.whl`: SHA-256 `07e40167763047a1d6ee11874d2fec86627c172de151b05b91c316e4c1e9c341`; contains `index.html`, hashed JS and CSS.
+- QA screenshots: 17 synthetic PNG files, 2,860,737 bytes, SHA-256 `d97630a60a0fbaee7b0e622b26dc34a7b8f483a58d29a700752df717a739613a`.
+- Final Docker tag `cgjedrem-qa1-web:repair1-final-20261030-8f31c2`; image ID `sha256:275e992dcb100d3b13548a6f4f8f4cc9c312013381b83902972145014ccf54af`. Image static tree matched the production tree hash above.
+
+### Final checks
+
+| Result | Scenario and provenance | Exact command and observation |
+|---|---|---|
+| PASS | Default Poetry install without `-E web`; isolated temp HOME; Python 3.13.7; `2026-10-30T19:43:01Z`–`19:43:04Z`. | `pytest hedge_fund/web -q` — 42 passed; exit 0. FastAPI/httpx/Uvicorn are available to the default dev test environment; runtime web dependencies remain optional. |
+| PASS | API plus affected paper-tick helpers; pytest temporary roots; non-loopback DNS and socket connections denied; provider credential variables unset; same source identity above; `2026-10-30T19:57:04.1847460Z`–`19:57:09.7509268Z`. | Guarded `pytest.main(["hedge_fund/web", "hedge_fund/paper/test_tick.py", "-q", "-k", "not test_redo_runs_the_latest_session_again_and_replaces_its_record"])` — 77 passed, 1 deselected in 3.64s; exit 0. Deselection is the documented Windows ledger-redo rename collision. |
+| PASS | Changed Python style gates; 14 explicit changed Python files; same source identity; `2026-10-30T19:51:13.2143781Z`–`19:51:22.1786063Z`. | `python -m black --check <14 files>`, `python -m isort --check-only <14 files>`, `python -m flake8 --max-line-length=420 <14 files>` — all exit 0. |
+| PASS | Frontend unit tests; offline locked npm dependencies; `2026-10-30T19:51:28.3950113Z`–`19:53:48.4994879Z`. | `cd frontend; npm test` — 5 passed in 126.44s; exit 0. JSDOM emitted Recharts zero-size and React Router future-flag warnings. |
+| PASS | Final production E2E; unique loopback port `49674`; synthetic demo server; external browser requests denied by the E2E listener; screenshots refreshed; `2026-10-30T19:56:16.0677197Z`–`19:56:52.7304803Z`. | `cd frontend; npm run e2e` — TypeScript check and Vite build passed; 5 Playwright tests passed in 18.7s. Verified desktop/narrow routes, visible chart paths and numeric costs, canonical builder payload, explicit backtest confirmation/cancellation, `.json`/dotted-name reloads, ungated/halted approval negatives, and zero external requests. Test server port closed. |
+| PASS | Windows-native build-and-serve CLI; temporary demo root; `NPM_CONFIG_OFFLINE=true`; `2026-10-30T19:49:33.7401980Z`–`19:50:58.8081038Z`. | `python -m hedge_fund.web --build --demo --root <temporary-root> --port 56199` — `npm ci` installed 318 locked packages from cache; `tsc --noEmit` passed; Vite transformed 2,299 modules and built in 11.66s. Root page returned 200; capabilities were read-only/write-off/network-off; port closed. |
+| PASS | Wheel build and archive inspection; temp artifact directory; `2026-10-30T19:43:56.0654412Z`–`19:44:01.5270774Z`. | `python -m poetry build --format wheel --output <temporary-directory>` — built the QA wheel above; archive contains 3 production static files. |
+| PASS | Wheel installed to a temp target and served with npm absent from `PATH`; synthetic demo root; `2026-10-30T19:45:46.8517167Z`–`19:46:07.6623198Z`. | `python -m hedge_fund.web --demo --root <temporary-root> --port 52489` — `shutil.which("npm") is None`; imported package came from the wheel target; `/` returned 200 and served the included JS; API reported read-only/write-off/network-off. Port closed after stop. |
+| PASS | Final Docker image; build context transfer 12.14 kB; image layers cached; `2026-10-30T20:00:28.4320310Z`–`20:00:30.4372235Z`. | `docker build --progress=plain -f Dockerfile.web -t cgjedrem-qa1-web:repair1-final-20261030-8f31c2 .` — exit 0; image ID above. |
+| PASS | Final Docker image, unique container, `--network none`, read-only root filesystem, synthetic read-only bind mount, no host ports; `2026-10-30T20:00:43.1268859Z`–`20:00:47.8758343Z`. | `docker run --detach --rm --name aihf-qa1-finalimage-smoke-20261030 --network none --read-only --mount type=bind,source=<synthetic-root>,target=/data,readonly --env PYTHONDONTWRITEBYTECODE=1 <image> aihf-web --container-bind --root /data --port 8765` — production static hash matched; `/`, `/api/capabilities`, and `/api/paper` passed; read-only/write-off/network-off; container removed. |
+
+### Remaining suite observations and limits
+
+- INCONCLUSIVE — `backtesting data features fund llm`: 547 passed, 37 skipped, 1 Windows failure in `features/test_intraday.py::test_a_headline_a_filing_or_a_band_crossing_changes_the_block` (`strftime("%b %-d %H:%M")` unsupported). Exact run timestamp/diff binding was not retained; not a final PASS.
+- INCONCLUSIVE — unbound suite observations: `brokers` 98 passed; `pipeline portfolio risk scorecard secrets signals` 231 passed; `hedge_fund/test_paths.py` 3 passed. Exact run timestamps were not retained.
+- INCONCLUSIVE — paper slices: deployed-broker 7 passed; ledger 22 passed; simulated Saxo 8 passed. Runner slice 10 passed, 2 deselected for the documented redo collision and process-lifecycle test. Tick slice is bound above.
+- INCONCLUSIVE — TUI slices: backtest 2, builder 15, builder-broker 1, funds 4, report 11, scorecard 3 and paper 24 passed. `test_home.py` had 8 passed / 1 Windows `stat.S_IMODE` failure (`0o666` vs POSIX `0o600`); `test_paper_view.py` had 5 passed / 1 Windows `%-d` formatting failure. Two daily/minute runner cases were deselected after teardown hangs; the PID/process-lifecycle test was not run.
+- INCONCLUSIVE — `hedge_fund/test_run.py`: pytest printed 30 passed, but process exit was 1.
+- INCONCLUSIVE — earlier `npm run e2e` attempt at `19:53:54.7708343Z`–`19:55:34.4317189Z` did not start the app: Poetry created a fresh empty venv because `POETRY_VIRTUALENVS_PATH` was not set, then import failed on missing NumPy. The isolated venv path was set for the final successful run above.
+- BLOCKED — offline Docker rebuild at `19:59:55.9750131Z`–`20:00:07.4600714Z` failed at `pip install poetry==2.5.1` because network was disabled and the package was not cached. No image was produced by that attempt. The default-network build above reused cached layers and passed.
+- INCONCLUSIVE — two initial wheel-smoke harness invocations failed before server startup because of PowerShell quoting (`unicodeescape` then lost quotes). The corrected stdin-based check above passed; no source changes resulted.
+- `npm ci` reported deprecation warnings for `whatwg-encoding` and Recharts 2.15.4. Earlier npm audit output reported 5 vulnerabilities (3 moderate, 2 critical); package-level details were not inspected and no remediation is claimed. Production JS remains above Vite's 500 kB chunk warning threshold: 898,580 bytes (262.97 kB gzip).
+- Repair-cycle checks used temporary synthetic roots only. No real fund root, real `.env`, provider credential, broker, paid data service, LLM, runner, or PID contents were accessed. INCONCLUSIVE — real-fund read-only browser acceptance remains unattempted; T023 remains partial. T024/T025 remain coordinator-owned.
 
 ## Implementation progress evidence (historical)
 
@@ -25,7 +66,7 @@ These rows preserve intermediate checks. Final-artifact results follow separatel
 | PASS | Changed Python style gates; revision and dirty-diff SHA-256 as preceding row; Python 3.13.7 on Windows; same invocation window. | `black --check <explicit changed Python files>`, `isort --check-only <same files>`, `flake8 --max-line-length=420 <same files>` — all exit 0. |
 | INCONCLUSIVE | Pre-change suite attempt was interrupted in earlier baseline runs. A safe package slice completed before implementation; test output showed a Windows formatting failure, not a feature regression. Exact timestamp was not captured, so this is not a revision-bound acceptance row. | `python -m poetry run pytest hedge_fund/backtesting hedge_fund/data hedge_fund/features hedge_fund/fund hedge_fund/llm -q` — 548 passed, 36 skipped, 1 failed in 104.33s. Failure: `hedge_fund/features/test_intraday.py::test_a_headline_a_filing_or_a_band_crossing_changes_the_block`; `strftime("%b %-d %H:%M")` raised `ValueError: Invalid format string` on Windows. |
 
-## Final-artifact evidence
+## Initial implementation final-artifact evidence (historical)
 
 | Result | Scenario and provenance | Exact command and observation |
 |---|---|---|
@@ -40,7 +81,7 @@ These rows preserve intermediate checks. Final-artifact results follow separatel
 | FAIL | TUI credential save test after resolving the default path at call time; pytest temp `.env`; fake credential; non-loopback DNS/connect denied; `2026-10-30T18:09:41.904828+00:00`–`2026-10-30T18:09:47.289471+00:00`. | Guarded `pytest.main(["hedge_fund/tui/test_home.py", "-q"])` — 8 passed, 1 failed. The saved file was the fixture temp path and content assertions passed; Windows `stat.S_IMODE` reported `0o666` after chmod while the test expects POSIX `0o600`. This platform assertion remains unresolved; no TUI permission behavior change was attempted. |
 | PASS | Real credential-file metadata only; no contents read by this check; `2026-10-30T18:23:17.5983104Z`–`2026-10-30T18:23:17.6364418Z`. | `Get-Item` on `~/.hedge-fund/.env` — length 509 bytes; `LastWriteTimeUtc=2026-10-26T15:33:49.5078305Z`. Timestamp matched the prior metadata observation. |
 
-### Existing-suite observations not bound to the final diff
+### Initial implementation suite observations (historical; not bound to repair diff)
 
 These chunked outcomes were captured during earlier implementation runs. Exact run timestamps/diff identities were not retained, so they are not final PASS evidence. Failures are reported as observed; no clean baseline rerun is claimed.
 
@@ -52,7 +93,7 @@ These chunked outcomes were captured during earlier implementation runs. Exact r
 - Paper slices: deployed-broker 7 passed; ledger 22 passed; runner 11 passed/1 failed; simulated Saxo 8 passed; tick 29 passed/1 failed. The two failures were Windows `FileExistsError` collisions in the existing ledger rewind/redo path; unchanged test and ledger source at baseline `85e5ec6`.
 - TUI slices: backtest 2, builder 15, builder-broker 1, funds 4, report 11, scorecard 3 and paper 24 passed; `paper-view` 5 passed/1 Windows `%-d` formatting failure. Daily/minute runner cases were deselected after earlier teardown hangs.
 
-## Safety, runtime gaps and limitations
+## Initial implementation safety notes (historical)
 
 - Tests and screenshots use explicit pytest temporary roots or the synthetic `--demo` root. No test called a paid data provider, external LLM, broker or live feed. Focused API test runs denied non-loopback DNS/connect; browser E2E denied external requests.
 - The final web service loads only the configured root's `.env`, keeps existing process environment values authoritative, and blocks reparse-point paths before reading. The regression test uses fake sentinel values in pytest temp storage.

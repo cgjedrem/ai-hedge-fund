@@ -53,8 +53,8 @@
 ## Phase 7: Packaging, QA and Evidence
 
 - [x] T021 Add one-command launcher, Compose web service/Linux override, Dockerfile.web and README.md instructions.
-- [x] T022 Run API/frontend/build/changed-file style and existing-suite checks; record exact baseline and blocked outcomes in specs/004-react-web-ui/acceptance-evidence.md.
-- [ ] T023 Capture production-build browser desktop/narrow screenshots, every screen and real-fund read-only checks in frontend/e2e/ and specs/004-react-web-ui/acceptance-evidence.md. Partial: browser route checks and 17 synthetic screenshots passed; protected-root content identity remains INCONCLUSIVE.
+- [x] T022 Run affected API/frontend/build/changed-file style checks and chunk existing-suite checks; record exact passes, platform failures, and exclusions in specs/004-react-web-ui/acceptance-evidence.md.
+- [ ] T023 Capture production-build browser desktop/narrow screenshots, every screen and real-fund read-only checks in frontend/e2e/ and specs/004-react-web-ui/acceptance-evidence.md. Partial: final browser route/interaction checks and 17 synthetic screenshots passed; protected-root identity and real-fund browser acceptance remain INCONCLUSIVE.
 - [ ] T024 Complete independent QA dev loop, rerun affected final-artifact evidence, and update parity/gaps in specs/004-react-web-ui/acceptance-evidence.md.
 - [ ] T025 Update PR #7 with self-contained run instructions/screenshots/parity/assumptions/limitations and leave safe read-only preview running.
 

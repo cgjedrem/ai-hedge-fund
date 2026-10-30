@@ -7,6 +7,7 @@ from hedge_fund.web import __main__ as launcher
 
 def test_default_launcher_uses_loopback_read_only_and_explicit_root(tmp_path, monkeypatch):
     observed = {}
+    monkeypatch.setattr(launcher, "_require_static_bundle", lambda: None)
 
     def fake_run(app, **kwargs):
         observed["app"] = app
@@ -29,6 +30,7 @@ def test_default_launcher_uses_loopback_read_only_and_explicit_root(tmp_path, mo
 
 def test_demo_launcher_uses_temporary_root_and_seeds_synthetic_records(monkeypatch):
     observed = {}
+    monkeypatch.setattr(launcher, "_require_static_bundle", lambda: None)
 
     def fake_run(app, **kwargs):
         observed["app"] = app
@@ -53,6 +55,7 @@ def test_demo_launcher_uses_temporary_root_and_seeds_synthetic_records(monkeypat
 
 def test_container_bind_is_explicit_and_port_range_is_validated(monkeypatch):
     observed = {}
+    monkeypatch.setattr(launcher, "_require_static_bundle", lambda: None)
 
     def fake_run(app, **kwargs):
         observed["kwargs"] = kwargs

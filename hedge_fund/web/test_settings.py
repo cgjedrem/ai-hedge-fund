@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 from pydantic import SecretStr
 
 from hedge_fund.llm import DEFAULT_MODEL, load_api_models
+from hedge_fund.llm.registry import is_supported
 from hedge_fund.web.app import create_app
 from hedge_fund.web.schemas import CredentialRequest, ModelRequest
 from hedge_fund.web.services import DeskService, ServiceError
@@ -73,14 +74,22 @@ def test_credential_write_is_allowlisted_write_only_and_control_safe(tmp_path, c
     service.close()
 
 
-def test_model_setting_is_catalog_allowlisted_and_persisted(tmp_path, monkeypatch):
+def test_model_setting_is_catalog_allowlisted_and_process_only(tmp_path, monkeypatch):
+    models = [model_id for _, model_id, provider in load_api_models() if is_supported(provider)]
+    if len(models) < 2:
+        pytest.skip("model catalog does not expose two options")
+    starting_model, model = models[:2]
+    original = f"HEDGE_FUND_LLM_MODEL={starting_model}\nKEEP_THIS=unchanged\n"
+    (tmp_path / ".env").write_text(original, encoding="utf-8")
+    monkeypatch.delenv("HEDGE_FUND_LLM_MODEL", raising=False)
     service = DeskService(tmp_path, allow_writes=True)
-    model = service.catalog()["models"][0]["id"]
 
     result = service.set_model(ModelRequest(model=model))
 
-    assert result == {"model": model, "saved": True}
-    assert (tmp_path / ".env").read_text(encoding="utf-8").strip() == f"HEDGE_FUND_LLM_MODEL={model}"
+    assert result == {"model": model, "scope": "process"}
+    assert service.settings()["model"] == model
+    assert os.environ["HEDGE_FUND_LLM_MODEL"] == model
+    assert (tmp_path / ".env").read_text(encoding="utf-8") == original
     with pytest.raises(ServiceError) as unknown:
         service.set_model(ModelRequest(model="unregistered-model"))
     assert unknown.value.status_code == 422

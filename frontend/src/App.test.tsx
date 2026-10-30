@@ -60,7 +60,7 @@ const home: HomeData = {
 
 const paperDetail: PaperSnapshot = {
   name: "demo-quality",
-  spec: { name: "demo-quality" },
+  spec: { name: "demo-quality", approval_required: true },
   universe: ["AAPL", "MSFT"],
   broker: "paper",
   created: "2024-06-01T00:00:00+00:00",
@@ -101,6 +101,7 @@ const mandates: MandateCollection = {
   items: [
     {
       name: "demo-quality",
+      agent_count: 2,
       strategies: [{ name: "earnings-drift", title: "Earnings Drift", mode: "long_short", weight: 1 }],
       cadence: "daily",
       capital: 100_000,
@@ -114,7 +115,17 @@ const mandates: MandateCollection = {
 
 const catalog: Catalog = {
   models: [{ label: "Test provider", id: "provider/model", provider: "test-provider" }],
-  strategies: [{ name: "value", title: "Value", models: ["buffett", "munger"], kind: "systematic", mode: "long_only" }],
+  strategies: [{
+    name: "value",
+    title: "Value",
+    models: [
+      { name: "buffett", weight: 1, params: {} },
+      { name: "munger", weight: 1, params: {} },
+    ],
+    kind: "systematic",
+    mode: "long_only",
+    blend: { method: "conviction_weighted", gross_target: 1, mode: "long_only" },
+  }],
   default_model: "provider/model",
 };
 
@@ -395,5 +406,13 @@ describe("local desk screens", () => {
 
     fireEvent.keyDown(document.body, { key: "k", ctrlKey: true });
     expect(await screen.findByPlaceholderText("Search pages…")).toBeInTheDocument();
+  });
+
+  it("labels model selection as process-only", async () => {
+    window.history.replaceState({}, "", "/settings");
+    render(<App />);
+
+    expect(await screen.findByText("Supported provider catalog · applies to this server process")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Use model for this process" })).toBeDisabled();
   });
 });

@@ -47,7 +47,7 @@ export function SettingsPage() {
     setFeedback(null);
     try {
       await apiPost("/api/settings/model", { model: selectedModel });
-      setFeedback({ tone: "neutral", message: "Model selection saved to the local settings file. An environment variable may still override the effective model." });
+      setFeedback({ tone: "neutral", message: "Model selection applies to this server process. New research jobs capture the selected model; the shared .env file is unchanged." });
       resource.refresh();
     } catch (cause) {
       setFeedback({ tone: "danger", message: cause instanceof Error ? cause.message : "Model selection could not be saved." });
@@ -97,7 +97,7 @@ export function SettingsPage() {
                 <div className="flex items-center justify-between gap-3">
                   <div>
                     <p className="text-sm font-semibold text-foreground">LLM model</p>
-                    <p className="mt-1 text-xs text-muted-foreground">Supported provider catalog · selected model may be overridden by environment</p>
+                    <p className="mt-1 text-xs text-muted-foreground">Supported provider catalog · applies to this server process</p>
                   </div>
                   <Settings2 className="h-4 w-4 text-accent" />
                 </div>
@@ -115,10 +115,10 @@ export function SettingsPage() {
                   </Select>
                 </div>
                 <Button className="w-full" variant="secondary" onClick={() => void saveModel()} disabled={!canWrite || savingModel || !selectedModel || selectedModel === settings.model}>
-                  {savingModel ? "Saving…" : "Save model selection"}
+                  {savingModel ? "Applying…" : "Use model for this process"}
                 </Button>
                 <p className="text-[10px] leading-relaxed text-muted-foreground">
-                  Changing this setting does not submit a model request. API credentials are used only when a separate model workflow is explicitly run.
+                  Changing this setting does not submit a model request or edit the shared <span className="mono">.env</span> file. New research jobs record the model selected when submitted.
                 </p>
               </CardContent>
             </Card>

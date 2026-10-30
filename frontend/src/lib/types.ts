@@ -18,12 +18,25 @@ export interface ModelOption {
   provider: string;
 }
 
+export interface StrategyModelOption {
+  name: string;
+  weight: number;
+  params: Record<string, unknown>;
+}
+
+export interface StrategyBlendOption {
+  method: string;
+  gross_target: number;
+  mode: string;
+}
+
 export interface StrategyOption {
   name: string;
   title: string;
-  models: string[];
+  models: StrategyModelOption[];
   kind: "systematic" | "discretionary";
   mode: string;
+  blend: StrategyBlendOption;
 }
 
 export interface Catalog {
@@ -41,6 +54,7 @@ export interface MandateStrategy {
 
 export interface MandateSummary {
   name: string;
+  agent_count: number;
   strategies: MandateStrategy[];
   cadence: string;
   capital: number;
@@ -161,7 +175,7 @@ export interface ScoreMetrics {
 
 export interface PaperSnapshot {
   name: string;
-  spec: Record<string, unknown>;
+  spec: Record<string, unknown> & { approval_required?: boolean };
   universe: string[];
   broker: string;
   created: string;
@@ -291,13 +305,14 @@ export interface Job {
   fund: string;
   provider: string;
   model: string;
-  status: "queued" | "running" | "succeeded" | "failed";
+  status: "queued" | "running" | "succeeded" | "failed" | "cancelled";
   progress: number;
   submitted_at: string;
   started_at: string | null;
   completed_at: string | null;
   report_id: string | null;
   error: string | null;
+  cancel_requested: boolean;
 }
 
 export interface Settings {

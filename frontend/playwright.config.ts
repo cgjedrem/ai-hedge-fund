@@ -1,5 +1,8 @@
 import { defineConfig, devices } from "@playwright/test";
 
+const port = process.env.AIHF_WEB_PORT ?? "8765";
+const baseURL = `http://127.0.0.1:${port}`;
+
 export default defineConfig({
   testDir: "./e2e",
   fullyParallel: false,
@@ -8,7 +11,7 @@ export default defineConfig({
   reporter: "list",
   outputDir: "./test-results",
   use: {
-    baseURL: "http://127.0.0.1:8765",
+    baseURL,
     trace: "retain-on-failure",
   },
   projects: [
@@ -18,8 +21,8 @@ export default defineConfig({
     },
   ],
   webServer: {
-    command: "python -m poetry -C .. run aihf-web --demo --port 8765",
-    url: "http://127.0.0.1:8765/api/capabilities",
+    command: `python -m poetry -C .. run aihf-web --demo --port ${port}`,
+    url: `${baseURL}/api/capabilities`,
     reuseExistingServer: false,
     timeout: 60_000,
   },

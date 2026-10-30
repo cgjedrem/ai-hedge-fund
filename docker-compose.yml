@@ -55,7 +55,7 @@ services:
     ports:
       - "127.0.0.1:8765:8765"
     volumes:
-      - ~/.hedge-fund:/root/.hedge-fund
+      - ~/.hedge-fund:/root/.hedge-fund:ro
     command: ["aihf-web", "--port", "8765", "--container-bind"]
     read_only: true
     tmpfs:

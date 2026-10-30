@@ -18,13 +18,17 @@ import {
 } from "@/components/ui/select";
 import { apiPost } from "@/lib/api";
 import { useDesk, useResource } from "@/lib/hooks";
-import type { Catalog, StrategyOption } from "@/lib/types";
+import type { Catalog, StrategyModelOption, StrategyOption } from "@/lib/types";
 
 interface StrategyDraft {
   id: number;
   name: string;
-  modelNames: string[];
+  models: StrategyModelOption[];
   weight: string;
+}
+
+function copyModels(models: StrategyModelOption[]): StrategyModelOption[] {
+  return models.map((model) => ({ ...model, params: { ...model.params } }));
 }
 
 interface SaveResult {
@@ -43,7 +47,7 @@ export function BuilderPage() {
   const catalogResource = useResource<Catalog>("/api/catalog");
   const [name, setName] = useState("");
   const [strategyDrafts, setStrategyDrafts] = useState<StrategyDraft[]>([
-    { id: 1, name: "", modelNames: [], weight: "1" },
+    { id: 1, name: "", models: [], weight: "1" },
   ]);
   const [nextStrategyId, setNextStrategyId] = useState(2);
   const [capital, setCapital] = useState("100000");
@@ -74,7 +78,7 @@ export function BuilderPage() {
           : {
               ...draft,
               name: catalog.strategies[0].name,
-              modelNames: [...catalog.strategies[0].models],
+              models: copyModels(catalog.strategies[0].models),
             },
       ),
     );
@@ -90,7 +94,7 @@ export function BuilderPage() {
     setStrategyDrafts((drafts) =>
       drafts.map((draft) =>
         draft.id === id
-          ? { ...draft, name: strategyName, modelNames: option ? [...option.models] : [] }
+          ? { ...draft, name: strategyName, models: option ? copyModels(option.models) : [] }
           : draft,
       ),
     );
@@ -99,20 +103,20 @@ export function BuilderPage() {
   function addStrategy(): void {
     const next = catalog?.strategies.find((strategy) => !strategyDrafts.some((draft) => draft.name === strategy.name));
     if (!next) return;
-    setStrategyDrafts((drafts) => [...drafts, { id: nextStrategyId, name: next.name, modelNames: [...next.models], weight: "1" }]);
+    setStrategyDrafts((drafts) => [...drafts, { id: nextStrategyId, name: next.name, models: copyModels(next.models), weight: "1" }]);
     setNextStrategyId((value) => value + 1);
   }
 
-  function toggleModel(id: number, modelName: string): void {
+  function toggleModel(id: number, model: StrategyModelOption): void {
     setStrategyDrafts((drafts) =>
       drafts.map((draft) =>
         draft.id !== id
           ? draft
           : {
               ...draft,
-              modelNames: draft.modelNames.includes(modelName)
-                ? draft.modelNames.filter((entry) => entry !== modelName)
-                : [...draft.modelNames, modelName],
+              models: draft.models.some((entry) => entry.name === model.name)
+                ? draft.models.filter((entry) => entry.name !== model.name)
+                : [...draft.models, { ...model, params: { ...model.params } }],
             },
       ),
     );
@@ -146,7 +150,7 @@ export function BuilderPage() {
       setError("A strategy can be added only once to a mandate.");
       return;
     }
-    if (configuredStrategies.some(({ draft, option, weight }) => !draft.modelNames.length || draft.modelNames.some((model) => !option?.models.includes(model)) || !Number.isFinite(weight) || weight <= 0)) {
+    if (configuredStrategies.some(({ draft, option, weight }) => !draft.models.length || draft.models.some((model) => !option?.models.some((entry) => entry.name === model.name)) || !Number.isFinite(weight) || weight <= 0)) {
       setError("Each strategy needs at least one supported analyst and a positive weight.");
       return;
     }
@@ -177,8 +181,8 @@ export function BuilderPage() {
         name: (option as StrategyOption).name,
         display_name: (option as StrategyOption).title,
         weight,
-        models: draft.modelNames.map((modelName) => ({ name: modelName, weight: 1, params: {} })),
-        blend: { mode: (option as StrategyOption).mode, gross_target: 1 },
+        models: copyModels(draft.models),
+        blend: { ...(option as StrategyOption).blend },
       })),
       risk: {
         max_position_pct: positionValue,
@@ -371,10 +375,10 @@ export function BuilderPage() {
                       <p className="mb-2 text-[10px] uppercase tracking-[0.13em] text-muted-foreground">Registered analysts</p>
                       {strategy?.models.length ? (
                         <div className="grid gap-2 sm:grid-cols-2">
-                          {strategy.models.map((modelName) => (
-                            <label key={modelName} className="flex cursor-pointer items-center gap-3 rounded-lg border border-border/80 bg-white/[0.02] px-3 py-2.5 text-xs text-foreground has-[:disabled]:cursor-not-allowed has-[:disabled]:opacity-60">
-                              <input type="checkbox" checked={draft.modelNames.includes(modelName)} onChange={() => toggleModel(draft.id, modelName)} disabled={Boolean(saved)} className="h-3.5 w-3.5 accent-cyan-400" />
-                              <span className="mono">{modelName}</span>
+                          {strategy.models.map((model) => (
+                            <label key={model.name} className="flex cursor-pointer items-center gap-3 rounded-lg border border-border/80 bg-white/[0.02] px-3 py-2.5 text-xs text-foreground has-[:disabled]:cursor-not-allowed has-[:disabled]:opacity-60">
+                              <input type="checkbox" checked={draft.models.some((entry) => entry.name === model.name)} onChange={() => toggleModel(draft.id, model)} disabled={Boolean(saved)} className="h-3.5 w-3.5 accent-cyan-400" />
+                              <span className="mono">{model.name} <span className="text-muted-foreground">· blend weight {model.weight}</span></span>
                             </label>
                           ))}
                         </div>

@@ -7,8 +7,9 @@ import re
 import stat
 import threading
 import unicodedata
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterator
 
 from dotenv import dotenv_values
 
@@ -37,7 +38,7 @@ from hedge_fund.paper.tick import following_session
 from hedge_fund.pipeline.session import SessionRecord
 from hedge_fund.scorecard import score
 from hedge_fund.tui.keys import save_credential
-from hedge_fund.web.jobs import JobConflict, JobRegistry
+from hedge_fund.web.jobs import JobCancelled, JobConflict, JobRegistry
 from hedge_fund.web.schemas import (
     ApprovalRequest,
     BacktestRequest,
@@ -80,6 +81,7 @@ class DeskService:
         self._locks_guard = threading.Lock()
         self._settings_lock = threading.RLock()
         self._load_root_environment()
+        self._selected_model = os.environ.get("HEDGE_FUND_LLM_MODEL") or DEFAULT_MODEL
 
     def close(self) -> None:
         self.jobs.close()
@@ -109,7 +111,7 @@ class DeskService:
         strategy_dir = Path(__file__).resolve().parents[1] / "strategies"
         for path in sorted(strategy_dir.glob("*.yaml")):
             try:
-                strategy = load_strategy(path.stem)
+                strategy = load_strategy(path)
             except (OSError, ValueError):
                 continue
             from hedge_fund.signals import LLMAgent
@@ -119,9 +121,10 @@ class DeskService:
                 {
                     "name": strategy.name,
                     "title": strategy.title,
-                    "models": [model.name for model in strategy.models],
+                    "models": [model.model_dump(mode="json") for model in strategy.models],
                     "kind": kind,
                     "mode": strategy.blend.mode,
+                    "blend": strategy.blend.model_dump(mode="json"),
                 }
             )
         return {"models": models, "strategies": strategies, "default_model": DEFAULT_MODEL}
@@ -334,7 +337,7 @@ class DeskService:
 
     def settings(self) -> dict:
         model_options = [{"label": label, "id": model_id, "provider": provider} for label, model_id, provider in load_api_models() if is_supported(provider)]
-        selected_model = os.environ.get("HEDGE_FUND_LLM_MODEL") or DEFAULT_MODEL
+        selected_model = self._selected_model
         env_path = self._safe_child(".env")
         values = {}
         if env_path.is_file():
@@ -367,13 +370,9 @@ class DeskService:
             raise ServiceError(422, "Model is not in the supported provider catalog.")
         with self._settings_lock:
             self._ensure_no_active_job()
-            self._guard_settings_write()
-            env_path = self._safe_child(".env")
-            try:
-                save_credential("HEDGE_FUND_LLM_MODEL", request.model, path=env_path)
-            except (OSError, ValueError) as exc:
-                raise ServiceError(409, f"Model selection could not be saved ({type(exc).__name__}).") from None
-        return {"model": request.model, "saved": True}
+            os.environ["HEDGE_FUND_LLM_MODEL"] = request.model
+            self._selected_model = request.model
+        return {"model": request.model, "scope": "process"}
 
     def set_credential(self, request: CredentialRequest) -> dict:
         self._require_writes()
@@ -409,24 +408,40 @@ class DeskService:
             universe = normalize_universe(request.universe)
         except (OSError, ValueError) as exc:
             raise ServiceError(422, f"Backtest request is invalid ({type(exc).__name__}).") from None
-        provider = data_provider()
-        model = os.environ.get("HEDGE_FUND_LLM_MODEL") or DEFAULT_MODEL
+        agent_count = sum(len(strategy.models) for strategy in spec.strategies)
+        if request.agent_count != agent_count:
+            raise ServiceError(409, "Mandate configuration changed; reload before confirming this backtest.")
 
-        def work(progress: Callable[[int], None]) -> dict:
-            data_client = self._make_data_client()
-            fund = self._fund_factory(spec)
-            result = backtest_fund(
-                fund,
-                request.start,
-                request.end,
-                data_client,
-                universe,
-                on_valuation=lambda index, total, _value: progress(int(100 * (index + 1) / total)),
-            )
-            path = save_result(result, directory=self._ensure_dir("research"))
-            return {"report_id": path.name}
+        def work(progress: Callable[[int], None], cancelled: Callable[[], bool]) -> dict:
+            with self._make_data_client() as data_client:
+                fund = self._fund_factory(spec)
+
+                def on_valuation(index: int, total: int, _value) -> None:
+                    if cancelled():
+                        raise JobCancelled()
+                    progress(int(100 * (index + 1) / total))
+
+                result = backtest_fund(
+                    fund,
+                    request.start,
+                    request.end,
+                    data_client,
+                    universe,
+                    on_valuation=on_valuation,
+                )
+                if cancelled():
+                    raise JobCancelled()
+                path = save_result(result, directory=self._ensure_dir("research"))
+                return {"report_id": path.name}
 
         with self._settings_lock:
+            provider = data_provider()
+            model = self._selected_model
+            allowed = {model_id for _, model_id, listed_provider in load_api_models() if is_supported(listed_provider)}
+            if request.provider != provider or request.model != model:
+                raise ServiceError(409, "Research provider or model changed; reload before confirming this backtest.")
+            if model not in allowed:
+                raise ServiceError(422, "Model is not in the supported provider catalog.")
             try:
                 return self.jobs.submit(name, provider, model, work)
             except JobConflict as exc:
@@ -443,12 +458,25 @@ class DeskService:
     def list_jobs(self) -> dict:
         return {"items": self.jobs.list()}
 
+    def cancel_job(self, job_id: str) -> dict:
+        self._require_writes()
+        if not re.fullmatch(r"[a-f0-9]{32}", job_id):
+            raise ServiceError(404, "Research job not found.")
+        try:
+            return self.jobs.cancel(job_id)
+        except JobConflict as exc:
+            raise ServiceError(409, str(exc)) from None
+
     def approve(self, name: str, request: ApprovalRequest) -> dict:
         self._require_writes()
         normalized = self._validated_name(name)
         self._guard_protected(normalized)
         with self._fund_lock(normalized):
             directory, deployed, ledger, state, latest = self._paper_state(normalized)
+            if not deployed.spec.approval_required:
+                raise ServiceError(409, "This fund does not require approval.")
+            if state.halted is not None:
+                raise ServiceError(409, "Halted funds cannot accept a verdict.")
             pending = state.pending
             if pending is None or latest is None:
                 raise ServiceError(409, "No pending decision is available.")
@@ -475,8 +503,10 @@ class DeskService:
         self._require_writes()
         normalized = self._validated_name(name)
         self._guard_protected(normalized)
+        if not isinstance(reason, str) or not reason.strip() or len(reason) > 240 or any(ord(char) < 32 or ord(char) == 127 for char in reason):
+            raise ServiceError(422, "Halt reason is invalid.")
         with self._fund_lock(normalized):
-            _, _, ledger, _, _ = self._paper_state(normalized)
+            _, ledger = self._paper_control_state(normalized)
             try:
                 ledger.halt(reason)
             except OSError as exc:
@@ -591,9 +621,34 @@ class DeskService:
             raise ServiceError(409, f"Paper state is invalid ({type(exc).__name__}).") from None
         return directory, deployed, ledger, state, latest
 
+    def _paper_control_state(self, name: str) -> tuple[Path, Ledger]:
+        directory = self._safe_child("paper", name)
+        if not directory.is_dir():
+            raise ServiceError(404, "Paper fund not found.")
+        self._safe_child("paper", name, "fund.yaml")
+        self._safe_child("paper", name, "control.json")
+        self._safe_child("paper", name, "events.jsonl")
+        try:
+            deployed = load_deployed(directory)
+        except (OSError, ValueError) as exc:
+            raise ServiceError(409, f"Paper fund is invalid ({type(exc).__name__}).") from None
+        if _windows_name_key(deployed.name) != _windows_name_key(name):
+            raise ServiceError(409, "Paper deployment identity does not match its directory.")
+        return directory, Ledger(directory)
+
     def _session_report(self, record: SessionRecord) -> dict:
         executed = record.executed
         decision = record.decision
+        executed_report = executed.model_dump(mode="json") if executed is not None else None
+        if executed_report is not None:
+            executed_report.update(
+                {
+                    "trading_cost": executed.trading_cost,
+                    "traded_notional": executed.traded_notional,
+                    "commission": executed.commission,
+                    "slippage": executed.slippage,
+                }
+            )
         return {
             "session": record.session,
             "fund": record.fund,
@@ -608,7 +663,7 @@ class DeskService:
             "benchmark": record.benchmark,
             "benchmark_close": record.benchmark_close,
             "rebalance": record.rebalance,
-            "executed": executed.model_dump(mode="json") if executed is not None else None,
+            "executed": executed_report,
             "proposed": {
                 "as_of": decision.as_of,
                 "universe": decision.universe,
@@ -664,16 +719,21 @@ class DeskService:
             "benchmark": spec.benchmark,
             "approval_required": spec.approval_required,
             "broker": spec.broker,
+            "agent_count": sum(len(strategy.models) for strategy in spec.strategies),
         }
         if include_spec:
             data["spec"] = spec.model_dump(mode="json")
         return data
 
-    def _make_data_client(self):
+    @contextmanager
+    def _make_data_client(self) -> Iterator[object]:
         if self._data_client_factory is not None:
-            return self._data_client_factory()
+            with self._data_client_factory() as client:
+                yield client
+            return
         cache = self._ensure_dir("cache")
-        return CachedDataClient(make_data_client(), cache_dir=cache)
+        with make_data_client() as client:
+            yield CachedDataClient(client, cache_dir=cache)
 
     def _runner_state(self) -> dict:
         return {
@@ -706,7 +766,7 @@ class DeskService:
     def _assert_unique(self, directory: Path, filename: str) -> None:
         candidate = Path(filename)
         for existing in directory.iterdir():
-            if existing.name.casefold() == candidate.name.casefold():
+            if _windows_name_key(existing.name) == _windows_name_key(candidate.name):
                 raise ServiceError(409, "A resource with this name already exists.")
 
     def _validated_name(self, name: str) -> str:
@@ -716,7 +776,7 @@ class DeskService:
             raise ServiceError(422, "Fund name is invalid.") from None
 
     def _guard_protected(self, name: str) -> None:
-        if name.casefold() in {entry.casefold() for entry in PROTECTED_NAMES}:
+        if _windows_name_key(name) in {_windows_name_key(entry) for entry in PROTECTED_NAMES}:
             raise ServiceError(403, "Protected fund names cannot be modified by the web UI.")
 
     def _require_writes(self) -> None:
@@ -749,7 +809,7 @@ class DeskService:
                 os.environ.setdefault(name, value)
 
     def _fund_lock(self, name: str) -> threading.RLock:
-        key = name.casefold()
+        key = _windows_name_key(name)
         with self._locks_guard:
             return self._locks.setdefault(key, threading.RLock())
 
@@ -775,6 +835,10 @@ def _is_reparse_point(path: Path) -> bool:
     attributes = getattr(info, "st_file_attributes", 0)
     reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
     return stat.S_ISLNK(info.st_mode) or bool(attributes & reparse_flag)
+
+
+def _windows_name_key(name: str) -> str:
+    return unicodedata.normalize("NFKC", name).rstrip(" .").casefold()
 
 
 def _reject_secret_fields(value) -> None:

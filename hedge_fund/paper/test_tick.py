@@ -139,7 +139,24 @@ def test_default_approval_deploy_yaml_matches_pre_feature_bytes(tmp_path, SPEC):
     assert (directory / "fund.yaml").read_bytes() == expected
 
 
-@pytest.mark.parametrize("bad", ["", ".", "..", "a/b", "-lead", ".hidden", "sp ace"])
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "",
+        ".",
+        "..",
+        "a/b",
+        "-lead",
+        ".hidden",
+        "sp ace",
+        "watchtower.",
+        "watchtower ",
+        "CON",
+        "nul.txt",
+        "COM1",
+        "LPT9.yaml",
+    ],
+)
 def test_deploy_rejects_unsafe_names(tmp_path, bad, SPEC):
     with pytest.raises(ValueError, match="invalid fund name"):
         validate_fund_name(bad)

@@ -43,7 +43,10 @@ class DeployedFund(BaseModel):
 
 def validate_fund_name(name: str) -> str:
     """A fund name is a directory name: no separators, nothing hidden."""
-    if not _NAME.fullmatch(name) or name in (".", ".."):
+    if not isinstance(name, str) or not _NAME.fullmatch(name) or name.endswith((".", " ")):
+        raise ValueError(f"invalid fund name {name!r}: use letters, digits, '.', '_' or '-', " "starting with a letter or digit")
+    device_name = name.split(".", 1)[0].casefold()
+    if device_name in {"con", "prn", "aux", "nul"} or re.fullmatch(r"(?:com|lpt)[1-9]", device_name):
         raise ValueError(f"invalid fund name {name!r}: use letters, digits, '.', '_' or '-', " "starting with a letter or digit")
     return name
 

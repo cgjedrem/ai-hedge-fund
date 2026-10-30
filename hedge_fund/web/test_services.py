@@ -3,6 +3,7 @@ import json
 import pytest
 from fastapi.testclient import TestClient
 
+from hedge_fund.paper.ledger import Ledger
 from hedge_fund.web.app import create_app
 from hedge_fund.web.services import DeskService, ServiceError
 
@@ -34,10 +35,37 @@ def test_read_adapters_match_seeded_mandate_paper_ledger_and_report(demo_root):
     assert scorecard["fund"] == "demo-quality"
     assert report["executed"]["orders"][0]["ticker"] == "AAPL"
     assert report["executed"]["fills"][0]["quantity"] == 100
+    executed = Ledger(demo_root / "paper" / "demo-quality").read("2024-06-04").executed
+    assert executed is not None
+    assert report["executed"]["trading_cost"] == executed.trading_cost
+    assert report["executed"]["traded_notional"] == executed.traded_notional
+    assert report["executed"]["commission"] == executed.commission
+    assert report["executed"]["slippage"] == executed.slippage
     assert report["proposed"]["as_of"] == "2024-06-04"
     assert report["proposed"]["target_weights"] == {"AAPL": 0.1}
     assert len(research["items"]) == 1
     assert research["items"][0]["fund"] == "demo-quality"
+
+
+def test_catalog_preserves_canonical_library_models_and_blend(demo_root):
+    service = DeskService(demo_root)
+    strategies = {item["name"]: item for item in service.catalog()["strategies"]}
+    service.close()
+
+    deep_value = strategies["deep-value"]
+    contrarian = strategies["contrarian-value"]
+    assert next(item for item in deep_value["models"] if item["name"] == "graham")["weight"] == 2.0
+    assert next(item for item in contrarian["models"] if item["name"] == "burry")["weight"] == 2.0
+    assert deep_value["blend"] == {
+        "method": "conviction_weighted",
+        "gross_target": 1.0,
+        "mode": "long_only",
+    }
+    assert contrarian["blend"] == {
+        "method": "conviction_weighted",
+        "gross_target": 1.0,
+        "mode": "long_short",
+    }
 
 
 def test_corrupt_ledger_is_reported_instead_of_becoming_an_empty_valid_snapshot(demo_root):
@@ -74,6 +102,18 @@ def test_report_path_traversal_and_symlink_are_denied(demo_root, tmp_path):
     with pytest.raises(ServiceError) as symlink:
         service.research_report("escape.json")
     assert symlink.value.status_code == 403
+    service.close()
+
+
+def test_resource_name_collision_uses_windows_canonical_key(tmp_path):
+    existing = tmp_path / "demo.fund"
+    existing.mkdir()
+    service = DeskService(tmp_path)
+
+    with pytest.raises(ServiceError) as conflict:
+        service._assert_unique(tmp_path, "DEMO.FUND.")
+
+    assert conflict.value.status_code == 409
     service.close()
 
 
