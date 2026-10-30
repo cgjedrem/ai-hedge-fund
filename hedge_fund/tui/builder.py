@@ -40,7 +40,7 @@ from hedge_fund.fund import (
     StrategySpec,
     TradingWindow,
 )
-from hedge_fund.fund.spec import EARLIEST_WINDOW, LATEST_WINDOW
+from hedge_fund.fund.spec import EARLIEST_WINDOW, LATEST_WINDOW, validate_saxo_window
 from hedge_fund.paper import deploy, validate_fund_name
 from hedge_fund.signals import ALPHA_MODEL_REGISTRY, get_investment_approach, LLMAgent
 from hedge_fund.tui.backtest import BacktestScreen
@@ -109,8 +109,8 @@ class BuilderScreen(Screen):
         self.STEP_IDS = ["step-name", "step-strategies", "step-capital", "step-cadence"]
         self.STEP_TITLES = ["Name", "Strategies", "Capital", "Cadence"]
         if mode == "paper":
-            self.STEP_IDS.extend(["step-approval", "step-tickers"])
-            self.STEP_TITLES.extend(["Approval", "Tickers"])
+            self.STEP_IDS.extend(["step-approval", "step-broker", "step-tickers"])
+            self.STEP_TITLES.extend(["Approval", "Broker", "Tickers"])
         # Library sorted like the CLI: discretionary pods first, then by name.
         self._library = sorted(
             (load_strategy(p) for p in STRATEGY_DIR.glob("*.yaml")),
@@ -189,6 +189,13 @@ class BuilderScreen(Screen):
                             Text("A missed decision lapses; the fund keeps running.", style=MUTED),
                             classes="hint",
                         )
+                    with Vertical(id="step-broker", classes="pane"):
+                        yield Label("Choose broker", classes="q")
+                        yield OptionList(
+                            Option("Paper — local educational book", id="broker-paper"),
+                            Option("Saxo SIM — external simulated book", id="broker-saxo"),
+                            id="broker-list",
+                        )
                 with VerticalScroll(id="step-interval", classes="pane"):
                     yield Label("Interval between sessions (minutes)", classes="q")
                     yield Input(value="1", id="interval-input")
@@ -255,6 +262,7 @@ class BuilderScreen(Screen):
             "step-capital": "#capital-input",
             "step-cadence": "#cadence-list",
             "step-approval": "#approval-list",
+            "step-broker": "#broker-list",
             "step-interval": "#interval-input",
             "step-window": "#window-start-input",
             "step-tickers": "#tickers-input",
@@ -266,6 +274,8 @@ class BuilderScreen(Screen):
             self.query_one("#cadence-list", OptionList).highlighted = self.CADENCES.index(picked)
         if pane_id == "step-approval":
             self.query_one("#approval-list", OptionList).highlighted = int(self._state.get("approval_required", False))
+        if pane_id == "step-broker":
+            self.query_one("#broker-list", OptionList).highlighted = int(self._state.get("broker", "paper") == "saxo")
         if pane_id == "step-interval":
             self._refresh_interval_line()
         if pane_id == "step-window":
@@ -303,6 +313,8 @@ class BuilderScreen(Screen):
         elif pane == "step-window":
             self._goto("step-interval")
         elif pane == "step-tickers":
+            self._goto("step-broker")
+        elif pane == "step-broker":
             self._goto("step-approval")
         elif pane == "step-approval" and self._state.get("rebalance") == "minute":
             self._goto("step-window")
@@ -392,6 +404,25 @@ class BuilderScreen(Screen):
     @on(OptionList.OptionSelected, "#approval-list")
     def _submit_approval(self, event: OptionList.OptionSelected) -> None:
         self._state["approval_required"] = event.option_index == 1
+        self._goto("step-broker")
+
+    @on(OptionList.OptionSelected, "#broker-list")
+    def _submit_broker(self, event: OptionList.OptionSelected) -> None:
+        broker = "saxo" if event.option_index == 1 else "paper"
+        if broker == "saxo" and self._state.get("rebalance") != "minute":
+            self.notify("Saxo requires an in-market intraday cadence; choose minute.", severity="error")
+            self._state["broker"] = "paper"
+            self.query_one("#broker-list", OptionList).highlighted = 0
+            return
+        if broker == "saxo":
+            try:
+                validate_saxo_window(self._state.get("window") or TradingWindow())
+            except ValueError as exc:
+                self.notify(str(exc), severity="error")
+                self._state["broker"] = "paper"
+                self.query_one("#broker-list", OptionList).highlighted = 0
+                return
+        self._state["broker"] = broker
         self._goto("step-tickers")
 
     # ---- the minute sub-steps: interval, then window ------------------------
@@ -449,6 +480,8 @@ class BuilderScreen(Screen):
         end = self.query_one("#window-end-input", Input).value.strip()
         try:
             self._state["window"] = TradingWindow(start=start, end=end)
+            if self._state.get("broker") == "saxo":
+                validate_saxo_window(self._state["window"])
         except ValueError as exc:
             self.notify(_first_reason(exc), severity="error")
             return
@@ -476,6 +509,7 @@ class BuilderScreen(Screen):
             capital=self._state["capital"],
             rebalance=self._state["rebalance"],
             approval_required=self._state.get("approval_required", False),
+            broker=self._state.get("broker", "paper"),
             **({"interval": self._state["interval"], "window": self._state["window"]} if intraday else {}),
         )
         # The user said yes to replacing the fund that held this name: clear
@@ -501,7 +535,7 @@ class BuilderScreen(Screen):
         staff = ", ".join(s.title for s in self._state["strategies"])
         identity = Text.assemble(
             (spec.name, f"bold {BRIGHT}"),
-            (f"  ·  {staff}  ·  ${spec.capital:,.0f}  ·  {cadence_identity(spec)}", MUTED),
+            (f"  ·  {staff}  ·  ${spec.capital:,.0f}  ·  {cadence_identity(spec)}  ·  broker: {spec.broker}", MUTED),
         )
         if replaced:
             self.notify(f"Replaced the previous {spec.name}.", severity="warning")
@@ -529,7 +563,12 @@ class BuilderScreen(Screen):
                     identity,
                     Text(" ".join(universe), style=MUTED),
                     Text(""),
-                    Text.assemble(("✓ ", f"bold {GREEN}"), ("Ledger and book at ", MUTED), (str(directory), MUTED)),
+                    Text.assemble(
+                        ("✓ ", f"bold {GREEN}"),
+                        ("Ledger at " if spec.broker == "saxo" else "Ledger and book at ", MUTED),
+                        (str(directory), MUTED),
+                        *([(" · Saxo SIM book is external", MUTED)] if spec.broker == "saxo" else []),
+                    ),
                     Text.assemble(("✓ ", f"bold {GREEN}"), ("Definition saved to ", MUTED), (str(path), MUTED)),
                     Text(""),
                     Text(first, style=MUTED),
@@ -571,7 +610,8 @@ class BuilderScreen(Screen):
             2: (f"${self._state['capital']:,.0f}" if "capital" in self._state else None),
             3: self._short_cadence(),
             4: ("approval required" if self._state.get("approval_required") else "automatic execution" if "approval_required" in self._state else None),
-            5: (short_tickers(self._state["universe"], 3) if "universe" in self._state else None),
+            5: {"paper": "Paper", "saxo": "Saxo SIM"}.get(self._state.get("broker")),
+            6: (short_tickers(self._state["universe"], 3) if "universe" in self._state else None),
         }
         active = self._step if self._pane() != "step-done" else -1
         for i, title in enumerate(self.STEP_TITLES):

@@ -119,7 +119,7 @@ def test_builder_paper_mode_builds_a_live_fund_and_refuses_taken_names():
             await pilot.press("end", "enter")  # the + row
             screen = app.screen
             assert isinstance(screen, builder.BuilderScreen) and screen.mode == "paper"
-            assert screen.STEP_TITLES == ["Name", "Strategies", "Capital", "Cadence", "Approval", "Tickers"]
+            assert screen.STEP_TITLES == ["Name", "Strategies", "Capital", "Cadence", "Approval", "Broker", "Tickers"]
             for taken in ("taken", "saved"):  # paper funds and saved definitions both count
                 screen.query_one("#name-input", Input).value = taken
                 await pilot.press("enter")
@@ -132,6 +132,8 @@ def test_builder_paper_mode_builds_a_live_fund_and_refuses_taken_names():
             await pilot.press("enter")
             screen.query_one("#agent-list", SelectionList).select("pead")
             await pilot.press("enter", "enter", "enter")
+            await pilot.press("enter")
+            assert screen.query_one("#panes", ContentSwitcher).current == "step-broker"
             await pilot.press("enter")
             assert screen.query_one("#panes", ContentSwitcher).current == "step-tickers"
             tickers = screen.query_one("#tickers-input", Input)
@@ -178,6 +180,8 @@ def test_builder_paper_mode_sets_approval_required(approval_required):
             assert screen.query_one("#panes", ContentSwitcher).current == "step-approval"
             choices = screen.query_one("#approval-list", OptionList)
             choices.highlighted = int(approval_required)
+            await pilot.press("enter")
+            assert screen.query_one("#panes", ContentSwitcher).current == "step-broker"
             await pilot.press("enter")
             assert screen.query_one("#panes", ContentSwitcher).current == "step-tickers"
             screen.query_one("#tickers-input", Input).value = "TEST"
@@ -247,14 +251,16 @@ def test_builder_minute_path_sets_interval_and_window_and_offers_start_running()
             await pilot.press("enter")
             assert screen.query_one("#panes", ContentSwitcher).current == "step-approval"
             await pilot.press("enter")
+            assert screen.query_one("#panes", ContentSwitcher).current == "step-broker"
+            await pilot.press("enter")
             assert screen.query_one("#panes", ContentSwitcher).current == "step-tickers"
             rail = render(screen.query_one("#rail-3", Static).content)
             assert "every 30s" in rail and "09:00–12:00 ET" in rail
             await pilot.press("escape")
-            assert screen.query_one("#panes", ContentSwitcher).current == "step-approval"
+            assert screen.query_one("#panes", ContentSwitcher).current == "step-broker"
             await pilot.press("escape")
-            assert screen.query_one("#panes", ContentSwitcher).current == "step-window"
-            await pilot.press("escape", "escape")
+            assert screen.query_one("#panes", ContentSwitcher).current == "step-approval"
+            await pilot.press("escape", "escape", "escape")
             assert screen.query_one("#panes", ContentSwitcher).current == "step-cadence"
             assert cadences.highlighted == 0
             await pilot.press("enter", "enter")  # interval and window remembered
@@ -262,6 +268,7 @@ def test_builder_minute_path_sets_interval_and_window_and_offers_start_running()
             await pilot.press("enter")
             await pilot.press("enter")
             screen.query_one("#tickers-input", Input).value = "TEST"
+            await pilot.press("enter")
             await pilot.press("enter")
             await pilot.pause()
             assert screen.query_one("#panes", ContentSwitcher).current == "step-done"
@@ -342,6 +349,7 @@ def test_builder_replaces_a_taken_name_only_after_yes_and_only_at_the_end():
             screen.query_one("#agent-list", SelectionList).select("pead")
             await pilot.press("enter", "enter", "enter")
             await pilot.press("enter")
+            await pilot.press("enter")  # choose the default paper broker
             screen.query_one("#tickers-input", Input).value = "TEST"
             await pilot.press("enter")
             await pilot.pause()
@@ -377,6 +385,7 @@ def test_builder_paper_mode_run_its_first_session_opens_the_approval_step(monkey
             screen.query_one("#agent-list", SelectionList).select("pead")
             await pilot.press("enter", "enter", "enter")
             await pilot.press("enter")
+            await pilot.press("enter")  # choose the default paper broker
             screen.query_one("#tickers-input", Input).value = "TEST"
             await pilot.press("enter")
             await pilot.pause()
