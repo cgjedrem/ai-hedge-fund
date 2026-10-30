@@ -37,9 +37,12 @@ export function HomePage() {
       key: "state",
       label: "State",
       render: (item) => (
-        <Badge variant={!item.ledger_ok ? "negative" : item.halted ? "warning" : "positive"}>
-          {!item.ledger_ok ? "Ledger issue" : item.halted ? "Halted" : "Recorded"}
-        </Badge>
+        <div className="flex flex-wrap gap-1">
+          <Badge variant={!item.ledger_ok ? "negative" : item.halt_state === "unreadable" || item.halt_state === "halted" ? "warning" : "positive"}>
+            {!item.ledger_ok ? "Ledger issue" : item.halt_state === "unreadable" ? "Halt state unknown" : item.halt_state === "halted" ? "Halted" : "Recorded"}
+          </Badge>
+          {!item.ledger_ok && item.halt_state === "unreadable" ? <Badge variant="warning">Halt state unknown</Badge> : null}
+        </div>
       ),
     },
   ];

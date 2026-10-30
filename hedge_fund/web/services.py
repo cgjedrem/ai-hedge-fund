@@ -186,6 +186,13 @@ class DeskService:
             directory = self._ensure_dir("mandates")
             self._assert_unique(directory, f"{name}.yaml")
             try:
+                self._load_mandate_by_name(name)
+            except ServiceError as exc:
+                if exc.status_code != 404:
+                    raise
+            else:
+                raise ServiceError(409, "A mandate with this name already exists.")
+            try:
                 save_spec(spec, directory)
             except FileExistsError:
                 raise ServiceError(409, "A mandate with this name already exists.") from None
@@ -245,6 +252,7 @@ class DeskService:
                         "last_session": snapshot.get("last_session"),
                         "ledger_ok": snapshot["ledger"]["ok"],
                         "halted": snapshot.get("halted"),
+                        "halt_state": snapshot["halt_state"],
                         "runner": self._runner_state(),
                     }
                 )
@@ -279,11 +287,17 @@ class DeskService:
         except (OSError, ValueError) as exc:
             raise ServiceError(409, f"Paper fund is invalid ({type(exc).__name__}).") from None
         ledger = Ledger(directory)
+        record: SessionRecord | None = None
+
+        def capture_verified(candidate: SessionRecord) -> None:
+            nonlocal record
+            if candidate.session == session:
+                record = candidate
+
         try:
-            ledger.replay(deployed.spec.capital, full=True)
-            if session not in ledger.sessions():
+            ledger.replay(deployed.spec.capital, full=True, on_verified=capture_verified)
+            if record is None:
                 raise ServiceError(404, "Session report not found.")
-            record = ledger.read(session)
         except ServiceError:
             raise
         except (LedgerError, OSError, ValueError) as exc:
@@ -517,8 +531,10 @@ class DeskService:
         ledger = Ledger(directory)
         try:
             halted = ledger.halted()
+            halt_state = "halted" if halted is not None else "clear"
         except (LedgerError, OSError, ValueError):
             halted = None
+            halt_state = "unreadable"
         try:
             records = ledger.records()
             state = ledger.replay(deployed.spec.capital, full=True)
@@ -584,6 +600,7 @@ class DeskService:
             "approval": approval,
             "next_run": next_run,
             "halted": halted,
+            "halt_state": halt_state,
             "ledger": ledger_status,
             "runner": self._runner_state(),
             "live_value": {

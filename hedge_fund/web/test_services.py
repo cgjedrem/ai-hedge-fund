@@ -104,6 +104,37 @@ def test_deploy_resolves_yml_file_by_spec_name(demo_root, tmp_path):
     assert (tmp_path / "paper" / "legacy-mandate" / "fund.yaml").is_file()
 
 
+@pytest.mark.parametrize(
+    ("existing_name", "filename", "requested_name"),
+    [
+        ("legacy-mandate", "alternate-name.yml", "legacy-mandate"),
+        ("legacy-case", "unrelated.yaml", "LEGACY-CASE"),
+    ],
+)
+def test_create_mandate_rejects_duplicate_canonical_name(demo_root, tmp_path, existing_name, filename, requested_name):
+    payload = yaml.safe_load((demo_root / "mandates" / "demo-quality.yaml").read_text(encoding="utf-8"))
+    payload["name"] = existing_name
+    directory = tmp_path / "mandates"
+    directory.mkdir()
+    existing = directory / filename
+    original = yaml.safe_dump(payload, sort_keys=False)
+    existing.write_text(original, encoding="utf-8")
+    requested = dict(payload)
+    requested["name"] = requested_name
+    service = DeskService(tmp_path, allow_writes=True)
+
+    try:
+        with pytest.raises(ServiceError) as conflict:
+            service.create_mandate(requested)
+    finally:
+        service.close()
+
+    assert conflict.value.status_code == 409
+    assert conflict.value.detail == "A mandate with this name already exists."
+    assert existing.read_text(encoding="utf-8") == original
+    assert not (directory / f"{requested_name}.yaml").exists()
+
+
 def test_mandate_detail_rejects_ambiguous_spec_names(demo_root, tmp_path):
     payload = yaml.safe_load((demo_root / "mandates" / "demo-quality.yaml").read_text(encoding="utf-8"))
     directory = tmp_path / "mandates"
@@ -155,6 +186,24 @@ def test_corrupt_ledger_is_reported_instead_of_becoming_an_empty_valid_snapshot(
     assert papers["errors"][0]["name"] == "demo-quality"
 
 
+@pytest.mark.parametrize("contents", ["{", "[]", "{}"])
+def test_unreadable_control_is_explicit_in_paper_list_and_detail(demo_root, contents):
+    control = demo_root / "paper" / "demo-quality" / "control.json"
+    control.write_text(contents, encoding="utf-8")
+
+    with TestClient(create_app(root=demo_root, demo=True)) as client:
+        detail = client.get("/api/paper/demo-quality", headers={"host": "127.0.0.1"}).json()
+        papers = client.get("/api/paper", headers={"host": "127.0.0.1"}).json()
+
+    item = next(item for item in papers["items"] if item["name"] == "demo-quality")
+    assert detail["halt_state"] == "unreadable"
+    assert detail["halted"] is None
+    assert detail["ledger"] == {"ok": False, "error": "Ledger verification failed (LedgerError)."}
+    assert item["halt_state"] == "unreadable"
+    assert item["halted"] is None
+    assert papers["errors"] == [{"name": "demo-quality", "error": "Ledger verification failed (LedgerError)."}]
+
+
 def test_session_report_verifies_entire_ledger_before_returning_a_later_record(demo_root):
     path = demo_root / "paper" / "demo-quality" / "ledger" / "2024-06-03.json"
     payload = json.loads(path.read_text(encoding="utf-8"))
@@ -170,6 +219,32 @@ def test_session_report_verifies_entire_ledger_before_returning_a_later_record(d
     assert response.status_code == 409
     assert response.json() == {"detail": "Ledger verification failed (LedgerError)."}
     assert not {"session", "hash", "nav", "executed"} & set(response.json())
+
+
+def test_session_report_returns_the_record_verified_during_replay(demo_root, monkeypatch):
+    original_read = Ledger.read
+    target_session = "2024-06-04"
+    reads = 0
+
+    def swap_on_reread(ledger, session):
+        nonlocal reads
+        record = original_read(ledger, session)
+        if session == target_session:
+            reads += 1
+            if reads > 1:
+                return record.model_copy(update={"nav": -1})
+        return record
+
+    monkeypatch.setattr(Ledger, "read", swap_on_reread)
+    with TestClient(create_app(root=demo_root, demo=True)) as client:
+        response = client.get(
+            f"/api/paper/demo-quality/sessions/{target_session}",
+            headers={"host": "127.0.0.1"},
+        )
+
+    assert response.status_code == 200
+    assert reads == 1
+    assert response.json()["nav"] == 100_495
 
 
 def test_report_path_traversal_and_symlink_are_denied(demo_root, tmp_path):

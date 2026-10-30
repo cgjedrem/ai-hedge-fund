@@ -1,5 +1,6 @@
 import json
 
+import pytest
 import yaml
 from fastapi.testclient import TestClient
 
@@ -110,6 +111,28 @@ def test_approval_is_rejected_for_halted_fund(write_client, demo_root):
     assert response.status_code == 409
     assert response.json()["detail"] == "Halted funds cannot accept a verdict."
     assert not ledger.approval()
+
+
+@pytest.mark.parametrize("contents", ["{", "[]", "{}"])
+def test_approval_is_rejected_when_control_is_unreadable(write_client, demo_root, contents):
+    client, headers = write_client
+    pending = client.get("/api/paper/demo-quality", headers={"host": "127.0.0.1"}).json()["pending"]
+    control = demo_root / "paper" / "demo-quality" / "control.json"
+    control.write_text(contents, encoding="utf-8")
+
+    response = client.post(
+        "/api/paper/demo-quality/approval",
+        headers=headers,
+        json={
+            "verdict": "approve",
+            "decision_as_of": pending["decision_as_of"],
+            "source_record_hash": pending["source_record_hash"],
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "Paper state is invalid (LedgerError)."
+    assert not (demo_root / "paper" / "demo-quality" / "pending-approval.json").exists()
 
 
 def test_halt_and_resume_reuse_the_existing_ledger_control(tmp_path):

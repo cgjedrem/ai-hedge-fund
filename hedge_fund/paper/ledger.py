@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -144,11 +145,19 @@ class Ledger:
             checkpoint.unlink()
         return latest
 
-    def replay(self, capital: float, *, before: str | None = None, full: bool = False) -> FundState:
+    def replay(
+        self,
+        capital: float,
+        *,
+        before: str | None = None,
+        full: bool = False,
+        on_verified: Callable[[SessionRecord], None] | None = None,
+    ) -> FundState:
         """Fold the chain into the fund's current state, verifying every link
         it walks. With *before*, stop short of that session: the state the
         fund was in going into it. Starts from the newest trusted checkpoint
-        before the stop unless *full*, which walks from the first record."""
+        before the stop unless *full*, which walks from the first record.
+        Calls on_verified after each record passes chain checks."""
         state = FundState.initial(capital)
         sessions = self.sessions()
         if not full:
@@ -167,6 +176,8 @@ class Ledger:
             if record.hash != record.compute_hash():
                 raise LedgerError(f"{record.fund}: session {session} has been altered since it was written")
             state = next_state(state, record)
+            if on_verified is not None:
+                on_verified(record)
         return state.model_copy(update={"halted": self.halted()})
 
     # ---- checkpoints ------------------------------------------------------
@@ -223,9 +234,14 @@ class Ledger:
             control = json.loads(self.control_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             raise LedgerError(f"{self.control_path}: cannot read the kill switch: {exc}") from exc
-        if not control.get("halted"):
+        if not isinstance(control, dict) or not isinstance(control.get("halted"), bool):
+            raise LedgerError(f"{self.control_path}: kill switch has no boolean halt state")
+        if not control["halted"]:
             return None
-        return control.get("reason") or "halted"
+        reason = control.get("reason")
+        if reason is not None and not isinstance(reason, str):
+            raise LedgerError(f"{self.control_path}: kill switch reason is invalid")
+        return reason or "halted"
 
     def halt(self, reason: str) -> None:
         self._write_control(True, reason)

@@ -52,6 +52,7 @@ const home: HomeData = {
       last_session: "2024-06-05",
       ledger_ok: true,
       halted: null,
+      halt_state: "clear",
       runner: { status: "unknown", available: false, reason: "Runner ownership is not verified." },
     },
   ],
@@ -90,6 +91,7 @@ const paperDetail: PaperSnapshot = {
   approval: null,
   next_run: "2024-06-06T13:30:00+00:00",
   halted: null,
+  halt_state: "clear",
   ledger: { ok: true, error: null },
   runner: { status: "unknown", available: false, reason: "Runner ownership is not verified; web process controls are disabled." },
   live_value: { status: "unavailable", value: null, as_of: null, provenance: null, reason: "Live quotes are not fetched by the web process." },
@@ -313,6 +315,32 @@ describe("local desk screens", () => {
     expect(await screen.findByRole("heading", { name: "demo-quality scorecard" })).toBeInTheDocument();
     expect(screen.getAllByText("$1,000")).toHaveLength(2);
     expect(await screen.findByText("$5.00")).toBeInTheDocument();
+  });
+
+  it("shows unreadable halt state in list and detail and disables paper actions", async () => {
+    const unreadableSummary = { ...home.paper_funds[0], halt_state: "unreadable" as const };
+    const unreadableDetail = { ...paperDetail, halt_state: "unreadable" as const };
+    installApi({
+      override: (path, method) => {
+        if (method !== "GET") return null;
+        if (path === "/api/paper") return { payload: { items: [unreadableSummary], errors: [] } };
+        if (path === "/api/paper/demo-quality") return { payload: unreadableDetail };
+        return null;
+      },
+    });
+    window.history.replaceState({}, "", "/paper");
+    const user = userEvent.setup();
+    render(<App />);
+
+    expect(await screen.findByText("Halt state unknown")).toBeInTheDocument();
+    await user.click(screen.getByRole("link", { name: /demo-quality/ }));
+    expect(await screen.findByRole("heading", { name: "demo-quality" })).toBeInTheDocument();
+    expect(screen.getAllByText("Halt state unknown").length).toBeGreaterThan(0);
+    expect(screen.getByText("Halt state cannot be verified. Verdicts are disabled.")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Approve" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Reject" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Halt" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Resume" })).toBeDisabled();
   });
 
   it("shows a verified-ledger error without session metrics", async () => {

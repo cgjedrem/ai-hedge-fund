@@ -35,6 +35,7 @@ import { apiPost } from "@/lib/api";
 import { useDesk, useResource } from "@/lib/hooks";
 import type {
   Approval,
+  HaltState,
   PaperCollection,
   PaperSnapshot,
   PaperSummary,
@@ -71,7 +72,13 @@ export function PaperPage() {
       render: (item) => (
         <div className="flex flex-wrap gap-1.5">
           <Badge variant={item.ledger_ok ? "positive" : "negative"}>{item.ledger_ok ? "Verified" : "Error"}</Badge>
-          {item.halted ? <Badge variant="warning">Halted</Badge> : <Badge variant="muted">Runner unknown</Badge>}
+          {item.halt_state === "unreadable" ? (
+            <Badge variant="warning">Halt state unknown</Badge>
+          ) : item.halt_state === "halted" ? (
+            <Badge variant="warning">Halted</Badge>
+          ) : (
+            <Badge variant="muted">Runner unknown</Badge>
+          )}
         </div>
       ),
     },
@@ -132,7 +139,7 @@ export function PaperDetailPage() {
   const canWrite = capabilities?.writes === true && !protectedName;
   const data = resource.data;
   const approvalRequired = data?.spec.approval_required === true;
-  const canApprove = canWrite && approvalRequired && !data?.halted && data?.ledger.ok === true;
+  const canApprove = canWrite && approvalRequired && data?.halt_state === "clear" && data?.ledger.ok === true;
 
   async function submitAction(): Promise<void> {
     if (!confirmAction) return;
@@ -200,6 +207,9 @@ export function PaperDetailPage() {
       {data ? (
         <>
           {!data.ledger.ok ? <Alert tone="danger" className="mb-5"><strong>Ledger verification failed.</strong> <span>{data.ledger.error}</span></Alert> : null}
+          {data.halt_state === "unreadable" ? (
+            <Alert tone="warning" className="mb-5">Halt state is unreadable. Paper controls and approval writes are disabled.</Alert>
+          ) : null}
           {protectedName ? <Alert tone="warning" className="mb-5">This protected fund can be inspected but not modified through the web desk.</Alert> : null}
           {feedback ? <Alert tone={feedback.tone} className="mb-5">{feedback.message}</Alert> : null}
 
@@ -209,10 +219,10 @@ export function PaperDetailPage() {
             <MetricCard label="Next forecast" value={data.next_run ? dateLabel(data.next_run) : "Unavailable"} note="Schedule estimate only · no process signal" icon={CalendarClock} />
             <MetricCard
               label="Book state"
-              value={!data.ledger.ok ? "Unverified" : data.halted ? "Halted" : "Recorded"}
-              note={data.runner.available ? "Runner available" : data.runner.reason}
-              tone={!data.ledger.ok ? "negative" : data.halted ? "warning" : "positive"}
-              icon={data.halted ? CirclePause : ShieldCheck}
+              value={!data.ledger.ok ? "Unverified" : data.halt_state === "unreadable" ? "Halt state unknown" : data.halt_state === "halted" ? "Halted" : "Recorded"}
+              note={data.halt_state === "unreadable" ? "Halt state cannot be verified." : data.runner.available ? "Runner available" : data.runner.reason}
+              tone={!data.ledger.ok ? "negative" : data.halt_state === "unreadable" || data.halt_state === "halted" ? "warning" : "positive"}
+              icon={data.halt_state === "halted" ? CirclePause : ShieldCheck}
             />
           </div>
 
@@ -241,19 +251,21 @@ export function PaperDetailPage() {
                 <CardHeader>
                   <div className="flex items-center justify-between gap-3">
                     <CardTitle>Control panel</CardTitle>
-                    <Badge variant={data.halted ? "warning" : "muted"}>{data.halted ? "Halted" : "Runner unverified"}</Badge>
+                    <Badge variant={data.halt_state === "clear" ? "muted" : "warning"}>
+                      {data.halt_state === "unreadable" ? "Halt state unknown" : data.halt_state === "halted" ? "Halted" : "Runner unverified"}
+                    </Badge>
                   </div>
                 </CardHeader>
                 <CardContent className="space-y-4">
                   <p className="text-xs leading-relaxed text-muted-foreground">{data.runner.reason}</p>
                   <div className="grid grid-cols-2 gap-2">
-                    <Button variant="danger" onClick={() => { setFeedback(null); setHaltDialogOpen(true); }} disabled={!canWrite || Boolean(data.halted)}>
+                    <Button variant="danger" onClick={() => { setFeedback(null); setHaltDialogOpen(true); }} disabled={!canWrite || data.halt_state !== "clear"}>
                       <CirclePause className="h-3.5 w-3.5" /> Halt
                     </Button>
                     <Button
                       variant="secondary"
                       onClick={() => setConfirmAction("resume")}
-                      disabled={!canWrite || !data.halted || !data.ledger.ok}
+                      disabled={!canWrite || data.halt_state !== "halted" || !data.ledger.ok}
                       title={!data.ledger.ok ? "Resume requires a valid, replayable ledger." : undefined}
                     >
                       <CirclePlay className="h-3.5 w-3.5" /> Resume
@@ -290,7 +302,7 @@ export function PaperDetailPage() {
                 pending={data.pending}
                 approval={data.approval}
                 approvalRequired={approvalRequired}
-                halted={Boolean(data.halted)}
+                haltState={data.halt_state}
                 enabled={canApprove}
                 onVerdict={(verdict) => setConfirmAction(verdict)}
               />
@@ -356,14 +368,14 @@ function PendingDecisionCard({
   pending,
   approval,
   approvalRequired,
-  halted,
+  haltState,
   enabled,
   onVerdict,
 }: {
   pending: PendingDecision | null;
   approval: Approval | null;
   approvalRequired: boolean;
-  halted: boolean;
+  haltState: HaltState;
   enabled: boolean;
   onVerdict: (verdict: "approve" | "reject") => void;
 }) {
@@ -383,8 +395,10 @@ function PendingDecisionCard({
     );
   }
   const weights = Object.entries(pending.final_weights).sort(([left], [right]) => left.localeCompare(right));
-  const status = !approvalRequired ? "Approval not required" : halted ? "Halted" : approval ? approval.verdict : "Awaiting verdict";
-  const statusVariant = !approvalRequired || halted ? "muted" : approval ? (approval.verdict === "approve" ? "positive" : "negative") : "warning";
+  const halted = haltState === "halted";
+  const haltUnreadable = haltState === "unreadable";
+  const status = !approvalRequired ? "Approval not required" : haltUnreadable ? "Halt state unknown" : halted ? "Halted" : approval ? approval.verdict : "Awaiting verdict";
+  const statusVariant = !approvalRequired || halted || haltUnreadable ? "muted" : approval ? (approval.verdict === "approve" ? "positive" : "negative") : "warning";
   return (
     <Card>
       <CardHeader>
@@ -413,11 +427,12 @@ function PendingDecisionCard({
         <p className="text-[10px] text-muted-foreground">Strategies: {pending.strategies.join(" · ") || "—"}</p>
         {!approvalRequired ? <p className="text-[10px] leading-relaxed text-muted-foreground">This mandate does not require approval. Its recorded decision is not waiting for a verdict.</p> : null}
         {approvalRequired && halted ? <p className="text-[10px] leading-relaxed text-muted-foreground">Halted funds cannot accept a verdict.</p> : null}
+        {approvalRequired && haltUnreadable ? <p className="text-[10px] leading-relaxed text-muted-foreground">Halt state cannot be verified. Verdicts are disabled.</p> : null}
         <div className="grid grid-cols-2 gap-2">
           <Button onClick={() => onVerdict("approve")} disabled={!enabled}>Approve</Button>
           <Button variant="danger" onClick={() => onVerdict("reject")} disabled={!enabled}>Reject</Button>
         </div>
-        {!enabled && approvalRequired && !halted ? <p className="text-[10px] leading-relaxed text-muted-foreground">Verdict writes require startup write capability and a non-protected fund name.</p> : null}
+        {!enabled && approvalRequired && haltState === "clear" ? <p className="text-[10px] leading-relaxed text-muted-foreground">Verdict writes require startup write capability and a non-protected fund name.</p> : null}
       </CardContent>
     </Card>
   );

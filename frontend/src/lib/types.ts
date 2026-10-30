@@ -86,6 +86,8 @@ export interface HomeData {
   errors: { name?: string; id?: string; error: string }[];
 }
 
+export type HaltState = "clear" | "halted" | "unreadable";
+
 export interface PaperSummary {
   name: string;
   universe: string[];
@@ -96,6 +98,7 @@ export interface PaperSummary {
   last_session: string | null;
   ledger_ok: boolean;
   halted: string | null;
+  halt_state: HaltState;
   runner: RunnerState;
 }
 
@@ -199,6 +202,7 @@ export interface PaperSnapshot {
   approval: Approval | null;
   next_run: string | null;
   halted: string | null;
+  halt_state: HaltState;
   ledger: { ok: boolean; error: string | null };
   runner: RunnerState;
   live_value: {
