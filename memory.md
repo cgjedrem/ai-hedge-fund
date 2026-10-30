@@ -23,3 +23,4 @@
 [2026-10-30] [high] Source: hedge_fund/paper/ledger.py, hedge_fund/web/services.py, frontend/src/pages/paper.tsx; halt state is explicit clear/halted/unreadable, malformed control shapes fail closed, and ledger verification errors remain distinct.
 [2026-10-30] [high] Source: hedge_fund/paper/ledger.py and hedge_fund/web/services.py; session_report returns the SessionRecord captured during verified full replay instead of rereading the selected ledger file.
 [2026-10-30] [high] Source: frontend/e2e/desk.spec.ts and frontend/src/pages/paper.tsx; E2E doubles that change legacy halted reason must also update halt_state because the UI gates on explicit state.
+[2026-10-30] [high] Source: specs/004-react-web-ui/qa-final.md and parity-checklist.md; React desk is additive and explicitly not full TUI parity; runner control, manual runs, live valuation and destructive operations remain deferred, with the TUI retained as the recovery/operator interface.

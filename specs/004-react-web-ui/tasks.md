@@ -55,7 +55,7 @@
 - [x] T021 Add one-command launcher, Compose web service/Linux override, Dockerfile.web and README.md instructions.
 - [x] T022 Run affected API/frontend/build/changed-file style checks and chunk existing-suite checks; record exact passes, platform failures, and exclusions in specs/004-react-web-ui/acceptance-evidence.md.
 - [x] T023 Capture production-build browser desktop/narrow screenshots, every screen and real-fund read-only checks in frontend/e2e/ and specs/004-react-web-ui/acceptance-evidence.md. Cycle 2: 17 synthetic screenshots refreshed; read-only browser checked 18 available real-root routes, all HTTP 200 with no UI/API errors. No live research report existed (0 saved reports); synthetic E2E covered report detail. Protected-root byte identity remains intentionally INCONCLUSIVE and was not fingerprinted.
-- [ ] T024 Complete independent QA dev loop, rerun affected final-artifact evidence, and update parity/gaps in specs/004-react-web-ui/acceptance-evidence.md.
+- [x] T024 Complete independent QA dev loop, rerun affected final-artifact evidence, and update parity/gaps in specs/004-react-web-ui/acceptance-evidence.md. Final static review passed with accepted nonblocking caveats recorded in qa-final.md; final source-bound Linux suite 1,134 passed / 37 skipped, API/shared 175, frontend 8, production E2E 5.
 - [ ] T025 Update PR #7 with self-contained run instructions/screenshots/parity/assumptions/limitations and leave safe read-only preview running.
 
 ## Dependencies and Execution Order

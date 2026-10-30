@@ -1,6 +1,6 @@
 # Acceptance Evidence
 
-Latest status after QA repair cycle 3: F1–F3 repairs are committed at `01c62a1e983dcd15c2a199ebbfadb032052f0d05`; final E2E fixture parity is committed at source HEAD `b3c51783e71e14cb3179880c8a98fa6c9607f9a3`. Final checks and detached default-root preview evidence follow below. Protected-root content identity remains INCONCLUSIVE; React/TUI parity remains partial; do not retire the TUI. T024/T025 remain coordinator-owned and unchecked. Cycle-two evidence remains historical.
+Latest status after QA repair cycle 3: F1–F3 repairs are committed at `01c62a1e983dcd15c2a199ebbfadb032052f0d05`; final E2E fixture parity is committed at source HEAD `b3c51783e71e14cb3179880c8a98fa6c9607f9a3`. Final checks and detached default-root preview evidence follow below. Independent final QA passed with accepted nonblocking caveats in qa-final.md; T024 is complete. Protected-root content identity remains INCONCLUSIVE; React/TUI parity remains partial; do not retire the TUI. T025 tracks final PR handoff. Cycle-two evidence remains historical.
 
 Cycle-one and cycle-two sections below are historical; cycle-three final-artifact evidence follows them.
 
@@ -164,7 +164,7 @@ An earlier isolated run at source `d054b3a` without `COLUMNS=240` reported 1,120
 - External session artifacts: `C:\Users\CHRIST~1\AppData\Local\Temp\aihf-final-repair-7012aa2f-d63c-4604-8906-7a89143c5242`. Guarded API runner SHA-256 `7d92363e72eb713efe65f9ef5688922b77d3830357618965a2e43c76c3d3e7f0`; final Playwright config SHA-256 `c9c2a1111bec4ccf1af7243a1a0bd44af228b4f64492bb588a0b01b8df7a2d7e`; real-root GET-only browser checker SHA-256 `63f18ef144deb553f03d1749449adcc23119e31853410e0ed86ee6986efdac28`.
 - `frontend/package-lock.json` SHA-256 remains `380011feb3bd4ce8888ccc3ecb13db8bfaec6cee2c1eecaf30f5bf97e8f444a0`.
 - Final production static tree: 3 files, 943,381 bytes, SHA-256 `496f5cb9225a8101393de17351e80a507ad32ee87b62192f4125d4161dec5f17`. JS: 918,673 bytes, SHA-256 `702da05b36a43c63301be39817dc71159a88206e2decb68e1c100d55c403b8f6`; CSS: 24,240 bytes, SHA-256 `b18090644dad01fb78c587b1bbb616cb72cd1edb235476ad933fed85c13eaaf3`; `index.html`: 468 bytes, SHA-256 `9a76bb6017a5539605c927f6673b540f8be727d7ec090f1fd5ba0d5562c040db`. Hash measured `2026-10-30T22:18:01.8052468Z`–`22:18:01.8911243Z`.
-- Final synthetic screenshot tree: 17 PNGs, 2,970,542 bytes, SHA-256 `c42a1b0d869bf4fa6d52c4b78d19bd52d627b98509055326df428a38830377de`; stored under the external session-artifacts path above. Hash uses sorted repository-relative UTF-8 paths, NUL, 8-byte big-endian size, bytes, NUL, with the established screenshot path prefix. No screenshot was added to the repository. Hash measured at the same time as the static tree.
+- Final synthetic screenshot tree: 17 PNGs, 2,970,542 bytes, SHA-256 `c42a1b0d869bf4fa6d52c4b78d19bd52d627b98509055326df428a38830377de`; originally stored under the external session-artifacts path above, then copied by the coordinator into `specs/004-react-web-ui/screenshots/` for the PR. Hash uses sorted repository-relative UTF-8 paths, NUL, 8-byte big-endian size, bytes, NUL, with the established screenshot path prefix. Hash measured at the same time as the static tree. Only synthetic screenshots are committed.
 
 ### Final-source checks
 
