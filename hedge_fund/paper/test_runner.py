@@ -3,6 +3,8 @@ canned prints; and tick on a bar, the same session by hand."""
 
 import os
 import signal
+import subprocess
+import sys
 import threading
 from contextlib import contextmanager
 from datetime import datetime, timedelta
@@ -374,7 +376,12 @@ def test_serve_holds_a_pid_file_and_stops_on_sigterm(tmp_path, monkeypatch):
     def quick(directory, data, *, stop, **kwargs):
         seen["pid"] = int((directory / PID_FILE).read_text())
         seen["running"] = is_running(directory)
-        threading.Timer(0.05, lambda: os.kill(os.getpid(), signal.SIGTERM)).start()
+        if os.name == "nt":
+            # os.kill(self, SIGTERM) is TerminateProcess on Windows: no handler
+            # runs, so simulate the signal handler's effect directly.
+            threading.Timer(0.05, stop.set).start()
+        else:
+            threading.Timer(0.05, lambda: os.kill(os.getpid(), signal.SIGTERM)).start()
         seen["stopped"] = stop.wait(5)
 
     monkeypatch.setattr(runner, "run", quick)
@@ -383,6 +390,16 @@ def test_serve_holds_a_pid_file_and_stops_on_sigterm(tmp_path, monkeypatch):
     assert seen == {"pid": os.getpid(), "running": True, "stopped": True}
     assert not (directory / PID_FILE).exists() and not is_running(directory)
     # Two runners on one fund is a race on the ledger: the second refuses.
-    (directory / PID_FILE).write_text(str(os.getpid()))
-    with pytest.raises(RuntimeError, match="already running"):
+    # The pid must name a live process other than this one; a file naming
+    # this process is a stale incarnation (pid reuse across container
+    # restarts) and must not block a start.
+    sleeper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        (directory / PID_FILE).write_text(str(sleeper.pid))
+        with pytest.raises(RuntimeError, match="already running"):
+            serve(directory, _tape(_at(DAY, "12:59:00")))
+        (directory / PID_FILE).write_text(str(os.getpid()))
         serve(directory, _tape(_at(DAY, "12:59:00")))
+    finally:
+        sleeper.kill()
+        sleeper.wait()

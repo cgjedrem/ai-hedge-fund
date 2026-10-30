@@ -215,7 +215,9 @@ def serve(
     """`run` as a process: one per fund, found by its pid file, stopped by
     SIGTERM or SIGINT after the bar in flight. Refuses to start twice."""
     directory = Path(directory)
-    if is_running(directory):
+    # A pid file naming this very process is a stale incarnation: its writer
+    # is dead and its pid was reused by us (pid 1 across container restarts).
+    if is_running(directory) and _read_pid(directory) != os.getpid():
         raise RuntimeError(f"{directory.name} is already running (pid {_read_pid(directory)})")
     stop = threading.Event()
     previous = {s: signal.signal(s, lambda *_: stop.set()) for s in (signal.SIGTERM, signal.SIGINT)}
@@ -236,10 +238,11 @@ def is_running(directory: str | Path) -> bool:
         return False
     try:
         os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
     except PermissionError:
         return True
+    except OSError:
+        # ProcessLookupError on POSIX; plain OSError (WinError 87) on Windows.
+        return False
     return True
 
 
