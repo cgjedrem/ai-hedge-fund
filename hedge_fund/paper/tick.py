@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Callable
 
 from hedge_fund.brokers.factory import build_broker
+from hedge_fund.brokers.models import Fill, Order
 from hedge_fund.brokers.paper import PaperBroker
 from hedge_fund.data.bars import (
     current_bar,
@@ -316,15 +317,21 @@ def _run(
                     "reason": "stale verdict" if clear_verdict is not None else "no verdict",
                 },
             )
+
+    def record_fill(order: Order, fill: Fill) -> None:
+        ledger.log_event("broker_fill", session=session, order=order.model_dump(mode="json"), fill=fill.model_dump(mode="json"))
+
     try:
-        record = advance(fund, run_state, session, broker, data_client, deployed.universe, clock)
+        record = advance(fund, run_state, session, broker, data_client, deployed.universe, clock, on_fill=record_fill if deployed.broker == "saxo" else None)
         ledger.append(record)
     except FundHalted:
         raise
     except Exception as exc:
         reason = f"tick {session} failed: {type(exc).__name__}: {exc}"
-        ledger.log_event("tick_failed", session=session, error=f"{type(exc).__name__}: {exc}")
-        ledger.halt(reason)
+        try:
+            ledger.log_event("tick_failed", session=session, error=f"{type(exc).__name__}: {exc}")
+        finally:
+            ledger.halt(reason)
         raise
     if audit is not None:
         kind, fields = audit

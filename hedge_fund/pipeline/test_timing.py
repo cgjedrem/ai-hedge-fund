@@ -7,12 +7,14 @@ import pytest
 
 from hedge_fund.backtesting.test_fund import FakeDataClient
 from hedge_fund.brokers.models import Fill, Order, Position
+from hedge_fund.brokers.protocol import OrderSubmissionDeferred
 from hedge_fund.brokers.saxo import SaxoBroker
 from hedge_fund.brokers.sim import SimBroker
 from hedge_fund.brokers.test_saxo_doubles import FakeClock
 from hedge_fund.data import sessions
 from hedge_fund.fund import Fund, FundSpec
 from hedge_fund.models import Signal
+from hedge_fund.pipeline.clock import Marked
 from hedge_fund.pipeline.models import CycleRecord, DecisionRecord
 from hedge_fund.pipeline.session import advance, FundState, next_state
 from hedge_fund.pipeline.stages import assess_fund, execute_decision
@@ -30,23 +32,17 @@ class DatedAnalyst:
         self.calls.append((ticker, date))
         # A model can request the complete daily history up to its cutoff.
         assert all(bar.time[:10] <= date for bar in data_client.get_prices(ticker, FRIDAY, date))
-        return Signal(model_name="druckenmiller", ticker=ticker, date=date,
-                      value=self.views.get(date, 1))
+        return Signal(model_name="druckenmiller", ticker=ticker, date=date, value=self.views.get(date, 1))
 
 
 def make_fund(analyst=None):
     analyst = analyst or DatedAnalyst()
-    spec = FundSpec(schema_version=2, name="timing", capital=10_000,
-                    strategies=[{"name": "macro", "models": [{"name": "druckenmiller"}],
-                                 "blend": {"mode": "long_short"}}],
-                    risk={"max_position_pct": 1, "max_gross_exposure": 1},
-                    costs={"spread_bps": 0, "commission_per_share": 0})
+    spec = FundSpec(schema_version=2, name="timing", capital=10_000, strategies=[{"name": "macro", "models": [{"name": "druckenmiller"}], "blend": {"mode": "long_short"}}], risk={"max_position_pct": 1, "max_gross_exposure": 1}, costs={"spread_bps": 0, "commission_per_share": 0})
     return Fund(spec, models={"macro": [analyst]}), analyst
 
 
 def market(execution=MONDAY, price=200):
-    return FakeDataClient({"SPY": {FRIDAY: 100, execution: 101},
-                           "A": {FRIDAY: 100, execution: price}})
+    return FakeDataClient({"SPY": {FRIDAY: 100, execution: 101}, "A": {FRIDAY: 100, execution: price}})
 
 
 def _advance_through(fund, broker, data, days, state=None):
@@ -145,6 +141,7 @@ def test_refresh_failure_does_not_fall_back_to_original_targets():
         if date != FRIDAY:
             raise ConnectionError("refresh failed")
         return original_predict(ticker, date, data)
+
     analyst.predict = predict
     broker = SimBroker(10_000)
     broker.place_order = Mock()
@@ -158,9 +155,13 @@ def test_invalid_projected_orders_fail_before_submission(monkeypatch):
     from importlib import import_module
 
     pipeline = import_module("hedge_fund.pipeline.stages")
-    monkeypatch.setattr(pipeline, "build_orders", lambda *args: [
-        Order(ticker="A", side="buy", quantity=1000, price=200),
-    ])
+    monkeypatch.setattr(
+        pipeline,
+        "build_orders",
+        lambda *args: [
+            Order(ticker="A", side="buy", quantity=1000, price=200),
+        ],
+    )
     fund, _ = make_fund()
     broker = SimBroker(10_000)
     broker.place_order = Mock()
@@ -315,6 +316,106 @@ def test_filtered_orders_that_worsen_gross_exposure_fail_before_submission():
     broker.place_order.assert_not_called()
 
 
+def _rotation(broker_name, *, initial_quantity, target_sign, defer_after=None, target_views=None, quantity_caps=None):
+    views = target_views or {"B": target_sign}
+
+    class RotationAnalyst:
+        def predict(self, ticker, date, data_client):
+            return Signal(model_name="druckenmiller", ticker=ticker, date=date, value=views.get(ticker, 0))
+
+    class RotationClock:
+        def is_complete(self, session):
+            return True
+
+        def previous(self, session):
+            return "2024-06-07T15:59:00"
+
+        def session_date(self, session):
+            return session[:10]
+
+        def marks(self, tickers, session):
+            return Marked(prices={ticker: 100.0 for ticker in tickers})
+
+    class RotationBroker(SimBroker):
+        def __init__(self):
+            super().__init__(10_000)
+            self.placed = []
+            self.gross = []
+
+        def place_order(self, order):
+            if defer_after is not None and len(self.placed) >= defer_after:
+                raise OrderSubmissionDeferred("market close reached before order submission")
+            fill = super().place_order(order)
+            self.placed.append(order)
+            self.gross.append(sum(abs(position.shares) for position in self.positions().values()) / 100)
+            return fill
+
+        def filter_orders(self, orders):
+            if quantity_caps is None:
+                return orders
+            return [order.model_copy(update={"quantity": min(order.quantity, quantity_caps[order.ticker])}) for order in orders]
+
+    spec = FundSpec(
+        schema_version=2,
+        name="rotation",
+        broker=broker_name,
+        rebalance="minute",
+        interval=1,
+        window={"start": "09:30", "end": "15:59"},
+        capital=10_000,
+        strategies=[{"name": "macro", "models": [{"name": "druckenmiller"}], "blend": {"mode": "long_short"}}],
+        risk={"max_position_pct": 1, "max_gross_exposure": 1},
+        costs={"spread_bps": 0, "commission_per_share": 0},
+    )
+    fund = Fund(spec, models={"macro": [RotationAnalyst()]})
+    universe = list(dict.fromkeys(["A", *views]))
+    data = FakeDataClient({ticker: {FRIDAY: 100, MONDAY: 100} for ticker in [*universe, "SPY"]})
+    clock = RotationClock()
+    broker = RotationBroker()
+    SimBroker.place_order(broker, Order(ticker="A", side="buy" if initial_quantity > 0 else "sell", quantity=abs(initial_quantity), price=100))
+    proposal = assess_fund(fund, "2024-06-07T15:59:00", data, universe, clock)
+    record = execute_decision(fund, proposal, "2024-06-10T09:30:00", broker, data, clock)
+    return broker, record
+
+
+@pytest.mark.parametrize("initial_quantity", [-100, -150])
+def test_saxo_reorders_unsafe_prefix_before_close_cutoff(initial_quantity):
+    broker, record = _rotation("saxo", initial_quantity=initial_quantity, target_sign=-1, defer_after=1)
+
+    assert [(order.ticker, order.side) for order in record.orders] == [("A", "buy")]
+    assert [(order.ticker, order.side) for order in record.deferred_orders] == [("B", "sell")]
+    assert broker.gross[0] <= max(1, abs(initial_quantity) / 100)
+    assert record.positions == {}
+
+
+def test_saxo_keeps_sell_first_order_when_all_prefixes_are_safe():
+    broker, record = _rotation("saxo", initial_quantity=100, target_sign=1)
+
+    assert [(order.ticker, order.side) for order in record.orders] == [("A", "sell"), ("B", "buy")]
+    assert max(broker.gross) <= 1
+
+
+def test_saxo_reorders_only_the_first_unsafe_prefix():
+    broker, record = _rotation("saxo", initial_quantity=-60, target_sign=-1, target_views={"B": -0.125, "C": -0.875})
+
+    assert [(order.ticker, order.side) for order in record.orders] == [("B", "sell"), ("A", "buy"), ("C", "sell")]
+    assert broker.gross == pytest.approx([0.725, 0.125, 1.0])
+
+
+def test_saxo_reordering_preserves_filtered_de_risking_from_an_existing_gross_breach():
+    broker, record = _rotation("saxo", initial_quantity=-150, target_sign=-1, quantity_caps={"A": 100, "B": 60})
+
+    assert [(order.ticker, order.side, order.quantity) for order in record.orders] == [("A", "buy", 100), ("B", "sell", 60)]
+    assert broker.gross == pytest.approx([0.5, 1.1])
+
+
+def test_paper_keeps_existing_sell_first_ordering():
+    broker, record = _rotation("paper", initial_quantity=-100, target_sign=-1)
+
+    assert [(order.ticker, order.side) for order in record.orders] == [("B", "sell"), ("A", "buy")]
+    assert broker.gross == [2, 1]
+
+
 def test_nonfinite_equity_fails_before_submission():
     fund, _ = make_fund()
     broker = SimBroker(float("nan"))
@@ -331,6 +432,7 @@ def test_current_new_york_day_is_excluded_even_after_close(monkeypatch, hour):
         @staticmethod
         def now(tz):
             return datetime(2024, 6, 10, hour, tzinfo=tz)
+
     monkeypatch.setattr(sessions, "datetime", Clock)
     fund, analyst = make_fund()
     broker = SimBroker(10_000)
@@ -342,8 +444,7 @@ def test_current_new_york_day_is_excluded_even_after_close(monkeypatch, hour):
     assert analyst.calls == []
     broker.place_order.assert_not_called()
     # Yesterday is complete: the fund can still decide, and nothing executes.
-    record = advance(fund, FundState.initial(10_000), "2024-06-09", broker,
-                     FakeDataClient({"SPY": {"2024-06-09": 100}, "A": {"2024-06-09": 100}}), ["A"])
+    record = advance(fund, FundState.initial(10_000), "2024-06-09", broker, FakeDataClient({"SPY": {"2024-06-09": 100}, "A": {"2024-06-09": 100}}), ["A"])
     assert record.decision.as_of == "2024-06-09" and record.executed is None
 
 
@@ -364,3 +465,6 @@ def test_old_executed_record_defaults_remain_readable():
     historical = CycleRecord.model_validate(raw)
     assert historical.execution_as_of is None
     assert historical.original_assessment is None
+    assert historical.deferred_orders == []
+    assert historical.deferral_reason is None
+    assert not {"deferred_orders", "deferral_reason"} & historical.model_dump().keys()

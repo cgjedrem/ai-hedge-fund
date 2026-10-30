@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_serializer
 
 from hedge_fund.brokers.models import Fill, Order, Shares
 from hedge_fund.fund.spec import FundSpec
@@ -31,10 +31,10 @@ class StrategyRecord(BaseModel):
     """One strategy's slice of a cycle: its analysts' views and its sleeve."""
 
     name: str
-    slice: float                        # normalized capital slice of the fund
-    signals: list[Signal]               # this strategy's analysts x tradeable tickers
-    convictions: dict[str, float]       # blended views, pre-scaling
-    weights: dict[str, float]           # the sleeve, before netting across strategies
+    slice: float  # normalized capital slice of the fund
+    signals: list[Signal]  # this strategy's analysts x tradeable tickers
+    convictions: dict[str, float]  # blended views, pre-scaling
+    weights: dict[str, float]  # the sleeve, before netting across strategies
     eligible_scores: dict[str, float] = Field(default_factory=dict)
     flat_reason: FlatReason | None = None
     final_contribution: dict[str, float] = Field(default_factory=dict)  # fraction of fund equity
@@ -65,26 +65,36 @@ class CycleRecord(BaseModel):
     schema_version: Literal[2] = 2
     fund: str
     as_of: str
-    spec: FundSpec                      # self-contained audit copy
-    universe: list[str]                 # the tickers this cycle was asked to trade
-    marks: dict[str, float]             # ticker -> close used for sizing and NAV
+    spec: FundSpec  # self-contained audit copy
+    universe: list[str]  # the tickers this cycle was asked to trade
+    marks: dict[str, float]  # ticker -> close used for sizing and NAV
     skipped: list[TickerSkip]
-    strategies: list[StrategyRecord]    # every sleeve, incl. each thesis
-    target_weights: dict[str, float]    # the NETTED book, pre-risk
+    strategies: list[StrategyRecord]  # every sleeve, incl. each thesis
+    target_weights: dict[str, float]  # the NETTED book, pre-risk
     clamps: list[ClampEvent]
-    final_weights: dict[str, float]     # post-risk
+    final_weights: dict[str, float]  # post-risk
     equity_before: float
     cash_before: float
     orders: list[Order]
     fills: list[Fill]
-    positions: dict[str, Shares]        # signed shares after fills
+    positions: dict[str, Shares]  # signed shares after fills
     cash: float
-    nav: float                          # cash + sum(shares * mark)
+    nav: float  # cash + sum(shares * mark)
     risk_scale_factor: float | None = None
     original_assessment: DecisionRecord | None = None
     refreshed_assessment: DecisionRecord | None = None
     execution_as_of: str | None = None
     execution_policy: Literal["next_close", "next_bar"] | None = None
+    deferred_orders: list[Order] = Field(default_factory=list)
+    deferral_reason: str | None = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        if not self.deferred_orders and self.deferral_reason is None:
+            data.pop("deferred_orders", None)
+            data.pop("deferral_reason", None)
+        return data
 
     @property
     def traded_notional(self) -> float:
@@ -95,19 +105,14 @@ class CycleRecord(BaseModel):
     def slippage(self) -> float:
         """What the fills cost against the reference marks: a buy filled above
         its mark and a sell filled below both count as a positive cost."""
-        return sum(
-            (fill.price - order.price) * fill.quantity * (1 if fill.side == "buy" else -1)
-            for order, fill in zip(self.orders, self.fills)
-        )
+        return sum((fill.price - order.price) * fill.quantity * (1 if fill.side == "buy" else -1) for order, fill in zip(self.orders, self.fills))
 
     @property
     def commission(self) -> float:
         """The cash the fills do not explain. Derived from the book, not from
         the mandate's cost model, so a record filled free reports zero and a
         live broker's real fees land here without a schema change."""
-        signed_notional = sum(
-            f.quantity * f.price * (1 if f.side == "buy" else -1) for f in self.fills
-        )
+        signed_notional = sum(f.quantity * f.price * (1 if f.side == "buy" else -1) for f in self.fills)
         return self.cash_before - self.cash - signed_notional
 
     @property

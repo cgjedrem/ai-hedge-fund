@@ -12,17 +12,18 @@ import tempfile
 import threading
 import time
 import uuid
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_DOWN
 from enum import Enum
 from pathlib import Path
-from typing import Protocol
+from typing import Callable, Iterator, Protocol
 from urllib.parse import parse_qs, urlparse
 
 import requests
 
 from hedge_fund.brokers.models import Fill, Order, Position
+from hedge_fund.brokers.protocol import OrderSubmissionDeferred
 from hedge_fund.secrets.provider import SecretProvider
 
 BASE_URL = "https://gateway.saxobank.com/sim/openapi"
@@ -205,16 +206,37 @@ class SaxoClient:
         self.client_key: str | None = None
         self.account_key: str | None = None
         self._ticker_uic: dict[str, int] = {}
+        self._order_submission_cutoff: tuple[datetime, Callable[[], datetime]] | None = None
+
+    @contextmanager
+    def order_submission_window(self, cutoff: datetime, *, now: Callable[[], datetime]) -> Iterator[None]:
+        if cutoff.tzinfo is None or cutoff.utcoffset() is None:
+            raise ValueError("Saxo order cutoff must be timezone-aware")
+        previous = self._order_submission_cutoff
+        self._order_submission_cutoff = (cutoff, now)
+        try:
+            yield
+        finally:
+            self._order_submission_cutoff = previous
+
+    def _prepare_order_post(self, headers: dict[str, str]) -> None:
+        self.pacer.wait_for("orders")
+        headers["x-request-id"] = str(uuid.uuid4())
+        if self._order_submission_cutoff is not None:
+            cutoff, now = self._order_submission_cutoff
+            moment = now()
+            if moment.tzinfo is None or moment.utcoffset() is None:
+                raise ValueError("Saxo order clock must be timezone-aware")
+            if moment >= cutoff:
+                raise OrderSubmissionDeferred("market close reached before order submission")
 
     def request(self, method: str, path: str, *, params=None, json_body=None, order_post=False):
         url = f"{BASE_URL}{path}"
-        headers = {}
-        if order_post:
-            self.pacer.wait_for("orders")
-            headers["x-request-id"] = str(uuid.uuid4())
         token = self.tokens.get_access_token()
+        headers = {"Authorization": "Bearer " + token}
+        if order_post:
+            self._prepare_order_post(headers)
         try:
-            headers["Authorization"] = "Bearer " + token
             response = self.transport.request(
                 method,
                 url,
@@ -233,8 +255,7 @@ class SaxoClient:
             token = self.tokens.get_access_token()
             headers["Authorization"] = "Bearer " + token
             if order_post:
-                self.pacer.wait_for("orders")
-                headers["x-request-id"] = str(uuid.uuid4())
+                self._prepare_order_post(headers)
             try:
                 status, body = _response(self.transport.request(method, url, headers=headers, params=params, json=json_body, timeout=15))
             except Exception:
@@ -262,28 +283,33 @@ class SaxoClient:
 
     def positions(self) -> dict[str, Position]:
         self._require_account()
-        status, result = self.request(
-            "GET",
-            "/port/v1/positions",
-            params={"ClientKey": self.client_key, "AccountKey": self.account_key},
-        )
-        if status != 200:
-            raise SaxoReconcileError("cannot read Saxo SIM positions")
-        rows = result.get("Data", []) if isinstance(result, dict) else []
-        if not isinstance(rows, list):
-            raise SaxoReconcileError("Saxo positions response has an invalid shape")
         totals: dict[str, float] = {}
-        for row in rows:
-            if not isinstance(row, dict):
-                raise SaxoReconcileError("Saxo position response has an invalid row")
-            base = row.get("PositionBase", {})
-            if not isinstance(base, dict):
-                raise SaxoReconcileError("Saxo position response has an invalid position")
-            ticker = next((name for name, uic in self._ticker_uic.items() if uic == base.get("Uic")), None)
-            if ticker is None or not row.get("NetPositionId"):
-                raise SaxoReconcileError("Saxo position cannot be mapped to a fund ticker")
-            amount = _finite_number(base.get("Amount"), "position amount", SaxoReconcileError)
-            totals[ticker] = totals.get(ticker, 0.0) + amount
+        skip = 0
+        while True:
+            params: dict[str, str | int | None] = {"ClientKey": self.client_key, "AccountKey": self.account_key}
+            if skip:
+                params["$skip"] = skip
+            status, result = self.request("GET", "/port/v1/positions", params=params)
+            if status != 200:
+                raise SaxoReconcileError("cannot read Saxo SIM positions")
+            rows = result.get("Data") if isinstance(result, dict) else None
+            if not isinstance(rows, list):
+                raise SaxoReconcileError("Saxo positions response has an invalid shape")
+            for row in rows:
+                if not isinstance(row, dict):
+                    raise SaxoReconcileError("Saxo position response has an invalid row")
+                base = row.get("PositionBase", {})
+                if not isinstance(base, dict):
+                    raise SaxoReconcileError("Saxo position response has an invalid position")
+                ticker = next((name for name, uic in self._ticker_uic.items() if uic == base.get("Uic")), None)
+                if ticker is None or not row.get("NetPositionId"):
+                    raise SaxoReconcileError("Saxo position cannot be mapped to a fund ticker")
+                amount = _finite_number(base.get("Amount"), "position amount", SaxoReconcileError)
+                totals[ticker] = totals.get(ticker, 0.0) + amount
+            next_skip = _next_page_skip(result.get("__next"), skip, SaxoReconcileError, "positions")
+            if next_skip is None:
+                break
+            skip = next_skip
         return {ticker: Position(ticker=ticker, shares=shares) for ticker, shares in totals.items() if shares != 0}
 
     def balances(self) -> dict:
@@ -391,6 +417,8 @@ class SaxoClient:
             notional = 0.0
             skip = 0
             while True:
+                if self.clock.monotonic() >= deadline:
+                    break
                 status, result = self.request(
                     "GET",
                     "/hist/v1/transactions",
@@ -425,17 +453,9 @@ class SaxoClient:
                     return quantity, notional / quantity
                 if quantity > requested_quantity:
                     raise SaxoOrderError(f"Saxo execution exceeds requested quantity for order {order_id}")
-                next_link = result.get("__next") if isinstance(result, dict) else None
-                if not next_link:
+                next_skip = _next_page_skip(result.get("__next"), skip, SaxoOrderError, f"execution for order {order_id}")
+                if next_skip is None:
                     break
-                query = parse_qs(urlparse(str(next_link)).query)
-                next_skip = query.get("$skip", [str(skip + len(rows))])[0]
-                try:
-                    next_skip = int(next_skip)
-                except (TypeError, ValueError):
-                    raise SaxoOrderError(f"Saxo execution pagination is invalid for order {order_id}") from None
-                if next_skip <= skip:
-                    raise SaxoOrderError(f"Saxo execution pagination did not advance for order {order_id}")
                 skip = next_skip
             self.clock.sleep(min(self.poll_interval_s, max(0.0, deadline - self.clock.monotonic())))
         if observed_quantity:
@@ -504,6 +524,9 @@ class SaxoBroker:
     def cash(self) -> float:
         return _finite_number(self.client.balances().get("CashBalance"), "accounting cash balance", SaxoReconcileError)
 
+    def order_submission_window(self, cutoff: datetime, *, now: Callable[[], datetime]) -> AbstractContextManager[None]:
+        return self.client.order_submission_window(cutoff, now=now)
+
     def _buying_power(self) -> float:
         return _finite_number(self.client.balances().get("CashAvailableForTrading"), "available trading cash", SaxoOrderError)
 
@@ -569,6 +592,21 @@ def _finite_number(value, label: str, error_type) -> float:
     if not math.isfinite(number):
         raise error_type(f"Saxo {label} is invalid")
     return number
+
+
+def _next_page_skip(link: object, skip: int, error_type: type[Exception], context: str) -> int | None:
+    if link is None:
+        return None
+    if not isinstance(link, str) or not link:
+        raise error_type(f"Saxo {context} pagination is invalid")
+    values = parse_qs(urlparse(link).query, keep_blank_values=True).get("$skip", [])
+    try:
+        next_skip = int(values[0]) if len(values) == 1 else skip
+    except ValueError:
+        raise error_type(f"Saxo {context} pagination is invalid") from None
+    if next_skip <= skip:
+        raise error_type(f"Saxo {context} pagination did not advance")
+    return next_skip
 
 
 def _error_code(body) -> str | None:

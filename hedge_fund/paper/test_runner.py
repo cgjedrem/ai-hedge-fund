@@ -4,6 +4,7 @@ canned prints; and tick on a bar, the same session by hand."""
 import os
 import signal
 import threading
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from importlib import import_module
 
@@ -166,6 +167,52 @@ def test_saxo_runner_skips_a_late_closing_bar_after_market_close(tmp_path, monke
     )
 
     assert waits == [runner_module.next_bar(tape.now, spec.interval_seconds, spec.window)]
+
+
+def test_saxo_runner_passes_the_bar_date_cutoff_to_order_submission(tmp_path, monkeypatch):
+    spec = _spec(broker="saxo", interval=1, window={"start": "09:30", "end": "15:59"})
+    directory = deploy("saxo-cutoff", spec, ["AAPL"], root=tmp_path)
+    deployed = runner_module.load_deployed(directory)
+    tape = _tape(_at(DAY, "15:59:00"))
+    stop = threading.Event()
+    windows = []
+
+    class GuardedBroker:
+        active = False
+
+        @contextmanager
+        def order_submission_window(self, cutoff, now):
+            windows.append((cutoff, now()))
+            self.active = True
+            try:
+                yield
+            finally:
+                self.active = False
+
+    broker = GuardedBroker()
+
+    def run_session(*args, **kwargs):
+        assert broker.active
+        stop.set()
+        return object()
+
+    monkeypatch.setattr(runner_module, "_run", run_session)
+    runner_module._run_bars(
+        directory,
+        deployed,
+        tape,
+        build_fund,
+        broker=broker,
+        stop=stop,
+        build_fund=None,
+        on_record=None,
+        on_event=None,
+        now=lambda: tape.now,
+        sleep=lambda _: None,
+    )
+
+    assert windows == [(_at(DAY, "16:00:00"), tape.now)]
+    assert not broker.active
 
 
 def test_a_late_start_skips_to_the_current_bar_and_logs_the_gap(tmp_path):

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
+from datetime import datetime
 from importlib import import_module
 
 import pytest
@@ -8,11 +11,14 @@ from textual.widgets import ContentSwitcher, Input, OptionList, SelectionList
 
 from hedge_fund import paths
 from hedge_fund.brokers.factory import build_broker
+from hedge_fund.brokers.protocol import OrderSubmissionDeferred
 from hedge_fund.brokers.saxo import SaxoBroker
+from hedge_fund.brokers.sim import SimBroker
 from hedge_fund.data.models import Price
-from hedge_fund.fund import Fund
+from hedge_fund.data.sessions import NEW_YORK
+from hedge_fund.fund import Fund, FundSpec
 from hedge_fund.models import Signal
-from hedge_fund.paper.deployed import load_deployed
+from hedge_fund.paper.deployed import deploy, load_deployed
 from hedge_fund.paper.ledger import Ledger
 from hedge_fund.paper.tick import _run
 from hedge_fund.pipeline.clock import Marked
@@ -153,6 +159,223 @@ class LongAnalyst:
 
 def _fund(spec):
     return Fund(spec, models={spec.strategies[0].name: [LongAnalyst()]})
+
+
+def _cutoff_setup(tmp_path, *, approval_required=False):
+    spec = FundSpec(
+        schema_version=2,
+        name="cutoff",
+        broker="saxo",
+        rebalance="minute",
+        interval=1,
+        window={"start": "09:30", "end": "15:59"},
+        capital=100_000,
+        costs={"spread_bps": 0, "commission_per_share": 0},
+        strategies=[{"name": "solo", "models": [{"name": "pead"}], "blend": {"mode": "long_short"}}],
+        risk={"max_position_pct": 1, "max_gross_exposure": 1},
+        approval_required=approval_required,
+    )
+    directory = deploy("cutoff", spec, ["AAPL", "MSFT"], root=tmp_path)
+
+    class TwoTickerData(FakeData):
+        def get_prices(self, ticker, start_date, end_date, **kwargs):
+            return super().get_prices("AAPL" if ticker == "MSFT" else ticker, start_date, end_date, **kwargs)
+
+    class CutoffClock(FakeClock):
+        def previous(self, session):
+            if session.endswith("15:59:00"):
+                return "2026-10-29T15:58:00"
+            if session.endswith("09:31:00"):
+                return "2026-10-30T09:30:00"
+            return "2026-10-29T15:59:00"
+
+        def marks(self, tickers, session):
+            return Marked(prices={ticker: 200.0 if ticker == "MSFT" and session.startswith("2026-10-30") else 100.0 for ticker in tickers})
+
+    return directory, load_deployed(directory), Ledger(directory), _fund(spec), TwoTickerData(), CutoffClock()
+
+
+@pytest.mark.parametrize("fills_before_cutoff", [0, 1])
+def test_cutoff_records_completed_fills_and_re_evaluates_unsubmitted_orders_next_bar(tmp_path, fills_before_cutoff):
+    directory, deployed, ledger, fund, data, clock = _cutoff_setup(tmp_path)
+
+    class CutoffBroker(SimBroker):
+        remaining = fills_before_cutoff
+
+        def place_order(self, order):
+            if self.remaining == 0:
+                raise OrderSubmissionDeferred("market close reached before order submission")
+            if self.remaining is not None:
+                self.remaining -= 1
+            return super().place_order(order)
+
+    broker = CutoffBroker(100_000)
+    first = _run(directory, deployed, ledger, ledger.replay(100_000), "2026-10-29T15:58:00", data, None, clock=clock, fund=fund, broker=broker)
+    assert first.decision is not None
+    closing = _run(directory, deployed, ledger, ledger.replay(100_000), "2026-10-29T15:59:00", data, None, clock=clock, fund=fund, broker=broker)
+
+    assert len(closing.executed.orders) == len(closing.executed.fills) == fills_before_cutoff
+    assert len(closing.executed.deferred_orders) == 2 - fills_before_cutoff
+    assert "market close" in closing.executed.deferral_reason
+    assert closing.executed.deferred_orders[-1].ticker == "MSFT"
+    assert closing.executed.deferred_orders[-1].quantity == 500
+    assert closing.positions == ({"AAPL": 500} if fills_before_cutoff else {})
+    assert ledger.replay(100_000, full=True).positions == closing.positions
+    assert len([event for event in ledger.events() if event["kind"] == "broker_fill"]) == fills_before_cutoff
+
+    broker.remaining = None
+    resumed = _run(directory, deployed, ledger, ledger.replay(100_000), "2026-10-30T09:30:00", data, None, clock=clock, fund=fund, broker=broker)
+    assert resumed.positions == {"AAPL": 500, "MSFT": 250}
+    assert len(resumed.executed.orders) == 2 - fills_before_cutoff
+    assert next(order for order in resumed.executed.orders if order.ticker == "MSFT").quantity == 250
+    assert resumed.executed.deferred_orders == []
+    assert "deferred_orders" not in resumed.executed.model_dump()
+    assert "deferral_reason" not in resumed.executed.model_dump()
+    legacy_payload = resumed.model_dump(mode="json", exclude={"hash", "snapshot_times"})
+    assert not {"deferred_orders", "deferral_reason"} & legacy_payload["executed"].keys()
+    assert hashlib.sha256(json.dumps(legacy_payload, ensure_ascii=False, separators=(",", ":")).encode()).hexdigest() == resumed.hash
+    assert ledger.replay(100_000, full=True).positions == resumed.positions
+
+
+def test_cutoff_re_evaluation_requires_a_new_approval(tmp_path):
+    directory, deployed, ledger, fund, data, clock = _cutoff_setup(tmp_path, approval_required=True)
+
+    class CutoffBroker(SimBroker):
+        remaining = 1
+
+        def place_order(self, order):
+            if self.remaining == 0:
+                raise OrderSubmissionDeferred("market close reached before order submission")
+            if self.remaining is not None:
+                self.remaining -= 1
+            return super().place_order(order)
+
+    broker = CutoffBroker(100_000)
+    first = _run(directory, deployed, ledger, ledger.replay(100_000), "2026-10-29T15:58:00", data, None, clock=clock, fund=fund, broker=broker)
+    ledger.set_approval("approve", first.decision.as_of, first.hash, "cli")
+    closing = _run(directory, deployed, ledger, ledger.replay(100_000), "2026-10-29T15:59:00", data, None, clock=clock, fund=fund, broker=broker)
+    assert closing.positions == {"AAPL": 500}
+    assert len(closing.executed.deferred_orders) == 1
+    assert ledger.approval() is None
+
+    broker.remaining = None
+    unapproved = _run(directory, deployed, ledger, ledger.replay(100_000), "2026-10-30T09:30:00", data, None, clock=clock, fund=fund, broker=broker)
+    assert unapproved.executed is None
+    assert unapproved.positions == closing.positions
+    ledger.set_approval("approve", unapproved.decision.as_of, unapproved.hash, "cli")
+    approved = _run(directory, deployed, ledger, ledger.replay(100_000), "2026-10-30T09:31:00", data, None, clock=clock, fund=fund, broker=broker)
+    assert approved.positions == {"AAPL": 500, "MSFT": 250}
+    assert [(order.ticker, order.quantity) for order in approved.executed.orders] == [("MSFT", 250)]
+    assert ledger.replay(100_000, full=True).positions == approved.positions
+
+
+def test_confirmed_external_fill_is_journaled_if_later_order_fails(tmp_path):
+    directory, deployed, ledger, fund, data, clock = _cutoff_setup(tmp_path)
+
+    class FailingBroker(SimBroker):
+        def place_order(self, order):
+            if self.positions():
+                raise RuntimeError("later order failed")
+            return super().place_order(order)
+
+    broker = FailingBroker(100_000)
+    _run(directory, deployed, ledger, ledger.replay(100_000), "2026-10-29T15:58:00", data, None, clock=clock, fund=fund, broker=broker)
+    with pytest.raises(RuntimeError, match="later order failed"):
+        _run(directory, deployed, ledger, ledger.replay(100_000), "2026-10-29T15:59:00", data, None, clock=clock, fund=fund, broker=broker)
+
+    fills = [event for event in ledger.events() if event["kind"] == "broker_fill"]
+    assert len(fills) == 1
+    assert fills[0]["fill"]["ticker"] == "AAPL"
+    assert fills[0]["order"]["quantity"] == fills[0]["fill"]["quantity"] == 500
+    assert ledger.halted() is not None
+    assert ledger.latest().session == "2026-10-29T15:58:00"
+
+
+def test_confirmed_fills_are_journaled_if_later_assessment_fails(tmp_path):
+    directory, deployed, ledger, fund, data, clock = _cutoff_setup(tmp_path)
+    broker = SimBroker(100_000)
+    analyst = fund.strategies[0][1][0]
+    original_predict = analyst.predict
+
+    def fail_at_close(ticker, date, data_client):
+        if date.endswith("15:59:00"):
+            raise RuntimeError("assessment failed")
+        return original_predict(ticker, date, data_client)
+
+    analyst.predict = fail_at_close
+    _run(directory, deployed, ledger, ledger.replay(100_000), "2026-10-29T15:58:00", data, None, clock=clock, fund=fund, broker=broker)
+    with pytest.raises(RuntimeError, match="assessment failed"):
+        _run(directory, deployed, ledger, ledger.replay(100_000), "2026-10-29T15:59:00", data, None, clock=clock, fund=fund, broker=broker)
+
+    assert {event["fill"]["ticker"] for event in ledger.events() if event["kind"] == "broker_fill"} == {"AAPL", "MSFT"}
+    assert ledger.halted() is not None
+    assert ledger.latest().session == "2026-10-29T15:58:00"
+
+
+def test_fill_journal_failure_still_halts_after_an_external_fill(tmp_path, monkeypatch):
+    directory, deployed, ledger, fund, data, clock = _cutoff_setup(tmp_path)
+    broker = SimBroker(100_000)
+    _run(directory, deployed, ledger, ledger.replay(100_000), "2026-10-29T15:58:00", data, None, clock=clock, fund=fund, broker=broker)
+
+    def fail_log(*args, **kwargs):
+        raise OSError("event journal unavailable")
+
+    monkeypatch.setattr(ledger, "log_event", fail_log)
+    with pytest.raises(OSError, match="event journal unavailable"):
+        _run(directory, deployed, ledger, ledger.replay(100_000), "2026-10-29T15:59:00", data, None, clock=clock, fund=fund, broker=broker)
+
+    assert ledger.halted() is not None
+    assert set(broker.positions()) == {"AAPL"}
+    assert ledger.latest().session == "2026-10-29T15:58:00"
+
+
+def test_real_saxo_client_deferral_reaches_the_session_ledger(tmp_path):
+    class ClosingClock(FakeClock):
+        def previous(self, session):
+            return "2026-10-29T15:58:00"
+
+    spec = FundSpec(
+        schema_version=2,
+        name="cutoff-client",
+        broker="saxo",
+        rebalance="minute",
+        interval=1,
+        window={"start": "09:30", "end": "15:59"},
+        capital=100_000,
+        strategies=[{"name": "solo", "models": [{"name": "pead"}], "blend": {"mode": "long_short"}}],
+        risk={"max_position_pct": 1, "max_gross_exposure": 1},
+    )
+    directory = deploy("cutoff-client", spec, ["AAPL"], root=tmp_path)
+    deployed = load_deployed(directory)
+    transport = SaxoSimTransport()
+    broker = build_broker(
+        deployed,
+        directory=directory,
+        secrets_provider=SharedSecrets(),
+        transport=transport,
+        environ={
+            "SAXO_APP_KEY_REF": "op://vault/item/key",
+            "SAXO_APP_SECRET_REF": "op://vault/item/secret",
+            "SAXO_REFRESH_TOKEN_REF": "op://vault/item/token",
+            "SAXO_REFRESH_LOCK_DIR": str(tmp_path / "locks"),
+        },
+    )
+    ledger = Ledger(directory)
+    clock = ClosingClock()
+    data = FakeData()
+    first = _run(directory, deployed, ledger, ledger.replay(100_000), "2026-10-29T15:58:00", data, None, clock=clock, fund=_fund(spec), broker=broker)
+
+    cutoff = datetime(2026, 10, 29, 16, tzinfo=NEW_YORK)
+    with broker.order_submission_window(cutoff, now=lambda: cutoff):
+        closing = _run(directory, deployed, ledger, ledger.replay(100_000), "2026-10-29T15:59:00", data, None, clock=clock, fund=_fund(spec), broker=broker)
+
+    assert first.decision is not None
+    assert closing.executed.orders == closing.executed.fills == []
+    assert [order.ticker for order in closing.executed.deferred_orders] == ["AAPL"]
+    assert "market close" in closing.executed.deferral_reason
+    assert not any(method == "POST" and url.endswith("/trade/v2/orders") for method, url, _ in transport.calls)
+    assert ledger.replay(100_000, full=True).positions == {}
+    assert ledger.halted() is None
 
 
 def test_saxo_external_adapter_records_order_fill_in_ledger(tmp_path, monkeypatch):

@@ -13,9 +13,10 @@ from __future__ import annotations
 from datetime import date as _date
 from datetime import timedelta
 from math import isfinite
+from typing import Callable
 
-from hedge_fund.brokers.models import Fill
-from hedge_fund.brokers.protocol import Broker
+from hedge_fund.brokers.models import Fill, Order
+from hedge_fund.brokers.protocol import Broker, OrderSubmissionDeferred
 from hedge_fund.data.protocol import DataClient
 from hedge_fund.fund import Fund, normalize_universe
 from hedge_fund.models import Signal
@@ -123,6 +124,8 @@ def execute_decision(
     broker: Broker,
     data_client: DataClient,
     clock: Clock | None = None,
+    *,
+    on_fill: Callable[[Order, Fill], None] | None = None,
 ) -> CycleRecord:
     """Refresh views before sizing a complete rebalance at exact session prices."""
     clock = clock or clock_for(fund.spec, data_client)
@@ -152,24 +155,23 @@ def execute_decision(
     if not isfinite(equity_before) or equity_before <= 0:
         raise ValueError(f"{spec.name}: equity on {session} must be finite and positive")
     orders = build_orders(targets, held, marks, equity_before)
+    current_weights = {t: p.shares * marks[t] / equity_before for t, p in held.items()}
+    current_gross = sum(abs(weight) for weight in current_weights.values())
+
+    def violates_limit(projected: float, current: float, limit: float) -> bool:
+        return projected > limit + WEIGHT_TOLERANCE and (current <= limit + WEIGHT_TOLERANCE or projected > current + WEIGHT_TOLERANCE)
 
     def validate_projected_orders(candidate_orders, *, filtered: bool = False) -> None:
-        current = {t: p.shares * marks[t] / equity_before for t, p in held.items()}
         projected = {t: p.shares for t, p in held.items()}
         for candidate in candidate_orders:
             projected[candidate.ticker] = projected.get(candidate.ticker, 0) + (candidate.quantity if candidate.side == "buy" else -candidate.quantity)
         weights = {t: shares * marks[t] / equity_before for t, shares in projected.items()}
         suffix = " after broker order filtering" if filtered else ""
         for ticker, weight in weights.items():
-            limit_breach = abs(weight) > spec.risk.max_position_pct + WEIGHT_TOLERANCE
-            worsens_current = abs(current.get(ticker, 0)) <= spec.risk.max_position_pct + WEIGHT_TOLERANCE or abs(weight) > abs(current.get(ticker, 0)) + WEIGHT_TOLERANCE
-            if not isfinite(weight) or (limit_breach and worsens_current):
+            if not isfinite(weight) or violates_limit(abs(weight), abs(current_weights.get(ticker, 0)), spec.risk.max_position_pct):
                 raise ValueError(f"{ticker}: projected position violates max_position_pct{suffix}")
-        current_gross = sum(abs(weight) for weight in current.values())
         projected_gross = sum(abs(weight) for weight in weights.values())
-        gross_breach = projected_gross > spec.risk.max_gross_exposure + WEIGHT_TOLERANCE
-        worsens_gross = current_gross <= spec.risk.max_gross_exposure + WEIGHT_TOLERANCE or projected_gross > current_gross + WEIGHT_TOLERANCE
-        if gross_breach and worsens_gross:
+        if not isfinite(projected_gross) or violates_limit(projected_gross, current_gross, spec.risk.max_gross_exposure):
             raise ValueError(f"projected portfolio violates max_gross_exposure{suffix}")
 
     validate_projected_orders(orders)
@@ -177,7 +179,41 @@ def execute_decision(
     if callable(filter_orders):
         orders = filter_orders(orders)
         validate_projected_orders(orders, filtered=True)
-    fills: list[Fill] = [broker.place_order(order) for order in orders]
+    if spec.broker == "saxo" and len(orders) > 1:
+        pending = list(orders)
+        ordered: list[Order] = []
+        projected = dict(current_weights)
+        gross = current_gross
+        while pending:
+            for index, order in enumerate(pending):
+                old_weight = projected.get(order.ticker, 0.0)
+                delta = order.quantity if order.side == "buy" else -order.quantity
+                new_weight = old_weight + delta * marks[order.ticker] / equity_before
+                next_gross = gross - abs(old_weight) + abs(new_weight)
+                if not isfinite(new_weight) or not isfinite(next_gross) or violates_limit(abs(new_weight), abs(current_weights.get(order.ticker, 0)), spec.risk.max_position_pct) or violates_limit(next_gross, current_gross, spec.risk.max_gross_exposure):
+                    continue
+                ordered.append(pending.pop(index))
+                projected[order.ticker] = new_weight
+                gross = next_gross
+                break
+            else:
+                raise ValueError("Saxo order basket has no safe execution sequence under projected risk limits")
+        orders = ordered
+    submitted: list[Order] = []
+    fills: list[Fill] = []
+    deferred: list[Order] = []
+    deferral_reason = None
+    for index, order in enumerate(orders):
+        try:
+            fill = broker.place_order(order)
+        except OrderSubmissionDeferred as exc:
+            deferred = orders[index:]
+            deferral_reason = str(exc) or "order submission deferred"
+            break
+        submitted.append(order)
+        fills.append(fill)
+        if on_fill is not None:
+            on_fill(order, fill)
     positions = {t: p.shares for t, p in broker.positions().items()}
     cash = broker.cash()
     fields = effective.model_dump(exclude={"as_of", "marks"})
@@ -187,8 +223,10 @@ def execute_decision(
         marks=marks,
         equity_before=equity_before,
         cash_before=cash_before,
-        orders=orders,
+        orders=submitted,
         fills=fills,
+        deferred_orders=deferred,
+        deferral_reason=deferral_reason,
         positions=positions,
         cash=cash,
         nav=cash + sum(shares * marks[t] for t, shares in positions.items()),

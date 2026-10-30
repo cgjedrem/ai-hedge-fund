@@ -37,6 +37,7 @@ import signal
 import subprocess
 import sys
 import threading
+from contextlib import nullcontext
 from datetime import datetime, time, timedelta
 from pathlib import Path
 from typing import Callable
@@ -171,18 +172,21 @@ def _run_bars(directory, deployed, data_client, fund, *, broker, stop, build_fun
             if bar != expected:
                 event("gap", **{"from": state.last_session, "to": bar, "bars_skipped": bars_between(state.last_session, bar, spec.interval_seconds, spec.window)})
 
-        record = _run(
-            directory,
-            deployed,
-            ledger,
-            state,
-            bar,
-            data_client,
-            build_fund,
-            clock=clock,
-            fund=fund,
-            broker=broker,
-        )
+        cutoff = datetime.combine(bar_time(bar).date(), _SAXO_MARKET_CLOSE, tzinfo=NEW_YORK)
+        submission_window = broker.order_submission_window(cutoff, now=now) if deployed.broker == "saxo" else nullcontext()
+        with submission_window:
+            record = _run(
+                directory,
+                deployed,
+                ledger,
+                state,
+                bar,
+                data_client,
+                build_fund,
+                clock=clock,
+                fund=fund,
+                broker=broker,
+            )
         if on_record is not None:
             on_record(record)
         if not stop.is_set():

@@ -33,11 +33,11 @@ from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _version
 from math import isclose
 from pathlib import Path
-from typing import Literal
+from typing import Callable, Literal
 
 from pydantic import BaseModel, Field
 
-from hedge_fund.brokers.models import Shares, format_shares
+from hedge_fund.brokers.models import Fill, format_shares, Order, Shares
 from hedge_fund.brokers.protocol import Broker
 from hedge_fund.data.bars import is_intraday
 from hedge_fund.data.protocol import DataClient
@@ -70,9 +70,9 @@ class FundState(BaseModel):
     positions: dict[str, Shares] = Field(default_factory=dict)  # signed shares
     cash: float
     last_session: str | None = None
-    pending: DecisionRecord | None = None       # assessed, awaiting execution
-    prev_hash: str | None = None                # hash of the last record
-    halted: str | None = None                   # reason, when the kill switch is set
+    pending: DecisionRecord | None = None  # assessed, awaiting execution
+    prev_hash: str | None = None  # hash of the last record
+    halted: str | None = None  # reason, when the kill switch is set
 
     @classmethod
     def initial(cls, capital: float) -> FundState:
@@ -88,14 +88,14 @@ class SessionRecord(BaseModel):
     fund: str
     session: str
     universe: list[str]
-    nav: float                          # cash + sum(shares * mark) at this close
+    nav: float  # cash + sum(shares * mark) at this close
     cash: float
-    positions: dict[str, Shares]        # signed shares after this session
-    marks: dict[str, float]             # closes used to value the book
+    positions: dict[str, Shares]  # signed shares after this session
+    marks: dict[str, float]  # closes used to value the book
     benchmark: str
     benchmark_close: float
-    rebalance: bool                     # was this a rebalance session?
-    executed: CycleRecord | None = None     # the prior decision, executed here
+    rebalance: bool  # was this a rebalance session?
+    executed: CycleRecord | None = None  # the prior decision, executed here
     decision: DecisionRecord | None = None  # assessed here, executed next session
     prev_hash: str | None = None
     hash: str = ""
@@ -136,6 +136,8 @@ def advance(
     data_client: DataClient,
     universe: list[str],
     clock: Clock | None = None,
+    *,
+    on_fill: Callable[[Order, Fill], None] | None = None,
 ) -> SessionRecord:
     """Advance *fund* through one completed *session*: a date (YYYY-MM-DD)
     for a daily/weekly/monthly fund, a bar (YYYY-MM-DDTHH:MM:SS, New York)
@@ -153,10 +155,7 @@ def advance(
     if state.halted is not None:
         raise FundHalted(f"{spec.name} is halted: {state.halted}")
     if state.last_session is not None and session <= state.last_session:
-        raise ValueError(
-            f"{spec.name}: session {session} is not after the last recorded "
-            f"session {state.last_session}"
-        )
+        raise ValueError(f"{spec.name}: session {session} is not after the last recorded " f"session {state.last_session}")
     if not clock.is_complete(session):
         raise ValueError(f"{spec.name}: session {session} is not complete yet")
     universe = normalize_universe(universe)
@@ -164,7 +163,7 @@ def advance(
 
     executed: CycleRecord | None = None
     if state.pending is not None:
-        executed = execute_decision(fund, state.pending, session, broker, data_client, clock)
+        executed = execute_decision(fund, state.pending, session, broker, data_client, clock, on_fill=on_fill)
 
     held = broker.positions()
     marked = clock.marks([*held, spec.benchmark], session)
@@ -218,10 +217,7 @@ def reconcile(state: FundState, broker: Broker, name: str) -> None:
     problems: list[str] = []
     for ticker in sorted(set(held) | set(expected)):
         if held.get(ticker, 0) != expected.get(ticker, 0):
-            problems.append(
-                f"{ticker}: broker {format_shares(held.get(ticker, 0), signed=True)}"
-                f" vs ledger {format_shares(expected.get(ticker, 0), signed=True)}"
-            )
+            problems.append(f"{ticker}: broker {format_shares(held.get(ticker, 0), signed=True)}" f" vs ledger {format_shares(expected.get(ticker, 0), signed=True)}")
     if not isclose(broker.cash(), state.cash, rel_tol=0, abs_tol=_CASH_TOLERANCE):
         problems.append(f"cash: broker {broker.cash():,.2f} vs ledger {state.cash:,.2f}")
     if problems:
@@ -263,7 +259,10 @@ def code_version() -> str:
     try:
         sha = subprocess.run(
             ["git", "-C", str(root), "rev-parse", "--short", "HEAD"],
-            capture_output=True, text=True, timeout=2, check=True,
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=True,
         ).stdout.strip()
     except (OSError, subprocess.SubprocessError):
         sha = ""
