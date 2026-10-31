@@ -15,11 +15,12 @@ from hedge_fund import paths
 from hedge_fund.backtesting.fund import FundBacktestResult
 
 
-def save_result(result: FundBacktestResult) -> Path:
-    """Write *result* where the mandate picker's history will find it."""
-    paths.RESEARCH_DIR.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    path = paths.RESEARCH_DIR / f"{result.fund}-{result.start}-{result.end}-{stamp}.json"
+def save_result(result: FundBacktestResult, *, directory: str | Path | None = None) -> Path:
+    """Write *result* under the configured research root or explicit directory."""
+    research_dir = Path(directory) if directory is not None else paths.RESEARCH_DIR
+    research_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    path = research_dir / f"{result.fund}-{result.start}-{result.end}-{stamp}.json"
     path.write_text(result.model_dump_json(indent=2))
     return path
 
@@ -33,15 +34,20 @@ def summarize(path: Path, mtime: float) -> dict | None:
             return None
         m = d["metrics"]
         return {
-            "kind": "backtest", "mtime": mtime, "fund": d.get("fund", ""),
+            "kind": "backtest",
+            "mtime": mtime,
+            "fund": d.get("fund", ""),
             "universe": d.get("universe", []),
-            "start": d.get("start", ""), "end": d.get("end", ""),
+            "start": d.get("start", ""),
+            "end": d.get("end", ""),
             "benchmark": d.get("benchmark", "SPY"),
             "total": m["total_return_pct"],
             "annualized": m["annualized_return_pct"],
-            "sharpe": m["sharpe_ratio"], "maxdd": m["max_drawdown_pct"],
+            "sharpe": m["sharpe_ratio"],
+            "maxdd": m["max_drawdown_pct"],
             "benchret": m["benchmark_return_pct"],
-            "excess": m["excess_return_pct"], "n_cycles": m["n_cycles"],
+            "excess": m["excess_return_pct"],
+            "n_cycles": m["n_cycles"],
         }
     except (json.JSONDecodeError, KeyError, OSError, TypeError, UnicodeError):
         return None

@@ -24,6 +24,13 @@ wheels/
 venv/
 ENV/
 
+# Web UI build outputs
+frontend/node_modules/
+frontend/coverage/
+frontend/playwright-report/
+frontend/test-results/
+hedge_fund/web/static/
+
 # Environment Variables
 .env
 

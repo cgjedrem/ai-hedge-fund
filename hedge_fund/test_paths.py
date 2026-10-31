@@ -1,4 +1,8 @@
+import os
+import stat
 from pathlib import Path
+
+import pytest
 
 import hedge_fund.paths as paths
 from hedge_fund.paths import write_atomic
@@ -37,3 +41,89 @@ def test_write_atomic_uses_a_unique_temp_path_per_write(tmp_path: Path, monkeypa
 
     assert len(set(temporary_names)) == 2
     assert path.read_text(encoding="utf-8") == "second"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX file modes required")
+def test_write_atomic_applies_mode_before_write_and_replace(tmp_path: Path, monkeypatch) -> None:
+    path = tmp_path / "secret.env"
+    path.write_text("old", encoding="utf-8")
+    original_fdopen = paths.os.fdopen
+    original_replace = paths.os.replace
+    observed = []
+
+    class CheckedStream:
+        def __init__(self, stream, descriptor):
+            self._stream = stream
+            self._descriptor = descriptor
+
+        def __enter__(self):
+            self._stream.__enter__()
+            return self
+
+        def __exit__(self, *exc_info):
+            return self._stream.__exit__(*exc_info)
+
+        def write(self, text):
+            observed.append(stat.S_IMODE(os.fstat(self._descriptor).st_mode))
+            return self._stream.write(text)
+
+    def check_fdopen(descriptor, *args, **kwargs):
+        return CheckedStream(original_fdopen(descriptor, *args, **kwargs), descriptor)
+
+    def check_replace(source, target):
+        observed.append(stat.S_IMODE(Path(source).stat().st_mode))
+        original_replace(source, target)
+
+    monkeypatch.setattr(paths.os, "fdopen", check_fdopen)
+    monkeypatch.setattr(paths.os, "replace", check_replace)
+
+    previous_umask = os.umask(0o022)
+    try:
+        write_atomic(path, "new", mode=stat.S_IRUSR | stat.S_IWUSR)
+    finally:
+        os.umask(previous_umask)
+
+    assert observed == [0o600, 0o600]
+    assert path.read_text(encoding="utf-8") == "new"
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX file modes required")
+def test_write_atomic_removes_restricted_temp_after_interrupted_write(tmp_path: Path, monkeypatch) -> None:
+    path = tmp_path / "secret.env"
+    path.write_text("old", encoding="utf-8")
+    original_fdopen = paths.os.fdopen
+    observed = []
+
+    class InterruptedStream:
+        def __init__(self, stream, descriptor):
+            self._stream = stream
+            self._descriptor = descriptor
+
+        def __enter__(self):
+            self._stream.__enter__()
+            return self
+
+        def __exit__(self, *exc_info):
+            return self._stream.__exit__(*exc_info)
+
+        def write(self, _text):
+            observed.append(stat.S_IMODE(os.fstat(self._descriptor).st_mode))
+            self._stream.write(_text[:2])
+            raise OSError("simulated interrupted write")
+
+    def interrupt_fdopen(descriptor, *args, **kwargs):
+        return InterruptedStream(original_fdopen(descriptor, *args, **kwargs), descriptor)
+
+    monkeypatch.setattr(paths.os, "fdopen", interrupt_fdopen)
+
+    previous_umask = os.umask(0o022)
+    try:
+        with pytest.raises(OSError, match="simulated interrupted write"):
+            write_atomic(path, "new", mode=stat.S_IRUSR | stat.S_IWUSR)
+    finally:
+        os.umask(previous_umask)
+
+    assert observed == [0o600]
+    assert path.read_text(encoding="utf-8") == "old"
+    assert list(tmp_path.glob(f".{path.name}.*.tmp")) == []

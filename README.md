@@ -71,6 +71,108 @@ With no arguments, this launches the interactive terminal app. It has two modes:
 - **Paper trading** — your funds, each with a ledger of real market days and fake money. Highlight a fund to see what its next run will do; press enter to review and run the next session, `y`/`n` to approve or reject a gated decision, `s` for history, and `h`/`r` for the kill switch. Build a new fund from the same list: strategies, capital, cadence, approval mode, tickers, and it is live. Every session is appended to a hash-chained ledger in `~/.hedge-fund/paper/<name>/`, so NAV is a track record, not a reset.
 - **Backtesting** — replay a fund over history and watch its equity curve draw against its benchmark. Results are saved to `~/.hedge-fund/research/`. Fund definitions live in `~/.hedge-fund/mandates/` and carry no tickers; you pick the universe per backtest.
 
+### Local React desk
+
+The React desk is additive; the Textual TUI and its entry points remain available.
+It serves a local production build through FastAPI. Views use saved records and
+do not fetch live quotes.
+
+```bash
+poetry install -E web
+make web
+```
+
+`make web` installs frontend build dependencies, creates the static bundle, and
+starts a synthetic demo on `http://127.0.0.1:8765`. Demo files live in a temporary
+directory and are removed when the server exits. Node is needed for the build,
+not for Python to serve an already-built bundle.
+
+On Windows, use the native launcher instead of GNU Make:
+
+```powershell
+poetry install -E web
+poetry run aihf-web --build --demo
+```
+
+`--build` runs `npm ci` from `frontend/package-lock.json`, builds the production
+bundle, then starts the server. It requires Node.js and npm on `PATH`; a clean
+checkout also needs package-registry access for the initial npm install. The
+server does not need Node after the bundle exists. Running `aihf-web` from a
+source checkout without built assets exits with build instructions. Packaged
+wheels serve their included static bundle without Node.
+
+#### Frontend development with Vite
+
+For hot reload, start a separate synthetic API in one terminal:
+
+```bash
+poetry run aihf-web --demo --port 8766
+```
+
+In another terminal:
+
+```bash
+cd frontend
+npm ci
+AIHF_WEB_API_TARGET=http://127.0.0.1:8766 npm run dev
+```
+
+In PowerShell, run
+`$env:AIHF_WEB_API_TARGET = "http://127.0.0.1:8766"` before `npm run dev`.
+Open `http://127.0.0.1:5173`. Add `--allow-writes` to the demo server only
+when testing synthetic mutations; network access stays off. Vite listens on
+loopback and proxies `/api` without changing `Host` or `Origin`. The FastAPI
+loopback, same-origin and CSRF checks remain active; no cross-origin exception
+is added.
+
+To inspect the configured `~/.hedge-fund` root, build the bundle and start the
+read-only, network-off server:
+
+```bash
+make web-build
+poetry run aihf-web
+```
+
+An alternate local data root can be selected explicitly with `--root PATH`.
+General writes and external network access are separate, immutable startup
+capabilities. The default has neither. Backtests require both:
+
+```bash
+poetry run aihf-web --allow-writes --enable-network
+```
+
+Use those flags only when intentionally submitting local changes or historical
+provider requests. The default Financial Datasets provider is paid; no view
+fetches it automatically. Runner start/stop, manual runs, deletion, ledger redo,
+and live quote fetching remain unavailable in the web desk. See the
+[TUI parity checklist](specs/004-react-web-ui/parity-checklist.md) for all
+supported and deferred workflows.
+
+Backtests show a confirmation of the provider, model, agent count, tickers and
+date range before submission. There are no automatic retries. Cancellation is
+cooperative at valuation boundaries; closing the browser does not cancel a job.
+Server shutdown requests cancellation and waits for active work, including any
+report write already in progress.
+
+#### Docker Compose web service
+
+The web profile builds local assets in a Node stage and runs a Python-only
+image. Compose publishes the service only on host loopback:
+
+```bash
+docker compose --profile web up --build web
+```
+
+Open `http://127.0.0.1:8765`. The service reads the mounted local data root and
+starts read-only with network access disabled. Do not publish this port on a
+non-loopback interface. On Linux, the override keeps the same loopback port
+mapping and adds an explicit host-gateway alias for an Ollama workflow that a
+user separately enables:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.linux.yml --profile web up --build web
+```
+
 ### Mandate cadence
 
 The `rebalance` field accepts `minute`, `daily`, `weekly`, or `monthly`
