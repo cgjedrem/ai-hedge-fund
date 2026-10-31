@@ -7,7 +7,7 @@
 - Copilot review `5722559422`: seven open inline findings and one “previously missed issue” embedded in the review body, submitted `2026-10-31T11:41:22Z`.
 - Inline comment IDs were fetched from the explicit PR comments endpoint. The Vite finding has no separate inline-comment ID; `5722559422` is its review-summary provenance.
 - Fix commit: `da78aa2cd1a282be854b5f844ce28b886d5d702a`.
-- All eight findings verified and fixed. Coordinator owns QA, thread replies/resolution and push. No GitHub replies, thread resolution or push performed here.
+- All eight findings verified and fixed. Independent QA passed with platform caveats; source fixes and evidence pushed to the original PR branch. Coordinator replied to all seven inline threads with the fixing SHA and resolved them; the summary-only Vite issue was answered in PR comment `6543947999`.
 
 ## Decision table
 
@@ -25,7 +25,7 @@
 ## Rollup and batching
 
 - 🔴 defect: 8 accepted-fix; 🟡 hardening: 0; 🔵 nit: 0; false positive: 0; deferred: 0.
-- Source fixes are grouped in one commit on the branch reviewed by Copilot. No stack surgery was needed. Coordinator owns publication and thread follow-up.
+- Source fixes are grouped in one commit on the branch reviewed by Copilot. No stack surgery was needed. Publication and thread follow-up completed; a post-fix re-fetch confirmed all seven threads resolved and no additional inline findings at that point.
 
 ## Convergence and remaining limits
 
@@ -33,4 +33,5 @@
 - No prior QA table recorded the default web factory’s `blind=False` or home-root `PromptCache`; both Copilot findings were verified against `Fund`, CLI/TUI defaults and the actual default web factory, then covered with fakes.
 - The Vite item was summary-only, not an inline thread. Its review-body claim was independently reproduced against the running dev proxy.
 - Windows skipped the two POSIX-only file-mode tests. No Linux/Docker runtime permission claim is made; see `acceptance-evidence.md`.
-- Copilot’s `COMMENTED` review is not approval. Coordinator-owned QA and thread follow-up remain outstanding.
+- Copilot's `COMMENTED` review is not approval. Independent QA accepted the fixes; its possible Windows double-newline hypothesis was disproved by a temporary-file bytes probe showing ordinary CRLF. The expanded affected suite passed 335 tests with 2 POSIX-only skips and 1 documented Windows redo deselection; the unfiltered run reproduced that rename failure. Full-repository validation and POSIX permission runtime remain inconclusive/blocked, not claimed green.
+- User-facing preview was deliberately not restarted or rebuilt during this work so the user could keep reading. It continues serving its previously loaded artifact until an intentional restart/build.
