@@ -1,5 +1,5 @@
 import { AlertCircle, ArrowRight, CircleStop, Clock3, FlaskConical, RefreshCw } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 
 import { DataTable, type TableColumn } from "@/components/data-table";
@@ -41,6 +41,26 @@ interface BacktestSubmission {
   agent_count: number;
 }
 
+const SELECTED_JOB_STORAGE_KEY = "aihf.backtests.selected-job";
+
+function readSelectedJobId(): string | null {
+  try {
+    const stored = window.localStorage.getItem(SELECTED_JOB_STORAGE_KEY);
+    return stored && /^[a-f0-9]{32}$/.test(stored) ? stored : null;
+  } catch {
+    return null;
+  }
+}
+
+function persistSelectedJobId(jobId: string | null): void {
+  try {
+    if (jobId) window.localStorage.setItem(SELECTED_JOB_STORAGE_KEY, jobId);
+    else window.localStorage.removeItem(SELECTED_JOB_STORAGE_KEY);
+  } catch {
+    return;
+  }
+}
+
 function isoDate(date: Date): string {
   return date.toISOString().slice(0, 10);
 }
@@ -50,7 +70,8 @@ export function BacktestsPage() {
   const mandates = useResource<MandateCollection>("/api/mandates");
   const settings = useResource<Settings>("/api/settings");
   const jobs = useResource<{ items: Job[] }>("/api/jobs");
-  const [jobId, setJobId] = useState<string | null>(null);
+  const [jobId, setJobId] = useState<string | null>(readSelectedJobId);
+  const [jobSelectionRestored, setJobSelectionRestored] = useState(false);
   const currentJob = useResource<Job>(jobId ? `/api/jobs/${encodeURIComponent(jobId)}` : null);
   const [fund, setFund] = useState("");
   const [universeText, setUniverseText] = useState("");
@@ -64,9 +85,13 @@ export function BacktestsPage() {
   const [cancelling, setCancelling] = useState(false);
   const [confirmation, setConfirmation] = useState<BacktestSubmission | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const selectJob = useCallback((selectedId: string | null) => {
+    setJobId(selectedId);
+    persistSelectedJobId(selectedId);
+  }, []);
   const canWrite = capabilities?.writes === true;
   const canRun = canWrite && capabilities?.network === true;
-  const activeJob = currentJob.data;
+  const activeJob = currentJob.data?.id === jobId ? currentJob.data : null;
   const selectedMandate = mandates.data?.items.find((item) => item.name === fund) ?? null;
   const selectedModel = settings.data?.models.find((item) => item.id === settings.data?.model) ?? null;
   const running = Boolean(activeJob && ["queued", "running"].includes(activeJob.status));
@@ -76,6 +101,16 @@ export function BacktestsPage() {
     const timer = window.setTimeout(currentJob.refresh, 1200);
     return () => window.clearTimeout(timer);
   }, [activeJob?.status, activeJob?.progress, currentJob.refresh]);
+
+  useEffect(() => {
+    if (!jobs.data || jobSelectionRestored) return;
+    const items = jobs.data.items;
+    const selected = jobId && items.some((item) => item.id === jobId)
+      ? jobId
+      : items.find((item) => ["queued", "running"].includes(item.status))?.id ?? items[0]?.id ?? null;
+    if (selected !== jobId) selectJob(selected);
+    setJobSelectionRestored(true);
+  }, [jobId, jobSelectionRestored, jobs.data, selectJob]);
 
   useEffect(() => {
     if (!fund && mandates.data?.items.length) setFund(mandates.data.items[0].name);
@@ -88,8 +123,24 @@ export function BacktestsPage() {
       { key: "submitted", label: "Submitted", render: (item) => <span className="mono text-[10px]">{dateLabel(item.submitted_at)}</span> },
       { key: "status", label: "Status", render: (item) => <JobStatus status={item.status} /> },
       { key: "progress", label: "Progress", align: "right", render: (item) => <span className="mono">{Math.min(100, Math.max(0, item.progress))}%</span> },
+      {
+        key: "monitor",
+        label: "Monitor",
+        render: (item) => (
+          <Button
+            type="button"
+            size="sm"
+            variant={jobId === item.id ? "secondary" : "ghost"}
+            aria-label={`Monitor job ${item.id}`}
+            aria-pressed={jobId === item.id}
+            onClick={() => selectJob(item.id)}
+          >
+            {jobId === item.id ? "Selected" : "Monitor"}
+          </Button>
+        ),
+      },
     ],
-    [],
+    [jobId, selectJob],
   );
 
   function requestConfirmation(): void {
@@ -149,7 +200,7 @@ export function BacktestsPage() {
         model: confirmation.model,
         mandate_hash: confirmation.mandate_hash,
       });
-      setJobId(job.id);
+      selectJob(job.id);
       setConfirmation(null);
       jobs.refresh();
     } catch (cause) {

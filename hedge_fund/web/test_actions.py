@@ -4,8 +4,11 @@ import pytest
 import yaml
 from fastapi.testclient import TestClient
 
+from hedge_fund.paper.deployed import load_deployed
 from hedge_fund.paper.ledger import Ledger
 from hedge_fund.web.app import create_app
+from hedge_fund.web.schemas import ApprovalRequest
+from hedge_fund.web.services import DeskService, ServiceError
 
 
 def test_approval_is_bound_to_the_displayed_timestamp_and_source_hash(write_client, demo_root):
@@ -255,3 +258,63 @@ def test_capabilities_explain_deferred_runner_ownership():
     assert "ownership" in result["deferred_actions"]["runner"]
     assert "disabled" in result["deferred_actions"]["manual_run"]
     app.state.service.close()
+
+
+@pytest.mark.parametrize(
+    ("action", "filename"),
+    [
+        ("approve", "pending-approval.json"),
+        ("approve", "control.json"),
+        ("approve", "events.jsonl"),
+        ("resume", "control.json"),
+        ("resume", "events.jsonl"),
+        ("resume", "pending-approval.json"),
+    ],
+)
+def test_approval_and_resume_reject_symlinked_control_files(demo_root, tmp_path, action, filename):
+    directory = demo_root / "paper" / "demo-quality"
+    deployed = load_deployed(directory)
+    state = Ledger(directory).replay(deployed.spec.capital, full=True)
+    assert state.pending is not None
+    request = ApprovalRequest(
+        verdict="approve",
+        decision_as_of=state.pending.as_of,
+        source_record_hash=state.prev_hash,
+    )
+    if filename == "pending-approval.json":
+        target_contents = json.dumps(
+            {
+                "verdict": "reject",
+                "decision_as_of": state.pending.as_of,
+                "decision_hash": state.prev_hash,
+                "decided_at": "2026-10-31T12:00:00+00:00",
+                "by": "tui",
+            }
+        )
+    elif filename == "control.json":
+        target_contents = '{"halted": false}\n'
+    else:
+        target_contents = '{"time":"2026-10-31T12:00:00+00:00","kind":"audit"}\n'
+    target = tmp_path / "external-control-target"
+    target.write_text(target_contents, encoding="utf-8")
+    target_before = target.read_bytes()
+    link = directory / filename
+    if link.exists() or link.is_symlink():
+        link.unlink()
+    try:
+        link.symlink_to(target)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlink creation unavailable on this platform")
+
+    service = DeskService(demo_root, allow_writes=True)
+    try:
+        with pytest.raises(ServiceError) as rejected:
+            if action == "approve":
+                service.approve("demo-quality", request)
+            else:
+                service.resume_fund("demo-quality")
+    finally:
+        service.close()
+
+    assert rejected.value.status_code == 403
+    assert target.read_bytes() == target_before

@@ -101,6 +101,30 @@ server does not need Node after the bundle exists. Running `aihf-web` from a
 source checkout without built assets exits with build instructions. Packaged
 wheels serve their included static bundle without Node.
 
+#### Frontend development with Vite
+
+For hot reload, start a separate synthetic API in one terminal:
+
+```bash
+poetry run aihf-web --demo --port 8766
+```
+
+In another terminal:
+
+```bash
+cd frontend
+npm ci
+AIHF_WEB_API_TARGET=http://127.0.0.1:8766 npm run dev
+```
+
+In PowerShell, run
+`$env:AIHF_WEB_API_TARGET = "http://127.0.0.1:8766"` before `npm run dev`.
+Open `http://127.0.0.1:5173`. Add `--allow-writes` to the demo server only
+when testing synthetic mutations; network access stays off. Vite listens on
+loopback and proxies `/api` without changing `Host` or `Origin`. The FastAPI
+loopback, same-origin and CSRF checks remain active; no cross-origin exception
+is added.
+
 To inspect the configured `~/.hedge-fund` root, build the bundle and start the
 read-only, network-off server:
 

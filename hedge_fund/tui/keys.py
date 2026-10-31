@@ -64,8 +64,7 @@ def save_credential(env_var: str, value: str, *, path: str | Path | None = None)
         updated = f"{line}\n"
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    write_atomic(path, updated)
-    path.chmod(stat.S_IRUSR | stat.S_IWUSR)
+    write_atomic(path, updated, mode=stat.S_IRUSR | stat.S_IWUSR)
     os.environ[env_var] = value
     return path
 

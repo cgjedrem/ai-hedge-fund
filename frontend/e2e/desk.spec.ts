@@ -344,3 +344,59 @@ test("ungated and halted decisions never present enabled verdict actions", async
   await expect(page.getByRole("button", { name: "Reject" })).toBeDisabled();
   await expect(page.getByRole("button", { name: "Resume" })).toBeDisabled();
 });
+
+test("restores a running job after navigation and reload", async ({ page }) => {
+  const jobId = "c".repeat(32);
+  let cancelRequested = false;
+  const job = () => ({
+    id: jobId,
+    fund: "demo-quality",
+    provider: "yfinance",
+    model: "provider/model",
+    status: "running",
+    progress: 40,
+    submitted_at: "2026-10-31T12:00:00+00:00",
+    started_at: "2026-10-31T12:00:01+00:00",
+    completed_at: null,
+    report_id: null,
+    error: null,
+    cancel_requested: cancelRequested,
+  });
+
+  await page.route("**/api/capabilities", (route) =>
+    route.fulfill({
+      json: {
+        mode: "demo",
+        read_only: false,
+        writes: true,
+        network: true,
+        protected_names: [],
+        mutation_token: "browser-test-token",
+        deferred_actions: {},
+      },
+    }),
+  );
+  await page.route("**/api/jobs", (route) => route.fulfill({ json: { items: [job()] } }));
+  await page.route(`**/api/jobs/${jobId}`, (route) => route.fulfill({ json: job() }));
+  await page.route(`**/api/jobs/${jobId}/cancel`, async (route) => {
+    expect(route.request().headers()["x-csrf-token"]).toBe("browser-test-token");
+    cancelRequested = true;
+    await route.fulfill({ json: job() });
+  });
+
+  await page.goto("/backtests");
+  await expect(page.getByText(jobId)).toBeVisible();
+  await expect(page.getByText("40%", { exact: true }).first()).toBeVisible();
+  await page.getByRole("button", { name: "Request cancellation" }).click();
+  await expect(page.getByRole("button", { name: "Cancellation requested…" })).toBeVisible();
+
+  const primaryNavigation = page.getByRole("navigation", { name: "Primary navigation" });
+  await primaryNavigation.getByRole("link", { name: "Research" }).click();
+  await expect(page.getByRole("heading", { name: "Research reports" })).toBeVisible();
+  await primaryNavigation.getByRole("link", { name: "Backtests" }).click();
+  await expect(page.getByText(jobId)).toBeVisible();
+
+  await page.reload();
+  await expect(page.getByText(jobId)).toBeVisible();
+  await expect(page.getByText("40%", { exact: true }).first()).toBeVisible();
+});

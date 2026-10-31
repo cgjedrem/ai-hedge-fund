@@ -4,6 +4,7 @@ import pytest
 import yaml
 from fastapi.testclient import TestClient
 
+from hedge_fund.paper.deployed import load_deployed
 from hedge_fund.paper.ledger import Ledger
 from hedge_fund.web.app import create_app
 from hedge_fund.web.schemas import DeployRequest
@@ -245,6 +246,119 @@ def test_session_report_returns_the_record_verified_during_replay(demo_root, mon
     assert response.status_code == 200
     assert reads == 1
     assert response.json()["nav"] == 100_495
+
+
+def test_paper_snapshot_uses_records_captured_by_the_verified_replay(demo_root, monkeypatch):
+    directory = demo_root / "paper" / "demo-quality"
+    ledger = Ledger(directory)
+    original = ledger.latest()
+    assert original is not None
+    replacement = original.model_copy(update={"cash": original.cash + 17, "nav": original.nav + 17})
+    replacement = replacement.model_copy(update={"hash": replacement.compute_hash()})
+    original_read = Ledger.read
+    swapped = False
+
+    def swap_after_verified_read(book, session):
+        nonlocal swapped
+        record = original_read(book, session)
+        if book.directory == directory and session == original.session and not swapped:
+            book.path(session).write_text(replacement.model_dump_json(indent=2), encoding="utf-8")
+            swapped = True
+        return record
+
+    monkeypatch.setattr(Ledger, "read", swap_after_verified_read)
+    service = DeskService(demo_root)
+    try:
+        snapshot = service._paper_snapshot(load_deployed(directory), directory)
+    finally:
+        service.close()
+
+    on_disk = original_read(ledger, original.session)
+    assert swapped
+    assert on_disk.hash == replacement.hash
+    assert snapshot["ledger"]["ok"] is True
+    assert snapshot["nav"] == original.nav
+    assert snapshot["cash"] == original.cash
+    assert snapshot["last_record_hash"] == original.hash
+    assert snapshot["sessions"][-1]["nav"] == original.nav
+    assert snapshot["pending"]["source_record_hash"] == original.hash
+
+
+def test_paper_state_returns_latest_record_from_replay_without_rereading(demo_root, monkeypatch):
+    def reject_reread(_ledger):
+        raise AssertionError("latest record must come from verified replay")
+
+    monkeypatch.setattr(Ledger, "latest", reject_reread)
+    service = DeskService(demo_root)
+    try:
+        _directory, _deployed, _ledger, state, latest = service._paper_state("demo-quality")
+    finally:
+        service.close()
+
+    assert latest is not None
+    assert latest.session == state.last_session
+    assert latest.hash == state.prev_hash
+
+
+def test_default_backtest_factory_blinds_agents_and_uses_root_prompt_cache(tmp_path, monkeypatch):
+    import hedge_fund.signals.llm_agent as llm_agent
+    import hedge_fund.web.services as web_services
+    from hedge_fund.fund import FundSpec
+    from hedge_fund.llm.cache import PromptCache
+
+    cache_paths = []
+    model_temperatures = []
+
+    def scoped_prompt_cache(path):
+        cache_paths.append(path)
+        return PromptCache(path)
+
+    def reject_default_prompt_cache(*_args, **_kwargs):
+        raise AssertionError("web backtests must not construct the default prompt cache")
+
+    class FakeLLM:
+        model = "offline-test-model"
+
+    def fake_make_llm(*, temperature=None):
+        model_temperatures.append(temperature)
+        return FakeLLM()
+
+    monkeypatch.setattr(web_services, "PromptCache", scoped_prompt_cache, raising=False)
+    monkeypatch.setattr(llm_agent, "PromptCache", reject_default_prompt_cache)
+    monkeypatch.setattr(llm_agent, "make_llm", fake_make_llm)
+    spec = FundSpec.model_validate(
+        {
+            "schema_version": 2,
+            "name": "isolated-research",
+            "strategies": [
+                {
+                    "name": "value",
+                    "models": [
+                        {
+                            "name": "buffett",
+                            "params": {"news": True, "samples": 3, "temperature": 0.7},
+                        }
+                    ],
+                    "blend": {"mode": "long_only"},
+                }
+            ],
+            "risk": {"max_position_pct": 1, "max_gross_exposure": 1},
+        }
+    )
+    service = DeskService(tmp_path)
+    try:
+        fund = service._fund_factory(spec)
+    finally:
+        service.close()
+
+    agent = fund.strategies[0][1][0]
+    assert agent._blind is True
+    assert agent._news is True
+    assert agent._samples == 3
+    assert agent._temperature == 0.7
+    assert agent._cache._dir == tmp_path.resolve() / "cache" / "llm"
+    assert cache_paths == [tmp_path.resolve() / "cache" / "llm"]
+    assert model_temperatures == [0.7]
 
 
 def test_report_path_traversal_and_symlink_are_denied(demo_root, tmp_path):

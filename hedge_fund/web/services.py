@@ -26,7 +26,7 @@ from hedge_fund.fund import (
     save_spec,
     StrategySpec,
 )
-from hedge_fund.llm import DEFAULT_MODEL, env_var_for, PROVIDER_ENV_VARS
+from hedge_fund.llm import DEFAULT_MODEL, env_var_for, PromptCache, PROVIDER_ENV_VARS
 from hedge_fund.llm.registry import is_supported, KEYLESS_PROVIDERS, load_api_models
 from hedge_fund.paper.deployed import (
     deploy,
@@ -77,7 +77,7 @@ class DeskService:
         self.network_enabled = bool(network_enabled)
         self.demo = bool(demo)
         self._data_client_factory = data_client_factory
-        self._fund_factory = fund_factory or Fund
+        self._fund_factory = fund_factory if fund_factory is not None else self._default_fund_factory
         self.jobs = JobRegistry()
         self._locks: dict[str, threading.RLock] = {}
         self._locks_guard = threading.Lock()
@@ -474,7 +474,8 @@ class DeskService:
         normalized = self._validated_name(name)
         self._guard_protected(normalized)
         with self._fund_lock(normalized):
-            directory, deployed, ledger, state, latest = self._paper_state(normalized)
+            _directory, deployed, ledger = self._paper_control_state(normalized)
+            state, latest = self._replay_paper_state(deployed, ledger)
             if not deployed.spec.approval_required:
                 raise ServiceError(409, "This fund does not require approval.")
             if state.halted is not None:
@@ -508,7 +509,7 @@ class DeskService:
         if not isinstance(reason, str) or not reason.strip() or len(reason) > 240 or any(ord(char) < 32 or ord(char) == 127 for char in reason):
             raise ServiceError(422, "Halt reason is invalid.")
         with self._fund_lock(normalized):
-            _, ledger = self._paper_control_state(normalized)
+            _, _, ledger = self._paper_control_state(normalized)
             try:
                 ledger.halt(reason)
             except OSError as exc:
@@ -520,7 +521,8 @@ class DeskService:
         normalized = self._validated_name(name)
         self._guard_protected(normalized)
         with self._fund_lock(normalized):
-            _, _, ledger, _, _ = self._paper_state(normalized)
+            _, deployed, ledger = self._paper_control_state(normalized)
+            self._replay_paper_state(deployed, ledger)
             try:
                 ledger.resume()
             except OSError as exc:
@@ -536,8 +538,8 @@ class DeskService:
             halted = None
             halt_state = "unreadable"
         try:
-            records = ledger.records()
-            state = ledger.replay(deployed.spec.capital, full=True)
+            records: list[SessionRecord] = []
+            state = ledger.replay(deployed.spec.capital, full=True, on_verified=records.append)
             ledger_status = {"ok": True, "error": None}
         except (LedgerError, OSError, ValueError) as exc:
             records = []
@@ -624,26 +626,39 @@ class DeskService:
         try:
             deployed = load_deployed(directory)
             ledger = Ledger(directory)
-            state = ledger.replay(deployed.spec.capital, full=True)
-            latest = ledger.latest()
+            state, latest = self._replay_paper_state(deployed, ledger)
         except (LedgerError, OSError, ValueError) as exc:
             raise ServiceError(409, f"Paper state is invalid ({type(exc).__name__}).") from None
         return directory, deployed, ledger, state, latest
 
-    def _paper_control_state(self, name: str) -> tuple[Path, Ledger]:
+    def _replay_paper_state(self, deployed: DeployedFund, ledger: Ledger):
+        latest = None
+
+        def capture(record: SessionRecord) -> None:
+            nonlocal latest
+            latest = record
+
+        try:
+            state = ledger.replay(deployed.spec.capital, full=True, on_verified=capture)
+        except (LedgerError, OSError, ValueError) as exc:
+            raise ServiceError(409, f"Paper state is invalid ({type(exc).__name__}).") from None
+        return state, latest
+
+    def _paper_control_state(self, name: str) -> tuple[Path, DeployedFund, Ledger]:
         directory = self._safe_child("paper", name)
         if not directory.is_dir():
             raise ServiceError(404, "Paper fund not found.")
         self._safe_child("paper", name, "fund.yaml")
         self._safe_child("paper", name, "control.json")
         self._safe_child("paper", name, "events.jsonl")
+        self._safe_child("paper", name, "pending-approval.json")
         try:
             deployed = load_deployed(directory)
         except (OSError, ValueError) as exc:
             raise ServiceError(409, f"Paper fund is invalid ({type(exc).__name__}).") from None
         if _windows_name_key(deployed.name) != _windows_name_key(name):
             raise ServiceError(409, "Paper deployment identity does not match its directory.")
-        return directory, Ledger(directory)
+        return directory, deployed, Ledger(directory)
 
     def _session_report(self, record: SessionRecord) -> dict:
         executed = record.executed
@@ -765,6 +780,10 @@ class DeskService:
                 raise ServiceError(422, "Custom analyst roster is invalid.") from None
             if strategy.models != canonical_custom.models or strategy.blend != canonical_custom.blend:
                 raise ServiceError(422, "Custom strategy must use registered analysts and the canonical blend mode.")
+
+    def _default_fund_factory(self, spec: FundSpec) -> Fund:
+        cache = PromptCache(self._safe_child("cache", "llm"))
+        return Fund(spec, blind=True, cache=cache)
 
     @contextmanager
     def _make_data_client(self) -> Iterator[object]:

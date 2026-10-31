@@ -7,6 +7,7 @@ import type {
   Capabilities,
   Catalog,
   HomeData,
+  Job,
   MandateCollection,
   PaperCollection,
   PaperSnapshot,
@@ -522,5 +523,75 @@ describe("local desk screens", () => {
 
     expect(await screen.findByText("Supported provider catalog · applies to this server process")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Use model for this process" })).toBeDisabled();
+  });
+
+  it("restores, selects, and persists a backtest job for monitoring and cancellation", async () => {
+    const activeJob: Job = {
+      id: "a".repeat(32),
+      fund: "demo-quality",
+      provider: "yfinance",
+      model: "provider/model",
+      status: "running",
+      progress: 45,
+      submitted_at: "2026-10-31T12:00:00+00:00",
+      started_at: "2026-10-31T12:00:01+00:00",
+      completed_at: null,
+      report_id: null,
+      error: null,
+      cancel_requested: false,
+    };
+    const completedJob: Job = {
+      ...activeJob,
+      id: "b".repeat(32),
+      fund: "archived-research",
+      status: "succeeded",
+      progress: 100,
+      completed_at: "2026-10-31T12:01:00+00:00",
+      report_id: "archived-report.json",
+    };
+    const writeCaps: Capabilities = {
+      ...capabilities,
+      mode: "live",
+      writes: true,
+      read_only: false,
+      network: true,
+      mutation_token: "job-test-token",
+    };
+    let currentActiveJob = activeJob;
+    window.localStorage.removeItem("aihf.backtests.selected-job");
+    installApi({
+      caps: writeCaps,
+      override: (path, method) => {
+        if (path === "/api/jobs" && method === "GET") return { payload: { items: [activeJob, completedJob] } };
+        if (path === `/api/jobs/${activeJob.id}` && method === "GET") return { payload: currentActiveJob };
+        if (path === `/api/jobs/${completedJob.id}` && method === "GET") return { payload: completedJob };
+        if (path === `/api/jobs/${activeJob.id}/cancel` && method === "POST") {
+          currentActiveJob = { ...activeJob, cancel_requested: true };
+          return { payload: currentActiveJob };
+        }
+        return null;
+      },
+    });
+    window.history.replaceState({}, "", "/backtests");
+    const user = userEvent.setup();
+    const view = render(<App />);
+
+    expect(await screen.findByText(activeJob.id)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Request cancellation" })).toBeEnabled();
+    await user.click(screen.getByRole("button", { name: "Request cancellation" }));
+    expect(fetchRequests.some((item) => item.path === `/api/jobs/${activeJob.id}/cancel` && item.method === "POST")).toBe(true);
+
+    await user.click(screen.getByRole("button", { name: `Monitor job ${completedJob.id}` }));
+    expect(await screen.findByText(completedJob.id)).toBeInTheDocument();
+    expect(window.localStorage.getItem("aihf.backtests.selected-job")).toBe(completedJob.id);
+
+    await user.click(within(screen.getByRole("navigation", { name: "Primary navigation" })).getByRole("link", { name: "Research" }));
+    expect(await screen.findByRole("heading", { name: "Research reports" })).toBeInTheDocument();
+    await user.click(within(screen.getByRole("navigation", { name: "Primary navigation" })).getByRole("link", { name: "Backtests" }));
+    expect(await screen.findByText(completedJob.id)).toBeInTheDocument();
+
+    view.unmount();
+    render(<App />);
+    expect(await screen.findByText(completedJob.id)).toBeInTheDocument();
   });
 });
