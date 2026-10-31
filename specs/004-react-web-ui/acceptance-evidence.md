@@ -185,3 +185,40 @@ An earlier isolated run at source `d054b3a` without `COLUMNS=240` reported 1,120
 - No default-width full-suite pass is claimed; the known Rich-output width sensitivity remains. The final Linux full-suite result is specifically bound to `COLUMNS=240`.
 - No protected-root content hash or state identity is claimed. No real `.env` or runner PID contents were read; no runner process was probed or controlled. The preview startup skips root `.env` loading because writes and network are both disabled. Final preview browser traffic was GET-only; no mutation was attempted.
 - TUI remains intact; React/TUI parity remains partial. No new saved research-report detail was introduced. T024 independent QA and T025 PR/preview handoff remain coordinator-owned and unchecked.
+
+## Copilot review fixes — final source evidence
+
+### Identity and environment
+
+- Baseline: `7466ad2e979eb4be0f5c6fb4b46ca0b67104c492`; branch `cgjedrem-fictional-winner`; no branch switch.
+- Source commit: `da78aa2cd1a282be854b5f844ce28b886d5d702a`, `2026-10-31`; contains the 14-file implementation/test/README diff and required Copilot co-author trailer.
+- Dirty-source identity before commit: SHA-256 `65ae4b835ab61d28ead369e72018bda1c7763f3d9eb4e7706b2e08e00ff10cd8`, measured `2026-10-31T12:55:19.509828Z`. Covers 14 non-spec source/test/README files; excludes `specs/**`, `memory.md`, and generated static assets. Algorithm: sorted first non-space status byte from `git status --porcelain=v1 -z` (`?` for untracked) + UTF-8 repository-relative path + NUL + 8-byte big-endian size + working-tree bytes + NUL.
+- Environment: Windows 11 Enterprise 10.0.26200; Python 3.13.7; Poetry 2.5.1; pytest 7.4.4; Node 22.13.1; npm 10.9.2; Vite 6.4.5; Playwright Chromium project.
+- Production static artifact built from source `da78aa2`: temporary directory `aihf-copilot-build-da78aa2-b8c2ce625ec54717b0b8da4b876fe59a`; tree SHA-256 `cfea02c133640dbde4fb63548ef5ef7fd08930e564a2daaff0ce4d6d305e5ff7`; 3 files, 944,284 bytes. CSS: 24,240 bytes; JS: 919,576 bytes; HTML: 468 bytes. Build output remained outside the repository. No Python wheel/install or dependency install was performed; package manifests were unchanged.
+
+### Final-source checks
+
+| Result | Scenario, identity and provenance | Command and observation |
+|---|---|---|
+| PASS | Affected Python service, `Fund`, ledger, path and credential tests; source `da78aa2`; temporary HOME, dotenv loading disabled before pytest import, provider credentials removed, DNS/connect restricted to loopback. `2026-10-31T12:56:07.644872Z`–`12:56:13.156426Z`. | Guarded inline runner invoked `pytest.main(["hedge_fund/web", "hedge_fund/fund/test_spec.py", "hedge_fund/test_paths.py", "hedge_fund/tui/test_keys.py", "-q"])` — 154 passed, 2 skipped in 3.71s; pytest return 0 and child exit 0. Both skips are POSIX-only permission tests. Six control-file symlink cases passed. |
+| PASS | Changed Python style gates; eight explicit changed Python files; source `da78aa2`. `2026-10-31T13:00:12.6029497Z`–`13:00:14.9882651Z`. | `python.exe -m black --check --line-length 420 <8 files>`; `python.exe -m isort --check-only <8 files>`; `python.exe -m flake8 --max-line-length=420 <8 files>`; `git diff --check HEAD^ HEAD` — all exit 0. |
+| PASS | Frontend unit tests, typecheck and production build; source `da78aa2`; Node 22.13.1; Vite 6.4.5. `2026-10-31T12:56:01.897509Z`–`12:56:43.8915765Z`. | In `frontend/`, `npm test` — 9 passed in 5.35s; `node node_modules/typescript/bin/tsc --noEmit` — exit 0; `node node_modules/vite/bin/vite.js build --outDir <temporary artifact> --emptyOutDir` — 2,307 modules, 31.00s, exit 0. Vite warned that the 919,576-byte JS chunk exceeds 500 kB; no chunk split is claimed. |
+| PASS | Production-browser job-recovery regression against the temporary static artifact and a synthetic read-only API root (`...\aihf-e2e-root-d56b18fe6323494ebe97228a64f5445e`); Chromium; API port `49682`; Playwright output external to repository. `2026-10-31T12:57:36.0328017Z`–`12:57:46.4055528Z`. | `AIHF_WEB_PORT=49682 AIHF_WEB_REUSE_EXISTING_SERVER=1 AIHF_PLAYWRIGHT_OUTPUT_DIR=<temporary directory> node node_modules/@playwright/test/cli.js test --config playwright.config.ts --grep=restores` — 1 passed in 4.0s; exit 0. Verified active-job restoration, progress, cancellation request, navigation away/back and reload. Underlying API used `demo=True`, network off; browser capabilities/job/cancel responses were fakes. Synthetic API stopped after the test. |
+| PASS | Actual Vite dev proxy and FastAPI security checks; Vite `127.0.0.1:5173`, synthetic writable demo API `127.0.0.1:8766`, root `...\aihf-vite-root-a0bf6224b9044a90abaa278092a3a582`, provider credentials cleared, API network disabled. `2026-10-31T12:59:08.3440732Z`–`12:59:08.8117102Z`. | `AIHF_WEB_API_TARGET=http://127.0.0.1:8766 npm.cmd run dev`; Vite ready in 515ms; loopback Node fetch smoke — same-origin GET 200, foreign-origin GET 403, foreign-origin POST with valid token 403, same-origin valid-CSRF POST 200, synthetic fixture verified halted. Smoke exit 0. Both test servers were stopped by exact PID; ports 5173 and 8766 were closed. |
+| PASS | Vite proxy-target boundary; source `da78aa2`; no server started. `2026-10-31T13:00:12.5904454Z`–`13:00:14.2811594Z`. | `vite.resolveConfig({}, "serve")` with malformed `http://fake-secret.invalid path` and non-loopback `http://example.com` — both rejected with the generic loopback-HTTP error; neither supplied value appeared in the checked error message; harness exit 0. |
+
+### Static self-review
+
+- Owner: python-dev; source `da78aa2`; `2026-10-31T13:02:59.0394093Z`.
+- 🔴 bug: none found in the complete committed source diff.
+- 🟡 risk: POSIX mode-before-write behavior remains unexecuted on this Windows host.
+- 🟡 risk: ledger callback keeps each replay internally consistent; no cross-process writer lock is claimed.
+
+### Limits, failed attempts and safety
+
+- INCONCLUSIVE — bounded full Python suite attempt printed 130 passed and 2 skipped, then `KeyboardInterrupt` while `test_two_managers_reread_rotated_token_under_shared_reference_lock` started a thread. No full-suite pass is claimed; the attempt did not retain a final source/diff identity.
+- INCONCLUSIVE — a separate safe slice including the pre-existing `test_run.py` process-exit anomaly returned 145 passed, 2 skipped from `pytest.main`, while the outer PowerShell process returned 1. This is not final full-suite evidence.
+- BLOCKED — POSIX permission behavior was not executed on Linux. Both permission tests skipped on Windows; Docker Engine was unavailable (`dockerDesktopLinuxEngine` pipe missing). Unblock owner: Linux-capable CI/workstation; run `hedge_fund/test_paths.py` with umask `022`. No Docker installation was attempted.
+- INCONCLUSIVE, superseded harness attempt — PowerShell native argument forwarding in an initial `npm run dev -- --port 53213` validation passed `53213` as a positional Vite root, started Vite on default port 5173 and did not exercise target validation. Only that test-owned Vite/npm process tree was stopped; port 5173 was verified closed. The no-server `vite.resolveConfig` checks and the documented `npm.cmd run dev` runtime smoke above then passed.
+- Final Python validation set temporary `HOME`/`USERPROFILE`, patched dotenv before pytest import, removed provider variables, and restricted DNS/connect to loopback. The first targeted runs preceded discovery of the test conftest’s `load_dotenv()` call; no `.env` contents were inspected or printed. No live provider, LLM, broker, paid-data call, real-fund write, runner/PID-file access, or protected process control occurred.
+- No HTTP request or mutation targeted the user’s read-only preview at `127.0.0.1:8765`; it was not restarted or stopped. All runtime servers and mutations used synthetic temp roots and separate ports. No generated static assets or screenshots were written into the repository.
