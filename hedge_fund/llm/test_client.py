@@ -19,8 +19,8 @@ import requests
 from hedge_fund.data.client import FDClientError
 from hedge_fund.llm import ChatLLM
 from hedge_fund.llm import client as client_module
-from hedge_fund.llm import contract
 from hedge_fund.llm import (
+    contract,
     LLMCallError,
     LLMClient,
     load_api_models,
@@ -288,12 +288,12 @@ def test_cli_jev_cycle_and_saved_replay(tmp_path, monkeypatch, http, capsys):
     and never touches the provider again."""
     import sys
     from datetime import date, timedelta
+
     from hedge_fund import paths, run
     from hedge_fund.backtesting import FundBacktestResult
     from hedge_fund.data.models import Price
     from hedge_fund.features import breakpoints
     from hedge_fund.signals import llm_agent
-    from hedge_fund.tui import keys
 
     class FinancialFixtures(MockDataClient):
         def __enter__(self):
@@ -317,7 +317,6 @@ def test_cli_jev_cycle_and_saved_replay(tmp_path, monkeypatch, http, capsys):
                     for day in days if day.weekday() < 5]
 
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(keys, "ENV_PATH", tmp_path / "saved.env")
     for variable in (*PROVIDER_ENV_VARS.values(), "MOONSHOT_API_KEY"):
         monkeypatch.delenv(variable, raising=False)
     monkeypatch.setenv("TYPESAFE_API_KEY", API_KEY)
@@ -346,12 +345,10 @@ risk:
 capital: 100000
 """)
     output = tmp_path / "result.json"
-    monkeypatch.setattr(sys, "argv", ["aihf", "--model", "jev-1.13.0", "backtest", str(mandate),
-                                     "--universe", "AAPL,MSFT", "--start", "2025-01-14",
-                                     "--end", "2025-01-15", "--out", str(output)])
+    monkeypatch.setattr(sys, "argv", ["aihf", "--root", str(tmp_path), "--model", "jev-1.13.0", "backtest", str(mandate), "--universe", "AAPL,MSFT", "--start", "2025-01-14", "--end", "2025-01-15", "--out", str(output)])
     _serve(http, _http_response(), _http_response(_response("bearish")))
     run.main()
-    result = FundBacktestResult.model_validate_json(output.read_text())
+    result = FundBacktestResult.model_validate_json(output.read_text(encoding="utf-8"))
     assert FundBacktestResult.model_validate_json(capsys.readouterr().out) == result
     assert [r.session for r in result.records] == ["2025-01-14", "2025-01-15"]
     decided, executed = result.records[0].decision, result.records[1].executed
@@ -366,7 +363,7 @@ capital: 100000
     assert http[0].call_count == 2
     assert len(list((tmp_path / "research").glob("jev-test-2025-01-14-2025-01-15-*.json"))) == 1
     run.main()
-    second = FundBacktestResult.model_validate_json(output.read_text()).records[1].executed
+    second = FundBacktestResult.model_validate_json(output.read_text(encoding="utf-8")).records[1].executed
     capsys.readouterr()
     assert second.final_weights == first.final_weights
     assert second.positions == first.positions

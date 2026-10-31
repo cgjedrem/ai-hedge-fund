@@ -7,8 +7,9 @@
     "dev": "vite --host 127.0.0.1",
     "build": "tsc --noEmit && vite build",
     "test": "vitest run src",
+    "test:e2e-safety": "node --test scripts/run-owned.test.mjs",
     "test:watch": "vitest src",
-    "e2e": "npm run build && playwright test"
+    "e2e": "node ./e2e/run-owned.mjs"
   },
   "dependencies": {
     "@radix-ui/react-dialog": "^1.1.14",

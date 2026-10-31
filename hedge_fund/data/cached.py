@@ -1,6 +1,6 @@
 """Disk-cached DataClient wrapper.
 
-Wraps any DataClient with a JSON file cache under ~/.hedge-fund/cache/data/. A warm
+Wraps any DataClient with a JSON file cache under the configured root. A warm
 cache reuses completed historical responses. Daily prices are reusable only
 when fetched after the requested end date has ended in New York; anything
 else asked about a day that has not ended (today's headlines, today's
@@ -29,6 +29,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
+from hedge_fund import paths
 from hedge_fund.data.models import (
     CompanyFacts,
     CompanyNews,
@@ -40,9 +41,16 @@ from hedge_fund.data.models import (
 )
 from hedge_fund.data.protocol import DataClient
 from hedge_fund.data.sessions import NEW_YORK
-from hedge_fund.paths import CACHE_DIR
+from hedge_fund.runtime.root import RootConfigurationError
 
-DEFAULT_CACHE_DIR = CACHE_DIR / "data"
+
+def _default_cache_dir() -> Path:
+    if paths.CACHE_DIR is None:
+        raise RootConfigurationError("an explicit root must be configured first")
+    return paths.CACHE_DIR / "data"
+
+
+DEFAULT_CACHE_DIR = _default_cache_dir() if paths.CACHE_DIR is not None else None
 SAME_DAY_TTL = 600  # seconds an answer about an unfinished day stays fresh
 
 
@@ -52,12 +60,12 @@ class CachedDataClient:
     def __init__(
         self,
         client: DataClient,
-        cache_dir: Path | str = DEFAULT_CACHE_DIR,
+        cache_dir: Path | str | None = None,
         refresh: bool = False,
         live: bool = False,
     ) -> None:
         self._client = client
-        self._dir = Path(cache_dir)
+        self._dir = Path(cache_dir) if cache_dir is not None else _default_cache_dir()
         self._refresh = refresh
         self._live = live
 
@@ -137,16 +145,15 @@ class CachedDataClient:
         if self._refresh:
             return None
         path = self._dir / f"{key}.json"
-        if not path.exists():
+        if paths.file_mtime(path) is None:
             return None
         try:
-            return json.loads(path.read_text())
+            return json.loads(paths.read_text(path))
         except (json.JSONDecodeError, OSError):
             return None  # corrupt entry -> miss; rewritten on fetch
 
     def _write(self, key: str, payload: dict) -> None:
-        self._dir.mkdir(parents=True, exist_ok=True)
-        (self._dir / f"{key}.json").write_text(json.dumps(payload))
+        paths.write_text(self._dir / f"{key}.json", json.dumps(payload))
 
     def _fresh(self, hit: dict, method: str, params: dict) -> bool:
         """Whether a cached answer can still be served.

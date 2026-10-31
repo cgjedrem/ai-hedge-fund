@@ -39,6 +39,7 @@ from hedge_fund.brokers import Fill
 from hedge_fund.data import CachedDataClient, make_data_client
 from hedge_fund.fund import discover_funds, Fund, FundSpec, normalize_universe
 from hedge_fund.pipeline import CycleRecord, mark_lookback_start
+from hedge_fund.runtime.defaults import BACKTEST_WEEKS, warm_tasks
 from hedge_fund.scorecard import score
 from hedge_fund.signals import ALPHA_MODEL_REGISTRY, LLMAgent
 from hedge_fund.tui.home import demand_run_keys, HomeScreen
@@ -47,13 +48,11 @@ from hedge_fund.tui.report import cost_line, roster_table, tape_table
 from hedge_fund.tui.scorecard_view import analyst_table, strategy_table
 from hedge_fund.tui.shared import (
     agent_names,
-    BACKTEST_WEEKS,
     DISPLAY_NAMES,
     fund_label,
     render_area_chart,
     UNIVERSE_PRESETS,
     valid_date,
-    WARM_CHUNK,
 )
 from hedge_fund.tui.widgets import first_selectable, StatTiles
 
@@ -273,11 +272,7 @@ class BacktestScreen(Screen):
             issubclass(ALPHA_MODEL_REGISTRY[m.name], LLMAgent)
             for s in spec.strategies for m in s.models
         )
-        chunks = [
-            (ticker, grid[j:j + WARM_CHUNK])
-            for ticker in universe
-            for j in range(0, len(grid), WARM_CHUNK)
-        ]
+        chunks = warm_tasks(universe, grid)
         bar = self.query_one("#warm-progress", ProgressBar)
 
         def prefetch(ticker: str, dates: list[str]) -> None:

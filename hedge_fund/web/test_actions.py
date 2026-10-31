@@ -251,8 +251,8 @@ def test_protected_windows_aliases_are_rejected_before_control_writes(tmp_path, 
     assert not (fund_dir / "pending-approval.json").exists()
 
 
-def test_capabilities_explain_deferred_runner_ownership():
-    app = create_app(root="unused-read-only-root")
+def test_capabilities_explain_deferred_runner_ownership(tmp_path):
+    app = create_app(root=tmp_path)
     result = app.state.service.capabilities(None)
 
     assert "ownership" in result["deferred_actions"]["runner"]

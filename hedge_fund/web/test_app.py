@@ -97,7 +97,9 @@ def test_api_errors_never_fall_through_to_spa_and_assets_get_csp(tmp_path):
     (static_dir / "index.html").write_text("<html>desk</html>", encoding="utf-8")
     (static_dir / "assets").mkdir()
     (static_dir / "assets" / "app.js").write_text("void 0", encoding="utf-8")
-    app = create_app(root=tmp_path / "data", static_dir=static_dir)
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    app = create_app(root=data_root, static_dir=static_dir)
 
     with TestClient(app) as client:
         deep_link = client.get("/paper/example", headers=LOOPBACK)

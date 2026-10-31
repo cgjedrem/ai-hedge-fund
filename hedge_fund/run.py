@@ -7,16 +7,16 @@ the clock, the broker, and where the state lives differ.
 
 Usage::
 
-    aihf
+    aihf --root /path/to/hedge-fund-data
         No arguments: the interactive app (a Textual TUI). Backtest a
         mandate, deploy and advance a paper fund, or build a new mandate.
 
-    aihf backtest ~/.hedge-fund/mandates/example.yaml --universe AAPL,MSFT
+    aihf --root /path/to/hedge-fund-data backtest mandates/example.yaml --universe AAPL,MSFT
         Replay the mandate over history (default: the last 18 months up to
         the latest completed session). Full result JSON on stdout; a copy
-        lands in ~/.hedge-fund/research/. --start/--end/--out/--model.
+        lands in research/. --start/--end/--out/--model.
 
-    aihf paper create alpha --mandate ~/.hedge-fund/mandates/example.yaml --universe AAPL,MSFT
+    aihf --root /path/to/hedge-fund-data paper create alpha --mandate mandates/example.yaml --universe AAPL,MSFT
         Deploy a paper fund: snapshot the mandate, fix the universe, open an
         empty ledger and a book with the mandate's capital.
 
@@ -26,7 +26,7 @@ Usage::
         bar at prints taken now for a minute fund. Idempotent; what a
         scheduler calls after each close:
 
-            30 18 * * 1-5  aihf paper tick alpha >> ~/.hedge-fund/paper/alpha/tick.log 2>&1
+            30 18 * * 1-5  aihf --root /path/to/hedge-fund-data paper tick alpha
 
         A missed day is never skipped — the next tick advances the oldest
         unrecorded session. --session names it explicitly.
@@ -55,72 +55,170 @@ import argparse
 import os
 import sys
 from datetime import date as _date
-from datetime import timedelta
 from pathlib import Path
 
 from rich.console import Console
 
-from hedge_fund.backtesting import backtest_fund, save_result
-from hedge_fund.brokers.models import format_shares
-from hedge_fund.data import CachedDataClient, make_data_client
-from hedge_fund.data.bars import is_intraday
-from hedge_fund.data.sessions import completed_through
-from hedge_fund.fund import Cadence, Fund, FundSpec, load_spec, normalize_universe
-from hedge_fund.paper import (
-    deploy,
-    is_running,
-    Ledger,
-    LedgerError,
-    list_deployed,
-    load_deployed,
-    NothingDue,
-    redo,
-    serve,
-    stop_runner,
-    tick,
-    validate_fund_name,
-)
-from hedge_fund.paths import ensure_mandates_dir, PAPER_DIR
-from hedge_fund.pipeline import FundHalted, SessionRecord
-from hedge_fund.scorecard import score
-from hedge_fund.tui.keys import apply_credentials
-from hedge_fund.tui.report import cost_line
-from hedge_fund.tui.scorecard_view import analyst_table, strategy_table
-from hedge_fund.tui.shared import BACKTEST_WEEKS
+from hedge_fund import paths
+from hedge_fund.runtime.root import RootContext, RootPathError
+
+backtest_fund = None
+save_result = None
+format_shares = None
+CachedDataClient = None
+make_data_client = None
+is_intraday = None
+completed_through = None
+Cadence = None
+Fund = None
+FundSpec = None
+load_spec = None
+normalize_universe = None
+deploy = None
+is_running = None
+Ledger = None
+LedgerError = None
+list_deployed = None
+load_deployed = None
+NothingDue = None
+redo = None
+serve = None
+stop_runner = None
+tick = None
+validate_fund_name = None
+ensure_mandates_dir = None
+PAPER_DIR = None
+FundHalted = None
+SessionRecord = None
+score = None
+cost_line = None
+analyst_table = None
+strategy_table = None
+_CONFIGURED_PAPER_DIR: Path | None = None
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     # Persona/LLM text is arbitrary unicode; a Windows console defaults to
     # cp1252 and would crash on it. Force UTF-8 (with replacement) on both
     # streams before anything prints.
     for stream in (sys.stdout, sys.stderr):
         if stream is not None and hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8", errors="replace")
-    apply_credentials()
-    ensure_mandates_dir()
     parser = _parser()
-    args = parser.parse_args()
-
-    if args.model:
-        os.environ["HEDGE_FUND_LLM_MODEL"] = args.model
-
-    if args.command is None:
-        # The interactive experience is the Textual app. Import it lazily so
-        # the non-interactive paths never pay to load Textual.
-        from hedge_fund.tui.app import HedgeFundApp
-
-        HedgeFundApp().run()
-        return
-
-    console = Console(stderr=True)  # status + summary on stderr; stdout stays pure JSON
+    args = parser.parse_args(argv)
     try:
-        if args.command == "backtest":
-            _backtest(args, parser, console)
-        else:
-            _paper(args, parser, console)
-    except (FundHalted, NothingDue, LedgerError) as exc:
-        console.print(f"[red]{exc}[/]")
-        sys.exit(1)
+        context = RootContext.open(args.root)
+    except RootPathError as exc:
+        parser.error(str(exc))
+
+    try:
+        with paths.bound_root(context):
+            try:
+                paths.load_root_dotenv(context, enabled=args.load_dotenv)
+            except (RootPathError, UnicodeError, ValueError) as exc:
+                parser.error(str(exc))
+            _load_runtime()
+            if args.model:
+                os.environ["HEDGE_FUND_LLM_MODEL"] = args.model
+            ensure_mandates_dir()
+
+            if args.command is None:
+                from hedge_fund.tui.app import HedgeFundApp
+
+                HedgeFundApp().run()
+                return
+
+            console = Console(stderr=True)
+            try:
+                if args.command == "backtest":
+                    _backtest(args, parser, console)
+                else:
+                    _paper(args, parser, console)
+            except (FundHalted, NothingDue, LedgerError) as exc:
+                console.print(f"[red]{exc}[/]")
+                sys.exit(1)
+    finally:
+        context.close()
+
+
+def _load_runtime() -> None:
+    global backtest_fund, save_result, format_shares, CachedDataClient
+    global make_data_client, is_intraday, completed_through, Cadence, Fund
+    global FundSpec, load_spec, normalize_universe, deploy, is_running
+    global Ledger, LedgerError, list_deployed, load_deployed, NothingDue
+    global redo, serve, stop_runner, tick, validate_fund_name
+    global ensure_mandates_dir, PAPER_DIR, FundHalted, SessionRecord
+    global score, cost_line, analyst_table, strategy_table
+    global _CONFIGURED_PAPER_DIR
+
+    from hedge_fund.backtesting import backtest_fund as engine_backtest_fund
+    from hedge_fund.backtesting import save_result as engine_save_result
+    from hedge_fund.brokers.models import format_shares as engine_format_shares
+    from hedge_fund.data import CachedDataClient as EngineCachedDataClient
+    from hedge_fund.data import make_data_client as engine_make_data_client
+    from hedge_fund.data.bars import is_intraday as engine_is_intraday
+    from hedge_fund.data.sessions import completed_through as engine_completed_through
+    from hedge_fund.fund import Cadence as EngineCadence
+    from hedge_fund.fund import Fund as EngineFund
+    from hedge_fund.fund import FundSpec as EngineFundSpec
+    from hedge_fund.fund import load_spec as engine_load_spec
+    from hedge_fund.fund import normalize_universe as engine_normalize_universe
+    from hedge_fund.paper import deploy as engine_deploy
+    from hedge_fund.paper import is_running as engine_is_running
+    from hedge_fund.paper import Ledger as EngineLedger
+    from hedge_fund.paper import LedgerError as EngineLedgerError
+    from hedge_fund.paper import list_deployed as engine_list_deployed
+    from hedge_fund.paper import load_deployed as engine_load_deployed
+    from hedge_fund.paper import NothingDue as EngineNothingDue
+    from hedge_fund.paper import redo as engine_redo
+    from hedge_fund.paper import serve as engine_serve
+    from hedge_fund.paper import stop_runner as engine_stop_runner
+    from hedge_fund.paper import tick as engine_tick
+    from hedge_fund.paper import validate_fund_name as engine_validate_fund_name
+    from hedge_fund.pipeline import FundHalted as EngineFundHalted
+    from hedge_fund.pipeline import SessionRecord as EngineSessionRecord
+    from hedge_fund.reporting.console import analyst_table, cost_line, strategy_table
+    from hedge_fund.scorecard import score as engine_score
+
+    bindings = {
+        "backtest_fund": engine_backtest_fund,
+        "save_result": engine_save_result,
+        "format_shares": engine_format_shares,
+        "CachedDataClient": EngineCachedDataClient,
+        "make_data_client": engine_make_data_client,
+        "is_intraday": engine_is_intraday,
+        "completed_through": engine_completed_through,
+        "Cadence": EngineCadence,
+        "Fund": EngineFund,
+        "FundSpec": EngineFundSpec,
+        "load_spec": engine_load_spec,
+        "normalize_universe": engine_normalize_universe,
+        "deploy": engine_deploy,
+        "is_running": engine_is_running,
+        "Ledger": EngineLedger,
+        "LedgerError": EngineLedgerError,
+        "list_deployed": engine_list_deployed,
+        "load_deployed": engine_load_deployed,
+        "NothingDue": EngineNothingDue,
+        "redo": engine_redo,
+        "serve": engine_serve,
+        "stop_runner": engine_stop_runner,
+        "tick": engine_tick,
+        "validate_fund_name": engine_validate_fund_name,
+        "ensure_mandates_dir": paths.ensure_mandates_dir,
+        "FundHalted": EngineFundHalted,
+        "SessionRecord": EngineSessionRecord,
+        "score": engine_score,
+        "cost_line": cost_line,
+        "analyst_table": analyst_table,
+        "strategy_table": strategy_table,
+    }
+    for name, value in bindings.items():
+        if globals()[name] is None:
+            globals()[name] = value
+    if PAPER_DIR is None or PAPER_DIR == _CONFIGURED_PAPER_DIR:
+        PAPER_DIR = paths.PAPER_DIR
+    _CONFIGURED_PAPER_DIR = paths.PAPER_DIR
 
 
 # ---------------------------------------------------------------------------
@@ -131,7 +229,18 @@ def main() -> None:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="aihf",
-        description="Run the AI hedge fund. No arguments: launch the interactive " "app. `backtest` replays a mandate over history; `paper` deploys and " "advances a paper fund.",
+        description="Run the AI hedge fund under an explicit data root.",
+    )
+    parser.add_argument(
+        "--root",
+        type=Path,
+        required=True,
+        help="existing absolute NTFS or ext4 data root",
+    )
+    parser.add_argument(
+        "--load-dotenv",
+        action="store_true",
+        help="load safe non-secret settings from this root's .env",
     )
     parser.add_argument(
         "--model",
@@ -144,19 +253,29 @@ def _parser() -> argparse.ArgumentParser:
         help="replay a mandate over history",
         description="Replay a mandate over history: every benchmark session from " "--start to --end, decisions at a rebalance session's close executed at " "the next close. Full result JSON on stdout, a copy in research/.",
     )
-    backtest.add_argument("mandate", help="path to a mandate YAML, e.g. ~/.hedge-fund/mandates/example.yaml")
+    backtest.add_argument(
+        "mandate",
+        help="path to a mandate YAML; relative paths resolve under --root",
+    )
     backtest.add_argument("--universe", required=True, help=_UNIVERSE_HELP)
-    backtest.add_argument("--start", help=f"first session YYYY-MM-DD (default: {BACKTEST_WEEKS} weeks before --end)")
+    backtest.add_argument("--start", help="first session YYYY-MM-DD (default: 78 weeks before --end)")
     backtest.add_argument("--end", help="last session YYYY-MM-DD (default: the latest completed session)")
-    backtest.add_argument("--out", help="also write the result JSON to this file")
+    backtest.add_argument(
+        "--out",
+        help="also write the result JSON to this file; relative paths resolve under --root",
+    )
     backtest.add_argument("--rebalance", choices=("minute", "daily", "weekly", "monthly"), help="override the mandate cadence for this backtest")
 
     paper = commands.add_parser("paper", help="deploy and advance a paper fund")
     actions = paper.add_subparsers(dest="action", required=True)
 
     create = actions.add_parser("create", help="deploy a mandate as a paper fund")
-    create.add_argument("name", help="fund name; becomes ~/.hedge-fund/paper/<name>/")
-    create.add_argument("--mandate", required=True, help="path to a mandate YAML")
+    create.add_argument("name", help="fund name; becomes paper/<name>/ under --root")
+    create.add_argument(
+        "--mandate",
+        required=True,
+        help="path to a mandate YAML; relative paths resolve under --root",
+    )
     create.add_argument("--universe", required=True, help=_UNIVERSE_HELP)
     create.add_argument("--rebalance", choices=("minute", "daily", "weekly", "monthly"), help="override the mandate cadence before deployment")
     create.add_argument("--approval", action="store_true", help="require approval before executing pending decisions")
@@ -236,12 +355,14 @@ def _fund_dir(name: str, parser: argparse.ArgumentParser) -> Path:
 def _backtest(args, parser: argparse.ArgumentParser, console: Console) -> None:
     universe = _universe(args.universe, parser)
     try:
-        spec = load_spec(args.mandate)
+        spec = load_spec(paths.resolve_user_path(args.mandate))
     except ValueError as exc:
         parser.error(str(exc))
     spec = _override_rebalance(spec, args.rebalance)
     end = args.end or completed_through()
-    start = args.start or (_date.fromisoformat(end) - timedelta(weeks=BACKTEST_WEEKS)).isoformat()
+    from hedge_fund.runtime.defaults import backtest_start_date
+
+    start = args.start or backtest_start_date(_date.fromisoformat(end)).isoformat()
     # A backtest blinds the investor agents' prompts (no ticker, industry or
     # calendar dates): the LLM may have been trained on what those companies
     # did over the window, and that memory would otherwise score as skill.
@@ -259,7 +380,10 @@ def _backtest(args, parser: argparse.ArgumentParser, console: Console) -> None:
     print(payload)
     saved = save_result(result)
     if args.out:
-        Path(args.out).write_text(payload)
+        try:
+            paths.write_text(paths.resolve_user_path(args.out), payload)
+        except (OSError, ValueError) as exc:
+            parser.error(f"result could not be written ({type(exc).__name__}).")
     m = result.metrics
     console.print(f"[bold]{spec.name}[/] {result.start} → {result.end}  ·  " f"{len(result.dates)} sessions  ·  {m.n_cycles} rebalances  ·  {m.n_orders} orders  ·  " f"{cost_line(m.trading_cost, m.traded_notional)}  ·  " f"return {m.total_return_pct:+.1%} vs {spec.benchmark} {m.benchmark_return_pct:+.1%}  ·  " f"sharpe {m.sharpe_ratio:.2f}  ·  max drawdown {m.max_drawdown_pct:.1%}")
     card = score(result.records)
@@ -278,7 +402,7 @@ def _paper(args, parser: argparse.ArgumentParser, console: Console) -> None:
         universe = _universe(args.universe, parser)
         try:
             validate_fund_name(args.name)
-            spec = load_spec(args.mandate)
+            spec = load_spec(paths.resolve_user_path(args.mandate))
         except ValueError as exc:
             parser.error(str(exc))
         spec = _override_rebalance(spec, args.rebalance)

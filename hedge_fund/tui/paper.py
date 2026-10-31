@@ -36,6 +36,7 @@ from hedge_fund.paper import (
     tick,
 )
 from hedge_fund.pipeline import DecisionRecord, FundState, SessionRecord
+from hedge_fund.runtime.defaults import BOARD_REFRESH
 from hedge_fund.scorecard import score
 from hedge_fund.signals import ALPHA_MODEL_REGISTRY, LLMAgent
 from hedge_fund.tui.builder import BuilderScreen
@@ -65,7 +66,6 @@ from hedge_fund.tui.report import (
 from hedge_fund.tui.scorecard_view import analyst_table, strategy_table
 from hedge_fund.tui.shared import (
     agent_names,
-    BOARD_REFRESH,
     cadence_identity,
     DISPLAY_NAMES,
     render_area_chart,

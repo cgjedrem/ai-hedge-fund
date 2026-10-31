@@ -1,4 +1,5 @@
 import json
+import os
 
 import pytest
 import yaml
@@ -48,6 +49,27 @@ def test_read_adapters_match_seeded_mandate_paper_ledger_and_report(demo_root):
     assert report["proposed"]["target_weights"] == {"AAPL": 0.1}
     assert len(research["items"]) == 1
     assert research["items"][0]["fund"] == "demo-quality"
+
+
+def test_service_revalidates_its_bound_root_before_storage_access(tmp_path):
+    service = DeskService(tmp_path)
+    moved = tmp_path.with_name(f"{tmp_path.name}-moved")
+
+    try:
+        if os.name == "nt":
+            with pytest.raises(OSError):
+                tmp_path.rename(moved)
+            assert service.list_mandates()["items"] == []
+            assert not moved.exists()
+        else:
+            tmp_path.rename(moved)
+            tmp_path.mkdir()
+            with pytest.raises(ServiceError) as changed:
+                service.list_mandates()
+            assert changed.value.status_code == 409
+            assert not (tmp_path / "mandates").exists()
+    finally:
+        service.close()
 
 
 def test_catalog_preserves_canonical_library_models_and_blend(demo_root):

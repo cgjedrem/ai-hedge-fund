@@ -3,7 +3,15 @@ import { resolve } from "node:path";
 
 import { expect, test, type Page } from "@playwright/test";
 
-const screenshotDir = resolve(process.cwd(), "../specs/004-react-web-ui/screenshots");
+const port = process.env.AIHF_WEB_PORT;
+if (port !== "8876") {
+  throw new Error("Run browser acceptance through the owned 8876 harness.");
+}
+const origin = `http://127.0.0.1:${port}`;
+const screenshotDir = resolve(
+  process.cwd(),
+  "../specs/005-web-engine-migration/screenshots",
+);
 const screenRoutes = [
   { path: "/", heading: "Research with a clear view of risk.", screenshot: "overview" },
   { path: "/mandates", heading: "Mandates", screenshot: "mandates" },
@@ -19,7 +27,6 @@ const screenRoutes = [
 ];
 
 test.beforeEach(async ({ page }) => {
-  const origin = `http://127.0.0.1:${process.env.AIHF_WEB_PORT ?? "8765"}`;
   await page.route("**/*", (route) => {
     if (new URL(route.request().url()).origin !== origin) return route.abort();
     return route.continue();
@@ -50,15 +57,13 @@ async function assertCustomMode(page: Page, mode: string): Promise<void> {
 test("production routes render at desktop and narrow widths without external requests", async ({ page }) => {
   mkdirSync(screenshotDir, { recursive: true });
   const externalRequests: string[] = [];
-  const baseOrigin = `http://127.0.0.1:${process.env.AIHF_WEB_PORT ?? "8765"}`;
   page.on("request", (request) => {
-    if (baseOrigin && new URL(request.url()).origin !== baseOrigin) {
+    if (new URL(request.url()).origin !== origin) {
       externalRequests.push(request.url());
     }
   });
 
   await page.setViewportSize({ width: 1440, height: 1000 });
-  await page.goto("/");
 
   for (const route of screenRoutes) {
     await page.goto(route.path);
