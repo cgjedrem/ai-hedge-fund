@@ -6,12 +6,11 @@ import pytest
 
 import hedge_fund.paths as paths
 from hedge_fund.paths import write_atomic
+from hedge_fund.runtime.root import RootContext, RootPathError
 
 
 def test_write_atomic_survives_non_ascii(tmp_path: Path) -> None:
-    # Ledger records embed LLM rationale text, which is not guaranteed to fit
-    # the platform default encoding (cp1252 on Windows). The write must be
-    # UTF-8 regardless of locale.
+    # Ledger rationale must round-trip beyond platform encoding.
     path = tmp_path / "record.json"
     text = '{"rationale": "cheap \u2192 buy \u2192 \U0001f4c8"}'
     write_atomic(path, text)
@@ -127,3 +126,36 @@ def test_write_atomic_removes_restricted_temp_after_interrupted_write(tmp_path: 
     assert observed == [0o600]
     assert path.read_text(encoding="utf-8") == "old"
     assert list(tmp_path.glob(f".{path.name}.*.tmp")) == []
+
+
+def test_root_path_helpers_revalidate_identity_before_returning_child(tmp_path: Path):
+    root = tmp_path / "root"
+    root.mkdir()
+    moved = tmp_path / "moved-root"
+
+    with RootContext.open(root) as context:
+        if os.name == "nt":
+            with pytest.raises(OSError):
+                root.rename(moved)
+            assert context.resolve("paper/fund/ledger") == root / "paper/fund/ledger"
+        else:
+            root.rename(moved)
+            root.mkdir()
+            with pytest.raises(RootPathError, match="identity changed"):
+                context.resolve("paper/fund/ledger")
+            assert not (root / "paper").exists()
+            assert not (moved / "paper").exists()
+
+
+def test_resolve_user_path_binds_relative_paths_to_root(tmp_path: Path):
+    root = tmp_path / "root"
+    root.mkdir()
+    outside = tmp_path / "outside.yaml"
+
+    with RootContext.open(root) as context:
+        with paths.bound_root(context):
+            assert paths.resolve_user_path("mandates/example.yaml") == root / "mandates" / "example.yaml"
+            assert paths.resolve_user_path(root / "cache" / "entry.json") == root / "cache" / "entry.json"
+            assert paths.resolve_user_path(outside) == outside
+            with pytest.raises(RootPathError, match="traversal"):
+                paths.resolve_user_path("../outside.yaml")

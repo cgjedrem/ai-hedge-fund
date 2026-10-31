@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import stat
 from pathlib import Path
 
 from hedge_fund.backtesting.fund import FundBacktestResult, performance_metrics
@@ -17,7 +19,7 @@ from hedge_fund.pipeline.session import mandate_hash, SessionRecord
 
 def seed_demo(root: str | Path) -> Path:
     """Write deterministic fixtures under an explicit empty root."""
-    data_root = Path(root).expanduser().resolve()
+    data_root = _demo_root(root)
     data_root.mkdir(parents=True, exist_ok=True)
     if any(data_root.iterdir()):
         raise ValueError("demo root must be empty")
@@ -77,6 +79,54 @@ def seed_demo(root: str | Path) -> Path:
     )
     save_result(result, directory=data_root / "research")
     return data_root
+
+
+def _demo_root(root: str | Path) -> Path:
+    candidate = Path(root)
+    if os.environ.get("HEDGE_FUND_TEST_MODE") != "1":
+        return candidate.expanduser().resolve()
+
+    test_root_value = os.environ.get("HEDGE_FUND_TEST_ROOT", "")
+    test_root = Path(test_root_value)
+    if not test_root_value or not test_root.is_absolute():
+        raise RuntimeError("test demo requires an absolute test root")
+    if not candidate.is_absolute():
+        raise ValueError("test demo root must be absolute")
+
+    test_root = Path(os.path.abspath(os.fspath(test_root)))
+    data_root = Path(os.path.abspath(os.fspath(candidate)))
+    try:
+        relative = data_root.relative_to(test_root)
+    except ValueError:
+        raise ValueError(
+            "demo root must stay inside test-owned root",
+        ) from None
+
+    current = test_root
+    if is_reparse_point(current):
+        raise ValueError("test root cannot contain reparse points")
+    for part in relative.parts:
+        current = current / part
+        if is_reparse_point(current):
+            raise ValueError("demo root cannot contain reparse points")
+
+    resolved_test_root = test_root.resolve(strict=True)
+    resolved_data_root = data_root.resolve(strict=False)
+    if not resolved_data_root.is_relative_to(resolved_test_root):
+        raise ValueError(
+            "demo root must stay inside test-owned root",
+        )
+    return resolved_data_root
+
+
+def is_reparse_point(path: Path) -> bool:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return False
+    attributes = getattr(info, "st_file_attributes", 0)
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    return stat.S_ISLNK(info.st_mode) or bool(attributes & reparse_flag)
 
 
 def _strategy(spec: FundSpec, session: str, conviction: float) -> StrategyRecord:

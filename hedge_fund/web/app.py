@@ -12,7 +12,7 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, Response
 
-from hedge_fund.paths import USER_DIR
+from hedge_fund.runtime.root import RootContext
 from hedge_fund.web.schemas import (
     ApprovalRequest,
     BacktestRequest,
@@ -91,13 +91,14 @@ async def _empty_receive():
 
 def create_app(
     *,
-    root: str | Path = USER_DIR,
+    root: str | Path,
     allow_writes: bool = False,
     network_enabled: bool = False,
     demo: bool = False,
     static_dir: str | Path | None = None,
     data_client_factory=None,
     fund_factory=None,
+    root_context: RootContext | None = None,
 ) -> FastAPI:
     """Create a disk-backed app; reads never initialize or mutate the root."""
     service = DeskService(
@@ -107,6 +108,7 @@ def create_app(
         demo=demo,
         data_client_factory=data_client_factory,
         fund_factory=fund_factory,
+        root_context=root_context,
     )
     token = secrets.token_urlsafe(32) if allow_writes else None
     requested_static = Path(static_dir) if static_dir is not None else Path(__file__).with_name("static")

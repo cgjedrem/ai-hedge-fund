@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from datetime import datetime, time, tzinfo
 from math import isfinite
 from pathlib import Path
 from typing import Literal
@@ -27,14 +26,11 @@ from textual.widgets.option_list import Option
 from textual.widgets.selection_list import Selection
 
 from hedge_fund import paths
-from hedge_fund.data.bars import bars_per_day
-from hedge_fund.data.sessions import NEW_YORK
 from hedge_fund.fund import (
     custom_strategy,
     format_interval,
     FundSpec,
     load_strategy,
-    MIN_INTERVAL_SECONDS,
     normalize_universe,
     save_spec,
     StrategySpec,
@@ -42,6 +38,12 @@ from hedge_fund.fund import (
 )
 from hedge_fund.fund.spec import EARLIEST_WINDOW, LATEST_WINDOW, validate_saxo_window
 from hedge_fund.paper import deploy, validate_fund_name
+from hedge_fund.runtime.defaults import (
+    fast_caveat,
+    interval_line,
+    parse_interval,
+    window_lines,
+)
 from hedge_fund.signals import ALPHA_MODEL_REGISTRY, get_investment_approach, LLMAgent
 from hedge_fund.tui.backtest import BacktestScreen
 from hedge_fund.tui.funds import (
@@ -72,9 +74,6 @@ _NEWS_SENTENCE = "Analysts are asked again at every bar and see new headlines as
 
 
 _WINDOW_NOTE = f"anywhere inside US extended hours ({EARLIEST_WINDOW}–{LATEST_WINDOW})"
-
-
-_FAST_SECONDS = 10  # under this, one price request per ticker (~1s each) may not fit in a bar
 
 
 class BuilderScreen(Screen):
@@ -654,51 +653,6 @@ class BuilderScreen(Screen):
         name = DISPLAY_NAMES.get(key, key)
         tag = "" if issubclass(cls, LLMAgent) else "  quant"
         return Text.assemble((f"{name:<24}", "bold"), (MODE_LABELS[get_investment_approach(key)] + tag, MUTED))
-
-
-def parse_interval(text: str) -> float:
-    """Minutes between bars from what was typed; ValueError says what is wrong."""
-    try:
-        minutes = float(text.strip())
-    except ValueError:
-        raise ValueError("Enter the interval in minutes: 1, 5, or 0.5 for every 30 seconds.") from None
-    if not isfinite(minutes) or minutes <= 0:
-        raise ValueError("Enter the interval in minutes: 1, 5, or 0.5 for every 30 seconds.")
-    if round(minutes * 60) < MIN_INTERVAL_SECONDS:
-        raise ValueError(f"The shortest interval is {MIN_INTERVAL_SECONDS}s: sessions are stamped to the second. " "Enter 0.0167 for every second.")
-    return minutes
-
-
-def interval_line(minutes: float, window: TradingWindow) -> str:
-    """`every 1m · 09:30–16:00 ET · 391 sessions a day`"""
-    seconds = int(round(minutes * 60))
-    return f"every {format_interval(seconds)} · {window.label} · {bars_per_day(seconds, window):,} sessions a day"
-
-
-def fast_caveat(minutes: float) -> str | None:
-    """What a very short interval costs: a price request per ticker takes
-    about a second, so bars the fetch cannot reach in time are skipped and
-    logged as gaps. None at intervals that comfortably fit."""
-    seconds = int(round(minutes * 60))
-    if seconds >= _FAST_SECONDS:
-        return None
-    return f"Under {_FAST_SECONDS}s a bar may not fit its price requests (about a second per ticker); " "bars the fund cannot reach in time are skipped and logged as gaps."
-
-
-def window_lines(window: TradingWindow, minutes: float = 1.0, *, today: datetime | None = None, local_zone: tzinfo | None = None) -> list[str]:
-    """The window as it will run, plus the same hours in the user's own zone
-    when that differs from New York (times are always stored in ET)."""
-    lines = [interval_line(minutes, window)]
-    today = today or datetime.now(NEW_YORK)
-    local = local_zone or datetime.now().astimezone().tzinfo
-    start_ny = datetime.combine(today.date(), time(*map(int, window.start.split(":"))), tzinfo=NEW_YORK)
-    end_ny = datetime.combine(today.date(), time(*map(int, window.end.split(":"))), tzinfo=NEW_YORK)
-    start_local, end_local = start_ny.astimezone(local), end_ny.astimezone(local)
-    if (start_local.hour, start_local.minute) != (start_ny.hour, start_ny.minute) or (end_local.hour, end_local.minute) != (end_ny.hour, end_ny.minute):
-        day_shift = (end_local.date() - end_ny.date()).days
-        suffix = {1: " (the next day)", -1: " (the day before)"}.get(day_shift, "")
-        lines.append(f"that is {start_local:%H:%M}–{end_local:%H:%M} {start_local:%Z} where you are{suffix}")
-    return lines
 
 
 def _first_reason(exc: Exception) -> str:

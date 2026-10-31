@@ -8,6 +8,7 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
+from hedge_fund import paths
 from hedge_fund.fund import (
     custom_strategy,
     discover_funds,
@@ -20,6 +21,7 @@ from hedge_fund.fund import (
     save_spec,
     StrategySpec,
 )
+from hedge_fund.runtime.root import RootContext
 from hedge_fund.signals import ALPHA_MODEL_REGISTRY, get_investment_approach
 
 MINIMAL = {
@@ -40,6 +42,28 @@ def test_yaml_load_happy_path(tmp_path):
     assert spec.strategies[0].weight == 2.0
     assert spec.strategies[0].models[0].weight == 3.0
     assert spec.capital == 50000
+
+
+def test_load_spec_reads_root_bound_path_through_context(tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    root.mkdir()
+    context = RootContext.open(root)
+    target = root / "mandates" / "fund.yaml"
+    try:
+        with paths.bound_root(context):
+            context.mkdir("mandates")
+            context.write_bytes("mandates/fund.yaml", yaml.safe_dump(MINIMAL).encode("utf-8"))
+            original_read_text = type(target).read_text
+
+            def reject_direct_read(path, *args, **kwargs):
+                if path == target:
+                    raise AssertionError("root-bound YAML bypassed RootContext")
+                return original_read_text(path, *args, **kwargs)
+
+            monkeypatch.setattr(type(target), "read_text", reject_direct_read)
+            assert load_spec(paths.resolve_user_path("mandates/fund.yaml")).name == "test-fund"
+    finally:
+        context.close()
 
 
 def test_load_strategy(tmp_path):

@@ -11,7 +11,7 @@ Point-in-time: the breakpoints for month M use end-of-month-M prices, so on
 any day inside M they are not yet knowable. A filing in month M is placed
 against the latest published row strictly before M.
 
-The file is fetched into ~/.hedge-fund/cache/ and refreshed when it ages past
+The file is fetched into the configured root's cache/ and refreshed when it ages past
 a month. It is third-party data and is not vendored.
 """
 
@@ -27,12 +27,19 @@ from typing import Callable
 
 import requests
 
-from hedge_fund.paths import CACHE_DIR
+from hedge_fund import paths
+from hedge_fund.runtime.root import RootConfigurationError
 
-BREAKPOINTS_URL = (
-    "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/ME_Breakpoints_CSV.zip"
-)
-DEFAULT_CACHE_PATH = CACHE_DIR / "breakpoints" / "ME_Breakpoints.csv"
+BREAKPOINTS_URL = "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/ME_Breakpoints_CSV.zip"
+
+
+def _default_cache_path() -> Path:
+    if paths.CACHE_DIR is None:
+        raise RootConfigurationError("an explicit root must be configured first")
+    return paths.CACHE_DIR / "breakpoints" / "ME_Breakpoints.csv"
+
+
+DEFAULT_CACHE_PATH = _default_cache_path() if paths.CACHE_DIR is not None else None
 MAX_AGE_DAYS = 35  # the table updates monthly
 
 _PERCENTILES = tuple(range(5, 101, 5))  # 20 columns: 5th, 10th, ..., 100th
@@ -106,7 +113,7 @@ def fetch_breakpoints_csv(url: str = BREAKPOINTS_URL, timeout: float = 30.0) -> 
 
 
 def load_breakpoints(
-    cache_path: Path | str = DEFAULT_CACHE_PATH,
+    cache_path: Path | str | None = None,
     *,
     max_age_days: int = MAX_AGE_DAYS,
     fetch: Callable[[], str] = fetch_breakpoints_csv,
@@ -117,18 +124,18 @@ def load_breakpoints(
     backtest looks up are months old regardless. No cache and no fetch is
     an error — a blind prompt must not silently change shape.
     """
-    path = Path(cache_path)
-    fresh = path.exists() and (time.time() - path.stat().st_mtime) < max_age_days * 86400
+    path = Path(cache_path) if cache_path is not None else _default_cache_path()
+    cached_at = paths.file_mtime(path)
+    fresh = cached_at is not None and (time.time() - cached_at) < max_age_days * 86400
     if not fresh:
         try:
             text = fetch()
         except Exception:
-            if not path.exists():
+            if paths.file_mtime(path) is None:
                 raise
         else:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(text)
-    return MEBreakpoints.parse(path.read_text())
+            paths.write_text(path, text)
+    return MEBreakpoints.parse(paths.read_text(path))
 
 
 _shared: MEBreakpoints | None = None

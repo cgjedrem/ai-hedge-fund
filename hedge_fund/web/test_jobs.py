@@ -1,6 +1,7 @@
 import threading
 import time
 from copy import deepcopy
+from datetime import datetime, timedelta, timezone
 
 import pytest
 import yaml
@@ -13,10 +14,78 @@ from hedge_fund.llm import DEFAULT_MODEL, load_api_models
 from hedge_fund.llm.registry import is_supported
 from hedge_fund.paper.deployed import load_deployed
 from hedge_fund.pipeline.session import mandate_hash
+from hedge_fund.runtime.admission import AdmissionCoordinator, OwnershipState
+from hedge_fund.runtime.capture import freeze_capture
+from hedge_fund.runtime.configuration import resolve_settings
+from hedge_fund.runtime.operations import OperationStatus, OperationStore
+from hedge_fund.runtime.root import RootContext
 from hedge_fund.web.app import create_app
-from hedge_fund.web.jobs import JobCancelled, JobConflict, JobRegistry
+from hedge_fund.web.jobs import JobCancelled, JobConflict, JobRegistry, OperationJobRegistry
 from hedge_fund.web.schemas import BacktestRequest, DeployRequest, ModelRequest
 from hedge_fund.web.services import DeskService, ServiceError
+
+_JOB_NOW = datetime(2026, 10, 31, 12, 0, tzinfo=timezone.utc)
+
+
+@pytest.fixture
+def durable_job_context(tmp_path):
+    root = tmp_path / "durable-jobs"
+    root.mkdir()
+    with RootContext.open(root) as root_context:
+        admission = AdmissionCoordinator(root_context, ownership=OwnershipState.VERIFIED)
+        store = OperationStore(
+            root_context,
+            admission=admission,
+            private_storage_verified=True,
+        )
+        capture = freeze_capture(
+            root=root_context,
+            subject_id="alpha",
+            mandate_digest="a" * 64,
+            universe=("AAA",),
+            broker="paper",
+            settings=resolve_settings(root_context),
+            credential_versions={},
+            code_version="synthetic-job-code",
+        )
+        yield root_context, store, capture
+
+
+def _accepted_operation(store, capture, request_id="job-request"):
+    preview = store.create_preview(
+        action="backtest",
+        subject_id="alpha",
+        expected_head="head-1",
+        due_set=(),
+        capture=capture,
+        operator_session="operator-1",
+        payload={"mode": "synthetic"},
+        now=_JOB_NOW,
+        expires_at=_JOB_NOW + timedelta(minutes=1),
+    )
+    return store.accept_request(
+        request_id=request_id,
+        action=preview.action,
+        subject_id=preview.subject_id,
+        preview_id=preview.preview_id,
+        preview_digest=preview.digest,
+        confirmation_token=preview.confirmation_token,
+        operator_session="operator-1",
+        expected_head=preview.expected_head,
+        due_set=preview.due_set,
+        payload=preview.payload,
+        now=_JOB_NOW,
+    )
+
+
+def _wait_for_operation(store, operation_id, status, timeout=5):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        operation = store.get_operation(operation_id)
+        if operation.status is status:
+            return operation
+        time.sleep(0.01)
+    raise AssertionError(f"operation did not reach {status.value}")
 
 
 class ManagedFakeDataClient(FakeDataClient):
@@ -499,3 +568,108 @@ def test_cancel_endpoint_uses_write_gate_and_cooperative_job_boundary(demo_root,
 
     assert data_client.entered is True
     assert data_client.exited is True
+
+
+def test_operation_job_registry_persists_progress_and_result(durable_job_context):
+    root_context, store, capture = durable_job_context
+    registry = OperationJobRegistry(store, clock=lambda: _JOB_NOW)
+    operation = _accepted_operation(store, capture)
+    entered = threading.Event()
+    release = threading.Event()
+
+    def work(progress, cancelled):
+        assert not cancelled()
+        progress(20)
+        entered.set()
+        release.wait(timeout=2)
+        assert not cancelled()
+        progress(75)
+        return {"sessions": 1}
+
+    try:
+        submitted = registry.submit(operation, work)
+        assert submitted.operation_id == operation.operation_id
+        assert entered.wait(timeout=5)
+        running = _wait_for_operation(store, operation.operation_id, OperationStatus.RUNNING)
+        assert running.progress == 20
+        release.set()
+        completed = _wait_for_operation(store, operation.operation_id, OperationStatus.COMPLETED)
+        assert completed.progress == 100
+        assert completed.result == {"sessions": 1}
+        assert root_context.read_bytes(f"runtime/operations/results/{operation.operation_id}.json")
+    finally:
+        release.set()
+        registry.close()
+
+
+def test_operation_job_cancellation_stops_at_boundary_without_result(durable_job_context):
+    _root_context, store, capture = durable_job_context
+    registry = OperationJobRegistry(store, clock=lambda: _JOB_NOW)
+    operation = _accepted_operation(store, capture)
+    entered = threading.Event()
+    release = threading.Event()
+    calls = []
+
+    def work(progress, cancelled):
+        calls.append("started")
+        progress(25)
+        entered.set()
+        release.wait(timeout=2)
+        if cancelled():
+            raise JobCancelled()
+        return {"must_not_persist": True}
+
+    try:
+        registry.submit(operation, work)
+        assert entered.wait(timeout=5)
+        cancel_requested = registry.cancel(
+            operation.operation_id,
+            request_id="cancel-job-1",
+            now=_JOB_NOW,
+        )
+        assert cancel_requested.status is OperationStatus.CANCEL_REQUESTED
+        release.set()
+        cancelled = _wait_for_operation(store, operation.operation_id, OperationStatus.CANCELLED)
+        assert cancelled.result is None
+        assert calls == ["started"]
+    finally:
+        release.set()
+        registry.close()
+
+
+def test_operation_job_restart_interrupts_and_never_resubmits(durable_job_context):
+    _root_context, store, capture = durable_job_context
+    registry = OperationJobRegistry(store, clock=lambda: _JOB_NOW)
+    operation = _accepted_operation(store, capture)
+    entered = threading.Event()
+    release = threading.Event()
+    shutdown_done = threading.Event()
+    restarts = []
+
+    def work(_progress, cancelled):
+        entered.set()
+        release.wait(timeout=2)
+        if cancelled():
+            raise JobCancelled()
+        return {"unexpected": True}
+
+    registry.submit(operation, work)
+    assert entered.wait(timeout=5)
+    shutdown = threading.Thread(target=lambda: (registry.close(), shutdown_done.set()))
+    shutdown.start()
+    try:
+        interrupted = _wait_for_operation(store, operation.operation_id, OperationStatus.INTERRUPTED)
+    finally:
+        release.set()
+    assert shutdown_done.wait(timeout=2)
+    shutdown.join(timeout=1)
+
+    restarted = OperationJobRegistry(store, clock=lambda: _JOB_NOW)
+    observed = restarted.submit(
+        interrupted,
+        lambda _progress, _cancelled: restarts.append("resumed"),
+    )
+    restarted.close()
+
+    assert observed.status is OperationStatus.INTERRUPTED
+    assert restarts == []

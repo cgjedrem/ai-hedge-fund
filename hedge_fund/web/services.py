@@ -11,8 +11,6 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable, Iterator
 
-from dotenv import dotenv_values
-
 from hedge_fund.backtesting.fund import backtest_fund, FundBacktestResult
 from hedge_fund.backtesting.research import save_result
 from hedge_fund.data import CachedDataClient, data_provider, make_data_client
@@ -38,8 +36,9 @@ from hedge_fund.paper.deployed import (
 from hedge_fund.paper.ledger import Ledger, LedgerError
 from hedge_fund.paper.tick import following_session
 from hedge_fund.pipeline.session import mandate_hash, SessionRecord
+from hedge_fund.runtime.credentials import save_credential
+from hedge_fund.runtime.root import RootContext, RootPathError
 from hedge_fund.scorecard import score
-from hedge_fund.tui.keys import save_credential
 from hedge_fund.web.jobs import JobCancelled, JobConflict, JobRegistry
 from hedge_fund.web.schemas import (
     ApprovalRequest,
@@ -71,8 +70,20 @@ class DeskService:
         demo: bool = False,
         data_client_factory: Callable[[], object] | None = None,
         fund_factory: Callable[[FundSpec], Fund] | None = None,
+        root_context: RootContext | None = None,
     ) -> None:
-        self.root = Path(root).expanduser().resolve()
+        if root_context is None:
+            root_context = RootContext.open(root)
+            self._owns_root_context = True
+        else:
+            if not isinstance(root_context, RootContext):
+                raise RootPathError("an opened root context is required")
+            if Path(root) != root_context.path:
+                raise RootPathError("root path does not match root context")
+            root_context.revalidate()
+            self._owns_root_context = False
+        self.root_context = root_context
+        self.root = root_context.path
         self.allow_writes = bool(allow_writes)
         self.network_enabled = bool(network_enabled)
         self.demo = bool(demo)
@@ -82,11 +93,14 @@ class DeskService:
         self._locks: dict[str, threading.RLock] = {}
         self._locks_guard = threading.Lock()
         self._settings_lock = threading.RLock()
-        self._load_root_environment()
         self._selected_model = os.environ.get("HEDGE_FUND_LLM_MODEL") or DEFAULT_MODEL
 
     def close(self) -> None:
-        self.jobs.close()
+        try:
+            self.jobs.close()
+        finally:
+            if self._owns_root_context:
+                self.root_context.close()
 
     def capabilities(self, mutation_token: str | None) -> dict:
         return {
@@ -803,6 +817,10 @@ class DeskService:
         }
 
     def _safe_child(self, *parts: str) -> Path:
+        try:
+            self.root_context.revalidate()
+        except RootPathError:
+            raise ServiceError(409, "Configured data root is no longer available.") from None
         candidate = self.root
         for part in parts:
             if not isinstance(part, str) or part in {"", ".", ".."} or Path(part).is_absolute():
@@ -817,10 +835,11 @@ class DeskService:
 
     def _ensure_dir(self, *parts: str) -> Path:
         self._require_writes()
-        if not self.root.exists():
-            self.root.mkdir(parents=True, exist_ok=True)
-        directory = self._safe_child(*parts)
-        directory.mkdir(parents=True, exist_ok=True)
+        self._safe_child(*parts)
+        try:
+            self.root_context.mkdir(Path(*parts).as_posix(), parents=True)
+        except (OSError, RootPathError):
+            raise ServiceError(409, "Storage directory could not be created.") from None
         return self._safe_child(*parts)
 
     def _assert_unique(self, directory: Path, filename: str) -> None:
@@ -888,26 +907,14 @@ class DeskService:
 
     def _ensure_root(self) -> None:
         self._require_writes()
-        if not self.root.exists():
-            self.root.mkdir(parents=True, exist_ok=True)
+        try:
+            self.root_context.revalidate()
+        except RootPathError:
+            raise ServiceError(409, "Configured data root is no longer available.") from None
 
     def _ensure_no_active_job(self) -> None:
         if any(job["status"] in {"queued", "running"} for job in self.jobs.list()):
             raise ServiceError(409, "Settings cannot change while a research job is active.")
-
-    def _load_root_environment(self) -> None:
-        if not self.allow_writes and not self.network_enabled:
-            return
-        env_path = self._safe_child(".env")
-        if not env_path.is_file():
-            return
-        try:
-            values = dotenv_values(env_path)
-        except (OSError, UnicodeError, ValueError):
-            return
-        for name, value in values.items():
-            if value is not None:
-                os.environ.setdefault(name, value)
 
     def _fund_lock(self, name: str) -> threading.RLock:
         key = _windows_name_key(name)

@@ -8,12 +8,7 @@ module. ANSI_THEME maps the plain colour names that reused renderables speak
 
 from rich.terminal_theme import TerminalTheme
 
-GREEN = "#2bd97c"
-CYAN = "#22d3ee"
-RED = "#f87171"
-TEXT = "#d9e6e0"
-BRIGHT = "#f2f7f4"
-MUTED = "#5f7268"
+from hedge_fund.reporting.palette import BRIGHT, CYAN, GREEN, MUTED, RED, TEXT  # noqa: F401
 
 # Reused rich renderables (the equity curve, the roster) speak in ANSI color
 # names — "green", "red", "cyan". This theme lands those on the brand palette

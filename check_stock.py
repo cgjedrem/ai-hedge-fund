@@ -14,6 +14,7 @@ What it does:
   4. Also runs the PEAD quant model (earnings-surprise drift).
 
 Costs nothing but time: data comes from Yahoo, opinions from your Ollama.
+Provider credentials must already be present in the process environment.
 """
 
 from __future__ import annotations
@@ -26,9 +27,8 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 from hedge_fund.data import make_data_client
-from hedge_fund.features.snapshot import InsufficientData, build_snapshot
+from hedge_fund.features.snapshot import build_snapshot, InsufficientData
 from hedge_fund.signals import ALPHA_MODEL_REGISTRY
-from hedge_fund.tui.keys import apply_credentials
 
 DEFAULT_PANEL = ["burry", "pabrai", "damodaran", "ackman", "pead"]
 
@@ -88,7 +88,6 @@ def main() -> None:
                     help="comma-separated from: " + ", ".join(ALPHA_MODEL_REGISTRY))
     args = ap.parse_args()
 
-    apply_credentials()
     as_of = args.date or latest_session_date()
     data_client = make_data_client()
     ticker = args.ticker.upper()

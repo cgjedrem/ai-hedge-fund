@@ -1,10 +1,13 @@
 """The CLI: configuration preflight, the backtest command, and the paper flow."""
 
 import hashlib
+import importlib
 import json
+import os
 import sys
 from contextlib import nullcontext
 from datetime import datetime
+from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
@@ -20,15 +23,17 @@ def offline(tmp_path, monkeypatch):
     """No credentials, no HTTP, user dirs under tmp, fakes for the engine."""
     from hedge_fund.backtesting.test_fund import FakeAnalyst, FakeDataClient
     from hedge_fund.fund import Fund
-    import importlib
+
     tick_module = importlib.import_module("hedge_fund.paper.tick")
 
     class OfflineClient(FakeDataClient):
         def __init__(self):
             super().__init__({ticker: {"2025-01-06": 100, "2025-01-07": 100, "2025-01-08": 110, "2025-01-13": 110}
                               for ticker in ("AAPL", "MSFT", "SPY")})
+
         def __enter__(self):
             return self
+
         def __exit__(self, *args):
             return False
 
@@ -36,7 +41,6 @@ def offline(tmp_path, monkeypatch):
         return Fund(spec, models={s.name: [FakeAnalyst(m.name, {"AAPL": .8, "MSFT": -.6}) for m in s.models]
                                   for s in spec.strategies})
 
-    monkeypatch.setattr(run, "apply_credentials", lambda: None)
     monkeypatch.setattr(run, "ensure_mandates_dir", lambda: tmp_path)
     monkeypatch.setattr(run, "Fund", build_fund)
     monkeypatch.setattr(tick_module, "Fund", build_fund)
@@ -47,6 +51,7 @@ def offline(tmp_path, monkeypatch):
 
     def set_today(day):
         y, m, d = map(int, day.split("-"))
+
         class Clock:
             @staticmethod
             def now(tz):
@@ -66,7 +71,8 @@ def _mandate(tmp_path, mode="long_short", name="mixed"):
 
 
 def _main(monkeypatch, *argv):
-    monkeypatch.setattr(sys, "argv", ["aihf", *argv])
+    root = Path(run.PAPER_DIR).parent if run.PAPER_DIR is not None else Path(os.environ["HEDGE_FUND_TEST_ROOT"])
+    monkeypatch.setattr(sys, "argv", ["aihf", "--root", str(root), *argv])
     run.main()
 
 
@@ -84,7 +90,6 @@ def test_cli_rejects_invalid_configuration_before_clients(tmp_path, monkeypatch,
     path.write_text(yaml.safe_dump(data))
     original = path.read_bytes()
     forbidden = Mock(side_effect=AssertionError("external activity"))
-    monkeypatch.setattr(run, "apply_credentials", lambda: None)
     monkeypatch.setattr(run, "ensure_mandates_dir", lambda: tmp_path)
     monkeypatch.setattr(run, "Fund", forbidden)
     monkeypatch.setattr(run, "make_data_client", forbidden)
@@ -105,7 +110,6 @@ def test_cli_rejects_invalid_configuration_before_clients(tmp_path, monkeypatch,
 
 def test_no_arguments_launches_the_app(monkeypatch):
     launched = Mock()
-    monkeypatch.setattr(run, "apply_credentials", lambda: None)
     monkeypatch.setattr(run, "ensure_mandates_dir", lambda: None)
     monkeypatch.setitem(sys.modules, "hedge_fund.tui.app", Mock(HedgeFundApp=lambda: launched))
     _main(monkeypatch)
@@ -276,7 +280,17 @@ def test_deployed_fund_commands_do_not_accept_rebalance_override(capsys, action)
     parser = run._parser()
 
     with pytest.raises(SystemExit) as exc:
-        parser.parse_args(["paper", action, "alpha", "--rebalance", "daily"])
+        parser.parse_args(
+            [
+                "--root",
+                os.environ["HEDGE_FUND_TEST_ROOT"],
+                "paper",
+                action,
+                "alpha",
+                "--rebalance",
+                "daily",
+            ]
+        )
 
     assert exc.value.code == 2
     assert "unrecognized arguments: --rebalance daily" in capsys.readouterr().err
@@ -340,12 +354,43 @@ def test_paper_flow_create_tick_status_halt_resume(tmp_path, monkeypatch, capsys
     assert exc.value.code == 2 and "no paper fund named 'nobody'" in capsys.readouterr().err
 
 
+def test_cli_resolves_relative_mandate_under_root(tmp_path, monkeypatch, capsys, offline):
+    root_mandate = tmp_path / "mandates"
+    root_mandate.mkdir()
+    spec = FundSpec(
+        schema_version=2,
+        name="root-mandate",
+        strategies=[custom_strategy(["buffett", "druckenmiller"])],
+        risk={"max_position_pct": 0.25, "max_gross_exposure": 1},
+    )
+    (root_mandate / "root-mandate.yaml").write_text(yaml.safe_dump(spec.model_dump()))
+
+    decoy = tmp_path / "cwd"
+    (decoy / "mandates").mkdir(parents=True)
+    (decoy / "mandates" / "root-mandate.yaml").write_text("not: a valid mandate")
+    monkeypatch.chdir(decoy)
+
+    _main(
+        monkeypatch,
+        "backtest",
+        "mandates/root-mandate.yaml",
+        "--universe",
+        "AAPL",
+        "--start",
+        "2025-01-06",
+        "--end",
+        "2025-01-08",
+    )
+
+    output = capsys.readouterr()
+    assert "root-mandate" in output.err
+    assert json.loads(output.out)["fund"] == "root-mandate"
+
+
 def test_paper_minute_fund_ticks_and_runs_like_a_daily_one(tmp_path, monkeypatch, capsys, offline):
     """The CLI verbs are the same at every cadence: `tick` runs the session
     that is due (for a minute fund, the current bar at the print taken now)
     and `run` leaves a runner on the fund."""
-    import importlib
-    import os
     from hedge_fund.data.sessions import NEW_YORK
     from hedge_fund.paper import PID_FILE
     from hedge_fund.pipeline.test_clock import Tape
@@ -363,17 +408,21 @@ def test_paper_minute_fund_ticks_and_runs_like_a_daily_one(tmp_path, monkeypatch
     class CliTape(Tape):
         def __enter__(self):
             return self
+
         def __exit__(self, *args):
             return False
+
     tape = CliTape({"AAPL": {"2025-01-07T09:30:00": 100.0, "2025-01-07T09:30:30": 101.0},
                     "SPY": {"2025-01-07T09:30:00": 500.0}},
                    now=datetime(2025, 1, 7, 9, 30, 40, tzinfo=NEW_YORK))  # 10s into the 09:30:30 bar
     monkeypatch.setattr(run, "make_data_client", lambda: tape)
     tick_module = importlib.import_module("hedge_fund.paper.tick")
+
     class Clock(datetime):  # the tick's wall clock is the tape's; everything else is datetime's
         @classmethod
         def now(cls, tz=None):
             return tape.now.astimezone(tz)
+
     monkeypatch.setattr(tick_module, "datetime", Clock)
 
     _main(monkeypatch, "paper", "tick", "fast")
@@ -395,6 +444,7 @@ def test_paper_minute_fund_ticks_and_runs_like_a_daily_one(tmp_path, monkeypatch
 
     # `run` is the serve loop; stand in for it and check the wiring around it.
     seen = {}
+
     def fake_serve(directory, data, *, on_record, on_event):
         seen["pid"] = directory / PID_FILE
         on_event("gap", {"from": None, "to": "2025-01-07T09:30:00", "bars_skipped": 3})
