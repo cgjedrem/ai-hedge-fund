@@ -684,3 +684,36 @@ Environment: Windows 11 / NTFS, Python 3.13.7 `.venv` (uv, `-e ".[web]"`, pytest
 - Lint: isort and flake8 clean on changed files; Black findings on `tui/funds.py`, `tui/backtest.py` pre-exist at HEAD. Windows `OpenProcess` PID probe and native NTFS/ext4 evidence from 3042c85 preserved unchanged.
 
 T021/T138 remain unchecked: deletion primitive parity, unaware legacy/out-of-band writers and the exhaustive writer-race matrix remain open. No TUI module or assertion was deleted.
+
+## T019 / T020 ? common error envelope and intermittent web-failure root causes (2026-11-01T22:33:09+01:00)
+
+**Status: PARTIAL.** Source-run evidence on Windows 11 / NTFS, Python 3.13.7 `.venv`, `PYTHON_DOTENV_DISABLED=1`, synthetic roots and fake providers only. Base `d5858e4`. Command form: `.venv\Scripts\python.exe -m pytest <paths> -q -p no:cacheprovider`.
+
+### Error envelope (T019/T020 partial)
+
+- `web/schemas.py` adds `ErrorCode`, `RetryPolicy`, default/retry/refresh maps, `ErrorResponse`, `error_code_for` and `error_payload`. Every HTTP error (middleware denials, Starlette 404/405, 413, 422 validation, `ServiceError`, unhandled 500) returns the additive envelope `{detail, code, message, refresh_required, retry_policy}`; `detail` is preserved for compatibility. About 47 `ServiceError` sites carry contract codes. 422 `loc` echoes of unknown field names are redacted; 500 responses carry security headers. Frontend `api.ts`/`types.ts` parse the envelope with a code whitelist; new `api.test.ts`.
+- Red/green: `web/test_app.py` **16 failed / 8 passed** before, **24 passed** after. Vitest **3 files / 29 tests passed**; `npx tsc --noEmit` exit 0.
+- Documented contract deviations (kept): halted, replay-corrupt and reconciliation-required stay 409 (not 423); validation stays 422 `invalid-request`; subject/request identity and current head are not yet in error bodies.
+
+### Intermittent web failures ? discriminating evidence and repairs
+
+1. **Swallowed worker exception.** `web/jobs.py::_log_worker_failure` logs only exception type and innermost frame basename:line (no message, path or secret) for start and worker failures; `test_operation_job_failure_logs_only_type_and_frame` proves message/secret/path are absent. First diagnostic capture: worker `AssertionError at test_jobs.py:1081` (second `cancelled()` check) ? the main thread's 5 s event wait expired under load and `close()` requested cancellation. Repair: test wait budgets `_WAIT_SECONDS = 60`.
+2. **Owned-runner readiness budget.** Production readiness was 8.0 s; idle cold import of the child alone measured **5.52 s / 2.12 s / 2.11 s**. Repair: `owned_runner._READINESS_TIMEOUT_SECONDS = 30.0`. New `test_owned_runner_readiness_timeout_fails_closed_and_stops_child` (constant patched to 0): operation and runner `failed` with `runner-readiness-timeout`, stop requested, child exits, ledger unchanged. Red on baseline: `AttributeError` (no constant). Paper-ops + jobs + owned-runner: **32 passed in 144 s**.
+3. **Lock-timeout misclassification and fatal transient busy.** Full suite after (1)?(2): **1 failed, 1569 passed, 42 skipped in 532.12 s** (`KeyError: 'status'` on a status poll). Added `operations.OperationBusy` and 503 `observation-conflict` / `retry-read-only` mapping for operation status/list reads; red (mapping removed) **409 request-conflict**, green **503**. Independent review found the conversion too broad (lock-file stat/open, ACL, reparse and `OwnershipUnknown` failures would be reported as retryable). Repair: `OperationStore._acquire_registry` raises `OperationBusy` **only** for `WriterConflict` during acquisition; other acquisition failures and `AdmissionError` from the locked body stay plain `OperationError` (409).
+4. Confirmatory full suite: **3 failed, 1568 passed, 42 skipped in 502.02 s**. Captured logs: `start failed: OperationBusy at operations.py:609` ? reviewed preview ended `interrupted`; test helper `_wait_for_operation` raised `WriterConflict`?`OperationBusy` after the 5 s bound; paper `start_entered.wait(timeout=10)` expired (worker later failed closed with `ServiceError at services.py:1188`).
+5. **Lock-contention experiment** (scratch roots under the session folder, one 60-write progress writer plus one status poller, deleted afterwards): idle durable write ~0.35 s each. Poll 10 ms: max writer lock wait **0.785 s** idle, **3.441 s** with 28 CPU burners. Poll 100 ms: **0.096 s** idle, **6.362 s** with burners (1 `OperationBusy`). Conclusion: the 5 s bound is exceeded under CPU saturation regardless of poll rate; slow durable writes are an open performance item.
+6. Repairs: `OperationJobRegistry._retry_busy` retries only `OperationBusy` (bounded 30 s, backoff 0.05?0.5 s, stops on shutdown) for `claim_worker`, `mark_running`, `update_progress`, `cancellation_requested`, `complete` and `fail`; each takes the registry lock once and writes only while held, so a busy result means no durable change. Test pollers retry only `OperationBusy` / 503 `observation-conflict`; paper start barrier widened to 60 s.
+7. New tests: `test_operation_lock_failure_other_than_timeout_is_not_retryable` (409 `request-conflict`, not retryable), `test_operation_body_admission_error_is_not_reported_busy`, `test_operation_job_retries_transient_busy_without_interrupting`. Red with blanket busy conversion and no job retry: **3 failed** (the retry test reproduced the full-suite `interrupted` symptom); sources restored byte-exact (SHA-256 verified). Green: **5 passed in 13.33 s**.
+
+### Results
+
+| Result | Command / scope | Observation |
+|---|---|---|
+| **PASS** | `hedge_fund\web` + runtime `test_*operations*`/`*owned_runner*`/`*admission*` + `backtesting\test_research.py` | **225 passed in 360.85 s** |
+| **PASS** | `pytest hedge_fund` (full suite) | **1574 passed, 42 skipped, 0 failed in 567.23 s** (wall 664 s) ? first fully green full suite in this migration |
+| **PASS** | `frontend`: `npx vitest run src`; `npx tsc --noEmit` | **29 passed**; tsc exit 0 |
+| **PASS** | flake8 (`--max-line-length 420 --extend-ignore E203,W503`), Black, isort on changed files; `git diff --check` | clean; pre-existing Black findings in `test_actions.py` unchanged |
+
+Independent reviews (code-review agents; no custom python-dev/qa-reviewer persona available): envelope diff **no significant issues**; OperationBusy delta **one medium finding** (non-timeout lock failures classified retryable) ? fixed; follow-up delta **no significant issues**.
+
+T019/T020 remain unchecked: identity/head fields in error bodies, 423 realignment, remaining 503 sites, expired-CSRF and SIM-denial envelope coverage, and observation reconnect are open. One green full suite is not a statistical flake-free claim.

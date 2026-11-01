@@ -268,7 +268,13 @@ def test_session_report_verifies_entire_ledger_before_returning_a_later_record(d
         )
 
     assert response.status_code == 409
-    assert response.json() == {"detail": "Ledger verification failed (LedgerError)."}
+    assert response.json() == {
+        "detail": "Ledger verification failed (LedgerError).",
+        "code": "replay-corrupt",
+        "message": "Ledger verification failed (LedgerError).",
+        "refresh_required": False,
+        "retry_policy": "inspect-status",
+    }
     assert not {"session", "hash", "nav", "executed"} & set(response.json())
 
 

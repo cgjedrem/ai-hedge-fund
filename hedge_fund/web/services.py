@@ -96,6 +96,7 @@ from hedge_fund.runtime.handover import (
 from hedge_fund.runtime.operations import (
     ConfirmationExpired,
     ConfirmationRejected,
+    OperationBusy,
     OperationConflict,
     OperationError,
     OperationRecord,
@@ -120,6 +121,7 @@ from hedge_fund.web.schemas import (
     BacktestRequest,
     CredentialRequest,
     DeployRequest,
+    error_code_for,
     ModelRequest,
     OperationAcceptRequest,
     OperationCancelRequest,
@@ -140,10 +142,11 @@ _SECRET_FIELD = re.compile(r"(?:api.?key|secret|token|password|credential|author
 
 
 class ServiceError(RuntimeError):
-    def __init__(self, status_code: int, detail: str) -> None:
+    def __init__(self, status_code: int, detail: str, *, code: str | None = None) -> None:
         super().__init__(detail)
         self.status_code = status_code
         self.detail = detail
+        self.code = error_code_for(status_code, code)
 
 
 class _DispatchGuardedInjectedDataClient:
@@ -453,7 +456,7 @@ class DeskService:
             with self._fund_lock(normalized):
                 current, path = self._load_mandate_entry(normalized)
                 if mandate_hash(current) != expected_hash:
-                    raise ServiceError(409, "Mandate changed; reload before editing.")
+                    raise ServiceError(409, "Mandate changed; reload before editing.", code="stale-preview")
                 relative = path.relative_to(self.root).as_posix()
                 if _windows_name_key(target) != _windows_name_key(normalized):
                     directory = self._safe_child("mandates")
@@ -499,7 +502,7 @@ class DeskService:
             with self._fund_lock(source):
                 current, _source_path = self._load_mandate_entry(source)
                 if mandate_hash(current) != expected_hash:
-                    raise ServiceError(409, "Mandate changed; reload before cloning.")
+                    raise ServiceError(409, "Mandate changed; reload before cloning.", code="stale-preview")
                 directory = self._ensure_dir("mandates")
                 self._assert_mandate_name_available(target, directory)
                 try:
@@ -526,7 +529,7 @@ class DeskService:
                 spec = self._load_mandate_by_name(normalized)
                 _reject_secret_fields(spec.model_dump(mode="python"))
                 if spec.broker != "paper":
-                    raise ServiceError(403, "Web deployment is restricted to local-paper mandates.")
+                    raise ServiceError(403, "Web deployment is restricted to local-paper mandates.", code="broker-not-web-supported")
                 paper_root = self._ensure_dir("paper")
                 self._assert_unique(paper_root, normalized)
                 try:
@@ -544,10 +547,7 @@ class DeskService:
                         admission=self._admission,
                     )
                 except HandoverError:
-                    raise ServiceError(
-                        409,
-                        "Deployment was written; root head inventory requires offline review.",
-                    ) from None
+                    raise ServiceError(409, "Deployment was written; root head inventory requires offline review.", code="reconciliation-required") from None
         return {"name": normalized, "universe": universe, "path": directory.name, "status": "deployed"}
 
     def list_paper(self) -> dict:
@@ -742,7 +742,7 @@ class DeskService:
                 try:
                     return self._runner_manager.request_stop(normalized)
                 except OwnedRunnerError:
-                    raise ServiceError(409, "Owned runner identity is unavailable; no process was signalled.") from None
+                    raise ServiceError(409, "Owned runner identity is unavailable; no process was signalled.", code="ownership-unknown") from None
 
     def _create_local_paper_preview(
         self,
@@ -774,12 +774,12 @@ class DeskService:
                     local_paper_only=True,
                 )
                 if deployed.broker != "paper":
-                    raise ServiceError(403, "Paper operations require a local-paper deployment.")
+                    raise ServiceError(403, "Paper operations require a local-paper deployment.", code="broker-not-web-supported")
                 current_head = latest.hash if latest is not None else None
                 if expected_head != current_head:
-                    raise ServiceError(409, "Paper ledger changed; reload before previewing.")
+                    raise ServiceError(409, "Paper ledger changed; reload before previewing.", code="stale-preview")
                 if state.halted is not None:
-                    raise ServiceError(409, "Halted funds cannot accept a paper operation.")
+                    raise ServiceError(409, "Halted funds cannot accept a paper operation.", code="halted")
                 with self._settings_lock:
                     self._ensure_settings_available()
                     settings = self._runtime_settings
@@ -905,7 +905,7 @@ class DeskService:
             local_paper_only=True,
         )
         if deployed.broker != "paper":
-            raise ServiceError(403, "Runner requires a local-paper deployment.")
+            raise ServiceError(403, "Runner requires a local-paper deployment.", code="broker-not-web-supported")
         model_calls = _estimate_paper_model_calls(
             deployed.spec,
             len(deployed.universe),
@@ -957,11 +957,11 @@ class DeskService:
         capture_id = self._preview_captures.get(request.preview_id)
         capture = self._captures.get(capture_id or "")
         if capture is None or capture.subject_id != normalized:
-            raise ServiceError(409, "Paper preview is no longer available; review again.")
+            raise ServiceError(409, "Paper preview is no longer available; review again.", code="stale-preview")
         if request.due_set != payload.get("initial_due_set", request.due_set):
-            raise ServiceError(409, "Reviewed session set changed; review again.")
+            raise ServiceError(409, "Reviewed session set changed; review again.", code="stale-preview")
         if payload.get("expected_head") != request.expected_head:
-            raise ServiceError(409, "Reviewed ledger head changed; review again.")
+            raise ServiceError(409, "Reviewed ledger head changed; review again.", code="stale-preview")
 
         def current_state() -> tuple[str | None, tuple[str, ...]]:
             return self._resolve_paper_schedule(normalized, capture)
@@ -991,7 +991,7 @@ class DeskService:
         with self._settings_lock:
             self._ensure_settings_available()
             if self._runtime_settings.version != capture.settings_version or self._runtime_settings.model != capture.model or self._runtime_settings.data_provider != capture.data_provider or self._runtime_settings.llm_provider != capture.llm_provider:
-                raise ServiceError(409, "Runtime settings changed; review the paper operation again.")
+                raise ServiceError(409, "Runtime settings changed; review the paper operation again.", code="stale-preview")
             self._require_local_paper_policy(self._runtime_settings)
             try:
                 operation = store.accept_request(
@@ -1012,11 +1012,11 @@ class DeskService:
             except ConfirmationExpired:
                 raise ServiceError(410, "Confirmation expired; review the paper operation again.") from None
             except (ConfirmationRejected, StalePreview):
-                raise ServiceError(409, "Reviewed paper operation is stale or no longer valid.") from None
+                raise ServiceError(409, "Reviewed paper operation is stale or no longer valid.", code="stale-preview") from None
             except OperationStartUncertain:
-                raise ServiceError(409, "Paper operation start is uncertain; inspect its durable status.") from None
+                raise ServiceError(409, "Paper operation start is uncertain; inspect its durable status.", code="ownership-unknown") from None
             except (AdmissionError, JobConflict, OperationConflict):
-                raise ServiceError(409, "Paper operation conflicts with current runner or execution state.") from None
+                raise ServiceError(409, "Paper operation conflicts with current runner or execution state.", code="writer-conflict") from None
             except OperationError:
                 raise ServiceError(409, "Paper operation could not be accepted.") from None
         return self._operation_view(operation)
@@ -1067,16 +1067,16 @@ class DeskService:
                     self._verify_root_inventory()
                     deployed = load_deployed(directory)
                     if deployed.broker != "paper" or mandate_hash(deployed.spec) != capture.mandate_digest or tuple(deployed.universe) != tuple(capture.universe):
-                        raise ServiceError(409, "Paper deployment changed after review.")
+                        raise ServiceError(409, "Paper deployment changed after review.", code="stale-preview")
                     state, latest = self._replay_paper_state(
                         deployed,
                         Ledger(directory),
                     )
                     head = latest.hash if latest is not None else None
                     if head != payload["expected_head"]:
-                        raise ServiceError(409, "Paper ledger head changed after review.")
+                        raise ServiceError(409, "Paper ledger head changed after review.", code="stale-preview")
                     if state.halted is not None:
-                        raise ServiceError(409, "Halted funds cannot run a paper tick.")
+                        raise ServiceError(409, "Halted funds cannot run a paper tick.", code="halted")
                     with self._make_data_client(
                         capture.data_provider,
                         dispatch=dispatch,
@@ -1089,7 +1089,7 @@ class DeskService:
                             data_client=client,
                         )
                         if due != session:
-                            raise ServiceError(409, "Paper due-set changed after review.")
+                            raise ServiceError(409, "Paper due-set changed after review.", code="stale-preview")
                         record = tick(
                             directory,
                             client,
@@ -1111,7 +1111,7 @@ class DeskService:
                 admission=self._admission,
             )
         except HandoverError:
-            raise ServiceError(409, "Paper tick recorded; root head inventory requires offline review.") from None
+            raise ServiceError(409, "Paper tick recorded; root head inventory requires offline review.", code="reconciliation-required") from None
         progress(95)
         return {
             "session": record.session,
@@ -1209,9 +1209,9 @@ class DeskService:
             local_paper_only=True,
         )
         if deployed.broker != "paper" or mandate_hash(deployed.spec) != capture.mandate_digest or tuple(deployed.universe) != tuple(capture.universe):
-            raise ServiceError(409, "Paper deployment changed after review.")
+            raise ServiceError(409, "Paper deployment changed after review.", code="stale-preview")
         if state.halted is not None:
-            raise ServiceError(409, "Halted funds cannot accept a paper operation.")
+            raise ServiceError(409, "Halted funds cannot accept a paper operation.", code="halted")
         head = latest.hash if latest is not None else None
         preview_dispatch = self._authorize_manual_capture(
             capture,
@@ -1334,7 +1334,7 @@ class DeskService:
         calls = min(10000, max(100, model_calls + 100 * len(capture.universe)))
         expires_at = self._preview_expiries.get(operation.preview_id)
         if expires_at is None:
-            raise ServiceError(409, "Paper operation deadline is unavailable; review again.")
+            raise ServiceError(409, "Paper operation deadline is unavailable; review again.", code="stale-preview")
         targets = (
             data_target,
             llm_target,
@@ -1475,9 +1475,9 @@ class DeskService:
         try:
             verify_root_inventory(self.root_context)
         except LedgerError:
-            raise ServiceError(409, "Paper state is invalid (LedgerError).") from None
+            raise ServiceError(409, "Paper state is invalid (LedgerError).", code="replay-corrupt") from None
         except HandoverError:
-            raise ServiceError(409, "Offline paper ledger inventory changed; writes are denied.") from None
+            raise ServiceError(409, "Offline paper ledger inventory changed; writes are denied.", code="reconciliation-required") from None
 
     def get_valuation(self, name: str) -> dict:
         """Return current-head estimate; never contacts a provider."""
@@ -1498,10 +1498,10 @@ class DeskService:
                     local_paper_only=True,
                 )
                 if deployed.broker != "paper":
-                    raise ServiceError(403, "Valuation requires a local-paper deployment.")
+                    raise ServiceError(403, "Valuation requires a local-paper deployment.", code="broker-not-web-supported")
                 expected_head = latest.hash if latest is not None else None
                 if request.expected_head != expected_head:
-                    raise ServiceError(409, "Paper ledger changed; reload before refreshing valuation.")
+                    raise ServiceError(409, "Paper ledger changed; reload before refreshing valuation.", code="stale-preview")
                 positions = {ticker: shares for ticker, shares in state.positions.items() if shares != 0}
                 if len(positions) > MAX_VALUATION_POSITIONS:
                     raise ServiceError(409, "Paper holdings exceed the quote-call bound.")
@@ -1676,7 +1676,7 @@ class DeskService:
         except ServiceError:
             raise
         except (LedgerError, OSError, ValueError) as exc:
-            raise ServiceError(409, f"Ledger verification failed ({type(exc).__name__}).") from None
+            raise ServiceError(409, f"Ledger verification failed ({type(exc).__name__}).", code="replay-corrupt") from None
         return self._session_report(record)
 
     def paper_scorecard(self, name: str) -> dict:
@@ -1888,7 +1888,7 @@ class DeskService:
                     expected_version=request.expected_version,
                 )
             except CredentialVersionConflict:
-                raise ServiceError(409, "Credential version changed; reload before saving.") from None
+                raise ServiceError(409, "Credential version changed; reload before saving.", code="stale-preview") from None
             except CredentialStoreError:
                 raise ServiceError(409, "Credential could not be saved.") from None
         return {"provider": provider, "configured": True, "version": version}
@@ -1907,7 +1907,7 @@ class DeskService:
                     expected_version=expected_version,
                 )
             except CredentialVersionConflict:
-                raise ServiceError(409, "Credential version changed; reload before saving.") from None
+                raise ServiceError(409, "Credential version changed; reload before saving.", code="stale-preview") from None
             except CredentialStoreError:
                 raise ServiceError(409, "Credential could not be deleted.") from None
         return {"provider": provider_name, "configured": False, "version": version}
@@ -1939,14 +1939,14 @@ class DeskService:
             raise ServiceError(422, "Backtest universe must use canonical uppercase tickers.")
         spec = self._load_mandate_by_name(subject)
         if spec.name != subject or mandate_hash(spec) != request.expected_head:
-            raise ServiceError(409, "Mandate changed; reload before previewing.")
+            raise ServiceError(409, "Mandate changed; reload before previewing.", code="stale-preview")
         if spec.broker != "paper":
-            raise ServiceError(403, "Only local-paper backtests are supported.")
+            raise ServiceError(403, "Only local-paper backtests are supported.", code="broker-not-web-supported")
         with self._settings_lock:
             self._ensure_settings_available()
             settings = self._runtime_settings
             if payload.provider != settings.data_provider or payload.model != settings.model:
-                raise ServiceError(409, "Provider or model changed; reload before previewing.")
+                raise ServiceError(409, "Provider or model changed; reload before previewing.", code="stale-preview")
             data_target = ProviderTarget(
                 kind="data",
                 provider=settings.data_provider,
@@ -2097,7 +2097,7 @@ class DeskService:
         capture_id = self._preview_captures.get(request.preview_id)
         capture = self._captures.get(capture_id or "")
         if capture is None or capture.subject_id != subject:
-            raise ServiceError(409, "Backtest preview is no longer available; review again.")
+            raise ServiceError(409, "Backtest preview is no longer available; review again.", code="stale-preview")
         payload = request.payload.model_dump(mode="json")
 
         def current_state() -> tuple[str | None, tuple[str, ...]]:
@@ -2123,7 +2123,7 @@ class DeskService:
         with self._settings_lock:
             self._ensure_settings_available()
             if self._runtime_settings.version != capture.settings_version or self._runtime_settings.model != capture.model or self._runtime_settings.data_provider != capture.data_provider:
-                raise ServiceError(409, "Runtime settings changed; review the operation again.")
+                raise ServiceError(409, "Runtime settings changed; review the operation again.", code="stale-preview")
             for provider_id, version in capture.credential_versions.items():
                 if self._credential_store is None:
                     raise ServiceError(409, "Captured credential storage is unavailable.")
@@ -2132,7 +2132,7 @@ class DeskService:
                 except CredentialStoreError:
                     raise ServiceError(409, "Captured credential version is unavailable.") from None
                 if current_version != version:
-                    raise ServiceError(409, "Credential version changed; review the operation again.")
+                    raise ServiceError(409, "Credential version changed; review the operation again.", code="stale-preview")
             try:
                 operation = store.accept_request(
                     request_id=request.request_id,
@@ -2152,9 +2152,9 @@ class DeskService:
             except ConfirmationExpired:
                 raise ServiceError(410, "Confirmation expired; review the operation again.") from None
             except (ConfirmationRejected, StalePreview):
-                raise ServiceError(409, "Reviewed operation is stale or no longer valid.") from None
+                raise ServiceError(409, "Reviewed operation is stale or no longer valid.", code="stale-preview") from None
             except OperationStartUncertain:
-                raise ServiceError(409, "Operation start is uncertain; inspect its durable status.") from None
+                raise ServiceError(409, "Operation start is uncertain; inspect its durable status.", code="ownership-unknown") from None
             except (OperationConflict, JobConflict):
                 raise ServiceError(409, "Operation request conflicts with durable state.") from None
             except ServiceError:
@@ -2169,6 +2169,8 @@ class DeskService:
             raise ServiceError(404, "Operation not found.")
         try:
             operation = store.get_operation(operation_id)
+        except OperationBusy:
+            raise ServiceError(503, "Operation status is busy; retry the read.", code="observation-conflict") from None
         except OperationError as exc:
             status = 404 if "not found" in str(exc) else 409
             raise ServiceError(status, "Operation is unavailable.") from None
@@ -2182,6 +2184,8 @@ class DeskService:
             return {"items": []}
         try:
             operations = store.list_operations(limit=limit)
+        except OperationBusy:
+            raise ServiceError(503, "Operation history is busy; retry the read.", code="observation-conflict") from None
         except OperationError:
             raise ServiceError(409, "Operation history is unavailable.") from None
         return {"items": [self._operation_view(item) for item in operations]}
@@ -2488,12 +2492,12 @@ class DeskService:
                 if not deployed.spec.approval_required:
                     raise ServiceError(409, "This fund does not require approval.")
                 if state.halted is not None:
-                    raise ServiceError(409, "Halted funds cannot accept a verdict.")
+                    raise ServiceError(409, "Halted funds cannot accept a verdict.", code="halted")
                 pending = state.pending
                 if pending is None or latest is None:
                     raise ServiceError(409, "No pending decision is available.")
                 if request.decision_as_of != pending.as_of or request.source_record_hash != latest.hash:
-                    raise ServiceError(409, "Pending decision changed; reload before submitting a verdict.")
+                    raise ServiceError(409, "Pending decision changed; reload before submitting a verdict.", code="stale-preview")
                 resolved, mailbox = ledger.resolve_approval(pending.as_of, latest.hash)
                 if resolved is not None and mailbox is None:
                     raise ServiceError(409, "This decision is already consumed or expired.")
@@ -2534,10 +2538,7 @@ class DeskService:
         with self._fund_lock(normalized):
             with self._paper_control_lane(normalized):
                 self._paper_control_state(normalized)
-                raise ServiceError(
-                    409,
-                    "Resume is disabled until a reconciliation receipt is available.",
-                )
+                raise ServiceError(409, "Resume is disabled until a reconciliation receipt is available.", code="reconciliation-required")
 
     @contextmanager
     def _paper_control_lane(
@@ -2691,11 +2692,11 @@ class DeskService:
         try:
             deployed = load_deployed(directory)
             if local_paper_only and deployed.broker != "paper":
-                raise ServiceError(403, "Web paper mutations require a local-paper deployment.")
+                raise ServiceError(403, "Web paper mutations require a local-paper deployment.", code="broker-not-web-supported")
             ledger = Ledger(directory)
             state, latest = self._replay_paper_state(deployed, ledger)
         except (LedgerError, OSError, ValueError) as exc:
-            raise ServiceError(409, f"Paper state is invalid ({type(exc).__name__}).") from None
+            raise ServiceError(409, f"Paper state is invalid ({type(exc).__name__}).", code="replay-corrupt") from None
         return directory, deployed, ledger, state, latest
 
     def _replay_paper_state(self, deployed: DeployedFund, ledger: Ledger):
@@ -2708,7 +2709,7 @@ class DeskService:
         try:
             state = ledger.replay(deployed.spec.capital, full=True, on_verified=capture)
         except (LedgerError, OSError, ValueError) as exc:
-            raise ServiceError(409, f"Paper state is invalid ({type(exc).__name__}).") from None
+            raise ServiceError(409, f"Paper state is invalid ({type(exc).__name__}).", code="replay-corrupt") from None
         return state, latest
 
     def _paper_control_state(self, name: str) -> tuple[Path, DeployedFund, Ledger]:
@@ -2726,7 +2727,7 @@ class DeskService:
         if _windows_name_key(deployed.name) != _windows_name_key(name):
             raise ServiceError(409, "Paper deployment identity does not match its directory.")
         if deployed.broker != "paper":
-            raise ServiceError(403, "Web paper mutations require a local-paper deployment.")
+            raise ServiceError(403, "Web paper mutations require a local-paper deployment.", code="broker-not-web-supported")
         return directory, deployed, Ledger(directory)
 
     def _session_report(self, record: SessionRecord) -> dict:
@@ -3135,7 +3136,7 @@ class DeskService:
                     admission=self._admission,
                 )
             except SettingsConflict:
-                raise ServiceError(409, "Runtime settings changed; reload before saving.") from None
+                raise ServiceError(409, "Runtime settings changed; reload before saving.", code="stale-preview") from None
             except ConfigurationError:
                 raise ServiceError(409, "Runtime settings could not be saved.") from None
             except (OSError, RootPathError):

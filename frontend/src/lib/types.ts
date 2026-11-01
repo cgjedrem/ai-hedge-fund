@@ -13,8 +13,40 @@ export interface Capabilities {
   deferred_actions: Record<string, string>;
 }
 
+export type ApiErrorCode =
+  | "invalid-request"
+  | "capability-denied"
+  | "read-only"
+  | "broker-not-web-supported"
+  | "not-found"
+  | "stale-preview"
+  | "request-conflict"
+  | "writer-conflict"
+  | "ownership-unknown"
+  | "halted"
+  | "replay-corrupt"
+  | "reconciliation-required"
+  | "expired-confirmation"
+  | "capacity-denied"
+  | "payload-too-large"
+  | "observation-conflict"
+  | "assets-unavailable"
+  | "internal-error";
+
+export type ApiRetryPolicy =
+  | "none"
+  | "review-again"
+  | "reload"
+  | "inspect-status"
+  | "retry-later"
+  | "retry-read-only";
+
 export interface ApiErrorShape {
   detail: string | { message?: string }[];
+  code?: ApiErrorCode;
+  message?: string;
+  refresh_required?: boolean;
+  retry_policy?: ApiRetryPolicy;
 }
 
 export interface ModelOption {

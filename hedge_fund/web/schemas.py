@@ -19,6 +19,91 @@ from pydantic import (
     StrictInt,
 )
 
+ErrorCode = Literal[
+    "invalid-request",
+    "capability-denied",
+    "read-only",
+    "broker-not-web-supported",
+    "not-found",
+    "stale-preview",
+    "request-conflict",
+    "writer-conflict",
+    "ownership-unknown",
+    "halted",
+    "replay-corrupt",
+    "reconciliation-required",
+    "expired-confirmation",
+    "capacity-denied",
+    "payload-too-large",
+    "observation-conflict",
+    "assets-unavailable",
+    "internal-error",
+]
+RetryPolicy = Literal["none", "review-again", "reload", "inspect-status", "retry-later", "retry-read-only"]
+
+_DEFAULT_ERROR_CODES: dict[int, str] = {
+    400: "invalid-request",
+    403: "capability-denied",
+    404: "not-found",
+    405: "invalid-request",
+    409: "request-conflict",
+    410: "expired-confirmation",
+    413: "payload-too-large",
+    422: "invalid-request",
+    423: "halted",
+    429: "capacity-denied",
+    503: "assets-unavailable",
+}
+_ERROR_RETRY_POLICIES: dict[str, str] = {
+    "stale-preview": "review-again",
+    "expired-confirmation": "review-again",
+    "request-conflict": "reload",
+    "writer-conflict": "retry-later",
+    "capacity-denied": "retry-later",
+    "ownership-unknown": "inspect-status",
+    "replay-corrupt": "inspect-status",
+    "reconciliation-required": "inspect-status",
+    "observation-conflict": "retry-read-only",
+    "assets-unavailable": "retry-read-only",
+    "internal-error": "retry-read-only",
+}
+_REFRESH_REQUIRED_CODES = frozenset({"stale-preview", "expired-confirmation", "ownership-unknown"})
+_ERROR_CODES = frozenset(ErrorCode.__args__)
+
+
+class ErrorResponse(BaseModel):
+    """Common safe error envelope; ``detail`` is kept for older clients."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    detail: str | list[dict[str, Any]]
+    code: ErrorCode
+    message: str
+    refresh_required: bool
+    retry_policy: RetryPolicy
+
+
+def error_code_for(status_code: int, code: str | None = None) -> str:
+    if code is not None:
+        if code not in _ERROR_CODES:
+            raise ValueError(f"unknown error code: {code}")
+        return code
+    if status_code >= 500 and status_code != 503:
+        return "internal-error"
+    return _DEFAULT_ERROR_CODES.get(status_code, "invalid-request")
+
+
+def error_payload(status_code: int, detail: str | list[dict[str, Any]], *, code: str | None = None) -> dict[str, Any]:
+    resolved = error_code_for(status_code, code)
+    message = detail if isinstance(detail, str) else "Invalid request."
+    return ErrorResponse(
+        detail=detail,
+        code=resolved,
+        message=message,
+        refresh_required=resolved in _REFRESH_REQUIRED_CODES,
+        retry_policy=_ERROR_RETRY_POLICIES.get(resolved, "none"),
+    ).model_dump()
+
 
 class RequestModel(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)

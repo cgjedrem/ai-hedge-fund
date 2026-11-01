@@ -2,13 +2,35 @@
 
 from __future__ import annotations
 
+import logging
 import threading
+import time
+import traceback
 import uuid
 from collections.abc import Callable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timezone
+from pathlib import PurePath
+from typing import TypeVar
 
-from hedge_fund.runtime.operations import OperationRecord, OperationStatus, OperationStore, WorkerFenced
+from hedge_fund.runtime.operations import (
+    OperationBusy,
+    OperationRecord,
+    OperationStatus,
+    OperationStore,
+    WorkerFenced,
+)
+
+_LOG = logging.getLogger(__name__)
+_BUSY_RETRY_SECONDS = 30.0
+_T = TypeVar("_T")
+
+
+def _log_worker_failure(operation_id: str, stage: str, exc: BaseException) -> None:
+    """Record only the exception type and innermost frame; messages may carry provider text."""
+    frames = traceback.extract_tb(exc.__traceback__)
+    location = f"{PurePath(frames[-1].filename).name}:{frames[-1].lineno}" if frames else "unknown"
+    _LOG.warning("operation %s %s failed: %s at %s", operation_id, stage, type(exc).__name__, location)
 
 
 class JobConflict(RuntimeError):
@@ -184,17 +206,20 @@ class OperationJobRegistry:
     ) -> None:
         fence = None
         try:
-            fence = self._store.claim_worker(
-                operation_id,
-                worker_id=uuid.uuid4().hex,
-                now=self._now(),
+            fence = self._retry_busy(
+                lambda: self._store.claim_worker(
+                    operation_id,
+                    worker_id=uuid.uuid4().hex,
+                    now=self._now(),
+                )
             )
-            self._store.mark_running(operation_id, fence, now=self._now())
+            self._retry_busy(lambda: self._store.mark_running(operation_id, fence, now=self._now()))
         except WorkerFenced:
             self._acknowledge_cancellation(operation_id, fence)
             self._finish_local(operation_id)
             return
-        except Exception:
+        except Exception as exc:
+            _log_worker_failure(operation_id, "start", exc)
             try:
                 self._store.interrupt(operation_id, now=self._now())
             except Exception:
@@ -206,18 +231,20 @@ class OperationJobRegistry:
             if type(value) is not int:
                 raise ValueError("progress is invalid")
             bounded = min(99, max(0, value))
-            self._store.update_progress(
-                operation_id,
-                fence,
-                progress=bounded,
-                now=self._now(),
+            self._retry_busy(
+                lambda: self._store.update_progress(
+                    operation_id,
+                    fence,
+                    progress=bounded,
+                    now=self._now(),
+                )
             )
 
         def cancellation_requested() -> bool:
             if self._shutdown_requested.is_set():
                 return True
             try:
-                return self._store.cancellation_requested(operation_id, fence)
+                return self._retry_busy(lambda: self._store.cancellation_requested(operation_id, fence))
             except WorkerFenced:
                 return True
 
@@ -226,18 +253,21 @@ class OperationJobRegistry:
 
         try:
             result = work(report_progress, cancellation_requested, apply_if_current)
-            self._store.complete(operation_id, fence, result=result, now=self._now())
+            self._retry_busy(lambda: self._store.complete(operation_id, fence, result=result, now=self._now()))
         except JobCancelled:
             self._acknowledge_cancellation(operation_id, fence)
         except WorkerFenced:
             self._acknowledge_cancellation(operation_id, fence)
-        except Exception:
+        except Exception as exc:
+            _log_worker_failure(operation_id, "worker", exc)
             try:
-                self._store.fail(
-                    operation_id,
-                    fence,
-                    error_code="worker-failed",
-                    now=self._now(),
+                self._retry_busy(
+                    lambda: self._store.fail(
+                        operation_id,
+                        fence,
+                        error_code="worker-failed",
+                        now=self._now(),
+                    )
                 )
             except WorkerFenced:
                 pass
@@ -245,6 +275,19 @@ class OperationJobRegistry:
                 pass
         finally:
             self._finish_local(operation_id)
+
+    def _retry_busy(self, step: Callable[[], _T]) -> _T:
+        # OperationBusy is raised only when the bounded lock wait expired before any durable change.
+        deadline = time.monotonic() + _BUSY_RETRY_SECONDS
+        delay = 0.05
+        while True:
+            try:
+                return step()
+            except OperationBusy:
+                if self._shutdown_requested.is_set() or time.monotonic() >= deadline:
+                    raise
+                time.sleep(delay)
+                delay = min(delay * 2, 0.5)
 
     def _acknowledge_cancellation(
         self,

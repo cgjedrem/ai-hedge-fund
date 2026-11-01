@@ -798,4 +798,10 @@ def test_unknown_local_policy_classification_returns_service_error(
     )
 
     assert response.status_code == 422
-    assert response.json() == {"detail": "Provider configuration is not supported for local-paper operations."}
+    assert response.json() == {
+        "detail": "Provider configuration is not supported for local-paper operations.",
+        "code": "invalid-request",
+        "message": "Provider configuration is not supported for local-paper operations.",
+        "refresh_required": False,
+        "retry_policy": "none",
+    }

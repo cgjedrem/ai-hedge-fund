@@ -94,15 +94,21 @@ def _wait_for_operation(
     service: DeskService,
     operation_id: str,
     *,
-    timeout: float = 20,
+    timeout: float = 60,
 ) -> dict:
     deadline = time.monotonic() + timeout
     latest = None
     while time.monotonic() < deadline:
-        latest = service.get_operation(operation_id)
+        try:
+            latest = service.get_operation(operation_id)
+        except ServiceError as exc:
+            if exc.status_code != 503 or exc.code != "observation-conflict":
+                raise
+            time.sleep(0.05)
+            continue
         if latest["status"] in {"completed", "failed", "cancelled", "interrupted"}:
             return latest
-        time.sleep(0.01)
+        time.sleep(0.05)
     raise AssertionError(f"paper operation did not reach a terminal state: {latest}")
 
 
@@ -111,7 +117,7 @@ def _wait_for_runner_status(
     name: str,
     expected: str,
     *,
-    timeout: float = 10,
+    timeout: float = 30,
 ) -> dict:
     deadline = time.monotonic() + timeout
     latest = None
@@ -394,11 +400,8 @@ def test_manual_tick_rejects_stale_head_before_creating_operation(
     assert accepted is None
 
 
-def test_owned_runner_child_starts_and_stops_with_exact_process_identity(
-    demo_root,
-):
-    name = "owned-runner-test"
-    root_path = Path(os.environ["HEDGE_FUND_TEST_ROOT"]) / "owned-runner-root"
+def _start_owned_runner(demo_root, name: str):
+    root_path = Path(os.environ["HEDGE_FUND_TEST_ROOT"]) / f"{name}-root"
     root_path.mkdir()
     enroll_synthetic_root(root_path)
     service = DeskService(
@@ -407,7 +410,6 @@ def test_owned_runner_child_starts_and_stops_with_exact_process_identity(
         network_enabled=True,
     )
     service._runtime_settings = _local_settings()
-    process = None
     try:
         payload = load_spec(demo_root / "mandates" / "demo-quality.yaml").model_dump(mode="python")
         payload.update(
@@ -471,6 +473,36 @@ def test_owned_runner_child_starts_and_stops_with_exact_process_identity(
             ),
             operator_session="owned-runner-test-session",
         )
+    except BaseException:
+        service.close()
+        raise
+    return service, root_path, session_record, head, accepted
+
+
+def _stop_owned_runner(service: DeskService, name: str) -> None:
+    try:
+        if service.runner_status(name)["status"] in {
+            "starting",
+            "running",
+            "stopping",
+        }:
+            service.stop_runner(name)
+    finally:
+        try:
+            process_ref = service._runner_manager._processes.get(runner_key(name))
+            if process_ref is not None and process_ref.process.poll() is None:
+                process_ref.process.wait(timeout=30)
+        finally:
+            service.close()
+
+
+def test_owned_runner_child_starts_and_stops_with_exact_process_identity(
+    demo_root,
+):
+    name = "owned-runner-test"
+    service, root_path, session_record, head, accepted = _start_owned_runner(demo_root, name)
+    process = None
+    try:
         completed = _wait_for_operation(service, accepted["operation_id"])
         state = read_runner_record(service.root_context, name, "state")
         assert completed["status"] == "completed", {
@@ -501,22 +533,34 @@ def test_owned_runner_child_starts_and_stops_with_exact_process_identity(
         after = Ledger(root_path / "paper" / name)
         assert after.sessions() == [session_record.session]
         assert after.latest().hash == head
-        assert process.wait(timeout=10) == 0
+        assert process.wait(timeout=30) == 0
     finally:
-        try:
-            if service.runner_status(name)["status"] in {
-                "starting",
-                "running",
-                "stopping",
-            }:
-                service.stop_runner(name)
-        finally:
-            try:
-                process_ref = service._runner_manager._processes.get(runner_key(name))
-                if process_ref is not None and process_ref.process.poll() is None:
-                    process_ref.process.wait(timeout=10)
-            finally:
-                service.close()
+        _stop_owned_runner(service, name)
+
+
+def test_owned_runner_readiness_timeout_fails_closed_and_stops_child(
+    demo_root,
+    monkeypatch,
+):
+    name = "owned-runner-timeout"
+    monkeypatch.setattr(owned_runner, "_READINESS_TIMEOUT_SECONDS", 0.0)
+    service, root_path, session_record, head, accepted = _start_owned_runner(demo_root, name)
+    try:
+        failed = _wait_for_operation(service, accepted["operation_id"], timeout=60)
+        state = read_runner_record(service.root_context, name, "state")
+        control = read_runner_record(service.root_context, name, "control")
+        process_ref = service._runner_manager._processes[runner_key(name)]
+
+        assert failed["status"] == "failed"
+        assert state["status"] == "failed"
+        assert state["reason"] == "runner-readiness-timeout"
+        assert control["stop_requested"] is True
+        assert process_ref.process.wait(timeout=60) is not None
+        after = Ledger(root_path / "paper" / name)
+        assert after.sessions() == [session_record.session]
+        assert after.latest().hash == head
+    finally:
+        _stop_owned_runner(service, name)
 
 
 def test_runner_start_rejects_head_changed_after_acceptance_before_spawn(
@@ -541,7 +585,7 @@ def test_runner_start_rejects_head_changed_after_acceptance_before_spawn(
 
     def delayed_start(*args, **kwargs):
         start_entered.set()
-        if not release_start.wait(timeout=10):
+        if not release_start.wait(timeout=60):
             raise TimeoutError("runner start barrier timed out")
         return original_start(*args, **kwargs)
 
@@ -584,7 +628,7 @@ def test_runner_start_rejects_head_changed_after_acceptance_before_spawn(
             ),
             operator_session="stale-runner-start-session",
         )
-        assert start_entered.wait(timeout=10)
+        assert start_entered.wait(timeout=60)
 
         deployed = load_deployed(demo_root / "paper" / name)
         changed = SessionRecord(

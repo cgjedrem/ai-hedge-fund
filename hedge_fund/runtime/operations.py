@@ -10,7 +10,7 @@ import math
 import re
 import stat
 from collections.abc import Callable, Mapping
-from contextlib import contextmanager
+from contextlib import contextmanager, ExitStack
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -23,6 +23,7 @@ from hedge_fund.runtime.admission import (
     AdmissionCoordinator,
     AdmissionError,
     LOCK_DIRECTORY,
+    WriterConflict,
 )
 from hedge_fund.runtime.capture import _root_id, FrozenCapture
 from hedge_fund.runtime.root import (
@@ -68,6 +69,10 @@ class OperationConflict(OperationError):
 
 class OperationStartUncertain(OperationError):
     """Worker start may have occurred; request cannot be replayed."""
+
+
+class OperationBusy(OperationError):
+    """Operation storage lock was not acquired within its bound; durable state is unchanged."""
 
 
 class StalePreview(OperationError):
@@ -598,11 +603,11 @@ class OperationStore:
                     "operations": {},
                 }
                 return
-        try:
-            with self._admission.registry_read_lock(timeout=_MAX_LOCK_WAIT_SECONDS):
-                yield self._read_index()
-        except AdmissionError as exc:
-            raise OperationError("operation admission lock is unavailable") from exc
+        with self._acquire_registry(
+            self._admission.registry_read_lock(timeout=_MAX_LOCK_WAIT_SECONDS),
+            "operation admission lock is unavailable",
+        ):
+            yield self._read_index()
 
     def claim_worker(
         self,
@@ -937,11 +942,28 @@ class OperationStore:
 
     @contextmanager
     def _locked(self, _subject_id: str) -> Iterator[None]:
-        try:
-            with self._admission.registry_lock(timeout=_MAX_LOCK_WAIT_SECONDS):
+        with self._acquire_registry(
+            self._admission.registry_lock(timeout=_MAX_LOCK_WAIT_SECONDS),
+            "operation writer admission is unavailable",
+        ):
+            yield
+
+    @staticmethod
+    @contextmanager
+    def _acquire_registry(lock, message: str) -> Iterator[None]:
+        # Only a bounded-wait timeout during acquisition is retryable; corruption, ACL or
+        # ownership failures and errors raised by the locked body stay plain OperationError.
+        with ExitStack() as stack:
+            try:
+                stack.enter_context(lock)
+            except WriterConflict as exc:
+                raise OperationBusy(message) from exc
+            except AdmissionError as exc:
+                raise OperationError(message) from exc
+            try:
                 yield
-        except AdmissionError as exc:
-            raise OperationError("operation writer admission is unavailable") from exc
+            except AdmissionError as exc:
+                raise OperationError(message) from exc
 
     @contextmanager
     def _locked_for_operation(self, operation_id: str) -> Iterator[None]:

@@ -172,7 +172,13 @@ def test_streamed_body_limit_checks_actual_bytes_without_content_length(tmp_path
 
     assert within_limit.status_code == 405
     assert over_limit.status_code == 413
-    assert over_limit.json() == {"detail": "Request body exceeds the 1 MB limit."}
+    assert over_limit.json() == {
+        "detail": "Request body exceeds the 1 MB limit.",
+        "code": "payload-too-large",
+        "message": "Request body exceeds the 1 MB limit.",
+        "refresh_required": False,
+        "retry_policy": "none",
+    }
     assert over_limit.headers["cache-control"] == "no-store"
     assert "default-src 'self'" in over_limit.headers["content-security-policy"]
 
@@ -214,3 +220,148 @@ def test_container_observer_cannot_be_promoted_by_spoofed_host(tmp_path):
         create_app(root=tmp_path, allow_writes=True, container_bind=True)
 
     assert not (tmp_path / "runtime" / "private").exists()
+
+
+_ENVELOPE_KEYS = {"detail", "code", "message", "refresh_required", "retry_policy"}
+
+
+def _assert_envelope(response, status, code, *, root=None):
+    body = response.json()
+    assert response.status_code == status
+    assert set(body) == _ENVELOPE_KEYS
+    assert body["code"] == code
+    assert isinstance(body["message"], str) and body["message"]
+    assert isinstance(body["refresh_required"], bool)
+    assert body["retry_policy"] in {"none", "review-again", "reload", "inspect-status", "retry-later", "retry-read-only"}
+    assert response.headers["cache-control"] == "no-store"
+    if root is not None:
+        assert str(root) not in response.text
+        assert str(root).replace("\\", "\\\\") not in response.text
+    return body
+
+
+def test_boundary_denials_use_common_error_envelope_without_side_effects(tmp_path):
+    enroll_synthetic_root(tmp_path)
+    app = create_app(root=tmp_path, allow_writes=True)
+    before = sorted(path.relative_to(tmp_path) for path in tmp_path.rglob("*"))
+    called = False
+
+    def forbidden(*args, **kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("write adapter must not run")
+
+    app.state.service.halt_fund = forbidden
+    with TestClient(app, client=("127.0.0.1", 50000)) as client:
+        no_session = client.post(
+            "/api/paper/demo/halt",
+            headers={"host": "127.0.0.1", "origin": "http://127.0.0.1", "x-csrf-token": "x"},
+            json={"reason": "test"},
+        )
+        token = client.get("/api/capabilities", headers=LOOPBACK).json()["mutation_token"]
+        valid = {"host": "127.0.0.1", "origin": "http://127.0.0.1", "x-csrf-token": token}
+        responses = {
+            "foreign-host": client.post("/api/paper/demo/halt", headers={**valid, "host": "desk.attacker.example"}, json={"reason": "t"}),
+            "foreign-origin": client.post("/api/paper/demo/halt", headers={**valid, "origin": "https://desk.attacker.example"}, json={"reason": "t"}),
+            "absent-origin": client.post("/api/paper/demo/halt", headers={"host": "127.0.0.1", "x-csrf-token": token}, json={"reason": "t"}),
+            "absent-csrf": client.post("/api/paper/demo/halt", headers={"host": "127.0.0.1", "origin": "http://127.0.0.1"}, json={"reason": "t"}),
+            "wrong-csrf": client.post("/api/paper/demo/halt", headers={**valid, "x-csrf-token": "expired-or-forged"}, json={"reason": "t"}),
+        }
+        remote_peer = TestClient(app, client=("192.0.2.10", 50000)).post("/api/paper/demo/halt", headers=valid, json={"reason": "t"})
+    # No-session request is denied before any cookie existed.
+    assert _assert_envelope(no_session, 403, "capability-denied", root=tmp_path)["detail"] == "A valid server-owned operator session is required."
+    for name, response in {**responses, "remote-peer": remote_peer}.items():
+        body = _assert_envelope(response, 403, "capability-denied", root=tmp_path)
+        assert body["refresh_required"] is False, name
+        assert body["retry_policy"] == "none", name
+    assert not called
+    assert sorted(path.relative_to(tmp_path) for path in tmp_path.rglob("*")) == before
+
+
+def test_read_only_server_denial_is_coded_read_only(tmp_path):
+    with TestClient(create_app(root=tmp_path)) as client:
+        response = client.post("/api/mandates", headers=LOOPBACK, json={"spec": {}})
+        deleted = client.delete("/api/settings/credentials/openai?expected_version=0", headers=LOOPBACK)
+
+    _assert_envelope(response, 403, "read-only", root=tmp_path)
+    _assert_envelope(deleted, 403, "read-only", root=tmp_path)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_validation_routing_and_unhandled_errors_are_coded_and_inert(tmp_path):
+    enroll_synthetic_root(tmp_path)
+    app = create_app(root=tmp_path, allow_writes=True)
+    hostile = "<script>alert(1)</script>" + str(tmp_path) + "\u202e"
+
+    def explode():
+        raise RuntimeError(f"secret sk-test-123 at {tmp_path}")
+
+    app.state.service.catalog = explode
+    with TestClient(app, client=("127.0.0.1", 50000), raise_server_exceptions=False) as client:
+        token = client.get("/api/capabilities", headers=LOOPBACK).json()["mutation_token"]
+        headers = {"host": "127.0.0.1", "origin": "http://127.0.0.1", "x-csrf-token": token}
+        invalid = client.post("/api/paper/demo/halt", headers=headers, json={"reason": "x", hostile: hostile})
+        wrong_method = client.post("/api/capabilities", headers=headers, json={})
+        missing = client.get("/api/not-a-route", headers=LOOPBACK)
+        crashed = client.get("/api/catalog", headers=LOOPBACK)
+
+    body = _assert_envelope(invalid, 422, "invalid-request", root=tmp_path)
+    assert isinstance(body["detail"], list) and body["message"] == "Invalid request."
+    assert ["body", "<redacted>"] in [item["loc"] for item in body["detail"]]
+    assert "<script>" not in invalid.text and "\u202e" not in invalid.text
+    _assert_envelope(wrong_method, 405, "invalid-request", root=tmp_path)
+    assert "POST" not in wrong_method.headers["allow"]
+    _assert_envelope(missing, 404, "not-found", root=tmp_path)
+    crash = _assert_envelope(crashed, 500, "internal-error", root=tmp_path)
+    assert crash["detail"] == "Internal server error."
+    assert "sk-test-123" not in crashed.text
+
+
+@pytest.mark.parametrize(
+    ("status", "code", "refresh", "retry"),
+    [
+        (409, "stale-preview", True, "review-again"),
+        (410, None, True, "review-again"),
+        (409, "halted", False, "none"),
+        (409, "ownership-unknown", True, "inspect-status"),
+        (409, "writer-conflict", False, "retry-later"),
+        (409, "replay-corrupt", False, "inspect-status"),
+        (409, "reconciliation-required", False, "inspect-status"),
+        (403, "broker-not-web-supported", False, "none"),
+        (429, None, False, "retry-later"),
+        (503, None, False, "retry-read-only"),
+    ],
+)
+def test_service_errors_map_to_contract_codes(tmp_path, status, code, refresh, retry):
+    from hedge_fund.web.services import ServiceError
+
+    app = create_app(root=tmp_path)
+
+    def fail():
+        raise ServiceError(status, "Denied.", code=code)
+
+    app.state.service.catalog = fail
+    with TestClient(app) as client:
+        response = client.get("/api/catalog", headers=LOOPBACK)
+
+    body = _assert_envelope(response, status, code or {410: "expired-confirmation", 429: "capacity-denied", 503: "assets-unavailable"}[status])
+    assert body["refresh_required"] is refresh
+    assert body["retry_policy"] == retry
+
+
+def test_service_error_rejects_codes_outside_the_contract():
+    from hedge_fund.web.services import ServiceError
+
+    with pytest.raises(ValueError, match="unknown error code"):
+        ServiceError(409, "Denied.", code="made-up")
+
+
+def test_tagged_service_conflicts_reach_clients_with_contract_codes():
+    import inspect
+
+    import hedge_fund.web.services as web_services
+
+    source = inspect.getsource(web_services)
+    assert 'ServiceError(409, "Halted funds cannot run a paper tick.", code="halted")' in source
+    assert 'ServiceError(409, "Paper due-set changed after review.", code="stale-preview")' in source
+    assert 'code="ownership-unknown"' in source

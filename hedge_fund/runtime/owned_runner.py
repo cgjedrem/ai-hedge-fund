@@ -46,6 +46,8 @@ RUNNER_ROOT = f"{PRIVATE_ROOT}/runners"
 _MAX_RECORD_BYTES = 2 * 1024 * 1024
 _MAX_SESSIONS = 100
 _MAX_OPERATION_SECONDS = 24 * 60 * 60
+# Cold interpreter start plus enrollment checks can exceed 8s on loaded Windows hosts.
+_READINESS_TIMEOUT_SECONDS = 30.0
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _SESSION_KEY = re.compile(r"^\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}:\d{2})?$")
 _ACTIVE_STATES = frozenset({"starting", "running", "stopping"})
@@ -279,7 +281,7 @@ class OwnedRunnerManager:
 
         with self._guard:
             self._processes[key] = _ProcessRef(process, identity, nonce_hash)
-        deadline = time.monotonic() + 8.0
+        deadline = time.monotonic() + _READINESS_TIMEOUT_SECONDS
         while time.monotonic() < deadline:
             observed = _read_record(self._root, state_path, missing_ok=True)
             if observed is not None and observed.get("nonce_hash") == nonce_hash:

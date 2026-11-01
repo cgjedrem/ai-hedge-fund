@@ -1,12 +1,51 @@
-import type { ApiErrorShape } from "@/lib/types";
+import type { ApiErrorCode, ApiErrorShape, ApiRetryPolicy } from "@/lib/types";
+
+const API_ERROR_CODES: ReadonlySet<string> = new Set<ApiErrorCode>([
+  "invalid-request",
+  "capability-denied",
+  "read-only",
+  "broker-not-web-supported",
+  "not-found",
+  "stale-preview",
+  "request-conflict",
+  "writer-conflict",
+  "ownership-unknown",
+  "halted",
+  "replay-corrupt",
+  "reconciliation-required",
+  "expired-confirmation",
+  "capacity-denied",
+  "payload-too-large",
+  "observation-conflict",
+  "assets-unavailable",
+  "internal-error",
+]);
+const RETRY_POLICIES: ReadonlySet<string> = new Set<ApiRetryPolicy>([
+  "none",
+  "review-again",
+  "reload",
+  "inspect-status",
+  "retry-later",
+  "retry-read-only",
+]);
 
 export class ApiError extends Error {
   readonly status: number;
+  readonly code: ApiErrorCode | null;
+  readonly refreshRequired: boolean;
+  readonly retryPolicy: ApiRetryPolicy;
 
-  constructor(message: string, status: number) {
+  constructor(
+    message: string,
+    status: number,
+    options: { code?: ApiErrorCode | null; refreshRequired?: boolean; retryPolicy?: ApiRetryPolicy } = {},
+  ) {
     super(message);
     this.name = "ApiError";
     this.status = status;
+    this.code = options.code ?? null;
+    this.refreshRequired = options.refreshRequired ?? false;
+    this.retryPolicy = options.retryPolicy ?? "none";
   }
 }
 
@@ -62,9 +101,19 @@ async function request<T>(path: string, init: RequestInit): Promise<T> {
   });
   const payload: unknown = await response.json().catch(() => null);
   if (!response.ok) {
-    throw new ApiError(errorMessage(payload as ApiErrorShape | null), response.status);
+    const shape = payload as ApiErrorShape | null;
+    throw new ApiError(errorMessage(shape), response.status, errorEnvelope(shape));
   }
   return payload as T;
+}
+
+function errorEnvelope(payload: ApiErrorShape | null) {
+  if (!payload || typeof payload !== "object") return {};
+  const code = typeof payload.code === "string" && API_ERROR_CODES.has(payload.code) ? payload.code : null;
+  const retryPolicy = typeof payload.retry_policy === "string" && RETRY_POLICIES.has(payload.retry_policy)
+    ? payload.retry_policy
+    : "none";
+  return { code, refreshRequired: payload.refresh_required === true, retryPolicy };
 }
 
 function errorMessage(payload: ApiErrorShape | null): string {
