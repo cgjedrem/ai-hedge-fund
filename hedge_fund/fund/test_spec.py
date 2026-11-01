@@ -22,7 +22,9 @@ from hedge_fund.fund import (
     StrategySpec,
 )
 from hedge_fund.fund.storage import StorageAdmissionError
+from hedge_fund.runtime.dispatch import make_one_shot_dispatch
 from hedge_fund.runtime.handover import enroll_fresh
+from hedge_fund.runtime.policy import KEN_FRENCH_BREAKPOINTS_TARGET
 from hedge_fund.runtime.root import RootContext
 from hedge_fund.signals import ALPHA_MODEL_REGISTRY, get_investment_approach
 
@@ -85,6 +87,30 @@ def test_defaults_applied():
     assert spec.capital == 100_000.0
     assert spec.rebalance == "weekly"
     assert spec.benchmark == "SPY"
+
+
+def test_model_call_bounds_include_llm_samples_and_local_fallback():
+    from hedge_fund.fund.spec import model_call_bounds
+
+    raw = deepcopy(MINIMAL)
+    raw["strategies"][0]["models"] = [
+        {"name": "buffett", "params": {"samples": 3}},
+        {"name": "pead"},
+    ]
+    spec = FundSpec.model_validate(raw)
+
+    assert model_call_bounds(spec) == (4, 3)
+    assert model_call_bounds(spec, local_llm_fallback=True) == (7, 6)
+
+
+def test_llm_samples_must_be_positive():
+    raw = deepcopy(MINIMAL)
+    raw["strategies"][0]["models"] = [
+        {"name": "buffett", "params": {"samples": 0}},
+    ]
+
+    with pytest.raises(ValidationError):
+        FundSpec.model_validate(raw)
 
 
 def test_rebalance_cadence_validated():
@@ -279,6 +305,61 @@ def test_fund_staffs_each_strategy_once():
     assert len(staff) == 1
     # The same objects persist for the fund's lifetime — caches survive cycles.
     assert fund.strategies[0][1][0] is staff[0]
+
+
+def test_fund_passes_operation_dispatch_to_blind_llm_agents():
+    from datetime import datetime, timedelta, timezone
+    from decimal import Decimal
+
+    now = datetime(2026, 11, 1, 12, 0, tzinfo=timezone.utc)
+    target = KEN_FRENCH_BREAKPOINTS_TARGET
+    dispatch = make_one_shot_dispatch(
+        root_id="fund-test-root",
+        subject_id="fund-test",
+        capture_digest="a" * 64,
+        operation_id="fund-operation",
+        operation_digest="b" * 64,
+        expires_at=now + timedelta(minutes=5),
+        targets=(target,),
+        max_calls=1,
+        max_cost=Decimal("0"),
+        max_resources=1,
+        upper_bound_costs={target.identity: Decimal("0")},
+        clock=lambda: now,
+        resolver=lambda _host, _port: ["8.8.8.8"],
+    )
+    spec = FundSpec(
+        **{
+            **MINIMAL,
+            "strategies": [
+                {
+                    "name": "value",
+                    "models": [{"name": "buffett"}],
+                    "blend": {"mode": "long_only"},
+                }
+            ],
+        }
+    )
+    fake_llm = Mock(model="fixture-model")
+    fund = Fund(
+        spec,
+        blind=True,
+        llm_factory=lambda _model_spec: fake_llm,
+        breakpoints_dispatch=dispatch,
+    )
+
+    assert fund.strategies[0][1][0]._breakpoints_dispatch is dispatch
+
+
+def test_breakpoint_dispatch_is_not_a_mandate_parameter():
+    payload = deepcopy(MINIMAL)
+    payload["strategies"][0]["models"][0] = {
+        "name": "buffett",
+        "params": {"breakpoints_dispatch": "untrusted"},
+    }
+
+    with pytest.raises(ValueError, match="constructor parameters"):
+        FundSpec(**payload)
 
 
 @pytest.mark.parametrize(

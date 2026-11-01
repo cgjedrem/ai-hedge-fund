@@ -9,9 +9,9 @@ fetched again after. `live=True` gives the date-less "latest" answers
 (earnings, company facts) the same ten minutes, for a process that stays
 up all day and would otherwise never see a new filing.
 
-    fd = CachedDataClient(FDClient())
-    prices = fd.get_prices("AAPL", "2024-01-01", "2024-12-31")  # API call
-    prices = fd.get_prices("AAPL", "2024-01-01", "2024-12-31")  # disk, ~0ms
+    fd = CachedDataClient(authorized_client)
+prices = fd.get_prices("AAPL", "2024-01-01", "2024-12-31")
+prices = fd.get_prices("AAPL", "2024-01-01", "2024-12-31")
 
 Failure semantics are inherited: only successful responses are cached, and
 errors from the wrapped client propagate (fail-loud preserved). Pass
@@ -19,6 +19,7 @@ refresh=True to ignore existing entries (they are rewritten on fetch).
 
 Cache keys are namespaced by the wrapped client's class, so switching
 HEDGE_FUND_DATA_PROVIDER never serves one provider's answers as another's.
+Cache wrapper adds no authority. Production client owns transport guard.
 """
 
 from __future__ import annotations

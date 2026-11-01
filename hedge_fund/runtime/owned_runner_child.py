@@ -9,7 +9,6 @@ import os
 import threading
 import time
 from datetime import datetime, timezone
-from decimal import Decimal
 from typing import Callable
 
 from hedge_fund.data import CachedDataClient, make_data_client
@@ -27,6 +26,7 @@ from hedge_fund.runtime.admission import (
 )
 from hedge_fund.runtime.capture import FrozenCapture
 from hedge_fund.runtime.configuration import ConfigurationError
+from hedge_fund.runtime.dispatch import ProviderDispatch
 from hedge_fund.runtime.handover import (
     HandoverError,
     record_ledger_head,
@@ -46,17 +46,15 @@ from hedge_fund.runtime.owned_runner import (
 from hedge_fund.runtime.ownership import current_process_identity
 from hedge_fund.runtime.policy import (
     AuthorizationDenied,
-    authorize_dispatch,
     authorize_session,
     classify_provider,
+    KEN_FRENCH_BREAKPOINTS_TARGET,
     OperationScope,
     ProviderClass,
     ProviderTarget,
     RunnerAuthorization,
 )
 from hedge_fund.runtime.root import RootContext, RootPathError
-
-_MAX_RUNNER_CALLS_PER_SESSION = 1000
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -82,6 +80,7 @@ def run_owned_runner(
     build_fund: Callable[[FundSpec, FrozenCapture, RootContext], Fund] | None = None,
     now: Callable[[], datetime] | None = None,
     sleep: Callable[[float], None] | None = None,
+    resolver=None,
 ) -> None:
     if not isinstance(root, RootContext):
         raise TypeError("an explicit root context is required")
@@ -175,6 +174,7 @@ def run_owned_runner(
                     build_fund=build_fund,
                     now=now or (lambda: datetime.now(timezone.utc)),
                     sleep=sleep or time.sleep,
+                    resolver=resolver,
                 )
         except Exception as exc:
             try:
@@ -235,6 +235,7 @@ def _runner_loop(
     build_fund,
     now: Callable[[], datetime],
     sleep: Callable[[float], None],
+    resolver=None,
 ) -> None:
     stop_event = threading.Event()
     watcher_done = threading.Event()
@@ -257,6 +258,58 @@ def _runner_loop(
 
     watcher = threading.Thread(target=watch_control, daemon=True)
     watcher.start()
+    targets = (
+        ProviderTarget(kind="data", provider=capture.data_provider),
+        ProviderTarget(
+            kind="llm",
+            provider=capture.llm_provider,
+            model=capture.model,
+            endpoint=capture.endpoint,
+        ),
+        KEN_FRENCH_BREAKPOINTS_TARGET,
+    )
+
+    def dispatch_fence() -> None:
+        moment = _validated_now(now())
+        if moment >= expires_at:
+            raise AuthorizationDenied("runner deadline expired")
+        if stop_event.is_set() and authorization.sessions_started == 0:
+            raise AuthorizationDenied("runner stop was requested")
+        root.revalidate()
+        require_enrollment(root)
+        verify_ledger_head(root, fund)
+        control = read_runner_record(root, fund, "control")
+        if not validate_runner_control(root, fund, nonce_hash, control):
+            raise AuthorizationDenied("runner control state is unavailable")
+        if control["stop_requested"]:
+            stop_event.set()
+            if authorization.sessions_started == 0:
+                raise AuthorizationDenied("runner stop was requested")
+        current_deployed = load_deployed(root.path / "paper" / fund)
+        if current_deployed.broker != "paper" or mandate_hash(current_deployed.spec) != capture.mandate_digest or tuple(current_deployed.universe) != capture.universe:
+            raise AuthorizationDenied("runner deployment changed")
+        current = Ledger(root.path / "paper" / fund).replay(
+            spec.capital,
+            full=True,
+        )
+        if current.halted is not None:
+            raise AuthorizationDenied("runner fund is halted")
+
+    dispatch = ProviderDispatch(
+        scope=OperationScope.SCHEDULED,
+        root_id=capture.root_id,
+        subject_id=fund,
+        capture_digest=capture.digest,
+        operation_id=authorization.operation_id,
+        operation_digest=authorization.operation_digest,
+        targets=targets,
+        network_authorized=True,
+        runner=authorization,
+        approved_local_models={capture.model},
+        clock=lambda: _validated_now(now()),
+        boundary_check=dispatch_fence,
+        resolver=resolver,
+    )
     last_session = None
     sessions_completed = 0
     try:
@@ -289,7 +342,12 @@ def _runner_loop(
                     if stop_event.wait(0.25):
                         break
                     continue
-                with _client_context(root, capture, data_client_factory) as client:
+                with _client_context(
+                    root,
+                    capture,
+                    data_client_factory,
+                    dispatch,
+                ) as client:
                     _execute_session(
                         root,
                         fund,
@@ -305,18 +363,16 @@ def _runner_loop(
                         status,
                         data_client_factory,
                         build_fund,
+                        dispatch,
                         moment,
                     )
             else:
-                _authorize_dispatch(
-                    authorization,
+                with _client_context(
+                    root,
                     capture,
-                    fund,
-                    now=moment,
-                    data=True,
-                    resource_units=max(1, len(capture.universe)),
-                )
-                with _client_context(root, capture, data_client_factory) as client:
+                    data_client_factory,
+                    dispatch,
+                ) as client:
                     due = next_session(
                         client,
                         spec,
@@ -342,6 +398,7 @@ def _runner_loop(
                         status,
                         data_client_factory,
                         build_fund,
+                        dispatch,
                         moment,
                     )
             latest = Ledger(root.path / "paper" / fund).latest()
@@ -354,6 +411,16 @@ def _runner_loop(
             _write_status(root, fund, nonce_hash, status)
             if stop_event.is_set():
                 break
+    except AuthorizationDenied as exc:
+        if stop_event.is_set():
+            status["status"] = "stopped"
+            status["reason"] = "stop-requested"
+        elif _validated_now(now()) >= expires_at:
+            status["status"] = "completed"
+            status["reason"] = "expiry-reached"
+        else:
+            status["status"] = "failed"
+            status["reason"] = f"runner-{type(exc).__name__}"
     except Exception as exc:
         status["status"] = "failed"
         status["reason"] = f"runner-{type(exc).__name__}"
@@ -387,6 +454,7 @@ def _execute_session(
     status: dict,
     data_client_factory,
     build_fund,
+    dispatch: ProviderDispatch,
     now: datetime,
 ) -> None:
     due_set = (due,)
@@ -395,25 +463,10 @@ def _execute_session(
         root_id=capture.root_id,
         deployment_id=fund,
         capture_digest=capture.digest,
+        operation_id=authorization.operation_id,
+        operation_digest=authorization.operation_digest,
         due_set=due_set,
         now=now,
-    )
-    _authorize_dispatch(
-        authorization,
-        capture,
-        fund,
-        now=now,
-        data=True,
-        resource_units=max(1, len(capture.universe) * 2),
-    )
-    model_calls = _estimated_model_calls(spec, len(capture.universe))
-    _authorize_dispatch(
-        authorization,
-        capture,
-        fund,
-        now=now,
-        data=False,
-        resource_units=model_calls,
     )
     with admission.execution_lease(fund, timeout=0):
         require_enrollment(root)
@@ -426,7 +479,7 @@ def _execute_session(
             root.path / "paper" / fund,
             data_client,
             session=due,
-            build_fund=((lambda selected: build_fund(selected, capture, root)) if build_fund is not None else (lambda selected: _build_fund(selected, capture, root))),
+            build_fund=((lambda selected: build_fund(selected, capture, root, dispatch)) if build_fund is not None else (lambda selected: _build_fund(selected, capture, root, dispatch))),
             now=lambda: now.astimezone(NEW_YORK),
         )
     record_ledger_head(root, fund, admission=admission)
@@ -435,9 +488,9 @@ def _execute_session(
     _write_status(root, fund, nonce_hash, status)
 
 
-def _client_context(root, capture, factory):
+def _client_context(root, capture, factory, dispatch):
     if factory is not None:
-        value = factory(capture, root)
+        value = factory(capture, root, dispatch)
         if not hasattr(value, "__enter__") or not hasattr(value, "__exit__"):
             raise OwnedRunnerError("runner data client is invalid")
         return value
@@ -445,7 +498,10 @@ def _client_context(root, capture, factory):
     class _ClientContext:
         def __enter__(self):
             root.mkdir("cache", parents=True, mode=0o700)
-            self._raw_client = make_data_client(provider=capture.data_provider)
+            self._raw_client = make_data_client(
+                provider=capture.data_provider,
+                dispatch=dispatch,
+            )
             self._client = self._raw_client.__enter__()
             return CachedDataClient(
                 self._client,
@@ -458,7 +514,12 @@ def _client_context(root, capture, factory):
     return _ClientContext()
 
 
-def _build_fund(spec: FundSpec, capture: FrozenCapture, root: RootContext) -> Fund:
+def _build_fund(
+    spec: FundSpec,
+    capture: FrozenCapture,
+    root: RootContext,
+    dispatch: ProviderDispatch,
+) -> Fund:
     cache_id = runner_key(spec.name)
     cache_relative = f"cache/llm/{cache_id}"
     root.mkdir(cache_relative, parents=True, mode=0o700)
@@ -475,9 +536,16 @@ def _build_fund(spec: FundSpec, capture: FrozenCapture, root: RootContext) -> Fu
             api_key=None,
             endpoint=capture.endpoint,
             use_environment=False,
+            dispatch=dispatch,
         )
 
-    return Fund(spec, blind=True, cache=cache, llm_factory=llm_factory)
+    return Fund(
+        spec,
+        blind=True,
+        cache=cache,
+        llm_factory=llm_factory,
+        breakpoints_dispatch=dispatch,
+    )
 
 
 def _require_local_capture(capture: FrozenCapture) -> None:
@@ -493,6 +561,8 @@ def _require_local_capture(capture: FrozenCapture) -> None:
         raise OwnedRunnerError("runner data provider is not free")
     if classify_provider(llm_target, approved_local_models=approved_models) is not ProviderClass.LOCAL:
         raise OwnedRunnerError("runner requires an approved local model endpoint")
+    if classify_provider(KEN_FRENCH_BREAKPOINTS_TARGET) is not ProviderClass.FREE_DATA:
+        raise OwnedRunnerError("runner breakpoint provider is not free")
     if capture.credential_versions or capture.credential_handles:
         raise OwnedRunnerError("runner cannot use credential handles")
 
@@ -506,6 +576,8 @@ def _runner_authorization(raw, capture) -> RunnerAuthorization:
         "max_sessions",
         "max_calls",
         "max_resources",
+        "operation_id",
+        "operation_digest",
     }
     if set(raw) != expected:
         raise OwnedRunnerError("runner authorization fields are invalid")
@@ -516,56 +588,24 @@ def _runner_authorization(raw, capture) -> RunnerAuthorization:
         model=capture.model,
         endpoint=capture.endpoint,
     )
+    breakpoints_target = KEN_FRENCH_BREAKPOINTS_TARGET
     return RunnerAuthorization(
         root_id=capture.root_id,
         deployment_id=capture.subject_id,
         capture_digest=capture.digest,
-        provider_ids=(data_target.identity, llm_target.identity),
+        operation_id=raw["operation_id"],
+        operation_digest=raw["operation_digest"],
+        provider_ids=(
+            data_target.identity,
+            llm_target.identity,
+            breakpoints_target.identity,
+        ),
         expires_at=_parse_datetime(raw["expires_at"]),
         max_sessions=raw["max_sessions"],
         max_calls=raw["max_calls"],
         max_resources=raw["max_resources"],
         initial_due_set=tuple(raw["initial_due_set"]),
     )
-
-
-def _authorize_dispatch(
-    authorization: RunnerAuthorization,
-    capture: FrozenCapture,
-    fund: str,
-    *,
-    now: datetime,
-    data: bool,
-    resource_units: int,
-) -> None:
-    if data:
-        target = ProviderTarget(kind="data", provider=capture.data_provider)
-    else:
-        target = ProviderTarget(
-            kind="llm",
-            provider=capture.llm_provider,
-            model=capture.model,
-            endpoint=capture.endpoint,
-        )
-    authorize_dispatch(
-        target,
-        scope=OperationScope.SCHEDULED,
-        root_id=capture.root_id,
-        subject_id=fund,
-        capture_digest=capture.digest,
-        now=now,
-        runner=authorization,
-        upper_bound_cost=Decimal("0"),
-        resource_units=resource_units,
-        approved_local_models={capture.model},
-    )
-
-
-def _estimated_model_calls(spec: FundSpec, universe_size: int) -> int:
-    calls = universe_size * sum(len(strategy.models) for strategy in spec.strategies) * 2
-    if type(calls) is not int or calls <= 0 or calls > _MAX_RUNNER_CALLS_PER_SESSION:
-        raise AuthorizationDenied("runner model-call bound is invalid")
-    return calls
 
 
 def _write_status(root, fund, nonce_hash, status) -> None:

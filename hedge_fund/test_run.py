@@ -27,9 +27,8 @@ def offline(tmp_path, monkeypatch):
     tick_module = importlib.import_module("hedge_fund.paper.tick")
 
     class OfflineClient(FakeDataClient):
-        def __init__(self):
-            super().__init__({ticker: {"2025-01-06": 100, "2025-01-07": 100, "2025-01-08": 110, "2025-01-13": 110}
-                              for ticker in ("AAPL", "MSFT", "SPY")})
+        def __init__(self, *_args, **_kwargs):
+            super().__init__({ticker: {"2025-01-06": 100, "2025-01-07": 100, "2025-01-08": 110, "2025-01-13": 110} for ticker in ("AAPL", "MSFT", "SPY")})
 
         def __enter__(self):
             return self
@@ -37,9 +36,13 @@ def offline(tmp_path, monkeypatch):
         def __exit__(self, *args):
             return False
 
-    def build_fund(spec, blind=False):
-        return Fund(spec, models={s.name: [FakeAnalyst(m.name, {"AAPL": .8, "MSFT": -.6}) for m in s.models]
-                                  for s in spec.strategies})
+    def build_fund(
+        spec,
+        blind=False,
+        llm_factory=None,
+        breakpoints_dispatch=None,
+    ):
+        return Fund(spec, models={s.name: [FakeAnalyst(m.name, {"AAPL": 0.8, "MSFT": -0.6}) for m in s.models] for s in spec.strategies})
 
     monkeypatch.setattr(run, "ensure_mandates_dir", lambda: tmp_path)
     monkeypatch.setattr(run, "Fund", build_fund)
@@ -49,6 +52,14 @@ def offline(tmp_path, monkeypatch):
     monkeypatch.setattr(run, "PAPER_DIR", tmp_path / "paper")
     monkeypatch.setattr(paths, "RESEARCH_DIR", tmp_path / "research")
 
+    def save_fake_result(result):
+        destination = paths.RESEARCH_DIR / f"{result.fund}-{result.start}-{result.end}-fixture.json"
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(result.model_dump_json(indent=2), encoding="utf-8")
+        return destination
+
+    monkeypatch.setattr(run, "save_result", save_fake_result)
+
     def set_today(day):
         y, m, d = map(int, day.split("-"))
 
@@ -57,6 +68,7 @@ def offline(tmp_path, monkeypatch):
             def now(tz):
                 return datetime(y, m, d, 12, tzinfo=tz)
         monkeypatch.setattr(sessions, "datetime", Clock)
+
     set_today("2025-01-14")
     return set_today
 
@@ -72,6 +84,14 @@ def _mandate(tmp_path, mode="long_short", name="mixed"):
 
 def _main(monkeypatch, *argv):
     root = Path(run.PAPER_DIR).parent if run.PAPER_DIR is not None else Path(os.environ["HEDGE_FUND_TEST_ROOT"])
+    if argv and argv[0] == "backtest" and "--enable-network" not in argv:
+        argv = ("--enable-network", *argv)
+    if argv and argv[0] == "paper":
+        action = argv[1] if len(argv) > 1 else None
+        if action == "tick" and "--enable-network" not in argv:
+            argv = ("--enable-network", *argv)
+        if action == "approve" and "--now" in argv and "--enable-network" not in argv:
+            argv = ("--enable-network", *argv)
     monkeypatch.setattr(sys, "argv", ["aihf", "--root", str(root), *argv])
     run.main()
 
@@ -312,6 +332,270 @@ def test_cli_rejects_invalid_configuration_before_clients(tmp_path, monkeypatch,
     assert not (tmp_path / "paper").exists()
 
 
+def test_backtest_without_network_consent_denies_before_provider_or_result_effects(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    path = _mandate(tmp_path)
+    monkeypatch.setenv("HEDGE_FUND_LLM_MODEL", "gpt-6-sol")
+    monkeypatch.setenv("OPENAI_API_KEY", "fixture-provider-secret")
+    forbidden = Mock(side_effect=AssertionError("provider/result effect before consent"))
+    monkeypatch.setattr(run, "PAPER_DIR", tmp_path / "paper")
+    monkeypatch.setattr(run, "ensure_mandates_dir", lambda: tmp_path / "mandates")
+    monkeypatch.setattr(run, "make_data_client", forbidden)
+    monkeypatch.setattr(run, "_cli_fund", forbidden)
+    monkeypatch.setattr(run, "backtest_fund", forbidden)
+    monkeypatch.setattr(run, "save_result", forbidden)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "aihf",
+            "--root",
+            str(tmp_path),
+            "backtest",
+            str(path),
+            "--universe",
+            "AAPL",
+            "--start",
+            "2025-01-06",
+            "--end",
+            "2025-01-07",
+        ],
+    )
+
+    with pytest.raises(SystemExit) as denied:
+        run.main()
+
+    output = capsys.readouterr()
+    assert denied.value.code == 2
+    assert "explicit --enable-network" in output.err
+    assert "fixture-provider-secret" not in output.out + output.err
+    assert forbidden.call_count == 0
+    assert not (tmp_path / "research").exists()
+    assert not (tmp_path / "paper").exists()
+
+
+def test_paid_provider_requires_explicit_consent_even_with_network_and_env_key(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    from hedge_fund.runtime.handover import enroll_fresh
+    from hedge_fund.runtime.root import RootContext
+
+    root = tmp_path / "paid-consent-root"
+    root.mkdir()
+    with RootContext.open(root) as context:
+        enroll_fresh(context)
+    path = _mandate(root, name="paid-consent")
+    monkeypatch.setattr(run, "PAPER_DIR", root / "paper")
+    monkeypatch.setattr(run, "ensure_mandates_dir", lambda: root / "mandates")
+    monkeypatch.setattr(paths, "RESEARCH_DIR", root / "research")
+    monkeypatch.setenv("HEDGE_FUND_DATA_PROVIDER", "fd")
+    monkeypatch.setenv("FINANCIAL_DATASETS_API_KEY", "ambient-fixture-secret")
+    forbidden = Mock(side_effect=AssertionError("paid provider/result effect before consent"))
+    monkeypatch.setattr(run, "make_data_client", forbidden)
+    monkeypatch.setattr(run, "_cli_fund", forbidden)
+    monkeypatch.setattr(run, "backtest_fund", forbidden)
+    monkeypatch.setattr(run, "save_result", forbidden)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "aihf",
+            "--root",
+            str(root),
+            "--enable-network",
+            "--model",
+            "gemma3:4b",
+            "backtest",
+            str(path),
+            "--universe",
+            "AAPL",
+            "--start",
+            "2025-01-06",
+            "--end",
+            "2025-01-07",
+        ],
+    )
+
+    with pytest.raises(SystemExit) as denied:
+        run.main()
+
+    output = capsys.readouterr()
+    assert denied.value.code == 2
+    assert "paid dispatch requires --authorize-paid-provider fd" in output.err
+    assert "ambient-fixture-secret" not in output.out + output.err
+    assert forbidden.call_count == 0
+    assert not (root / "research").exists()
+    assert not (root / "paper").exists()
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "aihf",
+            "--root",
+            str(root),
+            "--enable-network",
+            "--model",
+            "gemma3:4b",
+            "backtest",
+            str(path),
+            "--universe",
+            "AAPL",
+            "--start",
+            "2025-01-06",
+            "--end",
+            "2025-01-07",
+            "--authorize-paid-provider",
+            "fd",
+            "--paid-max-calls",
+            "1",
+            "--paid-max-cost-usd",
+            "1",
+            "--paid-max-attempt-cost-usd",
+            "0.16",
+        ],
+    )
+    with pytest.raises(SystemExit) as tier_denied:
+        run.main()
+
+    tier_output = capsys.readouterr()
+    assert tier_denied.value.code == 2
+    assert "requires --confirm-fd-self-service-pricing" in tier_output.err
+    assert forbidden.call_count == 0
+    assert not (root / "research").exists()
+    assert not (root / "paper").exists()
+
+
+def test_paid_fd_cli_backtest_uses_guarded_client_and_fake_transport(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    offline,
+):
+    from decimal import Decimal
+
+    import httpx
+
+    from hedge_fund.backtesting.test_fund import FakeAnalyst
+    from hedge_fund.data import make_data_client as production_factory
+    from hedge_fund.fund import Fund
+    from hedge_fund.runtime.admission import AdmissionCoordinator, RootOwnerLease
+    from hedge_fund.runtime.credentials import CredentialStore
+    from hedge_fund.runtime.handover import enroll_fresh
+    from hedge_fund.runtime.policy import ProviderTarget
+    from hedge_fund.runtime.root import RootContext
+
+    root = tmp_path / "paid-cli-root"
+    root.mkdir()
+    secret = "synthetic-fd-cli-key"
+    with RootContext.open(root) as context:
+        enroll_fresh(context)
+        with RootOwnerLease.acquire(context) as owner:
+            CredentialStore(
+                context,
+                AdmissionCoordinator(context, owner_lease=owner),
+            ).save("fd", secret, expected_version=0)
+    path = _mandate(root, name="paid-cli")
+    monkeypatch.setattr(run, "PAPER_DIR", root / "paper")
+    monkeypatch.setenv("HEDGE_FUND_DATA_PROVIDER", "fd")
+    monkeypatch.setenv("HEDGE_FUND_LLM_MODEL", "gemma3:4b")
+    monkeypatch.setattr(
+        "hedge_fund.runtime.endpoints._resolve_system",
+        lambda _host, _port: ["8.8.8.8"],
+    )
+    requests = []
+    dispatches = []
+    price_rows = [
+        {
+            "open": 100.0,
+            "high": 100.0,
+            "low": 100.0,
+            "close": 100.0,
+            "volume": 1000,
+            "time": f"2025-01-{day:02d}T00:00:00Z",
+        }
+        for day in (6, 7, 8)
+    ]
+
+    def handle(request):
+        requests.append(request)
+        assert request.url.host == "api.financialdatasets.ai"
+        assert request.headers.get("x-api-key") == secret
+        return httpx.Response(
+            200,
+            json={"prices": price_rows, "next_page_url": None},
+            request=request,
+        )
+
+    def guarded_factory(*, provider, dispatch, api_key):
+        dispatches.append(dispatch)
+        return production_factory(
+            provider=provider,
+            dispatch=dispatch,
+            api_key=api_key,
+            inner_transport=httpx.MockTransport(handle),
+        )
+
+    def build_fund(spec, blind=False, llm_factory=None, breakpoints_dispatch=None):
+        del blind, llm_factory, breakpoints_dispatch
+        return Fund(
+            spec,
+            models={strategy.name: [FakeAnalyst(model.name, {"AAPL": 0.6}) for model in strategy.models] for strategy in spec.strategies},
+        )
+
+    monkeypatch.setattr(run, "make_data_client", guarded_factory)
+    monkeypatch.setattr(run, "Fund", build_fund)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "aihf",
+            "--root",
+            str(root),
+            "--enable-network",
+            "backtest",
+            str(path),
+            "--universe",
+            "AAPL",
+            "--start",
+            "2025-01-06",
+            "--end",
+            "2025-01-08",
+            "--rebalance",
+            "monthly",
+            "--authorize-paid-provider",
+            "fd",
+            "--confirm-fd-self-service-pricing",
+            "--paid-max-calls",
+            "100",
+            "--paid-max-cost-usd",
+            "16",
+            "--paid-max-attempt-cost-usd",
+            "0.16",
+        ],
+    )
+
+    run.main()
+
+    output = capsys.readouterr()
+    assert "Paid dispatch authorized: fd" in output.err
+    assert secret not in output.out + output.err
+    assert len(requests) > 0
+    assert len(dispatches) == 1
+    target = ProviderTarget(kind="data", provider="fd")
+    authorization = dispatches[0]._one_shot[target.identity]
+    assert authorization.calls_reserved == len(requests)
+    assert authorization.cost_reserved == Decimal("0.16") * len(requests)
+    assert authorization.calls_reserved <= authorization.max_calls
+    assert (root / "research").exists()
+    assert not (root / "paper").exists()
+
+
 def test_no_arguments_launches_the_app(monkeypatch):
     launched = Mock()
     monkeypatch.setattr(run, "ensure_mandates_dir", lambda: None)
@@ -374,7 +658,7 @@ def test_backtest_rebalance_override_changes_monthly_cycle_count(tmp_path, monke
     series = {ticker: {day: 100.0 + index for index, day in enumerate(dates)} for ticker in ("AAPL", "MSFT", "SPY")}
 
     class MultiMonthClient(FakeDataClient):
-        def __init__(self):
+        def __init__(self, *_args, **_kwargs):
             super().__init__(series)
 
         def __enter__(self):
@@ -603,7 +887,7 @@ def test_enrolled_cli_tick_lane_conflict_leaves_ledger_unchanged(
                     "import sys",
                     "from pathlib import Path",
                     "from hedge_fund import run",
-                    f"sys.argv = ['aihf', '--root', {str(root)!r}, 'paper', 'tick', 'alpha']",
+                    f"sys.argv = ['aihf', '--root', {str(root)!r}, '--enable-network', 'paper', 'tick', 'alpha']",
                     "try:",
                     "    run.main()",
                     "except SystemExit as exc:",
@@ -657,12 +941,9 @@ def test_cli_resolves_relative_mandate_under_root(tmp_path, monkeypatch, capsys,
     assert json.loads(output.out)["fund"] == "root-mandate"
 
 
-def test_paper_minute_fund_ticks_and_runs_like_a_daily_one(tmp_path, monkeypatch, capsys, offline):
-    """The CLI verbs are the same at every cadence: `tick` runs the session
-    that is due (for a minute fund, the current bar at the print taken now)
-    and `run` leaves a runner on the fund."""
+def test_paper_minute_fund_ticks_and_denies_legacy_runner(tmp_path, monkeypatch, capsys, offline):
+    """Manual ticks use captured authority; legacy headless loops fail closed."""
     from hedge_fund.data.sessions import NEW_YORK
-    from hedge_fund.paper import PID_FILE
     from hedge_fund.pipeline.test_clock import Tape
     spec = FundSpec(schema_version=2, name="bars", strategies=[custom_strategy(["buffett"])],
                     risk={"max_position_pct": .25, "max_gross_exposure": 1},
@@ -674,8 +955,8 @@ def test_paper_minute_fund_ticks_and_runs_like_a_daily_one(tmp_path, monkeypatch
     err = " ".join(capsys.readouterr().err.split())  # the console wraps; read it as one line
     assert "every 30s" in err and "09:30–12:00 ET" in err
     root_argument = "--root <selected-root>"
-    assert f"aihf {root_argument} paper tick fast` to run one session" in err
-    assert f"aihf {root_argument} paper run fast` to leave it running" in err
+    assert f"aihf {root_argument} --enable-network paper tick fast` to authorize one bounded session" in err
+    assert "Headless scheduled runners are disabled" in err
 
     class CliTape(Tape):
         def __enter__(self):
@@ -684,10 +965,8 @@ def test_paper_minute_fund_ticks_and_runs_like_a_daily_one(tmp_path, monkeypatch
         def __exit__(self, *args):
             return False
 
-    tape = CliTape({"AAPL": {"2025-01-07T09:30:00": 100.0, "2025-01-07T09:30:30": 101.0},
-                    "SPY": {"2025-01-07T09:30:00": 500.0}},
-                   now=datetime(2025, 1, 7, 9, 30, 40, tzinfo=NEW_YORK))  # 10s into the 09:30:30 bar
-    monkeypatch.setattr(run, "make_data_client", lambda: tape)
+    tape = CliTape({"AAPL": {"2025-01-07T09:30:00": 100.0, "2025-01-07T09:30:30": 101.0}, "SPY": {"2025-01-07T09:30:00": 500.0}}, now=datetime(2025, 1, 7, 9, 30, 40, tzinfo=NEW_YORK))  # 10s into the 09:30:30 bar
+    monkeypatch.setattr(run, "make_data_client", lambda *_args, **_kwargs: tape)
     tick_module = importlib.import_module("hedge_fund.paper.tick")
 
     class Clock(datetime):  # the tick's wall clock is the tape's; everything else is datetime's
@@ -708,31 +987,25 @@ def test_paper_minute_fund_ticks_and_runs_like_a_daily_one(tmp_path, monkeypatch
     assert exc.value.code == 1
     assert "no bar after 2025-01-07T09:30:30; next 09:31:00 ET" in capsys.readouterr().err
 
-    _main(monkeypatch, "paper", "stop", "fast")
-    assert "not running" in capsys.readouterr().err
+    with pytest.raises(SystemExit) as denied_stop:
+        _main(monkeypatch, "paper", "stop", "fast")
+    assert denied_stop.value.code == 2
+    assert "Legacy unattended paper runner controls are disabled" in capsys.readouterr().err
     _main(monkeypatch, "paper", "list")
     listed = capsys.readouterr().out
     assert "every 30s" in listed and "running" not in listed
 
-    # `run` is the serve loop; stand in for it and check the wiring around it.
-    seen = {}
-
-    def fake_serve(directory, data, *, on_record, on_event):
-        seen["pid"] = directory / PID_FILE
-        on_event("gap", {"from": None, "to": "2025-01-07T09:30:00", "bars_skipped": 3})
-    monkeypatch.setattr(run, "serve", fake_serve)
-    _main(monkeypatch, "paper", "run", "fast")
-    err = capsys.readouterr().err
-    assert "fast" in err and "every 30s" in err and "gap start → 2025-01-07T09:30:00  3 bars skipped" in err
-    assert "stopped" in err
-
-    (seen["pid"]).write_text("test-owned")
-    monkeypatch.setattr(run, "is_running", lambda _directory: True)
-    _main(monkeypatch, "paper", "list")
-    assert "running" in capsys.readouterr().out
-    monkeypatch.setattr(run, "stop_runner", lambda directory: True)
-    _main(monkeypatch, "paper", "stop", "fast")
-    assert "asked to stop" in capsys.readouterr().err
+    with pytest.raises(SystemExit) as denied:
+        _main(monkeypatch, "paper", "run", "fast")
+    assert denied.value.code == 2
+    assert "Legacy unattended paper runner controls are disabled" in capsys.readouterr().err
+    stop_runner = Mock(return_value=True)
+    monkeypatch.setattr(run, "stop_runner", stop_runner, raising=False)
+    with pytest.raises(SystemExit) as second_denial:
+        _main(monkeypatch, "paper", "stop", "fast")
+    assert second_denial.value.code == 2
+    assert "Legacy unattended paper runner controls are disabled" in capsys.readouterr().err
+    stop_runner.assert_not_called()
 
 
 def _offline_tick(directory):

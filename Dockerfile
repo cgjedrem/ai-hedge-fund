@@ -1,11 +1,10 @@
-# The AI hedge fund in a container: the same app, two ways to run it.
+# The AI hedge fund in a container.
 #
 #   mkdir -p "$PWD/.aihf-demo-data"
 #   Interactive TUI: docker run -it --rm -v "$PWD/.aihf-demo-data:/data" aihf
-#   One local paper tick: docker run --rm -v "$PWD/.aihf-demo-data:/data" aihf --model gemma3:4b paper tick demo-alpha
 #
 # Data lives under the explicitly mounted root. Runner example uses local
-# Ollama and free Yahoo data.
+# Ollama and free Yahoo data only through the Linux Compose override.
 
 FROM python:3.11-slim
 

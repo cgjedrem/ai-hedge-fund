@@ -1,5 +1,7 @@
 """Offline-only fixtures for web adapter tests."""
 
+import socket
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -16,6 +18,31 @@ def deny_network_and_clear_provider_credentials(monkeypatch):
         "HEDGE_FUND_LLM_MODEL",
     ):
         monkeypatch.delenv(env_var, raising=False)
+
+    provider_hosts = {
+        "api.financialdatasets.ai",
+        "consent.yahoo.com",
+        "fc.yahoo.com",
+        "finance.yahoo.com",
+        "guce.yahoo.com",
+        "query1.finance.yahoo.com",
+        "query2.finance.yahoo.com",
+    }
+
+    def resolve_provider(host, port, *_args, **_kwargs):
+        if not isinstance(host, str) or host.casefold() not in provider_hosts:
+            raise socket.gaierror("synthetic resolver denied unknown host")
+        return [
+            (
+                socket.AF_INET,
+                socket.SOCK_STREAM,
+                socket.IPPROTO_TCP,
+                "",
+                ("8.8.8.8", port),
+            )
+        ]
+
+    monkeypatch.setattr(socket, "getaddrinfo", resolve_provider)
 
 
 @pytest.fixture

@@ -21,6 +21,7 @@ from hedge_fund.runtime.owned_runner import (
 )
 from hedge_fund.runtime.owned_runner_child import run_owned_runner
 from hedge_fund.runtime.ownership import current_process_identity
+from hedge_fund.runtime.policy import ProviderTarget
 from hedge_fund.runtime.root import RootContext
 
 _INITIAL_SESSION = "2024-06-07"
@@ -75,9 +76,37 @@ class _OfflineAnalyst:
 
 
 class _OfflineFund:
-    def __init__(self, spec, _capture, _root):
+    def __init__(self, spec, _capture, _root, _dispatch):
         self.spec = spec
         self.strategies = [(spec.strategies[0], [_OfflineAnalyst()])]
+
+
+class _GuardedOfflineDataClient:
+    def __init__(self, client, dispatch):
+        self._client = client
+        self._dispatch = dispatch
+        self._target = ProviderTarget(kind="data", provider="yfinance")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc_info):
+        return None
+
+    def __getattr__(self, name):
+        value = getattr(self._client, name)
+        if not callable(value):
+            return value
+
+        def guarded(*args, **kwargs):
+            self._dispatch.authorize_transport(
+                self._target,
+                url="https://query1.finance.yahoo.com/mock",
+                method="GET",
+            )
+            return value(*args, **kwargs)
+
+        return guarded
 
 
 def _fund_spec() -> FundSpec:
@@ -112,6 +141,8 @@ def _install_runner_records(root, fund, capture, last_session):
         "max_sessions": 2,
         "max_calls": 100,
         "max_resources": 1000,
+        "operation_id": "c" * 32,
+        "operation_digest": "d" * 64,
     }
     write_runner_record(
         root,
@@ -237,9 +268,13 @@ def test_stop_during_inflight_session_finishes_once_then_stops(tmp_path):
                     run_owned_runner(
                         root,
                         "alpha",
-                        data_client_factory=lambda _capture, _root: data_client,
+                        data_client_factory=lambda _capture, _root, dispatch: _GuardedOfflineDataClient(
+                            data_client,
+                            dispatch,
+                        ),
                         build_fund=_OfflineFund,
                         now=lambda: _RUNNER_NOW,
+                        resolver=lambda _host, _port: ["93.184.216.34"],
                     )
                 except Exception as exc:
                     errors.append(exc)

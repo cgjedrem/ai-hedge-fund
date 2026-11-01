@@ -226,7 +226,7 @@ class BuilderScreen(Screen):
                     yield Static("", id="done-summary")
                     if self.mode == "paper":
                         yield OptionList(
-                            Option("▶  Run its first session", id="go-run"),
+                            Option("First session via explicit-root CLI or web desk", id="go-run", disabled=True),
                             None,
                             Option("Back", id="go-back"),
                             id="done-menu",
@@ -546,21 +546,21 @@ class BuilderScreen(Screen):
             self.notify(f"Replaced the previous {spec.name}.", severity="warning")
         if self.mode == "paper":
             universe = self._state["universe"]
-            directory = deploy(spec.name, spec, universe, root=paths.PAPER_DIR)
+            deploy(spec.name, spec, universe, root=paths.PAPER_DIR)
             menu = self.query_one("#done-menu", OptionList)
             menu.clear_options()
             menu.add_options(
                 [
-                    Option("▶  Run its first session", id="go-run"),
+                    Option("First session via explicit-root CLI or web desk", id="go-run", disabled=True),
                     None,
                     Option("Back", id="go-back"),
                 ]
             )
             menu.highlighted = 0
             if spec.approval_required:
-                first = f"Its first session marks the book at the {'current bar' if intraday else 'latest completed close'} and " f"makes the first decision; the {'next bar' if intraday else 'next session'} waits for approval. " "Without a verdict, that decision lapses and the fund keeps running. " "Run one session at a time, or leave a runner on it from the paper screen (space)."
+                first = f"Its first session marks the book at the {'current bar' if intraday else 'latest completed close'} and " f"makes the first decision; the {'next bar' if intraday else 'next session'} waits for approval. " "Without a verdict, that decision lapses. " "Unattended runners are disabled. Use the explicit-root CLI or web desk for authorized one-shot sessions."
             else:
-                first = f"Its first session marks the book at the {'current bar' if intraday else 'latest completed close'} and " f"makes the first decision; the {'next bar' if intraday else 'session after'} executes it. " "Run it a session at a time, or leave a runner on it from the paper screen (space)."
+                first = f"Its first session marks the book at the {'current bar' if intraday else 'latest completed close'} and " f"makes the first decision; the {'next bar' if intraday else 'session after'} executes it. " "Unattended runners are disabled. Use the explicit-root CLI or web desk for authorized one-shot sessions."
             self.query_one("#done-summary", Static).update(
                 Group(
                     Text.assemble((spec.name, f"bold {GREEN}"), (" is live.", f"bold {BRIGHT}")),
@@ -595,14 +595,10 @@ class BuilderScreen(Screen):
     @on(OptionList.OptionSelected, "#done-menu")
     def _after_build(self, event: OptionList.OptionSelected) -> None:
         # Imported here, not at the top: the paper screen opens this builder.
-        from hedge_fund.tui.paper import PaperScreen
-
         assert self._built is not None
         spec = self._built[0]
         if event.option.id == "go-backtest":
             self.app.switch_screen(BacktestScreen(spec))
-        elif event.option.id == "go-run":
-            self.app.switch_screen(PaperScreen(select=spec.name, run=True))
         else:
             self.app.pop_screen()
 

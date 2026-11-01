@@ -17,15 +17,14 @@ import pytest
 import requests
 
 from hedge_fund.data import (
+    data_provider,
     DataClient,
     DataClientError,
     FDClient,
-    data_provider,
     make_data_client,
+    yfinance_client,
 )
-from hedge_fund.data import yfinance_client
 from hedge_fund.data.yfinance_client import YFinanceClient
-
 
 # ---------------------------------------------------------------------------
 # A fake yfinance module
@@ -105,6 +104,10 @@ class FakeTicker:
 
 def _install(monkeypatch: pytest.MonkeyPatch, ticker: FakeTicker | None = None) -> SimpleNamespace:
     """Point yfinance_client.yf at a fake module serving *ticker*."""
+
+    def fake_ticker(symbol: str, session=None):
+        return ticker if ticker is not None else FakeTicker(symbol)
+
     fake = SimpleNamespace(
         exceptions=SimpleNamespace(
             YFException=_YFError,
@@ -116,7 +119,7 @@ def _install(monkeypatch: pytest.MonkeyPatch, ticker: FakeTicker | None = None) 
             YFEarningsDateMissing=YFEarningsDateMissing,
         ),
         config=SimpleNamespace(debug=SimpleNamespace(hide_exceptions=True)),
-        Ticker=lambda symbol: ticker if ticker is not None else FakeTicker(symbol),
+        Ticker=fake_ticker,
     )
     monkeypatch.setattr(yfinance_client, "yf", fake)
     return fake
@@ -248,7 +251,7 @@ def test_a_fresh_ticker_per_call(monkeypatch):
     freeze quotes at their first fetch. Each call must build a new one."""
     built = []
 
-    def factory(symbol):
+    def factory(symbol, session=None):
         built.append(symbol)
         return FakeTicker(symbol, fast_info=SimpleNamespace(last_price=10.0, previous_close=9.0))
 
@@ -673,8 +676,9 @@ def test_news_falls_back_to_search_when_ticker_news_is_empty(monkeypatch):
     class FakeSearch:
         news = [FLAT_NEWS]
 
-        def __init__(self, query, news_count=10):
+        def __init__(self, query, news_count=10, session=None):
             assert query == "TEST"
+            assert session is not None
 
     fake.Search = FakeSearch
     client = YFinanceClient()
@@ -695,7 +699,7 @@ def test_news_filters_to_the_window(monkeypatch):
 
 def test_news_empty_means_no_news(monkeypatch):
     fake = _install(monkeypatch, FakeTicker("TEST", news=[]))
-    fake.Search = lambda query, news_count=10: SimpleNamespace(news=[])
+    fake.Search = lambda query, news_count=10, session=None: SimpleNamespace(news=[])
     client = YFinanceClient()
     assert client.get_news("TEST", "2025-01-11") == []
 
@@ -978,8 +982,8 @@ def test_transport_failure_raises_through_the_real_scraper(monkeypatch):
     regression test for yfinance's log-and-return-empty default."""
     real_yf = pytest.importorskip("yfinance")
     pytest.importorskip("curl_cffi")
-    from curl_cffi.requests.exceptions import RequestException
     import yfinance.data as ydata
+    from curl_cffi.requests.exceptions import RequestException
 
     monkeypatch.setattr(yfinance_client, "yf", real_yf)
     client = YFinanceClient()
@@ -1023,3 +1027,146 @@ def test_provider_switch_surfaces_a_missing_extra(monkeypatch):
     monkeypatch.setenv("HEDGE_FUND_DATA_PROVIDER", "yfinance")
     with pytest.raises(ImportError, match="reinstall application dependencies"):
         make_data_client()
+
+
+def _install_yahoo_transport(monkeypatch):
+    curl_requests = pytest.importorskip("curl_cffi.requests")
+    calls = []
+
+    def request_once(session, method, url, **kwargs):
+        calls.append(
+            {
+                "method": method,
+                "url": url,
+                "curl_options": dict(session.curl_options),
+                "kwargs": kwargs,
+            }
+        )
+        return SimpleNamespace(status_code=200)
+
+    monkeypatch.setattr(curl_requests.Session, "_request_once", request_once)
+    return calls
+
+
+def test_yfinance_factory_denies_before_real_transport_without_dispatch(monkeypatch):
+    from hedge_fund.runtime.policy import AuthorizationDenied
+
+    calls = _install_yahoo_transport(monkeypatch)
+    fake = _install(monkeypatch)
+    monkeypatch.setattr(yfinance_client, "_YfData", lambda session: None)
+
+    class TransportTicker:
+        def __init__(self, session):
+            self.session = session
+
+        def history(self, **_kwargs):
+            self.session.get("https://query1.finance.yahoo.com/v8/finance/chart/TEST")
+            return _prices_df([("2025-01-02", 10, 11, 9, 10, 100)])
+
+    monkeypatch.setattr(
+        fake,
+        "Ticker",
+        lambda _symbol, session=None: TransportTicker(session),
+    )
+    client = make_data_client("yfinance")
+    try:
+        with pytest.raises(AuthorizationDenied):
+            client.get_prices("TEST", "2025-01-01", "2025-01-03")
+    finally:
+        client.close()
+
+    assert calls == []
+
+
+def test_yfinance_news_search_cannot_bypass_guard(monkeypatch):
+    from hedge_fund.runtime.policy import AuthorizationDenied
+
+    calls = _install_yahoo_transport(monkeypatch)
+    fake = _install(monkeypatch, FakeTicker("TEST", news=[]))
+    monkeypatch.setattr(yfinance_client, "_YfData", lambda session: None)
+
+    class TransportSearch:
+        news = []
+
+        def __init__(self, query, news_count=10, session=None):
+            assert query == "TEST"
+            assert session is not None
+            session.get("https://query1.finance.yahoo.com/v1/finance/search?q=TEST")
+
+    fake.Search = TransportSearch
+    client = make_data_client("yfinance")
+    try:
+        with pytest.raises(AuthorizationDenied):
+            client.get_news("TEST", "2025-01-11")
+    finally:
+        client.close()
+
+    assert calls == []
+
+
+def test_yfinance_factory_reserves_and_pins_before_transport(monkeypatch):
+    from datetime import datetime, timedelta, timezone
+    from decimal import Decimal
+
+    from hedge_fund.runtime.dispatch import make_one_shot_dispatch
+    from hedge_fund.runtime.policy import ProviderTarget
+
+    calls = _install_yahoo_transport(monkeypatch)
+    fake = _install(monkeypatch)
+    monkeypatch.setattr(yfinance_client, "_YfData", lambda session: None)
+    target = ProviderTarget(kind="data", provider="yfinance")
+    now = datetime(2026, 11, 1, 12, 0, tzinfo=timezone.utc)
+    resolver_calls = []
+    fence_calls = []
+
+    def resolve(host, port):
+        resolver_calls.append((host, port))
+        return ["8.8.8.8"]
+
+    def boundary_check():
+        fence_calls.append(True)
+
+    dispatch = make_one_shot_dispatch(
+        root_id="a" * 64,
+        subject_id="synthetic-yfinance",
+        capture_digest="b" * 64,
+        operation_id="one-shot-yfinance",
+        operation_digest="c" * 64,
+        expires_at=now + timedelta(minutes=5),
+        targets=(target,),
+        max_calls=1,
+        max_cost=Decimal("0"),
+        max_resources=1,
+        upper_bound_costs={target.identity: Decimal("0")},
+        clock=lambda: now,
+        boundary_check=boundary_check,
+        resolver=resolve,
+    )
+    authorization = dispatch._one_shot[target.identity]
+
+    class TransportTicker:
+        def __init__(self, session):
+            self.session = session
+
+        def history(self, **_kwargs):
+            self.session.get("https://query1.finance.yahoo.com/v8/finance/chart/TEST")
+            return _prices_df([("2025-01-02", 10, 11, 9, 10, 100)])
+
+    monkeypatch.setattr(
+        fake,
+        "Ticker",
+        lambda _symbol, session=None: TransportTicker(session),
+    )
+    client = make_data_client("yfinance", dispatch=dispatch)
+    try:
+        prices = client.get_prices("TEST", "2025-01-01", "2025-01-03")
+    finally:
+        client.close()
+
+    assert [price.close for price in prices] == [10]
+    assert resolver_calls == [("query1.finance.yahoo.com", 443)]
+    assert fence_calls == [True, True]
+    assert len(calls) == authorization.calls_reserved == 1
+    assert authorization.cost_reserved == Decimal("0")
+    assert authorization.resources_reserved == 1
+    assert calls[0]["curl_options"][yfinance_client.CurlOpt.RESOLVE] == ["query1.finance.yahoo.com:443:8.8.8.8"]

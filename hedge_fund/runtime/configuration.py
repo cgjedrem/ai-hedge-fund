@@ -8,37 +8,34 @@ import os
 import stat
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from pathlib import Path
 from ipaddress import ip_address
+from pathlib import Path
 from types import MappingProxyType
 from urllib.parse import urlsplit, urlunsplit
 
 from hedge_fund.runtime.admission import AdmissionCoordinator, AdmissionError
-from hedge_fund.runtime.root import PRIVATE_ROOT, ensure_unique_resource_name, RootContext, RootPathError
+from hedge_fund.runtime.root import (
+    ensure_unique_resource_name,
+    PRIVATE_ROOT,
+    RootContext,
+    RootPathError,
+)
 
 SETTINGS_PATH = f"{PRIVATE_ROOT}/settings.json"
 DEFAULT_DATA_PROVIDER = "yfinance"
-DEFAULT_MODEL = "claude-opus-5-5"
+DEFAULT_MODEL = "gemma3:4b"
 DEFAULT_TIMEOUT_SECONDS = 60.0
-# Mirrors LLM registry; parity asserted by tests.
-_PROVIDERS = {provider.casefold(): provider for provider in ("Anthropic", "OpenAI", "xAI", "DeepSeek", "Google", "Kimi", "TypeSafe", "Ollama")}
+_PROVIDERS = {provider.casefold(): provider for provider in ("OpenAI", "xAI", "DeepSeek", "Kimi", "TypeSafe", "Ollama")}
 _MODEL_PROVIDERS = {
-    "claude-opus-5-5": "Anthropic",
-    "claude-fable-5-1": "Anthropic",
     "gpt-6-sol": "OpenAI",
     "gpt-6-astra": "OpenAI",
     "jev-1.13.0": "TypeSafe",
     "grok-4.7": "xAI",
     "deepseek-flash": "DeepSeek",
     "kimi-k3": "Kimi",
-    "gemini-3.8-flash": "Google",
     "gemma3:4b": "Ollama",
-    "glm-5.3-flash:cloud": "Ollama",
-    "glm-5.3:cloud": "Ollama",
-    "minimax-m3:cloud": "Ollama",
-    "kimi-k3:cloud": "Ollama",
 }
-_DEFAULT_LLM_PROVIDER = "Anthropic"
+_DEFAULT_LLM_PROVIDER = "Ollama"
 _DATA_PROVIDERS = {
     "fd": "fd",
     "financialdatasets": "fd",
@@ -442,7 +439,9 @@ def _normalize_settings(values: Mapping[str, object]) -> dict[str, object]:
     normalized_provider = _PROVIDERS[llm_provider.casefold()]
     model = _validate_text(values["model"], maximum=256, message="model is invalid")
     registered_provider = _MODEL_PROVIDERS.get(model)
-    if registered_provider is not None and registered_provider != normalized_provider:
+    if registered_provider is None:
+        raise ConfigurationError("model is not in the supported catalog")
+    if registered_provider != normalized_provider:
         raise ConfigurationError("model and provider do not match")
     parameters = _normalize_parameters(values["parameters"])
     if "context_size" in parameters and (

@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-import os
+from math import isfinite
+from urllib.parse import urlsplit
 
-import requests
+import httpx
 
 from hedge_fund.data.models import (
     CompanyFacts,
@@ -17,6 +18,8 @@ from hedge_fund.data.models import (
     PriceSnapshot,
 )
 from hedge_fund.data.protocol import DataClientError
+from hedge_fund.runtime.dispatch import blocked_httpx_client, ProviderDispatch
+from hedge_fund.runtime.policy import AuthorizationDenied, ProviderTarget
 
 NEWS_PAGE = 10  # the most /news/ returns per request
 
@@ -38,8 +41,13 @@ class FDClient:
 
     Usage::
 
-        with FDClient() as fd:
+        with FDClient(
+            api_key=captured_credential,
+            dispatch=operation_dispatch,
+        ) as fd:
             prices = fd.get_prices("AAPL", "2024-01-01", "2024-12-31")
+
+    Direct construction without dispatch has no I/O authority.
     """
 
     BASE_URL = "https://api.financialdatasets.ai"
@@ -48,10 +56,31 @@ class FDClient:
         self,
         api_key: str | None = None,
         timeout: float = 30.0,
+        *,
+        dispatch: ProviderDispatch | None = None,
+        inner_transport: httpx.BaseTransport | None = None,
     ) -> None:
-        self._api_key = api_key or os.environ.get("FINANCIAL_DATASETS_API_KEY", "")
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not isfinite(timeout) or timeout <= 0:
+            raise ValueError("timeout must be a positive finite number")
+        if dispatch is not None and not isinstance(dispatch, ProviderDispatch):
+            raise ValueError("provider dispatch is invalid")
+        if inner_transport is not None and not isinstance(inner_transport, httpx.BaseTransport):
+            raise ValueError("inner HTTP transport is invalid")
+        target = ProviderTarget(kind="data", provider="fd")
+        self._api_key = api_key if api_key is not None else ""
+        if not isinstance(self._api_key, str) or any(ord(char) < 32 or ord(char) == 127 for char in self._api_key):
+            raise ValueError("Financial Datasets credential is invalid")
+        if dispatch is not None and not self._api_key.strip():
+            raise AuthorizationDenied("captured Financial Datasets credential is required")
         self._timeout = timeout
-        self._session = requests.Session()
+        if dispatch is None:
+            self._session = blocked_httpx_client(timeout=timeout)
+        else:
+            self._session = dispatch.httpx_client(
+                target,
+                timeout=timeout,
+                inner_transport=inner_transport,
+            )
         self._session.headers["X-API-Key"] = self._api_key
 
     # ------------------------------------------------------------------
@@ -264,25 +293,41 @@ class FDClient:
         method: str,
         path: str,
         **kwargs,
-    ) -> requests.Response | None:
+    ) -> httpx.Response | None:
         """One HTTP attempt. Return None only for 404."""
         url = path if path.startswith("http") else self.BASE_URL + path
         try:
             resp = self._session.request(
-                method, url, timeout=self._timeout, **kwargs,
+                method,
+                url,
+                timeout=self._timeout,
+                **kwargs,
             )
-        except requests.RequestException as exc:
+        except httpx.RequestError as exc:
+            safe_path = _safe_path(path)
             raise FDClientError(
-                f"{method} {path} failed: {exc}", path=path,
-            ) from exc
+                f"{method} {safe_path} failed ({type(exc).__name__})",
+                path=safe_path,
+            ) from None
 
         if resp.status_code == 404:
             return None
 
         if resp.status_code >= 400:
+            safe_path = _safe_path(path)
+            body = resp.text[:200].replace(self._api_key, "[REDACTED]") if self._api_key else resp.text[:200]
             raise FDClientError(
-                f"{method} {path} returned {resp.status_code}: {resp.text[:200]}",
-                status_code=resp.status_code, path=path,
+                f"{method} {safe_path} returned {resp.status_code}: {body}",
+                status_code=resp.status_code,
+                path=safe_path,
             )
 
         return resp
+
+
+def _safe_path(value: str) -> str:
+    try:
+        parts = urlsplit(value)
+    except ValueError:
+        return "/"
+    return parts.path or "/"

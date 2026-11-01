@@ -453,8 +453,8 @@ def test_backtest_preview_uses_local_paper_provider_policy(demo_root):
     finally:
         service.close()
 
-    assert denied.value.status_code == 422
-    assert denied.value.detail == "Paper operations require a local Ollama model endpoint."
+    assert denied.value.status_code == 403
+    assert denied.value.detail == "Paid provider use requires explicit bounded authorization."
     assert operations == ()
 
 

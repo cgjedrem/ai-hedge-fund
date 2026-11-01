@@ -394,6 +394,11 @@ export interface BacktestPayload {
   provider: string;
   model: string;
   mandate_hash: string;
+  authorize_paid_provider?: boolean;
+  confirm_fd_self_service_pricing?: boolean;
+  paid_max_calls?: number | null;
+  paid_max_cost_usd?: string | null;
+  paid_max_attempt_cost_usd?: string | null;
 }
 
 export interface Operation {
@@ -434,7 +439,13 @@ export interface OperationPreview {
   capture: Record<string, unknown>;
   estimate: {
     maximum_model_calls: number;
+    paid_provider?: string | null;
     maximum_cost_usd: number | null;
+    maximum_paid_calls?: number;
+    maximum_attempt_cost_usd?: number | null;
+    cost_model_id?: string | null;
+    cost_model_version?: string | null;
+    cost_model?: string | null;
     market_data_provider: string;
   };
   warnings: string[];
@@ -475,7 +486,13 @@ export interface Settings {
   models: ModelOption[];
   providers: { provider: string; requires_key: boolean; configured: boolean; version: number }[];
   data_provider: string;
-  data_providers: { id: string; label: string }[];
+  data_providers: {
+    id: string;
+    label: string;
+    requires_key?: boolean;
+    configured?: boolean;
+    version?: number;
+  }[];
   active_captures: {
     capture_id: string;
     subject_id: string;

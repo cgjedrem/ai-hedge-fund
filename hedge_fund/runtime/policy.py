@@ -33,6 +33,9 @@ class OperationScope(str, Enum):
     SCHEDULED = "scheduled"
 
 
+APPROVED_LOCAL_MODELS = frozenset({"gemma3:4b"})
+
+
 @dataclass(frozen=True, slots=True)
 class ProviderTarget:
     kind: str
@@ -131,10 +134,14 @@ class OneShotAuthorization:
     subject_id: str
     capture_digest: str
     provider_id: str
+    operation_id: str
+    operation_digest: str
     expires_at: datetime
     max_calls: int
     max_cost: Decimal
     max_resources: int = 10000
+    upper_bound_cost: Decimal = Decimal("0")
+    shared_budget: DispatchBudget | None = field(default=None, repr=False, compare=False)
     _budget: DispatchBudget = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -142,22 +149,27 @@ class OneShotAuthorization:
         _validate_identity(self.subject_id)
         _validate_identity(self.capture_digest)
         _validate_identity(self.provider_id)
+        _validate_identity(self.operation_id)
+        _validate_digest(self.operation_digest)
         _validate_expiry_value(self.expires_at)
         if type(self.max_calls) is not int or self.max_calls <= 0:
             raise ValueError("one-shot bounds are invalid")
         if type(self.max_resources) is not int or self.max_resources <= 0:
             raise ValueError("one-shot bounds are invalid")
-        if not isinstance(self.max_cost, Decimal) or not self.max_cost.is_finite() or self.max_cost <= 0:
+        if not isinstance(self.max_cost, Decimal) or not self.max_cost.is_finite() or self.max_cost < 0:
             raise ValueError("one-shot bounds are invalid")
-        object.__setattr__(
-            self,
-            "_budget",
-            DispatchBudget(
+        if not isinstance(self.upper_bound_cost, Decimal) or not self.upper_bound_cost.is_finite() or self.upper_bound_cost < 0 or self.upper_bound_cost > self.max_cost:
+            raise ValueError("one-shot per-call cost bound is invalid")
+        budget = self.shared_budget
+        if budget is None:
+            budget = DispatchBudget(
                 max_calls=self.max_calls,
                 max_cost=self.max_cost,
                 max_resources=self.max_resources,
-            ),
-        )
+            )
+        elif not isinstance(budget, DispatchBudget) or budget.max_calls != self.max_calls or budget.max_cost != self.max_cost or budget.max_resources != self.max_resources:
+            raise ValueError("shared one-shot budget does not match bounds")
+        object.__setattr__(self, "_budget", budget)
 
     @property
     def calls_reserved(self) -> int:
@@ -184,6 +196,8 @@ class RunnerAuthorization:
     root_id: str
     deployment_id: str
     capture_digest: str
+    operation_id: str
+    operation_digest: str
     provider_ids: tuple[str, ...]
     expires_at: datetime
     max_sessions: int
@@ -196,6 +210,8 @@ class RunnerAuthorization:
         _validate_identity(self.root_id)
         _validate_identity(self.deployment_id)
         _validate_identity(self.capture_digest)
+        _validate_identity(self.operation_id)
+        _validate_digest(self.operation_digest)
         _validate_expiry_value(self.expires_at)
         if not isinstance(self.provider_ids, tuple) or not self.provider_ids or any(not isinstance(value, str) or not value for value in self.provider_ids) or len(set(self.provider_ids)) != len(self.provider_ids):
             raise ValueError("runner providers are invalid")
@@ -239,7 +255,12 @@ def classify_provider(
     if not isinstance(approved_local_models, (set, frozenset)) or any(not isinstance(model, str) or not _safe_text(model, maximum=256) for model in approved_local_models):
         raise AuthorizationDenied("local model allowlist is invalid")
     if target.kind == "data":
-        if target.provider in {"yfinance", "yf", "yahoo"}:
+        if target.provider in {
+            "ken-french-breakpoints",
+            "yfinance",
+            "yf",
+            "yahoo",
+        }:
             return ProviderClass.FREE_DATA
         if target.provider in {"fd", "financialdatasets", "financial-datasets"}:
             return ProviderClass.PAID_CLOUD
@@ -247,7 +268,7 @@ def classify_provider(
     if target.kind != "llm":
         raise AuthorizationDenied("provider kind is unknown")
     if target.provider == "ollama":
-        if target.model in approved_local_models and not _cloud_labelled(target.model or "") and _literal_local_ollama_endpoint(target.endpoint):
+        if target.model in APPROVED_LOCAL_MODELS and target.model in approved_local_models and not _cloud_labelled(target.model or "") and _literal_local_ollama_endpoint(target.endpoint):
             return ProviderClass.LOCAL
         return ProviderClass.PAID_CLOUD
     if target.provider in {
@@ -269,6 +290,8 @@ def authorize_session(
     root_id: str,
     deployment_id: str,
     capture_digest: str,
+    operation_id: str,
+    operation_digest: str,
     due_set: tuple[str, ...],
     now: datetime,
 ) -> int:
@@ -280,6 +303,8 @@ def authorize_session(
         root_id=root_id,
         deployment_id=deployment_id,
         capture_digest=capture_digest,
+        operation_id=operation_id,
+        operation_digest=operation_digest,
         now=now,
     )
     if not isinstance(due_set, tuple) or not due_set or any(not isinstance(value, str) or not _safe_text(value, maximum=256) for value in due_set) or len(set(due_set)) != len(due_set):
@@ -302,6 +327,8 @@ def authorize_dispatch(
     root_id: str,
     subject_id: str,
     capture_digest: str,
+    operation_id: str,
+    operation_digest: str,
     now: datetime,
     one_shot: OneShotAuthorization | None = None,
     runner: RunnerAuthorization | None = None,
@@ -317,9 +344,13 @@ def authorize_dispatch(
     _validate_identity(root_id)
     _validate_identity(subject_id)
     _validate_identity(capture_digest)
+    _validate_identity(operation_id)
+    _validate_digest(operation_digest)
     _validate_now(now)
     if type(network_authorized) is not bool:
         raise AuthorizationDenied("network authorization is invalid")
+    if not network_authorized:
+        raise AuthorizationDenied("network authorization is required")
     if type(attempt) is not int or attempt <= 0:
         raise AuthorizationDenied("attempt number is invalid")
     provider_class = classify_provider(
@@ -329,26 +360,31 @@ def authorize_dispatch(
     if scope is OperationScope.MANUAL_ONE_SHOT:
         if runner is not None:
             raise AuthorizationDenied("runner authority cannot authorize manual work")
+        if not isinstance(one_shot, OneShotAuthorization):
+            raise AuthorizationDenied("operation-bound provider authorization is required")
+        _validate_one_shot_identity(
+            one_shot,
+            target=target,
+            root_id=root_id,
+            subject_id=subject_id,
+            capture_digest=capture_digest,
+            operation_id=operation_id,
+            operation_digest=operation_digest,
+            now=now,
+        )
+        if upper_bound_cost != one_shot.upper_bound_cost:
+            raise AuthorizationDenied("provider cost bound does not match authorization")
         if provider_class is ProviderClass.PAID_CLOUD:
-            if not network_authorized or not isinstance(one_shot, OneShotAuthorization):
-                raise AuthorizationDenied("paid provider requires one-shot authorization")
-            _validate_one_shot_identity(
-                one_shot,
-                target=target,
-                root_id=root_id,
-                subject_id=subject_id,
-                capture_digest=capture_digest,
-                now=now,
-            )
             if attempt != 1:
                 raise AuthorizationDenied("paid retries are disabled")
-            one_shot._budget.reserve(
-                upper_bound_cost=upper_bound_cost,
-                resource_units=resource_units,
-            )
-            return provider_class
-        if provider_class is ProviderClass.FREE_DATA and not network_authorized:
-            raise AuthorizationDenied("network authorization is required")
+            if one_shot.upper_bound_cost <= 0:
+                raise BudgetDenied("paid upper-bound cost is unknown")
+        elif one_shot.upper_bound_cost != 0:
+            raise AuthorizationDenied("free/local provider cost bound must be zero")
+        one_shot._budget.reserve(
+            upper_bound_cost=one_shot.upper_bound_cost,
+            resource_units=resource_units,
+        )
         return provider_class
 
     if one_shot is not None or not isinstance(runner, RunnerAuthorization):
@@ -360,11 +396,15 @@ def authorize_dispatch(
         root_id=root_id,
         deployment_id=subject_id,
         capture_digest=capture_digest,
+        operation_id=operation_id,
+        operation_digest=operation_digest,
         now=now,
     )
     preflight_data = runner.sessions_started == 0 and target.kind == "data" and provider_class is ProviderClass.FREE_DATA
     if (runner.sessions_started <= 0 and not preflight_data) or target.identity not in runner.provider_ids:
         raise AuthorizationDenied("runner provider is not authorized")
+    if upper_bound_cost != Decimal("0"):
+        raise AuthorizationDenied("scheduled free/local cost bound must be zero")
     runner._state.budget.reserve(
         upper_bound_cost=Decimal("0"),
         resource_units=resource_units,
@@ -388,6 +428,11 @@ def _validate_identity(value: str) -> None:
         raise AuthorizationDenied("authorization identity is invalid")
 
 
+def _validate_digest(value: str) -> None:
+    if not isinstance(value, str) or re.fullmatch(r"[a-f0-9]{64}", value) is None:
+        raise AuthorizationDenied("authorization digest is invalid")
+
+
 def _validate_expiry_value(value: datetime) -> None:
     if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
         raise ValueError("authorization expiry must be timezone-aware")
@@ -405,9 +450,11 @@ def _validate_one_shot_identity(
     root_id: str,
     subject_id: str,
     capture_digest: str,
+    operation_id: str,
+    operation_digest: str,
     now: datetime,
 ) -> None:
-    if authorization.root_id != root_id or authorization.subject_id != subject_id or authorization.capture_digest != capture_digest or authorization.provider_id != target.identity or authorization.expires_at <= now:
+    if authorization.root_id != root_id or authorization.subject_id != subject_id or authorization.capture_digest != capture_digest or authorization.provider_id != target.identity or authorization.operation_id != operation_id or authorization.operation_digest != operation_digest or authorization.expires_at <= now:
         raise AuthorizationDenied("one-shot authorization does not match")
 
 
@@ -417,9 +464,11 @@ def _validate_runner_identity(
     root_id: str,
     deployment_id: str,
     capture_digest: str,
+    operation_id: str,
+    operation_digest: str,
     now: datetime,
 ) -> None:
-    if authorization.root_id != root_id or authorization.deployment_id != deployment_id or authorization.capture_digest != capture_digest or authorization.expires_at <= now:
+    if authorization.root_id != root_id or authorization.deployment_id != deployment_id or authorization.capture_digest != capture_digest or authorization.operation_id != operation_id or authorization.operation_digest != operation_digest or authorization.expires_at <= now:
         raise AuthorizationDenied("runner authorization does not match")
 
 
@@ -438,7 +487,7 @@ def _normalize_endpoint(value: str) -> str:
 
 def _literal_local_ollama_endpoint(endpoint: str | None) -> bool:
     if endpoint is None:
-        return False
+        return True
     try:
         parts = urlsplit(endpoint)
         port = parts.port
@@ -455,3 +504,9 @@ def _cloud_labelled(model: str) -> bool:
 
 def _safe_text(value: str, *, maximum: int) -> bool:
     return bool(value) and len(value) <= maximum and value == value.strip() and not any(ord(char) < 32 or ord(char) == 127 for char in value)
+
+
+KEN_FRENCH_BREAKPOINTS_TARGET = ProviderTarget(
+    kind="data",
+    provider="ken-french-breakpoints",
+)

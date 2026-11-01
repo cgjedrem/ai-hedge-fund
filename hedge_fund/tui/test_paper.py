@@ -12,7 +12,7 @@ from textual.widgets import ContentSwitcher, Input, OptionList, Static
 
 from hedge_fund import paths
 from hedge_fund.data.sessions import NEW_YORK
-from hedge_fund.paper import deploy, Ledger, load_deployed, PID_FILE
+from hedge_fund.paper import deploy, Ledger, load_deployed
 from hedge_fund.tui import backtest, funds, paper, paper_view, report
 from hedge_fund.tui.app import HedgeFundApp
 from hedge_fund.tui.fixtures import (
@@ -52,6 +52,7 @@ def test_all_modes_can_be_backtested_and_paper_traded(mode, size):
 
 
 def test_enrolled_root_displays_tui_write_denial_and_blocks_paper_controls(monkeypatch):
+    from hedge_fund.paper import runner as legacy_runner
     from hedge_fund.runtime.admission import AdmissionCoordinator, RootOwnerLease
     from hedge_fund.runtime.handover import enroll_fresh, record_ledger_head
     from hedge_fund.runtime.root import RootContext
@@ -64,9 +65,8 @@ def test_enrolled_root_displays_tui_write_denial_and_blocks_paper_controls(monke
     monkeypatch.setattr(paper, "make_data_client", forbidden_client)
     monkeypatch.setattr(paper, "tick", forbidden_action)
     monkeypatch.setattr(paper, "redo", forbidden_action)
-    monkeypatch.setattr(paper, "spawn_runner", forbidden_action)
-    monkeypatch.setattr(paper, "stop_runner", forbidden_action)
-    monkeypatch.setattr(paper, "demand_run_keys", forbidden_action)
+    monkeypatch.setattr(legacy_runner, "spawn_runner", forbidden_action)
+    monkeypatch.setattr(legacy_runner, "stop_runner", forbidden_action)
 
     with RootContext.open(root) as context, paths.bound_root(context):
         enroll_fresh(context)
@@ -273,67 +273,40 @@ def test_paper_screen_shows_live_prints_when_they_arrive(monkeypatch):
     asyncio.run(scenario())
 
 
-def test_paper_screen_runs_through_the_approval_step(monkeypatch):
+def test_paper_screen_execution_denies_before_provider_or_ledger_effects(monkeypatch):
     spec = make_spec(["pead"], "alpha")
     directory = deploy("alpha", spec, ["TEST"], root=paths.PAPER_DIR)
     ledger = Ledger(directory)
-    record, decided = executed_and_decided()
-    ledger.append(make_session("2025-01-17", decision=decided, nav=100000))
-    due = {"value": "2025-01-21"}
-    monkeypatch.setattr(paper, "make_data_client", lambda: Mock(__enter__=lambda s: s, __exit__=lambda s, *a: None))
-    monkeypatch.setattr(paper, "next_session", lambda data, spec, last, **kw: due["value"])
-    monkeypatch.setenv("FINANCIAL_DATASETS_API_KEY", "x")
-    monkeypatch.setenv("HEDGE_FUND_LLM_MODEL", "jev-1.13.0")
-    monkeypatch.setenv("TYPESAFE_API_KEY", "x")
-    started: list = []
-    monkeypatch.setattr(paper.RunSessionScreen, "_run", lambda self: started.append(self._directory))
+    before_records = ledger.records()
+    before_events = ledger.events()
+    forbidden_client = Mock(side_effect=AssertionError("TUI execution reached provider setup"))
+    monkeypatch.setattr(paper, "make_data_client", forbidden_client)
 
     async def scenario():
         app = HedgeFundApp()
         async with app.run_test(size=(140, 50)) as pilot:
             await app.push_screen(paper.PaperScreen())
             screen = app.screen
-            detail = render(screen.query_one("#detail-body", Static).content)
-            assert "NEXT RUN" in detail and "execute the 2025-01-20 decision" in detail
-            assert "TEST +25%" in detail and "SESSIONS" in detail and "2025-01-17" in detail
+            notified = []
+            monkeypatch.setattr(screen, "notify", lambda message, **_kwargs: notified.append(message))
             await pilot.press("enter")
             await pilot.pause()
-            modal = app.screen
-            assert isinstance(modal, paper.RunConfirmScreen)
-            body = render(modal.query_one("#run-body", Static).content)
-            assert "Execute the 2025-01-20 decision at the 2025-01-21 close" in body
-            assert "TEST +25%" in body and "first session of the week" in body
-            assert modal.check_action("confirm", ())
-            await pilot.press("escape")  # say no: nothing runs
-            assert app.screen is screen and started == []
-            await pilot.press("enter")
-            await pilot.pause()
-            await pilot.press("enter")  # say yes
-            await pilot.pause()
-            assert isinstance(app.screen, paper.RunSessionScreen) and started == [directory]
-            app.screen._phase = "done"
-            await pilot.press("escape")
             assert app.screen is screen
-            # Nothing due: the modal says when the next close is and offers
-            # to run the last session again; enter does that, esc does nothing.
-            due["value"] = None
-            await pilot.press("enter")
+            assert notified == ["TUI paper execution lacks operation-bound authorization. Use the explicit-root CLI or web desk."]
+            run_screen = paper.RunSessionScreen(directory)
+            await app.push_screen(run_screen)
+            for _ in range(20):
+                await pilot.pause(0.05)
+                if run_screen._phase == "failed":
+                    break
+            assert run_screen._phase == "failed"
+            assert "lacks operation-bound authorization" in render(run_screen.query_one("#run-phase", Static).content)
             await pilot.pause()
-            modal = app.screen
-            assert isinstance(modal, paper.RunConfirmScreen) and modal.check_action("confirm", ())
-            body = render(modal.query_one("#run-body", Static).content)
-            assert "Up to date through 2025-01-17" in body and "Run 2025-01-17 again?" in body
-            assert "run again" in render(modal.query_one("#run-keys", Static).content)
-            await pilot.press("escape")
-            assert app.screen is screen and started == [directory]
-            await pilot.press("enter")
-            await pilot.pause()
-            await pilot.press("enter")
-            await pilot.pause()
-            assert isinstance(app.screen, paper.RunSessionScreen) and app.screen._redo
-            assert started == [directory, directory]
 
     asyncio.run(scenario())
+    forbidden_client.assert_not_called()
+    assert ledger.records() == before_records
+    assert ledger.events() == before_events
 
 
 @pytest.mark.parametrize("size", [(120, 45), (80, 24)])
@@ -504,58 +477,35 @@ def test_paper_screen_enter_on_a_minute_fund_opens_the_same_approval_step(monkey
 
 
 @pytest.mark.parametrize("cadence", ["daily", "minute"])
-def test_paper_screen_space_starts_and_stops_a_runner_at_any_cadence(monkeypatch, cadence):
+def test_paper_screen_space_reports_runner_controls_disabled(monkeypatch, cadence):
+    from hedge_fund.paper import runner as legacy_runner
+
     spec = make_minute_spec() if cadence == "minute" else make_spec(["pead"], "alpha")
     directory = deploy(spec.name, spec, ["TEST"], root=paths.PAPER_DIR)
-    monkeypatch.setattr(paper, "demand_run_keys", lambda _app, _resume: True)
-    running = {"value": False}
-    spawned, stopped = [], []
+    assert directory.is_dir()
+    effects = []
 
-    def spawn(path, *, root):
-        assert root == paths.root_context().path
-        spawned.append(path)
-        running["value"] = True
-        (path / PID_FILE).write_text("test-owned")
-        return os.getpid()
-
-    def stop(path):
-        stopped.append(path)
-        running["value"] = False
-        (path / PID_FILE).unlink()
-        return True
-
-    monkeypatch.setattr(paper, "spawn_runner", spawn)
-    monkeypatch.setattr(paper, "stop_runner", stop)
-    monkeypatch.setattr(paper, "is_running", lambda _path: running["value"])
-    monkeypatch.setattr(paper_view, "is_running", lambda _path: running["value"])
+    def forbidden(*_args, **_kwargs):
+        effects.append(True)
+        pytest.fail("disabled TUI runner reached process control")
 
     async def scenario():
         app = HedgeFundApp()
         async with app.run_test(size=(140, 50)) as pilot:
             await app.push_screen(paper.PaperScreen())
             screen = app.screen
-            menu = screen.query_one("#paper-menu", OptionList)
-            assert "● new" in render(menu.get_option("paper:0").prompt)
+            monkeypatch.setattr(legacy_runner, "spawn_runner", forbidden)
+            monkeypatch.setattr(legacy_runner, "stop_runner", forbidden)
+            monkeypatch.setattr(paper_view, "is_running", forbidden)
+            notified = []
+            monkeypatch.setattr(screen, "notify", lambda message, **_kwargs: notified.append(message))
             await pilot.press("space")
-            await pilot.pause()
-            assert spawned == [directory] and app.screen is screen  # no approval modal for a runner
-            assert "● running" in render(menu.get_option("paper:0").prompt)
-            detail = render(screen.query_one("#detail-body", Static).content)
-            assert "● running · space to stop" in detail
-            await pilot.press("enter")  # the runner owns the ledger while it is up: enter does not run
             await pilot.pause()
             assert app.screen is screen
-            await pilot.press("space")
-            await pilot.pause()
-            assert stopped == [directory] and "● new" in render(menu.get_option("paper:0").prompt)
-            # A halted fund's runner is not started.
-            await pilot.press("h")
-            await pilot.pause()
-            await pilot.press("space")
-            await pilot.pause()
-            assert spawned == [directory]
+            assert notified == ["Unattended paper runners are disabled. Use the explicit-root CLI or web desk for one authorized session."]
 
     asyncio.run(scenario())
+    assert effects == []
 
 
 def test_sessions_screen_groups_a_minute_funds_bars_by_day():

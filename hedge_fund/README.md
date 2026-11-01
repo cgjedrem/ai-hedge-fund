@@ -62,11 +62,23 @@ poetry install
 ```
 
 Financial Datasets is an explicit paid provider selected with
-`HEDGE_FUND_DATA_PROVIDER=fd`. Yahoo fundamentals are reported as of now,
-not point-in-time; Yahoo backtests can leak future data.
+`HEDGE_FUND_DATA_PROVIDER=fd`; selection or saved credentials do not authorize
+dispatch. CLI provider calls require `--enable-network`. A paid CLI one-shot
+also needs explicit provider approval, finite call/cost limits, and a deadline.
+Financial Datasets also needs `--confirm-fd-self-service-pricing`; public
+self-service pricing only, custom Enterprise rates unsupported. Scheduled
+paper operations permit only free data and local models. Yahoo
+fundamentals are reported as of now, not point-in-time; Yahoo backtests can
+leak future data.
+
+Verified paid dispatch covers Financial Datasets self-service data and
+TypeSafe Jev 1.13.0 model calls. Other cloud-model providers lack verified cost
+bounds and fail closed before transport, even when a key is saved.
+Only one paid provider can be authorized per operation; combining paid
+Financial Datasets with TypeSafe in one action is unsupported.
 
 ```bash
-# No subcommand: launch the interactive app (a Textual TUI).
+# No subcommand: launch the interactive app (a Textual TUI; provider dispatch disabled).
 # Two modes: paper trading (your funds — review each run, approve/reject gated
 # decisions with y/n, see history, halt/resume, build a new fund) and
 # backtesting (replay a fund over history).
@@ -75,19 +87,28 @@ poetry run aihf --root "$AIHF_ROOT"
 # Backtest a mandate over a window: `advance` looped over every benchmark
 # session, full result JSON (every SessionRecord) on stdout, a copy saved to
 # the selected root's research/. A mandate carries no tickers — --universe says
-# what to point it at.
-poetry run aihf --root "$AIHF_ROOT" backtest "$AIHF_ROOT/mandates/example.yaml" \
+# what to point it at. Network authority is invocation-local.
+poetry run aihf --root "$AIHF_ROOT" --enable-network backtest "$AIHF_ROOT/mandates/example.yaml" \
     --universe AAPL,MSFT,NVDA --start 2024-01-02 --end 2024-06-28
 
+# Financial Datasets: each run needs deliberate provider, tier, call, cost,
+# and deadline approval. Save the key under Settings > Provider credentials
+# for this root; never put it on the command line.
+HEDGE_FUND_DATA_PROVIDER=fd poetry run aihf --root "$AIHF_ROOT" --enable-network \
+    backtest "$AIHF_ROOT/mandates/example.yaml" --universe AAPL,MSFT \
+    --start 2024-01-02 --end 2024-06-28 --authorize-paid-provider fd \
+    --confirm-fd-self-service-pricing --paid-max-calls 100 \
+    --paid-max-cost-usd 16 --paid-max-attempt-cost-usd 0.16
+
 # Paper trade: deploy the mandate, then advance it one session per tick.
-# tick is idempotent and never skips a session — a scheduler can call it
-# after every close, and a week away takes a week of ticks to catch up.
+# tick is idempotent and never skips a session. Scheduled ticks use free data
+# and local models only; each invocation needs explicit network enablement.
 poetry run aihf --root "$AIHF_ROOT" paper create alpha --mandate "$AIHF_ROOT/mandates/example.yaml" --universe AAPL,MSFT
-poetry run aihf --root "$AIHF_ROOT" paper tick alpha
-poetry run aihf --root "$AIHF_ROOT" paper tick alpha --again   # redo the latest session; the old record moves to ledger/superseded/
+poetry run aihf --root "$AIHF_ROOT" --enable-network paper tick alpha
+poetry run aihf --root "$AIHF_ROOT" --enable-network paper tick alpha --again   # redo the latest session; the old record moves to ledger/superseded/
 # Override cadence at deployment without editing the mandate:
 poetry run aihf --root "$AIHF_ROOT" paper create fast --mandate "$AIHF_ROOT/mandates/example.yaml" --universe AAPL,MSFT --rebalance minute
-poetry run aihf --root "$AIHF_ROOT" paper tick fast
+poetry run aihf --root "$AIHF_ROOT" --enable-network paper tick fast
 poetry run aihf --root "$AIHF_ROOT" paper status alpha
 poetry run aihf --root "$AIHF_ROOT" paper list
 poetry run aihf --root "$AIHF_ROOT" paper halt alpha --reason "..."     # the kill switch

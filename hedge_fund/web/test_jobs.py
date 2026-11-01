@@ -3,13 +3,17 @@ import time
 from concurrent.futures import Future
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
+import httpx
 import pytest
 import yaml
 from fastapi.testclient import TestClient
+from pydantic import SecretStr
 
 from hedge_fund.backtesting.test_fund import FakeAnalyst, FakeDataClient, SERIES
-from hedge_fund.fund import custom_strategy, Fund, load_spec
+from hedge_fund.data import make_data_client
+from hedge_fund.fund import custom_strategy, Fund, FundSpec, load_spec
 from hedge_fund.llm import load_api_models
 from hedge_fund.paper.deployed import load_deployed
 from hedge_fund.pipeline.session import mandate_hash
@@ -22,17 +26,20 @@ from hedge_fund.runtime.operations import (
     OperationStatus,
     OperationStore,
 )
+from hedge_fund.runtime.policy import ProviderTarget
 from hedge_fund.runtime.root import RootContext
 from hedge_fund.test_support.handover import enroll_synthetic_root
 from hedge_fund.web.app import create_app
 from hedge_fund.web.jobs import JobCancelled, OperationJobRegistry
 from hedge_fund.web.schemas import (
     BacktestRequest,
+    CredentialRequest,
     DeployRequest,
     ModelRequest,
     OperationAcceptRequest,
     OperationCancelRequest,
     OperationPreviewRequest,
+    RuntimeSettingsRequest,
 )
 from hedge_fund.web.services import DeskService, ServiceError
 
@@ -93,12 +100,14 @@ def _accepted_operation(store, capture, request_id="job-request"):
 
 def _wait_for_operation(store, operation_id, status, timeout=5):
     deadline = time.monotonic() + timeout
+    latest = None
     while time.monotonic() < deadline:
-        operation = store.get_operation(operation_id)
-        if operation.status is status:
-            return operation
+        latest = store.get_operation(operation_id)
+        if latest.status is status:
+            return latest
         time.sleep(0.01)
-    raise AssertionError(f"operation did not reach {status.value}")
+    view = latest.public_view() if latest is not None else None
+    raise AssertionError(f"operation did not reach {status.value}: {view}")
 
 
 class ManagedFakeDataClient(FakeDataClient):
@@ -124,6 +133,32 @@ def _spec(name="research-sample"):
         "capital": 100_000,
         "rebalance": "daily",
     }
+
+
+def test_backtest_call_bounds_include_llm_samples_and_local_fallback():
+    from hedge_fund.web.services import _estimate_backtest_bounds
+
+    raw = _spec()
+    raw["strategies"][0]["models"] = [
+        {"name": "buffett", "weight": 1.0, "params": {"samples": 2}},
+        {"name": "pead", "weight": 1.0, "params": {}},
+    ]
+    spec = FundSpec.model_validate(raw)
+
+    assert _estimate_backtest_bounds(
+        "2024-06-03",
+        "2024-06-03",
+        2,
+        spec,
+        local_llm_fallback=False,
+    ) == (6, 4)
+    assert _estimate_backtest_bounds(
+        "2024-06-03",
+        "2024-06-03",
+        2,
+        spec,
+        local_llm_fallback=True,
+    ) == (10, 8)
 
 
 def _write_headers(client):
@@ -353,6 +388,153 @@ def test_reviewed_operation_preview_accept_persists_capture_and_report(demo_root
     assert (demo_root / "runtime" / "private" / "v1" / "captures" / f"{preview['capture_id']}.json").is_file()
 
 
+def test_paid_fd_web_backtest_uses_guarded_real_client_and_fake_transport(
+    demo_root,
+    monkeypatch,
+):
+    import hedge_fund.web.services as services
+
+    service = DeskService(
+        demo_root,
+        allow_writes=True,
+        network_enabled=True,
+    )
+    service.save_runtime_settings(
+        RuntimeSettingsRequest(
+            data_provider="fd",
+            model=service.settings()["model"],
+            endpoint=None,
+            timeout_seconds=60.0,
+            parameters={},
+            expected_version=service.settings()["version"],
+        )
+    )
+    secret = "synthetic-fd-key"
+    service.set_credential(
+        CredentialRequest(
+            provider="fd",
+            value=SecretStr(secret),
+            expected_version=0,
+        )
+    )
+    http_calls = []
+    dispatches = []
+
+    def handle(request):
+        http_calls.append(request)
+        assert request.headers.get("x-api-key") == secret
+        return httpx.Response(
+            200,
+            json={"prices": [], "next_page_url": None},
+            request=request,
+        )
+
+    production_factory = make_data_client
+
+    def fake_transport_factory(*, provider, dispatch, api_key):
+        dispatches.append(dispatch)
+        return production_factory(
+            provider=provider,
+            dispatch=dispatch,
+            api_key=api_key,
+            inner_transport=httpx.MockTransport(handle),
+        )
+
+    def fake_backtest(_fund, start, end, data_client, _universe, *, on_valuation):
+        assert data_client.get_prices("AAPL", start, end) == []
+        on_valuation(0, 1, None)
+        return object()
+
+    def fake_save(_result, *, directory, admission):
+        del admission
+        path = Path(directory) / "fake-paid-backtest.json"
+        path.write_text("{}", encoding="utf-8")
+        return path
+
+    monkeypatch.setattr(services, "make_data_client", fake_transport_factory)
+    monkeypatch.setattr(services, "backtest_fund", fake_backtest)
+    monkeypatch.setattr(services, "save_result", fake_save)
+    payload_values = {
+        "fund": "demo-quality",
+        "universe": ["AAPL"],
+        "start": "2024-06-03",
+        "end": "2024-06-04",
+        "provider": "fd",
+        "model": service.settings()["model"],
+        "mandate_hash": _mandate_fingerprint(demo_root),
+        "authorize_paid_provider": True,
+        "paid_max_calls": 1,
+        "paid_max_cost_usd": "1",
+        "paid_max_attempt_cost_usd": "0.25",
+    }
+    unconfirmed_payload = BacktestRequest(**payload_values)
+    with pytest.raises(ServiceError) as tier_denied:
+        service.create_operation_preview(
+            OperationPreviewRequest(
+                action="backtest",
+                subject_id="demo-quality",
+                expected_head=unconfirmed_payload.mandate_hash,
+                payload=unconfirmed_payload,
+            ),
+            operator_session="synthetic-paid-session",
+        )
+    assert tier_denied.value.status_code == 403
+    assert "self-service pricing confirmation" in tier_denied.value.detail
+    assert http_calls == []
+    assert dispatches == []
+    assert service.list_operations()["items"] == []
+
+    payload = BacktestRequest(
+        **{
+            **payload_values,
+            "confirm_fd_self_service_pricing": True,
+        }
+    )
+    try:
+        preview = service.create_operation_preview(
+            OperationPreviewRequest(
+                action="backtest",
+                subject_id="demo-quality",
+                expected_head=payload.mandate_hash,
+                payload=payload,
+            ),
+            operator_session="synthetic-paid-session",
+        )
+        accepted = service.accept_operation(
+            OperationAcceptRequest(
+                request_id="synthetic-paid-fd-backtest",
+                action="backtest",
+                subject_id="demo-quality",
+                preview_id=preview["preview_id"],
+                preview_digest=preview["preview_digest"],
+                confirmation_token=preview["confirmation_token"],
+                expected_head=preview["expected_head"],
+                due_set=[],
+                payload=BacktestRequest.model_validate(preview["payload"]),
+            ),
+            operator_session="synthetic-paid-session",
+        )
+        store = service._operation_store
+        assert store is not None
+        completed = _wait_for_operation(
+            store,
+            accepted["operation_id"],
+            OperationStatus.COMPLETED,
+            timeout=30,
+        )
+    finally:
+        service.close()
+
+    assert completed.result["report_id"] == "fake-paid-backtest.json"
+    assert len(http_calls) == 1
+    assert len(dispatches) == 1
+    target = ProviderTarget(kind="data", provider="fd")
+    authorization = dispatches[0]._one_shot[target.identity]
+    assert authorization.calls_reserved == 1
+    assert str(authorization.cost_reserved) == "0.25"
+    assert secret not in str(completed.public_view())
+
+
 def test_cancel_after_effect_returns_preserves_completed_result(durable_job_context):
     _root, store, capture = durable_job_context
     operation = _accepted_operation(store, capture, request_id="cancel-after-effect")
@@ -390,6 +572,8 @@ def test_cancel_after_effect_returns_preserves_completed_result(durable_job_cont
 
 
 def test_injected_fund_factory_does_not_bypass_local_backtest_policy(demo_root):
+    from hedge_fund.runtime.configuration import RuntimeSettings
+
     called = False
 
     def forbidden_client():
@@ -407,6 +591,11 @@ def test_injected_fund_factory_does_not_bypass_local_backtest_policy(demo_root):
             models={"earnings-drift": [FakeAnalyst("pead", {"AAPL": 1.0})]},
         ),
     )
+    service._runtime_settings = RuntimeSettings(
+        data_provider="yfinance",
+        llm_provider="TypeSafe",
+        model="jev-1.13.0",
+    )
     try:
         payload = BacktestRequest(
             fund="demo-quality",
@@ -414,8 +603,12 @@ def test_injected_fund_factory_does_not_bypass_local_backtest_policy(demo_root):
             start="2024-06-03",
             end="2024-06-04",
             provider="yfinance",
-            model=service.settings()["model"],
+            model="jev-1.13.0",
             mandate_hash=_mandate_fingerprint(demo_root),
+            authorize_paid_provider=True,
+            paid_max_calls=1,
+            paid_max_cost_usd="1",
+            paid_max_attempt_cost_usd="0.16",
         )
         with pytest.raises(ServiceError) as denied:
             service.create_operation_preview(
@@ -427,8 +620,8 @@ def test_injected_fund_factory_does_not_bypass_local_backtest_policy(demo_root):
                 ),
                 operator_session="synthetic-server-session",
             )
-        assert denied.value.status_code == 422
-        assert "local Ollama" in denied.value.detail
+        assert denied.value.status_code == 403
+        assert "Injected model providers" in denied.value.detail
         assert service.list_operations()["items"] == []
         assert not called
     finally:
@@ -754,7 +947,7 @@ def test_reviewed_backtest_cancellation_closes_fake_client_and_freezes_model(dem
     try:
         assert operation["model"] == selected_model
         assert entered.wait(timeout=5)
-        changed_model = next(model_id for _, model_id, _provider in load_api_models() if model_id != selected_model)
+        changed_model = next(item["id"] for item in service.settings()["models"] if item["id"] != selected_model)
         service.set_model(
             ModelRequest(
                 model=changed_model,

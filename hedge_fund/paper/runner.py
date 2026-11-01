@@ -1,11 +1,12 @@
-"""run — the loop a paper fund lives in when nobody is watching.
+"""Legacy unattended runner algorithms; public process entrypoints deny use.
 
-    aihf --root <root> paper run <name>
+    aihf --root <root> paper run <name>  # disabled
 
-Any fund can be advanced by hand with `aihf --root <root> paper tick`. This
-loop sleeps until the fund's next session is due, advances it, then sleeps again.
-next session is due, advances it through `_run` (the path a tick takes),
-and goes back to sleep. The cadence decides what "due" means.
+The web-owned runner permits free data and local models only. Paid dispatch is
+one-shot and never runner authorization.
+
+The internal loop advances through `_run` at each due session. The cadence
+defines "due".
 
 A daily fund's session is a completed close, which under the engine's rule
 is any date before today in New York. The loop wakes just after midnight,
@@ -71,13 +72,7 @@ def run(
     now: Callable[[], datetime] | None = None,
     sleep: Callable[[float], None] | None = None,
 ) -> None:
-    """Advance the fund in *directory* session by session until *stop* is set.
-
-    *now* and *sleep* are the clock and the wait; tests inject both. The
-    default wait is `stop.wait`, so a stop lands within the second. Raises
-    FundHalted when the kill switch is set (on start, or after a session
-    fails).
-    """
+    """Disabled legacy unattended loop."""
     directory = Path(directory)
     _require_legacy_unenrolled(directory)
     deployed = load_deployed(directory)
@@ -213,8 +208,7 @@ def serve(
     on_record: Callable[[SessionRecord], None] | None = None,
     on_event: Callable[[str, dict], None] | None = None,
 ) -> None:
-    """`run` as a process: one per fund, found by its pid file, stopped by
-    SIGTERM or SIGINT after the bar in flight. Refuses to start twice."""
+    """Disabled legacy runner process entrypoint."""
     directory = Path(directory)
     _require_legacy_unenrolled(directory)
     # A pid file naming this very process is a stale incarnation: its writer
@@ -234,7 +228,7 @@ def serve(
 
 
 def is_running(directory: str | Path) -> bool:
-    """Whether a runner holds this fund: its pid file names a live process."""
+    """Whether a legacy runner PID file names a live process."""
     pid = _read_pid(directory)
     if pid is None:
         return False
@@ -262,7 +256,7 @@ _RUNNER_LOG = "runner.log"  # where a runner started from the app writes its con
 
 
 def spawn_runner(directory: Path, *, root: Path) -> int:
-    """Start detached runner child under fixed root; return child PID."""
+    """Disabled legacy detached runner launch."""
     if not isinstance(directory, Path) or not isinstance(root, Path):
         raise TypeError("runner directory and root must be paths")
     if not directory.is_absolute() or not root.is_absolute():
@@ -292,19 +286,8 @@ def spawn_runner(directory: Path, *, root: Path) -> int:
     return child.pid
 
 
-def _require_legacy_unenrolled(directory: Path) -> None:
-    if directory.parent.name.casefold() != "paper":
-        return
-    from hedge_fund.runtime.handover import enrollment_status
-    from hedge_fund.runtime.root import RootContext
-
-    try:
-        with RootContext.open(directory.parent.parent) as root:
-            status = enrollment_status(root, verify_inventory=True)
-    except Exception:
-        raise RuntimeError("Legacy paper runner is blocked because root enrollment cannot be verified.") from None
-    if status["state"] != "unenrolled":
-        raise RuntimeError("Legacy paper runner is disabled on enrolled or unverifiable roots.")
+def _require_legacy_unenrolled(_directory: Path) -> None:
+    raise RuntimeError("Legacy paper runner is disabled; unattended starts and stops are unsupported.")
 
 
 def _read_pid(directory: str | Path) -> int | None:

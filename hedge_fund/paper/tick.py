@@ -1,9 +1,7 @@
-"""tick — advance a paper fund by exactly one session.
+"""Advance a paper fund by exactly one session.
 
-This is what a human, a scheduler, or the runner calls when a session is
-due:
-
-    aihf --root <root> paper tick <name>        # cron, launchd, or a human
+CLI provider dispatch requires invocation-local network enablement. Paid
+authorization is one-shot; scheduled ticks use free data and local models.
 
 It loads the fund, replays the ledger into its state, works out the next
 session the fund owes, advances it, and appends the record. Calling it

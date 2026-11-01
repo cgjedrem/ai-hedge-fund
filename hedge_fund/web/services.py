@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -21,13 +22,20 @@ import yaml
 
 from hedge_fund.backtesting.fund import backtest_fund, FundBacktestResult
 from hedge_fund.backtesting.research import save_result
-from hedge_fund.data import CachedDataClient, make_data_client, PriceSnapshot
+from hedge_fund.data import (
+    CachedDataClient,
+    data_provider,
+    make_data_client,
+    PriceSnapshot,
+)
+from hedge_fund.data.registry import DATA_PROVIDER_ENV_VARS
 from hedge_fund.data.sessions import NEW_YORK
 from hedge_fund.fund import (
     Fund,
     FundSpec,
     load_spec,
     load_strategy,
+    model_call_bounds,
     normalize_universe,
     save_spec,
     StrategySpec,
@@ -40,6 +48,7 @@ from hedge_fund.llm import (
     PromptCache,
     PROVIDER_ENV_VARS,
 )
+from hedge_fund.llm.client import validate_llm_transport
 from hedge_fund.llm.registry import is_supported, KEYLESS_PROVIDERS, load_api_models
 from hedge_fund.paper.deployed import (
     deploy,
@@ -65,11 +74,19 @@ from hedge_fund.runtime.configuration import (
     save_settings,
     SettingsConflict,
 )
+from hedge_fund.runtime.costs import (
+    cost_model_description,
+    cost_model_identity,
+    COST_MODEL_VERSION,
+    has_verified_cost_model,
+    minimum_attempt_cost,
+)
 from hedge_fund.runtime.credentials import (
     CredentialStore,
     CredentialStoreError,
     CredentialVersionConflict,
 )
+from hedge_fund.runtime.dispatch import make_one_shot_dispatch, ProviderDispatch
 from hedge_fund.runtime.handover import (
     enrollment_status,
     HandoverError,
@@ -90,9 +107,8 @@ from hedge_fund.runtime.operations import (
 from hedge_fund.runtime.owned_runner import OwnedRunnerError, OwnedRunnerManager
 from hedge_fund.runtime.policy import (
     AuthorizationDenied,
-    authorize_dispatch,
     classify_provider,
-    OperationScope,
+    KEN_FRENCH_BREAKPOINTS_TARGET,
     ProviderClass,
     ProviderTarget,
 )
@@ -128,6 +144,54 @@ class ServiceError(RuntimeError):
         super().__init__(detail)
         self.status_code = status_code
         self.detail = detail
+
+
+class _DispatchGuardedInjectedDataClient:
+    """Reserve fake provider calls beneath operation authority."""
+
+    _METHODS = frozenset(
+        {
+            "get_company_facts",
+            "get_earnings",
+            "get_earnings_history",
+            "get_financial_metrics",
+            "get_insider_trades",
+            "get_market_cap",
+            "get_news",
+            "get_prices",
+            "get_snapshot",
+        }
+    )
+
+    def __init__(
+        self,
+        client: object,
+        dispatch: ProviderDispatch,
+        target: ProviderTarget,
+        url: str,
+    ) -> None:
+        if not isinstance(dispatch, ProviderDispatch) or not isinstance(target, ProviderTarget):
+            raise AuthorizationDenied("provider operation authorization is required")
+        dispatch.validate_target(target)
+        self._client = client
+        self._dispatch = dispatch
+        self._target = target
+        self._url = url
+
+    def __getattr__(self, name: str):
+        value = getattr(self._client, name)
+        if name not in self._METHODS or not callable(value):
+            return value
+
+        def guarded_call(*args, **kwargs):
+            self._dispatch.authorize_transport(
+                self._target,
+                url=self._url,
+                method="GET",
+            )
+            return value(*args, **kwargs)
+
+        return guarded_call
 
 
 class DeskService:
@@ -204,6 +268,7 @@ class DeskService:
         self._paper_operation_jobs: OperationJobRegistry | None = None
         self._captures: dict[str, FrozenCapture] = {}
         self._preview_captures: dict[str, str] = {}
+        self._preview_expiries: dict[str, datetime] = {}
         try:
             self._environment_settings = environment_settings()
             self._runtime_settings = resolve_settings(
@@ -738,7 +803,7 @@ class DeskService:
                             code_version=code_version(),
                             mandate_snapshot=deployed.spec.model_dump(mode="json"),
                         )
-                        self._authorize_manual_capture(
+                        preview_dispatch = self._authorize_manual_capture(
                             capture,
                             now=now,
                             model_calls=model_calls,
@@ -748,6 +813,7 @@ class DeskService:
                             state.last_session,
                             provider=capture.data_provider,
                             now=now,
+                            dispatch=preview_dispatch,
                         )
                         due_set = (due,) if due is not None else ()
                         if require_due and not due_set:
@@ -774,7 +840,11 @@ class DeskService:
                         raise
                     except (AdmissionError, HandoverError, OperationError, OSError, ValueError):
                         raise ServiceError(409, "Paper operation preview could not be verified or persisted.") from None
-                    self._cache_preview_capture(preview.preview_id, capture)
+                    self._cache_preview_capture(
+                        preview.preview_id,
+                        capture,
+                        preview.expires_at,
+                    )
                     return {
                         **preview.public_view(),
                         "confirmation_token": preview.confirmation_token,
@@ -979,7 +1049,13 @@ class DeskService:
         if model_calls > 1000:
             raise AuthorizationDenied("manual model-call bound is invalid")
         now = _utcnow()
-        self._authorize_manual_capture(capture, now=now, model_calls=model_calls)
+        dispatch = self._authorize_manual_capture(
+            capture,
+            now=now,
+            model_calls=model_calls,
+            operation=operation,
+            cancelled=cancelled,
+        )
         progress(10)
         if cancelled():
             raise JobCancelled()
@@ -1001,7 +1077,10 @@ class DeskService:
                         raise ServiceError(409, "Paper ledger head changed after review.")
                     if state.halted is not None:
                         raise ServiceError(409, "Halted funds cannot run a paper tick.")
-                    with self._make_data_client(capture.data_provider) as client:
+                    with self._make_data_client(
+                        capture.data_provider,
+                        dispatch=dispatch,
+                    ) as client:
                         due = self._next_paper_session(
                             deployed,
                             state.last_session,
@@ -1015,7 +1094,10 @@ class DeskService:
                             directory,
                             client,
                             session=session,
-                            build_fund=self._captured_fund_factory(capture),
+                            build_fund=self._captured_fund_factory(
+                                capture,
+                                dispatch,
+                            ),
                             now=lambda: now.astimezone(NEW_YORK),
                         )
         except ServiceError:
@@ -1068,6 +1150,11 @@ class DeskService:
             raise OperationError("captured mandate is invalid") from None
         if spec.name != operation.subject_id or mandate_hash(spec) != capture.mandate_digest or capture.credential_versions or capture.credential_handles:
             raise OperationError("captured runner inputs changed")
+        with self._settings_lock:
+            settings = self._runtime_settings
+            if settings.version != capture.settings_version or settings.data_provider != capture.data_provider or settings.llm_provider != capture.llm_provider or settings.model != capture.model or settings.endpoint != capture.endpoint:
+                raise OperationError("captured runner settings changed")
+            self._require_local_paper_policy(settings)
         initial_due = payload.get("initial_due_set")
         if not isinstance(initial_due, (list, tuple)) or len(initial_due) > 1 or any(not isinstance(session, str) for session in initial_due):
             raise OperationError("stored runner due-set is invalid")
@@ -1094,6 +1181,8 @@ class DeskService:
                 expires_at=_utcnow() + timedelta(minutes=max_runtime_minutes),
                 max_calls=max_calls,
                 max_resources=max_resources,
+                operation_id=operation.operation_id,
+                operation_digest=operation.request_digest,
             )
         except (OwnedRunnerError, AdmissionError, OSError, ValueError):
             raise ServiceError(409, "Owned runner could not be started safely.") from None
@@ -1124,11 +1213,20 @@ class DeskService:
         if state.halted is not None:
             raise ServiceError(409, "Halted funds cannot accept a paper operation.")
         head = latest.hash if latest is not None else None
+        preview_dispatch = self._authorize_manual_capture(
+            capture,
+            now=_utcnow(),
+            model_calls=_estimate_paper_model_calls(
+                deployed.spec,
+                len(capture.universe),
+            ),
+        )
         due = self._next_paper_session(
             deployed,
             state.last_session,
             provider=capture.data_provider,
             now=_utcnow(),
+            dispatch=preview_dispatch,
         )
         return head, (due,) if due is not None else ()
 
@@ -1140,6 +1238,7 @@ class DeskService:
         provider: str,
         now,
         data_client=None,
+        dispatch: ProviderDispatch | None = None,
     ) -> str | None:
         moment = now.astimezone(NEW_YORK)
         if deployed.spec.is_intraday:
@@ -1156,7 +1255,10 @@ class DeskService:
                 last_session,
                 now=lambda: moment,
             )
-        with self._make_data_client(provider) as client:
+        with self._make_data_client(
+            provider,
+            dispatch=dispatch,
+        ) as client:
             return next_session(
                 client,
                 deployed.spec,
@@ -1170,10 +1272,13 @@ class DeskService:
         *,
         now,
         model_calls: int,
-    ) -> None:
+        operation: OperationRecord | None = None,
+        cancelled: Callable[[], bool] | None = None,
+    ) -> ProviderDispatch | None:
         if not self.network_enabled:
             raise ServiceError(403, "Network capability is disabled for this server.")
         try:
+            breakpoints_target = KEN_FRENCH_BREAKPOINTS_TARGET
             data_target = ProviderTarget(
                 kind="data",
                 provider=capture.data_provider,
@@ -1184,32 +1289,101 @@ class DeskService:
                 model=capture.model,
                 endpoint=capture.endpoint,
             )
-            data_class = authorize_dispatch(
-                data_target,
-                scope=OperationScope.MANUAL_ONE_SHOT,
-                root_id=capture.root_id,
-                subject_id=capture.subject_id,
-                capture_digest=capture.digest,
-                now=now,
-                network_authorized=self.network_enabled,
-                upper_bound_cost=Decimal("0"),
-                resource_units=max(1, len(capture.universe)),
-            )
-            llm_class = authorize_dispatch(
+            validate_llm_transport(llm_target)
+            data_class = classify_provider(data_target)
+            llm_class = classify_provider(
                 llm_target,
-                scope=OperationScope.MANUAL_ONE_SHOT,
-                root_id=capture.root_id,
-                subject_id=capture.subject_id,
-                capture_digest=capture.digest,
-                now=now,
-                upper_bound_cost=Decimal("0"),
-                resource_units=max(1, model_calls),
                 approved_local_models={capture.model},
             )
             if data_class is not ProviderClass.FREE_DATA or llm_class is not ProviderClass.LOCAL:
                 raise AuthorizationDenied("manual paper providers are not local/free")
         except AuthorizationDenied:
             raise ServiceError(403, "Paper operations require free market data and a local model.") from None
+        if operation is None:
+            preview_calls = 10
+            preview_id = uuid4().hex
+            try:
+                return make_one_shot_dispatch(
+                    root_id=capture.root_id,
+                    subject_id=capture.subject_id,
+                    capture_digest=capture.digest,
+                    operation_id=preview_id,
+                    operation_digest=capture.digest,
+                    expires_at=now + timedelta(minutes=10),
+                    targets=(data_target,),
+                    max_calls=preview_calls,
+                    max_cost=Decimal("0"),
+                    max_resources=preview_calls,
+                    upper_bound_costs={
+                        data_target.identity: Decimal("0"),
+                    },
+                    per_target_bounds={
+                        data_target.identity: (
+                            preview_calls,
+                            Decimal("0"),
+                            preview_calls,
+                        ),
+                    },
+                    clock=_utcnow,
+                    boundary_check=lambda: self._check_preview_dispatch_fence(
+                        capture,
+                    ),
+                )
+            except AuthorizationDenied:
+                raise ServiceError(403, "Paper preview provider authorization could not be established.") from None
+        calls = min(10000, max(100, model_calls + 100 * len(capture.universe)))
+        expires_at = self._preview_expiries.get(operation.preview_id)
+        if expires_at is None:
+            raise ServiceError(409, "Paper operation deadline is unavailable; review again.")
+        targets = (
+            data_target,
+            llm_target,
+            breakpoints_target,
+        )
+        per_target_bounds = {
+            data_target.identity: (calls, Decimal("0"), calls),
+            llm_target.identity: (calls, Decimal("0"), calls),
+            breakpoints_target.identity: (1, Decimal("0"), 1),
+        }
+        max_calls = sum(bounds[0] for bounds in per_target_bounds.values())
+        max_resources = sum(bounds[2] for bounds in per_target_bounds.values())
+        try:
+            return make_one_shot_dispatch(
+                root_id=capture.root_id,
+                subject_id=capture.subject_id,
+                capture_digest=capture.digest,
+                operation_id=operation.operation_id,
+                operation_digest=operation.request_digest,
+                expires_at=expires_at,
+                targets=targets,
+                max_calls=max_calls,
+                max_cost=Decimal("0"),
+                max_resources=max_resources,
+                upper_bound_costs={target.identity: Decimal("0") for target in targets},
+                per_target_bounds=per_target_bounds,
+                approved_local_models={capture.model},
+                clock=_utcnow,
+                boundary_check=lambda: self._check_dispatch_fence(
+                    operation,
+                    capture,
+                    cancelled or (lambda: False),
+                    paper=True,
+                ),
+            )
+        except AuthorizationDenied:
+            raise ServiceError(403, "Paper provider authorization could not be established.") from None
+
+    def _check_preview_dispatch_fence(self, capture: FrozenCapture) -> None:
+        try:
+            self.root_context.revalidate()
+        except RootPathError:
+            raise AuthorizationDenied("preview root is unavailable") from None
+        if not self.network_enabled:
+            raise AuthorizationDenied("network capability is disabled")
+        with self._settings_lock:
+            settings = self._runtime_settings
+            if settings.version != capture.settings_version or settings.data_provider != capture.data_provider or settings.llm_provider != capture.llm_provider or settings.model != capture.model or settings.endpoint != capture.endpoint:
+                raise AuthorizationDenied("preview settings changed")
 
     def _require_local_paper_policy(self, settings: RuntimeSettings) -> None:
         if not self.network_enabled:
@@ -1222,6 +1396,7 @@ class DeskService:
             endpoint=settings.endpoint,
         )
         try:
+            validate_llm_transport(llm)
             data_class = classify_provider(data)
             llm_class = classify_provider(
                 llm,
@@ -1237,10 +1412,64 @@ class DeskService:
         if llm_class is not ProviderClass.LOCAL:
             raise ServiceError(422, "Paper operations require a local Ollama model endpoint.")
 
-    def _captured_fund_factory(self, capture: FrozenCapture) -> Callable[[FundSpec], Fund]:
+    def _captured_fund_factory(
+        self,
+        capture: FrozenCapture,
+        dispatch: ProviderDispatch,
+    ) -> Callable[[FundSpec], Fund]:
         if self._custom_fund_factory:
             return self._fund_factory
-        return lambda spec: self._default_fund_factory(spec, capture)
+        return lambda spec: self._default_fund_factory(
+            spec,
+            capture,
+            dispatch,
+        )
+
+    def _check_dispatch_fence(
+        self,
+        operation: OperationRecord,
+        capture: FrozenCapture,
+        cancelled: Callable[[], bool],
+        *,
+        paper: bool,
+    ) -> None:
+        if cancelled():
+            raise JobCancelled()
+        try:
+            self.root_context.revalidate()
+        except RootPathError:
+            raise AuthorizationDenied("operation root is unavailable") from None
+        if not self.network_enabled:
+            raise AuthorizationDenied("network capability is disabled")
+        with self._settings_lock:
+            settings = self._runtime_settings
+            if settings.version != capture.settings_version or settings.data_provider != capture.data_provider or settings.llm_provider != capture.llm_provider or settings.model != capture.model or settings.endpoint != capture.endpoint:
+                raise AuthorizationDenied("captured provider settings changed")
+        if capture.credential_versions:
+            if self._credential_store is None:
+                raise AuthorizationDenied("captured credentials are unavailable")
+            for provider, version in capture.credential_versions.items():
+                try:
+                    current, configured = self._credential_store.version(provider)
+                except CredentialStoreError:
+                    raise AuthorizationDenied("captured credentials are unavailable") from None
+                if current != version or not configured:
+                    raise AuthorizationDenied("captured credentials changed")
+        # Backtests use accepted capture; live mandate edits apply to later work.
+        if paper:
+            try:
+                self._verify_root_inventory()
+                directory = self._safe_child("paper", operation.subject_id)
+                deployed = load_deployed(directory)
+                state, latest = self._replay_paper_state(
+                    deployed,
+                    Ledger(directory),
+                )
+            except (HandoverError, LedgerError, OSError, RootPathError, ValueError):
+                raise AuthorizationDenied("paper operation state is unavailable") from None
+            current_head = latest.hash if latest is not None else None
+            if deployed.broker != "paper" or mandate_hash(deployed.spec) != capture.mandate_digest or tuple(deployed.universe) != capture.universe or current_head != operation.payload.get("expected_head") or state.halted is not None:
+                raise AuthorizationDenied("paper operation fence changed")
 
     def _verify_root_inventory(self) -> None:
         try:
@@ -1290,7 +1519,85 @@ class DeskService:
         errors: dict[str, str] = {}
         if positions:
             try:
-                with self._make_data_client(provider="yfinance") as client:
+                with self._settings_lock:
+                    settings = self._runtime_settings
+                    capture_settings = RuntimeSettings(
+                        data_provider="yfinance",
+                        llm_provider=settings.llm_provider,
+                        model=settings.model,
+                        endpoint=settings.endpoint,
+                        timeout_seconds=settings.timeout_seconds,
+                        parameters=settings.parameters,
+                        version=settings.version,
+                        provenance=settings.provenance,
+                    )
+                capture = freeze_capture(
+                    root=self.root_context,
+                    subject_id=normalized,
+                    mandate_digest=mandate_hash(deployed.spec),
+                    universe=tuple(deployed.universe),
+                    broker=deployed.broker,
+                    settings=capture_settings,
+                    credential_versions={},
+                    code_version=code_version(),
+                    mandate_snapshot=deployed.spec.model_dump(mode="json"),
+                )
+                operation_id = uuid4().hex
+                operation_digest = hashlib.sha256(
+                    json.dumps(
+                        {
+                            "capture": capture.digest,
+                            "expected_head": expected_head,
+                            "generation": generation,
+                            "positions": sorted(positions),
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest()
+
+                def boundary_check() -> None:
+                    if not self.network_enabled:
+                        raise AuthorizationDenied("network capability is disabled")
+                    try:
+                        self.root_context.revalidate()
+                    except RootPathError:
+                        raise AuthorizationDenied("valuation root is unavailable") from None
+                    with self._settings_lock:
+                        if self._runtime_settings.version != capture_settings.version:
+                            raise AuthorizationDenied("valuation settings changed")
+                    try:
+                        self._verify_root_inventory()
+                        _, current_deployed, _, current_state, current_latest = self._paper_state(
+                            normalized,
+                            local_paper_only=True,
+                        )
+                    except ServiceError:
+                        raise AuthorizationDenied("valuation state is unavailable") from None
+                    current_head = current_latest.hash if current_latest is not None else None
+                    if current_head != expected_head or current_state.halted is not None or mandate_hash(current_deployed.spec) != capture.mandate_digest:
+                        raise AuthorizationDenied("valuation fence changed")
+
+                data_target = ProviderTarget(kind="data", provider="yfinance")
+                dispatch = make_one_shot_dispatch(
+                    root_id=capture.root_id,
+                    subject_id=capture.subject_id,
+                    capture_digest=capture.digest,
+                    operation_id=operation_id,
+                    operation_digest=operation_digest,
+                    expires_at=_utcnow() + timedelta(minutes=10),
+                    targets=(data_target,),
+                    max_calls=MAX_VALUATION_POSITIONS * 10,
+                    max_cost=Decimal("0"),
+                    max_resources=MAX_VALUATION_POSITIONS * 10,
+                    upper_bound_costs={data_target.identity: Decimal("0")},
+                    clock=_utcnow,
+                    boundary_check=boundary_check,
+                )
+                with self._make_data_client(
+                    provider="yfinance",
+                    dispatch=dispatch,
+                ) as client:
                     for ticker in sorted(positions):
                         try:
                             quote = client.get_snapshot(ticker)
@@ -1470,8 +1777,12 @@ class DeskService:
         credential_status = self._credential_status_map()
         active_captures, active_captures_available = self._active_capture_views()
         providers = []
-        for provider in [*PROVIDER_ENV_VARS, *sorted(KEYLESS_PROVIDERS)]:
-            env_var = env_var_for(provider)
+        for provider in [
+            *PROVIDER_ENV_VARS,
+            *sorted(KEYLESS_PROVIDERS),
+            *sorted(DATA_PROVIDER_ENV_VARS),
+        ]:
+            env_var = env_var_for(provider) or DATA_PROVIDER_ENV_VARS.get(provider)
             saved = credential_status.get(
                 provider,
                 {"version": 0, "configured": False},
@@ -1490,8 +1801,26 @@ class DeskService:
             "models": model_options,
             "providers": providers,
             "data_providers": [
-                {"id": "fd", "label": "Financial Datasets"},
-                {"id": "yfinance", "label": "Yahoo Finance"},
+                {
+                    "id": "fd",
+                    "label": "Financial Datasets",
+                    "requires_key": True,
+                    "configured": credential_status.get(
+                        "fd",
+                        {"configured": False},
+                    )["configured"],
+                    "version": credential_status.get(
+                        "fd",
+                        {"version": 0},
+                    )["version"],
+                },
+                {
+                    "id": "yfinance",
+                    "label": "Yahoo Finance",
+                    "requires_key": False,
+                    "configured": True,
+                    "version": 0,
+                },
             ],
             "active_captures": active_captures,
             "active_captures_available": active_captures_available,
@@ -1618,23 +1947,88 @@ class DeskService:
             settings = self._runtime_settings
             if payload.provider != settings.data_provider or payload.model != settings.model:
                 raise ServiceError(409, "Provider or model changed; reload before previewing.")
-            self._require_local_paper_policy(settings)
-            estimated_model_calls = _estimate_backtest_calls(
+            data_target = ProviderTarget(
+                kind="data",
+                provider=settings.data_provider,
+            )
+            llm_target = ProviderTarget(
+                kind="llm",
+                provider=settings.llm_provider,
+                model=settings.model,
+                endpoint=settings.endpoint,
+            )
+            try:
+                validate_llm_transport(llm_target)
+                data_class = classify_provider(data_target)
+                llm_class = classify_provider(
+                    llm_target,
+                    approved_local_models={settings.model},
+                )
+            except AuthorizationDenied:
+                raise ServiceError(422, "Provider configuration has no guarded production transport.") from None
+            paid_targets = [
+                (target, provider_class)
+                for target, provider_class in (
+                    (data_target, data_class),
+                    (llm_target, llm_class),
+                )
+                if provider_class is ProviderClass.PAID_CLOUD
+            ]
+            if len(paid_targets) > 1:
+                raise ServiceError(422, "Only one paid provider may be authorized per backtest.")
+            if paid_targets and not payload.authorize_paid_provider:
+                raise ServiceError(403, "Paid provider use requires explicit bounded authorization.")
+            if not paid_targets and payload.authorize_paid_provider:
+                raise ServiceError(422, "Paid authorization does not match the captured providers.")
+            fd_pricing_attestation_required = any(target.kind == "data" and target.provider == "fd" for target, _provider_class in paid_targets)
+            if fd_pricing_attestation_required and not payload.confirm_fd_self_service_pricing:
+                raise ServiceError(403, "Financial Datasets dispatch requires explicit self-service pricing confirmation.")
+            if payload.confirm_fd_self_service_pricing and not fd_pricing_attestation_required:
+                raise ServiceError(422, "Financial Datasets pricing confirmation does not match the captured provider.")
+            paid_cost_model_id = None
+            if paid_targets:
+                paid_target = paid_targets[0][0]
+                paid_cost_model_id = cost_model_identity(paid_target)
+                minimum_cost = minimum_attempt_cost(paid_target)
+                if not has_verified_cost_model(paid_target) or minimum_cost is None:
+                    raise ServiceError(422, "Paid provider has no verified upper-bound cost model.")
+                if Decimal(payload.paid_max_attempt_cost_usd) < minimum_cost:
+                    raise ServiceError(422, "Per-attempt cost bound is below the provider's verified maximum.")
+            if payload.authorize_paid_provider and len(paid_targets) == 1 and paid_targets[0][0].kind == "llm" and self._custom_fund_factory:
+                raise ServiceError(403, "Injected model providers cannot authorize paid dispatch.")
+            if payload.authorize_paid_provider and len(paid_targets) == 1 and paid_targets[0][0].kind == "data" and self._data_client_factory is not None:
+                raise ServiceError(403, "Injected data providers cannot authorize paid dispatch.")
+            estimated_model_calls, estimated_llm_calls = _estimate_backtest_bounds(
                 payload.start,
                 payload.end,
                 len(universe),
                 spec,
+                local_llm_fallback=llm_class is ProviderClass.LOCAL,
             )
             if estimated_model_calls > 1000:
-                raise ServiceError(422, "Estimated local model calls exceed the 1000-call bound.")
-            provider_id = settings.llm_provider.casefold()
+                raise ServiceError(422, "Estimated model calls exceed the 1000-call bound.")
+            paid_call_bound = max(1, estimated_llm_calls) if paid_targets and paid_targets[0][0].kind == "llm" else min(10000, max(100, estimated_model_calls * 10))
+            if paid_targets:
+                if payload.paid_max_calls > paid_call_bound:
+                    raise ServiceError(422, "Paid call bound exceeds the captured operation estimate.")
+            elif settings.llm_provider not in KEYLESS_PROVIDERS:
+                raise ServiceError(403, "Paid model providers require explicit bounded authorization.")
+
             credential_versions = {}
-            if settings.llm_provider not in KEYLESS_PROVIDERS:
-                status = self._credential_status_map().get(settings.llm_provider)
+            if paid_targets:
+                target = paid_targets[0][0]
+                provider_id = target.provider.casefold()
+                status = next(
+                    (value for name, value in self._credential_status_map().items() if name.casefold() == provider_id),
+                    None,
+                )
                 if not status or not status["configured"]:
                     raise ServiceError(422, "Selected provider credential is not configured.")
                 credential_versions[provider_id] = status["version"]
             now = _utcnow()
+            operation_payload = payload.model_dump(mode="json")
+            operation_payload["cost_model_id"] = paid_cost_model_id
+            operation_payload["cost_model_version"] = COST_MODEL_VERSION if paid_cost_model_id is not None else None
             try:
                 capture = freeze_capture(
                     root=self.root_context,
@@ -1654,23 +2048,33 @@ class DeskService:
                     due_set=(),
                     capture=capture,
                     operator_session=operator_session,
-                    payload=payload.model_dump(mode="json"),
+                    payload=operation_payload,
                     now=now,
-                    expires_at=now + timedelta(minutes=10),
+                    expires_at=now + timedelta(hours=1),
                 )
             except OperationError:
                 raise ServiceError(409, "Backtest preview could not be persisted.") from None
-            self._cache_preview_capture(preview.preview_id, capture)
+            self._cache_preview_capture(
+                preview.preview_id,
+                capture,
+                preview.expires_at,
+            )
         return {
             **preview.public_view(),
             "confirmation_token": preview.confirmation_token,
             "capture": capture.public_view(current_settings_version=settings.version),
             "estimate": {
                 "maximum_model_calls": estimated_model_calls,
-                "maximum_cost_usd": 0.0 if not self._custom_fund_factory else None,
+                "paid_provider": (paid_targets[0][0].provider if paid_targets else None),
+                "maximum_paid_calls": payload.paid_max_calls if paid_targets else 0,
+                "maximum_cost_usd": (None if self._custom_fund_factory or self._data_client_factory is not None else float(Decimal(payload.paid_max_cost_usd)) if paid_targets else 0.0),
+                "maximum_attempt_cost_usd": (None if self._custom_fund_factory or self._data_client_factory is not None else float(Decimal(payload.paid_max_attempt_cost_usd)) if paid_targets else 0.0),
+                "cost_model_id": paid_cost_model_id,
+                "cost_model_version": (COST_MODEL_VERSION if paid_cost_model_id is not None else None),
+                "cost_model": (cost_model_description(paid_targets[0][0]) if paid_targets else None),
                 "market_data_provider": settings.data_provider,
             },
-            "warnings": ["No paid provider calls are enabled." if not self._custom_fund_factory else "Injected test providers only; no live provider call is authorized."],
+            "warnings": (["Injected test providers only; no live provider call is authorized."] if self._custom_fund_factory or self._data_client_factory is not None else [f"Each paid attempt reserves its declared cap before transport. Cost model: {cost_model_description(paid_targets[0][0])}"] if paid_targets else ["No paid provider calls are enabled."]),
         }
 
     def accept_operation(
@@ -1821,10 +2225,25 @@ class DeskService:
             raise OperationError("captured mandate snapshot is invalid") from None
         if spec.name != operation.subject_id or mandate_hash(spec) != capture.mandate_digest or spec.broker != "paper":
             raise OperationError("captured mandate is stale")
+        model_calls, llm_calls = _estimate_backtest_bounds(
+            request.start,
+            request.end,
+            len(capture.universe),
+            spec,
+            local_llm_fallback=False,
+        )
+        dispatch = self._backtest_dispatch(
+            operation,
+            capture,
+            request,
+            model_calls,
+            llm_calls,
+            cancelled,
+        )
         if self._custom_fund_factory:
             fund = self._fund_factory(spec)
         else:
-            fund = self._default_fund_factory(spec, capture)
+            fund = self._default_fund_factory(spec, capture, dispatch)
 
         def on_valuation(index: int, total: int, _value) -> None:
             if cancelled():
@@ -1832,7 +2251,12 @@ class DeskService:
             percent = int(100 * (index + 1) / total) if total > 0 else 0
             progress(min(99, max(0, percent)))
 
-        with self._make_data_client(capture.data_provider) as data_client:
+        data_key = self._captured_data_key(capture)
+        with self._make_data_client(
+            capture.data_provider,
+            dispatch=dispatch,
+            api_key=data_key,
+        ) as data_client:
             result = backtest_fund(
                 fund,
                 request.start,
@@ -1858,16 +2282,183 @@ class DeskService:
             "capture_digest": capture.digest,
         }
 
+    def _backtest_dispatch(
+        self,
+        operation: OperationRecord,
+        capture: FrozenCapture,
+        request: BacktestRequest,
+        model_calls: int,
+        llm_calls: int,
+        cancelled: Callable[[], bool],
+    ) -> ProviderDispatch:
+        if type(model_calls) is not int or model_calls <= 0 or type(llm_calls) is not int or not 0 <= llm_calls <= model_calls:
+            raise OperationError("captured model-call estimate is invalid")
+        breakpoints_target = KEN_FRENCH_BREAKPOINTS_TARGET
+        data_target = ProviderTarget(
+            kind="data",
+            provider=capture.data_provider,
+        )
+        llm_target = ProviderTarget(
+            kind="llm",
+            provider=capture.llm_provider,
+            model=capture.model,
+            endpoint=capture.endpoint,
+        )
+        try:
+            validate_llm_transport(llm_target)
+            data_class = classify_provider(data_target)
+            llm_class = classify_provider(
+                llm_target,
+                approved_local_models={capture.model},
+            )
+        except AuthorizationDenied:
+            raise OperationError("captured provider transport is unavailable") from None
+        paid_targets = [
+            (target, provider_class)
+            for target, provider_class in (
+                (data_target, data_class),
+                (llm_target, llm_class),
+            )
+            if provider_class is ProviderClass.PAID_CLOUD
+        ]
+        if len(paid_targets) > 1 or bool(paid_targets) != request.authorize_paid_provider:
+            raise OperationError("captured paid authorization does not match providers")
+        fd_pricing_attestation_required = any(target.kind == "data" and target.provider == "fd" for target, _provider_class in paid_targets)
+        if request.confirm_fd_self_service_pricing != fd_pricing_attestation_required:
+            raise OperationError("captured Financial Datasets pricing confirmation does not match")
+        if paid_targets:
+            paid_target = paid_targets[0][0]
+            expected_cost_model = cost_model_identity(paid_target)
+            minimum_cost = minimum_attempt_cost(paid_target)
+            if not has_verified_cost_model(paid_target) or expected_cost_model is None or request.cost_model_id != expected_cost_model or request.cost_model_version != COST_MODEL_VERSION or minimum_cost is None or Decimal(request.paid_max_attempt_cost_usd) < minimum_cost:
+                raise OperationError("captured paid cost model is unavailable")
+        expiry = self._preview_expiries.get(operation.preview_id)
+        if expiry is None:
+            raise OperationError("operation deadline is unavailable")
+        if llm_class is ProviderClass.LOCAL:
+            model_calls += llm_calls
+            llm_calls *= 2
+        if model_calls > 1000:
+            raise OperationError("captured model-call estimate exceeds its bound")
+        free_call_bound = min(
+            10000,
+            max(100, model_calls + 100 * len(capture.universe), llm_calls),
+        )
+        per_target_bounds = {}
+        upper_bound_costs = {}
+        paid_cost = Decimal("0")
+        if paid_targets:
+            paid_target, _paid_class = paid_targets[0]
+            paid_calls = request.paid_max_calls
+            per_call = Decimal(request.paid_max_attempt_cost_usd)
+            paid_cost = Decimal(request.paid_max_cost_usd)
+            paid_call_bound = max(1, llm_calls) if paid_target.kind == "llm" else min(10000, max(100, model_calls * 10))
+            if paid_calls is None or paid_calls > paid_call_bound or paid_cost <= 0 or per_call <= 0 or per_call > paid_cost:
+                raise OperationError("captured paid budget is invalid")
+            for target in (
+                data_target,
+                llm_target,
+                breakpoints_target,
+            ):
+                if target.identity == paid_target.identity:
+                    per_target_bounds[target.identity] = (
+                        paid_calls,
+                        paid_cost,
+                        paid_calls,
+                    )
+                    upper_bound_costs[target.identity] = per_call
+                elif target.identity == breakpoints_target.identity:
+                    per_target_bounds[target.identity] = (
+                        1,
+                        Decimal("0"),
+                        1,
+                    )
+                    upper_bound_costs[target.identity] = Decimal("0")
+                else:
+                    per_target_bounds[target.identity] = (
+                        free_call_bound,
+                        Decimal("0"),
+                        free_call_bound,
+                    )
+                    upper_bound_costs[target.identity] = Decimal("0")
+        else:
+            for target in (
+                data_target,
+                llm_target,
+                breakpoints_target,
+            ):
+                if target.identity == breakpoints_target.identity:
+                    per_target_bounds[target.identity] = (
+                        1,
+                        Decimal("0"),
+                        1,
+                    )
+                else:
+                    per_target_bounds[target.identity] = (
+                        free_call_bound,
+                        Decimal("0"),
+                        free_call_bound,
+                    )
+                upper_bound_costs[target.identity] = Decimal("0")
+        if sum(bounds[0] for bounds in per_target_bounds.values()) > 20000:
+            raise OperationError("operation transport-call bound exceeds its limit")
+        try:
+            return make_one_shot_dispatch(
+                root_id=capture.root_id,
+                subject_id=capture.subject_id,
+                capture_digest=capture.digest,
+                operation_id=operation.operation_id,
+                operation_digest=operation.request_digest,
+                expires_at=expiry,
+                targets=(
+                    data_target,
+                    llm_target,
+                    breakpoints_target,
+                ),
+                max_calls=sum(bounds[0] for bounds in per_target_bounds.values()),
+                max_cost=paid_cost,
+                max_resources=sum(bounds[2] for bounds in per_target_bounds.values()),
+                upper_bound_costs=upper_bound_costs,
+                per_target_bounds=per_target_bounds,
+                approved_local_models={capture.model},
+                clock=_utcnow,
+                boundary_check=lambda: self._check_dispatch_fence(
+                    operation,
+                    capture,
+                    cancelled,
+                    paper=False,
+                ),
+            )
+        except AuthorizationDenied:
+            raise OperationError("provider authorization could not be established") from None
+
+    def _captured_data_key(self, capture: FrozenCapture) -> str | None:
+        if capture.data_provider not in {"fd"}:
+            return None
+        version = capture.credential_versions.get("fd")
+        if version is None or self._credential_store is None:
+            raise OperationError("captured data credential is unavailable")
+        try:
+            value = self._credential_store.read_version("fd", version)
+        except CredentialStoreError:
+            raise OperationError("captured data credential is unavailable") from None
+        if not isinstance(value, str) or not value:
+            raise OperationError("captured data credential is unavailable")
+        return value
+
     def _cache_preview_capture(
         self,
         preview_id: str,
         capture: FrozenCapture,
+        expires_at: datetime,
     ) -> None:
         while len(self._preview_captures) >= 1000:
             oldest_preview_id = next(iter(self._preview_captures))
             old_capture_id = self._preview_captures.pop(oldest_preview_id)
+            self._preview_expiries.pop(oldest_preview_id, None)
             self._captures.pop(old_capture_id, None)
         self._preview_captures[preview_id] = capture.capture_id
+        self._preview_expiries[preview_id] = expires_at
         self._captures[capture.capture_id] = capture
 
     @staticmethod
@@ -2291,10 +2882,13 @@ class DeskService:
         self,
         spec: FundSpec,
         capture: FrozenCapture | None = None,
+        dispatch: ProviderDispatch | None = None,
     ) -> Fund:
         cache = PromptCache(self._safe_child("cache", "llm"))
         if capture is None:
             return Fund(spec, blind=True, cache=cache)
+        if not isinstance(dispatch, ProviderDispatch):
+            raise AuthorizationDenied("captured LLM dispatch authorization is required")
 
         def llm_factory(_model_spec):
             provider_key = capture.llm_provider.casefold()
@@ -2310,19 +2904,47 @@ class DeskService:
                 api_key=api_key,
                 endpoint=capture.endpoint,
                 use_environment=False,
+                dispatch=dispatch,
             )
 
-        return Fund(spec, blind=True, cache=cache, llm_factory=llm_factory)
+        return Fund(
+            spec,
+            blind=True,
+            cache=cache,
+            llm_factory=llm_factory,
+            breakpoints_dispatch=dispatch,
+        )
 
     @contextmanager
-    def _make_data_client(self, provider: str | None = None) -> Iterator[object]:
+    def _make_data_client(
+        self,
+        provider: str | None = None,
+        *,
+        dispatch: ProviderDispatch | None = None,
+        api_key: str | None = None,
+    ) -> Iterator[object]:
+        if not self.network_enabled or not isinstance(dispatch, ProviderDispatch):
+            raise AuthorizationDenied("provider operation authorization is required")
+        selected_provider = data_provider(self._runtime_settings.data_provider if provider is None else provider)
         if self._data_client_factory is not None:
+            if not isinstance(dispatch, ProviderDispatch):
+                raise AuthorizationDenied("provider operation authorization is required")
+            target = ProviderTarget(kind="data", provider=selected_provider)
+            url = "https://api.financialdatasets.ai/" if selected_provider == "fd" else "https://query1.finance.yahoo.com/"
             with self._data_client_factory() as client:
-                yield client
+                yield _DispatchGuardedInjectedDataClient(
+                    client,
+                    dispatch,
+                    target,
+                    url,
+                )
             return
         cache = self._ensure_dir("cache")
-        selected_provider = self._runtime_settings.data_provider if provider is None else provider
-        with make_data_client(provider=selected_provider) as client:
+        with make_data_client(
+            provider=selected_provider,
+            dispatch=dispatch,
+            api_key=api_key,
+        ) as client:
             yield CachedDataClient(client, cache_dir=cache)
 
     def _runner_state(self, name: str) -> dict:
@@ -2444,13 +3066,14 @@ class DeskService:
             raise ServiceError(403, "Offline root enrollment is unavailable.")
 
     def _credential_status_map(self) -> dict[str, dict[str, int | bool]]:
+        provider_ids = {provider.casefold() for provider in (*PROVIDER_ENV_VARS, *DATA_PROVIDER_ENV_VARS)}
         if self._credential_store is None:
-            return {provider: {"version": 0, "configured": False} for provider in PROVIDER_ENV_VARS}
+            return {provider: {"version": 0, "configured": False} for provider in provider_ids}
         try:
             return self._credential_store.status()
         except CredentialStoreError:
             self._settings_error = "private-credentials-unavailable"
-            return {provider: {"version": 0, "configured": False} for provider in PROVIDER_ENV_VARS}
+            return {provider: {"version": 0, "configured": False} for provider in provider_ids}
 
     def _active_capture_views(self) -> tuple[list[dict[str, object]], bool]:
         if self._operation_store is None:
@@ -2567,7 +3190,7 @@ def _credential_provider(value: str) -> str:
     if not isinstance(value, str):
         raise ServiceError(422, "Provider is not an allowlisted credential provider.")
     provider = next(
-        (name for name in PROVIDER_ENV_VARS if name.casefold() == value.casefold()),
+        (name for name in (*PROVIDER_ENV_VARS, *DATA_PROVIDER_ENV_VARS) if name.casefold() == value.casefold()),
         None,
     )
     if provider is None:
@@ -2591,12 +3214,14 @@ def _is_loopback_endpoint(value: str | None) -> bool:
         return False
 
 
-def _estimate_backtest_calls(
+def _estimate_backtest_bounds(
     start_text: str,
     end_text: str,
     universe_size: int,
     spec: FundSpec,
-) -> int:
+    *,
+    local_llm_fallback: bool,
+) -> tuple[int, int]:
     try:
         start = date.fromisoformat(start_text)
         end = date.fromisoformat(end_text)
@@ -2606,15 +3231,30 @@ def _estimate_backtest_calls(
         raise ServiceError(422, "Backtest date range exceeds its bound.")
     if type(universe_size) is not int or not 1 <= universe_size <= 20:
         raise ServiceError(422, "Backtest universe exceeds its bound.")
+    if not isinstance(spec, FundSpec) or type(local_llm_fallback) is not bool:
+        raise ServiceError(422, "Backtest model-call estimate is invalid.")
     weekdays = sum(1 for offset in range((end - start).days + 1) if (start + timedelta(days=offset)).weekday() < 5)
-    agent_count = sum(len(strategy.models) for strategy in spec.strategies)
-    return weekdays * universe_size * max(1, agent_count)
+    try:
+        model_calls, llm_calls = model_call_bounds(
+            spec,
+            local_llm_fallback=local_llm_fallback,
+        )
+    except ValueError:
+        raise ServiceError(422, "Backtest model-call estimate is invalid.") from None
+    return weekdays * universe_size * model_calls, weekdays * universe_size * llm_calls
 
 
 def _estimate_paper_model_calls(spec: FundSpec, universe_size: int) -> int:
     if not isinstance(spec, FundSpec) or type(universe_size) is not int or not 1 <= universe_size <= 25:
         raise ServiceError(422, "Paper model-call estimate is invalid.")
-    calls = universe_size * sum(len(strategy.models) for strategy in spec.strategies) * 2
+    try:
+        model_calls, _llm_calls = model_call_bounds(
+            spec,
+            local_llm_fallback=True,
+        )
+    except ValueError:
+        raise ServiceError(422, "Paper model-call estimate is invalid.") from None
+    calls = universe_size * model_calls * 2
     if type(calls) is not int or not 1 <= calls <= 1000:
         raise ServiceError(422, "Paper model-call estimate exceeds the 1000-call bound.")
     return calls
@@ -2630,9 +3270,10 @@ def _runner_limits(
     if not isinstance(spec, FundSpec) or type(universe_size) is not int or not 1 <= universe_size <= 25 or type(max_sessions) is not int or not 1 <= max_sessions <= 100 or type(max_runtime_minutes) is not int or not 1 <= max_runtime_minutes <= 1440:
         raise ServiceError(422, "Finite runner bounds are invalid.")
     model_calls = _estimate_paper_model_calls(spec, universe_size)
-    max_calls = max_runtime_minutes + 1 + max_sessions * 2
-    max_resources = (max_runtime_minutes + 1) * universe_size + max_sessions * (2 * universe_size + model_calls)
-    if not 1 <= max_calls <= 10000 or not 1 <= max_resources <= 1_000_000:
+    calls_per_session = model_calls + 40 * universe_size + 20
+    max_calls = 2 * max_runtime_minutes + 1 + max_sessions * calls_per_session
+    max_resources = max_calls
+    if not 1 <= max_calls <= 1_000_000 or not 1 <= max_resources <= 1_000_000:
         raise ServiceError(422, "Finite runner resource estimate exceeds its bound.")
     return max_calls, max_resources
 

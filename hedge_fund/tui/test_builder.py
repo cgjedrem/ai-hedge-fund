@@ -146,6 +146,7 @@ def test_builder_paper_mode_builds_a_live_fund_and_refuses_taken_names():
             assert "alpha is live." in render(screen.query_one("#done-summary", Static).content)
             menu = screen.query_one("#done-menu", OptionList)
             assert [menu.get_option_at_index(i).id for i in range(menu.option_count)] == ["go-run", "go-back"]
+            assert menu.get_option("go-run").disabled
             deployed = load_deployed(paths.PAPER_DIR / "alpha")
             saved = load_spec(paths.MANDATES_DIR / "alpha.yaml")
             assert deployed.universe == ["TEST", "MSFT"] and deployed.spec == saved
@@ -273,10 +274,10 @@ def test_builder_minute_path_sets_interval_and_window_and_offers_start_running()
             await pilot.pause()
             assert screen.query_one("#panes", ContentSwitcher).current == "step-done"
             menu = screen.query_one("#done-menu", OptionList)
-            assert render(menu.get_option_at_index(0).prompt).strip() == "▶  Run its first session"  # same as daily
+            assert render(menu.get_option_at_index(0).prompt).strip() == "First session via explicit-root CLI or web desk"
             summary = render(screen.query_one("#done-summary", Static).content)
             assert "every 30s · 09:00–12:00 ET" in summary
-            assert "marks the book at the current bar" in summary and "leave a runner on it" in summary
+            assert "marks the book at the current bar" in summary and "Unattended runners are disabled" in summary
             saved = load_spec(paths.MANDATES_DIR / "fast.yaml")
             assert saved.rebalance == "minute" and saved.interval == 0.5
             assert saved.window.start == "09:00" and saved.window.end == "12:00"
@@ -365,7 +366,7 @@ def test_builder_replaces_a_taken_name_only_after_yes_and_only_at_the_end():
     asyncio.run(scenario())
 
 
-def test_builder_paper_mode_run_its_first_session_opens_the_approval_step(monkeypatch):
+def test_builder_first_session_requires_cli_or_web_authorization(monkeypatch):
     monkeypatch.setattr(paper, "make_data_client", lambda: Mock(__enter__=lambda s: s, __exit__=lambda s, *a: None))
     monkeypatch.setattr(paper, "next_session", lambda data, benchmark, last: "2025-01-21")
     for variable in ("FINANCIAL_DATASETS_API_KEY", "TYPESAFE_API_KEY"):
@@ -389,18 +390,11 @@ def test_builder_paper_mode_run_its_first_session_opens_the_approval_step(monkey
             screen.query_one("#tickers-input", Input).value = "TEST"
             await pilot.press("enter")
             await pilot.pause()
-            await pilot.press("enter")  # "Run its first session"
+            menu = screen.query_one("#done-menu", OptionList)
+            assert menu.get_option("go-run").disabled
+            assert "Unattended runners are disabled" in render(screen.query_one("#done-summary", Static).content)
+            await pilot.press("enter")
             await pilot.pause()
-            await pilot.pause()
-            modal = app.screen
-            assert isinstance(modal, paper.RunConfirmScreen)
-            body = render(modal.query_one("#run-body", Static).content)
-            assert "Mark the book at the 2025-01-21 close.  No trades." in body and "first decision" in body
-            await pilot.press("escape")
-            fund_list = app.screen
-            assert isinstance(fund_list, paper.PaperScreen)
-            rail = fund_list.query_one("#paper-menu", OptionList)
-            assert rail.get_option_at_index(rail.highlighted).id == "paper:0"
-            assert not isinstance(app.screen_stack[-2], builder.BuilderScreen)  # the builder was switched out
+            assert app.screen is screen
 
     asyncio.run(scenario())

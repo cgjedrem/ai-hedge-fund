@@ -23,6 +23,7 @@ from hedge_fund import paths
 from hedge_fund.brokers.costs import TradingCosts
 from hedge_fund.llm.cache import PromptCache
 from hedge_fund.risk.limits import RiskLimits
+from hedge_fund.runtime.dispatch import ProviderDispatch
 from hedge_fund.signals import ALPHA_MODEL_REGISTRY, get_investment_approach, LLMAgent
 from hedge_fund.signals.base import AlphaModel
 
@@ -40,7 +41,7 @@ EARLIEST_WINDOW = "04:00"
 LATEST_WINDOW = "20:00"
 SAXO_REGULAR_OPEN = "09:30"
 SAXO_LAST_BAR = "15:59"
-_RUNTIME_MODEL_PARAMS = frozenset({"breakpoints", "cache", "llm"})
+_RUNTIME_MODEL_PARAMS = frozenset({"breakpoints", "breakpoints_dispatch", "cache", "llm"})
 
 
 def _json_value(value: Any) -> bool:
@@ -97,6 +98,7 @@ def _validate_model_params(name: str, params: dict[str, Any]) -> dict[str, Any]:
     model_type = ALPHA_MODEL_REGISTRY.get(name)
     if model_type is None or not _json_value(params):
         raise ValueError("model constructor parameters are invalid")
+    is_llm = issubclass(model_type, LLMAgent)
     try:
         constructor = inspect.signature(model_type.__init__)
     except (TypeError, ValueError):
@@ -114,6 +116,8 @@ def _validate_model_params(name: str, params: dict[str, Any]) -> dict[str, Any]:
             }
             or not _matches_parameter_type(value, parameter.annotation)
         ):
+            raise ValueError("model constructor parameters are invalid")
+        if key == "samples" and is_llm and value < 1:
             raise ValueError("model constructor parameters are invalid")
     return params
 
@@ -346,6 +350,33 @@ class FundSpec(BaseModel):
         return f"every {format_interval(self.interval_seconds)}"
 
 
+def model_call_bounds(
+    spec: FundSpec,
+    *,
+    local_llm_fallback: bool = False,
+) -> tuple[int, int]:
+    """Maximum model and LLM requests; local fallback reserves one extra request."""
+    if not isinstance(spec, FundSpec) or type(local_llm_fallback) is not bool:
+        raise ValueError("model-call estimate is invalid")
+    model_calls = 0
+    llm_calls = 0
+    multiplier = 2 if local_llm_fallback else 1
+    for strategy in spec.strategies:
+        for model in strategy.models:
+            model_type = ALPHA_MODEL_REGISTRY.get(model.name)
+            if model_type is None:
+                raise ValueError("model-call estimate is invalid")
+            if issubclass(model_type, LLMAgent):
+                samples = model.params.get("samples", 1)
+                if type(samples) is not int or samples < 1:
+                    raise ValueError("model-call estimate is invalid")
+                model_calls += samples * multiplier
+                llm_calls += samples * multiplier
+            else:
+                model_calls += 1
+    return model_calls, llm_calls
+
+
 def format_interval(seconds: int) -> str:
     """`30s`, `5m`, `1h`, `1h30m`, `2m30s` — the shortest honest spelling."""
     hours, rest = divmod(seconds, 3600)
@@ -442,9 +473,15 @@ class Fund:
         *,
         cache: PromptCache | None = None,
         llm_factory: Callable[[ModelSpec], object] | None = None,
+        breakpoints_dispatch: ProviderDispatch | None = None,
     ) -> None:
         if llm_factory is not None and not callable(llm_factory):
             raise ValueError("LLM factory must be callable")
+        if breakpoints_dispatch is not None and not isinstance(
+            breakpoints_dispatch,
+            ProviderDispatch,
+        ):
+            raise ValueError("breakpoints provider authorization is invalid")
         self.spec = spec
         self.strategies: list[tuple[StrategySpec, list[AlphaModel]]] = []
         for strategy in spec.strategies:
@@ -462,5 +499,10 @@ class Fund:
                     params = {**params, "cache": cache}
                 if llm_factory is not None and is_llm:
                     params = {**params, "llm": llm_factory(m)}
+                if breakpoints_dispatch is not None and is_llm:
+                    params = {
+                        **params,
+                        "breakpoints_dispatch": breakpoints_dispatch,
+                    }
                 staff.append(cls(**params))
             self.strategies.append((strategy, staff))

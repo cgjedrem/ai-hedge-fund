@@ -96,6 +96,8 @@ class OwnedRunnerManager:
         expires_at: datetime,
         max_calls: int,
         max_resources: int,
+        operation_id: str,
+        operation_digest: str,
     ) -> dict[str, object]:
         name, _key = _fund_key(fund)
         try:
@@ -109,6 +111,8 @@ class OwnedRunnerManager:
                     expires_at=expires_at,
                     max_calls=max_calls,
                     max_resources=max_resources,
+                    operation_id=operation_id,
+                    operation_digest=operation_digest,
                 )
         except AdmissionError:
             raise OwnedRunnerError("runner deployment admission is unavailable") from None
@@ -124,6 +128,8 @@ class OwnedRunnerManager:
         expires_at: datetime,
         max_calls: int,
         max_resources: int,
+        operation_id: str,
+        operation_digest: str,
     ) -> dict[str, object]:
         name, key = _fund_key(fund)
         if not isinstance(capture, FrozenCapture) or capture.subject_id != name:
@@ -132,10 +138,14 @@ class OwnedRunnerManager:
             raise OwnedRunnerError("runner requires a local-paper capture")
         if type(max_sessions) is not int or not 1 <= max_sessions <= _MAX_SESSIONS:
             raise OwnedRunnerError("runner session bound is invalid")
-        if type(max_calls) is not int or not 1 <= max_calls <= 10000:
+        if type(max_calls) is not int or not 1 <= max_calls <= 1_000_000:
             raise OwnedRunnerError("runner call bound is invalid")
         if type(max_resources) is not int or not 1 <= max_resources <= 1_000_000:
             raise OwnedRunnerError("runner resource bound is invalid")
+        if not isinstance(operation_id, str) or not re.fullmatch(r"[a-f0-9]{32}", operation_id):
+            raise OwnedRunnerError("runner operation identity is invalid")
+        if not isinstance(operation_digest, str) or not _SHA256.fullmatch(operation_digest):
+            raise OwnedRunnerError("runner operation digest is invalid")
         if expected_head is not None and (not isinstance(expected_head, str) or not _SHA256.fullmatch(expected_head)):
             raise OwnedRunnerError("runner ledger head is invalid")
         if not isinstance(initial_due_set, tuple) or len(initial_due_set) > 1:
@@ -192,6 +202,8 @@ class OwnedRunnerManager:
                 "max_sessions": max_sessions,
                 "max_calls": max_calls,
                 "max_resources": max_resources,
+                "operation_id": operation_id,
+                "operation_digest": operation_digest,
             },
         }
         state = {

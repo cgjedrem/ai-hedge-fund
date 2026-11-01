@@ -1,7 +1,8 @@
 import os
 import threading
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -16,8 +17,10 @@ from hedge_fund.paper.deployed import load_deployed
 from hedge_fund.paper.ledger import Ledger
 from hedge_fund.pipeline.session import code_version, mandate_hash, SessionRecord
 from hedge_fund.runtime.configuration import RuntimeSettings
+from hedge_fund.runtime.dispatch import make_one_shot_dispatch
 from hedge_fund.runtime.handover import record_ledger_head
 from hedge_fund.runtime.owned_runner import read_runner_record, runner_key
+from hedge_fund.runtime.policy import AuthorizationDenied, BudgetDenied, ProviderTarget
 from hedge_fund.test_support.handover import enroll_synthetic_root
 from hedge_fund.web.schemas import (
     DeployRequest,
@@ -185,6 +188,63 @@ def test_reviewed_manual_tick_executes_one_session_with_local_fakes(
     assert after == [*before, due_session]
     assert snapshot["last_session"] == due_session
     assert len(data_client.calls) > 0
+
+
+def test_injected_data_client_reserves_each_call_before_fake(demo_root):
+    data_client = _OfflineDataClient()
+    factory_calls = []
+    service = DeskService(
+        demo_root,
+        allow_writes=True,
+        network_enabled=True,
+        data_client_factory=lambda: factory_calls.append("factory") or data_client,
+    )
+    target = ProviderTarget(kind="data", provider="yfinance")
+    now = datetime.now(timezone.utc)
+    dispatch = make_one_shot_dispatch(
+        root_id="synthetic-root",
+        subject_id="demo-quality",
+        capture_digest="a" * 64,
+        operation_id="operation-1",
+        operation_digest="b" * 64,
+        expires_at=now + timedelta(minutes=5),
+        targets=(target,),
+        max_calls=1,
+        max_cost=Decimal("0"),
+        max_resources=1,
+        upper_bound_costs={target.identity: Decimal("0")},
+        clock=lambda: now,
+        resolver=lambda _host, _port: ["8.8.8.8"],
+    )
+    try:
+        with pytest.raises(AuthorizationDenied):
+            with service._make_data_client(provider="yfinance"):
+                pytest.fail("fake client factory ran without operation authority")
+        assert factory_calls == []
+
+        with service._make_data_client(
+            provider="yfinance",
+            dispatch=dispatch,
+        ) as guarded:
+            result = guarded.get_prices(
+                "AAPL",
+                "2024-06-03",
+                "2024-06-03",
+            )
+            with pytest.raises(BudgetDenied):
+                guarded.get_prices(
+                    "AAPL",
+                    "2024-06-04",
+                    "2024-06-04",
+                )
+    finally:
+        service.close()
+
+    authorization = dispatch._one_shot[target.identity]
+    assert result
+    assert factory_calls == ["factory"]
+    assert len(data_client.calls) == 1
+    assert authorization.calls_reserved == 1
 
 
 def test_manual_tick_denies_runner_lane_conflict_without_ledger_change(demo_root):

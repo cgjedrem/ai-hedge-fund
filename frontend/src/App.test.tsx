@@ -1212,14 +1212,26 @@ describe("local desk screens", () => {
       network: true,
       mutation_token: "review-test-token",
     };
+    const paidSettings: Settings = {
+      ...settings,
+      model: "gemma3:4b",
+      llm_provider: "Ollama",
+      models: [{ label: "Gemma 3 4B", id: "gemma3:4b", provider: "Ollama" }],
+      data_provider: "fd",
+    };
     const payload = {
       fund: "demo-quality",
       universe: ["AAPL"],
       start: "2026-10-01",
       end: "2026-10-30",
-      provider: "yfinance",
-      model: "provider/model",
+      provider: "fd",
+      model: "gemma3:4b",
       mandate_hash: mandates.items[0].mandate_hash,
+      authorize_paid_provider: true,
+      confirm_fd_self_service_pricing: true,
+      paid_max_calls: 10,
+      paid_max_cost_usd: "5.00",
+      paid_max_attempt_cost_usd: "0.25",
     };
     const preview: OperationPreview = {
       preview_id: "c".repeat(32),
@@ -1236,8 +1248,12 @@ describe("local desk screens", () => {
       capture: { model: payload.model },
       estimate: {
         maximum_model_calls: 2,
-        maximum_cost_usd: 0,
-        market_data_provider: "yfinance",
+        paid_provider: "fd",
+        maximum_paid_calls: 10,
+        maximum_cost_usd: 5,
+        maximum_attempt_cost_usd: 0.25,
+        cost_model: "Financial Datasets self-service rates",
+        market_data_provider: "fd",
       },
       warnings: [],
     };
@@ -1256,8 +1272,8 @@ describe("local desk screens", () => {
       progress: 0,
       id: "1".repeat(32),
       fund: "demo-quality",
-      provider: "yfinance",
-      model: "provider/model",
+      provider: "fd",
+      model: "gemma3:4b",
       report_id: null,
       error: null,
       cancel_requested: false,
@@ -1268,12 +1284,20 @@ describe("local desk screens", () => {
     installApi({
       caps: writeCaps,
       override: (path, method, body) => {
+        if (path === "/api/settings" && method === "GET") {
+          return { payload: paidSettings };
+        }
         if (path === "/api/operations/preview" && method === "POST") {
           previewCount += 1;
           expect(body).toMatchObject({
             action: "backtest",
             subject_id: "demo-quality",
             expected_head: mandates.items[0].mandate_hash,
+            payload: expect.objectContaining({
+              provider: "fd",
+              authorize_paid_provider: true,
+              confirm_fd_self_service_pricing: true,
+            }),
           });
           return { payload: preview, status: 201 };
         }
@@ -1303,9 +1327,14 @@ describe("local desk screens", () => {
 
     await user.type(await screen.findByLabelText("Ticker universe"), "AAPL");
     const reviewButton = screen.getByRole("button", { name: "Review backtest" });
+    expect(reviewButton).toBeDisabled();
+    await user.click(screen.getByLabelText(/I deliberately authorize this paid provider/));
+    expect(reviewButton).toBeDisabled();
+    await user.click(screen.getByLabelText(/I confirm this account uses public Financial Datasets self-service pricing/));
     await waitFor(() => expect(reviewButton).toBeEnabled());
     await user.click(reviewButton);
     expect(await screen.findByRole("heading", { name: "Confirm reviewed backtest" })).toBeInTheDocument();
+    expect(screen.getByText("Self-service; custom Enterprise pricing unsupported")).toBeInTheDocument();
     expect(previewCount).toBe(1);
     expect(acceptCount).toBe(0);
 

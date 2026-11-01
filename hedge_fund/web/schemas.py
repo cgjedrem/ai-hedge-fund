@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from datetime import date
+from decimal import Decimal
 from typing import Any, Literal
 
 from pydantic import (
@@ -13,6 +14,7 @@ from pydantic import (
     field_validator,
     model_validator,
     SecretStr,
+    StrictBool,
     StrictFloat,
     StrictInt,
 )
@@ -73,6 +75,19 @@ class BacktestRequest(RequestModel):
     provider: str = Field(pattern=r"^[a-z0-9_-]{1,32}$")
     model: str = Field(min_length=1, max_length=120)
     mandate_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    authorize_paid_provider: StrictBool = False
+    confirm_fd_self_service_pricing: StrictBool = False
+    cost_model_id: str | None = Field(default=None, pattern=r"^[a-z0-9._-]{1,64}$")
+    cost_model_version: str | None = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}-v\d+$")
+    paid_max_calls: StrictInt | None = Field(default=None, ge=1, le=10000)
+    paid_max_cost_usd: str | None = Field(
+        default=None,
+        pattern=r"^(?:0|[1-9]\d{0,2})(?:\.\d{1,6})?$",
+    )
+    paid_max_attempt_cost_usd: str | None = Field(
+        default=None,
+        pattern=r"^(?:0|[1-9]\d{0,1})(?:\.\d{1,6})?$",
+    )
 
     @field_validator("universe")
     @classmethod
@@ -91,6 +106,22 @@ class BacktestRequest(RequestModel):
             raise ValueError("end must not precede start")
         if (end - start).days > 730:
             raise ValueError("backtest range cannot exceed 730 calendar days")
+        budget_values = (
+            self.paid_max_calls,
+            self.paid_max_cost_usd,
+            self.paid_max_attempt_cost_usd,
+        )
+        if self.authorize_paid_provider:
+            if any(value is None for value in budget_values):
+                raise ValueError("paid authorization requires finite call and cost bounds")
+            total_cost = Decimal(self.paid_max_cost_usd)
+            attempt_cost = Decimal(self.paid_max_attempt_cost_usd)
+            if total_cost <= 0 or attempt_cost <= 0 or attempt_cost > total_cost or total_cost > Decimal("100") or attempt_cost > Decimal("10"):
+                raise ValueError("paid authorization cost bounds are outside the allowed range")
+        elif any(value is not None for value in budget_values):
+            raise ValueError("paid cost bounds require explicit paid authorization")
+        if self.confirm_fd_self_service_pricing and (not self.authorize_paid_provider or self.provider != "fd"):
+            raise ValueError("Financial Datasets pricing confirmation does not match the request")
         return self
 
 

@@ -78,6 +78,11 @@ export function BacktestsPage() {
     return isoDate(date);
   });
   const [end, setEnd] = useState(() => isoDate(new Date()));
+  const [authorizePaid, setAuthorizePaid] = useState(false);
+  const [confirmFdSelfServicePricing, setConfirmFdSelfServicePricing] = useState(false);
+  const [paidMaxCalls, setPaidMaxCalls] = useState("10");
+  const [paidMaxCost, setPaidMaxCost] = useState("5.00");
+  const [paidMaxAttemptCost, setPaidMaxAttemptCost] = useState("0.25");
   const [busy, setBusy] = useState(false);
   const [cancelling, setCancelling] = useState(false);
   const [confirmation, setConfirmation] = useState<OperationPreview | null>(null);
@@ -91,10 +96,42 @@ export function BacktestsPage() {
   const activeOperation = currentOperation.data?.id === operationId ? currentOperation.data : null;
   const selectedMandate = mandates.data?.items.find((item) => item.name === fund) ?? null;
   const selectedModel = settings.data?.models.find((item) => item.id === settings.data?.model) ?? null;
+  const paidProviderNames = [
+    ...(settings.data?.data_provider === "fd" ? ["Financial Datasets"] : []),
+    ...(settings.data && settings.data.llm_provider !== "Ollama" ? [settings.data.llm_provider] : []),
+  ];
+  const paidOperation = paidProviderNames.length > 0;
+  const minimumAttemptCost = settings.data?.data_provider === "fd"
+    ? 0.16
+    : selectedModel?.provider === "TypeSafe" && selectedModel.id === "jev-1.13.0"
+      ? 0.002688
+      : paidOperation ? Number.POSITIVE_INFINITY : 0;
+  const costModelDescription = settings.data?.data_provider === "fd"
+    ? "Financial Datasets public self-service maximum, including the 8× Credits premium multiplier; custom Enterprise pricing is unsupported."
+    : selectedModel?.provider === "TypeSafe" && selectedModel.id === "jev-1.13.0"
+      ? "Jev 1.13.0 published input-token rate with a 64K context ceiling; output tokens free; 1 MiB local request cap."
+      : "No verified paid cost model; this provider is denied.";
+  const paidBudgetValid =
+    /^\d+$/.test(paidMaxCalls)
+    && Number(paidMaxCalls) >= 1
+    && Number(paidMaxCalls) <= 10000
+    && /^(?:0|[1-9]\d{0,2})(?:\.\d{1,6})?$/.test(paidMaxCost)
+    && Number(paidMaxCost) > 0
+    && Number(paidMaxCost) <= 100
+    && /^(?:0|[1-9]\d{0,1})(?:\.\d{1,6})?$/.test(paidMaxAttemptCost)
+    && Number(paidMaxAttemptCost) > 0
+    && Number(paidMaxAttemptCost) >= minimumAttemptCost
+    && Number(paidMaxAttemptCost) <= 10
+    && Number(paidMaxAttemptCost) <= Number(paidMaxCost);
   const running = Boolean(
     activeOperation
     && ["accepted", "running", "cancel-requested"].includes(activeOperation.status),
   );
+
+  useEffect(() => {
+    setAuthorizePaid(false);
+    setConfirmFdSelfServicePricing(false);
+  }, [settings.data?.data_provider, settings.data?.llm_provider, settings.data?.model, settings.data?.version]);
 
   useEffect(() => {
     if (!activeOperation || !["accepted", "running", "cancel-requested"].includes(activeOperation.status)) return;
@@ -171,6 +208,18 @@ export function BacktestsPage() {
       setError("Mandate and provider settings must finish loading before confirmation.");
       return;
     }
+    if (paidProviderNames.length > 1) {
+      setError("This operation selects two paid providers. Choose a free data provider or local model.");
+      return;
+    }
+    if (settings.data.data_provider === "fd" && !confirmFdSelfServicePricing) {
+      setError("Confirm that the Financial Datasets account uses public self-service pricing.");
+      return;
+    }
+    if (paidOperation && (!authorizePaid || !paidBudgetValid)) {
+      setError("Explicitly authorize the paid provider with valid per-attempt and total bounds.");
+      return;
+    }
     const payload = {
       fund,
       universe,
@@ -179,6 +228,17 @@ export function BacktestsPage() {
       provider: settings.data.data_provider,
       model: settings.data.model,
       mandate_hash: selectedMandate.mandate_hash,
+      authorize_paid_provider: paidOperation && authorizePaid,
+      ...(settings.data.data_provider === "fd"
+        ? { confirm_fd_self_service_pricing: confirmFdSelfServicePricing }
+        : {}),
+      ...(paidOperation
+        ? {
+            paid_max_calls: Number(paidMaxCalls),
+            paid_max_cost_usd: paidMaxCost,
+            paid_max_attempt_cost_usd: paidMaxAttemptCost,
+          }
+        : {}),
     };
     setBusy(true);
     try {
@@ -250,7 +310,7 @@ export function BacktestsPage() {
       <PageHeader
         eyebrow="Research / backtests"
         title="Backtest operations"
-        description="Review a bounded historical research operation. External data access requires explicit startup write and network capabilities."
+        description="Review a bounded historical research operation. Paid providers require per-operation consent and a finite transport budget."
         actions={<Button asChild variant="secondary"><Link to="/research">Saved reports <ArrowRight className="h-3.5 w-3.5" /></Link></Button>}
       />
       {error ? <Alert tone="danger" className="mb-5"><AlertCircle className="mr-2 inline h-4 w-4" />{error}</Alert> : null}
@@ -291,7 +351,7 @@ export function BacktestsPage() {
               <div className="space-y-2 sm:col-span-2">
                 <Label htmlFor="backtest-universe">Ticker universe</Label>
                 <Input id="backtest-universe" value={universeText} onChange={(event) => setUniverseText(event.target.value)} placeholder="AAPL, MSFT, SPY" disabled={!canRun || running} />
-                <p className="text-[10px] text-muted-foreground">Up to 20 unique symbols · local model-call estimate is bounded before acceptance.</p>
+                <p className="text-[10px] text-muted-foreground">Up to 20 unique symbols · model-call estimate is bounded before acceptance.</p>
               </div>
               <div className="space-y-2">
                 <Label htmlFor="backtest-start">Start date</Label>
@@ -302,7 +362,53 @@ export function BacktestsPage() {
                 <Input id="backtest-end" type="date" value={end} onChange={(event) => setEnd(event.target.value)} disabled={!canRun || running} />
               </div>
             </div>
-            <Button className="w-full" onClick={() => void requestConfirmation()} disabled={!canRun || busy || mandates.loading || settings.loading || !selectedMandate || !selectedModel || running}>
+            {paidOperation ? (
+              <div className="space-y-3 rounded-lg border border-warning/40 bg-warning/5 p-4">
+                <div>
+                  <p className="text-xs font-semibold text-foreground">Paid provider authorization</p>
+                  <p className="mt-1 text-[10px] leading-relaxed text-muted-foreground">
+                    Selected provider: <span className="mono">{paidProviderNames[0] ?? "unknown"}</span>.
+                    {` ${costModelDescription} Each transport reserves the declared attempt cap before I/O.`}
+                  </p>
+                </div>
+                <label className="flex items-start gap-2 text-xs text-foreground">
+                  <input
+                    type="checkbox"
+                    checked={authorizePaid}
+                    onChange={(event) => setAuthorizePaid(event.target.checked)}
+                    disabled={!canRun || running}
+                  />
+                  I deliberately authorize this paid provider for this reviewed backtest.
+                </label>
+                {settings.data?.data_provider === "fd" ? (
+                  <label className="flex items-start gap-2 text-xs text-foreground">
+                    <input
+                      type="checkbox"
+                      checked={confirmFdSelfServicePricing}
+                      onChange={(event) => setConfirmFdSelfServicePricing(event.target.checked)}
+                      disabled={!canRun || running}
+                    />
+                    I confirm this account uses public Financial Datasets self-service pricing, not custom Enterprise rates.
+                  </label>
+                ) : null}
+                <div className="grid gap-3 sm:grid-cols-3">
+                  <div className="space-y-1">
+                    <Label htmlFor="paid-max-calls">Maximum paid calls</Label>
+                    <Input id="paid-max-calls" type="number" min="1" max="10000" step="1" value={paidMaxCalls} onChange={(event) => setPaidMaxCalls(event.target.value)} disabled={!canRun || running} />
+                  </div>
+                  <div className="space-y-1">
+                    <Label htmlFor="paid-max-attempt">Worst-case / attempt ($)</Label>
+                    <Input id="paid-max-attempt" type="number" min="0.000001" max="10" step="0.01" value={paidMaxAttemptCost} onChange={(event) => setPaidMaxAttemptCost(event.target.value)} disabled={!canRun || running} />
+                  </div>
+                  <div className="space-y-1">
+                    <Label htmlFor="paid-max-cost">Total operation cap ($)</Label>
+                    <Input id="paid-max-cost" type="number" min="0.000001" max="100" step="0.01" value={paidMaxCost} onChange={(event) => setPaidMaxCost(event.target.value)} disabled={!canRun || running} />
+                  </div>
+                </div>
+                <p className="text-[10px] text-muted-foreground">Bounds: at most 10,000 calls, $10 per attempt, and $100 total. Per-attempt minimum: ${minimumAttemptCost.toFixed(6)}. Paid automatic retries are denied.</p>
+              </div>
+            ) : null}
+            <Button className="w-full" onClick={() => void requestConfirmation()} disabled={!canRun || busy || mandates.loading || settings.loading || !selectedMandate || !selectedModel || running || (paidOperation && (!authorizePaid || !paidBudgetValid)) || (settings.data?.data_provider === "fd" && !confirmFdSelfServicePricing) || paidProviderNames.length > 1}>
               <FlaskConical className="h-3.5 w-3.5" /> Review backtest
             </Button>
           </CardContent>
@@ -395,7 +501,7 @@ export function BacktestsPage() {
           <DialogHeader>
             <DialogTitle>Confirm reviewed backtest</DialogTitle>
             <DialogDescription>
-            Accept the exact captured configuration, source head and finite local call estimate.
+            Accept the exact captured configuration, source head, provider and finite transport budget.
             </DialogDescription>
           </DialogHeader>
           {confirmation ? (
@@ -412,7 +518,14 @@ export function BacktestsPage() {
                 <ConfirmationValue label="Tickers" value={confirmation.payload.universe.join(", ")} />
                 <ConfirmationValue label="Date range" value={`${confirmation.payload.start} → ${confirmation.payload.end}`} />
                 <ConfirmationValue label="Max model calls" value={String(confirmation.estimate.maximum_model_calls)} />
-                <ConfirmationValue label="Max cost" value={confirmation.estimate.maximum_cost_usd === null ? "Test-only provider" : `$${confirmation.estimate.maximum_cost_usd.toFixed(2)}`} />
+                {confirmation.payload.confirm_fd_self_service_pricing ? (
+                  <ConfirmationValue label="FD pricing tier" value="Self-service; custom Enterprise pricing unsupported" />
+                ) : null}
+                <ConfirmationValue label="Paid provider" value={confirmation.estimate.paid_provider ?? "None"} />
+                <ConfirmationValue label="Max paid calls" value={String(confirmation.estimate.maximum_paid_calls ?? 0)} />
+                <ConfirmationValue label="Max cost" value={`$${(confirmation.estimate.maximum_cost_usd ?? 0).toFixed(6)}`} />
+                <ConfirmationValue label="Worst-case / attempt" value={`$${(confirmation.estimate.maximum_attempt_cost_usd ?? 0).toFixed(6)}`} />
+                <ConfirmationValue label="Cost model" value={confirmation.estimate.cost_model ?? "None"} />
                 <ConfirmationValue label="Expires" value={dateLabel(confirmation.expires_at)} />
               </dl>
               <div className="grid gap-2 sm:grid-cols-2" aria-label="Required startup capabilities">
@@ -420,7 +533,7 @@ export function BacktestsPage() {
                 <CapabilityBadge label="Network capability" enabled={capabilities?.network === true} />
               </div>
               <p className="text-[10px] leading-relaxed text-muted-foreground">
-                Preview token stays in page memory. Production web backtests allow free market data and local Ollama only; paid and cloud models are denied.
+                Preview token stays in page memory. Paid authorization binds to this capture, cost model and displayed deadline. Each attempt reserves its declared cap before dispatch.
               </p>
             </div>
           ) : null}

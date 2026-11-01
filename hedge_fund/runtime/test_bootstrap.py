@@ -175,8 +175,9 @@ def test_cache_defaults_follow_configured_root(owned_test_process, tmp_path):
         "assert prompt_cache.get('synthetic')['prompt'] == 'test'\n"
         "context.file_info('cache/llm/synthetic.json')\n"
         "csv = '202401,100,' + ','.join(str(i) for i in range(1, 21))\n"
-        "assert load_breakpoints(fetch=lambda: csv).latest_month == '202401'\n"
-        "assert load_breakpoints(fetch=lambda: (_ for _ in ()).throw(AssertionError())).latest_month == '202401'\n"
+        "paths.write_text(DEFAULT_CACHE_PATH, csv)\n"
+        "assert load_breakpoints().latest_month == '202401'\n"
+        "assert load_breakpoints().latest_month == '202401'\n"
         "context.file_info('cache/breakpoints/ME_Breakpoints.csv')\n"
         "context.close()\n"
     )

@@ -28,6 +28,8 @@ def test_runner_authorization_accepts_frozen_authorization_record():
         "max_sessions": 1,
         "max_calls": 4,
         "max_resources": 8,
+        "operation_id": "c" * 32,
+        "operation_digest": "d" * 64,
     }
 
     authorization = _runner_authorization(raw, capture)
@@ -39,6 +41,8 @@ def test_runner_authorization_accepts_frozen_authorization_record():
     assert authorization.max_sessions == 1
     assert authorization.max_calls == 4
     assert authorization.max_resources == 8
+    assert authorization.operation_id == "c" * 32
+    assert authorization.operation_digest == "d" * 64
 
 
 def test_runner_record_validators_require_timezone_aware_timestamps(tmp_path):

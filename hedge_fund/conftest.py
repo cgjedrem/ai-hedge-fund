@@ -8,7 +8,14 @@ from pathlib import Path
 
 import pytest
 
-from hedge_fund.test_support.network_guard import child_test_environment, cleanup_test_root, configure_test_environment, CREDENTIAL_ENV_VARS, prepare_test_output_root, PROXY_ENV_VARS
+from hedge_fund.test_support.network_guard import (
+    child_test_environment,
+    cleanup_test_root,
+    configure_test_environment,
+    CREDENTIAL_ENV_VARS,
+    prepare_test_output_root,
+    PROXY_ENV_VARS,
+)
 
 _REPOSITORY = Path(__file__).resolve().parent.parent
 _OUTPUTS = prepare_test_output_root(_REPOSITORY / "outputs")
@@ -67,13 +74,7 @@ def owned_test_process():
 
 
 @pytest.fixture(autouse=True)
-def _no_breakpoints_download(monkeypatch):
-    """No breakpoint downloads without an injected table."""
-
-    def refuse():
-        raise RuntimeError("inject MEBreakpoints; downloads disabled")
-
-    monkeypatch.setattr(breakpoints, "load_breakpoints", refuse)
+def _clear_breakpoints_cache(monkeypatch):
     monkeypatch.setattr(breakpoints, "_shared", None)
 
 

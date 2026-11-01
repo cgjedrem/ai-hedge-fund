@@ -4,15 +4,8 @@ Any class with these methods can be used as a data provider throughout
 the v2 pipeline. No inheritance required — Python's structural typing
 handles the rest.
 
-Example::
-
-    class YFinanceClient:
-        def get_prices(self, ticker, start_date, end_date, **kwargs):
-            # fetch from yfinance, return list[Price]
-            ...
-
-    # Works anywhere the pipeline expects a DataClient
-    client: DataClient = YFinanceClient()
+Local/fake implementations fit. Protocol conformance grants no network
+authority; production providers require operation-bound transport guards.
 """
 
 from __future__ import annotations

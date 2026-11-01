@@ -51,17 +51,23 @@ from hedge_fund.data.protocol import DataClient
 from hedge_fund.features.breakpoints import MEBreakpoints, shared_breakpoints
 from hedge_fund.features.intraday import build_intraday_context
 from hedge_fund.features.news import build_news_context
-from hedge_fund.features.snapshot import FundamentalsSnapshot, InsufficientData, build_snapshot
+from hedge_fund.features.snapshot import (
+    build_snapshot,
+    FundamentalsSnapshot,
+    InsufficientData,
+)
 from hedge_fund.llm import (
+    extract_json,
     LLMCallError,
     LLMClient,
-    PromptCache,
-    extract_json,
     make_llm,
     prompt_key,
+    PromptCache,
     salted_key,
 )
 from hedge_fund.models import Signal
+from hedge_fund.runtime.dispatch import ProviderDispatch
+from hedge_fund.runtime.policy import AuthorizationDenied
 from hedge_fund.signals.base import AlphaModel
 
 logger = logging.getLogger(__name__)
@@ -79,6 +85,7 @@ class LLMAgent(AlphaModel):
         cache: PromptCache | None = None,
         blind: bool = False,
         breakpoints: MEBreakpoints | None = None,
+        breakpoints_dispatch: ProviderDispatch | None = None,
         news: bool = False,
         samples: int = 1,
         temperature: float | None = None,
@@ -97,6 +104,12 @@ class LLMAgent(AlphaModel):
         # blind; live runs don't and never touch the breakpoints.
         self._blind = blind
         self._breakpoints = breakpoints
+        if breakpoints_dispatch is not None and not isinstance(
+            breakpoints_dispatch,
+            ProviderDispatch,
+        ):
+            raise AuthorizationDenied("breakpoints provider authorization is invalid")
+        self._breakpoints_dispatch = breakpoints_dispatch
         # Daily funds can read the week's headlines under the fundamentals
         # (features/news.py). Intraday bars get the day so far instead, and
         # blind backtests get neither: headlines name events a model could
@@ -168,6 +181,8 @@ class LLMAgent(AlphaModel):
 
             try:
                 response = self._llm.complete(system, user)
+            except AuthorizationDenied:
+                raise
             except Exception as exc:
                 if isinstance(exc, LLMCallError) and exc.diagnostic_record is not None:
                     self._cache.put(key, {**record, "call_error": str(exc),
@@ -218,7 +233,9 @@ class LLMAgent(AlphaModel):
         breakpoints = None
         if self._blind:
             if self._breakpoints is None:
-                self._breakpoints = shared_breakpoints()
+                self._breakpoints = shared_breakpoints(
+                    self._breakpoints_dispatch,
+                )
             breakpoints = self._breakpoints
         return build_snapshot(ticker, date, data_client, breakpoints=breakpoints)
 

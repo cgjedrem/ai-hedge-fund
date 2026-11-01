@@ -42,25 +42,25 @@ def test_settings_precedence_uses_launch_environment_persisted_and_free_default(
     defaults = resolve_settings(root_context)
     persisted = resolve_settings(
         root_context,
-        persisted={"data_provider": "fd", "model": "persisted-model"},
+        persisted={"data_provider": "fd", "model": "gpt-6-sol"},
     )
     environment = resolve_settings(
         root_context,
-        environment={"data_provider": "yfinance", "model": "environment-model"},
-        persisted={"data_provider": "fd", "model": "persisted-model"},
+        environment={"data_provider": "yfinance", "model": "gemma3:4b"},
+        persisted={"data_provider": "fd", "model": "gpt-6-sol"},
     )
     launch = resolve_settings(
         root_context,
-        launch={"model": "launch-model"},
-        environment={"data_provider": "yfinance", "model": "environment-model"},
-        persisted={"data_provider": "fd", "model": "persisted-model"},
+        launch={"model": "jev-1.13.0"},
+        environment={"data_provider": "yfinance", "model": "gemma3:4b"},
+        persisted={"data_provider": "fd", "model": "gpt-6-sol"},
     )
 
     assert defaults.data_provider == "yfinance"
     assert persisted.data_provider == "fd"
-    assert environment.model == "environment-model"
+    assert environment.model == "gemma3:4b"
     assert environment.data_provider == "yfinance"
-    assert launch.model == "launch-model"
+    assert launch.model == "jev-1.13.0"
     assert launch.provenance["model"] == "launch"
     assert launch.provenance["data_provider"] == "environment"
 
@@ -112,7 +112,10 @@ def test_context_size_requires_an_ollama_model(root_context):
     with pytest.raises(ConfigurationError):
         resolve_settings(
             root_context,
-            launch={"parameters": {"context_size": 8192}},
+            launch={
+                "model": "gpt-6-sol",
+                "parameters": {"context_size": 8192},
+            },
         )
 
 
@@ -177,7 +180,19 @@ def test_runtime_provider_catalog_matches_engine_registry():
 
     assert configuration.DEFAULT_MODEL == DEFAULT_MODEL
     assert set(configuration._PROVIDERS.values()) == SUPPORTED_PROVIDERS
-    assert configuration._MODEL_PROVIDERS == {model: provider for _, model, provider in load_api_models()}
+    assert configuration._MODEL_PROVIDERS == {model: provider for _, model, provider in load_api_models() if provider in SUPPORTED_PROVIDERS}
+
+
+def test_cloud_ollama_models_are_not_selectable_or_resolvable(root_context):
+    from hedge_fund.llm.registry import load_api_models
+
+    models = {model for _, model, _provider in load_api_models()}
+    assert not any(model.endswith(":cloud") for model in models)
+    with pytest.raises(ConfigurationError, match="supported catalog"):
+        resolve_settings(
+            root_context,
+            launch={"model": "glm-5.3:cloud"},
+        )
 
 
 def test_environment_cannot_elevate_root_writes_network_or_paid_policy(root_context, tmp_path):
@@ -218,7 +233,7 @@ def test_persisted_settings_versions_are_monotonic_and_compare_and_swap(root_con
     initial = load_settings(root_context)
     first = save_settings(
         root_context,
-        {"data_provider": "fd", "model": "persisted-model"},
+        {"data_provider": "fd", "model": "gpt-6-sol"},
         expected_version=initial.version,
         admission=root_owner,
     )
@@ -243,13 +258,13 @@ def test_persisted_settings_versions_are_monotonic_and_compare_and_swap(root_con
     )
     assert second.version == 2
     assert second.data_provider == "yfinance"
-    assert second.model == "persisted-model"
+    assert second.model == "gpt-6-sol"
 
 
 def test_frozen_capture_copies_versions_and_redacts_private_references(root_context):
     settings = resolve_settings(
         root_context,
-        launch={"data_provider": "yfinance", "model": "local-model"},
+        launch={"data_provider": "yfinance", "model": "gemma3:4b"},
     )
     versions = {"openai": 4}
     universe = ["AAA", "BBB"]
@@ -274,7 +289,7 @@ def test_frozen_capture_copies_versions_and_redacts_private_references(root_cont
         capture.credential_versions["openai"] = 6
 
     public = capture.public_view()
-    assert public["model"] == "local-model"
+    assert public["model"] == "gemma3:4b"
     assert "credential_versions" not in public
     assert "credential_material" not in public
     assert "mandate_digest" not in public
@@ -342,7 +357,7 @@ def test_capture_rejects_casefolded_duplicate_credential_providers(root_context)
 def test_child_environment_isolated_and_root_bound(root_context, tmp_path):
     settings = resolve_settings(
         root_context,
-        launch={"data_provider": "yfinance", "model": "local-model"},
+        launch={"data_provider": "yfinance", "model": "gemma3:4b"},
     )
     decoy_root = tmp_path / "decoy-root"
     inherited = {
@@ -370,7 +385,7 @@ def test_child_environment_isolated_and_root_bound(root_context, tmp_path):
     assert child["TEMP"] == child["TMP"]
     assert child["PYTHON_DOTENV_DISABLED"] == "1"
     assert child["HEDGE_FUND_DATA_PROVIDER"] == "yfinance"
-    assert child["HEDGE_FUND_LLM_MODEL"] == "local-model"
+    assert child["HEDGE_FUND_LLM_MODEL"] == "gemma3:4b"
     assert child["PATH"] == "synthetic-path"
     assert child["SystemRoot"] == "synthetic-system-root"
     if os.name == "nt":

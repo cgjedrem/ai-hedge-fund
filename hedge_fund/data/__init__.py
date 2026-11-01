@@ -2,6 +2,8 @@
 
 import os
 
+import httpx
+
 from hedge_fund.data.cached import CachedDataClient
 from hedge_fund.data.client import FDClient, FDClientError
 from hedge_fund.data.models import (
@@ -18,6 +20,7 @@ from hedge_fund.data.models import (
 )
 from hedge_fund.data.protocol import DataClient, DataClientError
 from hedge_fund.data.yfinance_client import YFinanceClient
+from hedge_fund.runtime.dispatch import ProviderDispatch
 
 __all__ = [
     "CachedDataClient",
@@ -61,14 +64,33 @@ def data_provider(provider: str | None = None) -> str:
     raise ValueError(f"unsupported {source}")
 
 
-def make_data_client(provider: str | None = None) -> DataClient:
+def make_data_client(
+    provider: str | None = None,
+    *,
+    dispatch: ProviderDispatch | None = None,
+    api_key: str | None = None,
+    inner_transport: httpx.BaseTransport | None = None,
+) -> DataClient:
     """Construct configured provider.
 
     yfinance is free and not point-in-time. fd is paid and filing-date filtered.
+    Provider I/O requires operation-bound dispatch; no-dispatch clients are inert.
     """
+    if dispatch is not None and not isinstance(dispatch, ProviderDispatch):
+        raise ValueError("provider dispatch is invalid")
+    if inner_transport is not None and not isinstance(inner_transport, httpx.BaseTransport):
+        raise ValueError("inner HTTP transport is invalid")
     selected = data_provider(provider)
     if selected == "fd":
-        return FDClient()
+        return FDClient(
+            api_key=api_key,
+            dispatch=dispatch,
+            inner_transport=inner_transport,
+        )
     if selected == "yfinance":
-        return YFinanceClient()
+        if inner_transport is not None:
+            raise ValueError("the selected provider does not support an HTTP transport")
+        if api_key is not None:
+            raise ValueError("the selected data provider does not use a credential")
+        return YFinanceClient(dispatch=dispatch)
     raise AssertionError("normalized data provider is unsupported")

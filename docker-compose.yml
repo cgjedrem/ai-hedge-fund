@@ -4,14 +4,13 @@
 #     export AIHF_DATA_ROOT="$PWD/.aihf-demo-data"
 #     mkdir -p "$AIHF_DATA_ROOT"
 #
-#   One bounded local paper tick (explicit profile):
-#     docker compose --profile runner run --rm runner
+#   Runner profiles are opt-in. The base bridge profile has no network
+#   authorization; use the Linux override for the supported host-local model.
 #
 #   Interactive TUI:
 #     docker compose run --rm tui
 #
-# Runner profiles use local Ollama and free Yahoo data. No runner starts by
-# default.
+# Provider calls stay disabled by default. `OLLAMA_BASE_URL` is not a setting.
 #
 # On Linux, use the docker-compose.linux.yml networking override.
 
@@ -20,7 +19,6 @@ services:
     profiles: ["runner"]
     build: .
     environment:
-      - OLLAMA_BASE_URL=http://host.docker.internal:11434
       - HEDGE_FUND_LLM_MODEL=gemma3:4b
       - HEDGE_FUND_DATA_PROVIDER=yfinance
     volumes:
@@ -34,7 +32,6 @@ services:
     profiles: ["runner-weekly"]
     build: .
     environment:
-      - OLLAMA_BASE_URL=http://host.docker.internal:11434
       - HEDGE_FUND_LLM_MODEL=gemma3:4b
       - HEDGE_FUND_DATA_PROVIDER=yfinance
     volumes:
@@ -49,8 +46,6 @@ services:
     build: .
     stdin_open: true
     tty: true
-    environment:
-      - OLLAMA_BASE_URL=http://host.docker.internal:11434
     volumes:
       - type: bind
         source: "${AIHF_DATA_ROOT:?Set AIHF_DATA_ROOT to an existing absolute data root}"

@@ -30,12 +30,19 @@ PROVIDER_ENV_VARS = {
 # Providers that need no API key — local or self-hosted runtimes.
 KEYLESS_PROVIDERS = frozenset({"Ollama"})
 
-# Providers v2 has a client for (see client.py:make_llm). Anything in the
-# registry but missing here is shown in the picker and not selectable — better
-# a greyed row than a run that dies on an id the transport rejects.
-SUPPORTED_PROVIDERS = frozenset(PROVIDER_ENV_VARS) | KEYLESS_PROVIDERS
+# Providers with a production transport guarded at the HTTP boundary.
+SUPPORTED_PROVIDERS = frozenset(
+    {
+        "OpenAI",
+        "xAI",
+        "DeepSeek",
+        "Kimi",
+        "TypeSafe",
+        "Ollama",
+    }
+)
 
-_FALLBACK = ("Opus 5.5", "claude-opus-5-5", "Anthropic")
+_FALLBACK = ("Gemma 3 4B", "gemma3:4b", "Ollama")
 
 
 def load_api_models() -> list[tuple[str, str, str]]:

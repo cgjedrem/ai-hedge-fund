@@ -47,12 +47,13 @@ aihf --root $env:AIHF_ROOT
 
 ### API keys
 
-The app stores user state under the selected root. It needs:
+The selected root stores credentials and non-secret settings:
 
-- Market data defaults to credential-free Yahoo Finance. A [Financial Datasets](https://financialdatasets.ai) API key is needed only when explicitly selecting paid provider `fd`.
-- One model API key for the selected cloud investor provider — or Ollama, which runs locally and needs no key.
+- Market data defaults to credential-free Yahoo Finance.
+- Models default to local Ollama. A [Financial Datasets](https://financialdatasets.ai) key or cloud-model key is needed only for a supported paid one-shot.
 
-Keys exported in your shell always win over the saved file.
+Shell API-key variables are not credential inputs. Provider/model settings may
+select a target, but credentials or environment settings never authorize calls.
 
 ### Market data
 
@@ -62,6 +63,20 @@ set; no provider extra is required.
 Financial Datasets is an explicit paid provider selected with
 `HEDGE_FUND_DATA_PROVIDER=fd`. Yahoo fundamentals are reported as of now,
 not point-in-time; backtests using Yahoo data can leak future information.
+
+CLI provider calls require `--enable-network` on that invocation. Paid CLI
+one-shots and web backtests also require explicit provider approval, finite
+call/cost limits, and a deadline. Financial Datasets additionally requires
+explicit confirmation of its published self-service pricing; custom Enterprise
+pricing is unsupported. The web desk permits paid providers only for reviewed
+backtests; manual paper actions and scheduled runners are free-data, local-model
+only. The TUI does not dispatch provider calls.
+
+Verified paid dispatch currently covers Financial Datasets self-service data
+and TypeSafe Jev 1.13.0 model calls. Other cloud-model providers lack verified
+cost bounds and are denied before transport, even when a key is saved.
+Only one paid provider can be authorized per operation; combining paid
+Financial Datasets with TypeSafe in one action is unsupported.
 
 ## How to Run
 
@@ -75,6 +90,9 @@ With no arguments, this launches the interactive terminal app. It has two modes:
 
 - **Paper trading** — your funds, each with a ledger of market days and paper money. Highlight a fund to review its next run; use `y`/`n` for gated decisions, `s` for history, and `h`/`r` for halt/resume. Sessions live in the selected root's `paper/<name>/`.
 - **Backtesting** — replay a fund over history and compare its equity curve with a benchmark. Results live in the selected root's `research/`; mandates live in `mandates/` and carry no tickers.
+
+Provider dispatch is disabled in the TUI; use the guarded CLI or web desk for
+provider-backed actions.
 
 ### Local React desk
 
@@ -155,16 +173,22 @@ poetry run aihf-web --root "$AIHF_ROOT" --allow-writes --enable-network
 
 Use those flags only when intentionally submitting local changes or historical
 provider requests. Reviewed web backtests permit free Yahoo data and local
-Ollama only. Explicit valuation refresh also requires both capabilities and
+Ollama by default; paid backtests require explicit per-operation approval and
+finite limits. Financial Datasets additionally requires a separate account-tier
+confirmation for public self-service pricing; custom Enterprise pricing is
+unsupported. Explicit valuation refresh also requires both capabilities and
 uses free Yahoo quotes; page loads never fetch. Exchange-print freshness is
-unverified. Runner start/stop, manual runs, deletion, ledger redo, and paid
-market-data calls remain unavailable in the web desk. See the
+unverified. Manual paper actions and scheduled runners permit only free Yahoo
+data and local Ollama. Paid/cloud runner operations fail closed. Deletion and
+ledger redo remain unavailable in the web desk. See the
 [TUI parity checklist](specs/004-react-web-ui/parity-checklist.md) for all
 supported and deferred workflows.
 
 Backtests show a confirmation of the provider, model, agent count, tickers and
-date range before submission. There are no automatic retries. Cancellation is
-cooperative at valuation boundaries; closing the browser does not cancel a job.
+date range before submission. Provider-level HTTP retries are disabled;
+configured model samples are separate calls and consume the operation's finite
+authorization. Cancellation is cooperative at valuation boundaries; closing
+the browser does not cancel a job.
 Server shutdown requests cancellation and waits for active work, including any
 report write already in progress.
 
@@ -187,8 +211,7 @@ mkdir -p "$AIHF_DATA_ROOT"
 ```
 
 Do not publish this port on a non-loopback interface. On Linux, the override keeps the same loopback port
-mapping and adds an explicit host-gateway alias for an Ollama workflow that a
-user separately enables:
+mapping. The web observer remains read-only and does not access host Ollama:
 
 ```bash
 docker compose -f docker-compose.yml -f docker-compose.linux.yml --profile web up --build web
@@ -205,7 +228,7 @@ Override cadence for a backtest or when creating a paper fund; the mandate
 file stays unchanged:
 
 ```bash
-aihf --root "$AIHF_ROOT" backtest "$AIHF_ROOT/mandates/example.yaml" --universe AAPL,MSFT --rebalance monthly
+aihf --root "$AIHF_ROOT" --enable-network backtest "$AIHF_ROOT/mandates/example.yaml" --universe AAPL,MSFT --rebalance monthly
 aihf --root "$AIHF_ROOT" paper create alpha --mandate "$AIHF_ROOT/mandates/example.yaml" --universe AAPL,MSFT --rebalance daily
 ```
 
@@ -219,7 +242,7 @@ builder, or `--approval` at CLI creation:
 ```bash
 aihf --root "$AIHF_ROOT" paper create alpha --mandate "$AIHF_ROOT/mandates/example.yaml" --universe AAPL,MSFT --approval
 aihf --root "$AIHF_ROOT" paper approve alpha             # queue approval for the next session
-aihf --root "$AIHF_ROOT" paper approve alpha --now       # execute now if a session is due
+aihf --root "$AIHF_ROOT" --enable-network paper approve alpha --now  # execute now if a session is due
 aihf --root "$AIHF_ROOT" paper reject alpha
 ```
 
@@ -237,29 +260,28 @@ their next decision period. The gate is separate from the kill switch:
 
 ### Docker
 
-Containers require an explicit host data root. Compose runner profiles use
-local Ollama and free Yahoo data; no runner starts by default.
+Containers require an explicit host data root. Runner profiles are opt-in.
+Provider calls require explicit CLI network enablement; the base bridge profile
+does not enable it.
 
 ```bash
 docker build -t aihf .
 export AIHF_DATA_ROOT="$PWD/.aihf-demo-data"
 mkdir -p "$AIHF_DATA_ROOT"
 
-# Interactive TUI (needs a terminal). Image binds its root to /data:
+# Offline TUI (needs a terminal). Image binds its root to /data:
 docker run -it --rm -v "$AIHF_DATA_ROOT:/data" aihf
 
-# One bounded local tick for an existing demo-alpha paper fund:
-docker run --rm -v "$AIHF_DATA_ROOT:/data" \
-    -e OLLAMA_BASE_URL=http://host.docker.internal:11434 \
-    -e HEDGE_FUND_LLM_MODEL=gemma3:4b \
-    -e HEDGE_FUND_DATA_PROVIDER=yfinance \
-    aihf --model gemma3:4b paper tick demo-alpha
+# Linux only: one bounded free-data/local-model tick for an existing fund.
+docker compose -f docker-compose.yml -f docker-compose.linux.yml --profile runner run --rm runner
 ```
 
-Compose paper-tick profiles are opt-in and use generic example subjects:
+The Linux override supplies the supported local endpoint and explicit network
+flag. `host.docker.internal` and `OLLAMA_BASE_URL` are not accepted provider
+configuration. On other Docker hosts, use the native CLI with
+`--enable-network` and a supported literal-loopback local model endpoint.
 
 ```bash
-docker compose --profile runner run --rm runner
 docker compose run --rm tui
 docker compose --profile web up --build web
 ```
@@ -267,24 +289,21 @@ docker compose --profile web up --build web
 The web profile mounts the same root read-only. Rebuild only the selected
 service after code changes. Do not run one paper fund from multiple processes.
 
-#### Using Ollama models in the container
+#### Local models in containers
 
-The local `gemma3:4b` model runs on the host's Ollama — inside a container,
-`localhost` is the container itself. Before starting a runner:
-
-1. **Run Ollama on the host** — install it and keep the daemon up (`ollama serve` or the desktop app; it listens on `localhost:11434`).
-2. **Check the model answers on the host first**: `ollama run gemma3:4b "hi"`.
-3. **Point the container at the host** — compose sets `OLLAMA_BASE_URL=http://host.docker.internal:11434` on both services; with plain `docker run`, add `-e OLLAMA_BASE_URL=http://host.docker.internal:11434`.
-4. **Sanity-check the wiring** — `curl http://localhost:11434/api/version` on the host should return JSON. If a container's LLM calls fail with "Connection refused", this env var is the first thing to check.
-
-On a Linux host, `host.docker.internal` needs one extra flag: `--add-host=host.docker.internal:host-gateway` for `docker run`, or `extra_hosts: ["host.docker.internal:host-gateway"]` on a compose service. For a Linux home server, prefer the `docker-compose.linux.yml` override instead — see the next section.
+The local-model policy accepts literal loopback only. Bridge containers cannot
+reach host Ollama through `host.docker.internal`; the endpoint is denied before
+provider dispatch. `OLLAMA_BASE_URL` is ignored. The Linux override uses host
+networking and `HEDGE_FUND_LLM_ENDPOINT=http://127.0.0.1:11434`.
 
 #### Linux host networking (local-only)
 
-On a Linux host, Docker Desktop's `host.docker.internal` doesn't exist. Use the Linux override, which runs the containers on the host's own network — `localhost` inside the container *is* the host, so Ollama needs no extra wiring:
+On Linux, use the override for a one-session free-data/local-model run. It
+binds the local endpoint to `127.0.0.1` and supplies `--enable-network` only
+for the explicit `runner` profile:
 
 ```bash
-docker compose -f docker-compose.yml -f docker-compose.linux.yml --profile runner run --rm runner   # one local tick
+docker compose -f docker-compose.yml -f docker-compose.linux.yml --profile runner run --rm runner
 docker compose -f docker-compose.yml -f docker-compose.linux.yml run --rm tui   # terminal TUI
 ```
 

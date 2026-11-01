@@ -1,9 +1,6 @@
 """run — the unattended loop at both cadences, driven by a fake clock and
 canned prints; and tick on a bar, the same session by hand."""
 
-import os
-import signal
-import sys
 import threading
 from contextlib import contextmanager
 from datetime import datetime, timedelta
@@ -14,18 +11,7 @@ import pytest
 from hedge_fund.backtesting.test_fund import FakeDataClient, SERIES
 from hedge_fund.data.sessions import NEW_YORK
 from hedge_fund.fund import Fund, FundSpec
-from hedge_fund.paper import (
-    deploy,
-    is_running,
-    Ledger,
-    NothingDue,
-    PID_FILE,
-    redo,
-    run,
-    serve,
-    stop_runner,
-    tick,
-)
+from hedge_fund.paper import deploy, Ledger, NothingDue, PID_FILE, redo, tick
 from hedge_fund.paper.test_tick import build_fund
 from hedge_fund.pipeline.session import FundHalted
 from hedge_fund.pipeline.test_clock import Tape
@@ -110,7 +96,22 @@ class Loop:
         self._until = until or _at(NEXT, "23:00:00")
 
     def __call__(self):
-        run(self.directory, self.tape, stop=self.stop, build_fund=build_fund, now=lambda: self.tape.now, sleep=self._sleep, on_record=self._record, on_event=lambda k, f: self.events.append((k, f)))
+        deployed = runner_module.load_deployed(self.directory)
+        fund = build_fund(deployed.spec)
+        loop = runner_module._run_bars if deployed.spec.is_intraday else runner_module._run_days
+        loop(
+            self.directory,
+            deployed,
+            self.tape,
+            fund,
+            broker=None,
+            stop=self.stop,
+            build_fund=build_fund,
+            now=lambda: self.tape.now,
+            sleep=self._sleep,
+            on_record=self._record,
+            on_event=lambda k, f: self.events.append((k, f)),
+        )
 
     def _sleep(self, seconds):
         self.tape.now += timedelta(seconds=seconds)
@@ -141,26 +142,21 @@ def test_a_day_of_bars_decides_fills_and_checkpoints(tmp_path):
     assert ledger.replay(100_000) == ledger.replay(100_000, full=True)
 
 
-def test_saxo_runner_builds_one_broker_for_all_sessions(tmp_path, monkeypatch):
+def test_legacy_runner_denies_before_broker_construction(tmp_path, monkeypatch):
     directory = deploy("saxo", _spec(broker="saxo"), ["AAPL"], root=tmp_path)
-    broker = object()
-    builds = []
-    seen = []
-    monkeypatch.setattr(runner_module, "build_broker", lambda deployed, directory: builds.append(deployed) or broker)
-
-    def run_bars(*args, **kwargs):
-        seen.append(kwargs["broker"])
-
-    monkeypatch.setattr(runner_module, "_run_bars", run_bars)
-    runner_module.run(
-        directory,
-        _tape(_at(DAY, "12:00:00")),
-        stop=threading.Event(),
-        build_fund=build_fund,
+    monkeypatch.setattr(
+        runner_module,
+        "build_broker",
+        lambda *_args, **_kwargs: pytest.fail("disabled runner built a broker"),
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "load_deployed",
+        lambda *_args, **_kwargs: pytest.fail("disabled runner loaded a deployment"),
     )
 
-    assert len(builds) == 1
-    assert seen == [broker]
+    with pytest.raises(RuntimeError, match="Legacy paper runner is disabled"):
+        runner_module.run(directory, _tape(_at(DAY, "12:00:00")))
 
 
 def test_saxo_runner_skips_a_late_closing_bar_after_market_close(tmp_path, monkeypatch):
@@ -389,88 +385,59 @@ def test_a_daily_fund_is_run_unattended_too_catching_up_after_each_midnight(tmp_
     assert loop.events == [] and Ledger(directory).sessions() == ["2024-06-03", "2024-06-04", "2024-06-05", "2024-06-06"]
 
 
-def test_serve_holds_a_pid_file_and_stops_on_sigterm(
-    tmp_path, monkeypatch, owned_test_process
+def test_legacy_runner_entrypoints_deny_before_pid_or_provider_effects(
+    tmp_path,
+    monkeypatch,
 ):
     directory = deploy("bars", _spec(), ["AAPL"], root=tmp_path)
-    active_pid = {"value": None}
+    effects = []
 
-    def safe_is_running(path):
-        pid = runner_module._read_pid(path)
-        return pid is not None and pid == active_pid["value"]
+    def forbidden(*_args, **_kwargs):
+        effects.append(True)
+        pytest.fail("disabled runner reached a provider, ledger, or process effect")
 
-    monkeypatch.setattr(runner_module, "is_running", safe_is_running)
-    monkeypatch.setattr(sys.modules[__name__], "is_running", safe_is_running)
-    assert not is_running(directory) and not stop_runner(directory)
-    (directory / PID_FILE).write_text("999999999")
-    assert not is_running(directory)  # a stale pid is not a runner
+    for name in (
+        "build_broker",
+        "is_running",
+        "load_deployed",
+        "_read_pid",
+    ):
+        monkeypatch.setattr(runner_module, name, forbidden)
+    monkeypatch.setattr(runner_module.subprocess, "Popen", forbidden)
+    monkeypatch.setattr(runner_module.os, "kill", forbidden)
+    monkeypatch.setattr(runner_module.signal, "signal", forbidden)
 
-    import hedge_fund.paper.runner as runner
+    class NoIODataClient:
+        def get_prices(self, *_args, **_kwargs):
+            forbidden()
 
-    seen = {}
+    data = NoIODataClient()
+    with pytest.raises(RuntimeError, match="Legacy paper runner is disabled"):
+        runner_module.run(directory, data)
+    with pytest.raises(RuntimeError, match="Legacy paper runner is disabled"):
+        runner_module.serve(directory, data)
+    with pytest.raises(RuntimeError, match="Legacy paper runner is disabled"):
+        runner_module.stop_runner(directory)
 
-    def quick(directory, data, *, stop, **kwargs):
-        seen["pid"] = int((directory / PID_FILE).read_text())
-        seen["running"] = is_running(directory)
-        if os.name == "nt":
-            # os.kill(self, SIGTERM) is TerminateProcess on Windows: no handler
-            # runs, so simulate the signal handler's effect directly.
-            stop.set()
-        else:
-            threading.Timer(0.05, lambda: os.kill(os.getpid(), signal.SIGTERM)).start()
-        seen["stopped"] = stop.wait(5)
-
-    monkeypatch.setattr(runner, "run", quick)
-
-    active_pid["value"] = os.getpid()
-    serve(directory, _tape(_at(DAY, "12:59:00")))
-    assert seen == {"pid": os.getpid(), "running": True, "stopped": True}
-    assert not (directory / PID_FILE).exists() and not is_running(directory)
-    # Two runners on one fund is a race on the ledger: the second refuses.
-    # The pid must name a live process other than this one; a file naming
-    # this process is a stale incarnation (pid reuse across container
-    # restarts) and must not block a start.
-    sleeper = owned_test_process("import time; time.sleep(30)")
-    active_pid["value"] = sleeper.pid
-    (directory / PID_FILE).write_text(str(sleeper.pid))
-    with pytest.raises(RuntimeError, match="already running"):
-        serve(directory, _tape(_at(DAY, "12:59:00")))
-    assert sleeper.poll() is None
-    active_pid["value"] = os.getpid()
-    (directory / PID_FILE).write_text(str(os.getpid()))
-    serve(directory, _tape(_at(DAY, "12:59:00")))
+    assert effects == []
+    assert not (directory / PID_FILE).exists()
+    assert not (directory / "runner.log").exists()
 
 
-def test_spawn_runner_passes_explicit_root_to_cli_child(tmp_path, monkeypatch):
+def test_spawn_runner_denies_before_log_or_process_launch(tmp_path, monkeypatch):
     root = tmp_path / "root"
     directory = root / "paper" / "demo-alpha"
     directory.mkdir(parents=True)
-    observed = {}
 
-    class Child:
-        pid = 4321
+    def forbidden_launch(*_args, **_kwargs):
+        pytest.fail("disabled runner reached process launch")
 
-    def fake_popen(command, **kwargs):
-        observed["command"] = command
-        observed["kwargs"] = kwargs
-        return Child()
+    monkeypatch.setattr(runner_module.subprocess, "Popen", forbidden_launch)
 
-    monkeypatch.setattr(runner_module.subprocess, "Popen", fake_popen)
+    with pytest.raises(RuntimeError, match="Legacy paper runner is disabled"):
+        runner_module.spawn_runner(directory, root=root)
 
-    process_id = runner_module.spawn_runner(directory, root=root)
-
-    assert process_id == 4321
-    assert observed["command"] == [
-        sys.executable,
-        "-m",
-        "hedge_fund.run",
-        "--root",
-        str(root),
-        "paper",
-        "run",
-        "demo-alpha",
-    ]
-    assert observed["kwargs"]["cwd"] == str(directory)
+    assert not (directory / "runner.log").exists()
 
 
 def test_spawn_runner_rejects_root_mismatch_before_launch(tmp_path, monkeypatch):

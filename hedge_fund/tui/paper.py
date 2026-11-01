@@ -31,8 +31,6 @@ from hedge_fund.paper import (
     next_session,
     NothingDue,
     redo,
-    spawn_runner,
-    stop_runner,
     tick,
 )
 from hedge_fund.pipeline import DecisionRecord, FundState, SessionRecord
@@ -41,7 +39,6 @@ from hedge_fund.scorecard import score
 from hedge_fund.signals import ALPHA_MODEL_REGISTRY, LLMAgent
 from hedge_fund.tui.builder import BuilderScreen
 from hedge_fund.tui.funds import ConfirmWipeScreen, paper_write_denial, wipe_fund
-from hedge_fund.tui.home import demand_run_keys
 from hedge_fund.tui.palette import BRIGHT, CYAN, GREEN, MUTED, RED, TEXT
 from hedge_fund.tui.paper_view import (
     APP_HALT,
@@ -78,14 +75,14 @@ class PaperScreen(Screen):
     """Paper trading. The fund list is the home of the fund: every deployed
     fund on the left, the highlighted one's state and its next run on the
     right. Enter runs its next session; `y`/`n` approve or reject gated
-    decisions. `space` starts or stops its runner; `s` opens history; `h`/`r`
-    work the kill switch. The last row builds a fund.
+    decisions. `space` reports disabled runner control; `s` opens history;
+    `h`/`r` work the kill switch. The last row builds a fund.
     """
 
     BINDINGS = [
         Binding("escape", "back", "back"),
         Binding("enter", "run", "run next session", priority=True),
-        Binding("space", "runner", "start/stop runner"),
+        Binding("space", "runner", "runner control disabled"),
         Binding("s", "sessions", "sessions"),
         Binding("y", "approve", "approve"),
         Binding("n", "reject", "reject"),
@@ -199,12 +196,7 @@ class PaperScreen(Screen):
             if not self._snaps:
                 blurb.append("No funds yet.\n\n", style=f"bold {BRIGHT}")
             blurb.append(
-                "Build a fund here and it starts paper trading at once: pick its "
-                "strategies, capital, cadence and tickers, and it gets a ledger, a "
-                "book and a kill switch of its own under\n" + str(paths.PAPER_DIR) + "\n\n"
-                "Then run it a session at a time with enter, or leave it running with "
-                "space (`aihf paper run <name>` from a shell). Whatever its cadence, "
-                "the next session is the next close or the next bar.",
+                "Build a fund here and it starts paper trading at once: pick its " "strategies, capital, cadence and tickers, and it gets a ledger, a " "book and a kill switch of its own under\n" + str(paths.PAPER_DIR) + "\n\n" "Unattended runners are disabled. Use the explicit-root CLI or web desk " "for an authorized one-shot session. The next session is the next close " "or the next bar.",
                 style=MUTED,
             )
             if self._write_denial is not None:
@@ -215,9 +207,8 @@ class PaperScreen(Screen):
 
     def _poll_quotes(self) -> None:
         """Ask for the highlighted fund's prints, off-thread. Only a fund with
-        positions has anything live to show; cash is cash. A runner changes
-        the ledger under us: re-read it when the runner has come or gone, or
-        has recorded a session since the last read."""
+        positions has anything live to show; cash is cash. Re-read the ledger
+        when a legacy process or another authorized writer records a session."""
         snap = self._current()
         if snap is None:
             return
@@ -277,61 +268,22 @@ class PaperScreen(Screen):
         if self._deny_paper_write():
             return
         menu = self.query_one("#paper-menu", OptionList)
-        if menu.highlighted is None:
-            return
-        if (menu.get_option_at_index(menu.highlighted).id or "") == "build":
+        if menu.highlighted is not None and (menu.get_option_at_index(menu.highlighted).id or "") == "build":
             self.app.push_screen(BuilderScreen(mode="paper"))
             return
-        snap = self._current()
-        if snap is None or snap.error:
-            return
-        if snap.halted:
-            self.notify(f"{snap.deployed.name} is halted — r to resume first.", severity="warning")
-            return
-        if snap.running:
-            self.notify(f"{snap.deployed.name}'s runner is advancing it — space to stop it first.", severity="warning")
-            return
-        directory = snap.directory
-
-        def resume() -> None:
-            if demand_run_keys(self.app, resume):
-                self.app.push_screen(RunConfirmScreen(directory), lambda verdict: self._after_confirm(directory, verdict))
-
-        resume()
+        self.notify(
+            "TUI paper execution lacks operation-bound authorization. Use the explicit-root CLI or web desk.",
+            severity="warning",
+        )
 
     def action_runner(self) -> None:
-        """Space: stop the fund's runner if one is up, else start one (a
-        detached `aihf paper run`, so it outlives this screen). The runner
-        does what enter does, unattended, at the fund's cadence."""
+        """Space reports disabled legacy unattended runner control."""
         if self._deny_paper_write():
             return
-        snap = self._current()
-        if snap is None or snap.error:
-            return
-        name = snap.deployed.name
-        if is_running(snap.directory):
-            stop_runner(snap.directory)
-            self.notify(f"{name} stopping after the session in flight")
-            self._populate(name)
-            return
-        if snap.halted:
-            self.notify(f"{name} is halted — r to resume first.", severity="warning")
-            return
-
-        def resume() -> None:
-            if demand_run_keys(self.app, resume):
-                try:
-                    spawn_runner(
-                        snap.directory,
-                        root=paths.root_context().path,
-                    )
-                except OSError as exc:
-                    self.notify(f"Could not start {name}: {exc}", severity="error")
-                    return
-                self.notify(f"{name} running · {cadence_identity(snap.spec)}")
-                self._populate(name)
-
-        resume()
+        self.notify(
+            "Unattended paper runners are disabled. Use the explicit-root CLI or web desk for one authorized session.",
+            severity="warning",
+        )
 
     def _after_confirm(self, directory: Path, verdict: str | None) -> None:
         if verdict is not None:
@@ -537,6 +489,8 @@ class RunSessionScreen(Screen):
         app = self.app
         directory = self._directory
         denial = paper_write_denial()
+        if denial is None:
+            denial = "TUI paper execution lacks operation-bound authorization; " "use the explicit-root CLI or web desk."
         if denial is not None:
             app.call_from_thread(self._fail, RuntimeError(denial))
             return

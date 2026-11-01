@@ -12,13 +12,19 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from hedge_fund import paths
-from hedge_fund.llm import PROVIDER_ENV_VARS, env_var_for
-from hedge_fund.runtime.admission import LOCK_DIRECTORY, AdmissionCoordinator, AdmissionError
+from hedge_fund.data.registry import DATA_PROVIDER_ENV_VARS
+from hedge_fund.llm import env_var_for, PROVIDER_ENV_VARS
+from hedge_fund.runtime.admission import (
+    AdmissionCoordinator,
+    AdmissionError,
+    LOCK_DIRECTORY,
+)
 from hedge_fund.runtime.root import PRIVATE_ROOT, RootContext
 
 write_atomic = paths.write_atomic
 _CREDENTIAL_ROOT = f"{PRIVATE_ROOT}/credentials"
 _CREDENTIAL_INDEX = f"{_CREDENTIAL_ROOT}/index.json"
+_CREDENTIAL_PROVIDERS = frozenset(PROVIDER_ENV_VARS) | frozenset(DATA_PROVIDER_ENV_VARS)
 _MAX_CREDENTIAL_BYTES = 8192
 _MAX_CREDENTIAL_VERSION = 2**31 - 1
 
@@ -55,7 +61,7 @@ class CredentialStore:
                         {"version": 0, "configured": False},
                     )["configured"],
                 }
-                for provider in sorted(PROVIDER_ENV_VARS, key=str.casefold)
+                for provider in sorted(_CREDENTIAL_PROVIDERS, key=str.casefold)
             }
 
     def version(self, provider: str) -> tuple[int, bool]:
@@ -198,9 +204,7 @@ class CredentialStore:
         if type(index.get("schema")) is not int or index["schema"] != 1:
             raise CredentialStoreError("credential index is invalid")
         providers = index.get("providers")
-        if not isinstance(providers, dict) or set(providers) - {
-            provider.casefold() for provider in PROVIDER_ENV_VARS
-        }:
+        if not isinstance(providers, dict) or set(providers) - {provider.casefold() for provider in _CREDENTIAL_PROVIDERS}:
             raise CredentialStoreError("credential index is invalid")
         for provider, record in providers.items():
             if (
@@ -242,7 +246,7 @@ def _provider_id(provider: str) -> str:
     if not isinstance(provider, str):
         raise CredentialStoreError("credential provider is invalid")
     provider_id = provider.casefold()
-    if provider_id not in {name.casefold() for name in PROVIDER_ENV_VARS}:
+    if provider_id not in {name.casefold() for name in _CREDENTIAL_PROVIDERS}:
         raise CredentialStoreError("credential provider is invalid")
     return provider_id
 

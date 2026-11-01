@@ -163,12 +163,24 @@ def test_effective_settings_resolve_environment_precedence(tmp_path, monkeypatch
     result = service.settings()
 
     assert result["data_provider"] == "fd"
-    assert result["llm_provider"] == "Anthropic"
+    assert result["llm_provider"] == "Ollama"
     assert result["provenance"]["data_provider"] == "environment"
     assert result["provenance"]["model"] == "environment"
     assert result["data_providers"] == [
-        {"id": "fd", "label": "Financial Datasets"},
-        {"id": "yfinance", "label": "Yahoo Finance"},
+        {
+            "id": "fd",
+            "label": "Financial Datasets",
+            "requires_key": True,
+            "configured": False,
+            "version": 0,
+        },
+        {
+            "id": "yfinance",
+            "label": "Yahoo Finance",
+            "requires_key": False,
+            "configured": True,
+            "version": 0,
+        },
     ]
     service.close()
 
@@ -267,7 +279,7 @@ def test_runtime_settings_api_persists_validated_effective_values(tmp_path):
         },
         {
             "data_provider": "yfinance",
-            "model": DEFAULT_MODEL,
+            "model": "gpt-6-sol",
             "endpoint": None,
             "timeout_seconds": 30,
             "parameters": {"context_size": 8192},

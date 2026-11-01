@@ -10,10 +10,9 @@
     paper/<name>/events.jsonl     halts, failures, resumes, gaps, checkpoints
     paper/<name>/runner.pid       the fund's runner, while it is alive
 
-`tick` advances one session: a human, a scheduler, or the runner calls it
-when one is due. `run` is the loop that keeps a fund going unattended, at
-whatever cadence it has. Backtests never import anything from here:
-research reads the shared data cache and writes only to research/.
+`tick` advances one session under explicit operation authority. Legacy
+unattended runner entrypoints raise before process or provider effects.
+Backtests never import anything from here: research writes only to research/.
 """
 
 from hedge_fund.paper.deployed import (

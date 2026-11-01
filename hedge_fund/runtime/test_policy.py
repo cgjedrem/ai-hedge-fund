@@ -3,7 +3,54 @@ from decimal import Decimal
 
 import pytest
 
-from hedge_fund.runtime.policy import AuthorizationDenied, authorize_dispatch, authorize_session, BudgetDenied, classify_provider, DispatchBudget, OneShotAuthorization, OperationScope, ProviderClass, ProviderTarget, RunnerAuthorization
+from hedge_fund.runtime.policy import AuthorizationDenied
+from hedge_fund.runtime.policy import authorize_dispatch as _authorize_dispatch
+from hedge_fund.runtime.policy import authorize_session as _authorize_session
+from hedge_fund.runtime.policy import BudgetDenied, classify_provider, DispatchBudget
+from hedge_fund.runtime.policy import OneShotAuthorization as _OneShotAuthorization
+from hedge_fund.runtime.policy import OperationScope, ProviderClass, ProviderTarget
+from hedge_fund.runtime.policy import RunnerAuthorization as _RunnerAuthorization
+
+_OPERATION_ID = "operation-1"
+_OPERATION_DIGEST = "f" * 64
+
+
+def OneShotAuthorization(**kwargs):
+    kwargs.setdefault("upper_bound_cost", Decimal("0.10"))
+    return _OneShotAuthorization(
+        operation_id=_OPERATION_ID,
+        operation_digest=_OPERATION_DIGEST,
+        **kwargs,
+    )
+
+
+def RunnerAuthorization(**kwargs):
+    return _RunnerAuthorization(
+        operation_id=_OPERATION_ID,
+        operation_digest=_OPERATION_DIGEST,
+        **kwargs,
+    )
+
+
+def authorize_dispatch(target, *args, **kwargs):
+    kwargs.setdefault("network_authorized", True)
+    return _authorize_dispatch(
+        target,
+        *args,
+        operation_id=_OPERATION_ID,
+        operation_digest=_OPERATION_DIGEST,
+        **kwargs,
+    )
+
+
+def authorize_session(authorization, *args, **kwargs):
+    return _authorize_session(
+        authorization,
+        *args,
+        operation_id=_OPERATION_ID,
+        operation_digest=_OPERATION_DIGEST,
+        **kwargs,
+    )
 
 
 def test_cloud_labelled_keyless_ollama_is_not_classified_as_local():
@@ -16,19 +63,19 @@ def test_cloud_labelled_keyless_ollama_is_not_classified_as_local():
     local_target = ProviderTarget(
         kind="llm",
         provider="ollama",
-        model="llama3.2",
+        model="gemma3:4b",
         endpoint="http://127.0.0.1:11434",
     )
     remote_target = ProviderTarget(
         kind="llm",
         provider="ollama",
-        model="llama3.2",
+        model="gemma3:4b",
         endpoint="https://models.example.invalid",
     )
 
-    assert classify_provider(cloud_target, approved_local_models={"llama3.2"}) is ProviderClass.PAID_CLOUD
-    assert classify_provider(local_target, approved_local_models={"llama3.2"}) is ProviderClass.LOCAL
-    assert classify_provider(remote_target, approved_local_models={"llama3.2"}) is ProviderClass.PAID_CLOUD
+    assert classify_provider(cloud_target, approved_local_models={"gemma3:4b"}) is ProviderClass.PAID_CLOUD
+    assert classify_provider(local_target, approved_local_models={"gemma3:4b"}) is ProviderClass.LOCAL
+    assert classify_provider(remote_target, approved_local_models={"gemma3:4b"}) is ProviderClass.PAID_CLOUD
 
 
 def test_paid_provider_requires_matching_manual_one_shot_authorization():
@@ -42,6 +89,7 @@ def test_paid_provider_requires_matching_manual_one_shot_authorization():
         expires_at=now + timedelta(minutes=1),
         max_calls=1,
         max_cost=Decimal("0.25"),
+        upper_bound_cost=Decimal("0.20"),
     )
 
     assert (
@@ -170,6 +218,7 @@ def test_paid_dispatch_denies_unknown_cost_and_retries_before_reserving():
         expires_at=now + timedelta(minutes=1),
         max_calls=3,
         max_cost=Decimal("1.00"),
+        upper_bound_cost=Decimal("0.10"),
     )
     inputs = {
         "scope": OperationScope.MANUAL_ONE_SHOT,
@@ -195,6 +244,50 @@ def test_paid_dispatch_denies_unknown_cost_and_retries_before_reserving():
     assert authorization.cost_reserved == Decimal("0")
 
 
+@pytest.mark.parametrize(
+    "target,approved_models",
+    [
+        (ProviderTarget(kind="data", provider="yfinance"), frozenset()),
+        (
+            ProviderTarget(
+                kind="llm",
+                provider="ollama",
+                model="gemma3:4b",
+                endpoint="http://127.0.0.1:11434",
+            ),
+            frozenset({"gemma3:4b"}),
+        ),
+    ],
+)
+def test_free_and_local_dispatch_require_network_and_operation_authority(
+    target,
+    approved_models,
+):
+    now = datetime(2026, 10, 31, 12, 0, tzinfo=timezone.utc)
+    identity = {
+        "scope": OperationScope.MANUAL_ONE_SHOT,
+        "root_id": "synthetic-root",
+        "subject_id": "research-1",
+        "capture_digest": "capture-digest",
+        "now": now,
+        "approved_local_models": approved_models,
+    }
+
+    with pytest.raises(AuthorizationDenied):
+        authorize_dispatch(
+            target,
+            **identity,
+            network_authorized=False,
+        )
+
+    with pytest.raises(AuthorizationDenied):
+        authorize_dispatch(
+            target,
+            **identity,
+            network_authorized=True,
+        )
+
+
 def test_paid_dispatch_denies_mismatched_identity_and_expiry_before_reserving():
     now = datetime(2026, 10, 31, 12, 0, tzinfo=timezone.utc)
     target = ProviderTarget(kind="data", provider="fd")
@@ -206,6 +299,7 @@ def test_paid_dispatch_denies_mismatched_identity_and_expiry_before_reserving():
         expires_at=now + timedelta(minutes=1),
         max_calls=1,
         max_cost=Decimal("0.25"),
+        upper_bound_cost=Decimal("0.10"),
     )
     inputs = {
         "scope": OperationScope.MANUAL_ONE_SHOT,
@@ -224,6 +318,49 @@ def test_paid_dispatch_denies_mismatched_identity_and_expiry_before_reserving():
             target,
             root_id="synthetic-root",
             **{**inputs, "now": now + timedelta(minutes=2)},
+        )
+
+    assert authorization.calls_reserved == 0
+    assert authorization.cost_reserved == Decimal("0")
+
+
+def test_paid_dispatch_binds_authorization_to_operation_id_and_digest():
+    now = datetime(2026, 10, 31, 12, 0, tzinfo=timezone.utc)
+    target = ProviderTarget(kind="data", provider="fd")
+    authorization = OneShotAuthorization(
+        root_id="synthetic-root",
+        subject_id="research-1",
+        capture_digest="capture-digest",
+        provider_id=target.identity,
+        expires_at=now + timedelta(minutes=1),
+        max_calls=2,
+        max_cost=Decimal("0.50"),
+        upper_bound_cost=Decimal("0.10"),
+    )
+    arguments = {
+        "scope": OperationScope.MANUAL_ONE_SHOT,
+        "root_id": "synthetic-root",
+        "subject_id": "research-1",
+        "capture_digest": "capture-digest",
+        "now": now,
+        "one_shot": authorization,
+        "network_authorized": True,
+        "upper_bound_cost": Decimal("0.10"),
+    }
+
+    with pytest.raises(AuthorizationDenied):
+        _authorize_dispatch(
+            target,
+            operation_id="operation-2",
+            operation_digest="c" * 64,
+            **arguments,
+        )
+    with pytest.raises(AuthorizationDenied):
+        _authorize_dispatch(
+            target,
+            operation_id=_OPERATION_ID,
+            operation_digest="c" * 64,
+            **arguments,
         )
 
     assert authorization.calls_reserved == 0
