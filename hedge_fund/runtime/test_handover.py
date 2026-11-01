@@ -1,10 +1,13 @@
 import json
 import os
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from hedge_fund.fund import FundSpec
 from hedge_fund.paper.deployed import deploy
+from hedge_fund.pipeline.session import code_version
+from hedge_fund.runtime import handover
 from hedge_fund.runtime.admission import (
     OwnershipUnknown,
     RootMigrationLease,
@@ -23,7 +26,14 @@ from hedge_fund.runtime.handover import (
     migrate_existing,
     OPERATOR_ATTESTATION,
     require_enrollment,
+    root_binding,
     verify_ledger_head,
+)
+from hedge_fund.runtime.owned_runner import (
+    read_runner_record,
+    runner_key,
+    RUNNER_ROOT,
+    write_runner_record,
 )
 from hedge_fund.runtime.root import PRIVATE_ROOT, RootContext
 
@@ -217,3 +227,104 @@ def test_handover_record_digest_detects_tampering(tmp_path):
         context.write_bytes(HANDOVER_PATH, json.dumps(record).encode())
         with pytest.raises(EnrollmentInvalid):
             require_enrollment(context)
+
+
+def _active_runner_state(root, fund="alpha"):
+    now = datetime.now(timezone.utc)
+    created = now - timedelta(hours=2)
+    root.mkdir(f"{RUNNER_ROOT}/{runner_key(fund)}", parents=True, mode=0o700)
+    owner = {
+        "pid": 987654321,
+        "creation_time": "synthetic-incarnation",
+        "image": "synthetic-runner",
+        "host": root.host_identity,
+        "namespace": root.namespace_identity,
+    }
+    return {
+        "schema": 1,
+        "protocol_version": 1,
+        "build_id": code_version(),
+        "root": root_binding(root),
+        "fund": fund,
+        "nonce_hash": "a" * 64,
+        "status": "running",
+        "created_at": created.isoformat(),
+        "expires_at": (created + timedelta(hours=1)).isoformat(),
+        "max_sessions": 1,
+        "sessions_completed": 0,
+        "last_session": None,
+        "reason": None,
+        "pid": owner["pid"],
+        "process_identity": owner,
+    }
+
+
+def _recovery_evidence():
+    return {
+        "owner_quiescence": "Verified no runner process in the configured namespace.",
+        "legacy_exclusion": "Legacy launcher and writable containers disabled for this root.",
+    }
+
+
+def test_stale_reservation_recovery_requires_attestation_and_leaves_no_record_on_denial(tmp_path):
+    with RootContext.open(tmp_path) as root:
+        enroll_fresh(root)
+        write_runner_record(root, "alpha", "state", _active_runner_state(root))
+        before = root.read_bytes(f"{RUNNER_ROOT}/{runner_key('alpha')}/state.json")
+
+        with pytest.raises(HandoverError, match="attestation"):
+            handover.recover_stale_reservation(
+                root,
+                "alpha",
+                evidence=_recovery_evidence(),
+                operator_attestation="not an attestation",
+            )
+
+        assert root.read_bytes(f"{RUNNER_ROOT}/{runner_key('alpha')}/state.json") == before
+        assert not (tmp_path / handover.RECOVERY_ROOT).exists()
+
+
+def test_stale_reservation_recovery_records_identity_evidence_and_operator_action(tmp_path):
+    with RootContext.open(tmp_path) as root:
+        enroll_fresh(root)
+        original = _active_runner_state(root)
+        write_runner_record(root, "alpha", "state", original)
+
+        record = handover.recover_stale_reservation(
+            root,
+            "alpha",
+            evidence=_recovery_evidence(),
+            operator_attestation=handover.STALE_RECOVERY_ATTESTATION,
+        )
+
+        relative = f"{handover.RECOVERY_ROOT}/{runner_key('alpha')}/{original['nonce_hash']}.json"
+        persisted = json.loads(root.read_bytes(relative))
+        assert record == persisted
+        assert persisted["root"] == root_binding(root)
+        assert persisted["build_id"] == code_version()
+        assert persisted["protocol_version"] == 1
+        assert persisted["prior_owner_identity"]["process_identity"] == original["process_identity"]
+        assert persisted["evidence"] == _recovery_evidence()
+        assert persisted["operator_attestation"] == handover.STALE_RECOVERY_ATTESTATION
+        assert len(persisted["record_digest"]) == 64
+        assert handover.require_enrollment(root)["heads"] == {}
+        assert handover.read_stale_recovery(root, "alpha") == persisted
+        assert read_runner_record(root, "alpha", "state")["status"] == "failed"
+
+
+def test_stale_reservation_recovery_waits_for_shared_root_owners(tmp_path):
+    with RootContext.open(tmp_path) as root:
+        enroll_fresh(root)
+        write_runner_record(root, "alpha", "state", _active_runner_state(root))
+        participant = RootOwnerLease.acquire(root)
+        try:
+            with pytest.raises(HandoverError, match="quiescence"):
+                handover.recover_stale_reservation(
+                    root,
+                    "alpha",
+                    evidence=_recovery_evidence(),
+                    operator_attestation=handover.STALE_RECOVERY_ATTESTATION,
+                )
+            assert not (tmp_path / handover.RECOVERY_ROOT).exists()
+        finally:
+            participant.close()

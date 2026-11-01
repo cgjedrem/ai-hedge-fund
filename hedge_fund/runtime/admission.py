@@ -214,7 +214,7 @@ class AdmissionCoordinator:
     def lane_is_held(self, lane: str, identity: str | None = None) -> bool:
         if lane == "registry":
             key = "registry"
-        elif lane in {"deployment", "runner", "execution", "control"} and identity is not None:
+        elif lane in {"deployment", "runner", "execution", "control", "research"} and identity is not None:
             key = f"{lane}:{_resource_identity(identity)}"
         else:
             raise AdmissionError("admission lane is invalid")
@@ -301,6 +301,17 @@ class AdmissionCoordinator:
         resource = _resource_identity(identity)
         wait = _validate_timeout(timeout, MAX_CONTROL_WAIT_SECONDS)
         with self._lock(f"control:{resource}", timeout=wait):
+            yield
+
+    @contextmanager
+    def research_lane(
+        self,
+        identity: str,
+        *,
+        timeout: float = 0.0,
+    ) -> Iterator[None]:
+        resource = _resource_identity(identity)
+        with self._lock(f"research:{resource}", timeout=timeout):
             yield
 
     @contextmanager
@@ -542,7 +553,7 @@ def _lock_filename(key: str) -> str:
     if not isinstance(key, str) or ":" not in key:
         raise AdmissionError("admission lane is invalid")
     namespace, identity = key.split(":", 1)
-    if namespace not in {"deployment", "runner", "execution", "control"} or not identity:
+    if namespace not in {"deployment", "runner", "execution", "control", "research"} or not identity:
         raise AdmissionError("admission lane is invalid")
     digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
     return f"{namespace}-{digest}.lock"

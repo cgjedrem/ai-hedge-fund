@@ -52,10 +52,12 @@ def offline(tmp_path, monkeypatch):
     monkeypatch.setattr(run, "PAPER_DIR", tmp_path / "paper")
     monkeypatch.setattr(paths, "RESEARCH_DIR", tmp_path / "research")
 
-    def save_fake_result(result):
+    def save_fake_result(result, *, admission=None):
+        assert admission is not None
         destination = paths.RESEARCH_DIR / f"{result.fund}-{result.start}-{result.end}-fixture.json"
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_text(result.model_dump_json(indent=2), encoding="utf-8")
+        with admission.research_lane(result.fund):
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_text(result.model_dump_json(indent=2), encoding="utf-8")
         return destination
 
     monkeypatch.setattr(run, "save_result", save_fake_result)
@@ -94,6 +96,24 @@ def _main(monkeypatch, *argv):
             argv = ("--enable-network", *argv)
     monkeypatch.setattr(sys, "argv", ["aihf", "--root", str(root), *argv])
     run.main()
+
+
+def _enroll_test_root(root):
+    from hedge_fund.runtime.handover import (
+        build_head_inventory,
+        inventory_digest,
+        migrate_existing,
+        OPERATOR_ATTESTATION,
+    )
+    from hedge_fund.runtime.root import RootContext
+
+    with RootContext.open(root) as context:
+        heads = build_head_inventory(context)
+        migrate_existing(
+            context,
+            expected_inventory_digest=inventory_digest(heads),
+            operator_attestation=OPERATOR_ATTESTATION,
+        )
 
 
 def test_cli_requires_explicit_root(monkeypatch, capsys):
@@ -607,6 +627,7 @@ def test_no_arguments_launches_the_app(monkeypatch):
 @pytest.mark.parametrize("mode", ["long_only", "long_short", "dollar_neutral"])
 def test_backtest_prints_json_and_files_a_research_copy(tmp_path, monkeypatch, capsys, offline, mode):
     path = _mandate(tmp_path, mode)
+    _enroll_test_root(tmp_path)
     _main(monkeypatch, "backtest", str(path), "--universe", "AAPL,MSFT", "--start", "2025-01-06", "--end", "2025-01-13")
     output = capsys.readouterr()
     result = json.loads(output.out)
@@ -627,6 +648,7 @@ def test_backtest_prints_json_and_files_a_research_copy(tmp_path, monkeypatch, c
 
 def test_backtest_defaults_end_to_the_latest_completed_session(tmp_path, monkeypatch, capsys, offline):
     path = _mandate(tmp_path)
+    _enroll_test_root(tmp_path)
     _main(monkeypatch, "backtest", str(path), "--universe", "AAPL", "--start", "2025-01-06")
     result = json.loads(capsys.readouterr().out)
     assert result["end"] == "2025-01-13"
@@ -639,6 +661,7 @@ def test_backtest_without_rebalance_key_defaults_to_weekly(tmp_path, monkeypatch
     mandate = yaml.safe_load(path.read_text())
     mandate.pop("rebalance")
     path.write_text(yaml.safe_dump(mandate))
+    _enroll_test_root(tmp_path)
     # Freeze revision stamp → compare CLI JSON across commits.
     monkeypatch.setattr(pipeline_session, "code_version", lambda: "2.6.1+cd662f4")
 
@@ -669,6 +692,7 @@ def test_backtest_rebalance_override_changes_monthly_cycle_count(tmp_path, monke
 
     monkeypatch.setattr(run, "make_data_client", MultiMonthClient)
     path = _mandate(tmp_path)
+    _enroll_test_root(tmp_path)
     original = path.read_bytes()
     args = ("backtest", str(path), "--universe", "AAPL,MSFT", "--start", dates[0], "--end", dates[-1])
     offline("2025-03-04")
@@ -687,6 +711,7 @@ def test_backtest_rebalance_override_changes_monthly_cycle_count(tmp_path, monke
 def test_paper_create_rebalance_override_is_frozen_and_reported(tmp_path, monkeypatch, capsys, offline):
     path = _mandate(tmp_path)
     original = path.read_bytes()
+    _enroll_test_root(tmp_path)
 
     _main(monkeypatch, "paper", "create", "alpha", "--mandate", str(path), "--universe", "AAPL", "--rebalance", "daily")
     output = capsys.readouterr()
@@ -728,6 +753,7 @@ def test_paper_create_overrides_minute_to_daily_without_minute_fields(tmp_path, 
     mandate.update(rebalance="minute", interval=0.5, window={"start": "09:30", "end": "12:00"})
     path.write_text(yaml.safe_dump(mandate))
     original = path.read_bytes()
+    _enroll_test_root(tmp_path)
 
     _main(monkeypatch, "paper", "create", "fast", "--mandate", str(path), "--universe", "AAPL", "--rebalance", "daily")
     output = capsys.readouterr()
@@ -749,6 +775,7 @@ def test_paper_create_overrides_day_grid_to_minute_with_standard_defaults(tmp_pa
     mandate.pop("window", None)
     path.write_text(yaml.safe_dump(mandate))
     original = path.read_bytes()
+    _enroll_test_root(tmp_path)
 
     _main(monkeypatch, "paper", "create", "fast", "--mandate", str(path), "--universe", "AAPL", "--rebalance", "minute")
     output = capsys.readouterr()
@@ -787,6 +814,7 @@ def test_deployed_fund_commands_do_not_accept_rebalance_override(capsys, action)
 def test_paper_flow_resume_requires_reconciliation_receipt(tmp_path, monkeypatch, capsys, offline):
     set_today = offline
     path = _mandate(tmp_path)
+    _enroll_test_root(tmp_path)
 
     set_today("2025-01-07")  # deployed Tuesday morning: Monday 01-06 is the latest close
     _main(monkeypatch, "paper", "create", "alpha", "--mandate", str(path), "--universe", "AAPL, MSFT")
@@ -922,6 +950,7 @@ def test_cli_resolves_relative_mandate_under_root(tmp_path, monkeypatch, capsys,
     decoy = tmp_path / "cwd"
     (decoy / "mandates").mkdir(parents=True)
     (decoy / "mandates" / "root-mandate.yaml").write_text("not: a valid mandate")
+    _enroll_test_root(tmp_path)
     monkeypatch.chdir(decoy)
 
     _main(
@@ -950,6 +979,7 @@ def test_paper_minute_fund_ticks_and_denies_legacy_runner(tmp_path, monkeypatch,
                     rebalance="minute", interval=0.5, window={"start": "09:30", "end": "12:00"})
     path = tmp_path / "bars.yaml"
     path.write_text(yaml.safe_dump(spec.model_dump()))
+    _enroll_test_root(tmp_path)
 
     _main(monkeypatch, "paper", "create", "fast", "--mandate", str(path), "--universe", "AAPL")
     err = " ".join(capsys.readouterr().err.split())  # the console wraps; read it as one line
@@ -1009,8 +1039,22 @@ def test_paper_minute_fund_ticks_and_denies_legacy_runner(tmp_path, monkeypatch,
 
 
 def _offline_tick(directory):
-    with run.make_data_client() as raw:
-        run.tick(directory, run.CachedDataClient(raw))
+    from hedge_fund.runtime.admission import AdmissionCoordinator, RootOwnerLease
+    from hedge_fund.runtime.root import RootContext
+
+    with RootContext.open(Path(directory).parent.parent) as root:
+        owner = RootOwnerLease.acquire(root, timeout=0)
+        admission = AdmissionCoordinator(root, owner_lease=owner)
+        try:
+            with paths.bound_root(root):
+                with admission.manual_session(Path(directory).name, timeout=0):
+                    with run.make_data_client() as raw:
+                        run.tick(directory, run.CachedDataClient(raw))
+                from hedge_fund.runtime.handover import record_ledger_head
+
+                record_ledger_head(root, Path(directory).name, admission=admission)
+        finally:
+            owner.close()
 
 
 def _disable_status_animation(monkeypatch):
@@ -1021,6 +1065,7 @@ def test_paper_create_approval_and_approve_commands_show_status(tmp_path, monkey
     set_today = offline
     path = _mandate(tmp_path)
     set_today("2025-01-07")
+    _enroll_test_root(tmp_path)
 
     _main(monkeypatch, "paper", "create", "alpha", "--mandate", str(path), "--universe", "AAPL", "--approval")
     created = capsys.readouterr()
@@ -1049,6 +1094,7 @@ def test_paper_approve_now_executes_when_a_session_is_due(tmp_path, monkeypatch,
     set_today = offline
     path = _mandate(tmp_path)
     set_today("2025-01-07")
+    _enroll_test_root(tmp_path)
     _main(monkeypatch, "paper", "create", "alpha", "--mandate", str(path), "--universe", "AAPL", "--approval")
     capsys.readouterr()
     directory = tmp_path / "paper" / "alpha"
@@ -1068,6 +1114,7 @@ def test_paper_approve_now_executes_when_a_session_is_due(tmp_path, monkeypatch,
 
 def test_paper_approve_now_without_a_due_session_schedules_next_close(tmp_path, monkeypatch, capsys, offline):
     path = _mandate(tmp_path)
+    _enroll_test_root(tmp_path)
     _main(monkeypatch, "paper", "create", "alpha", "--mandate", str(path), "--universe", "AAPL", "--approval")
     capsys.readouterr()
     directory = tmp_path / "paper" / "alpha"
@@ -1086,6 +1133,7 @@ def test_paper_reject_records_verdict_and_event(tmp_path, monkeypatch, capsys, o
     set_today = offline
     path = _mandate(tmp_path)
     set_today("2025-01-07")
+    _enroll_test_root(tmp_path)
     _main(monkeypatch, "paper", "create", "alpha", "--mandate", str(path), "--universe", "AAPL", "--approval")
     capsys.readouterr()
     directory = tmp_path / "paper" / "alpha"
@@ -1105,6 +1153,7 @@ def test_paper_approval_commands_refuse_when_gate_is_off(tmp_path, monkeypatch, 
     set_today = offline
     path = _mandate(tmp_path)
     set_today("2025-01-07")
+    _enroll_test_root(tmp_path)
     _main(monkeypatch, "paper", "create", "alpha", "--mandate", str(path), "--universe", "AAPL")
     capsys.readouterr()
     _offline_tick(tmp_path / "paper" / "alpha")
@@ -1119,6 +1168,7 @@ def test_paper_approval_commands_refuse_when_gate_is_off(tmp_path, monkeypatch, 
 @pytest.mark.parametrize("action", ["approve", "reject"])
 def test_paper_approval_commands_refuse_when_nothing_is_pending(tmp_path, monkeypatch, capsys, offline, action):
     path = _mandate(tmp_path)
+    _enroll_test_root(tmp_path)
     _main(monkeypatch, "paper", "create", "alpha", "--mandate", str(path), "--universe", "AAPL", "--approval")
     capsys.readouterr()
 
@@ -1134,6 +1184,7 @@ def test_paper_approval_commands_refuse_halted_funds_without_touching_control(tm
     set_today = offline
     path = _mandate(tmp_path)
     set_today("2025-01-07")
+    _enroll_test_root(tmp_path)
     _main(monkeypatch, "paper", "create", "alpha", "--mandate", str(path), "--universe", "AAPL", "--approval")
     capsys.readouterr()
     directory = tmp_path / "paper" / "alpha"

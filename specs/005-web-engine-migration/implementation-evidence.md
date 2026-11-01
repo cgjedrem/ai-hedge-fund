@@ -637,3 +637,36 @@ At `2026-11-01T11:26:18.3783384+01:00` → `11:29:20.1900746+01:00`, the final i
 - The observations are source-run unit/integration tests with fake transports. They do not prove an actual provider accepts the request, an installed T137 artifact behaves the same, or platform/network behavior outside the guarded test harness.
 - No live provider, broker, paid retry or scheduled job was run. No production key was loaded. The old wheel smoke is unrelated to the T137 code identity.
 - T137 is scoped complete only for the supported guarded paths above. Wider migration remains **PARTIAL / NOT READY TO MERGE**; combined paid providers, all cloud providers, live runtime, full-suite completion, Linux/ext4, and actual ACL evidence remain unresolved.
+
+## T138 / T015 / T021 — storage and research writer slice
+
+**Status: PARTIAL.** Evidence is source-run unit testing, not an installed artifact or runtime deployment.
+
+- Observation timestamp: `2026-11-01T18:59:11.694992+01:00`.
+- Revision: `1acbf4623686c90a04aba95099dc4fe5fe14db34`. Scoped source/test content identity: 11 paths / 221,544 bytes / SHA-256 `279429839f430abd7042e9f685de94f06ff4208cbd9d517f6bacdffdcf9fd7e9`. Scoped tracked diff: 50,705 bytes / SHA-256 `48c01317a58dbe5182d00197a93eb5e07135dd06db9bc38e7b4a6e2151d5b487`. `fund/storage.py` already used RootContext plus `root_registry_writer`; it was not modified in this slice.
+- Environment: Windows checkout, project venv `outputs/spec005-poetry-envs/aihf-DI2Co9qP-py3.13/Scripts/python.exe`, Python 3.13.7; `PYTHON_DOTENV_DISABLED=1`; project pytest fixtures isolate HOME/TEMP/root/credentials/network. Synthetic roots and fakes only.
+- For the pytest commands below, `$py` was set to that venv interpreter and dotenv was disabled in the PowerShell process.
+
+| Result | Exact command | Observation |
+|---|---|---|
+| **PASS** | `& $py -m pytest hedge_fund\fund\test_storage.py hedge_fund\backtesting\test_research.py hedge_fund\runtime\test_handover.py hedge_fund\test_paths.py -q -p no:cacheprovider --tb=short` | Final run: **34 passed, 2 skipped in 8.29 s**, exit 0. Covers unchanged-byte denial for ordinary and paper paths, enrolled lane acceptance, research lane isolation from unrelated runner reservation, independent-fund concurrent writes, and explicit stale-recovery attestation/record identity. |
+| **PASS** | `& $py -m pytest hedge_fund\test_run.py -q -p no:cacheprovider --tb=short` | Final run: **45 passed in 41.56 s**, exit 0. CLI backtest persistence uses an owner lease and the shared research lane; paper test helpers now mirror owner/manual-session admission and ledger-head update. |
+| **PASS** | `& $py -m pytest hedge_fund\web\test_main.py hedge_fund\web\test_app.py -q -p no:cacheprovider --tb=short` | **20 passed in 6.57 s**, exit 0. Dotenv fixture uses a supported catalog model. |
+| **PASS** | Owned subprocess: `python -m hedge_fund.web --demo --root <owned-root> --port 49678` | **4.282 s**, PID 31260. `/api/capabilities`: `mode=demo`, `writes=false`, `network=false`; dynamic loopback port, not 8765. `Stop-Process -Id 31260` stopped only the owned child; marked scratch root cleanup passed. |
+| **FAIL** | `& $py -m pytest hedge_fund\tui\test_paper.py hedge_fund\tui\test_builder.py -q -p no:cacheprovider --tb=no` | **16 failed, 27 passed in 33.82 s**, exit 1. TUI flow is not green and is not treated as acceptance evidence. |
+
+Black `--check --line-length 420` passed on 8 focused files. Black reports `test_research.py` and `test_run.py`; both also fail when checked from `HEAD` content. isort Black profile, flake8 with `--ignore=E203,W503 --max-line-length=420`, and `git diff --check` passed on selected changed paths. No build/install was performed for this slice.
+
+The paper-path regression was red before the guard: **1 failed in 0.43 s** because `RootConfigurationError` was not raised; that red run stopped before asserting byte preservation. After the false-admission denial, the test passed **1 test in 0.12 s**, including unchanged bytes. An enrolled CLI deployment then identified the control-file lane requirement: `Ledger.init()` writes `control.json` under deployment admission. The path guard now recognizes that lane; final CLI and focused path suites pass.
+
+### Direct-writer audit and limits
+
+- `fund/storage.py::save_spec` uses root-relative `RootContext` I/O and registry admission; typed storage error on unavailable/denied admission.
+- `backtesting/research.py::save_result` requires an `AdmissionCoordinator`, writes through `RootContext`, and holds the per-fund research lane. Research lanes are independent across funds and separate from runner reservations.
+- `paths.py::write_bytes`, `write_text`, and `ensure_directory` enforce root registry admission for ordinary root paths and paper-lane admission for conventional paper paths; false admission on an unenrolled paper root now denies before bytes change. The paper fund directory, not its target file, binds the lane identity. `control.json` initialization also accepts the deployment lane; ordinary control writes still require control or execution lanes. `features/breakpoints.py`, `data/cached.py`, `llm/cache.py`, and root-bound CLI output use these helpers. Explicit output paths outside the selected root remain caller-owned paths.
+- `paper/deployed.py` checks the deployment lane; `paper/ledger.py` checks write/control lanes. `paper/runner.py` retains direct legacy PID/log writes and denies enrolled roots; it remains a legacy/out-of-band boundary, not a proof that an unaware binary is stopped. `web/services.py`, `runtime/configuration.py`, `runtime/credentials.py`, `runtime/operations.py`, `runtime/handover.py`, and `runtime/owned_runner.py` use root-relative writes under their respective admission/operation/owner paths. `brokers/saxo.py` writes its refresh-lock owner under a temp lock directory, not a fund root.
+- `tui/funds.py` still has direct unlink/rmtree fund deletion paths without shared admission on an unenrolled root. Existing TUI paper-denial behavior is not a complete fail-closed proof for legacy roots. This clause remains open; no TUI code was changed.
+- Fresh web demo seeding enrolls the owned root, acquires `RootOwnerLease`/`AdmissionCoordinator`, and uses deployment, manual-session, and research lanes. The live launcher smoke proved this path after paper-path admission began rejecting unenrolled roots; no real-root exception was added.
+- Legacy and out-of-band binaries remain **unfenced unless explicitly excluded**. Operator attestation and application locks do not prove that an unaware writer is absent. No full direct-writer race matrix, full Python suite, live provider, broker, network call, protected root, or production write was exercised.
+
+T138, T015, and T021 remain unchecked. Stale-recovery record creation is implemented and explicitly attested, but T015 remains partial because legacy/out-of-band exclusion is unproven; T021 remains partial because the complete writer inventory/race matrix and TUI mutation boundary are unresolved.

@@ -16,8 +16,12 @@ from pathlib import Path
 from hedge_fund import paths
 from hedge_fund.backtesting.fund import FundBacktestResult
 from hedge_fund.paper.deployed import validate_fund_name
-from hedge_fund.runtime.admission import AdmissionCoordinator, root_registry_writer
-from hedge_fund.runtime.root import RootContext
+from hedge_fund.runtime.admission import AdmissionCoordinator, AdmissionError
+from hedge_fund.runtime.root import RootContext, RootPathError
+
+
+class ResearchAdmissionError(RuntimeError):
+    """Research write lacks verified root and fund-lane admission."""
 
 
 def save_result(
@@ -26,11 +30,11 @@ def save_result(
     directory: str | Path | None = None,
     admission: AdmissionCoordinator | None = None,
 ) -> Path:
-    """Write *result* under an admitted research root."""
+    """Write *result* under its enrolled root and fund-specific lane."""
     if not isinstance(result, FundBacktestResult):
         raise TypeError("a validated FundBacktestResult is required")
-    if admission is not None and not isinstance(admission, AdmissionCoordinator):
-        raise TypeError("admission must be an AdmissionCoordinator")
+    if not isinstance(admission, AdmissionCoordinator):
+        raise ResearchAdmissionError("research writes require shared admission")
     if directory is not None and not isinstance(directory, (str, os.PathLike)):
         raise TypeError("research directory must be path-like")
     try:
@@ -39,23 +43,16 @@ def save_result(
         end = _safe_date_component(result.end)
     except (TypeError, ValueError):
         raise ValueError("backtest report identity is invalid") from None
-    configured = paths.root_context(required=False)
-    root = admission.root if admission is not None else configured
-    if root is None:
-        raise ValueError("research writes require an explicit root context")
-    research_dir = Path(directory) if directory is not None else root.path / "research" if admission is not None else paths.RESEARCH_DIR
-    if not isinstance(root, RootContext):
-        raise TypeError("an explicit RootContext is required")
-    if configured is not None and admission is None:
-        _relative_root_path(configured, research_dir)
-    relative_directory = _relative_root_path(root, research_dir)
-    if relative_directory != "research":
-        raise ValueError("backtest reports must use the research directory")
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-    filename = f"{fund_name}-{start}-{end}-{stamp}.json"
-    relative_file = "/".join(part for part in (relative_directory, filename) if part)
+    root = admission.root
+    research_dir = Path(directory) if directory is not None else root.path / "research"
     try:
-        with root_registry_writer(root, admission):
+        relative_directory = _relative_root_path(root, research_dir)
+        if relative_directory != "research":
+            raise ValueError("backtest reports must use the research directory")
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        filename = f"{fund_name}-{start}-{end}-{stamp}.json"
+        relative_file = f"{relative_directory}/{filename}"
+        with admission.research_lane(fund_name, timeout=0):
             if relative_directory:
                 root.mkdir(relative_directory, parents=True)
             try:
@@ -67,6 +64,10 @@ def save_result(
             root.write_bytes(relative_file, result.model_dump_json(indent=2).encode("utf-8"))
     except FileExistsError:
         raise
+    except ResearchAdmissionError:
+        raise
+    except (AdmissionError, OSError, RootPathError, RuntimeError) as exc:
+        raise ResearchAdmissionError("research writer admission is unavailable") from exc
     return root.path / Path(relative_file)
 
 

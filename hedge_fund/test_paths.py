@@ -6,7 +6,13 @@ import pytest
 
 import hedge_fund.paths as paths
 from hedge_fund.paths import write_atomic
-from hedge_fund.runtime.root import RootContext, RootPathError
+from hedge_fund.runtime.admission import (
+    AdmissionCoordinator,
+    RootMigrationLease,
+    RootOwnerLease,
+)
+from hedge_fund.runtime.handover import enroll_fresh
+from hedge_fund.runtime.root import RootConfigurationError, RootContext, RootPathError
 
 
 def test_write_atomic_survives_non_ascii(tmp_path: Path) -> None:
@@ -40,6 +46,64 @@ def test_write_atomic_uses_a_unique_temp_path_per_write(tmp_path: Path, monkeypa
 
     assert len(set(temporary_names)) == 2
     assert path.read_text(encoding="utf-8") == "second"
+
+
+def test_root_path_writer_denies_when_admission_is_unavailable_without_changing_bytes(tmp_path: Path) -> None:
+    target = tmp_path / "cache" / "answer.json"
+
+    with RootContext.open(tmp_path) as root:
+        enroll_fresh(root)
+        root.mkdir("cache")
+        root.write_bytes("cache/answer.json", b"reviewed")
+        migration = RootMigrationLease.acquire(root, timeout=0)
+        try:
+            with paths.bound_root(root):
+                with pytest.raises(RootConfigurationError):
+                    paths.write_bytes(target, b"changed")
+            assert target.read_bytes() == b"reviewed"
+        finally:
+            migration.close()
+
+
+def test_root_path_writer_rejects_unenrolled_legacy_root_without_changing_bytes(tmp_path: Path) -> None:
+    target = tmp_path / "cache" / "answer.json"
+    target.parent.mkdir()
+    target.write_bytes(b"legacy")
+
+    with RootContext.open(tmp_path) as root:
+        with paths.bound_root(root):
+            with pytest.raises(RootConfigurationError):
+                paths.write_bytes(target, b"changed")
+        assert target.read_bytes() == b"legacy"
+
+
+def test_paper_root_writer_rejects_unenrolled_root_without_changing_bytes(tmp_path: Path) -> None:
+    target = tmp_path / "paper" / "alpha" / "state.json"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"legacy")
+
+    with RootContext.open(tmp_path) as root:
+        with paths.bound_root(root):
+            with pytest.raises(RootConfigurationError):
+                paths.write_bytes(target, b"changed")
+        assert target.read_bytes() == b"legacy"
+
+
+def test_paper_root_writer_accepts_enrolled_deployment_lane(tmp_path: Path) -> None:
+    from hedge_fund.runtime.handover import enroll_fresh
+
+    with RootContext.open(tmp_path) as root:
+        enroll_fresh(root)
+        owner = RootOwnerLease.acquire(root, timeout=0)
+        admission = AdmissionCoordinator(root, owner_lease=owner)
+        try:
+            with paths.bound_root(root):
+                with admission.deployment_lock("alpha", timeout=0):
+                    target = tmp_path / "paper" / "alpha" / "state.json"
+                    paths.write_bytes(target, b"admitted")
+            assert target.read_bytes() == b"admitted"
+        finally:
+            owner.close()
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX file modes required")

@@ -198,10 +198,11 @@ def write_bytes(
     selected = _relative_user_path(candidate)
     if selected is not None:
         context, relative = selected
-        parent = Path(relative).parent
-        if parent.parts:
-            context.mkdir(parent.as_posix(), parents=True)
-        context.write_bytes(relative, data, mode=mode)
+        with _root_write_admission(context, relative):
+            parent = Path(relative).parent
+            if parent.parts:
+                context.mkdir(parent.as_posix(), parents=True)
+            context.write_bytes(relative, data, mode=mode)
         return
     candidate.parent.mkdir(parents=True, exist_ok=True)
     candidate.write_bytes(data)
@@ -246,7 +247,8 @@ def ensure_directory(
     selected = _relative_user_path(candidate)
     if selected is not None:
         context, relative = selected
-        return context.mkdir(relative, parents=True, mode=mode)
+        with _root_write_admission(context, relative):
+            return context.mkdir(relative, parents=True, mode=mode)
     candidate.mkdir(parents=True, exist_ok=True)
     return candidate
 
@@ -270,6 +272,41 @@ def ensure_mandates_dir() -> Path:
     except (OSError, RuntimeError, ValueError) as exc:
         raise RootConfigurationError("offline enrollment and root writer admission are required") from exc
     return MANDATES_DIR
+
+
+@contextmanager
+def _root_write_admission(context: RootContext, relative: str) -> Iterator[None]:
+    parts = Path(relative).parts
+    if parts and parts[0].casefold() == "paper":
+        from hedge_fund.runtime.admission import (
+            AdmissionError,
+            require_paper_write_lanes,
+        )
+
+        if len(parts) < 2:
+            raise RootConfigurationError("paper-root writes require a deployment identity")
+        filename = parts[-1].casefold()
+        lane_sets = (("control",), ("deployment",), ("runner", "execution")) if filename in {"control.json", "pending-approval.json"} else (("deployment",), ("runner", "execution"))
+        try:
+            admitted = require_paper_write_lanes(
+                context.path.joinpath(*parts[:2]),
+                parts[1],
+                lane_sets=lane_sets,
+            )
+            if not admitted:
+                raise RootConfigurationError("paper write admission is unavailable")
+        except AdmissionError as exc:
+            raise RootConfigurationError("paper write admission is unavailable") from exc
+        yield
+        return
+
+    try:
+        from hedge_fund.runtime.admission import root_registry_writer
+
+        with root_registry_writer(context):
+            yield
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise RootConfigurationError("root write admission is unavailable") from exc
 
 
 def write_atomic(path: Path, text: str, *, mode: int | None = None) -> None:

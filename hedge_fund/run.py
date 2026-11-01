@@ -1138,7 +1138,14 @@ def _backtest(
 
     payload = result.model_dump_json(indent=2)
     print(payload)
-    saved = save_result(result)
+    from hedge_fund.runtime.admission import AdmissionCoordinator, RootOwnerLease
+
+    owner = RootOwnerLease.acquire(root, timeout=0)
+    research_admission = AdmissionCoordinator(root, owner_lease=owner)
+    try:
+        saved = save_result(result, admission=research_admission)
+    finally:
+        owner.close()
     if args.out:
         try:
             paths.write_text(paths.resolve_user_path(args.out), payload)

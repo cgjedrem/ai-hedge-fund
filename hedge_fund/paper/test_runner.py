@@ -495,3 +495,27 @@ def test_enrolled_root_blocks_legacy_runner_start_and_pid_signaling(tmp_path, mo
 
     assert pid_file.read_bytes() == pid_before
     assert not (directory / "runner.log").exists()
+
+
+def test_is_running_never_sends_console_control_events(tmp_path, monkeypatch):
+    import os
+    import subprocess
+    import sys
+
+    from hedge_fund.paper import runner as runner_module
+
+    def forbidden(*_args):
+        raise AssertionError("os.kill(pid, 0) is CTRL_C_EVENT on Windows and interrupts the whole console")
+
+    if sys.platform == "win32":
+        monkeypatch.setattr(runner_module.os, "kill", forbidden)
+    pid_file = tmp_path / PID_FILE
+    pid_file.write_text(str(os.getpid()), encoding="utf-8")
+    assert runner_module.is_running(tmp_path)
+    child = subprocess.Popen([sys.executable, "-c", "pass"])
+    child.wait(timeout=30)
+    pid_file.write_text(str(child.pid), encoding="utf-8")
+    assert not runner_module.is_running(tmp_path)
+    for invalid in ("0", "-1", "999999999", "not-a-pid"):
+        pid_file.write_text(invalid, encoding="utf-8")
+        assert not runner_module.is_running(tmp_path)

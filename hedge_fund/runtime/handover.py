@@ -9,7 +9,7 @@ import re
 import stat
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 
 from hedge_fund.pipeline.session import code_version
 from hedge_fund.runtime.admission import (
@@ -29,11 +29,13 @@ from hedge_fund.runtime.root import (
 )
 
 HANDOVER_PATH = f"{PRIVATE_ROOT}/handover.json"
+RECOVERY_ROOT = f"{PRIVATE_ROOT}/recoveries"
 _SHA256 = re.compile(r"[a-f0-9]{64}")
 _MAX_RECORD_BYTES = 2 * 1024 * 1024
 _MAX_INVENTORY_FUNDS = 10000
 _MAX_LEDGER_SESSIONS = 1000000
 OPERATOR_ATTESTATION = "I confirm every legacy writer and out-of-band writer is stopped and excluded " "from this root, and this ledger-head inventory is exact."
+STALE_RECOVERY_ATTESTATION = "I confirm the runner owner is quiescent in this root namespace, legacy and out-of-band " "writers are excluded, and the recorded evidence is exact."
 
 
 class HandoverError(RuntimeError):
@@ -50,6 +52,20 @@ class EnrollmentInvalid(HandoverError):
 
 class LedgerDrift(HandoverError):
     """Current ledger state differs from its enrolled head."""
+
+
+class StaleReservationRecoveryRecord(TypedDict):
+    schema: int
+    protocol_version: int
+    build_id: str
+    root: dict[str, Any]
+    fund: str
+    inventory_digest: str
+    prior_owner_identity: dict[str, Any]
+    evidence: dict[str, str]
+    operator_attestation: str
+    recovered_at: str
+    record_digest: str
 
 
 def root_binding(root: RootContext) -> dict[str, Any]:
@@ -351,6 +367,133 @@ def record_ledger_head(
         raise HandoverError("ledger head inventory update is unavailable") from exc
 
 
+def recover_stale_reservation(
+    root: RootContext,
+    fund: str,
+    *,
+    evidence: dict[str, str],
+    operator_attestation: str,
+) -> dict[str, Any]:
+    """Record operator recovery after root-wide participant quiescence."""
+    if not isinstance(root, RootContext):
+        raise TypeError("an explicit RootContext is required")
+    _resource_key(fund)
+    evidence = _validated_recovery_evidence(evidence)
+    if operator_attestation != STALE_RECOVERY_ATTESTATION:
+        raise HandoverError("explicit stale-reservation recovery attestation is required")
+
+    from hedge_fund.runtime.owned_runner import (
+        OwnedRunnerError,
+        read_runner_record,
+        runner_key,
+        validate_runner_state,
+        write_runner_record,
+    )
+
+    runner_identity = runner_key(fund)
+    try:
+        migration = RootMigrationLease.acquire(root, timeout=0)
+    except WriterConflict as exc:
+        raise HandoverError("root participant is active; stale recovery requires quiescence") from exc
+    try:
+        enrollment = require_enrollment(root)
+        verify_root_inventory(root, record=enrollment)
+        if _has_legacy_runner_pid(root.path):
+            raise HandoverError("legacy runner marker blocks stale recovery")
+        state = read_runner_record(root, fund, "state")
+        if not validate_runner_state(root, fund, state):
+            raise HandoverError("runner owner identity is unavailable for recovery")
+        if state is None:
+            raise HandoverError("runner reservation is not present")
+
+        prior_owner = _prior_owner_identity(state)
+        recovery_path = f"{RECOVERY_ROOT}/{runner_identity}/{state['nonce_hash']}.json"
+        try:
+            existing = read_stale_recovery(root, fund)
+        except HandoverError:
+            raise
+        if state["status"] not in {"starting", "running", "stopping"}:
+            if state["status"] == "failed" and state["reason"] == "operator-stale-recovery" and existing is not None and existing["evidence"] == evidence and existing["operator_attestation"] == operator_attestation:
+                return existing
+            raise HandoverError("runner reservation is not stale and active")
+
+        if existing is None:
+            heads = build_head_inventory(root)
+            if heads != enrollment["heads"]:
+                raise LedgerDrift("ledger head changed; stale recovery is blocked")
+            body = {
+                "schema": 1,
+                "protocol_version": PROTOCOL_VERSION,
+                "build_id": code_version(),
+                "root": root_binding(root),
+                "fund": state["fund"],
+                "inventory_digest": _digest(heads),
+                "prior_owner_identity": prior_owner,
+                "evidence": evidence,
+                "operator_attestation": operator_attestation,
+                "recovered_at": datetime.now(timezone.utc).isoformat(timespec="microseconds"),
+            }
+            record = {**body, "record_digest": _digest(body)}
+            _validate_stale_recovery_record(root, fund, record)
+            root.mkdir(f"{RECOVERY_ROOT}/{runner_identity}", parents=True, mode=0o700)
+            try:
+                root.file_info(recovery_path)
+            except FileNotFoundError:
+                _write_stale_recovery_record(root, recovery_path, record)
+            else:
+                raise HandoverError("recovery record already exists but is unreadable")
+        else:
+            if existing["prior_owner_identity"] != prior_owner or existing["evidence"] != evidence or existing["operator_attestation"] != operator_attestation:
+                raise HandoverError("existing recovery record does not match this owner and attestation")
+            record = existing
+
+        state["status"] = "failed"
+        state["reason"] = "operator-stale-recovery"
+        state["updated_at"] = datetime.now(timezone.utc).isoformat(timespec="microseconds")
+        write_runner_record(root, fund, "state", state)
+        return record
+    except HandoverError:
+        raise
+    except (AdmissionError, OwnedRunnerError, OSError, RootPathError, ValueError) as exc:
+        raise HandoverError("stale-reservation recovery failed closed") from exc
+    finally:
+        migration.close()
+
+
+def read_stale_recovery(root: RootContext, fund: str) -> dict[str, Any] | None:
+    """Read one validated recovery record by fund identity."""
+    if not isinstance(root, RootContext):
+        raise TypeError("an explicit RootContext is required")
+    from hedge_fund.runtime.owned_runner import read_runner_record, runner_key
+
+    name = _resource_key(fund)
+    key = runner_key(fund)
+    try:
+        state_record = read_runner_record(root, fund, "state")
+    except (OSError, RootPathError, ValueError):
+        raise HandoverError("runner state is unavailable for recovery lookup") from None
+    if state_record is None:
+        return None
+    nonce_hash = state_record.get("nonce_hash") if isinstance(state_record, dict) else None
+    if not isinstance(nonce_hash, str) or not _SHA256.fullmatch(nonce_hash):
+        raise HandoverError("runner state identity is invalid for recovery lookup")
+    relative = f"{RECOVERY_ROOT}/{key}/{nonce_hash}.json"
+    try:
+        info = root.file_info(relative)
+    except FileNotFoundError:
+        return None
+    except (OSError, RootPathError) as exc:
+        raise HandoverError("stale recovery record is unavailable") from exc
+    if info.size <= 0 or info.size > 64 * 1024:
+        raise HandoverError("stale recovery record size is invalid")
+    try:
+        record = json.loads(root.read_bytes(relative).decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, RootPathError):
+        raise HandoverError("stale recovery record is malformed") from None
+    _validate_stale_recovery_record(root, name, record)
+    return record
+
+
 def root_is_enrolled(root: RootContext) -> bool:
     try:
         root.file_info(HANDOVER_PATH)
@@ -387,6 +530,105 @@ def _new_record(
         "inventory_digest": _digest(heads),
     }
     return {**body, "record_digest": _digest(body)}
+
+
+def _validated_recovery_evidence(value: object) -> dict[str, str]:
+    fields = {"owner_quiescence", "legacy_exclusion"}
+    if not isinstance(value, dict) or set(value) != fields:
+        raise HandoverError("stale recovery evidence is incomplete")
+    evidence: dict[str, str] = {}
+    for field in sorted(fields):
+        text = value[field]
+        if not isinstance(text, str) or not text.strip() or len(text) > 2048 or any(ord(char) < 32 and char not in "\t\n\r" for char in text):
+            raise HandoverError("stale recovery evidence is invalid")
+        evidence[field] = text.strip()
+    return evidence
+
+
+def _prior_owner_identity(state: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "status": state["status"],
+        "nonce_hash": state["nonce_hash"],
+        "created_at": state["created_at"],
+        "pid": state["pid"],
+        "process_identity": state["process_identity"],
+    }
+
+
+def _validate_stale_recovery_record(
+    root: RootContext,
+    fund: str,
+    record: object,
+) -> None:
+    fields = {
+        "schema",
+        "protocol_version",
+        "build_id",
+        "root",
+        "fund",
+        "inventory_digest",
+        "prior_owner_identity",
+        "evidence",
+        "operator_attestation",
+        "recovered_at",
+        "record_digest",
+    }
+    if not isinstance(record, dict) or set(record) != fields:
+        raise HandoverError("stale recovery record fields are invalid")
+    if (
+        type(record["schema"]) is not int
+        or record["schema"] != 1
+        or type(record["protocol_version"]) is not int
+        or record["protocol_version"] != PROTOCOL_VERSION
+        or record["build_id"] != code_version()
+        or record["root"] != root_binding(root)
+        or not isinstance(record["fund"], str)
+        or _resource_key(record["fund"]) != _resource_key(fund)
+        or not isinstance(record["inventory_digest"], str)
+        or not _SHA256.fullmatch(record["inventory_digest"])
+        or record["operator_attestation"] != STALE_RECOVERY_ATTESTATION
+        or not _valid_timestamp(record["recovered_at"])
+    ):
+        raise HandoverError("stale recovery record identity is invalid")
+    evidence = _validated_recovery_evidence(record["evidence"])
+    if evidence != record["evidence"]:
+        raise HandoverError("stale recovery evidence is not canonical")
+    prior = record["prior_owner_identity"]
+    if not isinstance(prior, dict) or set(prior) != {"status", "nonce_hash", "created_at", "pid", "process_identity"}:
+        raise HandoverError("stale recovery owner identity is invalid")
+    if prior["status"] not in {"starting", "running", "stopping"} or not isinstance(prior["nonce_hash"], str) or not _SHA256.fullmatch(prior["nonce_hash"]) or not _valid_timestamp(prior["created_at"]):
+        raise HandoverError("stale recovery owner identity is invalid")
+    process_identity = prior["process_identity"]
+    if prior["pid"] is None:
+        if prior["status"] != "starting" or process_identity is not None:
+            raise HandoverError("stale recovery process identity is invalid")
+    elif (
+        type(prior["pid"]) is not int
+        or prior["pid"] <= 0
+        or not isinstance(process_identity, dict)
+        or set(process_identity) != {"pid", "creation_time", "image", "host", "namespace"}
+        or type(process_identity.get("pid")) is not int
+        or process_identity["pid"] != prior["pid"]
+        or any(not isinstance(process_identity.get(key), str) or not process_identity[key] for key in ("creation_time", "image", "host", "namespace"))
+        or process_identity["host"].casefold() != root.host_identity.casefold()
+        or process_identity["namespace"] != root.namespace_identity
+    ):
+        raise HandoverError("stale recovery process identity is invalid")
+    body = {key: value for key, value in record.items() if key != "record_digest"}
+    if not isinstance(record["record_digest"], str) or record["record_digest"] != _digest(body):
+        raise HandoverError("stale recovery record digest is invalid")
+    root.revalidate()
+
+
+def _write_stale_recovery_record(
+    root: RootContext,
+    relative: str,
+    record: StaleReservationRecoveryRecord,
+) -> None:
+    payload = json.dumps(record, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    if len(payload) > 64 * 1024:
+        raise HandoverError("stale recovery record exceeds its storage bound")
+    root.write_bytes(relative, payload, mode=stat.S_IRUSR | stat.S_IWUSR)
 
 
 def _write_record(root: RootContext, record: dict[str, Any]) -> None:

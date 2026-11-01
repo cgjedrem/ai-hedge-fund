@@ -46,7 +46,7 @@ def test_web_launcher_requires_root_outside_demo_mode(monkeypatch):
 
 def test_web_dotenv_is_opt_in_exact_root_and_non_secret_only(tmp_path, monkeypatch):
     (tmp_path / ".env").write_text(
-        "HEDGE_FUND_LLM_MODEL=safe-model\nHEDGE_FUND_DATA_PROVIDER=yfinance\nOPENAI_API_KEY=synthetic-secret\nHEDGE_FUND_ROOT=decoy-root\nAIHF_ALLOW_WRITES=1\n",
+        "HEDGE_FUND_LLM_MODEL=gpt-6-sol\nHEDGE_FUND_DATA_PROVIDER=yfinance\nOPENAI_API_KEY=synthetic-secret\nHEDGE_FUND_ROOT=decoy-root\nAIHF_ALLOW_WRITES=1\n",
         encoding="utf-8",
     )
     monkeypatch.setenv("HOME", str(tmp_path / "decoy"))
@@ -69,9 +69,9 @@ def test_web_dotenv_is_opt_in_exact_root_and_non_secret_only(tmp_path, monkeypat
     monkeypatch.setattr(launcher.uvicorn, "run", fake_run)
     launcher.main(["--root", str(tmp_path), "--load-dotenv"])
 
-    assert observed["settings"]["model"] == "safe-model"
+    assert observed["settings"]["model"] == "gpt-6-sol"
     assert observed["settings"]["data_provider"] == "yfinance"
-    assert os.environ["HEDGE_FUND_LLM_MODEL"] == "safe-model"
+    assert os.environ["HEDGE_FUND_LLM_MODEL"] == "gpt-6-sol"
     assert os.environ["HEDGE_FUND_DATA_PROVIDER"] == "yfinance"
     assert "OPENAI_API_KEY" not in os.environ
     assert "HEDGE_FUND_ROOT" not in os.environ
