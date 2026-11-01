@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import inspect
+import math
+import types
 from pathlib import Path
-from typing import Any, Callable, Literal, TypeAlias
+from typing import Any, Callable, get_args, get_origin, Literal, TypeAlias, Union
 
 import yaml
 from pydantic import (
@@ -37,6 +40,82 @@ EARLIEST_WINDOW = "04:00"
 LATEST_WINDOW = "20:00"
 SAXO_REGULAR_OPEN = "09:30"
 SAXO_LAST_BAR = "15:59"
+_RUNTIME_MODEL_PARAMS = frozenset({"breakpoints", "cache", "llm"})
+
+
+def _json_value(value: Any) -> bool:
+    if value is None or type(value) in {str, int, bool}:
+        return True
+    if type(value) is float:
+        return math.isfinite(value)
+    if type(value) is list:
+        return all(_json_value(item) for item in value)
+    if type(value) is dict:
+        return all(isinstance(key, str) and _json_value(item) for key, item in value.items())
+    return False
+
+
+def _matches_parameter_type(value: Any, annotation: Any) -> bool:
+    if isinstance(annotation, str):
+        annotation_types = {
+            "Any": Any,
+            "bool": bool,
+            "float": float,
+            "int": int,
+            "None": type(None),
+            "NoneType": type(None),
+            "str": str,
+        }
+        options = [part.strip() for part in annotation.split("|")]
+        if not options or any(option not in annotation_types for option in options):
+            return False
+        return any(_matches_parameter_type(value, annotation_types[option]) for option in options)
+    if annotation is inspect.Parameter.empty or annotation is Any:
+        return _json_value(value)
+    if annotation is type(None):
+        return value is None
+    if annotation is bool:
+        return type(value) is bool
+    if annotation is int:
+        return type(value) is int
+    if annotation is float:
+        if type(value) not in {int, float}:
+            return False
+        try:
+            return math.isfinite(float(value))
+        except (OverflowError, ValueError):
+            return False
+    if annotation is str:
+        return isinstance(value, str)
+    origin = get_origin(annotation)
+    if origin in {types.UnionType, Union}:
+        return any(_matches_parameter_type(value, option) for option in get_args(annotation))
+    return False
+
+
+def _validate_model_params(name: str, params: dict[str, Any]) -> dict[str, Any]:
+    model_type = ALPHA_MODEL_REGISTRY.get(name)
+    if model_type is None or not _json_value(params):
+        raise ValueError("model constructor parameters are invalid")
+    try:
+        constructor = inspect.signature(model_type.__init__)
+    except (TypeError, ValueError):
+        raise ValueError("model constructor parameters are invalid") from None
+    for key, value in params.items():
+        parameter = constructor.parameters.get(key)
+        if (
+            key in _RUNTIME_MODEL_PARAMS
+            or parameter is None
+            or parameter.kind
+            in {
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.VAR_POSITIONAL,
+                inspect.Parameter.VAR_KEYWORD,
+            }
+            or not _matches_parameter_type(value, parameter.annotation)
+        ):
+            raise ValueError("model constructor parameters are invalid")
+    return params
 
 
 def _clock_seconds(hhmm: str) -> int:
@@ -107,6 +186,14 @@ class ModelSpec(BaseModel):
     def _declared_approach(cls, name: str) -> str:
         get_investment_approach(name)
         return name
+
+    @field_validator("params")
+    @classmethod
+    def _registered_constructor_params(cls, value: dict[str, Any], info) -> dict[str, Any]:
+        name = info.data.get("name")
+        if not isinstance(name, str):
+            raise ValueError("model constructor parameters are invalid")
+        return _validate_model_params(name, value)
 
 
 class BlendPolicy(BaseModel):

@@ -105,6 +105,21 @@ def test_offline_handover_cli_skips_runtime_and_mandate_setup(tmp_path, monkeypa
     assert forbidden.call_count == 0
 
 
+def test_cli_reports_unenrolled_mandate_writer_denial(tmp_path, monkeypatch, capsys):
+    root = tmp_path / "unenrolled-root"
+    root.mkdir()
+    monkeypatch.setattr(run, "PAPER_DIR", root / "paper")
+    monkeypatch.setattr(run, "_load_runtime", Mock())
+    monkeypatch.setattr(run, "ensure_mandates_dir", paths.ensure_mandates_dir)
+
+    with pytest.raises(SystemExit) as denied:
+        _main(monkeypatch)
+
+    assert denied.value.code == 2
+    assert "offline enrollment" in capsys.readouterr().err
+    assert not (root / "mandates").exists()
+
+
 def test_cli_writer_admission_rejects_missing_handover_with_admission_artifacts(
     tmp_path,
     monkeypatch,
@@ -485,7 +500,7 @@ def test_deployed_fund_commands_do_not_accept_rebalance_override(capsys, action)
     assert "unrecognized arguments: --rebalance daily" in capsys.readouterr().err
 
 
-def test_paper_flow_create_tick_status_halt_resume(tmp_path, monkeypatch, capsys, offline):
+def test_paper_flow_resume_requires_reconciliation_receipt(tmp_path, monkeypatch, capsys, offline):
     set_today = offline
     path = _mandate(tmp_path)
 
@@ -532,11 +547,19 @@ def test_paper_flow_create_tick_status_halt_resume(tmp_path, monkeypatch, capsys
         _main(monkeypatch, "paper", "tick", "alpha")
     assert exc.value.code == 1 and "halted" in capsys.readouterr().err
 
-    _main(monkeypatch, "paper", "resume", "alpha")
-    _main(monkeypatch, "paper", "tick", "alpha")
-    assert json.loads(capsys.readouterr().out)["session"] == "2025-01-08"
+    control = tmp_path / "paper" / "alpha" / "control.json"
+    before_resume = control.read_bytes()
+    with pytest.raises(SystemExit) as exc:
+        _main(monkeypatch, "paper", "resume", "alpha")
+    assert exc.value.code == 1
+    assert "reconciliation receipt" in capsys.readouterr().err
+    assert control.read_bytes() == before_resume
+    with pytest.raises(SystemExit) as exc:
+        _main(monkeypatch, "paper", "tick", "alpha")
+    assert exc.value.code == 1 and "halted" in capsys.readouterr().err
     _main(monkeypatch, "paper", "list")
-    assert "3 sessions" in capsys.readouterr().out
+    listed = capsys.readouterr().out
+    assert "2 sessions" in listed and "HALTED: operator review" in listed
 
     with pytest.raises(SystemExit) as exc:
         _main(monkeypatch, "paper", "status", "nobody")

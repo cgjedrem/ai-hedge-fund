@@ -551,7 +551,7 @@ def test_redo_refuses_a_halted_fund_and_leaves_it_untouched(tmp_path, clock, SPE
     assert not (directory / "ledger" / "superseded").exists()
 
 
-def test_failure_inside_advance_halts_the_fund_and_a_resume_clears_it(tmp_path, clock, SPEC):
+def test_failure_inside_advance_stays_halted_without_reconciliation_receipt(tmp_path, clock, SPEC):
     clock("2024-06-05")
     directory = deploy("alpha", SPEC, ["AAPL"], root=tmp_path)
     _tick(directory)  # 06-04, decision made
@@ -564,13 +564,18 @@ def test_failure_inside_advance_halts_the_fund_and_a_resume_clears_it(tmp_path, 
     assert ledger.halted().startswith("tick 2024-06-05 failed: ValueError")
     assert [e["kind"] for e in ledger.events()] == ["tick", "tick_failed", "halt"]
     assert ledger.sessions() == ["2024-06-04"]
+    control_before = ledger.control_path.read_bytes()
+    events_before = ledger.events_path.read_bytes()
+    with pytest.raises(LedgerError, match="verified reconciliation receipt"):
+        ledger.resume()
     with pytest.raises(FundHalted):
-        _tick(directory)  # data is fine again, but nobody has looked yet
-    ledger.resume()
-    assert _tick(directory).session == "2024-06-05"
+        _tick(directory)
+    assert ledger.sessions() == ["2024-06-04"]
+    assert ledger.control_path.read_bytes() == control_before
+    assert ledger.events_path.read_bytes() == events_before
 
 
-def test_gated_approval_survives_failed_advance_and_retries(tmp_path, clock, SPEC, monkeypatch):
+def test_gated_approval_survives_failed_advance_and_resume_denial(tmp_path, clock, SPEC, monkeypatch):
     spec = SPEC.model_copy(update={"approval_required": True, "rebalance": "daily"})
     clock("2024-06-04")
     directory = deploy("alpha", spec, ["AAPL"], root=tmp_path)
@@ -592,13 +597,14 @@ def test_gated_approval_survives_failed_advance_and_retries(tmp_path, clock, SPE
     assert ledger.approval() == verdict
     assert ledger.sessions() == ["2024-06-03"]
 
-    ledger.resume()
+    with pytest.raises(LedgerError, match="verified reconciliation receipt"):
+        ledger.resume()
     monkeypatch.setattr(paper_tick_module, "advance", real_advance)
-    retried = _tick(directory)
-
-    assert retried.executed is not None
-    assert retried.positions == {"AAPL": 500}
-    assert ledger.approval() is None
+    with pytest.raises(FundHalted):
+        _tick(directory)
+    assert ledger.sessions() == ["2024-06-03"]
+    assert ledger.approval() == verdict
+    assert [event["kind"] for event in ledger.events()][-1] == "halt"
 
 
 def test_broker_drift_between_ticks_is_caught_and_halts(tmp_path, clock, SPEC):

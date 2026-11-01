@@ -9,8 +9,6 @@ call the API.
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta, timezone
-from email.utils import format_datetime
 from unittest.mock import Mock
 
 import pytest
@@ -71,6 +69,16 @@ def test_registry_and_clients_agree():
     """
     listed = {prov for _, _, prov in load_api_models()}
     assert listed <= SUPPORTED_PROVIDERS, f"no client for: {listed - SUPPORTED_PROVIDERS}"
+
+
+@pytest.mark.parametrize(
+    "provider",
+    ["Anthropic", "DeepSeek", "Google", "Kimi", "OpenAI", "xAI"],
+)
+def test_cloud_langchain_clients_disable_retries(provider, keyed):
+    client = make_llm(_BY_PROVIDER[provider])
+
+    assert client._chat.max_retries == 0
 
 
 def test_missing_key_names_the_variable(monkeypatch):
@@ -464,53 +472,39 @@ def test_timeout_is_bounded(timeout):
 
 
 @pytest.mark.parametrize("status", [429, 500, 502, 503, 504, 529])
-def test_transient_http_failure_retries_once(status, http):
-    _serve(http, _http_response(status=status), _http_response())
-    payload = json.loads(JevLLM(API_KEY).complete("s", "u"))
-    assert http[0].call_count == 2
-    http[1].assert_called_once_with(1.0)
-    assert http[0].call_args_list[0] == http[0].call_args_list[1]
-    assert payload["provider_metadata"]["jev"]["attempt_count"] == 2
-
-
-@pytest.mark.parametrize("header,delay", [("5", 5), ("0", 1), ("-2", 1), ("bad-date", 1), ("nan", 1), ("inf", 1)])
-def test_retry_after_seconds_and_invalid_values(header, delay, http):
-    _serve(http, _http_response(status=429, retry_after=header), _http_response())
-    JevLLM(API_KEY).complete("s", "u")
-    http[1].assert_called_once_with(delay)
-
-
-def test_retry_after_http_date(monkeypatch, http):
-    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
-    clock = Mock()
-    clock.now.return_value = now
-    monkeypatch.setattr(client_module, "datetime", clock)
-    header = format_datetime(now + timedelta(seconds=10), usegmt=True)
-    _serve(http, _http_response(status=529, retry_after=header), _http_response())
-    JevLLM(API_KEY).complete("s", "u")
-    http[1].assert_called_once_with(10)
-
-
-def test_long_retry_after_fails_without_sleeping_or_retrying(http):
-    _serve(http, _http_response(status=429, retry_after="61"))
-    with pytest.raises(LLMCallError, match="retry delay exceeds timeout") as caught:
+def test_transient_http_failure_is_not_retried(status, http):
+    _serve(http, _http_response(status=status), _http_response(status=status))
+    with pytest.raises(LLMCallError, match=f"HTTP {status}") as caught:
         JevLLM(API_KEY).complete("s", "u")
     assert caught.value.diagnostic_record["attempt_count"] == 1
     http[0].assert_called_once()
     http[1].assert_not_called()
 
 
-@pytest.mark.parametrize("status,attempts", [(401, 1), (403, 1), (422, 1), (302, 1), (429, 2), (529, 2)])
-def test_http_failures_have_bounded_attempts(status, attempts, http):
-    _serve(http, *[_http_response(status=status, raw="failure") for _ in range(attempts)])
+def test_retry_after_is_ignored(http):
+    _serve(http, _http_response(status=429, retry_after="61"), _http_response(status=429))
+    with pytest.raises(LLMCallError, match="HTTP 429") as caught:
+        JevLLM(API_KEY).complete("s", "u")
+    assert caught.value.diagnostic_record["attempt_count"] == 1
+    http[0].assert_called_once()
+    http[1].assert_not_called()
+
+
+@pytest.mark.parametrize("status", [401, 403, 422, 302, 429, 529])
+def test_http_failures_have_one_attempt(status, http):
+    _serve(
+        http,
+        _http_response(status=status, raw="failure"),
+        _http_response(status=status, raw="failure"),
+    )
     with pytest.raises(LLMCallError, match=f"HTTP {status}") as caught:
         JevLLM(API_KEY).complete("s", "u")
     record = caught.value.diagnostic_record
     assert record["status_code"] == status
     assert record["raw_response"] == "failure"
     assert record["failure_category"] == "http"
-    assert record["attempt_count"] == http[0].call_count == attempts
-    assert http[1].call_count == attempts - 1
+    assert record["attempt_count"] == http[0].call_count == 1
+    http[1].assert_not_called()
 
 
 @pytest.mark.parametrize("exception", [requests.Timeout, requests.ConnectionError])

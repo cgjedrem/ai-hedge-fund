@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from hedge_fund import paths
+from hedge_fund.runtime.handover import enroll_fresh
 from hedge_fund.runtime.root import RootConfigurationError, RootContext
 
 
@@ -39,11 +40,18 @@ def test_root_configuration_binds_every_store_path(tmp_path, configured_root):
     assert paths.ENV_PATH == root / ".env"
 
 
+def test_mandate_bootstrap_denies_unenrolled_root(configured_root):
+    with pytest.raises(RootConfigurationError, match="offline enrollment"):
+        paths.ensure_mandates_dir()
+    assert not (configured_root.path / "mandates").exists()
+
+
 def test_root_path_helpers_keep_store_io_handle_relative(
     configured_root,
     monkeypatch,
 ):
     root = configured_root.path
+    enroll_fresh(configured_root)
     methods = ("mkdir", "read_bytes", "write_bytes", "read_text", "write_text", "resolve")
 
     for method in methods:

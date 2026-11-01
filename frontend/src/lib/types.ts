@@ -253,6 +253,16 @@ export interface PaperSnapshot {
   scorecard_error: string | null;
 }
 
+export interface PaperSessionsCollection {
+  items: SessionSummary[];
+  errors: { id: string; error: string }[];
+  next_cursor: string | null;
+  limit: number;
+  total: number;
+  search: string;
+  ledger: { ok: boolean; error: string | null };
+}
+
 export interface OrderDto {
   ticker: string;
   side: "buy" | "sell";
@@ -346,6 +356,10 @@ export interface ResearchReport extends ResearchSummary {
 export interface ResearchCollection {
   items: ResearchSummary[];
   errors: { id: string; error: string }[];
+  next_cursor: string | null;
+  limit: number;
+  total: number;
+  search: string;
 }
 
 export interface Job {

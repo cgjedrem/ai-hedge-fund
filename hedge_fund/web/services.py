@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import stat
 import threading
 import unicodedata
 from contextlib import contextmanager
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from ipaddress import ip_address
 from pathlib import Path
@@ -16,12 +17,13 @@ from typing import Callable, Iterator
 from urllib.parse import urlsplit
 from uuid import uuid4
 
+import yaml
+
 from hedge_fund.backtesting.fund import backtest_fund, FundBacktestResult
 from hedge_fund.backtesting.research import save_result
 from hedge_fund.data import CachedDataClient, make_data_client, PriceSnapshot
 from hedge_fund.data.sessions import NEW_YORK
 from hedge_fund.fund import (
-    custom_strategy,
     Fund,
     FundSpec,
     load_spec,
@@ -30,6 +32,7 @@ from hedge_fund.fund import (
     save_spec,
     StrategySpec,
 )
+from hedge_fund.fund.storage import StorageAdmissionError
 from hedge_fund.llm import (
     DEFAULT_MODEL,
     env_var_for,
@@ -116,6 +119,7 @@ from hedge_fund.web.valuation import estimate_valuation, MAX_VALUATION_POSITIONS
 
 PROTECTED_NAMES = ("watchtower", "watchtower-weekly", "umbrella")
 _REPORT_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,180}\.json$")
+_SESSION_CURSOR = re.compile(r"\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}:\d{2})?$")
 _SECRET_FIELD = re.compile(r"(?:api.?key|secret|token|password|credential|authorization)", re.IGNORECASE)
 
 
@@ -320,7 +324,7 @@ class DeskService:
             "mode": "demo" if self.demo else "live",
             "mandate_count": len(mandates["items"]),
             "paper_count": len(paper_items),
-            "research_count": len(reports["items"]),
+            "research_count": reports["total"],
             "recorded_nav_total": sum(item["nav"] for item in paper_items if isinstance(item.get("nav"), (int, float))),
             "paper_funds": paper_items[:6],
             "errors": mandates["errors"] + papers["errors"] + reports["errors"],
@@ -344,7 +348,7 @@ class DeskService:
                 items.append(self._mandate_summary(spec))
             except ServiceError as exc:
                 errors.append({"name": path.stem, "error": exc.detail})
-            except (OSError, ValueError) as exc:
+            except (OSError, ValueError, StorageAdmissionError) as exc:
                 errors.append({"name": path.stem, "error": f"Invalid mandate ({type(exc).__name__})."})
         return {"items": items, "errors": errors}
 
@@ -356,30 +360,91 @@ class DeskService:
 
     def create_mandate(self, payload: dict) -> dict:
         self._require_writes()
-        try:
-            spec = FundSpec.model_validate(payload)
-        except ValueError as exc:
-            raise ServiceError(422, f"Mandate validation failed ({type(exc).__name__}).") from None
-        _reject_secret_fields(spec.model_dump(mode="python"))
-        self._validate_mandate_strategies(spec)
+        spec = self._validated_mandate(payload)
         name = self._validated_name(spec.name)
         self._guard_protected(name)
-        with self._fund_lock(name):
-            directory = self._ensure_dir("mandates")
-            self._assert_unique(directory, f"{name}.yaml")
-            try:
-                self._load_mandate_by_name(name)
-            except ServiceError as exc:
-                if exc.status_code != 404:
-                    raise
-            else:
-                raise ServiceError(409, "A mandate with this name already exists.")
-            try:
-                save_spec(spec, directory)
-            except FileExistsError:
-                raise ServiceError(409, "A mandate with this name already exists.") from None
-            except (OSError, ValueError) as exc:
-                raise ServiceError(422, f"Mandate could not be saved ({type(exc).__name__}).") from None
+        with self._mandate_writer():
+            with self._fund_lock(name):
+                directory = self._ensure_dir("mandates")
+                self._assert_mandate_name_available(name, directory)
+                try:
+                    save_spec(spec, directory, admission=self._admission)
+                except FileExistsError:
+                    raise ServiceError(409, "A mandate with this name already exists.") from None
+                except (OSError, ValueError, StorageAdmissionError) as exc:
+                    raise ServiceError(422, f"Mandate could not be saved ({type(exc).__name__}).") from None
+        return self._mandate_summary(spec, include_spec=True)
+
+    def update_mandate(self, name: str, payload: dict, *, expected_hash: str) -> dict:
+        self._require_writes()
+        normalized = self._validated_name(name)
+        self._guard_protected(normalized)
+        if not isinstance(expected_hash, str) or re.fullmatch(r"[0-9a-f]{64}", expected_hash) is None:
+            raise ServiceError(422, "Mandate revision is invalid.")
+        spec = self._validated_mandate(payload)
+        target = self._validated_name(spec.name)
+        self._guard_protected(target)
+        with self._mandate_writer():
+            with self._fund_lock(normalized):
+                current, path = self._load_mandate_entry(normalized)
+                if mandate_hash(current) != expected_hash:
+                    raise ServiceError(409, "Mandate changed; reload before editing.")
+                relative = path.relative_to(self.root).as_posix()
+                if _windows_name_key(target) != _windows_name_key(normalized):
+                    directory = self._safe_child("mandates")
+                    self._assert_mandate_name_available(
+                        target,
+                        directory,
+                        exclude_path=path,
+                    )
+                    target_relative = f"mandates/{target}.yaml"
+                    if relative.casefold() != target_relative.casefold():
+                        try:
+                            self.root_context.rename_file(relative, target_relative)
+                        except FileExistsError:
+                            raise ServiceError(
+                                409,
+                                "A mandate with this name already exists.",
+                            ) from None
+                        except (OSError, RootPathError, ValueError):
+                            raise ServiceError(
+                                409,
+                                "Mandate could not be renamed safely.",
+                            ) from None
+                    relative = target_relative
+                serialized = yaml.safe_dump(spec.model_dump(), sort_keys=False).encode("utf-8")
+                try:
+                    self.root_context.write_bytes(relative, serialized)
+                except (OSError, RootPathError, ValueError):
+                    raise ServiceError(409, "Mandate could not be updated safely.") from None
+        return self._mandate_summary(spec, include_spec=True)
+
+    def clone_mandate(self, name: str, payload: dict, *, expected_hash: str) -> dict:
+        self._require_writes()
+        source = self._validated_name(name)
+        self._guard_protected(source)
+        if not isinstance(expected_hash, str) or re.fullmatch(r"[0-9a-f]{64}", expected_hash) is None:
+            raise ServiceError(422, "Mandate revision is invalid.")
+        spec = self._validated_mandate(payload)
+        target = self._validated_name(spec.name)
+        self._guard_protected(target)
+        if _windows_name_key(target) == _windows_name_key(source):
+            raise ServiceError(422, "A clone must use a distinct mandate name.")
+        with self._mandate_writer():
+            with self._fund_lock(source):
+                current, _source_path = self._load_mandate_entry(source)
+                if mandate_hash(current) != expected_hash:
+                    raise ServiceError(409, "Mandate changed; reload before cloning.")
+                directory = self._ensure_dir("mandates")
+                self._assert_mandate_name_available(target, directory)
+                try:
+                    save_spec(spec, directory, admission=self._admission)
+                except FileExistsError:
+                    raise ServiceError(409, "A mandate with this name already exists.") from None
+                except StorageAdmissionError:
+                    raise ServiceError(409, "Mandate could not be saved safely.") from None
+                except (OSError, ValueError) as exc:
+                    raise ServiceError(422, f"Mandate could not be saved ({type(exc).__name__}).") from None
         return self._mandate_summary(spec, include_spec=True)
 
     def deploy_mandate(self, name: str, request: DeployRequest) -> dict:
@@ -395,6 +460,8 @@ class DeskService:
                 self._verify_root_inventory()
                 spec = self._load_mandate_by_name(normalized)
                 _reject_secret_fields(spec.model_dump(mode="python"))
+                if spec.broker != "paper":
+                    raise ServiceError(403, "Web deployment is restricted to local-paper mandates.")
                 paper_root = self._ensure_dir("paper")
                 self._assert_unique(paper_root, normalized)
                 try:
@@ -470,6 +537,73 @@ class DeskService:
             raise ServiceError(422, f"Paper fund is invalid ({type(exc).__name__}).") from None
         return self._paper_snapshot(deployed, directory, include_records=True)
 
+    def paper_sessions(
+        self,
+        name: str,
+        *,
+        limit: int = 50,
+        cursor: str | None = None,
+        search: str | None = None,
+    ) -> dict:
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise ServiceError(422, "Session page limit must be between 1 and 100.")
+        if cursor is not None:
+            if not isinstance(cursor, str) or not _SESSION_CURSOR.fullmatch(cursor):
+                raise ServiceError(422, "Session cursor is invalid.")
+            try:
+                if "T" in cursor:
+                    datetime.strptime(cursor, "%Y-%m-%dT%H:%M:%S")
+                else:
+                    date.fromisoformat(cursor)
+            except ValueError:
+                raise ServiceError(422, "Session cursor is invalid.") from None
+        if search is not None and (not isinstance(search, str) or len(search) > 128 or any(ord(character) < 32 or ord(character) == 127 for character in search)):
+            raise ServiceError(422, "Session search is invalid.")
+
+        normalized = self._validated_name(name)
+        directory = self._safe_child("paper", normalized)
+        if not directory.is_dir():
+            raise ServiceError(404, "Paper fund not found.")
+        try:
+            deployed = load_deployed(directory)
+        except ValueError as exc:
+            raise ServiceError(422, f"Paper fund is invalid ({type(exc).__name__}).") from None
+
+        records: list[SessionRecord] = []
+        try:
+            Ledger(directory).replay(
+                deployed.spec.capital,
+                full=True,
+                on_verified=records.append,
+            )
+        except (LedgerError, OSError, ValueError) as exc:
+            error = f"Ledger verification failed ({type(exc).__name__})."
+            return {
+                "items": [],
+                "errors": [{"id": "ledger", "error": error}],
+                "next_cursor": None,
+                "limit": limit,
+                "total": 0,
+                "search": search or "",
+                "ledger": {"ok": False, "error": error},
+            }
+
+        query = search.casefold() if search else ""
+        entries = [record for record in sorted(records, key=lambda record: record.session, reverse=True) if not query or query in record.session.casefold() or query in record.hash.casefold()]
+        total = len(entries)
+        if cursor is not None:
+            entries = [record for record in entries if record.session < cursor]
+        page = entries[:limit]
+        return {
+            "items": [self._session_summary(record) for record in reversed(page)],
+            "errors": [],
+            "next_cursor": page[-1].session if len(entries) > limit else None,
+            "limit": limit,
+            "total": total,
+            "search": search or "",
+            "ledger": {"ok": True, "error": None},
+        }
+
     def create_manual_tick_preview(
         self,
         name: str,
@@ -539,6 +673,7 @@ class DeskService:
         self._guard_protected(normalized)
         with self._fund_lock(normalized):
             with self._paper_control_lane(normalized):
+                self._paper_control_state(normalized)
                 try:
                     return self._runner_manager.request_stop(normalized)
                 except OwnedRunnerError:
@@ -569,7 +704,10 @@ class DeskService:
         with self._fund_lock(normalized):
             with self._paper_manual_lane(normalized):
                 self._verify_root_inventory()
-                directory, deployed, _ledger, state, latest = self._paper_state(normalized)
+                directory, deployed, _ledger, state, latest = self._paper_state(
+                    normalized,
+                    local_paper_only=True,
+                )
                 if deployed.broker != "paper":
                     raise ServiceError(403, "Paper operations require a local-paper deployment.")
                 current_head = latest.hash if latest is not None else None
@@ -692,7 +830,10 @@ class DeskService:
         if not isinstance(request, RunnerStartAcceptRequest):
             raise ServiceError(422, "Runner acceptance is invalid.")
         normalized = self._validated_name(name)
-        _directory, deployed, _ledger, _state, _latest = self._paper_state(normalized)
+        _directory, deployed, _ledger, _state, _latest = self._paper_state(
+            normalized,
+            local_paper_only=True,
+        )
         if deployed.broker != "paper":
             raise ServiceError(403, "Runner requires a local-paper deployment.")
         model_calls = _estimate_paper_model_calls(
@@ -974,7 +1115,10 @@ class DeskService:
         capture: FrozenCapture,
     ) -> tuple[str | None, tuple[str, ...]]:
         self._verify_root_inventory()
-        directory, deployed, _ledger, state, latest = self._paper_state(name)
+        directory, deployed, _ledger, state, latest = self._paper_state(
+            name,
+            local_paper_only=True,
+        )
         if deployed.broker != "paper" or mandate_hash(deployed.spec) != capture.mandate_digest or tuple(deployed.universe) != tuple(capture.universe):
             raise ServiceError(409, "Paper deployment changed after review.")
         if state.halted is not None:
@@ -1077,9 +1221,20 @@ class DeskService:
             model=settings.model,
             endpoint=settings.endpoint,
         )
-        if classify_provider(data) is not ProviderClass.FREE_DATA:
+        try:
+            data_class = classify_provider(data)
+            llm_class = classify_provider(
+                llm,
+                approved_local_models={settings.model},
+            )
+        except AuthorizationDenied:
+            raise ServiceError(
+                422,
+                "Provider configuration is not supported for local-paper operations.",
+            ) from None
+        if data_class is not ProviderClass.FREE_DATA:
             raise ServiceError(422, "Paper operations require free yfinance market data.")
-        if classify_provider(llm, approved_local_models={settings.model}) is not ProviderClass.LOCAL:
+        if llm_class is not ProviderClass.LOCAL:
             raise ServiceError(422, "Paper operations require a local Ollama model endpoint.")
 
     def _captured_fund_factory(self, capture: FrozenCapture) -> Callable[[FundSpec], Fund]:
@@ -1109,7 +1264,10 @@ class DeskService:
         self._guard_protected(normalized)
         with self._fund_lock(normalized):
             with self._paper_execution_lane(normalized):
-                _, deployed, _, state, latest = self._paper_state(normalized)
+                _, deployed, _, state, latest = self._paper_state(
+                    normalized,
+                    local_paper_only=True,
+                )
                 if deployed.broker != "paper":
                     raise ServiceError(403, "Valuation requires a local-paper deployment.")
                 expected_head = latest.hash if latest is not None else None
@@ -1163,7 +1321,10 @@ class DeskService:
 
         with self._fund_lock(normalized):
             with self._paper_execution_lane(normalized):
-                _, current, _, current_state, current_latest = self._paper_state(normalized)
+                _, current, _, current_state, current_latest = self._paper_state(
+                    normalized,
+                    local_paper_only=True,
+                )
                 current_head = current_latest.hash if current_latest is not None else None
                 if current.name != deployed.name or current_head != expected_head or current_state.cash != cash or current_state.positions != state.positions:
                     raise ServiceError(409, "Paper ledger changed during valuation; result discarded.")
@@ -1218,24 +1379,73 @@ class DeskService:
             raise ServiceError(409, snapshot.get("scorecard_error") or "No recorded sessions to score.")
         return card
 
-    def list_research(self) -> dict:
+    def list_research(
+        self,
+        *,
+        limit: int = 50,
+        cursor: str | None = None,
+        search: str | None = None,
+    ) -> dict:
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise ServiceError(422, "Research page limit must be between 1 and 100.")
+        if cursor is not None and (not isinstance(cursor, str) or not _REPORT_ID.fullmatch(cursor) or ".." in cursor):
+            raise ServiceError(422, "Research cursor is invalid.")
+        if search is not None and (not isinstance(search, str) or len(search) > 128 or any(ord(character) < 32 or ord(character) == 127 for character in search)):
+            raise ServiceError(422, "Research search is invalid.")
+
         directory = self._safe_child("research")
+        query = search.casefold() if search else ""
+        response = {
+            "items": [],
+            "errors": [],
+            "next_cursor": None,
+            "limit": limit,
+            "total": 0,
+            "search": search or "",
+        }
         if not directory.exists():
-            return {"items": [], "errors": []}
+            return response
         if not directory.is_dir():
             raise ServiceError(409, "Research storage is not a directory.")
-        items = []
-        errors = []
-        for path in sorted(directory.glob("*.json"), key=lambda entry: entry.name.casefold(), reverse=True):
+
+        entries = []
+        paths = sorted(
+            directory.glob("*.json"),
+            key=lambda entry: (entry.name.casefold(), entry.name),
+            reverse=True,
+        )
+        for path in paths:
             try:
+                if not _REPORT_ID.fullmatch(path.name) or ".." in path.name:
+                    raise ServiceError(422, "Research report identifier is invalid.")
                 safe_path = self._safe_child("research", path.name)
                 result = FundBacktestResult.model_validate_json(safe_path.read_text(encoding="utf-8"))
-                items.append(self._research_summary(path.name, result))
+                item = self._research_summary(path.name, result)
+                if query and query not in path.name.casefold() and query not in item["fund"].casefold():
+                    continue
+                entries.append({"id": path.name, "item": item})
             except ServiceError as exc:
-                errors.append({"id": path.name, "error": exc.detail})
+                if not query or query in path.name.casefold():
+                    entries.append({"id": path.name, "error": exc.detail})
             except (OSError, ValueError) as exc:
-                errors.append({"id": path.name, "error": f"Invalid research report ({type(exc).__name__})."})
-        return {"items": items[:100], "errors": errors}
+                if not query or query in path.name.casefold():
+                    entries.append(
+                        {
+                            "id": path.name,
+                            "error": f"Invalid research report ({type(exc).__name__}).",
+                        }
+                    )
+
+        response["total"] = len(entries)
+        if cursor is not None:
+            cursor_key = (cursor.casefold(), cursor)
+            entries = [entry for entry in entries if (entry["id"].casefold(), entry["id"]) < cursor_key]
+        page = entries[:limit]
+        response["items"] = [entry["item"] for entry in page if "item" in entry]
+        response["errors"] = [{"id": entry["id"], "error": entry["error"]} for entry in page if "error" in entry]
+        if len(entries) > limit:
+            response["next_cursor"] = page[-1]["id"]
+        return response
 
     def research_report(self, report_id: str) -> dict:
         if not _REPORT_ID.fullmatch(report_id) or ".." in report_id:
@@ -1408,7 +1618,7 @@ class DeskService:
             settings = self._runtime_settings
             if payload.provider != settings.data_provider or payload.model != settings.model:
                 raise ServiceError(409, "Provider or model changed; reload before previewing.")
-            self._require_local_backtest_policy(settings)
+            self._require_local_paper_policy(settings)
             estimated_model_calls = _estimate_backtest_calls(
                 payload.start,
                 payload.end,
@@ -1633,7 +1843,13 @@ class DeskService:
             )
         if cancelled():
             raise JobCancelled()
-        path = apply_if_current(lambda: save_result(result, directory=self._ensure_dir("research")))
+        path = apply_if_current(
+            lambda: save_result(
+                result,
+                directory=self._safe_child("research"),
+                admission=self._admission,
+            )
+        )
         if not isinstance(path, Path):
             raise OperationError("backtest report path is invalid")
         return {
@@ -1641,12 +1857,6 @@ class DeskService:
             "capture_id": capture.capture_id,
             "capture_digest": capture.digest,
         }
-
-    def _require_local_backtest_policy(self, settings: RuntimeSettings) -> None:
-        if settings.data_provider != "yfinance":
-            raise ServiceError(422, "Web backtests require the free yfinance data provider.")
-        if settings.llm_provider != "Ollama" or settings.model.casefold().endswith(":cloud") or not _is_loopback_endpoint(settings.endpoint):
-            raise ServiceError(422, "Web backtests require a local Ollama model endpoint.")
 
     def _cache_preview_capture(
         self,
@@ -1717,13 +1927,12 @@ class DeskService:
         self._guard_protected(normalized)
         if not isinstance(reason, str) or not reason.strip() or len(reason) > 240 or any(ord(char) < 32 or ord(char) == 127 for char in reason):
             raise ServiceError(422, "Halt reason is invalid.")
-        with self._fund_lock(normalized):
-            with self._paper_control_lane(normalized, verify_inventory=False):
-                _, _, ledger = self._paper_control_state(normalized)
-                try:
-                    ledger.halt(reason)
-                except OSError as exc:
-                    raise ServiceError(409, f"Fund could not be halted ({type(exc).__name__}).") from None
+        with self._paper_control_lane(normalized, verify_inventory=False):
+            _, _, ledger = self._paper_control_state(normalized)
+            try:
+                ledger.halt(reason)
+            except OSError as exc:
+                raise ServiceError(409, f"Fund could not be halted ({type(exc).__name__}).") from None
         return {"name": normalized, "halted": True}
 
     def resume_fund(self, name: str) -> dict:
@@ -1884,12 +2093,14 @@ class DeskService:
             snapshot["session_reports"] = [self._session_report(record) for record in records[-100:]]
         return snapshot
 
-    def _paper_state(self, name: str):
+    def _paper_state(self, name: str, *, local_paper_only: bool = False):
         directory = self._safe_child("paper", name)
         if not directory.is_dir():
             raise ServiceError(404, "Paper fund not found.")
         try:
             deployed = load_deployed(directory)
+            if local_paper_only and deployed.broker != "paper":
+                raise ServiceError(403, "Web paper mutations require a local-paper deployment.")
             ledger = Ledger(directory)
             state, latest = self._replay_paper_state(deployed, ledger)
         except (LedgerError, OSError, ValueError) as exc:
@@ -2029,24 +2240,52 @@ class DeskService:
         return strategies
 
     def _validate_mandate_strategies(self, spec: FundSpec) -> None:
-        library = self._strategy_library()
+        library_names = set(self._strategy_library())
         for strategy in spec.strategies:
-            canonical = library.get(strategy.name)
-            if canonical is not None:
-                if strategy.models != canonical.models or strategy.blend != canonical.blend:
-                    raise ServiceError(
-                        422,
-                        "Library strategies must retain their canonical analyst roster, weights, params, and blend policy.",
-                    )
-                continue
-            if strategy.name != "custom":
-                raise ServiceError(422, "Strategy must use a backend library entry or the canonical custom analyst roster.")
-            try:
-                canonical_custom = custom_strategy([model.name for model in strategy.models])
-            except ValueError:
-                raise ServiceError(422, "Custom analyst roster is invalid.") from None
-            if strategy.models != canonical_custom.models or strategy.blend != canonical_custom.blend:
-                raise ServiceError(422, "Custom strategy must use registered analysts and the canonical blend mode.")
+            if strategy.name != "custom" and strategy.name not in library_names:
+                raise ServiceError(422, "Strategy must use a backend library entry or the custom identity.")
+
+    def _validated_mandate(self, payload: dict) -> FundSpec:
+        try:
+            spec = FundSpec.model_validate(payload)
+        except ValueError as exc:
+            raise ServiceError(422, f"Mandate validation failed ({type(exc).__name__}).") from None
+        _reject_secret_fields(spec.model_dump(mode="python"))
+        self._validate_mandate_strategies(spec)
+        return spec
+
+    @contextmanager
+    def _mandate_writer(self) -> Iterator[None]:
+        lane = self._admission.registry_lock(timeout=0)
+        try:
+            lane.__enter__()
+        except (AdmissionError, OSError, RootPathError):
+            raise ServiceError(409, "Mandate writer admission is unavailable.") from None
+        try:
+            self._verify_root_inventory()
+            yield
+        finally:
+            lane.__exit__(None, None, None)
+
+    def _assert_mandate_name_available(
+        self,
+        name: str,
+        directory: Path,
+        *,
+        exclude_path: Path | None = None,
+    ) -> None:
+        self._assert_unique(
+            directory,
+            f"{name}.yaml",
+            exclude_path=exclude_path,
+        )
+        try:
+            self._load_mandate_by_name(name)
+        except ServiceError as exc:
+            if exc.status_code != 404:
+                raise
+        else:
+            raise ServiceError(409, "A mandate with this name already exists.")
 
     def _default_fund_factory(
         self,
@@ -2122,9 +2361,18 @@ class DeskService:
             raise ServiceError(409, "Storage directory could not be created.") from None
         return self._safe_child(*parts)
 
-    def _assert_unique(self, directory: Path, filename: str) -> None:
+    def _assert_unique(
+        self,
+        directory: Path,
+        filename: str,
+        *,
+        exclude_path: Path | None = None,
+    ) -> None:
         candidate = Path(filename)
+        excluded = os.path.normcase(os.path.abspath(os.fspath(exclude_path))) if exclude_path is not None else None
         for existing in directory.iterdir():
+            if excluded is not None and os.path.normcase(os.path.abspath(os.fspath(existing))) == excluded:
+                continue
             if _windows_name_key(existing.name) == _windows_name_key(candidate.name):
                 raise ServiceError(409, "A resource with this name already exists.")
 
@@ -2135,13 +2383,16 @@ class DeskService:
             raise ServiceError(422, "Fund name is invalid.") from None
 
     def _load_mandate_by_name(self, name: str) -> FundSpec:
+        return self._load_mandate_entry(name)[0]
+
+    def _load_mandate_entry(self, name: str) -> tuple[FundSpec, Path]:
         directory = self._safe_child("mandates")
         if not directory.exists():
             raise ServiceError(404, "Mandate not found.")
         if not directory.is_dir():
             raise ServiceError(409, "Mandate storage is not a directory.")
         name_key = _windows_name_key(name)
-        matches = []
+        matches: list[tuple[FundSpec, Path]] = []
         invalid_type = None
         try:
             paths = sorted(directory.iterdir(), key=lambda entry: entry.name.casefold())
@@ -2164,7 +2415,7 @@ class DeskService:
                     invalid_type = type(exc).__name__
                 continue
             if _windows_name_key(spec.name) == name_key:
-                matches.append(spec)
+                matches.append((spec, safe_path))
         if len(matches) > 1:
             raise ServiceError(409, "Multiple mandates share this name.")
         if matches:

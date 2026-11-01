@@ -416,6 +416,32 @@
 - `2026-10-31T21:53:11.2453049+01:00` → `2026-10-31T21:53:18.3533673+01:00`: isolated acceptance Python `3.13.7`, `python -m pytest hedge_fund/runtime/test_root.py hedge_fund/runtime/test_defaults.py hedge_fund/reporting/test_console.py hedge_fund/tui/test_keys.py hedge_fund/tui/test_home.py -p no:cacheprovider -q --tb=short`; **59 passed in 5.22 s**, process exit 0.
 - `2026-10-31T21:56:31.0194510+01:00` → `2026-10-31T21:56:34.5877793+01:00`: changed-scope formatting after import-only cleanup: Black **49 files**, isort **47 files**, flake8 **55 files**, `git diff --check`; all passed. Differential review against `HEAD` confirms the remaining all-scope findings are inherited: Black's seven existing files and isort's nine existing files still fail their all-scope checks; `check_stock.py` has no new flake8 finding. No behavior changes in this formatting slice.
 
+## Convergence — SIM denial and responsive Halt (partial)
+
+| Field | Evidence |
+|---|---|
+| Status | **PARTIAL PASS.** Web SIM mutation/effect denials and bounded emergency Halt have focused synthetic coverage. This does not close T139 lifecycle/provisioning or T140 reconciliation/resume/redo, and does not establish runtime/platform acceptance. |
+| Revision / dirty diff | Base `9694f619207e14fb5e55de1bef96deb79df7a360`; `git diff --binary` SHA-256 `bff9ec9c4e428ddfec05bb51b96d306f13239a8938696b1c3e41fb76ac9250cb`, **41,459 bytes**. |
+| Environment | Windows 11 Enterprise build `26200`; NTFS; isolated test venv Python `3.13.7`; system timezone `W. Europe Standard Time` (UTC+01:00). |
+| Isolation | Per-run synthetic HOME/USERPROFILE/TEMP roots; dotenv disabled; credential/provider/proxy environment references cleared; pytest plugin autoload disabled. Test providers were offline fakes. |
+| Scenario | Web TestClient routes used synthetic demo roots. Valid paper previews were accepted for review, then the fixture deployment was changed to `saxo`; manual/runner accept, control, approval, preview, valuation, and deploy routes returned 403 before data calls, ledger writes, operation acceptance, deploy, or worker stop. Headless Saxo compatibility tests used test doubles. Halt regression held the fund-work mutex in one thread and observed the emergency halt complete and persist through the bounded control lane. |
+| Provenance | Python source/tests only; no wheel, server, paid provider, network, real brokerage, protected root, owned child or process signal. Fake unit results are not runtime acceptance. |
+
+### Measurements
+
+- `2026-11-01T08:03:33.8590619+01:00` → `2026-11-01T08:03:42.2973613+01:00`: frontend `App.test.tsx`, **19 passed in 7.49 s**, exit 0. Non-fatal Recharts/jsdom chart-size warnings.
+- `2026-11-01T08:05:51.2369289+01:00` → `2026-11-01T08:05:56.5174922+01:00`: valid-preview SIM manual/runner acceptance regression, **1 passed in 2.88 s**, exit 0.
+- `2026-11-01T08:06:09.4642750+01:00` → `2026-11-01T08:06:11.0913676+01:00`: paper runner/deployed-broker Saxo selections, **8 passed, 15 deselected in 0.89 s**, exit 0.
+- `2026-11-01T08:07:46.0781657+01:00` → `2026-11-01T08:07:50.2869936+01:00`: red Halt concurrency regression, **1 failed in 2.10 s**, exit 1; `completed.wait()` was false while another thread held the per-fund work lock.
+- `2026-11-01T08:08:21.1530508+01:00` → `2026-11-01T08:09:54.7782174+01:00`: `python -m pytest hedge_fund/web/test_actions.py hedge_fund/web/test_paper_operations.py -p no:cacheprovider -q --tb=short`, **33 passed in 77.54 s**, process exit 0. Includes SIM effect-denial routes, accepted-preview denials, shared control-lane use, and Halt responsiveness/persisted-state assertions.
+- Same final source slice: Black `--check --line-length=420` passed for `services.py` and `test_paper_operations.py`; `test_actions.py` has the same formatter finding on `HEAD` and contains no new Black diff in the added tests. Isort and flake8 passed on all three files; `git diff --check` passed.
+
+### Limits
+
+- Web SIM controls are denied; headless SIM compatibility remains fake-only. No account-binding provisioning/validation was exercised.
+- Halt no longer waits for the in-process fund-work mutex; this does not prove cancellation of an already-in-flight model/data call or reconcile ambiguous external fills.
+- `T139` and `T140` remain unchecked in `tasks.md` until all residual contract criteria and acceptance gates have evidence.
+
 ### Final artifact blocker and limits
 
 - Final wheel rebuild is **BLOCKED**. `python -m build` was unavailable in the acceptance venv and system Python. Offline installation of `build==1.6.1` and `poetry-core==2.5.0` from the checkout cache failed; at `2026-10-31T21:45:52.1105983+01:00` → `2026-10-31T21:45:52.3334524+01:00`, the required `build` package was not cached. No package index/network was used. The failed synthetic root was cleaned.
@@ -511,3 +537,50 @@
 - **T021 remains partial:** `fund/storage.py` and `backtesting/research.py` are not integrated; no complete CLI/web/TUI/runner/archive/out-of-band race matrix exists. Some low-level `Ledger` mutations rely on top-level admission preflight rather than verifying the full inventory themselves. Do not claim every possible caller fails closed.
 - A drifted root disables ordinary write capability and owned-runner stop in `DeskService`; emergency halt is separate. The owned child verifies its head at session boundaries, but a stop route on drift is not enabled. No unknown PID is signalled.
 - Required final status is **INCONCLUSIVE/BLOCKED outside this bounded slice**. Next stop: complete T015 stale-reservation/offline exclusion evidence and T021 remaining writer integration before any existing-root deployment; separately obtain native Linux/ext4 and ACL evidence. Do not resume into TUI retirement or broader US1 acceptance in this slice.
+
+## Convergence — T141 physical mandate rename (partial)
+
+| Field | Evidence |
+|---|---|
+| Status | **PARTIAL PASS.** Revision-bound update now atomically moves the mandate file to its canonical target without replacement, then writes the validated revision. The prior advanced-field update/clone code remains; this slice does not prove complete `FundSpec` round-trip or browser parity. T141 remains unchecked. |
+| Source identity | Base revision `9694f619207e14fb5e55de1bef96deb79df7a360`; source/test snapshot `hedge_fund/runtime/root.py`, `hedge_fund/runtime/test_root.py`, `hedge_fund/web/services.py`, `hedge_fund/web/test_services.py`: 4 paths / 224,930 bytes / SHA-256 `743edd853a24164a1075a3a8baa9028208a713b8025e20b824b2ccc40c1fc8dd`. No wheel or installed artifact; pytest imported this working-tree snapshot. |
+| Dirty-diff identity | At the test checkpoint, tracked `git diff --binary HEAD`: 148,984 bytes / SHA-256 `48fb92f6aea25b54c78951d8e1daccc7d8d7d4a76e956f44031efe012780ba68`. This identity excludes untracked `pip/` and `pypa/`; neither directory was touched. |
+| Environment | Windows 11 `10.0.26200`, local `C:` NTFS, Python `3.13.7` in `outputs/spec005-run-t138-targeted/.venv`; dotenv disabled; credential/provider/proxy environment names cleared before pytest; repository test harness used synthetic roots and blocked unapproved network requests. |
+| Scenario | Root tests moved a regular file under a synthetic root, rejected destination collision without replacing either file, denied traversal and rejected a directory leaf. Service tests renamed the mandate under its expected-hash revision, retained the deployed `fund.yaml` bytes, confirmed old logical name absence, and reused that old name with a new mandate. Collision preserved the source revision. |
+| Provenance | Execution owner: python-dev. Automatic fake/unit tests only. No provider, external network, real broker, protected root, owned runner, process signal or browser route was used. |
+| Result | At `2026-11-01T10:12:04.2664564+01:00` → `2026-11-01T10:12:55.8618147+01:00`, `python -m pytest -p no:cacheprovider hedge_fund/runtime/test_root.py hedge_fund/web/test_services.py -q --tb=short`: **71 passed, 1 skipped in 41.95 s**, exit 0. Black check passed on these four changed Python files; flake8 passed with `--max-line-length=420 --extend-ignore=E203`. Isort still reports `test_root.py` and `web/services.py`; both already required sorting at base HEAD. |
+| Repair evidence | First run (`10:02:37.8238063+01:00`–`10:03:29.2381499+01:00`) and second run (`10:03:47.1009618+01:00`–`10:04:37.2366568+01:00`) each observed **1 failed, 70 passed, 1 skipped**: Windows returned `PermissionError [WinError 5]` when the test expected `RootPathError` for a directory leaf. The second stack showed `NtCreateFile` rejected the leaf before `_validate_windows_handle`; the extra metadata preflight did not distinguish directory from denied access. The preflight was removed; the cross-platform denial test now accepts native `OSError` or `RootPathError`. Final regression above passed. |
+| Limits | The Linux `renameat2(RENAME_NOREPLACE)` path is unexecuted; Linux/ext4 is **BLOCKED** in this environment. No concurrent out-of-band writer, crash between rename and content rewrite, actual ACL, browser, or full migration acceptance was exercised. A crash after the move but before the rewrite is not journaled; retry behavior is not crash-injection verified. |
+
+## Convergence — T141 advanced JSON round-trip (partial)
+
+| Field | Evidence |
+|---|---|
+| Status | **PARTIAL PASS.** Revision-bound update now has an assertion that the full saved spec equals `FundSpec.model_validate(candidate).model_dump(mode="json")`; this covers field preservation in the tested candidate, not every constructor/field combination. T141 remains unchecked. |
+| Source identity | Base revision `9694f619207e14fb5e55de1bef96deb79df7a360`; 4 source/test paths (`hedge_fund/runtime/root.py`, `hedge_fund/runtime/test_root.py`, `hedge_fund/web/services.py`, `hedge_fund/web/test_services.py`): 237,070 bytes / SHA-256 `754f7004deffbc5c75a60e77afea3b615ec07d578bf5076cbf106b4499bafe2c`. `services.py` and `test_services.py` also contain T146 work. |
+| Dirty-diff identity | `git diff --binary HEAD` limited to those 4 source/test paths: 52,762 bytes / SHA-256 `37ffc0ef806313813fe9e5a978f9a7a892f5e9063f1c63f7f29c3fe19d98686d`. Untracked `pip/` and `pypa/` excluded and untouched. |
+| Environment | Windows 11 `10.0.26200`, NTFS, Python `3.13.7` in `outputs/spec005-run-t138-targeted/.venv`; dotenv disabled; credential/provider/proxy environment names cleared; all file tests use synthetic roots. |
+| Scenario | Revision-bound JSON edit checks the exact full serialized candidate after model validation, stale-hash rejection and immutable deployed bytes. Root/service cases exercise canonical physical rename, old-name reuse and no-replace collision. |
+| Provenance | Execution owner: python-dev. Automatic pytest only; no provider, paid network, real broker, protected root, owned runner or process signal. |
+| Result | At `2026-11-01T10:42:19.8916853+01:00` → `2026-11-01T10:44:41.0003325+01:00`, `python -m pytest -p no:cacheprovider hedge_fund/runtime/test_root.py hedge_fund/web/test_services.py hedge_fund/web/test_actions.py hedge_fund/web/test_paper_operations.py -q --tb=short`: **106 passed, 1 skipped in 114.59 s**, exit 0. |
+| Limits | Mandate-editor browser save/rename, exhaustive registered-parameter/field matrix, Linux/ext4 no-replace, crash injection and full migration acceptance remain unverified. Rename then rewrite is not one journaled transaction. |
+
+## Convergence — T146 bounded research and paper-history pages (partial)
+
+| Field | Evidence |
+|---|---|
+| Status | **PARTIAL PASS.** Research index and verified paper-session history now expose bounded stable cursor/search pages, including records beyond 100. T146 remains unchecked: canonical drilldown/export coverage, full risk/tape/thesis detail parity and honest per-ticker valuation freshness are still open. |
+| Source identity | Base revision `9694f619207e14fb5e55de1bef96deb79df7a360`; 8 source/test paths (`hedge_fund/web/services.py`, `hedge_fund/web/app.py`, `hedge_fund/web/test_services.py`, `frontend/src/pages/research.tsx`, `frontend/src/pages/paper.tsx`, `frontend/src/lib/types.ts`, `frontend/src/App.test.tsx`, `frontend/e2e/desk.spec.ts`): 368,295 bytes / SHA-256 `74844d4d8b88b8ed908e1f887b6eb9dbc1eea2da34a7ebbe9c9510c6b66badce`. |
+| Dirty-diff identity | `git diff --binary HEAD` limited to those 8 source/test paths: 82,611 bytes / SHA-256 `77e9c244470657cbccabef1fc80b8c1c26a7e80cd7f1058ee253ec85ea1e78b7`. Combined T141/T146 10-path source/test snapshot: 448,294 bytes / SHA-256 `fef200395abef9e2fdb55c6cf7e082172eba8d1ede614c44c43f85efcb10ae57`; selected dirty diff: 91,560 bytes / SHA-256 `55d345451fd714d9d71848220d667bae3c6d647338c497601bd70d15f75d9599`. |
+| Artifact identity | Node `v22.13.1`, Vite `6.4.5`; isolated production build in the owned E2E root: SHA-256 `309b88c7a472685221fee0cb89f207d9d72e8f36d9f38a2a9a2301c82df7897a` (3 files / 973,294 bytes). Source-to-artifact mapping: the T146 source snapshot above, built by `run-owned.mjs`; no wheel/install artifact. Bundle-size warning (>500 kB minified) remained non-fatal. |
+| Environment | Windows 11 `10.0.26200`, NTFS, Python `3.13.7`, Node `v22.13.1`, npm `10.9.2`; test HOME/USERPROFILE and web root isolated; dotenv, credentials and proxies cleared. Playwright Chromium project used configured Microsoft Edge channel; exact browser build was not logged. Owned local server used `127.0.0.1:8876`; no port `8765`, external provider or paid call. |
+| Scenario | Backend research test paginates 107 synthetic JSON entries including one malformed report, checks case-insensitive fund search, cursor continuity, error visibility and bounds. Paper-history test appends 105 hash-chained records to the 3-record synthetic demo ledger; the actual `Ledger.replay(full=True)` verifies all 108, then pages 40/40/28 with date/hash search, cursor validation and API query bounds. UI tests and browser tests confirm search/reset/next/previous cursor wiring; browser API responses are deliberately fake. |
+| Provenance | Final backend command and result are recorded in the T141 row above; the same 106-test run includes research and paper-history API cases. `npm test`: **26 passed** in 8.06 s, exit 0. `npm run build` (`tsc --noEmit && vite build`): exit 0, Vite build 11.73 s. At `2026-11-01T10:31:16.9160415+01:00` → `2026-11-01T10:31:52.6138198+01:00`, `node ./e2e/run-owned.mjs --grep "history search follows"`: **2 Playwright tests passed** in 15.3 s, exit 0; the isolated root was cleaned. |
+| Invocation note | First attempt via `npm run e2e -- --grep "research history search follows stable page cursors"` forwarded the words without `--grep`; Playwright reported “No tests found” and exited 1. No assertion ran. Direct Node invocation above selected and passed both browser cases. |
+| Limits | Playwright pagination routes return fakes; backend pages are separately exercised against synthetic root files and a real hash-chained ledger. Full browser-to-backend pagination, >100 browser dataset, report exports, full drilldowns, risk detail, valuation freshness, wheel, Linux/ext4 and final migration acceptance remain unverified. |
+
+## Final bounded QA closure — partial
+
+The final service fixes, exact test commands, timezone-qualified observations, full source/test/screenshot identity, current browser artifact, wheel identity and remaining blockers are consolidated in [`spec005-final-evidence.md`](spec005-final-evidence.md). Final readiness is **PARTIAL / NOT READY TO MERGE**; see [`qa-final-disposition.md`](qa-final-disposition.md).
+
+At `2026-11-01T11:26:18.3783384+01:00` → `11:29:20.1900746+01:00`, the final isolated root/services/actions/manual-paper slice passed **112 tests, 1 skipped in 152.76 s**, exit 0. Final frontend unit tests passed **26**, TypeScript/build exited 0, owned fake-route Playwright passed **12**, bounded fake-transport Saxo tests passed **8**, and the candidate wheel built. Full Python suite remains **INCONCLUSIVE**; Linux/ext4 and actual ACL acceptance remain **BLOCKED**. T015/T021 remain partial; T137/T138/T140–T148 remain incomplete, including bounded partial evidence for T139/T141/T146. No production write activation or TUI retirement.

@@ -185,9 +185,14 @@ def test_kill_switch_round_trips_and_logs(tmp_path):
     ledger.halt("drawdown breach")
     assert ledger.halted() == "drawdown breach"
     assert ledger.replay(1.0).halted == "drawdown breach"
-    ledger.resume()
-    assert ledger.halted() is None
-    assert [e["kind"] for e in ledger.events()] == ["halt", "resume"]
+    control_before = ledger.control_path.read_bytes()
+    events_before = ledger.events_path.read_bytes()
+    with pytest.raises(LedgerError, match="verified reconciliation receipt"):
+        ledger.resume()
+    assert ledger.halted() == "drawdown breach"
+    assert [e["kind"] for e in ledger.events()] == ["halt"]
+    assert ledger.control_path.read_bytes() == control_before
+    assert ledger.events_path.read_bytes() == events_before
     assert ledger.events()[0]["reason"] == "drawdown breach"
     assert all("time" in e for e in ledger.events())
 

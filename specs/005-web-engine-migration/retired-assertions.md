@@ -183,3 +183,14 @@ Do not delete or weaken any inventoried test until its named replacement exists,
 against the candidate artifact, and is linked to a closed acceptance row. Headless
 compatibility is not a browser parity claim; G4 SIM denials and the F13 daily-grid
 limitation remain explicit.
+
+## Phase 10 coverage additions — not retirements
+
+| Surface | Added assertions | Scope | Status |
+| --- | --- | --- | --- |
+| Research index | `hedge_fund/web/test_services.py::test_research_pages_use_stable_cursor_search_and_bounded_limits`; `frontend/src/App.test.tsx` search/cursor case; `frontend/e2e/desk.spec.ts::research history search follows stable page cursors`. | 107 synthetic report entries, malformed entry visibility, case-insensitive search, bounded cursor progression. | Added; T146/F07 acceptance remains pending. |
+| Paper session history | `hedge_fund/web/test_services.py::test_paper_session_pages_cover_verified_history_and_search`; `frontend/src/App.test.tsx` paper-history search/cursor case; `frontend/e2e/desk.spec.ts::paper session history search follows verified cursors`. | 108 hash-chained synthetic ledger records, verified replay, search, bounded cursor progression. | Added; full T146/report/export acceptance remains pending. |
+
+Retirement delta at `9694f619207e14fb5e55de1bef96deb79df7a360`: zero TUI tests,
+assertions, imports or dependencies removed. These additions do not close T148 or
+authorize TUI retirement.

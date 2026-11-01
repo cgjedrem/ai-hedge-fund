@@ -19,8 +19,6 @@ import os
 import re
 import time
 from collections.abc import Callable
-from datetime import datetime, timezone
-from email.utils import parsedate_to_datetime
 from typing import Protocol, runtime_checkable
 from urllib.parse import urlsplit
 
@@ -128,8 +126,6 @@ class JevLLM:
     """
 
     ENDPOINT = "https://api.typesafe.ai/v1/systemone"
-    _RETRY_STATUSES = frozenset({429, 500, 502, 503, 504, 529})
-
     def __init__(self, api_key: str, model: str = "jev-1.13.0", timeout: float = 60.0) -> None:
         if not isinstance(api_key, str) or not api_key.strip():
             raise ValueError("A non-empty TypeSafe API key is required")
@@ -169,7 +165,7 @@ class JevLLM:
             # credentials. Diagnostics intentionally omit all HTTP headers.
             raise LLMCallError(message, self._redact(diagnostics)) from None
 
-        for attempt in range(1, 3):
+        for attempt in (1,):
             diagnostics["attempt_count"] = attempt
             try:
                 with requests.post(
@@ -181,17 +177,10 @@ class JevLLM:
                 ) as response:
                     status = response.status_code
                     raw = response.text
-                    retry_after = response.headers.get("Retry-After")
             except requests.RequestException:
                 fail("transport", "TypeSafe request failed during transport")
 
             diagnostics.update(status_code=status, raw_response=raw)
-            if status in self._RETRY_STATUSES and attempt == 1:
-                delay = _retry_delay(retry_after)
-                if delay > self._timeout:
-                    fail("http", f"TypeSafe HTTP {status}: retry delay exceeds timeout")
-                time.sleep(delay)
-                continue
             if not 200 <= status < 300:
                 fail("http", f"TypeSafe returned HTTP {status}")
             try:
@@ -218,24 +207,6 @@ class JevLLM:
         if isinstance(value, list):
             return [self._redact(item) for item in value]
         return value
-
-
-def _retry_delay(header: str | None) -> float:
-    """One-second backoff, honoring valid delta-seconds and HTTP-date values."""
-    if header is not None:
-        try:
-            seconds = float(header)
-        except ValueError:
-            try:
-                retry_at = parsedate_to_datetime(header)
-                if retry_at.tzinfo is None:
-                    retry_at = retry_at.replace(tzinfo=timezone.utc)
-                seconds = (retry_at - datetime.now(timezone.utc)).total_seconds()
-            except (ValueError, TypeError, OverflowError):
-                return 1.0
-        if math.isfinite(seconds):
-            return max(1.0, seconds)
-    return 1.0
 
 
 def make_llm(
@@ -345,11 +316,11 @@ def make_llm(
     if provider == "Anthropic":
         from langchain_anthropic import ChatAnthropic
         chat = ChatAnthropic(model=model, api_key=api_key, timeout=timeout,
-                             max_retries=1, max_tokens=max_tokens, **sampling)
+                             max_retries=0, max_tokens=max_tokens, **sampling)
     elif provider == "OpenAI":
         from langchain_openai import ChatOpenAI
         chat = ChatOpenAI(model=model, api_key=api_key, timeout=timeout,
-                          max_retries=1,
+                          max_retries=0,
                           max_tokens=max_tokens,
                           base_url=endpoint or (
                               os.getenv("OPENAI_API_BASE") if use_environment else None
@@ -358,22 +329,22 @@ def make_llm(
     elif provider == "DeepSeek":
         from langchain_deepseek import ChatDeepSeek
         chat = ChatDeepSeek(model=model, api_key=api_key, timeout=timeout,
-                            max_retries=1, max_tokens=max_tokens, **sampling)
+                            max_retries=0, max_tokens=max_tokens, **sampling)
     elif provider == "Google":
         from langchain_google_genai import ChatGoogleGenerativeAI
         chat = ChatGoogleGenerativeAI(model=model, api_key=api_key,
-                                      timeout=timeout, max_retries=1,
+                                      timeout=timeout, max_retries=0,
                                       max_output_tokens=max_tokens, **sampling)
     elif provider == "xAI":
         from langchain_xai import ChatXAI
         chat = ChatXAI(model=model, api_key=api_key, timeout=timeout,
-                       max_retries=1, max_tokens=max_tokens, **sampling)
+                       max_retries=0, max_tokens=max_tokens, **sampling)
     elif provider == "Kimi":
         # Moonshot speaks the OpenAI wire format. Default to the international
         # host; mainland users override with MOONSHOT_BASE_URL (v1 does the same).
         from langchain_openai import ChatOpenAI
         chat = ChatOpenAI(
-            model=model, api_key=api_key, timeout=timeout, max_retries=1,
+            model=model, api_key=api_key, timeout=timeout, max_retries=0,
             max_tokens=max_tokens,
             base_url=endpoint or (
                 os.getenv("MOONSHOT_BASE_URL") if use_environment else None

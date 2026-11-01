@@ -187,6 +187,113 @@ test("production routes render at desktop and narrow widths without external req
   expect(externalRequests).toEqual([]);
 });
 
+test("research history search follows stable page cursors", async ({ page }) => {
+  const researchRequests: string[] = [];
+  const summary = {
+    id: "history-001.json",
+    fund: "demo-quality",
+    start: "2024-01-01",
+    end: "2024-01-02",
+    rebalance: "daily",
+    benchmark: "SPY",
+    universe: ["AAPL"],
+    session_count: 2,
+    metrics: { total_return_pct: 1.25, max_drawdown_pct: -0.5 },
+  };
+  await page.route(
+    (url) => url.pathname === "/api/research",
+    async (route) => {
+      const requestUrl = new URL(route.request().url());
+      researchRequests.push(requestUrl.toString());
+      const cursor = requestUrl.searchParams.get("cursor");
+      const search = requestUrl.searchParams.get("search") ?? "";
+      await route.fulfill({
+        json: cursor
+          ? {
+              items: [],
+              errors: [],
+              next_cursor: null,
+              limit: 50,
+              total: 51,
+              search,
+            }
+          : {
+              items: [summary],
+              errors: [],
+              next_cursor: "history-050.json",
+              limit: 50,
+              total: 51,
+              search,
+            },
+      });
+    },
+  );
+
+  await page.goto("/research");
+  await page.getByRole("searchbox", { name: "Search reports or funds" }).fill("demo");
+  await page.getByRole("button", { name: "Search", exact: true }).click();
+  await expect(page.getByRole("link", { name: "demo-quality" })).toBeVisible();
+  const firstPage = new URL(researchRequests.at(-1)!);
+  expect(firstPage.searchParams.get("search")).toBe("demo");
+  expect(firstPage.searchParams.has("cursor")).toBe(false);
+
+  await page.getByRole("button", { name: "Next" }).click();
+  await expect(page.getByText("Page 2")).toBeVisible();
+  await expect(page.getByText("No research reports")).toBeVisible();
+  const secondPage = new URL(researchRequests.at(-1)!);
+  expect(secondPage.searchParams.get("search")).toBe("demo");
+  expect(secondPage.searchParams.get("cursor")).toBe("history-050.json");
+});
+
+test("paper session history search follows verified cursors", async ({ page }) => {
+  const sessionRequests: string[] = [];
+  const summary = {
+    session: "2024-01-02",
+    hash: "a".repeat(64),
+    nav: 100_000,
+    cash: 100_000,
+    rebalance: false,
+    orders: 0,
+    fills: 0,
+    decision_as_of: null,
+  };
+  await page.route(
+    (url) => url.pathname === "/api/paper/demo-quality/sessions",
+    async (route) => {
+      const requestUrl = new URL(route.request().url());
+      sessionRequests.push(requestUrl.toString());
+      const cursor = requestUrl.searchParams.get("cursor");
+      const search = requestUrl.searchParams.get("search") ?? "";
+      await route.fulfill({
+        json: {
+          items: cursor ? [] : [summary],
+          errors: [],
+          next_cursor: cursor ? null : "2024-01-01",
+          limit: 50,
+          total: 1,
+          search,
+          ledger: { ok: true, error: null },
+        },
+      });
+    },
+  );
+
+  await page.goto("/paper/demo-quality");
+  await page.getByRole("searchbox", { name: "Search sessions or hashes" }).fill("2024");
+  await page.getByRole("button", { name: "Search", exact: true }).click();
+  await expect(page.getByRole("link", { name: "2024-01-02" })).toBeVisible();
+  const firstPage = new URL(sessionRequests.at(-1)!);
+  expect(firstPage.searchParams.get("search")).toBe("2024");
+  expect(firstPage.searchParams.has("cursor")).toBe(false);
+
+  await page.getByRole("button", { name: "Next" }).click();
+  await expect(page.getByText("Page 2")).toBeVisible();
+  await expect(page.getByText("No verified sessions")).toBeVisible();
+  const secondPage = new URL(sessionRequests.at(-1)!);
+  expect(secondPage.searchParams.get("search")).toBe("2024");
+  expect(secondPage.searchParams.get("cursor")).toBe("2024-01-01");
+});
+
 test("paper valuation requires an explicit quote refresh", async ({ page }) => {
   const capabilities = await (await page.request.get("/api/capabilities")).json();
   const paper = await (await page.request.get("/api/paper/demo-quality")).json();

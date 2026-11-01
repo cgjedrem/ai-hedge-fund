@@ -309,8 +309,54 @@ function installApi(options?: {
     if (path === "/api/paper") return response({ items: home.paper_funds, errors: [] } satisfies PaperCollection);
     if (path === "/api/paper/demo-quality") return response(paperDetail);
     if (path === "/api/paper/demo-quality/scorecard") return response(scorecard);
+    if (path.startsWith("/api/paper/demo-quality/sessions?")) {
+      const requestUrl = new URL(path, "http://127.0.0.1");
+      const cursor = requestUrl.searchParams.get("cursor");
+      if (cursor === "demo-session-next") {
+        return response({
+          items: [],
+          errors: [],
+          next_cursor: null,
+          limit: 50,
+          total: paperDetail.sessions.length,
+          search: requestUrl.searchParams.get("search") ?? "",
+          ledger: { ok: true, error: null },
+        });
+      }
+      return response({
+        items: paperDetail.sessions,
+        errors: [],
+        next_cursor: "demo-session-next",
+        limit: 50,
+        total: paperDetail.sessions.length,
+        search: requestUrl.searchParams.get("search") ?? "",
+        ledger: { ok: true, error: null },
+      });
+    }
     if (path === "/api/paper/demo-quality/sessions/2024-06-04") return response(sessionReport);
-    if (path === "/api/research") return response({ items: [researchReport], errors: [] });
+    if (path.startsWith("/api/research?")) {
+      const requestUrl = new URL(path, "http://127.0.0.1");
+      const cursor = requestUrl.searchParams.get("cursor");
+      const search = requestUrl.searchParams.get("search") ?? "";
+      if (cursor === "demo-next.json") {
+        return response({
+          items: [],
+          errors: [],
+          next_cursor: null,
+          limit: 50,
+          total: 1,
+          search,
+        });
+      }
+      return response({
+        items: [researchReport],
+        errors: [],
+        next_cursor: "demo-next.json",
+        limit: 50,
+        total: 1,
+        search,
+      });
+    }
     if (path === "/api/research/demo-report.json") return response(researchReport);
     if (path === "/api/operations") return response({ items: [] });
     return response({ detail: "Not found." }, 404);
@@ -399,6 +445,45 @@ describe("local desk screens", () => {
     expect(screen.getByRole("button", { name: "Reject" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "Halt" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "Resume" })).toBeDisabled();
+  });
+
+  it("keeps every web mutation disabled for a SIM deployment", async () => {
+    const writeCaps: Capabilities = {
+      ...capabilities,
+      mode: "live",
+      writes: true,
+      read_only: false,
+      network: true,
+      mutation_token: "paper-only-token",
+    };
+    const simDetail = { ...paperDetail, broker: "saxo" };
+    const activeRunner: RunnerState = {
+      ...paperDetail.runner,
+      status: "running",
+      available: true,
+      reason: null,
+    };
+    installApi({
+      caps: writeCaps,
+      override: (path, method) => {
+        if (method !== "GET") return null;
+        if (path === "/api/paper/demo-quality") return { payload: simDetail };
+        if (path === "/api/paper/demo-quality/runner") return { payload: activeRunner };
+        return null;
+      },
+    });
+    window.history.replaceState({}, "", "/paper/demo-quality");
+    render(<App />);
+
+    expect(await screen.findByRole("heading", { name: "demo-quality" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Approve" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Reject" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Halt" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Resume" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Stop runner" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Manual one-session tick" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Refresh estimate" })).toBeDisabled();
+    expect(fetchRequests.filter((request) => request.method === "POST")).toHaveLength(0);
   });
 
   it("fetches valuation only after an explicit refresh and keeps recorded NAV separate", async () => {
@@ -551,6 +636,47 @@ describe("local desk screens", () => {
     });
   });
 
+  it("offers paper-only mandates and saves a paper broker identity", async () => {
+    const writeCaps: Capabilities = {
+      ...capabilities,
+      mode: "live",
+      writes: true,
+      read_only: false,
+      mutation_token: "builder-token",
+    };
+    installApi({
+      caps: writeCaps,
+      override: (path, method, body) =>
+        path === "/api/mandates" && method === "POST"
+          ? {
+              status: 201,
+              payload: {
+                name: "paper-only",
+                strategies: [],
+                cadence: "weekly",
+                capital: 100_000,
+                benchmark: "SPY",
+                approval_required: true,
+                broker: "paper",
+                spec: (body as { spec: Record<string, unknown> }).spec,
+              },
+            }
+          : null,
+    });
+    window.history.replaceState({}, "", "/builder");
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findByText("Value");
+
+    expect(screen.queryByRole("combobox", { name: "Broker book" })).not.toBeInTheDocument();
+    await user.type(screen.getByLabelText("Mandate name"), "paper-only");
+    await user.click(screen.getByRole("button", { name: "Save new mandate" }));
+    expect(await screen.findByText("Mandate saved")).toBeInTheDocument();
+
+    const request = fetchRequests.find((item) => item.path === "/api/mandates" && item.method === "POST");
+    expect(request?.body).toMatchObject({ spec: { broker: "paper" } });
+  });
+
   it("keeps library rosters fixed and derives custom blend from analyst profiles", async () => {
     const writeCaps: Capabilities = {
       ...capabilities,
@@ -603,6 +729,202 @@ describe("local desk screens", () => {
       { name: "druckenmiller", weight: 1, params: {} },
     ]);
     expect(custom?.blend.mode).toBe("long_short");
+  });
+
+  it("creates a complete advanced FundSpec without rebuilding custom fields", async () => {
+    const writeCaps: Capabilities = {
+      ...capabilities,
+      mode: "live",
+      writes: true,
+      read_only: false,
+      mutation_token: "builder-token",
+    };
+    installApi({
+      caps: writeCaps,
+      override: (path, method, body) =>
+        path === "/api/mandates" && method === "POST"
+          ? {
+              status: 201,
+              payload: {
+                name: "advanced-json",
+                mandate_hash: "c".repeat(64),
+                strategies: [],
+                cadence: "every 2m",
+                capital: 250_000,
+                benchmark: "IWM",
+                approval_required: true,
+                broker: "paper",
+                spec: (body as { spec: Record<string, unknown> }).spec,
+              },
+            }
+          : null,
+    });
+    window.history.replaceState({}, "", "/builder?advanced=true");
+    const user = userEvent.setup();
+    render(<App />);
+    const editor = await screen.findByRole("textbox", { name: "Full FundSpec JSON" });
+    const submitted = {
+      schema_version: 2,
+      name: "advanced-json",
+      strategies: [{
+        name: "custom",
+        display_name: "Custom sleeve",
+        weight: 2,
+        models: [{ name: "druckenmiller", weight: 3.25, params: { news: true, samples: 2, temperature: 0.25 } }],
+        blend: { method: "conviction_weighted", gross_target: 0.8, mode: "dollar_neutral" },
+      }],
+      risk: { max_position_pct: 0.2, max_gross_exposure: 1.2 },
+      costs: { spread_bps: 2, commission_per_share: 0.01 },
+      min_order_pct_of_equity: 0.003,
+      capital: 250_000,
+      rebalance: "minute",
+      interval: 2,
+      window: { start: "09:30", end: "15:59" },
+      benchmark: "IWM",
+      approval_required: true,
+      broker: "paper",
+    };
+    fireEvent.change(editor, { target: { value: JSON.stringify(submitted, null, 2) } });
+    await user.click(screen.getByRole("button", { name: "Create mandate" }));
+    await screen.findByText(/Saved revision/);
+
+    const request = fetchRequests.find((item) => item.path === "/api/mandates" && item.method === "POST");
+    expect(request?.body).toEqual({ spec: submitted });
+    expect(request?.headers.get("x-csrf-token")).toBe("builder-token");
+  });
+
+  it("edits a mandate against its loaded revision hash", async () => {
+    const writeCaps: Capabilities = {
+      ...capabilities,
+      mode: "live",
+      writes: true,
+      read_only: false,
+      mutation_token: "builder-token",
+    };
+    const sourceSpec = {
+      schema_version: 2,
+      name: "demo-quality",
+      strategies: [{
+        name: "earnings-drift",
+        models: [{ name: "pead", weight: 1, params: {} }],
+        blend: { method: "conviction_weighted", gross_target: 1, mode: "long_short" },
+      }],
+      risk: { max_position_pct: 0.25, max_gross_exposure: 1 },
+      costs: { spread_bps: 4.5, commission_per_share: 0.005 },
+      capital: 100_000,
+      rebalance: "daily",
+      benchmark: "SPY",
+      approval_required: true,
+    };
+    const source = {
+      name: "demo-quality",
+      mandate_hash: sourceHash,
+      agent_count: 1,
+      strategies: [{ name: "earnings-drift", title: "Earnings Drift", mode: "long_short", weight: 1 }],
+      cadence: "daily",
+      capital: 100_000,
+      benchmark: "SPY",
+      approval_required: true,
+      broker: "paper",
+      spec: sourceSpec,
+    };
+    installApi({
+      caps: writeCaps,
+      override: (path, method, body) => {
+        if (path === "/api/mandates/demo-quality" && method === "GET") return { payload: source };
+        if (path === "/api/mandates/demo-quality" && method === "PUT") {
+          return {
+            payload: {
+              ...source,
+              mandate_hash: "d".repeat(64),
+              spec: (body as { spec: Record<string, unknown> }).spec,
+            },
+          };
+        }
+        return null;
+      },
+    });
+    window.history.replaceState({}, "", "/builder?edit=demo-quality");
+    const user = userEvent.setup();
+    render(<App />);
+    const editor = await screen.findByRole("textbox", { name: "Full FundSpec JSON" });
+    const edited = { ...sourceSpec, min_order_pct_of_equity: 0.0025 };
+    fireEvent.change(editor, { target: { value: JSON.stringify(edited, null, 2) } });
+    await user.click(screen.getByRole("button", { name: "Save revision" }));
+    await screen.findByText(/Saved revision/);
+
+    const request = fetchRequests.find((item) => item.path === "/api/mandates/demo-quality" && item.method === "PUT");
+    expect(request?.body).toEqual({ expected_hash: sourceHash, spec: edited });
+    expect(request?.headers.get("x-csrf-token")).toBe("builder-token");
+  });
+
+  it("clones a mandate with a distinct name and the captured source revision", async () => {
+    const writeCaps: Capabilities = {
+      ...capabilities,
+      mode: "live",
+      writes: true,
+      read_only: false,
+      mutation_token: "builder-token",
+    };
+    const source = {
+      name: "demo-quality",
+      mandate_hash: sourceHash,
+      agent_count: 1,
+      strategies: [{ name: "earnings-drift", title: "Earnings Drift", mode: "long_short", weight: 1 }],
+      cadence: "daily",
+      capital: 100_000,
+      benchmark: "SPY",
+      approval_required: true,
+      broker: "paper",
+      spec: {
+        schema_version: 2,
+        name: "demo-quality",
+        strategies: [{
+          name: "earnings-drift",
+          models: [{ name: "pead", weight: 1, params: {} }],
+          blend: { method: "conviction_weighted", gross_target: 1, mode: "long_short" },
+        }],
+        risk: { max_position_pct: 0.25, max_gross_exposure: 1 },
+        costs: { spread_bps: 4.5, commission_per_share: 0.005 },
+        capital: 100_000,
+        rebalance: "daily",
+        benchmark: "SPY",
+        approval_required: true,
+      },
+    };
+    installApi({
+      caps: writeCaps,
+      override: (path, method, body) => {
+        if (path === "/api/mandates/demo-quality" && method === "GET") return { payload: source };
+        if (path === "/api/mandates/demo-quality/clone" && method === "POST") {
+          return {
+            status: 201,
+            payload: {
+              ...source,
+              name: "demo-quality-copy",
+              mandate_hash: "f".repeat(64),
+              spec: (body as { spec: Record<string, unknown> }).spec,
+            },
+          };
+        }
+        return null;
+      },
+    });
+    window.history.replaceState({}, "", "/builder?clone=demo-quality");
+    const user = userEvent.setup();
+    render(<App />);
+    const editor = await screen.findByRole("textbox", { name: "Full FundSpec JSON" });
+    const cloned = JSON.parse((editor as HTMLTextAreaElement).value) as { name: string };
+    expect(cloned.name).toBe("demo-quality-copy");
+    await user.click(screen.getByRole("button", { name: "Create clone" }));
+    await screen.findByText(/Saved revision/);
+
+    const request = fetchRequests.find((item) => item.path === "/api/mandates/demo-quality/clone" && item.method === "POST");
+    expect(request?.body).toMatchObject({
+      expected_hash: sourceHash,
+      spec: { name: "demo-quality-copy" },
+    });
+    expect(request?.headers.get("x-csrf-token")).toBe("builder-token");
   });
 
   it("clears credential input, does not render its value, and leaves Ctrl+K inside text input", async () => {
@@ -822,6 +1144,63 @@ describe("local desk screens", () => {
     view.unmount();
     render(<App />);
     expect(await screen.findByText(completedOperation.id)).toBeInTheDocument();
+  });
+
+  it("searches reports and advances with the server cursor", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(
+      within(screen.getByRole("navigation", { name: "Primary navigation" })).getByRole("link", {
+        name: "Research",
+      }),
+    );
+
+    await user.type(await screen.findByRole("searchbox", { name: "Search reports or funds" }), "demo");
+    await user.click(screen.getByRole("button", { name: "Search" }));
+    expect(await screen.findByRole("link", { name: "demo-quality" })).toBeInTheDocument();
+
+    const searchRequest = fetchRequests
+      .filter((item) => item.path.startsWith("/api/research?"))
+      .map((item) => new URL(item.path, "http://127.0.0.1"));
+    expect(searchRequest.at(-1)?.searchParams.get("search")).toBe("demo");
+    expect(searchRequest.at(-1)?.searchParams.has("cursor")).toBe(false);
+
+    await user.click(screen.getByRole("button", { name: "Next" }));
+    expect(await screen.findByText("No research reports")).toBeInTheDocument();
+    await waitFor(() => {
+      const latest = fetchRequests
+        .filter((item) => item.path.startsWith("/api/research?"))
+        .map((item) => new URL(item.path, "http://127.0.0.1"))
+        .at(-1);
+      expect(latest?.searchParams.get("cursor")).toBe("demo-next.json");
+      expect(latest?.searchParams.get("search")).toBe("demo");
+    });
+    expect(screen.getByText("Page 2")).toBeInTheDocument();
+  });
+
+  it("searches paper history and advances with the session cursor", async () => {
+    const user = userEvent.setup();
+    window.history.replaceState({}, "", "/paper/demo-quality");
+    render(<App />);
+
+    await screen.findByRole("heading", { name: "demo-quality" });
+    await user.type(await screen.findByRole("searchbox", { name: "Search sessions or hashes" }), "2024");
+    await user.click(screen.getByRole("button", { name: "Search" }));
+    expect(await screen.findByRole("link", { name: /2024-06-04/ })).toBeInTheDocument();
+
+    const firstPage = fetchRequests
+      .filter((item) => item.path.startsWith("/api/paper/demo-quality/sessions?"))
+      .map((item) => new URL(item.path, "http://127.0.0.1"));
+    expect(firstPage[firstPage.length - 1]?.searchParams.get("search")).toBe("2024");
+    expect(firstPage[firstPage.length - 1]?.searchParams.has("cursor")).toBe(false);
+
+    await user.click(screen.getByRole("button", { name: "Next" }));
+    expect(await screen.findByText("Page 2")).toBeInTheDocument();
+    const latest = fetchRequests
+      .filter((item) => item.path.startsWith("/api/paper/demo-quality/sessions?"))
+      .map((item) => new URL(item.path, "http://127.0.0.1"));
+    expect(latest[latest.length - 1]?.searchParams.get("search")).toBe("2024");
+    expect(latest[latest.length - 1]?.searchParams.get("cursor")).toBe("demo-session-next");
   });
 
   it("requires a fresh server preview before durable acceptance", async () => {

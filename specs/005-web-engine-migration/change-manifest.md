@@ -37,6 +37,8 @@
 - `specs/005-web-engine-migration/implementation-evidence.md` — revision-bound harness test evidence.
 - `specs/005-web-engine-migration/implementation-progress.md` — task checkpoints and next stop.
 - `specs/005-web-engine-migration/change-manifest.md` — implementation file inventory.
+- `specs/005-web-engine-migration/spec005-final-evidence.md` — consolidated final bounded-QA evidence and artifact identities.
+- `specs/005-web-engine-migration/qa-final-disposition.md` — partial readiness, remaining blockers and safe preview boundary.
 - `specs/005-web-engine-migration/screenshots/desktop-backtests.png` — synthetic browser screenshot.
 - `specs/005-web-engine-migration/screenshots/desktop-builder.png` — synthetic browser screenshot.
 - `specs/005-web-engine-migration/screenshots/desktop-mandate-detail.png` — synthetic browser screenshot.
@@ -90,28 +92,38 @@
 - `hedge_fund/llm/cache.py` — root-scoped prompt cache reads/writes.
 - `hedge_fund/llm/test_client.py` — explicit root CLI invocation, UTF-8 output reads and no-TUI credential helper import.
 - `hedge_fund/web/app.py` — pass the fixed root context into the web service.
-- `hedge_fund/web/services.py` — bind service file access to the configured root context and use neutral credential helpers.
-- `hedge_fund/web/test_actions.py` — root-bound web action regressions.
+- `hedge_fund/web/services.py` — bind service file access to the configured root context; verify mandate inventory under the registry lock; count uncapped research totals; gate backtests on local/free provider policy.
+- `hedge_fund/web/test_actions.py` — root-bound web action regressions and classifier-denial HTTP mapping.
 - `hedge_fund/web/test_app.py` — fixed-root app coverage.
 - `hedge_fund/web/test_jobs.py` — durable operation worker progress, cancellation, restart and fencing tests; bounded wait timeouts.
-- `hedge_fund/web/test_services.py` — root-bound service regressions.
+- `hedge_fund/web/test_services.py` — root-bound service regressions; mandate drift, clone admission, rename/write retry, local/free backtest and uncapped research-count coverage.
 - `hedge_fund/web/test_settings.py` — root-bound settings file coverage.
-- `memory.md` — append verified changed-scope style-baseline fact.
+- `memory.md` — append verified root-guard, pagination, retry-limit, policy-mapping and style-baseline facts.
 - `specs/005-web-engine-migration/tasks.md` — task status and platform/integration limits.
 - `specs/005-web-engine-migration/implementation-evidence.md` — revision-bound test, browser, package and limitation evidence.
-- `specs/005-web-engine-migration/implementation-progress.md` — T001–T017 checkpoints, final verification and blockers.
+- `specs/005-web-engine-migration/implementation-progress.md` — T001–T018 checkpoints, final verification and blockers.
 - `specs/005-web-engine-migration/change-manifest.md` — cumulative source/test/document inventory.
+- `specs/004-react-web-ui/parity-checklist.md` — retained-TUI and final migration blockers.
 
 ## Deleted
 
 - None.
 
+## Final bounded QA closure — 2026-11-01
+
+- Service guard regressions deny both in-place mandate updates and physical renames after root-inventory drift; research home count uses the uncapped `total`; clone storage-admission failure maps to 409; paid/unknown backtest policy denies before operation persistence.
+- The rename-then-write path is not transactional. Fault injection confirms a failed write leaves original bytes at the renamed path; retry with the original logical identity succeeds. No crash-atomicity claim.
+- Final browser run refreshed the synthetic screenshot set. Seventeen files: 2,749,128 bytes; sorted relative filename + NUL + full bytes + NUL SHA-256 `18b4f94915483066e59286ab82626ab26b514e8c01c61729d7d6dafa44629039`.
+- Final artifact/test source identity covers every modified tracked `.py`, `.ts`, `.tsx`, `.mjs` and `.png` path, not a narrow four-file selection: at `2026-11-01T11:45:32.6822468+01:00` → `11:45:32.8695038+01:00`, 41 paths / 2,308,066 bytes / SHA-256 `875ade896c3869ffe4213cba47e7440edceb35d6ed4ce20da91ec25fe9b3e62b`. Algorithm: sorted UTF-8 repository-relative path + NUL + full worktree bytes + NUL. Base revision: `9694f619207e14fb5e55de1bef96deb79df7a360`.
+- Production static bundle and wheel-embedded static files match the owned Playwright artifact: 3 files / 973,294 bytes / SHA-256 `309b88c7a472685221fee0cb89f207d9d72e8f36d9f38a2a9a2301c82df7897a`. Wheel: `dist/aihf-2.6.1-py3-none-any.whl`, 653,276 bytes / SHA-256 `db57b12627fcb5bf86b2587c1842cf7e6a5a9be7de01768d1721f50b68cc19e0`; build passed, wheel install/runtime smoke not run.
+- Full tracked-diff identity is recorded in the ignored session artifact and PR #8 handoff after commit. Untracked `pip/` and `pypa/` remain untouched and excluded.
+
 ## Acceptance boundary
 
 - T011 test-design task is complete; operation-store tests pass on synthetic Windows/NTFS, with one earlier unrooted sidecar-write failure retained as INCONCLUSIVE.
-- T018 remains partial and open. The in-process operation registry is not wired into production API/DeskService paths; owned child lifecycle, ACL/private-storage proof and controlled handover are absent.
-- Final source/test identity: 64 paths / 795,260 bytes / SHA-256 `774c93db77b948fabf44216f4fe911558a109ab771b29124b28a38c8b566adf4`, based on `5860036d6a247d5858b5a34204bda3cb4c82816b`. Final frontend unit/build/browser and runtime/web regression evidence is recorded in `implementation-evidence.md`; the final wheel rebuild remains BLOCKED and the prior installed-wheel smoke does not cover this identity.
-- The 17 listed screenshot artifacts are synthetic; final Playwright rerun refreshed them at `2026-10-31T21:49:45+01:00` (2,783,348 bytes total). They are intentionally included despite the repository-wide `*.png` ignore rule.
-- Migration is partial: T015 and T018–T136 remain open; current web mutation paths do not use the durable operation protocol. Do not enable write, network or container flags as a production execution surface.
-- Unrelated untracked `pypa/` is preserved and excluded from this manifest and implementation staging.
-- `outputs/web-migration-acceptance-20261031-152200/session-artifacts/progress.md` contains the final checkpoint; ignored session artifact, not staged or included in the PR.
+- T018 implementation/test criteria are complete only on synthetic Windows/NTFS. Durable operation storage is not wired into the production API/DeskService mutation paths; owned-child lifecycle, ACL/private-storage proof and controlled legacy-writer handover are not established.
+- T015/T021 remain partial. T137/T138/T140/T142–T145/T147/T148 remain open; T139/T141/T146 have bounded partial evidence but stay unchecked. Full migration and TUI retirement remain BLOCKED.
+- Full Python suite remains INCONCLUSIVE after prior stalls at 149 passed / 2 skipped of 1,207 collected. Native Linux/ext4 and actual NTFS ACL evidence remain BLOCKED. The final wheel built, but installed-wheel runtime smoke remains INCONCLUSIVE.
+- React desk remains an additive subset. TUI/Textual and operator recovery paths remain retained. Do not enable production writes, paid/headless dispatch or container execution from this partial candidate.
+- Untracked `pip/` and `pypa/` are preserved, untouched and excluded from this manifest and implementation staging.
+- `outputs/spec005-test-final-closure-20261101-01/session-artifacts/progress.md` contains the exact final command checkpoints; ignored artifact, not staged or included in the PR.

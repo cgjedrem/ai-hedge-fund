@@ -164,7 +164,7 @@ def test_builder_canonical_validation_conflicts_and_deployment(tmp_path):
     service.close()
 
 
-def test_mandate_api_rejects_library_roster_and_model_weight_drift(tmp_path):
+def test_mandate_api_preserves_advanced_model_roster_and_weights_and_rejects_unknown_params(tmp_path):
     enroll_synthetic_root(tmp_path)
     app = create_app(root=tmp_path, allow_writes=True)
     with TestClient(app, client=("127.0.0.1", 50000)) as client:
@@ -200,11 +200,13 @@ def test_mandate_api_rejects_library_roster_and_model_weight_drift(tmp_path):
 
     assert accepted.status_code == 201
     assert accepted.json()["spec"]["strategies"][0]["weight"] == 0.5
-    assert partial_response.status_code == 422
-    assert weight_response.status_code == 422
+    assert partial_response.status_code == 201
+    assert partial_response.json()["spec"]["strategies"][0]["models"] == partial["strategies"][0]["models"]
+    assert weight_response.status_code == 201
+    assert weight_response.json()["spec"]["strategies"][0]["models"][0]["weight"] == changed_weight["strategies"][0]["models"][0]["weight"]
     assert params_response.status_code == 422
-    assert not (tmp_path / "mandates" / "partial-library.yaml").exists()
-    assert not (tmp_path / "mandates" / "changed-library-weight.yaml").exists()
+    assert (tmp_path / "mandates" / "partial-library.yaml").is_file()
+    assert (tmp_path / "mandates" / "changed-library-weight.yaml").is_file()
     assert not (tmp_path / "mandates" / "changed-library-params.yaml").exists()
     app.state.service.close()
 
@@ -230,7 +232,7 @@ def test_custom_mandate_api_uses_canonical_registry_mode(tmp_path, names, mode):
     app.state.service.close()
 
 
-def test_custom_mandate_api_rejects_dollar_neutral_override(tmp_path):
+def test_custom_mandate_api_preserves_dollar_neutral_override(tmp_path):
     enroll_synthetic_root(tmp_path)
     app = create_app(root=tmp_path, allow_writes=True)
     with TestClient(app, client=("127.0.0.1", 50000)) as client:
@@ -240,8 +242,9 @@ def test_custom_mandate_api_rejects_dollar_neutral_override(tmp_path):
         payload["strategies"][0]["blend"]["mode"] = "dollar_neutral"
         response = client.post("/api/mandates", headers=headers, json={"spec": payload})
 
-    assert response.status_code == 422
-    assert not (tmp_path / "mandates" / "custom-neutral.yaml").exists()
+    assert response.status_code == 201
+    assert response.json()["spec"]["strategies"][0]["blend"]["mode"] == "dollar_neutral"
+    assert (tmp_path / "mandates" / "custom-neutral.yaml").is_file()
     app.state.service.close()
 
 

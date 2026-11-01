@@ -58,7 +58,7 @@ def _seed_demo_data(data_root: Path, admission: AdmissionCoordinator, context: R
             "approval_required": True,
         }
     )
-    save_spec(spec, data_root / "mandates")
+    save_spec(spec, data_root / "mandates", admission=admission)
     with admission.deployment_lock(spec.name, timeout=0):
         paper_dir = deploy("demo-quality", spec, ["AAPL", "MSFT"], root=data_root / "paper")
     record_ledger_head(context, spec.name, admission=admission)
@@ -95,7 +95,7 @@ def _seed_demo_data(data_root: Path, admission: AdmissionCoordinator, context: R
         metrics=performance_metrics(spec.capital, dates, nav, benchmark_nav, [cycle_one, cycle_two]),
         records=records,
     )
-    save_result(result, directory=data_root / "research")
+    save_result(result, directory=data_root / "research", admission=admission)
     return data_root
 
 

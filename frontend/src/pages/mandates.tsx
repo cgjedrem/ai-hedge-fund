@@ -154,6 +154,12 @@ export function MandateDetailPage() {
             <Button asChild variant="secondary">
               <Link to="/mandates"><ArrowLeft className="h-3.5 w-3.5" /> All mandates</Link>
             </Button>
+            <Button asChild variant="outline" disabled={!canWrite}>
+              <Link to={`/builder?edit=${encodeURIComponent(name)}`}>Edit full JSON</Link>
+            </Button>
+            <Button asChild variant="outline" disabled={!canWrite}>
+              <Link to={`/builder?clone=${encodeURIComponent(name)}`}>Clone</Link>
+            </Button>
             <Button onClick={() => { setError(null); setDialogOpen(true); }} disabled={!canWrite}>
               Deploy to paper
             </Button>

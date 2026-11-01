@@ -81,25 +81,25 @@ def test_404_means_no_data_not_failure(client):
     assert client.get_financial_metrics("ZZZZ", "2024-12-31") == []
 
 
-def test_429_retries_then_raises_when_exhausted(client, monkeypatch):
-    monkeypatch.setattr("hedge_fund.data.client.time.sleep", lambda s: None)
-    _stub(client, [_FakeResponse(429)] * (len(FDClient._RETRY_DELAYS) + 1))
+def test_429_is_not_retried(client):
+    calls = _stub(client, [_FakeResponse(429), _FakeResponse(200, {"prices": []})])
     with pytest.raises(FDClientError) as exc_info:
         client.get_prices("AAPL", "2024-01-01", "2024-12-31")
     assert exc_info.value.status_code == 429
+    assert len(calls) == 1
 
 
-def test_429_then_success_recovers(client, monkeypatch):
-    monkeypatch.setattr("hedge_fund.data.client.time.sleep", lambda s: None)
-    _stub(client, [
+def test_429_retry_after_is_ignored(client):
+    calls = _stub(client, [
         _FakeResponse(429),
         _FakeResponse(200, {"prices": [{
             "open": 1.0, "close": 2.0, "high": 2.0, "low": 1.0,
             "volume": 100, "time": "2024-01-02",
         }]}),
     ])
-    prices = client.get_prices("AAPL", "2024-01-01", "2024-12-31")
-    assert len(prices) == 1
+    with pytest.raises(FDClientError):
+        client.get_prices("AAPL", "2024-01-01", "2024-12-31")
+    assert len(calls) == 1
 
 
 # ---------------------------------------------------------------------------

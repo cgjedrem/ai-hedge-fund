@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import logging
 import os
-import time
 
 import requests
 
@@ -19,8 +17,6 @@ from hedge_fund.data.models import (
     PriceSnapshot,
 )
 from hedge_fund.data.protocol import DataClientError
-
-logger = logging.getLogger(__name__)
 
 NEWS_PAGE = 10  # the most /news/ returns per request
 
@@ -47,7 +43,6 @@ class FDClient:
     """
 
     BASE_URL = "https://api.financialdatasets.ai"
-    _RETRY_DELAYS = (5, 15, 30)
 
     def __init__(
         self,
@@ -270,48 +265,24 @@ class FDClient:
         path: str,
         **kwargs,
     ) -> requests.Response | None:
-        """HTTP request with retry on 429.
-
-        Fail-loud contract: raises FDClientError on network errors, HTTP
-        errors, and exhausted rate-limit retries. Returns None ONLY for
-        404 — "this data doesn't exist" is a data fact, not a failure.
-        Silently returning empty on real failures poisons backtests
-        (missing data reads as "no signal").
-
-        *path* may be an absolute URL (a ``next_page_url`` from a previous
-        response), which is requested verbatim.
-        """
+        """One HTTP attempt. Return None only for 404."""
         url = path if path.startswith("http") else self.BASE_URL + path
-        for attempt, delay in enumerate((*self._RETRY_DELAYS, None)):
-            try:
-                resp = self._session.request(
-                    method, url, timeout=self._timeout, **kwargs,
-                )
-            except requests.RequestException as exc:
-                raise FDClientError(
-                    f"{method} {path} failed: {exc}", path=path,
-                ) from exc
+        try:
+            resp = self._session.request(
+                method, url, timeout=self._timeout, **kwargs,
+            )
+        except requests.RequestException as exc:
+            raise FDClientError(
+                f"{method} {path} failed: {exc}", path=path,
+            ) from exc
 
-            if resp.status_code == 429 and delay is not None:
-                logger.info(
-                    "Rate limited (429), retrying in %ds (attempt %d/%d)",
-                    delay, attempt + 1, len(self._RETRY_DELAYS),
-                )
-                time.sleep(delay)
-                continue
+        if resp.status_code == 404:
+            return None
 
-            if resp.status_code == 404:
-                return None
+        if resp.status_code >= 400:
+            raise FDClientError(
+                f"{method} {path} returned {resp.status_code}: {resp.text[:200]}",
+                status_code=resp.status_code, path=path,
+            )
 
-            if resp.status_code >= 400:
-                raise FDClientError(
-                    f"{method} {path} returned {resp.status_code}: {resp.text[:200]}",
-                    status_code=resp.status_code, path=path,
-                )
-
-            return resp
-
-        raise FDClientError(
-            f"{method} {path} rate limited (429) after {len(self._RETRY_DELAYS)} retries",
-            status_code=429, path=path,
-        )
+        return resp

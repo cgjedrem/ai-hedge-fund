@@ -447,6 +447,31 @@ class RootContext:
         self.revalidate()
         return self.path.joinpath(*parts)
 
+    def rename_file(
+        self,
+        source: str | os.PathLike[str],
+        destination: str | os.PathLike[str],
+    ) -> Path:
+        source_parts = _relative_parts(source)
+        destination_parts = _relative_parts(destination)
+        if source_parts == destination_parts:
+            raise ValueError("source and destination must differ")
+        self.revalidate()
+        if os.name == "nt":
+            _windows_rename_relative(
+                self._handles[-1],
+                source_parts,
+                destination_parts,
+            )
+        else:
+            _posix_rename_relative(
+                self._fd,
+                source_parts,
+                destination_parts,
+            )
+        self.revalidate()
+        return self.path.joinpath(*destination_parts)
+
     def mkdir(
         self,
         relative: str | os.PathLike[str],
@@ -569,6 +594,67 @@ def _posix_parent_fd(root_fd: int, parents: tuple[str, ...]) -> int:
         if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
             raise RootPathError("reparse paths are not allowed") from exc
         raise
+
+
+def _posix_rename_relative(
+    root_fd: int,
+    source_parts: tuple[str, ...],
+    destination_parts: tuple[str, ...],
+) -> None:
+    source_parent = _posix_parent_fd(root_fd, source_parts[:-1])
+    destination_parent = None
+    try:
+        destination_parent = _posix_parent_fd(root_fd, destination_parts[:-1])
+        info = os.stat(
+            source_parts[-1],
+            dir_fd=source_parent,
+            follow_symlinks=False,
+        )
+        if not stat.S_ISREG(info.st_mode):
+            raise RootPathError("root rename requires a regular file")
+        if not sys.platform.startswith("linux"):
+            raise UnsupportedFilesystemError("atomic no-replace rename is unsupported")
+        libc = ctypes.CDLL(None, use_errno=True)
+        try:
+            renameat2 = libc.renameat2
+        except AttributeError:
+            raise UnsupportedFilesystemError("atomic no-replace rename is unavailable") from None
+        renameat2.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        renameat2.restype = ctypes.c_int
+        result = renameat2(
+            source_parent,
+            os.fsencode(source_parts[-1]),
+            destination_parent,
+            os.fsencode(destination_parts[-1]),
+            1,
+        )
+        if result == 0:
+            return
+        error = ctypes.get_errno()
+        if error == errno.EEXIST:
+            raise FileExistsError(
+                error,
+                os.strerror(error),
+                "/".join(destination_parts),
+            )
+        if error in {
+            errno.EINVAL,
+            errno.ENOSYS,
+            errno.EOPNOTSUPP,
+            getattr(errno, "ENOTSUP", errno.EOPNOTSUPP),
+        }:
+            raise UnsupportedFilesystemError("atomic no-replace rename is unsupported")
+        raise OSError(error, os.strerror(error), "/".join(source_parts))
+    finally:
+        if destination_parent is not None:
+            os.close(destination_parent)
+        os.close(source_parent)
 
 
 def _posix_secure_private_directory(
@@ -1292,6 +1378,78 @@ def _nt_open_child(
     return handle.value
 
 
+def _windows_open_parent(
+    root_handle: int,
+    parts: tuple[str, ...],
+) -> tuple[int, int | None]:
+    parent = root_handle
+    owned_parent = None
+    try:
+        for part in parts:
+            child = _nt_open_child(
+                parent,
+                part,
+                directory=True,
+                share_delete=True,
+            )
+            try:
+                _validate_windows_handle(child, directory=True)
+            except BaseException:
+                _close_windows_handles((child,))
+                raise
+            if owned_parent is not None:
+                _close_windows_handles((owned_parent,))
+            owned_parent = child
+            parent = child
+        return parent, owned_parent
+    except BaseException:
+        if owned_parent is not None:
+            _close_windows_handles((owned_parent,))
+        raise
+
+
+def _windows_rename_relative(
+    root_handle: int,
+    source_parts: tuple[str, ...],
+    destination_parts: tuple[str, ...],
+) -> None:
+    source_parent = root_handle
+    source_owned = None
+    destination_parent = root_handle
+    destination_owned = None
+    handle = None
+    try:
+        source_parent, source_owned = _windows_open_parent(
+            root_handle,
+            source_parts[:-1],
+        )
+        destination_parent, destination_owned = _windows_open_parent(
+            root_handle,
+            destination_parts[:-1],
+        )
+        handle = _nt_open_child(
+            source_parent,
+            source_parts[-1],
+            directory=False,
+            access=0x00010000 | 0x00000080 | 0x00100000,
+            share_delete=True,
+        )
+        _validate_windows_handle(handle, directory=False)
+        _windows_rename_handle(
+            handle,
+            destination_parent,
+            destination_parts[-1],
+            replace=False,
+        )
+    finally:
+        if handle is not None:
+            _close_windows_handles((handle,))
+        if destination_owned is not None:
+            _close_windows_handles((destination_owned,))
+        if source_owned is not None:
+            _close_windows_handles((source_owned,))
+
+
 def _windows_mkdir_relative(
     root_handle: int,
     parts: tuple[str, ...],
@@ -1601,7 +1759,13 @@ def _windows_write_handle(handle: int, data: bytes) -> None:
         raise ctypes.WinError(ctypes.get_last_error())
 
 
-def _windows_rename_handle(handle: int, parent: int, name: str) -> None:
+def _windows_rename_handle(
+    handle: int,
+    parent: int,
+    name: str,
+    *,
+    replace: bool = True,
+) -> None:
     class IoStatusBlock(ctypes.Structure):
         _fields_ = [("status", ctypes.c_void_p), ("information", ctypes.c_size_t)]
 
@@ -1617,7 +1781,7 @@ def _windows_rename_handle(handle: int, parent: int, name: str) -> None:
     offset = RenameInformationEx.name.offset
     buffer = ctypes.create_string_buffer(offset + len(encoded))
     info = ctypes.cast(buffer, ctypes.POINTER(RenameInformationEx)).contents
-    info.flags = 0x0001 | 0x0002
+    info.flags = 0x0002 | (0x0001 if replace else 0)
     info.root_directory = parent
     info.name_length = len(encoded)
     ctypes.memmove(ctypes.addressof(buffer) + offset, encoded, len(encoded))

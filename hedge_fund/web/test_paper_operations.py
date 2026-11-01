@@ -217,6 +217,41 @@ def test_manual_tick_denies_runner_lane_conflict_without_ledger_change(demo_root
     assert after == before
 
 
+def test_web_saxo_deployment_denied_before_deploy_adapter(demo_root, monkeypatch):
+    payload = load_spec(demo_root / "mandates" / "demo-quality.yaml").model_dump(mode="python")
+    payload.update(
+        {
+            "name": "saxo-web-denied",
+            "broker": "saxo",
+            "rebalance": "minute",
+            "interval": 5.0,
+            "window": {"start": "09:30", "end": "15:59"},
+        }
+    )
+    spec = FundSpec.model_validate(payload)
+    service = DeskService(demo_root, allow_writes=True)
+    service.create_mandate(spec.model_dump(mode="python"))
+    calls = []
+
+    def forbidden(*_args, **_kwargs):
+        calls.append(True)
+        raise AssertionError("web SIM deployment reached the deploy adapter")
+
+    monkeypatch.setattr(web_services, "deploy", forbidden)
+    try:
+        with pytest.raises(ServiceError) as rejected:
+            service.deploy_mandate(
+                "saxo-web-denied",
+                DeployRequest(universe=["AAPL"]),
+            )
+    finally:
+        service.close()
+
+    assert rejected.value.status_code == 403
+    assert calls == []
+    assert not (demo_root / "paper" / "saxo-web-denied").exists()
+
+
 def test_manual_tick_rejects_stale_head_before_creating_operation(
     demo_root,
     monkeypatch,

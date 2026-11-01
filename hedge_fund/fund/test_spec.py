@@ -21,6 +21,8 @@ from hedge_fund.fund import (
     save_spec,
     StrategySpec,
 )
+from hedge_fund.fund.storage import StorageAdmissionError
+from hedge_fund.runtime.handover import enroll_fresh
 from hedge_fund.runtime.root import RootContext
 from hedge_fund.signals import ALPHA_MODEL_REGISTRY, get_investment_approach
 
@@ -296,6 +298,7 @@ def test_custom_rules_derive_without_constructing_analysts(names, mode, monkeypa
     spec = FundSpec(**{**MINIMAL, "strategies": [strategy]})
     path = tmp_path / "new.yaml"
     path.write_text(yaml.safe_dump(spec.model_dump()))
+    monkeypatch.undo()
     assert load_spec(path) == spec
     assert FundSpec.model_validate_json(spec.model_dump_json()) == spec
 
@@ -418,9 +421,55 @@ def test_blind_reaches_llm_agents_only(monkeypatch, blind):
 
 def test_save_spec_round_trips_and_never_overwrites(tmp_path):
     spec = FundSpec(**MINIMAL)
-    path = save_spec(spec, tmp_path / "mandates")
-    assert path == tmp_path / "mandates" / "test-fund.yaml"
-    assert load_spec(path) == spec
-    with pytest.raises(FileExistsError):
-        save_spec(spec, tmp_path / "mandates")
-    assert load_spec(path) == spec
+    context = RootContext.open(tmp_path)
+    try:
+        enroll_fresh(context)
+        with paths.bound_root(context):
+            path = save_spec(spec, tmp_path / "mandates")
+            assert path == tmp_path / "mandates" / "test-fund.yaml"
+            assert load_spec(path) == spec
+            with pytest.raises(FileExistsError):
+                save_spec(spec, tmp_path / "mandates")
+            assert load_spec(path) == spec
+    finally:
+        context.close()
+
+
+def test_optional_registered_constructor_parameter_accepts_none():
+    payload = deepcopy(MINIMAL)
+    payload["strategies"] = [
+        {
+            "name": "optional-temperature",
+            "models": [{"name": "buffett", "params": {"temperature": None}}],
+            "blend": {"mode": "long_only"},
+        }
+    ]
+
+    spec = FundSpec.model_validate(payload)
+
+    assert spec.strategies[0].models[0].params["temperature"] is None
+
+
+def test_save_spec_denies_unenrolled_root(tmp_path):
+    spec = FundSpec(**MINIMAL)
+    context = RootContext.open(tmp_path)
+    try:
+        context.prepare_private_storage()
+        with paths.bound_root(context):
+            with pytest.raises(StorageAdmissionError):
+                save_spec(spec, tmp_path / "mandates")
+            assert not (tmp_path / "mandates" / "test-fund.yaml").exists()
+    finally:
+        context.close()
+
+
+def test_save_spec_rejects_path_like_fund_name(tmp_path):
+    invalid = FundSpec(**MINIMAL).model_copy(update={"name": "../outside"})
+    context = RootContext.open(tmp_path)
+    try:
+        with paths.bound_root(context):
+            with pytest.raises(ValueError, match="mandate name"):
+                save_spec(invalid, tmp_path / "mandates")
+            assert not (tmp_path / "mandates").exists()
+    finally:
+        context.close()

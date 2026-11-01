@@ -335,7 +335,7 @@ def test_protected_windows_aliases_are_rejected_before_control_writes(tmp_path, 
     assert not (fund_dir / "pending-approval.json").exists()
 
 
-@pytest.mark.parametrize("action", ["approve", "halt", "resume"])
+@pytest.mark.parametrize("action", ["approve", "halt", "resume", "runner-stop"])
 def test_nonlocal_broker_mutations_stop_before_ledger_adapter(demo_root, monkeypatch, action):
     directory = demo_root / "paper" / "demo-quality"
     deployed_path = directory / "fund.yaml"
@@ -371,6 +371,9 @@ def test_nonlocal_broker_mutations_stop_before_ledger_adapter(demo_root, monkeyp
                 service.approve("demo-quality", request)
             elif action == "halt":
                 service.halt_fund("demo-quality", "must not write")
+            elif action == "runner-stop":
+                monkeypatch.setattr(service._runner_manager, "request_stop", forbidden)
+                service.stop_runner("demo-quality")
             else:
                 service.resume_fund("demo-quality")
     finally:
@@ -378,6 +381,253 @@ def test_nonlocal_broker_mutations_stop_before_ledger_adapter(demo_root, monkeyp
 
     assert rejected.value.status_code == 403
     assert not called
+
+
+def test_saxo_web_routes_deny_before_provider_or_writer_effects(
+    demo_root,
+    monkeypatch,
+):
+    from hedge_fund.fund import FundSpec, load_spec
+    from hedge_fund.paper.ledger import Ledger as RealLedger
+    from hedge_fund.runtime.handover import record_ledger_head
+    from hedge_fund.web import services as service_module
+
+    deployed_dir = demo_root / "paper" / "demo-quality"
+    deployed_path = deployed_dir / "fund.yaml"
+    app = create_app(
+        root=demo_root,
+        allow_writes=True,
+        network_enabled=True,
+        demo=True,
+        data_client_factory=lambda: pytest.fail("SIM route reached the data client"),
+    )
+    service = app.state.service
+    try:
+        sim_payload = load_spec(demo_root / "mandates" / "demo-quality.yaml").model_dump(mode="python")
+        sim_payload.update(
+            {
+                "name": "saxo-route",
+                "broker": "saxo",
+                "rebalance": "minute",
+                "interval": 5.0,
+                "window": {"start": "09:30", "end": "15:59"},
+            }
+        )
+        sim_spec = FundSpec.model_validate(sim_payload)
+        service.create_mandate(sim_spec.model_dump(mode="python"))
+
+        deployed = yaml.safe_load(deployed_path.read_text(encoding="utf-8"))
+        deployed["broker"] = "saxo"
+        deployed_path.write_text(
+            yaml.safe_dump(deployed, sort_keys=False),
+            encoding="utf-8",
+        )
+        record_ledger_head(
+            service.root_context,
+            "demo-quality",
+            admission=service._admission,
+        )
+        head = RealLedger(deployed_dir).latest().hash
+        events_path = deployed_dir / "events.jsonl"
+        before_events = events_path.read_bytes() if events_path.exists() else None
+        paths = [
+            (
+                "/api/paper/demo-quality/approval",
+                {
+                    "verdict": "approve",
+                    "decision_as_of": "2024-06-05",
+                    "source_record_hash": "b" * 64,
+                },
+            ),
+            ("/api/paper/demo-quality/halt", {"reason": "blocked"}),
+            ("/api/paper/demo-quality/resume", None),
+            ("/api/paper/demo-quality/runner/stop", None),
+            ("/api/paper/demo-quality/tick/preview", {"expected_head": head}),
+            ("/api/paper/demo-quality/runner/preview", {"expected_head": head}),
+            ("/api/paper/demo-quality/valuation", {"expected_head": head}),
+            ("/api/mandates/saxo-route/deploy", {"universe": ["AAPL"]}),
+        ]
+        called = []
+
+        def forbidden(*_args, **_kwargs):
+            called.append(True)
+            raise AssertionError("SIM route reached a writer or process adapter")
+
+        monkeypatch.setattr(service_module, "Ledger", forbidden)
+        monkeypatch.setattr(service_module, "deploy", forbidden)
+        monkeypatch.setattr(service._runner_manager, "request_stop", forbidden)
+        with TestClient(app, client=("127.0.0.1", 50000)) as client:
+            capability = client.get(
+                "/api/capabilities",
+                headers={"host": "127.0.0.1"},
+            ).json()
+            headers = {
+                "host": "127.0.0.1",
+                "origin": "http://127.0.0.1",
+                "x-csrf-token": capability["mutation_token"],
+            }
+            results = [client.post(f"/{path.lstrip('/')}", headers=headers, json=body) if body is not None else client.post(f"/{path.lstrip('/')}", headers=headers) for path, body in paths]
+    finally:
+        service.close()
+
+    assert [response.status_code for response in results] == [403] * len(paths)
+    assert called == []
+    after_events = events_path.read_bytes() if events_path.exists() else None
+    assert after_events == before_events
+    assert not (deployed_dir / "pending-approval.json").exists()
+    assert not (demo_root / "paper" / "saxo-route").exists()
+
+
+def test_saxo_accept_routes_reject_previews_before_worker_or_ledger_effects(
+    demo_root,
+    monkeypatch,
+):
+    from hedge_fund.data.models import Price
+    from hedge_fund.fund import load_spec
+    from hedge_fund.paper.ledger import Ledger as RealLedger
+    from hedge_fund.runtime.configuration import RuntimeSettings
+    from hedge_fund.runtime.handover import record_ledger_head
+    from hedge_fund.web import services as service_module
+    from hedge_fund.web.schemas import DeployRequest
+
+    class OfflineData:
+        def __init__(self):
+            self.calls = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def get_prices(self, ticker, start_date, end_date, **_kwargs):
+            self.calls.append((ticker, start_date, end_date))
+            if start_date > end_date:
+                return []
+            return [
+                Price(
+                    open=100,
+                    close=101,
+                    high=102,
+                    low=99,
+                    volume=1000,
+                    time=f"{end_date}T16:00:00-04:00",
+                )
+            ]
+
+    data = OfflineData()
+    app = create_app(
+        root=demo_root,
+        allow_writes=True,
+        network_enabled=True,
+        demo=True,
+        data_client_factory=lambda: data,
+    )
+    service = app.state.service
+    service._runtime_settings = RuntimeSettings(
+        data_provider="yfinance",
+        llm_provider="Ollama",
+        model="gemma3:4b",
+        endpoint="http://127.0.0.1:11434",
+        timeout_seconds=1,
+        parameters={"max_tokens": 32},
+        version=0,
+    )
+    name = "saxo-accept-route"
+    spec = load_spec(demo_root / "mandates" / "demo-quality.yaml").model_copy(update={"name": name})
+    service.create_mandate(spec.model_dump(mode="python"))
+    service.deploy_mandate(name, DeployRequest(universe=["AAPL", "MSFT"]))
+    directory = demo_root / "paper" / name
+    deployed_path = directory / "fund.yaml"
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("SIM acceptance reached a writer or worker")
+
+    try:
+        with TestClient(app, client=("127.0.0.1", 50000)) as client:
+            capability = client.get(
+                "/api/capabilities",
+                headers={"host": "127.0.0.1"},
+            ).json()
+            headers = {
+                "host": "127.0.0.1",
+                "origin": "http://127.0.0.1",
+                "x-csrf-token": capability["mutation_token"],
+            }
+            manual_preview = client.post(
+                f"/api/paper/{name}/tick/preview",
+                headers=headers,
+                json={"expected_head": None},
+            )
+            runner_preview = client.post(
+                f"/api/paper/{name}/runner/preview",
+                headers=headers,
+                json={"expected_head": None},
+            )
+            assert manual_preview.status_code == 201
+            assert runner_preview.status_code == 201
+            calls_before_accept = len(data.calls)
+
+            deployed = yaml.safe_load(deployed_path.read_text(encoding="utf-8"))
+            deployed["broker"] = "saxo"
+            deployed_path.write_text(
+                yaml.safe_dump(deployed, sort_keys=False),
+                encoding="utf-8",
+            )
+            record_ledger_head(
+                service.root_context,
+                name,
+                admission=service._admission,
+            )
+            events_path = directory / "events.jsonl"
+            before_events = events_path.read_bytes() if events_path.exists() else None
+            head = RealLedger(directory).latest()
+            assert head is None
+
+            monkeypatch.setattr(service_module, "Ledger", forbidden)
+            monkeypatch.setattr(
+                service._paper_operation_jobs,
+                "submit",
+                forbidden,
+            )
+            manual = manual_preview.json()
+            manual_accept = client.post(
+                f"/api/paper/{name}/tick",
+                headers=headers,
+                json={
+                    "request_id": "saxo-manual-accept",
+                    "preview_id": manual["preview_id"],
+                    "preview_digest": manual["preview_digest"],
+                    "confirmation_token": manual["confirmation_token"],
+                    "expected_head": None,
+                    "due_set": manual["due_set"],
+                },
+            )
+            runner = runner_preview.json()
+            runner_accept = client.post(
+                f"/api/paper/{name}/runner",
+                headers=headers,
+                json={
+                    "request_id": "saxo-runner-accept",
+                    "preview_id": runner["preview_id"],
+                    "preview_digest": runner["preview_digest"],
+                    "confirmation_token": runner["confirmation_token"],
+                    "expected_head": None,
+                    "due_set": runner["due_set"],
+                    "max_sessions": runner["payload"]["max_sessions"],
+                    "max_runtime_minutes": runner["payload"]["max_runtime_minutes"],
+                },
+            )
+            accepted_operations = service._operation_store.list_operations()
+    finally:
+        service.close()
+
+    assert manual_accept.status_code == 403
+    assert runner_accept.status_code == 403
+    assert len(data.calls) == calls_before_accept
+    after_events = events_path.read_bytes() if events_path.exists() else None
+    assert after_events == before_events
+    assert accepted_operations == ()
 
 
 def test_web_halt_enters_shared_control_lane(tmp_path, monkeypatch):
@@ -402,6 +652,43 @@ def test_web_halt_enters_shared_control_lane(tmp_path, monkeypatch):
 
     assert result == {"name": "demo-quality", "halted": True}
     assert acquired == [("demo-quality", 0.1)]
+
+
+def test_web_halt_does_not_wait_for_fund_work_lock(tmp_path):
+    from threading import Event, Thread
+
+    from hedge_fund.web.demo import seed_demo
+
+    root = seed_demo(tmp_path / "writes")
+    service = DeskService(root, allow_writes=True)
+    work_lock = service._fund_lock("demo-quality")
+    completed = Event()
+    result = []
+    failures = []
+
+    def halt():
+        try:
+            result.append(service.halt_fund("demo-quality", "operator pause"))
+        except Exception as exc:
+            failures.append(exc)
+        finally:
+            completed.set()
+
+    work_lock.acquire()
+    thread = Thread(target=halt)
+    try:
+        thread.start()
+        responsive = completed.wait(timeout=1)
+    finally:
+        work_lock.release()
+        thread.join(timeout=2)
+        service.close()
+
+    assert responsive
+    assert not thread.is_alive()
+    assert failures == []
+    assert result == [{"name": "demo-quality", "halted": True}]
+    assert Ledger(root / "paper" / "demo-quality").halted() == "operator pause"
 
 
 def test_capabilities_explain_deferred_runner_ownership(tmp_path):
@@ -475,3 +762,40 @@ def test_approval_and_resume_reject_symlinked_control_files(demo_root, tmp_path,
 
     assert rejected.value.status_code == 403
     assert target.read_bytes() == target_before
+
+
+def test_unknown_local_policy_classification_returns_service_error(
+    write_client,
+    demo_root,
+    monkeypatch,
+):
+    import hedge_fund.web.services as web_services
+    from hedge_fund.runtime.configuration import RuntimeSettings
+    from hedge_fund.runtime.policy import AuthorizationDenied, ProviderClass
+
+    client, headers = write_client
+    service = client.app.state.service
+    service.network_enabled = True
+    service._runtime_settings = RuntimeSettings(
+        data_provider="yfinance",
+        llm_provider="Ollama",
+        model="gemma3:4b",
+        endpoint="http://127.0.0.1:11434",
+    )
+
+    def classify(target, **_kwargs):
+        if target.kind == "llm":
+            raise AuthorizationDenied("LLM provider is unknown")
+        return ProviderClass.FREE_DATA
+
+    monkeypatch.setattr(web_services, "classify_provider", classify)
+    latest = Ledger(demo_root / "paper" / "demo-quality").latest()
+    assert latest is not None
+    response = client.post(
+        "/api/paper/demo-quality/tick/preview",
+        headers=headers,
+        json={"expected_head": latest.hash},
+    )
+
+    assert response.status_code == 422
+    assert response.json() == {"detail": "Provider configuration is not supported for local-paper operations."}

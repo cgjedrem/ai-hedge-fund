@@ -10,12 +10,14 @@ description: "Executable, mandatory-test work plan for complete web-only engine 
 `docs\governance\web-migration-contract.md`.
 **Prerequisite gate:** [exact Git/API receipt](tasks-gate-2026-10-31.md): clean/pushed
 spec and plan at `193d16dc754567710c8dd5703e4f427184c9079f`, open main-targeting PR #8.
-**Current state:** user-directed implementation authorized. **17/136 tasks complete:**
+**Current state:** user-directed implementation authorized. **17/148 tasks complete:**
 T001–T014 and T016–T018. T009–T011 include completed test-design/red phases. T018 passes
 its implementation/test criteria on synthetic Windows/NTFS, including reviewed local-paper
 ticks and bounded owned-runner controls. T015 and T021 remain partial: operator attestation
 does not fence unaware writers, stale-reservation recovery is absent, and `fund/storage.py`
 plus `backtesting/research.py` are not integrated. T019–T020 and T022–T136 remain open.
+T139, T141 and T146 have bounded partial evidence but remain unchecked; the remaining
+convergence tasks T137–T148 are not complete.
 T006/T007/T012/T014/T016/T017 do not establish Linux/ext4, actual NTFS ACL or live-runtime
 acceptance. T003's isolated production build/browser harness passed; T004–T005 inventories
 are complete. Credential material/version retention, complete writer/provider integration,
@@ -535,3 +537,23 @@ All story-phase tasks carry their exact spec story label, including P1 US6 befor
 sections; setup/foundation/polish carry no story labels. Every task includes concrete
 paths, required tests/evidence are non-optional, all six independent test criteria are
 stated, and retirement/removal dependencies are explicit rather than implied by list order.
+
+## Phase 10: Convergence — residuals T137–T148
+
+**Purpose:** close concrete production gaps found during implementation convergence. These
+tasks supplement, not rewrite or renumber, T001–T136. Passing a unit/fake test does not
+close native, paid-provider, package, browser, or platform evidence. Never retire Textual
+while a required acceptance row remains blocked or inconclusive.
+
+- [ ] T137 Enforce per-transport-call authorization, expiry, Halt/fence checks, resource bounds and worst-case cost reservations beneath real LLM/data factories for CLI, manual, backtest and runner paths; remove hidden paid defaults and automatic paid retries, and validate approved destinations with DNS-rebinding-resistant address pinning. Paid one-shot/backtest calls require finite operator authorization; paid/cloud loops remain prohibited. Add fake transports below production guards; never make paid/network acceptance calls.
+- [ ] T138 Integrate `RootContext`, shared admission and controlled handover with `fund/storage.py`, `backtesting/research.py` and every supported direct writer; guard or deny each writer, preserve independent-fund lanes and document that legacy/out-of-band binaries remain unfenced unless excluded.
+- [ ] T139 Deny every web SIM execution, control, approval, redo and lifecycle action before effects. Preserve only explicitly provisioned, headless SIM under fake exclusive account binding; provisioning grants no execution authority.
+- [ ] T140 Implement head-bound durable reconciliation receipts for ambiguous post-fill outcomes, including identity/head, broker book/fills, evidence, capture, operator decision, time, expiry and single-use semantics. Resume requires verified replay plus reconciliation; expose latest-session redo only after quiescence. Keep emergency Halt on a bounded control lane that never waits for a long LLM lock.
+- [ ] T141 Implement lossless revision-bound mandate edit/clone/rename and complete advanced JSON round-trip for every `FundSpec` field, registered constructor parameter, strategy/model weight, blend policy and schedule/default omission; keep deployments immutable and validate all API inputs.
+- [ ] T142 Implement restart-safe verified owned-runner reattachment, quiescence/fencing and stale-reservation review/recovery with process-incarnation proof; never trust TTL/PID alone or adopt unknown work. Integrate with canonical headless runner stop/status/upgrade paths and test native owned-child fake-canonical completion.
+- [ ] T143 Implement exact-date manual/backlog review with bounded oldest-first selection/skip/no-work outcomes, canonical cadence and stage/agent/thesis progress; make overview refresh explicit and label minute mandates as daily replay.
+- [ ] T144 Implement reversible identity/head-bound lifecycle for templates, deployments and research with durable expiring single-use confirmations, collision-safe stopped restore, quiescence and distinct linked replacement. Keep UI, API and headless behavior aligned; no broad deletion.
+- [ ] T145 Expose stored/effective/active configuration provenance, overrides, deletion-after-capture and restart-required state; bind long-running runners to captured versions. Honor persisted non-secret CLI settings; never echo or persist secrets in browser storage, logs, URLs or arguments.
+- [ ] T146 Implement stable bounded pagination/search beyond 100 research/history records, complete canonical report drilldowns/precision JSON exports, and honest per-ticker valuation freshness/source/coverage without changing recorded NAV.
+- [ ] T147 Implement a safe host-generated immutable paired-head snapshot for the read-only observer container, mounted read-only and isolated from provider credentials, caches, jobs and writes. Bind publication to host loopback only; remove ttyd/TUI/shared-writable runner topology from supported compose paths while documenting intentional compatibility limits.
+- [ ] T148 Make the explicit-root React desk the default web driver and prove supported headless imports without Textual; migrate every remaining TUI assertion before removal. Retire TUI/Textual/ttyd/dependencies/entrypoint/docs only after final parity/package/browser/Windows/Linux gates pass; otherwise preserve TUI and record retirement as blocked while retaining the candidate headless path.

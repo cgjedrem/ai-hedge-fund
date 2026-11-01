@@ -168,6 +168,47 @@ def test_handle_relative_atomic_write_replaces_and_reads_inside_root(tmp_path):
     assert list(root.glob(".*.tmp")) == []
 
 
+def test_handle_relative_rename_moves_regular_file_without_replacing(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+
+    with RootContext.open(root) as context:
+        context.mkdir("mandates")
+        context.write_bytes("mandates/old.yaml", b"old")
+        renamed = context.rename_file("mandates/old.yaml", "mandates/new.yaml")
+
+        assert renamed == root / "mandates" / "new.yaml"
+        assert context.read_bytes("mandates/new.yaml") == b"old"
+        with pytest.raises(FileNotFoundError):
+            context.file_info("mandates/old.yaml")
+
+        context.write_bytes("mandates/old.yaml", b"replacement")
+        with pytest.raises(FileExistsError):
+            context.rename_file("mandates/new.yaml", "mandates/old.yaml")
+
+        assert context.read_bytes("mandates/new.yaml") == b"old"
+        assert context.read_bytes("mandates/old.yaml") == b"replacement"
+
+
+def test_handle_relative_rename_rejects_escape_and_non_file(tmp_path):
+    root = tmp_path / "root"
+    outside = tmp_path / "outside.yaml"
+    root.mkdir()
+    outside.write_bytes(b"outside")
+
+    with RootContext.open(root) as context:
+        context.write_bytes("record.yaml", b"inside")
+        context.mkdir("subdir")
+        with pytest.raises(RootPathError):
+            context.rename_file("../outside.yaml", "moved.yaml")
+        with pytest.raises(RootPathError):
+            context.rename_file("record.yaml", "../outside.yaml")
+        with pytest.raises((RootPathError, OSError)):
+            context.rename_file("subdir", "moved.yaml")
+
+    assert outside.read_bytes() == b"outside"
+
+
 def test_open_reader_does_not_block_atomic_replacement(tmp_path, monkeypatch):
     root = tmp_path / "root"
     root.mkdir()

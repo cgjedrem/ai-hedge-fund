@@ -391,6 +391,37 @@ class AdmissionCoordinator:
         self._root.revalidate()
 
 
+@contextmanager
+def root_registry_writer(
+    root: RootContext,
+    admission: AdmissionCoordinator | None = None,
+) -> Iterator[AdmissionCoordinator]:
+    if not isinstance(root, RootContext):
+        raise TypeError("an explicit RootContext is required")
+    if admission is not None and (not isinstance(admission, AdmissionCoordinator) or admission.root is not root):
+        raise TypeError("admission must match the RootContext")
+    owner = None
+    coordinator = admission
+    if coordinator is None:
+        owner = RootOwnerLease.acquire(root, timeout=0)
+        coordinator = AdmissionCoordinator(root, owner_lease=owner)
+    try:
+        if coordinator.lane_is_held("registry"):
+            from hedge_fund.runtime.handover import verify_root_inventory
+
+            verify_root_inventory(root)
+            yield coordinator
+        else:
+            with coordinator.registry_lock(timeout=0):
+                from hedge_fund.runtime.handover import verify_root_inventory
+
+                verify_root_inventory(root)
+                yield coordinator
+    finally:
+        if owner is not None:
+            owner.close()
+
+
 def require_paper_write_lanes(
     path: str | os.PathLike[str],
     identity: str,

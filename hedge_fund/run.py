@@ -135,7 +135,10 @@ def main(argv: list[str] | None = None) -> None:
             _load_runtime()
             if args.model:
                 os.environ["HEDGE_FUND_LLM_MODEL"] = args.model
-            ensure_mandates_dir()
+            try:
+                ensure_mandates_dir()
+            except RootPathError as exc:
+                parser.error(str(exc))
 
             if args.command is None:
                 from hedge_fund.tui.app import HedgeFundApp
@@ -321,7 +324,7 @@ def _parser() -> argparse.ArgumentParser:
     halt.add_argument("name")
     halt.add_argument("--reason", required=True)
 
-    resume = actions.add_parser("resume", help="clear the kill switch")
+    resume = actions.add_parser("resume", help="resume only after verified reconciliation")
     resume.add_argument("name")
 
     approve = actions.add_parser("approve", help="approve a pending decision")
@@ -800,8 +803,7 @@ def _paper(args, parser: argparse.ArgumentParser, console: Console) -> None:
                 ledger.halt(args.reason)
                 console.print(f"[red]{args.name} halted:[/] {args.reason}")
             elif args.action == "resume":
-                ledger.resume()
-                console.print(f"[green]{args.name} resumed[/]")
+                raise PaperWriterDenied("Resume requires a verified reconciliation receipt; automatic resume is disabled.")
 
 
 def _status_line(directory: Path) -> str:

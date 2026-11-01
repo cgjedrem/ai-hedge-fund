@@ -9,7 +9,7 @@ import {
   FileText,
   ShieldCheck,
 } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type FormEvent } from "react";
 import { Link, useParams } from "react-router-dom";
 
 import { ConfirmDialog } from "@/components/confirm-dialog";
@@ -39,6 +39,7 @@ import type {
   LiveValuation,
   PaperCollection,
   PaperOperationPreview,
+  PaperSessionsCollection,
   PaperSnapshot,
   PaperSummary,
   PendingDecision,
@@ -138,6 +139,16 @@ export function PaperDetailPage() {
   const { name = "" } = useParams();
   const { capabilities } = useDesk();
   const resource = useResource<PaperSnapshot>(name ? `/api/paper/${encodeURIComponent(name)}` : null);
+  const [sessionSearchText, setSessionSearchText] = useState("");
+  const [sessionSearch, setSessionSearch] = useState("");
+  const [sessionCursorStack, setSessionCursorStack] = useState<(string | null)[]>([null]);
+  const sessionCursor = sessionCursorStack[sessionCursorStack.length - 1];
+  const sessionQuery = new URLSearchParams({ limit: "50" });
+  if (sessionCursor) sessionQuery.set("cursor", sessionCursor);
+  if (sessionSearch) sessionQuery.set("search", sessionSearch);
+  const sessionResource = useResource<PaperSessionsCollection>(
+    name ? `/api/paper/${encodeURIComponent(name)}/sessions?${sessionQuery.toString()}` : null,
+  );
   const runnerResource = useResource<RunnerState>(
     name ? `/api/paper/${encodeURIComponent(name)}/runner` : null,
   );
@@ -169,8 +180,9 @@ export function PaperDetailPage() {
   const runner = runnerResource.data ?? data?.runner;
   const operation = operationResource.data?.id === operationId ? operationResource.data : null;
   const approvalRequired = data?.spec.approval_required === true;
-  const canApprove = canWrite && approvalRequired && data?.halt_state === "clear" && data?.ledger.ok === true;
-  const canRefreshValuation = canWrite && capabilities?.network === true && data?.ledger.ok === true;
+  const canWritePaper = canWrite && data?.broker === "paper";
+  const canApprove = canWritePaper && approvalRequired && data?.halt_state === "clear" && data?.ledger.ok === true;
+  const canRefreshValuation = canWritePaper && capabilities?.network === true && data?.ledger.ok === true;
   const liveValue = valuationResult ?? data?.live_value;
   const paperOperationActive = Boolean(
     operation && ["accepted", "running", "cancel-requested"].includes(operation.status),
@@ -181,19 +193,23 @@ export function PaperDetailPage() {
     && ["stopped", "completed", "failed"].includes(runner.status),
   );
   const canOperatePaper = Boolean(
-    canWrite
+    canWritePaper
     && capabilities?.network === true
-    && data?.broker === "paper"
     && data.ledger.ok
     && data.halt_state === "clear"
     && runnerInactive
     && !paperOperationActive,
   );
   const canStopRunner = Boolean(
-    canWrite
+    canWritePaper
     && runner?.available
     && runner.status === "running",
   );
+  const submitSessionSearch = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setSessionCursorStack([null]);
+    setSessionSearch(sessionSearchText);
+  };
 
   useEffect(() => {
     valuationRequest.current += 1;
@@ -241,6 +257,11 @@ export function PaperDetailPage() {
 
   async function submitAction(): Promise<void> {
     if (!confirmAction) return;
+    if (
+      confirmAction === "approve" || confirmAction === "reject"
+        ? !canApprove
+        : !canWritePaper
+    ) return;
     setBusy(true);
     setFeedback(null);
     try {
@@ -267,6 +288,7 @@ export function PaperDetailPage() {
   }
 
   async function submitHalt(): Promise<void> {
+    if (!canWritePaper) return;
     const reason = haltReason.trim();
     if (!reason) {
       setFeedback({ tone: "danger", message: "Enter a reason before halting this fund." });
@@ -462,10 +484,61 @@ export function PaperDetailPage() {
               </Card>
               <Card>
                 <CardHeader>
-                  <SectionTitle title="Session ledger" note={`${data.sessions.length} most recent records`} />
+                  <SectionTitle
+                    title="Session ledger"
+                    note={`${sessionResource.data?.total ?? data.sessions.length} verified records`}
+                  />
                 </CardHeader>
                 <CardContent>
-                  <SessionsTable name={name} sessions={data.sessions} />
+                  <form
+                    className="mb-4 flex max-w-xl gap-2"
+                    onSubmit={submitSessionSearch}
+                    role="search"
+                    aria-label="Search session history"
+                  >
+                    <Input
+                      aria-label="Search sessions or hashes"
+                      maxLength={128}
+                      onChange={(event) => setSessionSearchText(event.target.value)}
+                      placeholder="Search sessions or hashes"
+                      type="search"
+                      value={sessionSearchText}
+                    />
+                    <Button type="submit" variant="secondary" disabled={sessionResource.loading}>Search</Button>
+                  </form>
+                  {sessionResource.error ? <ErrorState message={sessionResource.error} /> : null}
+                  {sessionResource.data?.errors.length ? (
+                    <Alert tone="warning" className="mb-4">
+                      {sessionResource.data.errors.map((item) => (
+                        <p key={item.id}><span className="mono">{item.id}</span><span className="px-2 opacity-50">/</span>{item.error}</p>
+                      ))}
+                    </Alert>
+                  ) : null}
+                  <SessionsTable name={name} sessions={sessionResource.data?.items ?? []} />
+                  <div className="mt-4 flex items-center justify-between gap-3 border-t border-border pt-4">
+                    <p className="text-xs text-muted-foreground">Page {sessionCursorStack.length}</p>
+                    <div className="flex gap-2">
+                      <Button
+                        disabled={sessionCursorStack.length <= 1 || sessionResource.loading}
+                        onClick={() => setSessionCursorStack((current) => current.slice(0, -1))}
+                        variant="secondary"
+                      >
+                        Previous
+                      </Button>
+                      <Button
+                        disabled={!sessionResource.data?.next_cursor || sessionResource.loading}
+                        onClick={() => {
+                          const nextCursor = sessionResource.data?.next_cursor;
+                          if (nextCursor) {
+                            setSessionCursorStack((current) => [...current, nextCursor]);
+                          }
+                        }}
+                        variant="secondary"
+                      >
+                        Next
+                      </Button>
+                    </div>
+                  </div>
                 </CardContent>
               </Card>
             </div>
@@ -501,13 +574,13 @@ export function PaperDetailPage() {
                       : runner?.reason ?? "Runner ownership verified by this server."}
                   </p>
                   <div className="grid grid-cols-2 gap-2">
-                    <Button variant="danger" onClick={() => { setFeedback(null); setHaltDialogOpen(true); }} disabled={!canWrite || data.halt_state !== "clear"}>
+                    <Button variant="danger" onClick={() => { setFeedback(null); setHaltDialogOpen(true); }} disabled={!canWritePaper || data.halt_state !== "clear"}>
                       <CirclePause className="h-3.5 w-3.5" /> Halt
                     </Button>
                     <Button
                       variant="secondary"
                       onClick={() => setConfirmAction("resume")}
-                      disabled={!canWrite || data.halt_state !== "halted" || !data.ledger.ok}
+                      disabled={!canWritePaper || data.halt_state !== "halted" || !data.ledger.ok}
                       title={!data.ledger.ok ? "Resume requires a valid, replayable ledger." : undefined}
                     >
                       <CirclePlay className="h-3.5 w-3.5" /> Resume
@@ -792,7 +865,7 @@ export function PaperDetailPage() {
           </div>
           <DialogFooter>
             <Button variant="ghost" onClick={() => setHaltDialogOpen(false)} disabled={busy}>Cancel</Button>
-            <Button variant="danger" onClick={() => void submitHalt()} disabled={busy || !canWrite}>{busy ? "Recording…" : "Record halt"}</Button>
+            <Button variant="danger" onClick={() => void submitHalt()} disabled={busy || !canWritePaper}>{busy ? "Recording…" : "Record halt"}</Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>

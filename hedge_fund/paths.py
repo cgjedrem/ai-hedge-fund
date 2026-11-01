@@ -255,14 +255,20 @@ def ensure_mandates_dir() -> Path:
     context = root_context()
     if context is None or MANDATES_DIR is None:
         raise RootConfigurationError("an explicit root must be configured first")
-    context.mkdir("mandates", parents=True)
     try:
-        context.file_info("mandates/example.yaml")
-    except FileNotFoundError:
-        context.write_bytes(
-            "mandates/example.yaml",
-            EXAMPLE_MANDATE.read_bytes(),
-        )
+        from hedge_fund.runtime.admission import root_registry_writer
+
+        with root_registry_writer(context):
+            context.mkdir("mandates", parents=True)
+            try:
+                context.file_info("mandates/example.yaml")
+            except FileNotFoundError:
+                context.write_bytes(
+                    "mandates/example.yaml",
+                    EXAMPLE_MANDATE.read_bytes(),
+                )
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise RootConfigurationError("offline enrollment and root writer admission are required") from exc
     return MANDATES_DIR
 
 

@@ -283,8 +283,7 @@ class Ledger:
 
     def resume(self) -> None:
         self._require_write_lanes(_CONTROL_LANES)
-        self._write_control(False, None)
-        self.log_event("resume")
+        raise LedgerError("Resume requires a verified reconciliation receipt.")
 
     def _write_control(self, halted: bool, reason: str | None) -> None:
         self._require_write_lanes(_CONTROL_LANES)

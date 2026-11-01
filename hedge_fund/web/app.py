@@ -21,6 +21,7 @@ from hedge_fund.web.schemas import (
     DeployRequest,
     HaltRequest,
     MandateCreateRequest,
+    MandateRevisionRequest,
     ModelRequest,
     OperationAcceptRequest,
     OperationCancelRequest,
@@ -236,6 +237,22 @@ def create_app(
     def create_mandate(request: MandateCreateRequest):
         return service.create_mandate(request.spec)
 
+    @app.put("/api/mandates/{name}")
+    def update_mandate(name: str, request: MandateRevisionRequest):
+        return service.update_mandate(
+            name,
+            request.spec,
+            expected_hash=request.expected_hash,
+        )
+
+    @app.post("/api/mandates/{name}/clone", status_code=201)
+    def clone_mandate(name: str, request: MandateRevisionRequest):
+        return service.clone_mandate(
+            name,
+            request.spec,
+            expected_hash=request.expected_hash,
+        )
+
     @app.post("/api/mandates/{name}/deploy", status_code=201)
     def deploy_mandate(name: str, request: DeployRequest):
         return service.deploy_mandate(name, request)
@@ -297,9 +314,13 @@ def create_app(
         return service.refresh_valuation(name, request)
 
     @app.get("/api/paper/{name}/sessions")
-    def paper_sessions(name: str):
-        detail = service.paper_detail(name)
-        return {"items": detail["sessions"], "ledger": detail["ledger"]}
+    def paper_sessions(
+        name: str,
+        limit: int = Query(default=50, ge=1, le=100),
+        cursor: str | None = Query(default=None, max_length=19),
+        search: str | None = Query(default=None, max_length=128),
+    ):
+        return service.paper_sessions(name, limit=limit, cursor=cursor, search=search)
 
     @app.get("/api/paper/{name}/sessions/{session}")
     def session_report(name: str, session: str):
@@ -322,8 +343,12 @@ def create_app(
         return service.resume_fund(name)
 
     @app.get("/api/research")
-    def research():
-        return service.list_research()
+    def research(
+        limit: int = Query(default=50, ge=1, le=100),
+        cursor: str | None = Query(default=None, max_length=186),
+        search: str | None = Query(default=None, max_length=128),
+    ):
+        return service.list_research(limit=limit, cursor=cursor, search=search)
 
     @app.get("/api/research/{report_id}")
     def research_report(report_id: str):

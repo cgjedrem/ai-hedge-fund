@@ -26,6 +26,11 @@ class MandateCreateRequest(RequestModel):
     spec: dict[str, Any]
 
 
+class MandateRevisionRequest(RequestModel):
+    expected_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    spec: dict[str, Any]
+
+
 class DeployRequest(RequestModel):
     universe: list[str] = Field(min_length=1, max_length=25)
 
