@@ -3,14 +3,15 @@
 # network, so `localhost` inside the container IS the host — Ollama at
 # localhost:11434 needs no extra wiring, and no ports are published.
 #
-#   runner:   docker compose -f docker-compose.yml -f docker-compose.linux.yml up -d runner
+#   Set AIHF_DATA_ROOT to an existing absolute root before Compose commands.
+#   Runner:   docker compose -f docker-compose.yml -f docker-compose.linux.yml --profile runner run --rm runner
 #   TUI:      docker compose -f docker-compose.yml -f docker-compose.linux.yml run --rm tui
 #   Web desk: docker compose -f docker-compose.yml -f docker-compose.linux.yml --profile web up -d web
-#             (still published only on 127.0.0.1:8765)
+#             (still published only on 127.0.0.1:8876)
 #   Web TUI:  docker compose -f docker-compose.yml -f docker-compose.linux.yml up -d tui-web
-#             (serves the TUI on 127.0.0.1:7681)
+#             (serves the TUI on local loopback port 7681)
 #
-# See the README's "Home server (Linux + Tailscale)" section.
+# See the README's Linux deployment section.
 
 services:
   runner:
@@ -28,8 +29,7 @@ services:
     environment:
       - OLLAMA_BASE_URL=http://127.0.0.1:11434
 
-  # Browser TUI: the full app in a browser tab, bound to loopback so only
-  # Tailscale (or an SSH tunnel) can reach it.
+  # Browser TUI: legacy app bound to local loopback.
   tui-web:
     profiles: ["tui-web"]
     build: .
@@ -38,7 +38,11 @@ services:
     network_mode: host
     environment:
       - OLLAMA_BASE_URL=http://127.0.0.1:11434
-    entrypoint: ["ttyd", "-W", "-b", "127.0.0.1", "-p", "7681", "aihf"]
+    volumes:
+      - type: bind
+        source: "${AIHF_DATA_ROOT:?Set AIHF_DATA_ROOT to an existing absolute data root}"
+        target: /data
+    entrypoint: ["ttyd", "-W", "-b", "127.0.0.1", "-p", "7681", "aihf", "--root", "/data"]
 
   web:
     extra_hosts:

@@ -12,6 +12,8 @@ from pydantic import (
     field_validator,
     model_validator,
     SecretStr,
+    StrictFloat,
+    StrictInt,
 )
 
 
@@ -40,6 +42,10 @@ class ApprovalRequest(RequestModel):
     verdict: Literal["approve", "reject"]
     decision_as_of: str = Field(min_length=1, max_length=32)
     source_record_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class ValuationRefreshRequest(RequestModel):
+    expected_head: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
 
 
 class HaltRequest(RequestModel):
@@ -82,13 +88,47 @@ class BacktestRequest(RequestModel):
         return self
 
 
+class OperationPreviewRequest(RequestModel):
+    action: Literal["backtest"]
+    subject_id: str = Field(min_length=1, max_length=64)
+    expected_head: str = Field(pattern=r"^[0-9a-f]{64}$")
+    payload: BacktestRequest
+
+
+class OperationAcceptRequest(RequestModel):
+    request_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+    action: Literal["backtest"]
+    subject_id: str = Field(min_length=1, max_length=64)
+    preview_id: str = Field(pattern=r"^[a-f0-9]{32}$")
+    preview_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+    confirmation_token: str = Field(min_length=32, max_length=512)
+    expected_head: str = Field(pattern=r"^[0-9a-f]{64}$")
+    due_set: list[str] = Field(default_factory=list, max_length=10000)
+    payload: BacktestRequest
+
+
+class OperationCancelRequest(RequestModel):
+    request_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+
+
 class ModelRequest(RequestModel):
     model: str = Field(min_length=1, max_length=120)
+    expected_version: int = Field(ge=0, le=2**31 - 1)
+
+
+class RuntimeSettingsRequest(RequestModel):
+    data_provider: Literal["fd", "yfinance"]
+    model: str = Field(min_length=1, max_length=256)
+    endpoint: str | None = Field(default=None, max_length=2048)
+    timeout_seconds: float = Field(strict=True, gt=0, le=300)
+    parameters: dict[str, StrictInt | StrictFloat] = Field(default_factory=dict)
+    expected_version: StrictInt = Field(ge=0, le=2**31 - 1)
 
 
 class CredentialRequest(RequestModel):
     provider: str = Field(min_length=1, max_length=32)
     value: SecretStr = Field(min_length=1, max_length=4096)
+    expected_version: int = Field(ge=0, le=2**31 - 1)
 
 
 class CapabilitiesResponse(BaseModel):
@@ -96,6 +136,10 @@ class CapabilitiesResponse(BaseModel):
     read_only: bool
     writes: bool
     network: bool
+    local_operator_only: bool
+    csrf_authenticates_users: Literal[False]
+    container_observer: bool
+    write_unavailable_reason: str | None
     protected_names: list[str]
     mutation_token: str | None
     deferred_actions: dict[str, str]

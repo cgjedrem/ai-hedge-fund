@@ -2,14 +2,27 @@ import hashlib
 import json
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
-from threading import Barrier, Event
+from threading import Barrier, current_thread, Event
 
 import pytest
 
-from hedge_fund.runtime.admission import AdmissionCoordinator, OwnershipState
+from hedge_fund.runtime.admission import AdmissionCoordinator, RootOwnerLease
 from hedge_fund.runtime.capture import freeze_capture
 from hedge_fund.runtime.configuration import resolve_settings
-from hedge_fund.runtime.operations import ConfirmationExpired, ConfirmationRejected, OperationConflict, OperationError, OperationStartUncertain, OperationStatus, OperationStore, StalePreview, WorkerFenced
+from hedge_fund.runtime.operations import (
+    CAPTURE_ROOT,
+    ConfirmationExpired,
+    ConfirmationRejected,
+    INDEX_PATH,
+    OperationConflict,
+    OperationError,
+    OPERATIONS_ROOT,
+    OperationStartUncertain,
+    OperationStatus,
+    OperationStore,
+    StalePreview,
+    WorkerFenced,
+)
 from hedge_fund.runtime.root import RootContext
 
 _NOW = datetime(2026, 10, 31, 12, 0, tzinfo=timezone.utc)
@@ -20,17 +33,18 @@ def root_context(tmp_path):
     root = tmp_path / "root"
     root.mkdir()
     with RootContext.open(root) as context:
+        context.prepare_private_storage()
         yield context
 
 
 @pytest.fixture
 def operation_store(root_context):
-    admission = AdmissionCoordinator(root_context, ownership=OwnershipState.VERIFIED)
-    return OperationStore(
-        root_context,
-        admission=admission,
-        private_storage_verified=True,
-    )
+    owner_lease = RootOwnerLease.acquire(root_context)
+    admission = AdmissionCoordinator(root_context, owner_lease=owner_lease)
+    try:
+        yield OperationStore(root_context, admission=admission)
+    finally:
+        owner_lease.close()
 
 
 @pytest.fixture
@@ -80,6 +94,7 @@ def _accept(
     due_set=None,
     now=_NOW,
     start_worker=None,
+    current_state_resolver=None,
 ):
     return store.accept_request(
         request_id=request_id,
@@ -94,6 +109,7 @@ def _accept(
         payload=preview.payload if payload is None else payload,
         now=now,
         start_worker=start_worker,
+        current_state_resolver=current_state_resolver,
     )
 
 
@@ -133,11 +149,11 @@ def test_operation_observation_does_not_create_or_change_sidecars(
 ):
     operation = _accept(operation_store, _preview(operation_store, frozen_capture))
     runtime = root_context.path / "runtime"
-    before = {path.relative_to(root_context.path).as_posix(): path.read_bytes() for path in runtime.rglob("*") if path.is_file()}
+    before = {path.relative_to(root_context.path).as_posix(): path.read_bytes() for path in runtime.rglob("*") if path.is_file() and path.suffix != ".lock"}
 
     observed = operation_store.get_operation(operation.operation_id)
 
-    after = {path.relative_to(root_context.path).as_posix(): path.read_bytes() for path in runtime.rglob("*") if path.is_file()}
+    after = {path.relative_to(root_context.path).as_posix(): path.read_bytes() for path in runtime.rglob("*") if path.is_file() and path.suffix != ".lock"}
     assert observed.operation_id == operation.operation_id
     assert after == before
 
@@ -150,8 +166,7 @@ def test_operation_observation_remains_available_when_writer_owner_is_unknown(
     operation = _accept(operation_store, _preview(operation_store, frozen_capture))
     observer = OperationStore(
         root_context,
-        admission=AdmissionCoordinator(root_context, ownership=OwnershipState.UNKNOWN),
-        private_storage_verified=True,
+        admission=AdmissionCoordinator(root_context),
     )
 
     observed = observer.get_operation(operation.operation_id)
@@ -160,17 +175,34 @@ def test_operation_observation_remains_available_when_writer_owner_is_unknown(
     assert observed.status is OperationStatus.ACCEPTED
 
 
-def test_preview_token_is_not_persisted_and_private_storage_defaults_denied(root_context, frozen_capture):
-    admission = AdmissionCoordinator(root_context, ownership=OwnershipState.VERIFIED)
-    denied_store = OperationStore(root_context, admission=admission)
+def test_missing_index_reports_missing_operation_without_creating_lock_state(
+    operation_store,
+    root_context,
+):
+    with pytest.raises(OperationError, match="operation record was not found"):
+        operation_store.get_operation("0" * 32)
+
+    assert not root_context.resolve(INDEX_PATH).exists()
+    assert not root_context.resolve("runtime/admission/v1/registry.lock").exists()
+
+
+def test_preview_token_is_not_persisted_and_private_storage_defaults_denied(
+    operation_store,
+    root_context,
+    frozen_capture,
+):
+    denied_store = OperationStore(
+        root_context,
+        admission=AdmissionCoordinator(root_context),
+    )
 
     with pytest.raises(OperationError):
         _preview(denied_store, frozen_capture)
-    assert not root_context.resolve("runtime/operations").exists()
+    assert not root_context.resolve(OPERATIONS_ROOT).exists()
 
-    preview = _preview(operation_store_for(root_context, admission), frozen_capture)
-    index = root_context.read_bytes("runtime/operations/index.json")
-    preview_record = root_context.read_bytes(f"runtime/operations/previews/{preview.preview_id}.json")
+    preview = _preview(operation_store_for(root_context, operation_store._admission), frozen_capture)
+    index = root_context.read_bytes(INDEX_PATH)
+    preview_record = root_context.read_bytes(f"{OPERATIONS_ROOT}/previews/{preview.preview_id}.json")
 
     assert preview.confirmation_token.encode("utf-8") not in index
     assert preview.confirmation_token.encode("utf-8") not in preview_record
@@ -432,7 +464,7 @@ def test_corrupt_cancel_sidecar_fails_idempotent_replay(operation_store, frozen_
         request_id="cancel-1",
         now=_NOW + timedelta(seconds=1),
     )
-    relative = f"runtime/operations/cancellations/{hashlib.sha256(b'cancel-1').hexdigest()}.json"
+    relative = f"{OPERATIONS_ROOT}/cancellations/{hashlib.sha256(b'cancel-1').hexdigest()}.json"
     root_context.write_bytes(relative, b"{}")
 
     with pytest.raises(OperationError):
@@ -463,7 +495,7 @@ def test_completed_result_is_durable_and_worker_effects_are_fenced(operation_sto
     assert completed.status is OperationStatus.COMPLETED
     assert completed.progress == 100
     assert completed.public_view()["result"] == {"sessions": 1, "summary": "synthetic"}
-    assert root_context.read_bytes(f"runtime/operations/results/{operation.operation_id}.json")
+    assert root_context.read_bytes(f"{OPERATIONS_ROOT}/results/{operation.operation_id}.json")
     with pytest.raises(WorkerFenced):
         operation_store.apply_if_current(
             operation.operation_id,
@@ -556,6 +588,312 @@ def test_status_read_waits_for_atomic_sidecar_snapshot(operation_store, frozen_c
     assert observed.progress == 40
 
 
+@pytest.mark.parametrize("lookup", ["get_by_request", "list_operations"])
+def test_operation_indexes_wait_for_committed_snapshot(
+    operation_store,
+    frozen_capture,
+    lookup,
+    monkeypatch,
+):
+    preview = _preview(operation_store, frozen_capture)
+    sidecars_written = Event()
+    read_lock_attempted = Event()
+    allow_index_commit = Event()
+    write_index = operation_store._write_index
+    registry_read_lock = operation_store._admission.registry_read_lock
+
+    def pause_before_index(index):
+        if index["operations"]:
+            sidecars_written.set()
+            assert allow_index_commit.wait(timeout=5)
+        write_index(index)
+
+    def observe_read_lock(*, timeout=0.0):
+        if current_thread().name.startswith("operation-reader"):
+            read_lock_attempted.set()
+        return registry_read_lock(timeout=timeout)
+
+    monkeypatch.setattr(operation_store, "_write_index", pause_before_index)
+    monkeypatch.setattr(
+        operation_store._admission,
+        "registry_read_lock",
+        observe_read_lock,
+    )
+
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="operation-reader") as pool:
+        writer = pool.submit(_accept, operation_store, preview)
+        assert sidecars_written.wait(timeout=5)
+        if lookup == "get_by_request":
+            reader = pool.submit(operation_store.get_by_request, "request-1")
+        else:
+            reader = pool.submit(operation_store.list_operations)
+        try:
+            assert read_lock_attempted.wait(timeout=5)
+            assert not reader.done()
+        finally:
+            allow_index_commit.set()
+        accepted = writer.result(timeout=5)
+        observed = reader.result(timeout=5)
+
+    if lookup == "get_by_request":
+        assert observed.operation_id == accepted.operation_id
+    else:
+        assert [operation.operation_id for operation in observed] == [accepted.operation_id]
+
+
+def test_index_entry_limit_rejects_before_writing_sidecars(
+    operation_store,
+    frozen_capture,
+    root_context,
+    monkeypatch,
+):
+    import hedge_fund.runtime.operations as operations_module
+
+    monkeypatch.setattr(operations_module, "_MAX_INDEX_ENTRIES", 1, raising=False)
+    _preview(operation_store, frozen_capture)
+    runtime = root_context.path / "runtime"
+    before = {path.relative_to(root_context.path).as_posix(): path.read_bytes() for path in runtime.rglob("*") if path.is_file() and path.suffix != ".lock"}
+
+    with pytest.raises(OperationError):
+        _preview(operation_store, frozen_capture)
+
+    after = {path.relative_to(root_context.path).as_posix(): path.read_bytes() for path in runtime.rglob("*") if path.is_file() and path.suffix != ".lock"}
+    assert after == before
+
+
+def test_torn_terminal_transition_recovers_without_resuming_worker(
+    operation_store,
+    frozen_capture,
+    root_context,
+    monkeypatch,
+):
+    operation = _accept(operation_store, _preview(operation_store, frozen_capture))
+    fence = operation_store.claim_worker(
+        operation.operation_id,
+        worker_id="synthetic-worker",
+        now=_NOW,
+    )
+    operation_store.mark_running(operation.operation_id, fence, now=_NOW)
+    write_bytes = root_context.write_bytes
+
+    def fail_terminal_index(relative, payload, *, mode=0o600):
+        if relative == INDEX_PATH:
+            index = json.loads(payload.decode("utf-8"))
+            if index["operations"][operation.operation_id]["status"] == "completed":
+                raise OSError(5, "synthetic index replacement fault")
+        return write_bytes(relative, payload, mode=mode)
+
+    monkeypatch.setattr(root_context, "write_bytes", fail_terminal_index)
+    with pytest.raises(OperationError) as error:
+        operation_store.complete(
+            operation.operation_id,
+            fence,
+            result={"sessions": 1},
+            now=_NOW + timedelta(seconds=1),
+        )
+    assert isinstance(error.value.__cause__, OSError)
+
+    monkeypatch.setattr(root_context, "write_bytes", write_bytes)
+    recovered = operation_store.recover_unfinished(now=_NOW + timedelta(seconds=2))
+
+    assert len(recovered) == 1
+    assert recovered[0].status is OperationStatus.INTERRUPTED
+    assert operation_store.get_operation(operation.operation_id).status is OperationStatus.INTERRUPTED
+
+
+def test_torn_completed_sidecar_is_repaired_without_replaying_effect(
+    operation_store,
+    frozen_capture,
+    root_context,
+    monkeypatch,
+    caplog,
+):
+    operation = _accept(operation_store, _preview(operation_store, frozen_capture))
+    fence = operation_store.claim_worker(
+        operation.operation_id,
+        worker_id="synthetic-worker",
+        now=_NOW,
+    )
+    operation_store.mark_running(operation.operation_id, fence, now=_NOW)
+    original_write = root_context.write_bytes
+    failure = OSError(5, "synthetic result-sidecar fault")
+    failure_used = False
+    effects = []
+    report_path = operation_store.apply_if_current(
+        operation.operation_id,
+        fence,
+        lambda: effects.append("report-written") or "synthetic.json",
+    )
+    assert report_path == "synthetic.json"
+
+    def fail_result_sidecar(relative, payload, *, mode=0o600):
+        nonlocal failure_used
+        if relative == f"{OPERATIONS_ROOT}/results/{operation.operation_id}.json":
+            if not failure_used:
+                failure_used = True
+                raise failure
+        return original_write(relative, payload, mode=mode)
+
+    monkeypatch.setattr(root_context, "write_bytes", fail_result_sidecar)
+    caplog.set_level("WARNING", logger="hedge_fund.runtime.operations")
+    completed = operation_store.complete(
+        operation.operation_id,
+        fence,
+        result={"report_id": "synthetic.json"},
+        now=_NOW + timedelta(seconds=1),
+    )
+
+    assert completed.status is OperationStatus.COMPLETED
+    assert "write_type=OSError errno=5 winerror=None" in caplog.text
+    assert "synthetic result-sidecar fault" not in caplog.text
+    assert f"{OPERATIONS_ROOT}/results/" not in caplog.text
+    assert operation_store._read_index()["operations"][operation.operation_id]["status"] == "completed"
+    assert operation_store.get_operation(operation.operation_id).status is OperationStatus.COMPLETED
+
+    recovered = operation_store.recover_unfinished(now=_NOW + timedelta(seconds=2))
+
+    assert recovered == ()
+    assert operation_store.get_operation(operation.operation_id).status is OperationStatus.COMPLETED
+    assert effects == ["report-written"]
+    with pytest.raises(WorkerFenced):
+        operation_store.apply_if_current(
+            operation.operation_id,
+            fence,
+            lambda: effects.append("duplicate-report"),
+        )
+    assert effects == ["report-written"]
+
+
+def test_torn_preview_sidecar_is_repaired_from_committed_index(
+    operation_store,
+    frozen_capture,
+    root_context,
+    monkeypatch,
+):
+    original_write = root_context.write_bytes
+    failure = OSError(5, "synthetic preview-sidecar fault")
+    failure_used = False
+
+    def fail_preview_sidecar(relative, payload, *, mode=0o600):
+        nonlocal failure_used
+        if relative.startswith(f"{OPERATIONS_ROOT}/previews/") and not failure_used:
+            failure_used = True
+            raise failure
+        return original_write(relative, payload, mode=mode)
+
+    monkeypatch.setattr(root_context, "write_bytes", fail_preview_sidecar)
+    preview = _preview(operation_store, frozen_capture)
+
+    stored = operation_store._read_index()["previews"][preview.preview_id]
+    operation_store._verify_preview_sidecar(stored)
+    assert stored["state"] == "issued"
+    assert preview.confirmation_token
+
+
+def test_torn_acceptance_sidecar_repairs_before_starting_worker(
+    operation_store,
+    frozen_capture,
+    root_context,
+    monkeypatch,
+):
+    preview = _preview(operation_store, frozen_capture)
+    original_write = root_context.write_bytes
+    failure = OSError(5, "synthetic acceptance-sidecar fault")
+    failure_used = False
+    started = []
+
+    def fail_result_sidecar(relative, payload, *, mode=0o600):
+        nonlocal failure_used
+        if relative.startswith(f"{OPERATIONS_ROOT}/results/") and not failure_used:
+            failure_used = True
+            raise failure
+        return original_write(relative, payload, mode=mode)
+
+    monkeypatch.setattr(root_context, "write_bytes", fail_result_sidecar)
+    operation = _accept(
+        operation_store,
+        preview,
+        request_id="request-sidecar-fault",
+        start_worker=lambda accepted: started.append(accepted.operation_id),
+    )
+    replay = _accept(
+        operation_store,
+        preview,
+        request_id="request-sidecar-fault",
+        start_worker=lambda accepted: started.append(accepted.operation_id),
+    )
+
+    assert operation.status is OperationStatus.ACCEPTED
+    assert operation_store.get_operation(operation.operation_id).status is OperationStatus.ACCEPTED
+    assert replay.operation_id == operation.operation_id
+    assert started == [operation.operation_id]
+
+
+def test_torn_cancellation_sidecar_repairs_idempotent_replay(
+    operation_store,
+    frozen_capture,
+    root_context,
+    monkeypatch,
+):
+    operation = _accept(operation_store, _preview(operation_store, frozen_capture))
+    request_id = "cancel-sidecar-fault"
+    cancellation_path = f"{OPERATIONS_ROOT}/cancellations/" f"{hashlib.sha256(request_id.encode('utf-8')).hexdigest()}.json"
+    original_write = root_context.write_bytes
+    failure = OSError(5, "synthetic cancellation-sidecar fault")
+    failure_used = False
+
+    def fail_cancellation_sidecar(relative, payload, *, mode=0o600):
+        nonlocal failure_used
+        if relative == cancellation_path and not failure_used:
+            failure_used = True
+            raise failure
+        return original_write(relative, payload, mode=mode)
+
+    monkeypatch.setattr(root_context, "write_bytes", fail_cancellation_sidecar)
+    cancelled = operation_store.request_cancel(
+        operation.operation_id,
+        request_id=request_id,
+        now=_NOW + timedelta(seconds=1),
+    )
+    replay = operation_store.request_cancel(
+        operation.operation_id,
+        request_id=request_id,
+        now=_NOW + timedelta(seconds=2),
+    )
+
+    assert cancelled.status is OperationStatus.CANCEL_REQUESTED
+    assert replay.status is OperationStatus.CANCEL_REQUESTED
+    assert operation_store.get_operation(operation.operation_id).status is OperationStatus.CANCEL_REQUESTED
+
+
+def test_accept_revalidates_current_head_and_due_set_under_subject_lease(
+    operation_store,
+    frozen_capture,
+):
+    preview = _preview(operation_store, frozen_capture)
+    resolver_calls = []
+
+    def resolve_current_state():
+        resolver_calls.append("called")
+        lease_held = True
+        try:
+            with operation_store._admission.execution_lease("alpha", timeout=0):
+                lease_held = False
+        except Exception:
+            pass
+        assert lease_held
+        return "head-2", preview.due_set
+
+    with pytest.raises(StalePreview):
+        _accept(
+            operation_store,
+            preview,
+            current_state_resolver=resolve_current_state,
+        )
+
+    assert resolver_calls == ["called"]
+
+
 def test_failure_result_contains_only_a_validated_error_code(operation_store, frozen_capture):
     operation = _accept(operation_store, _preview(operation_store, frozen_capture))
     fence = operation_store.claim_worker(
@@ -592,12 +930,12 @@ def test_preview_payload_rejects_secret_field_aliases(operation_store, frozen_ca
             payload={"mode": "manual", secret_field: "synthetic-not-a-secret"},
         )
 
-    assert not root_context.resolve("runtime/operations").exists()
+    assert not root_context.resolve(OPERATIONS_ROOT).exists()
 
 
 def test_corrupt_operation_sidecar_fails_closed(operation_store, frozen_capture, root_context):
     operation = _accept(operation_store, _preview(operation_store, frozen_capture))
-    state_path = f"runtime/operations/state/{operation.operation_id}.json"
+    state_path = f"{OPERATIONS_ROOT}/state/{operation.operation_id}.json"
     root_context.write_bytes(state_path, b'{"schema":1,"status":"completed"}')
 
     with pytest.raises(OperationError):
@@ -606,10 +944,10 @@ def test_corrupt_operation_sidecar_fails_closed(operation_store, frozen_capture,
 
 def test_corrupt_index_cross_reference_fails_closed(operation_store, frozen_capture, root_context):
     operation = _accept(operation_store, _preview(operation_store, frozen_capture))
-    index = json.loads(root_context.read_bytes("runtime/operations/index.json"))
+    index = json.loads(root_context.read_bytes(INDEX_PATH))
     index["requests"]["request-1"]["operation_id"] = "0" * 32
     root_context.write_bytes(
-        "runtime/operations/index.json",
+        INDEX_PATH,
         json.dumps(index, sort_keys=True, separators=(",", ":")).encode("utf-8"),
     )
 
@@ -619,7 +957,7 @@ def test_corrupt_index_cross_reference_fails_closed(operation_store, frozen_capt
 
 def test_restart_reconciles_torn_state_sidecar_without_resuming_worker(operation_store, frozen_capture, root_context):
     operation = _accept(operation_store, _preview(operation_store, frozen_capture))
-    state_path = f"runtime/operations/state/{operation.operation_id}.json"
+    state_path = f"{OPERATIONS_ROOT}/state/{operation.operation_id}.json"
     root_context.write_bytes(state_path, b'{"schema":1,"status":"running"}')
 
     with pytest.raises(OperationError):
@@ -634,7 +972,7 @@ def test_restart_reconciles_torn_state_sidecar_without_resuming_worker(operation
 
 def test_corrupt_capture_sidecar_denies_confirmation(operation_store, frozen_capture, root_context):
     preview = _preview(operation_store, frozen_capture)
-    root_context.write_bytes(f"runtime/captures/{frozen_capture.capture_id}.json", b"{}")
+    root_context.write_bytes(f"{CAPTURE_ROOT}/{frozen_capture.capture_id}.json", b"{}")
 
     with pytest.raises(OperationError):
         _accept(operation_store, preview)
@@ -642,8 +980,4 @@ def test_corrupt_capture_sidecar_denies_confirmation(operation_store, frozen_cap
 
 
 def operation_store_for(root_context, admission):
-    return OperationStore(
-        root_context,
-        admission=admission,
-        private_storage_verified=True,
-    )
+    return OperationStore(root_context, admission=admission)

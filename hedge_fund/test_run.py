@@ -76,6 +76,64 @@ def _main(monkeypatch, *argv):
     run.main()
 
 
+def test_cli_requires_explicit_root(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["aihf"])
+
+    with pytest.raises(SystemExit) as missing:
+        run.main()
+
+    assert missing.value.code == 2
+    assert "--root" in capsys.readouterr().err
+
+
+def test_documented_cli_examples_include_explicit_root():
+    commands = [
+        line.strip()
+        for line in (run.__doc__ or "").splitlines()
+        if line.strip().startswith("aihf ")
+    ]
+
+    assert commands
+    assert all(command.startswith("aihf --root ") for command in commands)
+
+
+def test_supported_container_launchers_pass_explicit_root():
+    repository = Path(__file__).resolve().parents[1]
+    compose = yaml.safe_load((repository / "docker-compose.yml").read_text(encoding="utf-8"))
+    linux_compose = yaml.safe_load(
+        (repository / "docker-compose.linux.yml").read_text(encoding="utf-8")
+    )
+
+    dockerfile = (repository / "Dockerfile").read_text(encoding="utf-8")
+    web_dockerfile = (repository / "Dockerfile.web").read_text(encoding="utf-8")
+    assert 'ENTRYPOINT ["aihf", "--root", "/data"]' in dockerfile
+    assert 'ENTRYPOINT ["aihf-web", "--root", "/data"]' in web_dockerfile
+    assert 'CMD ["--port", "8876", "--container-bind"]' in web_dockerfile
+    for service_name in ("runner", "runner-weekly", "tui"):
+        service = compose["services"][service_name]
+        assert service["entrypoint"] == ["aihf", "--root", "/data"]
+        assert "--root" not in service.get("command", [])
+    web_service = compose["services"]["web"]
+    assert web_service["entrypoint"] == ["aihf-web", "--root", "/data"]
+    assert web_service["command"] == ["--port", "8876", "--container-bind"]
+    assert web_service["ports"] == ["127.0.0.1:8876:8876"]
+    assert "--root" in linux_compose["services"]["tui-web"]["entrypoint"]
+    assert "/data" in linux_compose["services"]["tui-web"]["entrypoint"]
+
+
+def test_makefile_write_targets_require_caller_selected_absolute_root():
+    repository = Path(__file__).resolve().parents[1]
+    makefile = (repository / "Makefile").read_text(encoding="utf-8")
+
+    assert "AIHF_ROOT ?=\n" in makefile
+    assert "AIHF_ROOT ?= $(HOME)" not in makefile
+    assert "dev: require-root" in makefile
+    assert "web-local: require-root" in makefile
+    assert "os.path.isabs(sys.argv[1])" in makefile
+    assert "poetry run aihf --root '$(AIHF_ROOT)'" in makefile
+    assert 'poetry run aihf-web --root "$(AIHF_ROOT)"' in makefile
+
+
 @pytest.mark.parametrize("command", ["backtest", "create"])
 @pytest.mark.parametrize("unversioned", [False, True])
 def test_cli_rejects_invalid_configuration_before_clients(tmp_path, monkeypatch, capsys, command, unversioned):
@@ -403,7 +461,9 @@ def test_paper_minute_fund_ticks_and_runs_like_a_daily_one(tmp_path, monkeypatch
     _main(monkeypatch, "paper", "create", "fast", "--mandate", str(path), "--universe", "AAPL")
     err = " ".join(capsys.readouterr().err.split())  # the console wraps; read it as one line
     assert "every 30s" in err and "09:30–12:00 ET" in err
-    assert "aihf paper tick fast` to run one session" in err and "aihf paper run fast` to leave it running" in err
+    root_argument = "--root <selected-root>"
+    assert f"aihf {root_argument} paper tick fast` to run one session" in err
+    assert f"aihf {root_argument} paper run fast` to leave it running" in err
 
     class CliTape(Tape):
         def __enter__(self):

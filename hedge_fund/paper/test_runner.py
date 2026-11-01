@@ -3,7 +3,6 @@ canned prints; and tick on a bar, the same session by hand."""
 
 import os
 import signal
-import subprocess
 import sys
 import threading
 from contextlib import contextmanager
@@ -294,6 +293,7 @@ def test_redo_runs_a_bar_again_at_the_prices_it_saw(tmp_path):
 
     flipped = redo(directory, tape, build_fund=bearish)
     assert flipped.decision.final_weights == {"AAPL": -1.0} and flipped.hash != again.hash
+    assert len(list((directory / "ledger" / "superseded").glob("*.json"))) == 2
 
 
 def test_tick_runs_the_current_bar_by_hand_at_the_print_taken_now(tmp_path):
@@ -363,7 +363,9 @@ def test_a_daily_fund_is_run_unattended_too_catching_up_after_each_midnight(tmp_
     assert loop.events == [] and Ledger(directory).sessions() == ["2024-06-03", "2024-06-04", "2024-06-05", "2024-06-06"]
 
 
-def test_serve_holds_a_pid_file_and_stops_on_sigterm(tmp_path, monkeypatch):
+def test_serve_holds_a_pid_file_and_stops_on_sigterm(
+    tmp_path, monkeypatch, owned_test_process
+):
     directory = deploy("bars", _spec(), ["AAPL"], root=tmp_path)
     assert not is_running(directory) and not stop_runner(directory)
     (directory / PID_FILE).write_text("999999999")
@@ -379,7 +381,7 @@ def test_serve_holds_a_pid_file_and_stops_on_sigterm(tmp_path, monkeypatch):
         if os.name == "nt":
             # os.kill(self, SIGTERM) is TerminateProcess on Windows: no handler
             # runs, so simulate the signal handler's effect directly.
-            threading.Timer(0.05, stop.set).start()
+            stop.set()
         else:
             threading.Timer(0.05, lambda: os.kill(os.getpid(), signal.SIGTERM)).start()
         seen["stopped"] = stop.wait(5)
@@ -393,13 +395,58 @@ def test_serve_holds_a_pid_file_and_stops_on_sigterm(tmp_path, monkeypatch):
     # The pid must name a live process other than this one; a file naming
     # this process is a stale incarnation (pid reuse across container
     # restarts) and must not block a start.
-    sleeper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
-    try:
-        (directory / PID_FILE).write_text(str(sleeper.pid))
-        with pytest.raises(RuntimeError, match="already running"):
-            serve(directory, _tape(_at(DAY, "12:59:00")))
-        (directory / PID_FILE).write_text(str(os.getpid()))
+    sleeper = owned_test_process("import time; time.sleep(30)")
+    (directory / PID_FILE).write_text(str(sleeper.pid))
+    with pytest.raises(RuntimeError, match="already running"):
         serve(directory, _tape(_at(DAY, "12:59:00")))
-    finally:
-        sleeper.kill()
-        sleeper.wait()
+    assert sleeper.poll() is None
+    (directory / PID_FILE).write_text(str(os.getpid()))
+    serve(directory, _tape(_at(DAY, "12:59:00")))
+
+
+def test_spawn_runner_passes_explicit_root_to_cli_child(tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    directory = root / "paper" / "demo-alpha"
+    directory.mkdir(parents=True)
+    observed = {}
+
+    class Child:
+        pid = 4321
+
+    def fake_popen(command, **kwargs):
+        observed["command"] = command
+        observed["kwargs"] = kwargs
+        return Child()
+
+    monkeypatch.setattr(runner_module.subprocess, "Popen", fake_popen)
+
+    process_id = runner_module.spawn_runner(directory, root=root)
+
+    assert process_id == 4321
+    assert observed["command"] == [
+        sys.executable,
+        "-m",
+        "hedge_fund.run",
+        "--root",
+        str(root),
+        "paper",
+        "run",
+        "demo-alpha",
+    ]
+    assert observed["kwargs"]["cwd"] == str(directory)
+
+
+def test_spawn_runner_rejects_root_mismatch_before_launch(tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    directory = root / "paper" / "demo-alpha"
+    directory.mkdir(parents=True)
+
+    def forbidden_launch(*_args, **_kwargs):
+        raise AssertionError("mismatched runner root reached process launch")
+
+    monkeypatch.setattr(runner_module.subprocess, "Popen", forbidden_launch)
+
+    with pytest.raises(ValueError, match="outside the configured root"):
+        runner_module.spawn_runner(directory, root=tmp_path / "other")
+
+    assert not (directory / "runner.log").exists()

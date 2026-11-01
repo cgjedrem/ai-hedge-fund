@@ -22,6 +22,7 @@ from collections.abc import Callable
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from typing import Protocol, runtime_checkable
+from urllib.parse import urlsplit
 
 import requests
 
@@ -243,18 +244,64 @@ def make_llm(
     max_tokens: int = 4096,
     on_token: TokenListener = None,
     temperature: float | None = None,
+    top_p: float | None = None,
+    context_size: int | None = None,
+    *,
+    api_key: str | None = None,
+    endpoint: str | None = None,
+    use_environment: bool = True,
 ) -> LLMClient:
-    """Build the client for a model id, routed by the registry's provider.
-
-    The id comes from the caller, else HEDGE_FUND_LLM_MODEL, else DEFAULT_MODEL — the
-    same seam the TUI's picker writes to. Raises with the name of the missing
-    environment variable, because that is the only thing the user can act on.
-
-    `temperature` (0 = deterministic, up to 2 = creative) is passed to chat
-    providers' constructors; None keeps each provider's default. TypeSafe's
-    typed judgments have no sampling, so it is ignored there.
-    """
-    model = model or os.environ.get("HEDGE_FUND_LLM_MODEL") or DEFAULT_MODEL
+    """Build selected client; explicit mode skips all provider environment reads."""
+    if type(use_environment) is not bool:
+        raise ValueError("environment policy is invalid")
+    if model is not None and (
+        not isinstance(model, str)
+        or not model
+        or model != model.strip()
+        or any(ord(char) < 32 or ord(char) == 127 for char in model)
+    ):
+        raise ValueError("model is invalid")
+    if temperature is not None and (
+        isinstance(temperature, bool)
+        or not isinstance(temperature, (int, float))
+        or not math.isfinite(temperature)
+        or not 0 <= temperature <= 2
+    ):
+        raise ValueError("temperature is invalid")
+    if top_p is not None and (
+        isinstance(top_p, bool)
+        or not isinstance(top_p, (int, float))
+        or not math.isfinite(top_p)
+        or not 0 <= top_p <= 1
+    ):
+        raise ValueError("top-p is invalid")
+    if context_size is not None and (
+        type(context_size) is not int or not 256 <= context_size <= 131072
+    ):
+        raise ValueError("context size is invalid")
+    if endpoint is not None:
+        if not isinstance(endpoint, str) or not endpoint or endpoint != endpoint.strip():
+            raise ValueError("endpoint is invalid")
+        try:
+            parts = urlsplit(endpoint)
+            port = parts.port
+        except ValueError:
+            raise ValueError("endpoint is invalid") from None
+        if (
+            parts.scheme not in {"http", "https"}
+            or not parts.hostname
+            or parts.username is not None
+            or parts.password is not None
+            or parts.query
+            or parts.fragment
+            or (port is not None and not 1 <= port <= 65535)
+        ):
+            raise ValueError("endpoint is invalid")
+    model = (
+        model
+        or (os.environ.get("HEDGE_FUND_LLM_MODEL") if use_environment else None)
+        or DEFAULT_MODEL
+    )
     provider = provider_for(model)
     if provider is None:
         # Unlisted ids still work: a model newer than the registry should not
@@ -265,13 +312,31 @@ def make_llm(
             f"No v2 client for {provider} (model {model}). "
             f"Supported: {', '.join(sorted(SUPPORTED_PROVIDERS))}."
         )
+    if context_size is not None and (
+        provider != "Ollama" or model.casefold().endswith(":cloud")
+    ):
+        raise ValueError("context size is supported only by local Ollama.")
 
-    api_key = _require_key(provider)
+    if api_key is None:
+        if provider in KEYLESS_PROVIDERS:
+            api_key = ""
+        elif use_environment:
+            api_key = _require_key(provider)
+        else:
+            raise ValueError("A persisted provider credential is required.")
+    elif (
+        not isinstance(api_key, str)
+        or (provider not in KEYLESS_PROVIDERS and not api_key.strip())
+        or any(ord(char) < 32 or ord(char) == 127 for char in api_key)
+    ):
+        raise ValueError("Provider credential is invalid.")
 
     # Only hand providers a temperature when one was asked for: several
     # constructors (Google's pydantic model among them) reject an explicit
     # None, and omitting it keeps each provider's own default.
-    temp = {"temperature": temperature} if temperature is not None else {}
+    sampling = {"temperature": temperature} if temperature is not None else {}
+    if top_p is not None:
+        sampling["top_p"] = top_p
 
     if provider == "TypeSafe":
         # Typed judgments have no generated tokens or output-token budget.
@@ -280,33 +345,40 @@ def make_llm(
     if provider == "Anthropic":
         from langchain_anthropic import ChatAnthropic
         chat = ChatAnthropic(model=model, api_key=api_key, timeout=timeout,
-                             max_retries=1, max_tokens=max_tokens, **temp)
+                             max_retries=1, max_tokens=max_tokens, **sampling)
     elif provider == "OpenAI":
         from langchain_openai import ChatOpenAI
         chat = ChatOpenAI(model=model, api_key=api_key, timeout=timeout,
-                          max_retries=1, base_url=os.getenv("OPENAI_API_BASE"),
-                          **temp)
+                          max_retries=1,
+                          max_tokens=max_tokens,
+                          base_url=endpoint or (
+                              os.getenv("OPENAI_API_BASE") if use_environment else None
+                          ),
+                          **sampling)
     elif provider == "DeepSeek":
         from langchain_deepseek import ChatDeepSeek
         chat = ChatDeepSeek(model=model, api_key=api_key, timeout=timeout,
-                            max_retries=1, **temp)
+                            max_retries=1, max_tokens=max_tokens, **sampling)
     elif provider == "Google":
         from langchain_google_genai import ChatGoogleGenerativeAI
         chat = ChatGoogleGenerativeAI(model=model, api_key=api_key,
-                                      timeout=timeout, max_retries=1, **temp)
+                                      timeout=timeout, max_retries=1,
+                                      max_output_tokens=max_tokens, **sampling)
     elif provider == "xAI":
         from langchain_xai import ChatXAI
         chat = ChatXAI(model=model, api_key=api_key, timeout=timeout,
-                       max_retries=1, **temp)
+                       max_retries=1, max_tokens=max_tokens, **sampling)
     elif provider == "Kimi":
         # Moonshot speaks the OpenAI wire format. Default to the international
         # host; mainland users override with MOONSHOT_BASE_URL (v1 does the same).
         from langchain_openai import ChatOpenAI
         chat = ChatOpenAI(
             model=model, api_key=api_key, timeout=timeout, max_retries=1,
-            base_url=(os.getenv("MOONSHOT_BASE_URL")
-                      or "https://api.moonshot.ai/v1"),
-            **temp)
+            max_tokens=max_tokens,
+            base_url=endpoint or (
+                os.getenv("MOONSHOT_BASE_URL") if use_environment else None
+            ) or "https://api.moonshot.ai/v1",
+            **sampling)
     elif provider == "Ollama":
         # Local (or self-hosted) Ollama — no API key. OLLAMA_BASE_URL points
         # at a non-default host. num_ctx is raised above Ollama's small
@@ -315,10 +387,23 @@ def make_llm(
         from langchain_ollama import ChatOllama
         chat = ChatOllama(
             model=model,
-            base_url=os.getenv("OLLAMA_BASE_URL") or "http://localhost:11434",
-            num_ctx=int(os.getenv("OLLAMA_NUM_CTX") or 8192),
-            client_kwargs={"timeout": float(os.getenv("OLLAMA_TIMEOUT") or timeout)},
-            **temp,
+            base_url=endpoint or (
+                os.getenv("OLLAMA_BASE_URL") if use_environment else None
+            ) or "http://localhost:11434",
+            num_ctx=(
+                context_size
+                if context_size is not None
+                else int(os.getenv("OLLAMA_NUM_CTX") or 8192)
+                if use_environment
+                else 8192
+            ),
+            num_predict=max_tokens,
+            client_kwargs={
+                "timeout": float(os.getenv("OLLAMA_TIMEOUT") or timeout)
+                if use_environment
+                else timeout
+            },
+            **sampling,
         )
     else:  # pragma: no cover - SUPPORTED_PROVIDERS is checked above
         raise ValueError(f"Unhandled provider {provider}")

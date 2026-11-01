@@ -8,15 +8,16 @@ import hashlib
 import math
 import os
 import sys
+import threading
 import time
 from contextlib import contextmanager, ExitStack
-from enum import Enum
 from typing import Iterator
 
-from hedge_fund.runtime.root import ensure_unique_resource_name, RootContext, RootPathError, UnsupportedFilesystemError
+from hedge_fund.runtime.root import PRIVATE_ROOT, ensure_unique_resource_name, RootContext, RootPathError, UnsupportedFilesystemError
 
 PROTOCOL_VERSION = 1
-LOCK_DIRECTORY = f"runtime/admission/v{PROTOCOL_VERSION}"
+LOCK_DIRECTORY = f"{PRIVATE_ROOT}/admission/v{PROTOCOL_VERSION}"
+OWNER_LOCK_PATH = f"{LOCK_DIRECTORY}/owner.lock"
 MAX_LOCK_WAIT_SECONDS = 5.0
 MAX_CONTROL_WAIT_SECONDS = 0.5
 _LOCK_POLL_SECONDS = 0.01
@@ -34,12 +35,6 @@ class WriterConflict(AdmissionError):
     """Another writer owns the requested lane."""
 
 
-class OwnershipState(str, Enum):
-    VERIFIED = "verified"
-    UNKNOWN = "unknown"
-    LEGACY = "legacy"
-
-
 class _Overlapped(ctypes.Structure):
     _fields_ = [
         ("internal", ctypes.c_size_t),
@@ -50,6 +45,76 @@ class _Overlapped(ctypes.Structure):
     ]
 
 
+class RootOwnerLease:
+    """Hold exclusive root-write ownership for one process lifetime."""
+
+    def __init__(
+        self,
+        root: RootContext,
+        handle,
+        token,
+    ) -> None:
+        self._root = root
+        self._root_identity = root._root_identity
+        self._handle = handle
+        self._token = token
+        self._closed = False
+        self._guard = threading.Lock()
+
+    @classmethod
+    def acquire(
+        cls,
+        root: RootContext,
+        *,
+        timeout: float = 0.0,
+    ) -> RootOwnerLease:
+        if not isinstance(root, RootContext):
+            raise TypeError("an explicit RootContext is required")
+        wait = _validate_timeout(timeout, MAX_LOCK_WAIT_SECONDS)
+        if not root.verify_private_storage():
+            raise OwnershipUnknown("Private root storage is not verified.")
+        root.mkdir(LOCK_DIRECTORY, parents=True, mode=0o700)
+        handle = root.open_lock_file(OWNER_LOCK_PATH, mode=0o600)
+        try:
+            token = _acquire_os_lock(handle, wait)
+            root.revalidate()
+            return cls(root, handle, token)
+        except BaseException:
+            handle.close()
+            raise
+
+    def matches(self, root: RootContext) -> bool:
+        with self._guard:
+            if self._closed or self._root is not root or root._root_identity != self._root_identity:
+                return False
+        return root.verify_private_storage()
+
+    def close(self) -> None:
+        with self._guard:
+            if self._closed:
+                return
+            self._closed = True
+            handle = self._handle
+            token = self._token
+            self._handle = None
+            self._token = None
+        try:
+            _release_os_lock(handle, token)
+        finally:
+            handle.close()
+
+    def __enter__(self) -> RootOwnerLease:
+        with self._guard:
+            if self._closed:
+                raise OwnershipUnknown("Root owner lease is closed.")
+        if not self._root.verify_private_storage():
+            raise OwnershipUnknown("Private root storage is not verified.")
+        return self
+
+    def __exit__(self, *_exc_info) -> None:
+        self.close()
+
+
 class AdmissionCoordinator:
     """Acquire versioned root and deployment writer lanes."""
 
@@ -57,20 +122,27 @@ class AdmissionCoordinator:
         self,
         root: RootContext,
         *,
-        ownership: OwnershipState = OwnershipState.UNKNOWN,
+        owner_lease: RootOwnerLease | None = None,
     ) -> None:
         if not isinstance(root, RootContext):
             raise TypeError("an explicit RootContext is required")
-        if not isinstance(ownership, OwnershipState):
-            raise TypeError("ownership must be an OwnershipState")
+        if owner_lease is not None and not isinstance(owner_lease, RootOwnerLease):
+            raise TypeError("a root owner lease is required")
         root.revalidate()
         self._root = root
-        self._ownership = ownership
+        self._owner_lease = owner_lease
+
+    @property
+    def root(self) -> RootContext:
+        return self._root
 
     @contextmanager
     def registry_lock(self, *, timeout: float = 0.0) -> Iterator[None]:
         with self._lock("registry", timeout=timeout):
             yield
+
+    def require_root_owner(self) -> None:
+        self._require_verified_owner()
 
     @contextmanager
     def registry_read_lock(self, *, timeout: float = 0.0) -> Iterator[None]:
@@ -81,8 +153,8 @@ class AdmissionCoordinator:
         try:
             self._root.file_info(relative)
             handle = self._root.open_lock_file(relative, mode=0o600)
-        except Exception:
-            raise AdmissionError("existing registry lock is unavailable") from None
+        except Exception as exc:
+            raise AdmissionError("existing registry lock is unavailable") from exc
         acquired = False
         token = None
         try:
@@ -209,7 +281,7 @@ class AdmissionCoordinator:
                 handle.close()
 
     def _require_verified_owner(self) -> None:
-        if self._ownership is not OwnershipState.VERIFIED:
+        if self._owner_lease is None or not self._owner_lease.matches(self._root):
             raise OwnershipUnknown("Writer ownership is unknown.")
         self._root.revalidate()
 

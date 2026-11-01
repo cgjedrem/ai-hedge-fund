@@ -9,6 +9,7 @@ import platform
 import re
 import stat
 import sys
+import threading
 import unicodedata
 import uuid
 from dataclasses import dataclass, field
@@ -25,6 +26,9 @@ class RootConfigurationError(RootPathError):
 
 class UnsupportedFilesystemError(RootPathError):
     """Filesystem identity or access primitives unsupported."""
+
+
+PRIVATE_ROOT = "runtime/private/v1"
 
 
 @dataclass(frozen=True)
@@ -167,6 +171,8 @@ def _validate_component(part: str) -> None:
         raise RootPathError("path traversal is not allowed")
     if part[-1] in {".", " "}:
         raise RootPathError("trailing dots and spaces are not allowed")
+    if re.search(r"~\d", part):
+        raise RootPathError("short-name aliases are not allowed")
     if "\x00" in part or ":" in part:
         raise RootPathError("invalid path component")
     device_name = part.split(".", 1)[0].upper()
@@ -268,6 +274,10 @@ class RootContext:
     _fd: int | None = field(default=None, repr=False)
     _handles: tuple[int, ...] = field(default=(), repr=False)
     _closed: bool = field(default=False, repr=False)
+    _identity_lock: threading.RLock = field(
+        default_factory=threading.RLock,
+        repr=False,
+    )
 
     @classmethod
     def open(cls, root: str | os.PathLike[str] | None) -> RootContext:
@@ -324,6 +334,34 @@ class RootContext:
     def dotenv_path(self) -> Path:
         return self.path / ".env"
 
+    @property
+    def private_storage_verified(self) -> bool:
+        return self.verify_private_storage()
+
+    def prepare_private_storage(self) -> None:
+        with self._identity_lock:
+            self.mkdir(PRIVATE_ROOT, parents=True, mode=0o700)
+            parts = _relative_parts(PRIVATE_ROOT)
+            if os.name == "nt":
+                _windows_secure_private_directory(self._handles[-1], parts)
+            else:
+                _posix_secure_private_directory(self._fd, parts)
+            if not self.verify_private_storage():
+                raise UnsupportedFilesystemError("private storage protection is unverified")
+
+    def verify_private_storage(self) -> bool:
+        with self._identity_lock:
+            try:
+                self.revalidate()
+                parts = _relative_parts(PRIVATE_ROOT)
+                if os.name == "nt":
+                    _windows_verify_private_directory(self._handles[-1], parts)
+                else:
+                    _posix_verify_private_directory(self._fd, parts)
+            except (OSError, RootPathError, UnsupportedFilesystemError):
+                return False
+            return True
+
     def __enter__(self) -> RootContext:
         self._require_open()
         return self
@@ -332,45 +370,47 @@ class RootContext:
         self.close()
 
     def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        if self._fd is not None:
-            os.close(self._fd)
-            self._fd = None
-        if self._handles:
-            _close_windows_handles(self._handles)
-            self._handles = ()
+        with self._identity_lock:
+            if self._closed:
+                return
+            self._closed = True
+            if self._fd is not None:
+                os.close(self._fd)
+                self._fd = None
+            if self._handles:
+                _close_windows_handles(self._handles)
+                self._handles = ()
 
     def revalidate(self) -> None:
-        self._require_open()
-        if os.name == "nt":
+        with self._identity_lock:
+            self._require_open()
+            if os.name == "nt":
+                try:
+                    current = _open_windows_chain(
+                        self.path,
+                        PureWindowsPath(str(self.path)).parts[1:],
+                        PureWindowsPath(str(self.path)).anchor,
+                    )
+                except OSError as exc:
+                    raise RootPathError("root identity changed") from exc
+                try:
+                    if _windows_handle_identity(current[-1]) != self._root_identity:
+                        raise RootPathError("root identity changed")
+                finally:
+                    _close_windows_handles(current)
+                return
+
+            parts = Path(self.path).parts[1:]
             try:
-                current = _open_windows_chain(
-                    self.path,
-                    PureWindowsPath(str(self.path)).parts[1:],
-                    PureWindowsPath(str(self.path)).anchor,
-                )
+                current_fd = _open_posix_chain(parts)
             except OSError as exc:
                 raise RootPathError("root identity changed") from exc
             try:
-                if _windows_handle_identity(current[-1]) != self._root_identity:
+                info = os.fstat(current_fd)
+                if (info.st_dev, info.st_ino) != self._root_identity:
                     raise RootPathError("root identity changed")
             finally:
-                _close_windows_handles(current)
-            return
-
-        parts = Path(self.path).parts[1:]
-        try:
-            current_fd = _open_posix_chain(parts)
-        except OSError as exc:
-            raise RootPathError("root identity changed") from exc
-        try:
-            info = os.fstat(current_fd)
-            if (info.st_dev, info.st_ino) != self._root_identity:
-                raise RootPathError("root identity changed")
-        finally:
-            os.close(current_fd)
+                os.close(current_fd)
 
     def resolve(self, relative: str | os.PathLike[str]) -> Path:
         parts = _relative_parts(relative)
@@ -531,6 +571,428 @@ def _posix_parent_fd(root_fd: int, parents: tuple[str, ...]) -> int:
         raise
 
 
+def _posix_secure_private_directory(
+    root_fd: int,
+    parts: tuple[str, ...],
+) -> None:
+    if not sys.platform.startswith("linux") or not hasattr(os, "O_NOFOLLOW"):
+        raise UnsupportedFilesystemError("private directory permissions are unsupported")
+    parent = _posix_parent_fd(root_fd, parts[:-1])
+    descriptor = None
+    try:
+        descriptor = os.open(
+            parts[-1],
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=parent,
+        )
+        info = os.fstat(descriptor)
+        if info.st_uid != os.geteuid():
+            raise UnsupportedFilesystemError("private directory owner is not current user")
+        os.fchmod(descriptor, 0o700)
+        info = os.fstat(descriptor)
+        if stat.S_IMODE(info.st_mode) != 0o700:
+            raise UnsupportedFilesystemError("private directory permissions are not private")
+    except UnsupportedFilesystemError:
+        raise
+    except OSError as exc:
+        raise UnsupportedFilesystemError("private directory permissions cannot be verified") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        os.close(parent)
+
+
+def _posix_verify_private_directory(
+    root_fd: int,
+    parts: tuple[str, ...],
+) -> None:
+    if not sys.platform.startswith("linux") or not hasattr(os, "O_NOFOLLOW"):
+        raise UnsupportedFilesystemError("private directory permissions are unsupported")
+    parent = _posix_parent_fd(root_fd, parts[:-1])
+    descriptor = None
+    try:
+        descriptor = os.open(
+            parts[-1],
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=parent,
+        )
+        info = os.fstat(descriptor)
+        if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o700:
+            raise UnsupportedFilesystemError("private directory permissions are not private")
+    except UnsupportedFilesystemError:
+        raise
+    except OSError as exc:
+        raise UnsupportedFilesystemError("private directory permissions cannot be verified") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        os.close(parent)
+
+
+def _windows_secure_private_directory(
+    root_handle: int,
+    parts: tuple[str, ...],
+) -> None:
+    parent = root_handle
+    owned_parent = None
+    descriptor = None
+    try:
+        for part in parts[:-1]:
+            child = _nt_open_child(parent, part, directory=True)
+            _validate_windows_handle(child, directory=True)
+            if owned_parent is not None:
+                _close_windows_handles((owned_parent,))
+            owned_parent = child
+            parent = child
+        descriptor = _nt_open_child(
+            parent,
+            parts[-1],
+            directory=True,
+            access=0x00020000 | 0x00040000 | 0x00000080 | 0x00100000,
+        )
+        _validate_windows_handle(descriptor, directory=True)
+        _windows_apply_private_acl(descriptor)
+    except OSError as exc:
+        raise UnsupportedFilesystemError("private directory ACL cannot be verified") from exc
+    finally:
+        if descriptor is not None:
+            _close_windows_handles((descriptor,))
+        if owned_parent is not None:
+            _close_windows_handles((owned_parent,))
+
+
+def _windows_verify_private_directory(
+    root_handle: int,
+    parts: tuple[str, ...],
+) -> None:
+    parent = root_handle
+    owned_parent = None
+    descriptor = None
+    try:
+        for part in parts[:-1]:
+            child = _nt_open_child(parent, part, directory=True)
+            _validate_windows_handle(child, directory=True)
+            if owned_parent is not None:
+                _close_windows_handles((owned_parent,))
+            owned_parent = child
+            parent = child
+        descriptor = _nt_open_child(
+            parent,
+            parts[-1],
+            directory=True,
+            access=0x00020000 | 0x00000080 | 0x00100000,
+        )
+        _validate_windows_handle(descriptor, directory=True)
+        _windows_verify_private_acl_handle(
+            descriptor,
+            _windows_current_user_sid(),
+        )
+    except OSError as exc:
+        raise UnsupportedFilesystemError("private directory ACL cannot be verified") from exc
+    finally:
+        if descriptor is not None:
+            _close_windows_handles((descriptor,))
+        if owned_parent is not None:
+            _close_windows_handles((owned_parent,))
+
+
+def _windows_current_user_sid() -> str:
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = ctypes.c_int
+    advapi32.OpenProcessToken.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_ulong,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    advapi32.OpenProcessToken.restype = ctypes.c_int
+    advapi32.GetTokenInformation.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_ulong,
+        ctypes.POINTER(ctypes.c_ulong),
+    ]
+    advapi32.GetTokenInformation.restype = ctypes.c_int
+    process = kernel32.GetCurrentProcess()
+    token = ctypes.c_void_p()
+    if not advapi32.OpenProcessToken(process, 0x0008, ctypes.byref(token)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        required = ctypes.c_ulong()
+        advapi32.GetTokenInformation(token, 1, None, 0, ctypes.byref(required))
+        if not required.value:
+            raise ctypes.WinError(ctypes.get_last_error())
+        buffer = ctypes.create_string_buffer(required.value)
+        if not advapi32.GetTokenInformation(
+            token,
+            1,
+            ctypes.byref(buffer),
+            required.value,
+            ctypes.byref(required),
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+
+        class SidAndAttributes(ctypes.Structure):
+            _fields_ = [("sid", ctypes.c_void_p), ("attributes", ctypes.c_ulong)]
+
+        class TokenUser(ctypes.Structure):
+            _fields_ = [("user", SidAndAttributes)]
+
+        sid = ctypes.cast(buffer, ctypes.POINTER(TokenUser)).contents.user.sid
+        return _windows_sid_text(sid)
+    finally:
+        kernel32.CloseHandle(token)
+
+
+def _windows_sid_text(sid: int) -> str:
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel32.LocalFree.restype = ctypes.c_void_p
+    advapi32.ConvertSidToStringSidW.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_wchar_p),
+    ]
+    advapi32.ConvertSidToStringSidW.restype = ctypes.c_int
+    text = ctypes.c_wchar_p()
+    if not advapi32.ConvertSidToStringSidW(sid, ctypes.byref(text)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        return text.value
+    finally:
+        kernel32.LocalFree(ctypes.cast(text, ctypes.c_void_p))
+
+
+def _windows_apply_private_acl(handle: int) -> None:
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel32.LocalFree.restype = ctypes.c_void_p
+    advapi32.GetSecurityInfo.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_ulong,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    advapi32.GetSecurityInfo.restype = ctypes.c_ulong
+    user_sid = _windows_current_user_sid()
+    owner = ctypes.c_void_p()
+    descriptor = ctypes.c_void_p()
+    error = advapi32.GetSecurityInfo(
+        handle,
+        1,
+        0x00000001,
+        ctypes.byref(owner),
+        None,
+        None,
+        None,
+        ctypes.byref(descriptor),
+    )
+    if error:
+        raise ctypes.WinError(error)
+    try:
+        if _windows_sid_text(owner) != user_sid:
+            raise UnsupportedFilesystemError("private directory owner is not current user")
+    finally:
+        kernel32.LocalFree(descriptor)
+
+    sddl = f"D:P(A;OICI;FA;;;{user_sid})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"
+    advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [
+        ctypes.c_wchar_p,
+        ctypes.c_ulong,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_ulong),
+    ]
+    advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.restype = ctypes.c_int
+    security_descriptor = ctypes.c_void_p()
+    if not advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        sddl,
+        1,
+        ctypes.byref(security_descriptor),
+        None,
+    ):
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        present = ctypes.c_int()
+        defaulted = ctypes.c_int()
+        dacl = ctypes.c_void_p()
+        advapi32.GetSecurityDescriptorDacl.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.POINTER(ctypes.c_int),
+        ]
+        advapi32.GetSecurityDescriptorDacl.restype = ctypes.c_int
+        if (
+            not advapi32.GetSecurityDescriptorDacl(
+                security_descriptor,
+                ctypes.byref(present),
+                ctypes.byref(dacl),
+                ctypes.byref(defaulted),
+            )
+            or not present.value
+            or not dacl.value
+        ):
+            raise UnsupportedFilesystemError("private directory ACL is invalid")
+        advapi32.SetSecurityInfo.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_ulong,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+        ]
+        advapi32.SetSecurityInfo.restype = ctypes.c_ulong
+        error = advapi32.SetSecurityInfo(
+            handle,
+            1,
+            0x00000004 | 0x80000000,
+            None,
+            None,
+            dacl,
+            None,
+        )
+        if error:
+            raise ctypes.WinError(error)
+    finally:
+        kernel32.LocalFree(security_descriptor)
+
+    _windows_verify_private_acl_handle(handle, user_sid)
+
+
+def _windows_verify_private_acl_handle(handle: int, user_sid: str) -> None:
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel32.LocalFree.restype = ctypes.c_void_p
+    advapi32.GetSecurityInfo.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_ulong,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    advapi32.GetSecurityInfo.restype = ctypes.c_ulong
+    owner = ctypes.c_void_p()
+    dacl = ctypes.c_void_p()
+    descriptor = ctypes.c_void_p()
+    error = advapi32.GetSecurityInfo(
+        handle,
+        1,
+        0x00000001 | 0x00000004,
+        ctypes.byref(owner),
+        None,
+        ctypes.byref(dacl),
+        None,
+        ctypes.byref(descriptor),
+    )
+    if error:
+        raise ctypes.WinError(error)
+    try:
+        if _windows_sid_text(owner) != user_sid:
+            raise UnsupportedFilesystemError("private directory owner changed")
+        _windows_verify_private_dacl(advapi32, descriptor, dacl, user_sid)
+    finally:
+        kernel32.LocalFree(descriptor)
+
+
+def _windows_verify_private_dacl(
+    advapi32,
+    descriptor: int,
+    dacl: int,
+    user_sid: str,
+) -> None:
+    control = ctypes.c_ushort()
+    revision = ctypes.c_ulong()
+    advapi32.GetSecurityDescriptorControl.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_ushort),
+        ctypes.POINTER(ctypes.c_ulong),
+    ]
+    advapi32.GetSecurityDescriptorControl.restype = ctypes.c_int
+    if (
+        not advapi32.GetSecurityDescriptorControl(
+            descriptor,
+            ctypes.byref(control),
+            ctypes.byref(revision),
+        )
+        or not control.value & 0x1000
+    ):
+        raise UnsupportedFilesystemError("private directory ACL is inherited")
+
+    class AclSizeInformation(ctypes.Structure):
+        _fields_ = [
+            ("ace_count", ctypes.c_ulong),
+            ("acl_bytes_in_use", ctypes.c_ulong),
+            ("acl_bytes_free", ctypes.c_ulong),
+        ]
+
+    class AceHeader(ctypes.Structure):
+        _fields_ = [
+            ("ace_type", ctypes.c_ubyte),
+            ("ace_flags", ctypes.c_ubyte),
+            ("ace_size", ctypes.c_ushort),
+        ]
+
+    class AccessAllowedAce(ctypes.Structure):
+        _fields_ = [
+            ("header", AceHeader),
+            ("mask", ctypes.c_ulong),
+            ("sid_start", ctypes.c_ulong),
+        ]
+
+    info = AclSizeInformation()
+    advapi32.GetAclInformation.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_ulong,
+        ctypes.c_int,
+    ]
+    advapi32.GetAclInformation.restype = ctypes.c_int
+    if (
+        not advapi32.GetAclInformation(
+            dacl,
+            ctypes.byref(info),
+            ctypes.sizeof(info),
+            2,
+        )
+        or info.ace_count != 3
+    ):
+        raise UnsupportedFilesystemError("private directory ACL entries are invalid")
+    advapi32.GetAce.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_ulong,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    advapi32.GetAce.restype = ctypes.c_int
+    principals = set()
+    for index in range(info.ace_count):
+        ace_pointer = ctypes.c_void_p()
+        if not advapi32.GetAce(dacl, index, ctypes.byref(ace_pointer)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        ace = ctypes.cast(
+            ace_pointer,
+            ctypes.POINTER(AccessAllowedAce),
+        ).contents
+        if ace.header.ace_type != 0 or ace.header.ace_flags != 0x03 or ace.mask & 0x001F01FF != 0x001F01FF:
+            raise UnsupportedFilesystemError("private directory ACL entries are invalid")
+        sid = ctypes.c_void_p(ctypes.addressof(ace) + 8)
+        principals.add(_windows_sid_text(sid))
+    if principals != {user_sid, "S-1-5-18", "S-1-5-32-544"}:
+        raise UnsupportedFilesystemError("private directory ACL principals are invalid")
+
+
 def _posix_mkdir_relative(
     root_fd: int,
     parts: tuple[str, ...],
@@ -577,10 +1039,13 @@ def _posix_file_info(root_fd: int, parts: tuple[str, ...]) -> RootFileInfo:
 def _posix_read_relative(root_fd: int, parts: tuple[str, ...]) -> bytes:
     parent_fd = _posix_parent_fd(root_fd, parts[:-1])
     try:
+        flags = os.O_RDONLY | os.O_NOFOLLOW
+        if hasattr(os, "O_NONBLOCK"):
+            flags |= os.O_NONBLOCK
         try:
             descriptor = os.open(
                 parts[-1],
-                os.O_RDONLY | os.O_NOFOLLOW,
+                flags,
                 dir_fd=parent_fd,
             )
         except OSError as exc:
@@ -747,6 +1212,7 @@ def _nt_open_child(
     directory: bool,
     disposition: int = 1,
     access: int | None = None,
+    share_delete: bool = False,
 ) -> int:
     class UnicodeString(ctypes.Structure):
         _fields_ = [
@@ -812,7 +1278,7 @@ def _nt_open_child(
         ctypes.byref(status_block),
         None,
         0,
-        0x0001 | 0x0002,
+        0x0001 | 0x0002 | (0x0004 if share_delete else 0),
         disposition,
         options,
         None,
@@ -865,7 +1331,12 @@ def _windows_file_info(
     owned_parent = None
     try:
         for part in parts[:-1]:
-            child = _nt_open_child(parent, part, directory=True)
+            child = _nt_open_child(
+                parent,
+                part,
+                directory=True,
+                share_delete=True,
+            )
             try:
                 _validate_windows_handle(child, directory=True)
             except BaseException:
@@ -875,7 +1346,12 @@ def _windows_file_info(
                 _close_windows_handles((owned_parent,))
             owned_parent = child
             parent = child
-        handle = _nt_open_child(parent, parts[-1], directory=False)
+        handle = _nt_open_child(
+            parent,
+            parts[-1],
+            directory=False,
+            share_delete=True,
+        )
         try:
             _validate_windows_handle(handle, directory=False)
             info = _ByHandleInfo()
@@ -973,7 +1449,12 @@ def _windows_read_relative(root_handle: int, parts: tuple[str, ...]) -> bytes:
     owned_parent = None
     try:
         for part in parts[:-1]:
-            child = _nt_open_child(parent, part, directory=True)
+            child = _nt_open_child(
+                parent,
+                part,
+                directory=True,
+                share_delete=True,
+            )
             try:
                 _validate_windows_handle(child, directory=True)
             except BaseException:
@@ -983,7 +1464,12 @@ def _windows_read_relative(root_handle: int, parts: tuple[str, ...]) -> bytes:
                 _close_windows_handles((owned_parent,))
             owned_parent = child
             parent = child
-        descriptor = _nt_open_child(parent, parts[-1], directory=False)
+        descriptor = _nt_open_child(
+            parent,
+            parts[-1],
+            directory=False,
+            share_delete=True,
+        )
         try:
             _validate_windows_handle(descriptor, directory=False)
             return _windows_read_handle(descriptor)
@@ -1058,7 +1544,12 @@ def _windows_write_relative(
     handle = None
     try:
         for part in parts[:-1]:
-            child = _nt_open_child(parent, part, directory=True)
+            child = _nt_open_child(
+                parent,
+                part,
+                directory=True,
+                share_delete=True,
+            )
             try:
                 _validate_windows_handle(child, directory=True)
             except BaseException:
@@ -1114,19 +1605,19 @@ def _windows_rename_handle(handle: int, parent: int, name: str) -> None:
     class IoStatusBlock(ctypes.Structure):
         _fields_ = [("status", ctypes.c_void_p), ("information", ctypes.c_size_t)]
 
-    class RenameInformation(ctypes.Structure):
+    class RenameInformationEx(ctypes.Structure):
         _fields_ = [
-            ("replace", ctypes.c_ubyte),
+            ("flags", ctypes.c_ulong),
             ("root_directory", ctypes.c_void_p),
             ("name_length", ctypes.c_ulong),
             ("name", ctypes.c_wchar * 1),
         ]
 
     encoded = name.encode("utf-16-le")
-    offset = RenameInformation.name.offset
+    offset = RenameInformationEx.name.offset
     buffer = ctypes.create_string_buffer(offset + len(encoded))
-    info = ctypes.cast(buffer, ctypes.POINTER(RenameInformation)).contents
-    info.replace = 1
+    info = ctypes.cast(buffer, ctypes.POINTER(RenameInformationEx)).contents
+    info.flags = 0x0001 | 0x0002
     info.root_directory = parent
     info.name_length = len(encoded)
     ctypes.memmove(ctypes.addressof(buffer) + offset, encoded, len(encoded))
@@ -1147,7 +1638,7 @@ def _windows_rename_handle(handle: int, parent: int, name: str) -> None:
         ctypes.byref(status_block),
         ctypes.byref(buffer),
         len(buffer),
-        10,
+        65,
     )
     if status < 0:
         dos_error = ntdll.RtlNtStatusToDosError(status)

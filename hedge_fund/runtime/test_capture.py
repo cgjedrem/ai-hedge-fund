@@ -2,8 +2,18 @@ from dataclasses import FrozenInstanceError, replace
 
 import pytest
 
+from hedge_fund.runtime.admission import AdmissionCoordinator, RootOwnerLease
 from hedge_fund.runtime.capture import CredentialHandle, freeze_capture
-from hedge_fund.runtime.configuration import build_child_environment, child_root_arguments, ConfigurationError, environment_settings, load_settings, resolve_settings, save_settings, SettingsConflict
+from hedge_fund.runtime.configuration import (
+    build_child_environment,
+    child_root_arguments,
+    ConfigurationError,
+    environment_settings,
+    load_settings,
+    resolve_settings,
+    save_settings,
+    SettingsConflict,
+)
 from hedge_fund.runtime.root import RootContext
 
 
@@ -13,6 +23,16 @@ def root_context(tmp_path):
     root.mkdir()
     with RootContext.open(root) as context:
         yield context
+
+
+@pytest.fixture
+def root_owner(root_context):
+    root_context.prepare_private_storage()
+    owner = RootOwnerLease.acquire(root_context)
+    try:
+        yield AdmissionCoordinator(root_context, owner_lease=owner)
+    finally:
+        owner.close()
 
 
 def test_settings_precedence_uses_launch_environment_persisted_and_free_default(root_context):
@@ -42,7 +62,7 @@ def test_settings_precedence_uses_launch_environment_persisted_and_free_default(
     assert launch.provenance["data_provider"] == "environment"
 
 
-def test_registered_model_selects_provider_without_secret_environment_access(root_context):
+def test_registered_model_selects_provider_without_secret_environment_access(root_context, root_owner):
     settings = resolve_settings(
         root_context,
         environment=environment_settings(
@@ -65,6 +85,7 @@ def test_registered_model_selects_provider_without_secret_environment_access(roo
         root_context,
         {"model": "gpt-6-sol"},
         expected_version=0,
+        admission=root_owner,
     )
     assert persisted.llm_provider == "OpenAI"
 
@@ -72,6 +93,71 @@ def test_registered_model_selects_provider_without_secret_environment_access(roo
         resolve_settings(
             root_context,
             launch={"model": "gpt-6-sol", "llm_provider": "Anthropic"},
+        )
+
+
+@pytest.mark.parametrize("context_size", [0, 255, 131073, True])
+def test_local_context_size_is_bounded(context_size, root_context):
+    with pytest.raises(ConfigurationError):
+        resolve_settings(
+            root_context,
+            launch={"parameters": {"context_size": context_size}},
+        )
+
+
+def test_context_size_requires_an_ollama_model(root_context):
+    with pytest.raises(ConfigurationError):
+        resolve_settings(
+            root_context,
+            launch={"parameters": {"context_size": 8192}},
+        )
+
+
+def test_validated_local_sampling_and_context_settings_are_captured(root_context):
+    settings = resolve_settings(
+        root_context,
+        launch={
+            "model": "gemma3:4b",
+            "parameters": {
+                "context_size": 16384,
+                "max_tokens": 2048,
+                "temperature": 0.4,
+                "top_p": 0.8,
+            },
+        },
+    )
+    capture = freeze_capture(
+        root=root_context,
+        subject_id="alpha",
+        mandate_digest="a" * 64,
+        universe=("AAPL",),
+        broker="paper",
+        settings=settings,
+        credential_versions={},
+        code_version="synthetic-code-stamp",
+    )
+
+    assert capture.llm_provider == "Ollama"
+    assert capture.parameters == {
+        "context_size": 16384,
+        "max_tokens": 2048,
+        "temperature": 0.4,
+        "top_p": 0.8,
+    }
+
+
+def test_invalid_mandate_snapshot_is_rejected_before_freezing(root_context):
+    with pytest.raises(ConfigurationError, match="mandate snapshot"):
+        freeze_capture(
+            root=root_context,
+            subject_id="alpha",
+            mandate_digest="a" * 64,
+            universe=("AAA",),
+            broker="paper",
+            settings=resolve_settings(root_context),
+            credential_versions={},
+            code_version="synthetic-code-stamp",
+            mandate_snapshot={"name": "alpha", "api_key": "synthetic-sentinel"},
         )
 
 
@@ -125,29 +211,32 @@ def test_environment_cannot_elevate_root_writes_network_or_paid_policy(root_cont
         )
 
 
-def test_persisted_settings_versions_are_monotonic_and_compare_and_swap(root_context):
+def test_persisted_settings_versions_are_monotonic_and_compare_and_swap(root_context, root_owner):
     initial = load_settings(root_context)
     first = save_settings(
         root_context,
         {"data_provider": "fd", "model": "persisted-model"},
         expected_version=initial.version,
+        admission=root_owner,
     )
 
     assert initial.version == 0
     assert first.version == 1
-    assert load_settings(root_context) == first
+    assert load_settings(root_context, admission=root_owner) == first
 
     with pytest.raises(SettingsConflict):
         save_settings(
             root_context,
             {"data_provider": "yfinance"},
             expected_version=0,
+            admission=root_owner,
         )
 
     second = save_settings(
         root_context,
         {"data_provider": "yfinance"},
         expected_version=first.version,
+        admission=root_owner,
     )
     assert second.version == 2
     assert second.data_provider == "yfinance"

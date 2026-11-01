@@ -222,9 +222,9 @@ def test_satisfies_the_data_client_protocol(monkeypatch):
     assert isinstance(client, DataClient)
 
 
-def test_constructor_raises_import_error_without_the_extra(monkeypatch):
+def test_constructor_raises_when_runtime_dependency_is_missing(monkeypatch):
     monkeypatch.setattr(yfinance_client, "yf", None)
-    with pytest.raises(ImportError, match="poetry install -E yfinance"):
+    with pytest.raises(ImportError, match="reinstall application dependencies"):
         YFinanceClient()
 
 
@@ -998,10 +998,11 @@ def test_transport_failure_raises_through_the_real_scraper(monkeypatch):
 # The provider switch
 # ---------------------------------------------------------------------------
 
-def test_provider_defaults_to_fd(monkeypatch):
+def test_provider_defaults_to_yfinance(monkeypatch):
     monkeypatch.delenv("HEDGE_FUND_DATA_PROVIDER", raising=False)
-    assert data_provider() == "fd"
-    assert isinstance(make_data_client(), FDClient)
+    _install(monkeypatch)
+    assert data_provider() == "yfinance"
+    assert isinstance(make_data_client(), YFinanceClient)
 
 
 def test_provider_switch_selects_yfinance(monkeypatch):
@@ -1020,5 +1021,5 @@ def test_provider_switch_rejects_unknown_values(monkeypatch):
 def test_provider_switch_surfaces_a_missing_extra(monkeypatch):
     monkeypatch.setattr(yfinance_client, "yf", None)
     monkeypatch.setenv("HEDGE_FUND_DATA_PROVIDER", "yfinance")
-    with pytest.raises(ImportError, match="poetry install -E yfinance"):
+    with pytest.raises(ImportError, match="reinstall application dependencies"):
         make_data_client()

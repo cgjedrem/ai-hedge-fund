@@ -34,6 +34,7 @@ import re
 from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
+from uuid import uuid4
 
 from hedge_fund.data.bars import is_intraday, session_date
 from hedge_fund.paths import write_atomic
@@ -139,7 +140,11 @@ class Ledger:
         keep = self.records_dir / SUPERSEDED_SUBDIR
         keep.mkdir(exist_ok=True)
         safe = latest.session.replace(":", "")
-        self.path(latest.session).rename(keep / f"{safe}.{latest.hash[:12]}.json")
+        name = f"{safe}.{latest.hash[:12]}"
+        target = keep / f"{name}.json"
+        if target.exists():
+            target = keep / f"{name}.{uuid4().hex}.json"
+        self.path(latest.session).rename(target)
         checkpoint = self.checkpoint_path(session_date(latest.session))
         if checkpoint.exists():
             checkpoint.unlink()

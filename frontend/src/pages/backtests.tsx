@@ -27,35 +27,24 @@ import {
 } from "@/components/ui/select";
 import { apiPost } from "@/lib/api";
 import { useDesk, useResource } from "@/lib/hooks";
-import type { Job, MandateCollection, Settings } from "@/lib/types";
+import type { MandateCollection, Operation, OperationPreview, OperationStatus, Settings } from "@/lib/types";
 import { dateLabel } from "@/lib/utils";
 
-interface BacktestSubmission {
-  fund: string;
-  universe: string[];
-  start: string;
-  end: string;
-  provider: string;
-  model: string;
-  mandate_hash: string;
-  agent_count: number;
-}
+const SELECTED_OPERATION_STORAGE_KEY = "aihf.backtests.selected-operation";
 
-const SELECTED_JOB_STORAGE_KEY = "aihf.backtests.selected-job";
-
-function readSelectedJobId(): string | null {
+function readSelectedOperationId(): string | null {
   try {
-    const stored = window.localStorage.getItem(SELECTED_JOB_STORAGE_KEY);
+    const stored = window.localStorage.getItem(SELECTED_OPERATION_STORAGE_KEY);
     return stored && /^[a-f0-9]{32}$/.test(stored) ? stored : null;
   } catch {
     return null;
   }
 }
 
-function persistSelectedJobId(jobId: string | null): void {
+function persistSelectedOperationId(operationId: string | null): void {
   try {
-    if (jobId) window.localStorage.setItem(SELECTED_JOB_STORAGE_KEY, jobId);
-    else window.localStorage.removeItem(SELECTED_JOB_STORAGE_KEY);
+    if (operationId) window.localStorage.setItem(SELECTED_OPERATION_STORAGE_KEY, operationId);
+    else window.localStorage.removeItem(SELECTED_OPERATION_STORAGE_KEY);
   } catch {
     return;
   }
@@ -65,14 +54,22 @@ function isoDate(date: Date): string {
   return date.toISOString().slice(0, 10);
 }
 
+function newRequestId(): string {
+  const bytes = new Uint8Array(16);
+  window.crypto.getRandomValues(bytes);
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
 export function BacktestsPage() {
   const { capabilities } = useDesk();
   const mandates = useResource<MandateCollection>("/api/mandates");
   const settings = useResource<Settings>("/api/settings");
-  const jobs = useResource<{ items: Job[] }>("/api/jobs");
-  const [jobId, setJobId] = useState<string | null>(readSelectedJobId);
-  const [jobSelectionRestored, setJobSelectionRestored] = useState(false);
-  const currentJob = useResource<Job>(jobId ? `/api/jobs/${encodeURIComponent(jobId)}` : null);
+  const operations = useResource<{ items: Operation[] }>("/api/operations");
+  const [operationId, setOperationId] = useState<string | null>(readSelectedOperationId);
+  const [operationSelectionRestored, setOperationSelectionRestored] = useState(false);
+  const currentOperation = useResource<Operation>(
+    operationId ? `/api/operations/${encodeURIComponent(operationId)}` : null,
+  );
   const [fund, setFund] = useState("");
   const [universeText, setUniverseText] = useState("");
   const [start, setStart] = useState(() => {
@@ -83,45 +80,50 @@ export function BacktestsPage() {
   const [end, setEnd] = useState(() => isoDate(new Date()));
   const [busy, setBusy] = useState(false);
   const [cancelling, setCancelling] = useState(false);
-  const [confirmation, setConfirmation] = useState<BacktestSubmission | null>(null);
+  const [confirmation, setConfirmation] = useState<OperationPreview | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const selectJob = useCallback((selectedId: string | null) => {
-    setJobId(selectedId);
-    persistSelectedJobId(selectedId);
+  const selectOperation = useCallback((selectedId: string | null) => {
+    setOperationId(selectedId);
+    persistSelectedOperationId(selectedId);
   }, []);
   const canWrite = capabilities?.writes === true;
   const canRun = canWrite && capabilities?.network === true;
-  const activeJob = currentJob.data?.id === jobId ? currentJob.data : null;
+  const activeOperation = currentOperation.data?.id === operationId ? currentOperation.data : null;
   const selectedMandate = mandates.data?.items.find((item) => item.name === fund) ?? null;
   const selectedModel = settings.data?.models.find((item) => item.id === settings.data?.model) ?? null;
-  const running = Boolean(activeJob && ["queued", "running"].includes(activeJob.status));
+  const running = Boolean(
+    activeOperation
+    && ["accepted", "running", "cancel-requested"].includes(activeOperation.status),
+  );
 
   useEffect(() => {
-    if (!activeJob || !["queued", "running"].includes(activeJob.status)) return;
-    const timer = window.setTimeout(currentJob.refresh, 1200);
+    if (!activeOperation || !["accepted", "running", "cancel-requested"].includes(activeOperation.status)) return;
+    const timer = window.setTimeout(currentOperation.refresh, 1200);
     return () => window.clearTimeout(timer);
-  }, [activeJob?.status, activeJob?.progress, currentJob.refresh]);
+  }, [activeOperation?.status, activeOperation?.progress, currentOperation.refresh]);
 
   useEffect(() => {
-    if (!jobs.data || jobSelectionRestored) return;
-    const items = jobs.data.items;
-    const selected = jobId && items.some((item) => item.id === jobId)
-      ? jobId
-      : items.find((item) => ["queued", "running"].includes(item.status))?.id ?? items[0]?.id ?? null;
-    if (selected !== jobId) selectJob(selected);
-    setJobSelectionRestored(true);
-  }, [jobId, jobSelectionRestored, jobs.data, selectJob]);
+    if (!operations.data || operationSelectionRestored) return;
+    const items = operations.data.items;
+    const selected = operationId && items.some((item) => item.id === operationId)
+      ? operationId
+      : items.find((item) => ["accepted", "running", "cancel-requested"].includes(item.status))?.id
+        ?? items[0]?.id
+        ?? null;
+    if (selected !== operationId) selectOperation(selected);
+    setOperationSelectionRestored(true);
+  }, [operationId, operationSelectionRestored, operations.data, selectOperation]);
 
   useEffect(() => {
     if (!fund && mandates.data?.items.length) setFund(mandates.data.items[0].name);
   }, [fund, mandates.data]);
 
-  const jobColumns = useMemo<TableColumn<Job>[]>(
+  const operationColumns = useMemo<TableColumn<Operation>[]>(
     () => [
       { key: "fund", label: "Mandate", render: (item) => <span className="mono text-foreground">{item.fund}</span> },
       { key: "provider", label: "Provider / model", render: (item) => <span className="text-xs">{item.provider} · {item.model}</span> },
-      { key: "submitted", label: "Submitted", render: (item) => <span className="mono text-[10px]">{dateLabel(item.submitted_at)}</span> },
-      { key: "status", label: "Status", render: (item) => <JobStatus status={item.status} /> },
+      { key: "submitted", label: "Created", render: (item) => <span className="mono text-[10px]">{dateLabel(item.created_at)}</span> },
+      { key: "status", label: "Status", render: (item) => <OperationStatusBadge status={item.status} /> },
       { key: "progress", label: "Progress", align: "right", render: (item) => <span className="mono">{Math.min(100, Math.max(0, item.progress))}%</span> },
       {
         key: "monitor",
@@ -130,20 +132,20 @@ export function BacktestsPage() {
           <Button
             type="button"
             size="sm"
-            variant={jobId === item.id ? "secondary" : "ghost"}
-            aria-label={`Monitor job ${item.id}`}
-            aria-pressed={jobId === item.id}
-            onClick={() => selectJob(item.id)}
+            variant={operationId === item.id ? "secondary" : "ghost"}
+            aria-label={`Monitor operation ${item.id}`}
+            aria-pressed={operationId === item.id}
+            onClick={() => selectOperation(item.id)}
           >
-            {jobId === item.id ? "Selected" : "Monitor"}
+            {operationId === item.id ? "Selected" : "Monitor"}
           </Button>
         ),
       },
     ],
-    [jobId, selectJob],
+    [operationId, selectOperation],
   );
 
-  function requestConfirmation(): void {
+  async function requestConfirmation(): Promise<void> {
     setError(null);
     if (!canRun) {
       setError("Backtests require startup write capability and explicit network consent.");
@@ -169,7 +171,7 @@ export function BacktestsPage() {
       setError("Mandate and provider settings must finish loading before confirmation.");
       return;
     }
-    setConfirmation({
+    const payload = {
       fund,
       universe,
       start,
@@ -177,8 +179,21 @@ export function BacktestsPage() {
       provider: settings.data.data_provider,
       model: settings.data.model,
       mandate_hash: selectedMandate.mandate_hash,
-      agent_count: selectedMandate.agent_count,
-    });
+    };
+    setBusy(true);
+    try {
+      const preview = await apiPost<OperationPreview>("/api/operations/preview", {
+        action: "backtest",
+        subject_id: fund,
+        expected_head: selectedMandate.mandate_hash,
+        payload,
+      });
+      setConfirmation(preview);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Backtest preview could not be created.");
+    } finally {
+      setBusy(false);
+    }
   }
 
   async function submitConfirmed(): Promise<void> {
@@ -191,18 +206,20 @@ export function BacktestsPage() {
     setBusy(true);
     setError(null);
     try {
-      const job = await apiPost<Job>("/api/backtests", {
-        fund: confirmation.fund,
-        universe: confirmation.universe,
-        start: confirmation.start,
-        end: confirmation.end,
-        provider: confirmation.provider,
-        model: confirmation.model,
-        mandate_hash: confirmation.mandate_hash,
+      const operation = await apiPost<Operation>("/api/operations", {
+        request_id: newRequestId(),
+        action: confirmation.action,
+        subject_id: confirmation.subject_id,
+        preview_id: confirmation.preview_id,
+        preview_digest: confirmation.preview_digest,
+        confirmation_token: confirmation.confirmation_token,
+        expected_head: confirmation.expected_head,
+        due_set: confirmation.due_set,
+        payload: confirmation.payload,
       });
-      selectJob(job.id);
+      selectOperation(operation.id);
       setConfirmation(null);
-      jobs.refresh();
+      operations.refresh();
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Backtest could not be submitted.");
     } finally {
@@ -210,14 +227,17 @@ export function BacktestsPage() {
     }
   }
 
-  async function cancelActiveJob(): Promise<void> {
-    if (!activeJob || !running || !canWrite || cancelling) return;
+  async function cancelActiveOperation(): Promise<void> {
+    if (!activeOperation || !running || !canWrite || cancelling) return;
     setCancelling(true);
     setError(null);
     try {
-      await apiPost(`/api/jobs/${encodeURIComponent(activeJob.id)}/cancel`);
-      currentJob.refresh();
-      jobs.refresh();
+      await apiPost(
+        `/api/operations/${encodeURIComponent(activeOperation.id)}/cancel`,
+        { request_id: newRequestId() },
+      );
+      currentOperation.refresh();
+      operations.refresh();
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Cancellation request failed.");
     } finally {
@@ -229,8 +249,8 @@ export function BacktestsPage() {
     <>
       <PageHeader
         eyebrow="Research / backtests"
-        title="Backtest jobs"
-        description="Submit one bounded historical research job. External data access requires both startup writes and explicit network consent."
+        title="Backtest operations"
+        description="Review a bounded historical research operation. External data access requires explicit startup write and network capabilities."
         actions={<Button asChild variant="secondary"><Link to="/research">Saved reports <ArrowRight className="h-3.5 w-3.5" /></Link></Button>}
       />
       {error ? <Alert tone="danger" className="mb-5"><AlertCircle className="mr-2 inline h-4 w-4" />{error}</Alert> : null}
@@ -251,8 +271,8 @@ export function BacktestsPage() {
           <CardHeader>
             <div className="flex items-center justify-between gap-3">
               <div>
-                <p className="text-sm font-semibold text-foreground">New research job</p>
-                <p className="mt-1 text-xs text-muted-foreground">No automatic retries · single worker · maximum 730 calendar days</p>
+                <p className="text-sm font-semibold text-foreground">New reviewed operation</p>
+                <p className="mt-1 text-xs text-muted-foreground">Server-issued preview · durable request · maximum 730 calendar days</p>
               </div>
               <FlaskConical className="h-4 w-4 text-accent" />
             </div>
@@ -271,7 +291,7 @@ export function BacktestsPage() {
               <div className="space-y-2 sm:col-span-2">
                 <Label htmlFor="backtest-universe">Ticker universe</Label>
                 <Input id="backtest-universe" value={universeText} onChange={(event) => setUniverseText(event.target.value)} placeholder="AAPL, MSFT, SPY" disabled={!canRun || running} />
-                <p className="text-[10px] text-muted-foreground">Up to 20 unique symbols · the fund benchmark is included by canonical valuation.</p>
+                <p className="text-[10px] text-muted-foreground">Up to 20 unique symbols · local model-call estimate is bounded before acceptance.</p>
               </div>
               <div className="space-y-2">
                 <Label htmlFor="backtest-start">Start date</Label>
@@ -282,7 +302,7 @@ export function BacktestsPage() {
                 <Input id="backtest-end" type="date" value={end} onChange={(event) => setEnd(event.target.value)} disabled={!canRun || running} />
               </div>
             </div>
-            <Button className="w-full" onClick={requestConfirmation} disabled={!canRun || busy || mandates.loading || settings.loading || !selectedMandate || !selectedModel || running}>
+            <Button className="w-full" onClick={() => void requestConfirmation()} disabled={!canRun || busy || mandates.loading || settings.loading || !selectedMandate || !selectedModel || running}>
               <FlaskConical className="h-3.5 w-3.5" /> Review backtest
             </Button>
           </CardContent>
@@ -292,35 +312,37 @@ export function BacktestsPage() {
           <CardHeader>
             <div className="flex items-center justify-between gap-3">
               <div>
-                <p className="text-sm font-semibold text-foreground">Job monitor</p>
-                <p className="mt-1 text-xs text-muted-foreground">Progress is reported by the canonical backtest run.</p>
+                <p className="text-sm font-semibold text-foreground">Operation monitor</p>
+                <p className="mt-1 text-xs text-muted-foreground">Durable progress survives browser reload and server restart.</p>
               </div>
               <Clock3 className="h-4 w-4 text-accent" />
             </div>
           </CardHeader>
           <CardContent>
-            {currentJob.loading ? <div className="h-28 animate-pulse rounded-lg border border-border bg-white/[0.025]" /> : null}
-            {currentJob.error ? <Alert tone="danger">{currentJob.error}</Alert> : null}
-            {activeJob ? (
+            {currentOperation.loading ? <div className="h-28 animate-pulse rounded-lg border border-border bg-white/[0.025]" /> : null}
+            {currentOperation.error ? <Alert tone="danger">{currentOperation.error}</Alert> : null}
+            {activeOperation ? (
               <div className="rounded-lg border border-border bg-black/10 p-4" aria-live="polite">
                 <div className="flex flex-wrap items-center justify-between gap-3">
                   <div>
-                    <p className="mono text-sm text-foreground">{activeJob.fund}</p>
-                    <p className="mono mt-1 text-[9px] text-muted-foreground">{activeJob.id}</p>
+                    <p className="mono text-sm text-foreground">{activeOperation.fund}</p>
+                    <p className="mono mt-1 text-[9px] text-muted-foreground">{activeOperation.id}</p>
                   </div>
-                  <JobStatus status={activeJob.status} />
+                  <OperationStatusBadge status={activeOperation.status} />
                 </div>
                 <div className="mt-4 h-1.5 overflow-hidden rounded-full bg-white/[0.07]">
-                  <div className="h-full rounded-full bg-accent transition-[width]" style={{ width: `${Math.min(100, Math.max(0, activeJob.progress))}%` }} />
+                  <div className="h-full rounded-full bg-accent transition-[width]" style={{ width: `${Math.min(100, Math.max(0, activeOperation.progress))}%` }} />
                 </div>
                 <div className="mt-2 flex items-center justify-between">
-                  <span className="mono text-[10px] text-muted-foreground">{Math.min(100, Math.max(0, activeJob.progress))}%</span>
-                  {activeJob.completed_at ? <span className="mono text-[10px] text-muted-foreground">{dateLabel(activeJob.completed_at)}</span> : <RefreshCw className="h-3 w-3 animate-spin text-accent" />}
+                  <span className="mono text-[10px] text-muted-foreground">{Math.min(100, Math.max(0, activeOperation.progress))}%</span>
+                  {["completed", "failed", "interrupted", "cancelled"].includes(activeOperation.status)
+                    ? <span className="mono text-[10px] text-muted-foreground">{dateLabel(activeOperation.updated_at)}</span>
+                    : <RefreshCw className="h-3 w-3 animate-spin text-accent" />}
                 </div>
-                {activeJob.error ? <Alert tone="danger" className="mt-4">{activeJob.error}</Alert> : null}
-                {activeJob.report_id ? (
+                {activeOperation.error ? <Alert tone="danger" className="mt-4">{activeOperation.error}</Alert> : null}
+                {activeOperation.report_id ? (
                   <Button asChild className="mt-4 w-full">
-                    <Link to={`/research/${encodeURIComponent(activeJob.report_id)}`}>Open saved report <ArrowRight className="h-3.5 w-3.5" /></Link>
+                    <Link to={`/research/${encodeURIComponent(activeOperation.report_id)}`}>Open saved report <ArrowRight className="h-3.5 w-3.5" /></Link>
                   </Button>
                 ) : null}
                 {running ? (
@@ -328,22 +350,22 @@ export function BacktestsPage() {
                     <Button
                       className="w-full"
                       variant="danger"
-                      onClick={() => void cancelActiveJob()}
-                      disabled={!canWrite || cancelling || activeJob.cancel_requested}
+                      onClick={() => void cancelActiveOperation()}
+                      disabled={!canWrite || cancelling || activeOperation.cancel_requested}
                     >
                       <CircleStop className="h-3.5 w-3.5" />
-                      {cancelling || activeJob.cancel_requested ? "Cancellation requested…" : "Request cancellation"}
+                      {cancelling || activeOperation.cancel_requested ? "Cancellation requested…" : "Request cancellation"}
                     </Button>
                     <p className="text-[10px] leading-relaxed text-muted-foreground">
-                      Cancellation is cooperative at valuation boundaries. An in-flight provider/session step cannot be interrupted, so cancel and shutdown latency depends on that step. Closing this page does not cancel the job; shutdown waits for active work.
+                      Cancellation is cooperative at valuation boundaries. An in-flight model or data step cannot be interrupted. Closing this page does not cancel the operation; shutdown fences unfinished work.
                     </p>
                   </div>
                 ) : null}
               </div>
             ) : (
               <div className="flex min-h-32 flex-col items-center justify-center rounded-lg border border-dashed border-border px-4 text-center">
-                <p className="text-xs font-medium text-foreground">No selected job</p>
-                <p className="mt-1 text-[10px] text-muted-foreground">Submit a research run to see state and progress here.</p>
+                <p className="text-xs font-medium text-foreground">No selected operation</p>
+                <p className="mt-1 text-[10px] text-muted-foreground">Review and accept a backtest to see durable state and progress here.</p>
               </div>
             )}
           </CardContent>
@@ -352,18 +374,18 @@ export function BacktestsPage() {
 
       <Card className="mt-5">
         <CardHeader>
-          <SectionTitle title="Recent jobs" note={jobs.data ? `${jobs.data.items.length} local job receipts` : "Local job receipts"} />
+          <SectionTitle title="Recent operations" note={operations.data ? `${operations.data.items.length} durable receipts` : "Durable operation receipts"} />
         </CardHeader>
         <CardContent>
-          {jobs.loading ? <div className="h-24 animate-pulse rounded-lg border border-border bg-white/[0.025]" /> : null}
-          {jobs.error ? <ErrorState message={jobs.error} /> : null}
-          {jobs.data ? (
+          {operations.loading ? <div className="h-24 animate-pulse rounded-lg border border-border bg-white/[0.025]" /> : null}
+          {operations.error ? <ErrorState message={operations.error} /> : null}
+          {operations.data ? (
             <DataTable
-              columns={jobColumns}
-              rows={jobs.data.items}
+              columns={operationColumns}
+              rows={operations.data.items}
               rowKey={(item) => item.id}
-              emptyTitle="No jobs submitted"
-              emptyDescription="A new job will appear after explicit submission."
+              emptyTitle="No operations submitted"
+              emptyDescription="A durable receipt appears after confirmation."
             />
           ) : null}
         </CardContent>
@@ -371,38 +393,41 @@ export function BacktestsPage() {
       <Dialog open={confirmation !== null} onOpenChange={(open) => { if (!open && !busy) setConfirmation(null); }}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Confirm historical backtest</DialogTitle>
+            <DialogTitle>Confirm reviewed backtest</DialogTitle>
             <DialogDescription>
-              One research job will use these inputs. No automatic retry runs if it fails.
+            Accept the exact captured configuration, source head and finite local call estimate.
             </DialogDescription>
           </DialogHeader>
           {confirmation ? (
             <div className="space-y-4">
               <dl className="grid gap-3 rounded-lg border border-border bg-black/10 p-4 text-xs sm:grid-cols-2">
-                <ConfirmationValue label="Mandate" value={confirmation.fund} />
-                <ConfirmationValue label="Agents" value={String(confirmation.agent_count)} />
-                <ConfirmationValue label="Mandate hash" value={confirmation.mandate_hash} />
-                <ConfirmationValue label="Market-data provider" value={confirmation.provider} />
+                <ConfirmationValue label="Mandate" value={confirmation.payload.fund} />
+                <ConfirmationValue label="Reviewed head" value={confirmation.expected_head ?? "none"} />
+                <ConfirmationValue label="Preview digest" value={confirmation.preview_digest} />
+                <ConfirmationValue label="Market-data provider" value={confirmation.payload.provider} />
                 <ConfirmationValue
                   label="LLM model"
-                  value={selectedModel ? `${selectedModel.label} · ${selectedModel.provider}` : confirmation.model}
+                  value={selectedModel ? `${selectedModel.label} · ${selectedModel.provider}` : confirmation.payload.model}
                 />
-                <ConfirmationValue label="Tickers" value={confirmation.universe.join(", ")} />
-                <ConfirmationValue label="Date range" value={`${confirmation.start} → ${confirmation.end}`} />
+                <ConfirmationValue label="Tickers" value={confirmation.payload.universe.join(", ")} />
+                <ConfirmationValue label="Date range" value={`${confirmation.payload.start} → ${confirmation.payload.end}`} />
+                <ConfirmationValue label="Max model calls" value={String(confirmation.estimate.maximum_model_calls)} />
+                <ConfirmationValue label="Max cost" value={confirmation.estimate.maximum_cost_usd === null ? "Test-only provider" : `$${confirmation.estimate.maximum_cost_usd.toFixed(2)}`} />
+                <ConfirmationValue label="Expires" value={dateLabel(confirmation.expires_at)} />
               </dl>
               <div className="grid gap-2 sm:grid-cols-2" aria-label="Required startup capabilities">
                 <CapabilityBadge label="Write capability" enabled={capabilities?.writes === true} />
                 <CapabilityBadge label="Network capability" enabled={capabilities?.network === true} />
               </div>
               <p className="text-[10px] leading-relaxed text-muted-foreground">
-                Confirm only if both capabilities are enabled and this provider/model/range is intended. A report write already underway is not interrupted by cancellation.
+                Preview token stays in page memory. Production web backtests allow free market data and local Ollama only; paid and cloud models are denied.
               </p>
             </div>
           ) : null}
           <DialogFooter>
             <Button variant="ghost" onClick={() => setConfirmation(null)} disabled={busy}>Review later</Button>
             <Button onClick={() => void submitConfirmed()} disabled={busy || !canRun}>
-              {busy ? "Submitting…" : "Confirm and submit"}
+              {busy ? "Accepting…" : "Accept reviewed operation"}
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -411,8 +436,8 @@ export function BacktestsPage() {
   );
 }
 
-function JobStatus({ status }: { status: Job["status"] }) {
-  const variant = status === "succeeded" ? "positive" : status === "failed" ? "negative" : status === "running" ? "warning" : "muted";
+function OperationStatusBadge({ status }: { status: OperationStatus }) {
+  const variant = status === "completed" ? "positive" : status === "failed" || status === "interrupted" ? "negative" : ["running", "cancel-requested"].includes(status) ? "warning" : "muted";
   return <Badge variant={variant}>{status}</Badge>;
 }
 

@@ -4,8 +4,15 @@ from pathlib import Path
 
 import pytest
 
-from hedge_fund.runtime.admission import AdmissionCoordinator, AdmissionError, LOCK_DIRECTORY, OwnershipState, OwnershipUnknown, WriterConflict
-from hedge_fund.runtime.root import RootContext
+from hedge_fund.runtime.admission import (
+    AdmissionCoordinator,
+    AdmissionError,
+    LOCK_DIRECTORY,
+    OwnershipUnknown,
+    RootOwnerLease,
+    WriterConflict,
+)
+from hedge_fund.runtime.root import PRIVATE_ROOT, RootContext
 
 
 @pytest.fixture
@@ -13,12 +20,14 @@ def admission_root(tmp_path):
     root = tmp_path / "root"
     root.mkdir()
     context = RootContext.open(root)
-    coordinator = AdmissionCoordinator(
-        context,
-        ownership=OwnershipState.VERIFIED,
-    )
-    yield root, context, coordinator
-    context.close()
+    context.prepare_private_storage()
+    owner_lease = RootOwnerLease.acquire(context)
+    coordinator = AdmissionCoordinator(context, owner_lease=owner_lease)
+    try:
+        yield root, context, owner_lease, coordinator
+    finally:
+        owner_lease.close()
+        context.close()
 
 
 def _wait_for(path: Path, process, timeout: float = 5.0) -> None:
@@ -31,37 +40,8 @@ def _wait_for(path: Path, process, timeout: float = 5.0) -> None:
         time.sleep(0.01)
 
 
-def _holding_child_script(
-    root: Path,
-    ready: Path,
-    release: Path,
-    method: str,
-    resource: str | None,
-) -> str:
-    timeout = 0.1 if method == "control_lane" else 1.0
-    lease_call = f"coordinator.{method}({resource!r}, timeout={timeout})" if resource is not None else f"coordinator.{method}(timeout={timeout})"
-    return "\n".join(
-        [
-            "import time",
-            "from pathlib import Path",
-            "from hedge_fund.runtime.admission import AdmissionCoordinator, OwnershipState",
-            "from hedge_fund.runtime.root import RootContext",
-            f"context = RootContext.open({str(root)!r})",
-            "coordinator = AdmissionCoordinator(context, ownership=OwnershipState.VERIFIED)",
-            f"lease = {lease_call}",
-            "lease.__enter__()",
-            f"Path({str(ready)!r}).write_text('ready', encoding='utf-8')",
-            "deadline = time.monotonic() + 10.0",
-            f"while not Path({str(release)!r}).exists() and time.monotonic() < deadline:",
-            "    time.sleep(0.01)",
-            "lease.__exit__(None, None, None)",
-            "context.close()",
-        ]
-    )
-
-
 def test_multi_deployment_acquires_registry_then_sorted_identities(admission_root, monkeypatch):
-    _root, _context, coordinator = admission_root
+    _root, _context, _owner, coordinator = admission_root
     acquired = []
     original_lock = coordinator._lock
 
@@ -79,211 +59,162 @@ def test_multi_deployment_acquires_registry_then_sorted_identities(admission_roo
     assert acquired == ["registry", "deployment:alpha", "deployment:beta"]
 
 
-def test_multi_deployment_rejects_canonical_aliases_before_lock_state(admission_root):
-    root, _context, coordinator = admission_root
+def test_multi_deployment_rejects_canonical_aliases_before_lane_creation(admission_root):
+    root, _context, _owner, coordinator = admission_root
 
     with pytest.raises(AdmissionError):
         with coordinator.multi_deployment(["Alpha", "alpha.yaml"]):
             pass
 
-    assert not (root / "runtime" / "admission").exists()
+    assert not list((root / LOCK_DIRECTORY).glob("deployment-*.lock"))
 
 
-@pytest.mark.parametrize(
-    ("method", "resource"),
-    [("registry_lock", None), ("deployment_lock", "alpha")],
-)
-def test_registry_and_deployment_locks_contend_across_processes(admission_root, owned_test_process, tmp_path, method, resource):
-    root, _context, coordinator = admission_root
-    ready = tmp_path / f"{method}-ready"
-    release = tmp_path / f"{method}-release"
-    child = owned_test_process(_holding_child_script(root, ready, release, method, resource))
-
-    try:
-        _wait_for(ready, child)
-        started = time.monotonic()
-        with pytest.raises(WriterConflict):
-            if resource is None:
-                with coordinator.registry_lock(timeout=0.05):
-                    pass
-            else:
-                with coordinator.deployment_lock(resource, timeout=0.05):
-                    pass
-        assert time.monotonic() - started < 0.5
-    finally:
-        release.write_text("release", encoding="utf-8")
-
-    assert child.wait(timeout=10) == 0
-
-
-def test_independent_fund_runs_while_other_runner_is_reserved(admission_root, owned_test_process, tmp_path):
-    root, _context, coordinator = admission_root
-    ready = tmp_path / "runner-ready"
-    release = tmp_path / "runner-release"
-    child = owned_test_process(
-        _holding_child_script(
-            root,
-            ready,
-            release,
-            "runner_reservation",
-            "alpha",
-        )
-    )
-
-    try:
-        _wait_for(ready, child)
-        with coordinator.control_lane("alpha", timeout=0.1):
-            pass
-
-        with pytest.raises(WriterConflict):
-            with coordinator.manual_session("alpha", timeout=0.05):
-                pass
-
-        with coordinator.manual_session("beta", timeout=0.5):
-            assert child.poll() is None
-    finally:
-        release.write_text("release", encoding="utf-8")
-
-    assert child.wait(timeout=10) == 0
-
-
-def test_crashed_process_releases_execution_lock(admission_root, owned_test_process, tmp_path):
-    root, _context, coordinator = admission_root
-    acquired = tmp_path / "crash-lock-acquired"
+def test_second_process_cannot_claim_root_owner_lease(
+    admission_root,
+    owned_test_process,
+    tmp_path,
+):
+    root, _context, _owner, _coordinator = admission_root
+    result = tmp_path / "owner-conflict"
     script = "\n".join(
         [
-            "import os",
             "from pathlib import Path",
-            "from hedge_fund.runtime.admission import AdmissionCoordinator, OwnershipState",
+            "from hedge_fund.runtime.admission import RootOwnerLease, WriterConflict",
             "from hedge_fund.runtime.root import RootContext",
             f"context = RootContext.open({str(root)!r})",
-            "coordinator = AdmissionCoordinator(context, ownership=OwnershipState.VERIFIED)",
-            "lease = coordinator.execution_lease('alpha', timeout=1.0)",
-            "lease.__enter__()",
-            f"Path({str(acquired)!r}).write_text('locked', encoding='utf-8')",
-            "os._exit(0)",
+            "try:",
+            "    try:",
+            "        RootOwnerLease.acquire(context, timeout=0)",
+            "    except WriterConflict:",
+            f"        Path({str(result)!r}).write_text('conflict', encoding='utf-8')",
+            "    else:",
+            "        raise SystemExit(2)",
+            "finally:",
+            "    context.close()",
         ]
     )
     child = owned_test_process(script)
 
-    _wait_for(acquired, child)
+    _wait_for(result, child)
+
     assert child.wait(timeout=10) == 0
-
-    with coordinator.execution_lease("alpha", timeout=0.5):
-        pass
+    assert result.read_text(encoding="utf-8") == "conflict"
 
 
-@pytest.mark.parametrize(
-    "ownership",
-    [None, OwnershipState.UNKNOWN, OwnershipState.LEGACY],
-)
-def test_unverified_owner_denies_before_creating_lock_state(tmp_path, ownership):
+def test_subject_sessions_conflict_while_controls_remain_independent(admission_root):
+    _root, _context, _owner, coordinator = admission_root
+
+    with coordinator.manual_session("alpha", timeout=0.1):
+        with coordinator.control_lane("alpha", timeout=0.1):
+            pass
+        with pytest.raises(WriterConflict):
+            with coordinator.manual_session("alpha", timeout=0.05):
+                pass
+        with coordinator.manual_session("beta", timeout=0.1):
+            pass
+
+
+def test_closed_owner_lease_denies_writes_and_reacquisition_restores_them(admission_root):
+    _root, context, owner_lease, coordinator = admission_root
+    owner_lease.close()
+
+    with pytest.raises(OwnershipUnknown):
+        with coordinator.registry_lock(timeout=0):
+            pass
+
+    replacement = RootOwnerLease.acquire(context, timeout=0)
+    try:
+        replacement_coordinator = AdmissionCoordinator(
+            context,
+            owner_lease=replacement,
+        )
+        with replacement_coordinator.registry_lock(timeout=0):
+            pass
+    finally:
+        replacement.close()
+
+
+def test_unowned_root_denies_mutations_without_creating_private_state(tmp_path):
     root = tmp_path / "root"
     root.mkdir()
 
     with RootContext.open(root) as context:
-        if ownership is None:
-            coordinator = AdmissionCoordinator(context)
-        else:
-            coordinator = AdmissionCoordinator(context, ownership=ownership)
-
+        observer = AdmissionCoordinator(context)
         with pytest.raises(OwnershipUnknown):
-            with coordinator.manual_session("alpha", timeout=0):
+            with observer.manual_session("alpha", timeout=0):
                 pass
 
-    assert not (root / "runtime" / "admission").exists()
+    assert not (root / PRIVATE_ROOT).exists()
 
 
-def test_registry_read_lock_uses_existing_lock_without_writer_authority(tmp_path):
-    root = tmp_path / "root"
-    root.mkdir()
+def test_registry_read_lock_uses_existing_lock_without_owner_authority(admission_root):
+    root, context, _owner, writer = admission_root
+    with writer.registry_lock(timeout=0):
+        pass
+    observer = AdmissionCoordinator(context)
+    before = {path.relative_to(root) for path in root.rglob("*")}
 
-    with RootContext.open(root) as context:
-        writer = AdmissionCoordinator(context, ownership=OwnershipState.VERIFIED)
-        with writer.registry_lock(timeout=0):
-            pass
-        observer = AdmissionCoordinator(context, ownership=OwnershipState.UNKNOWN)
-        before = {path.relative_to(root) for path in root.rglob("*")}
+    with observer.registry_read_lock(timeout=0):
+        pass
 
-        with observer.registry_read_lock(timeout=0):
-            pass
-
-        after = {path.relative_to(root) for path in root.rglob("*")}
-
+    after = {path.relative_to(root) for path in root.rglob("*")}
     assert after == before
 
 
-def test_registry_read_lock_does_not_create_missing_lock_state(tmp_path):
+def test_registry_read_lock_does_not_create_missing_private_state(tmp_path):
     root = tmp_path / "root"
     root.mkdir()
 
     with RootContext.open(root) as context:
-        observer = AdmissionCoordinator(context, ownership=OwnershipState.UNKNOWN)
-
+        observer = AdmissionCoordinator(context)
         with pytest.raises(AdmissionError):
             with observer.registry_read_lock(timeout=0):
                 pass
 
-    assert not (root / LOCK_DIRECTORY).exists()
+    assert not (root / PRIVATE_ROOT).exists()
 
 
 @pytest.mark.parametrize("identity", ["../outside", r"C:\outside", ""])
-def test_invalid_deployment_identity_denies_before_lock_state(admission_root, identity):
-    root, _context, coordinator = admission_root
+def test_invalid_deployment_identity_denies_before_lane_creation(admission_root, identity):
+    root, _context, _owner, coordinator = admission_root
 
     with pytest.raises(AdmissionError):
         with coordinator.execution_lease(identity):
             pass
 
-    assert not (root / "runtime" / "admission").exists()
+    assert not list((root / LOCK_DIRECTORY).glob("execution-*.lock"))
 
 
 @pytest.mark.parametrize(
     "timeout",
     [True, -0.01, float("nan"), float("inf"), 5.01],
 )
-def test_invalid_manual_timeout_denies_before_lock_state(admission_root, timeout):
-    root, _context, coordinator = admission_root
+def test_invalid_manual_timeout_denies_before_lane_creation(admission_root, timeout):
+    root, _context, _owner, coordinator = admission_root
 
     with pytest.raises(ValueError):
         with coordinator.manual_session("alpha", timeout=timeout):
             pass
 
-    assert not (root / "runtime" / "admission").exists()
+    assert not list((root / LOCK_DIRECTORY).glob("runner-*.lock"))
 
 
 def test_control_lane_timeout_has_a_hard_upper_bound(admission_root):
-    root, _context, coordinator = admission_root
+    root, _context, _owner, coordinator = admission_root
 
     with pytest.raises(ValueError):
         with coordinator.control_lane("alpha", timeout=0.51):
             pass
 
-    assert not (root / "runtime" / "admission").exists()
+    assert not list((root / LOCK_DIRECTORY).glob("control-*.lock"))
 
 
-def test_control_lane_is_independent_and_has_a_bounded_wait(admission_root, owned_test_process, tmp_path):
-    root, _context, coordinator = admission_root
-    ready = tmp_path / "control-ready"
-    release = tmp_path / "control-release"
-    child = owned_test_process(
-        _holding_child_script(
-            root,
-            ready,
-            release,
-            "control_lane",
-            "alpha",
-        )
-    )
+def test_control_lane_conflict_has_a_bounded_wait(admission_root):
+    _root, _context, _owner, coordinator = admission_root
 
-    try:
-        _wait_for(ready, child)
+    with coordinator.control_lane("alpha", timeout=0):
         started = time.monotonic()
         with pytest.raises(WriterConflict):
             with coordinator.control_lane("alpha", timeout=0.05):
                 pass
         assert time.monotonic() - started < 0.5
-    finally:
-        release.write_text("release", encoding="utf-8")
-
-    assert child.wait(timeout=10) == 0

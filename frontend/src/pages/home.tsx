@@ -52,7 +52,7 @@ export function HomePage() {
       <PageHeader
         eyebrow="Desk overview · local workspace"
         title="Research with a clear view of risk."
-        description="Inspect canonical mandates, paper ledgers, and saved research. This desk does not execute orders or fetch live quotes."
+        description="Inspect canonical mandates, paper ledgers, and saved research. No orders; quote refresh requires an explicit network-authorized action."
         actions={
           <>
             <Button asChild variant="secondary">

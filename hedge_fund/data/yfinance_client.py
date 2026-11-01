@@ -1,9 +1,6 @@
-"""yfinance-backed DataClient — the free data provider.
+"""yfinance-backed DataClient — credential-free default.
 
-Selected with ``HEDGE_FUND_DATA_PROVIDER=yfinance`` (see
-``hedge_fund.data.make_data_client``). Uses Yahoo Finance via the optional
-``yfinance`` package (``poetry install -E yfinance``): no API key, no
-credits.
+Uses Yahoo Finance. No API key or credits.
 
 .. warning::
 
@@ -12,9 +9,8 @@ credits.
    filters statement periods by ``end_date``, but a quarter's numbers only
    become public weeks after the period ends, and Yahoo folds restatements
    into history. A backtest on this data leaks the future into the past.
-   Use this client for day-to-day paper trading and iteration; run final
-   backtest validation against the paid Financial Datasets provider
-   (``HEDGE_FUND_DATA_PROVIDER=fd``), which filters on SEC filing dates.
+   Use this client for day-to-day paper trading and iteration. Financial
+   Datasets is an explicit paid provider (``HEDGE_FUND_DATA_PROVIDER=fd``).
 
 Failure semantics follow the DataClient protocol: rate-limit, network and
 server failures RAISE ``DataClientError``; empty is returned only when the
@@ -103,8 +99,7 @@ class YFinanceClient:
     def __init__(self, timeout: float = 30.0) -> None:
         if yf is None:
             raise ImportError(
-                "HEDGE_FUND_DATA_PROVIDER=yfinance needs the optional "
-                "dependency: `poetry install -E yfinance` or `pip install yfinance`"
+                "yfinance runtime dependency is missing; reinstall application dependencies"
             )
         self._timeout = timeout
         # yfinance's default is to log exceptions and return empty frames,

@@ -4,30 +4,37 @@ from __future__ import annotations
 
 import hmac
 import ipaddress
+import re
 import secrets
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, Response
 
 from hedge_fund.runtime.root import RootContext
 from hedge_fund.web.schemas import (
     ApprovalRequest,
-    BacktestRequest,
     CapabilitiesResponse,
     CredentialRequest,
     DeployRequest,
     HaltRequest,
     MandateCreateRequest,
     ModelRequest,
+    OperationAcceptRequest,
+    OperationCancelRequest,
+    OperationPreviewRequest,
+    RuntimeSettingsRequest,
+    ValuationRefreshRequest,
 )
 from hedge_fund.web.services import DeskService, ServiceError
 
 _SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
 _CSP = "default-src 'self'; " "script-src 'self'; " "style-src 'self' 'unsafe-inline'; " "img-src 'self' data:; " "font-src 'self'; " "connect-src 'self'; " "object-src 'none'; " "base-uri 'self'; " "frame-ancestors 'none'; " "form-action 'self'"
 _MAX_REQUEST_BODY_BYTES = 1_000_000
+_SESSION_COOKIE = "aihf_operator_session"
+_SESSION_MAX_AGE_SECONDS = 12 * 60 * 60
 
 
 class RequestBodyLimitMiddleware:
@@ -99,8 +106,11 @@ def create_app(
     data_client_factory=None,
     fund_factory=None,
     root_context: RootContext | None = None,
+    container_bind: bool = False,
 ) -> FastAPI:
     """Create a disk-backed app; reads never initialize or mutate the root."""
+    if type(container_bind) is not bool:
+        raise TypeError("container observer mode must be a boolean")
     service = DeskService(
         root,
         allow_writes=allow_writes,
@@ -109,8 +119,9 @@ def create_app(
         data_client_factory=data_client_factory,
         fund_factory=fund_factory,
         root_context=root_context,
+        container_observer=container_bind,
     )
-    token = secrets.token_urlsafe(32) if allow_writes else None
+    token = secrets.token_urlsafe(32) if service.allow_writes else None
     requested_static = Path(static_dir) if static_dir is not None else Path(__file__).with_name("static")
     static_root = requested_static.resolve() if requested_static.is_dir() else None
     app = FastAPI(
@@ -124,26 +135,71 @@ def create_app(
     app.state.service = service
     app.state.capability_token = token
     app.state.static_root = static_root
+    app.state.container_observer = container_bind
+    app.state.session_signing_key = secrets.token_bytes(32)
     app.add_event_handler("shutdown", service.close)
 
     @app.middleware("http")
     async def local_boundary(request: Request, call_next):
         host = request.headers.get("host", "")
         parsed_host = _parse_loopback_host(host)
+        operator_session = _read_operator_session(
+            request.cookies.get(_SESSION_COOKIE),
+            app.state.session_signing_key,
+        )
+        request.state.operator_session = operator_session
         if parsed_host is None:
             response = JSONResponse({"detail": "Host must be a loopback address."}, status_code=403)
         else:
             origin = request.headers.get("origin")
             if origin is not None and not _same_origin(origin, host, request.url.scheme):
                 response = JSONResponse({"detail": "Origin must match the loopback host."}, status_code=403)
-            elif request.method.upper() not in _SAFE_METHODS and not allow_writes:
+            elif request.method.upper() not in _SAFE_METHODS and not service.allow_writes:
                 response = JSONResponse({"detail": "Write capability is disabled for this server."}, status_code=403)
+            elif (
+                request.method.upper() not in _SAFE_METHODS
+                and service.allow_writes
+                and not _is_loopback_peer(request.client.host if request.client else None)
+            ):
+                response = JSONResponse(
+                    {"detail": "Writable server requires a loopback client connection."},
+                    status_code=403,
+                )
+            elif (
+                request.method.upper() not in _SAFE_METHODS
+                and service.allow_writes
+                and operator_session is None
+            ):
+                response = JSONResponse(
+                    {"detail": "A valid server-owned operator session is required."},
+                    status_code=403,
+                )
             elif request.method.upper() not in _SAFE_METHODS and origin is None:
                 response = JSONResponse({"detail": "Mutation requires a same-origin request."}, status_code=403)
             elif request.method.upper() not in _SAFE_METHODS and not _valid_token(request.headers.get("x-csrf-token"), token):
                 response = JSONResponse({"detail": "Mutation token is missing or invalid."}, status_code=403)
             else:
                 response = await call_next(request)
+        if (
+            operator_session is None
+            and service.allow_writes
+            and _is_loopback_peer(request.client.host if request.client else None)
+            and parsed_host is not None
+        ):
+            session_id = secrets.token_hex(16)
+            signature = _sign_operator_session(
+                session_id,
+                app.state.session_signing_key,
+            )
+            response.set_cookie(
+                _SESSION_COOKIE,
+                f"{session_id}.{signature}",
+                max_age=_SESSION_MAX_AGE_SECONDS,
+                httponly=True,
+                secure=request.url.scheme == "https",
+                samesite="strict",
+                path="/",
+            )
         _security_headers(response, request.url.path)
         return response
 
@@ -196,6 +252,14 @@ def create_app(
     def paper_detail(name: str):
         return service.paper_detail(name)
 
+    @app.get("/api/paper/{name}/valuation")
+    def paper_valuation(name: str):
+        return service.get_valuation(name)
+
+    @app.post("/api/paper/{name}/valuation")
+    def refresh_paper_valuation(name: str, request: ValuationRefreshRequest):
+        return service.refresh_valuation(name, request)
+
     @app.get("/api/paper/{name}/sessions")
     def paper_sessions(name: str):
         detail = service.paper_detail(name)
@@ -229,25 +293,43 @@ def create_app(
     def research_report(report_id: str):
         return service.research_report(report_id)
 
-    @app.post("/api/backtests", status_code=202)
-    def start_backtest(request: BacktestRequest):
-        return service.submit_backtest(request)
+    @app.post("/api/operations/preview", status_code=201)
+    def operation_preview(request: OperationPreviewRequest, http_request: Request):
+        return service.create_operation_preview(
+            request,
+            operator_session=http_request.state.operator_session,
+        )
 
-    @app.get("/api/jobs")
-    def jobs():
-        return service.list_jobs()
+    @app.post("/api/operations", status_code=202)
+    def accept_operation(request: OperationAcceptRequest, http_request: Request):
+        return service.accept_operation(
+            request,
+            operator_session=http_request.state.operator_session,
+        )
 
-    @app.get("/api/jobs/{job_id}")
-    def job(job_id: str):
-        return service.get_job(job_id)
+    @app.get("/api/operations")
+    def operations(limit: int = Query(default=100, ge=1, le=100)):
+        return service.list_operations(limit=limit)
 
-    @app.post("/api/jobs/{job_id}/cancel")
-    def cancel_job(job_id: str):
-        return service.cancel_job(job_id)
+    @app.get("/api/operations/{operation_id}")
+    def operation(operation_id: str):
+        return service.get_operation(operation_id)
+
+    @app.post("/api/operations/{operation_id}/cancel")
+    def cancel_operation(operation_id: str, request: OperationCancelRequest):
+        return service.cancel_operation(operation_id, request)
 
     @app.get("/api/settings")
     def settings():
         return service.settings()
+
+    @app.put("/api/settings")
+    def save_settings(request: RuntimeSettingsRequest):
+        return service.save_runtime_settings(request)
+
+    @app.get("/api/credentials/status")
+    def credential_status():
+        return service.credential_status()
 
     @app.post("/api/settings/model")
     def set_model(request: ModelRequest):
@@ -256,6 +338,13 @@ def create_app(
     @app.post("/api/settings/credentials")
     def set_credential(request: CredentialRequest):
         return service.set_credential(request)
+
+    @app.delete("/api/settings/credentials/{provider}")
+    def delete_credential(
+        provider: str,
+        expected_version: int = Query(ge=0, le=2**31 - 1),
+    ):
+        return service.delete_credential(provider, expected_version=expected_version)
 
     @app.get("/")
     def index():
@@ -291,6 +380,31 @@ def _parse_loopback_host(value: str) -> tuple[str, int | None] | None:
         except ValueError:
             return None
     return normalized, port
+
+
+def _is_loopback_peer(value: str | None) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        return ipaddress.ip_address(value).is_loopback
+    except ValueError:
+        return False
+
+
+def _sign_operator_session(session_id: str, key: bytes) -> str:
+    return hmac.new(key, session_id.encode("ascii"), "sha256").hexdigest()
+
+
+def _read_operator_session(value: str | None, key: bytes) -> str | None:
+    if not isinstance(value, str):
+        return None
+    parts = value.split(".")
+    if len(parts) != 2 or not re.fullmatch(r"[a-f0-9]{32}", parts[0]):
+        return None
+    if not re.fullmatch(r"[a-f0-9]{64}", parts[1]):
+        return None
+    expected = _sign_operator_session(parts[0], key)
+    return parts[0] if hmac.compare_digest(parts[1], expected) else None
 
 
 def _same_origin(origin: str, host: str, request_scheme: str) -> bool:

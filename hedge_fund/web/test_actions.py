@@ -1,4 +1,5 @@
 import json
+from contextlib import contextmanager
 
 import pytest
 import yaml
@@ -138,11 +139,14 @@ def test_approval_is_rejected_when_control_is_unreadable(write_client, demo_root
     assert not (demo_root / "paper" / "demo-quality" / "pending-approval.json").exists()
 
 
-def test_halt_and_resume_reuse_the_existing_ledger_control(tmp_path):
+def test_halt_reuses_ledger_control_and_resume_requires_reconciliation(tmp_path):
     from hedge_fund.web.demo import seed_demo
 
     root = seed_demo(tmp_path / "writes")
-    with TestClient(create_app(root=root, allow_writes=True, demo=True)) as client:
+    with TestClient(
+        create_app(root=root, allow_writes=True, demo=True),
+        client=("127.0.0.1", 50000),
+    ) as client:
         token = client.get("/api/capabilities", headers={"host": "127.0.0.1"}).json()["mutation_token"]
         headers = {
             "host": "127.0.0.1",
@@ -156,9 +160,10 @@ def test_halt_and_resume_reuse_the_existing_ledger_control(tmp_path):
     ledger = Ledger(root / "paper" / "demo-quality")
     assert halted.status_code == 200
     assert current["halted"] == "operator pause"
-    assert resumed.status_code == 200
-    assert ledger.halted() is None
-    assert [event["kind"] for event in ledger.events()][-2:] == ["halt", "resume"]
+    assert resumed.status_code == 409
+    assert "reconciliation receipt" in resumed.json()["detail"]
+    assert ledger.halted() == "operator pause"
+    assert [event["kind"] for event in ledger.events()][-1:] == ["halt"]
 
 
 def test_halt_works_for_corrupt_ledger_but_resume_still_requires_valid_replay(demo_root):
@@ -166,7 +171,10 @@ def test_halt_works_for_corrupt_ledger_but_resume_still_requires_valid_replay(de
     record = json.loads(path.read_text(encoding="utf-8"))
     record["cash"] = 1
     path.write_text(json.dumps(record), encoding="utf-8")
-    with TestClient(create_app(root=demo_root, allow_writes=True, demo=True)) as client:
+    with TestClient(
+        create_app(root=demo_root, allow_writes=True, demo=True),
+        client=("127.0.0.1", 50000),
+    ) as client:
         token = client.get("/api/capabilities", headers={"host": "127.0.0.1"}).json()["mutation_token"]
         headers = {
             "host": "127.0.0.1",
@@ -194,7 +202,7 @@ def test_protected_name_guard_runs_before_fund_adapter(tmp_path, monkeypatch):
         raise AssertionError("protected fund adapter must not run")
 
     monkeypatch.setattr(service, "_paper_control_state", forbidden)
-    with TestClient(app) as client:
+    with TestClient(app, client=("127.0.0.1", 50000)) as client:
         token = client.get("/api/capabilities", headers={"host": "127.0.0.1"}).json()["mutation_token"]
         response = client.post(
             "/api/paper/WATCHTOWER/halt",
@@ -231,7 +239,7 @@ def test_protected_windows_aliases_are_rejected_before_control_writes(tmp_path, 
         raise AssertionError("protected path must not reach a paper adapter")
 
     monkeypatch.setattr(service, "_paper_control_state", forbidden)
-    with TestClient(app) as client:
+    with TestClient(app, client=("127.0.0.1", 50000)) as client:
         token = client.get("/api/capabilities", headers={"host": "127.0.0.1"}).json()["mutation_token"]
         headers = {
             "host": "127.0.0.1",
@@ -249,6 +257,74 @@ def test_protected_windows_aliases_are_rejected_before_control_writes(tmp_path, 
     assert control.read_bytes() == before_control
     assert events.read_bytes() == before_events
     assert not (fund_dir / "pending-approval.json").exists()
+
+
+@pytest.mark.parametrize("action", ["approve", "halt", "resume"])
+def test_nonlocal_broker_mutations_stop_before_ledger_adapter(demo_root, monkeypatch, action):
+    directory = demo_root / "paper" / "demo-quality"
+    deployed_path = directory / "fund.yaml"
+    deployed = yaml.safe_load(deployed_path.read_text(encoding="utf-8"))
+    deployed["broker"] = "saxo"
+    deployed_path.write_text(yaml.safe_dump(deployed, sort_keys=False), encoding="utf-8")
+    pending = Ledger(directory).replay(
+        deployed["spec"]["capital"],
+        full=True,
+    ).pending
+    assert pending is not None
+    request = ApprovalRequest(
+        verdict="approve",
+        decision_as_of=pending.as_of,
+        source_record_hash=Ledger(directory).replay(
+            deployed["spec"]["capital"],
+            full=True,
+        ).prev_hash,
+    )
+    service = DeskService(demo_root, allow_writes=True)
+    called = False
+
+    def forbidden(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("non-local paper mutation reached the ledger adapter")
+
+    monkeypatch.setattr("hedge_fund.web.services.Ledger", forbidden)
+    try:
+        with pytest.raises(ServiceError) as rejected:
+            if action == "approve":
+                service.approve("demo-quality", request)
+            elif action == "halt":
+                service.halt_fund("demo-quality", "must not write")
+            else:
+                service.resume_fund("demo-quality")
+    finally:
+        service.close()
+
+    assert rejected.value.status_code == 403
+    assert not called
+
+
+def test_web_halt_enters_shared_control_lane(tmp_path, monkeypatch):
+    from hedge_fund.web.demo import seed_demo
+
+    root = seed_demo(tmp_path / "writes")
+    service = DeskService(root, allow_writes=True)
+    acquired = []
+    original = service._admission.control_lane
+
+    @contextmanager
+    def observe(identity, *, timeout):
+        acquired.append((identity, timeout))
+        with original(identity, timeout=timeout):
+            yield
+
+    monkeypatch.setattr(service._admission, "control_lane", observe)
+    try:
+        result = service.halt_fund("demo-quality", "operator pause")
+    finally:
+        service.close()
+
+    assert result == {"name": "demo-quality", "halted": True}
+    assert acquired == [("demo-quality", 0.1)]
 
 
 def test_capabilities_explain_deferred_runner_ownership(tmp_path):

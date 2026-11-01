@@ -30,7 +30,7 @@ def write_client(demo_root):
         allow_writes=True,
         demo=True,
     )
-    with TestClient(app) as client:
+    with TestClient(app, client=("127.0.0.1", 50000)) as client:
         capabilities = client.get(
             "/api/capabilities",
             headers={"host": "127.0.0.1"},

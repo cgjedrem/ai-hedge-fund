@@ -30,6 +30,22 @@ export async function apiPost<T>(path: string, body?: unknown): Promise<T> {
   });
 }
 
+export async function apiPut<T>(path: string, body: unknown): Promise<T> {
+  const headers = new Headers({ "Content-Type": "application/json" });
+  if (mutationToken) headers.set("X-CSRF-Token", mutationToken);
+  return request<T>(path, {
+    method: "PUT",
+    headers,
+    body: JSON.stringify(body),
+  });
+}
+
+export async function apiDelete<T>(path: string): Promise<T> {
+  const headers = new Headers();
+  if (mutationToken) headers.set("X-CSRF-Token", mutationToken);
+  return request<T>(path, { method: "DELETE", headers });
+}
+
 async function request<T>(path: string, init: RequestInit): Promise<T> {
   if (!path.startsWith("/api/")) {
     throw new Error("API paths must stay under /api.");

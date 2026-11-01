@@ -293,7 +293,10 @@ class PaperScreen(Screen):
         def resume() -> None:
             if demand_run_keys(self.app, resume):
                 try:
-                    spawn_runner(snap.directory)
+                    spawn_runner(
+                        snap.directory,
+                        root=paths.root_context().path,
+                    )
                 except OSError as exc:
                     self.notify(f"Could not start {name}: {exc}", severity="error")
                     return

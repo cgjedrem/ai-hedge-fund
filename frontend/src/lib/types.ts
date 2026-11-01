@@ -3,6 +3,10 @@ export interface Capabilities {
   read_only: boolean;
   writes: boolean;
   network: boolean;
+  local_operator_only: boolean;
+  csrf_authenticates_users: false;
+  container_observer: boolean;
+  write_unavailable_reason: string | null;
   protected_names: string[];
   mutation_token: string | null;
   deferred_actions: Record<string, string>;
@@ -120,6 +124,39 @@ export interface Position {
   market_value: number | null;
 }
 
+export interface ValuationQuote {
+  ticker: string;
+  shares: string;
+  price: string | null;
+  quote_time: string | null;
+  observation_age_seconds: number | null;
+  status: "quoted" | "missing" | "stale" | "error";
+  freshness: "unknown";
+  reason: string | null;
+}
+
+export interface LiveValuation {
+  status: "unavailable" | "estimated" | "partial" | "stale" | "obsolete";
+  value: string | null;
+  partial_estimate: string | null;
+  as_of: string | null;
+  provenance: string | null;
+  expected_head: string | null;
+  recorded_nav: string | null;
+  request_id?: string;
+  deployment?: string;
+  coverage: {
+    total: number;
+    quoted: number;
+    usable: number;
+    missing: number;
+    stale: number;
+    errors: number;
+  };
+  quotes: ValuationQuote[];
+  reason: string;
+}
+
 export interface CurvePoint {
   session: string;
   nav: number;
@@ -205,13 +242,7 @@ export interface PaperSnapshot {
   halt_state: HaltState;
   ledger: { ok: boolean; error: string | null };
   runner: RunnerState;
-  live_value: {
-    status: string;
-    value: number | null;
-    as_of: string | null;
-    provenance: string | null;
-    reason: string;
-  };
+  live_value: LiveValuation;
   scorecard: ScoreMetrics | null;
   scorecard_error: string | null;
 }
@@ -326,10 +357,94 @@ export interface Job {
   cancel_requested: boolean;
 }
 
+export type OperationStatus =
+  | "accepted"
+  | "running"
+  | "completed"
+  | "failed"
+  | "interrupted"
+  | "cancel-requested"
+  | "cancelled";
+
+export interface BacktestPayload {
+  fund: string;
+  universe: string[];
+  start: string;
+  end: string;
+  provider: string;
+  model: string;
+  mandate_hash: string;
+}
+
+export interface Operation {
+  operation_id: string;
+  request_id: string;
+  action: string;
+  subject_id: string;
+  capture_id: string;
+  capture_digest: string;
+  status: OperationStatus;
+  created_at: string;
+  updated_at: string;
+  payload: BacktestPayload;
+  result: Record<string, unknown> | null;
+  progress: number;
+  id: string;
+  fund: string;
+  provider: string | null;
+  model: string | null;
+  report_id: string | null;
+  error: string | null;
+  cancel_requested: boolean;
+  status_url: string;
+}
+
+export interface OperationPreview {
+  preview_id: string;
+  preview_digest: string;
+  confirmation_token: string;
+  action: string;
+  subject_id: string;
+  expected_head: string | null;
+  due_set: string[];
+  capture_id: string;
+  capture_digest: string;
+  expires_at: string;
+  payload: BacktestPayload;
+  capture: Record<string, unknown>;
+  estimate: {
+    maximum_model_calls: number;
+    maximum_cost_usd: number | null;
+    market_data_provider: string;
+  };
+  warnings: string[];
+}
+
 export interface Settings {
   model: string;
+  llm_provider: string;
+  endpoint: string | null;
+  timeout_seconds: number;
+  parameters: Record<string, number>;
+  version: number;
+  provenance: Record<string, "default" | "persisted" | "environment" | "launch">;
+  settings_error: string | null;
   models: ModelOption[];
-  providers: { provider: string; requires_key: boolean; configured: boolean }[];
+  providers: { provider: string; requires_key: boolean; configured: boolean; version: number }[];
   data_provider: string;
+  data_providers: { id: string; label: string }[];
+  active_captures: {
+    capture_id: string;
+    subject_id: string;
+    status: "accepted" | "running" | "cancel-requested";
+    capture_details_available: boolean;
+    settings_version: number | null;
+    data_provider: string | null;
+    llm_provider: string | null;
+    model: string | null;
+    endpoint: string | null;
+    restart_needed: boolean | null;
+  }[];
+  active_captures_available: boolean;
   network_enabled: boolean;
 }

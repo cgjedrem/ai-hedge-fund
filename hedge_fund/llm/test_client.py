@@ -119,6 +119,26 @@ def test_temperature_none_keeps_provider_default(keyed):
     assert llm._chat.temperature is None
 
 
+def test_ollama_receives_captured_generation_context_and_endpoint(monkeypatch):
+    monkeypatch.setenv("OLLAMA_NUM_CTX", "4096")
+    llm = make_llm(
+        "gemma3:4b",
+        timeout=17,
+        max_tokens=1024,
+        temperature=0.4,
+        top_p=0.8,
+        context_size=16384,
+        endpoint="http://127.0.0.1:11434",
+        use_environment=False,
+    )
+
+    assert llm._chat.num_ctx == 16384
+    assert llm._chat.num_predict == 1024
+    assert llm._chat.temperature == 0.4
+    assert llm._chat.top_p == 0.8
+    assert llm._chat.base_url == "http://127.0.0.1:11434"
+
+
 def test_typesafe_accepts_and_ignores_temperature(monkeypatch):
     """TypeSafe has no sampling knob; the factory takes the kwarg and drops it."""
     monkeypatch.delenv("HEDGE_FUND_LLM_MODEL", raising=False)

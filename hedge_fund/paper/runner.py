@@ -1,9 +1,9 @@
 """run — the loop a paper fund lives in when nobody is watching.
 
-    aihf paper run <name>
+    aihf --root <root> paper run <name>
 
-Any fund can be advanced a session at a time by hand (the app, `aihf paper
-tick`). This loop does the same thing unattended: it sleeps until the fund's
+Any fund can be advanced by hand with `aihf --root <root> paper tick`. This
+loop sleeps until the fund's next session is due, advances it, then sleeps again.
 next session is due, advances it through `_run` (the path a tick takes),
 and goes back to sleep. The cadence decides what "due" means.
 
@@ -258,14 +258,27 @@ def stop_runner(directory: str | Path) -> bool:
 _RUNNER_LOG = "runner.log"  # where a runner started from the app writes its console
 
 
-def spawn_runner(directory: Path) -> int:
-    """Start `aihf paper run <name>` as its own session so it survives the
-    app closing; its console goes to runner.log in the fund directory. The
-    runner writes runner.pid itself once it is up. Returns the child's pid."""
+def spawn_runner(directory: Path, *, root: Path) -> int:
+    """Start detached runner child under fixed root; return child PID."""
+    if not isinstance(directory, Path) or not isinstance(root, Path):
+        raise TypeError("runner directory and root must be paths")
+    if not directory.is_absolute() or not root.is_absolute():
+        raise ValueError("runner directory and root must be absolute")
+    if directory.parent != root / "paper":
+        raise ValueError("runner directory is outside the configured root")
     log = (directory / _RUNNER_LOG).open("a")
     with log:
         child = subprocess.Popen(
-            [sys.executable, "-m", "hedge_fund.run", "paper", "run", directory.name],
+            [
+                sys.executable,
+                "-m",
+                "hedge_fund.run",
+                "--root",
+                str(root),
+                "paper",
+                "run",
+                directory.name,
+            ],
             stdin=subprocess.DEVNULL,
             stdout=log,
             stderr=subprocess.STDOUT,

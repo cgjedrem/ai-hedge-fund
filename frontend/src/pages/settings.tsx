@@ -16,7 +16,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { apiPost } from "@/lib/api";
+import { apiDelete, apiPost, apiPut } from "@/lib/api";
 import { useDesk, useResource } from "@/lib/hooks";
 import type { Settings } from "@/lib/types";
 
@@ -25,49 +25,131 @@ export function SettingsPage() {
   const resource = useResource<Settings>("/api/settings");
   const settings = resource.data;
   const [selectedModel, setSelectedModel] = useState("");
+  const [dataProvider, setDataProvider] = useState("");
+  const [endpoint, setEndpoint] = useState("");
+  const [timeoutSeconds, setTimeoutSeconds] = useState("");
+  const [maxTokens, setMaxTokens] = useState("");
+  const [contextSize, setContextSize] = useState("");
+  const [temperature, setTemperature] = useState("");
+  const [topP, setTopP] = useState("");
   const [provider, setProvider] = useState("");
   const [credential, setCredential] = useState("");
-  const [savingModel, setSavingModel] = useState(false);
+  const [savingSettings, setSavingSettings] = useState(false);
   const [savingCredential, setSavingCredential] = useState(false);
   const [feedback, setFeedback] = useState<{ tone: "danger" | "neutral"; message: string } | null>(null);
   const canWrite = capabilities?.writes === true;
   const credentialProviders = settings?.providers.filter((item) => item.requires_key) ?? [];
+  const selectedCredentialProvider = credentialProviders.find((item) => item.provider === provider);
 
   useEffect(() => {
-    if (settings && !selectedModel) setSelectedModel(settings.model);
+    if (!settings || selectedModel) return;
+    setSelectedModel(settings.model);
+    setDataProvider(settings.data_provider);
+    setEndpoint(settings.endpoint ?? "");
+    setTimeoutSeconds(String(settings.timeout_seconds));
+    setMaxTokens(settings.parameters.max_tokens?.toString() ?? "");
+    setContextSize(settings.parameters.context_size?.toString() ?? "");
+    setTemperature(settings.parameters.temperature?.toString() ?? "");
+    setTopP(settings.parameters.top_p?.toString() ?? "");
   }, [selectedModel, settings]);
 
   useEffect(() => {
     if (credentialProviders.length && !provider) setProvider(credentialProviders[0].provider);
   }, [credentialProviders, provider]);
 
-  async function saveModel(): Promise<void> {
-    if (!selectedModel || !canWrite) return;
-    setSavingModel(true);
+  const timeoutValue = Number(timeoutSeconds);
+  const maxTokensValue = maxTokens.trim() ? Number(maxTokens) : undefined;
+  const contextSizeValue = contextSize.trim() ? Number(contextSize) : undefined;
+  const temperatureValue = temperature.trim() ? Number(temperature) : undefined;
+  const topPValue = topP.trim() ? Number(topP) : undefined;
+  const endpointValue = endpoint.trim() || null;
+  const selectedModelProvider = settings?.models.find((item) => item.id === selectedModel)?.provider;
+  const supportsLocalContext =
+    selectedModelProvider === "Ollama" && !selectedModel.toLowerCase().endsWith(":cloud");
+  const parameters = {
+    ...(maxTokensValue !== undefined ? { max_tokens: maxTokensValue } : {}),
+    ...(supportsLocalContext && contextSizeValue !== undefined
+      ? { context_size: contextSizeValue }
+      : {}),
+    ...(temperatureValue !== undefined ? { temperature: temperatureValue } : {}),
+    ...(supportsLocalContext && topPValue !== undefined ? { top_p: topPValue } : {}),
+  };
+  const runtimeSettingsValid =
+    Number.isFinite(timeoutValue) &&
+    timeoutValue > 0 &&
+    timeoutValue <= 300 &&
+    (maxTokensValue === undefined || (Number.isInteger(maxTokensValue) && maxTokensValue >= 1 && maxTokensValue <= 131072)) &&
+    (!supportsLocalContext ||
+      contextSizeValue === undefined ||
+      (Number.isInteger(contextSizeValue) && contextSizeValue >= 256 && contextSizeValue <= 131072)) &&
+    (temperatureValue === undefined || (Number.isFinite(temperatureValue) && temperatureValue >= 0 && temperatureValue <= 2)) &&
+    (!supportsLocalContext ||
+      topPValue === undefined ||
+      (Number.isFinite(topPValue) && topPValue >= 0 && topPValue <= 1));
+  const runtimeSettingsChanged = settings
+    ? selectedModel !== settings.model ||
+      dataProvider !== settings.data_provider ||
+      endpointValue !== settings.endpoint ||
+      timeoutValue !== settings.timeout_seconds ||
+      Object.keys(parameters).length !== Object.keys(settings.parameters).length ||
+      Object.entries(parameters).some(([name, value]) => settings.parameters[name] !== value)
+    : false;
+
+  async function saveRuntimeSettings(): Promise<void> {
+    if (!selectedModel || !dataProvider || !canWrite || !settings || !runtimeSettingsValid) return;
+    setSavingSettings(true);
     setFeedback(null);
     try {
-      await apiPost("/api/settings/model", { model: selectedModel });
-      setFeedback({ tone: "neutral", message: "Model selection applies to this server process. New research jobs capture the selected model; the shared .env file is unchanged." });
+      await apiPut("/api/settings", {
+        data_provider: dataProvider,
+        model: selectedModel,
+        endpoint: endpointValue,
+        timeout_seconds: timeoutValue,
+        parameters,
+        expected_version: settings.version,
+      });
+      setFeedback({ tone: "neutral", message: "Runtime settings are saved in this root. New operations capture this version; active captures and the shared .env file are unchanged." });
       resource.refresh();
     } catch (cause) {
-      setFeedback({ tone: "danger", message: cause instanceof Error ? cause.message : "Model selection could not be saved." });
+      setFeedback({ tone: "danger", message: cause instanceof Error ? cause.message : "Runtime settings could not be saved." });
     } finally {
-      setSavingModel(false);
+      setSavingSettings(false);
     }
   }
 
   async function saveCredential(): Promise<void> {
-    if (!provider || !credential || !canWrite) return;
+    if (!provider || !credential || !canWrite || !selectedCredentialProvider) return;
     const secret = credential;
     setCredential("");
     setSavingCredential(true);
     setFeedback(null);
     try {
-      await apiPost("/api/settings/credentials", { provider, value: secret });
+      await apiPost("/api/settings/credentials", {
+        provider,
+        value: secret,
+        expected_version: selectedCredentialProvider?.version ?? 0,
+      });
       setFeedback({ tone: "neutral", message: `Credential saved for ${provider}. The value is not returned or displayed.` });
       resource.refresh();
     } catch (cause) {
       setFeedback({ tone: "danger", message: cause instanceof Error ? cause.message : "Credential could not be saved." });
+    } finally {
+      setSavingCredential(false);
+    }
+  }
+
+  async function deleteCredential(): Promise<void> {
+    if (!selectedCredentialProvider?.configured || !canWrite) return;
+    setSavingCredential(true);
+    setFeedback(null);
+    try {
+      await apiDelete(
+        `/api/settings/credentials/${encodeURIComponent(provider)}?expected_version=${selectedCredentialProvider.version}`,
+      );
+      setFeedback({ tone: "neutral", message: `Credential removed for ${provider}. Existing captures retain their prior version.` });
+      resource.refresh();
+    } catch (cause) {
+      setFeedback({ tone: "danger", message: cause instanceof Error ? cause.message : "Credential could not be deleted." });
     } finally {
       setSavingCredential(false);
     }
@@ -83,6 +165,8 @@ export function SettingsPage() {
       {resource.loading ? <div className="mb-5 h-24 animate-pulse rounded-xl border border-border bg-white/[0.025]" /> : null}
       {resource.error ? <div className="mb-5"><ErrorState message={resource.error} /></div> : null}
       {!canWrite && capabilities ? <Alert tone="warning" className="mb-5">Settings are read only. Start a separate server with explicit write consent to save a model or credential.</Alert> : null}
+      {capabilities?.local_operator_only ? <Alert tone="warning" className="mb-5">Local operator only. The CSRF token blocks cross-site requests; it is not authentication against local processes.</Alert> : null}
+      {settings?.settings_error ? <Alert tone="danger" className="mb-5">Private settings or credential status is unavailable. Writes that depend on this state are blocked.</Alert> : null}
       {feedback ? <Alert tone={feedback.tone} className="mb-5">{feedback.message}</Alert> : null}
       {settings ? (
         <>
@@ -96,15 +180,26 @@ export function SettingsPage() {
               <CardHeader>
                 <div className="flex items-center justify-between gap-3">
                   <div>
-                    <p className="text-sm font-semibold text-foreground">LLM model</p>
-                    <p className="mt-1 text-xs text-muted-foreground">Supported provider catalog · applies to this server process</p>
+                    <p className="text-sm font-semibold text-foreground">Runtime configuration</p>
+                    <p className="mt-1 text-xs text-muted-foreground">Effective values · saved to this root</p>
                   </div>
                   <Settings2 className="h-4 w-4 text-accent" />
                 </div>
               </CardHeader>
               <CardContent className="space-y-4">
                 <div className="space-y-2">
-                  <Label htmlFor="model-choice">Model</Label>
+                  <Label htmlFor="data-provider-choice">Data provider</Label>
+                  <Select value={dataProvider || settings.data_provider} onValueChange={setDataProvider} disabled={!canWrite}>
+                    <SelectTrigger id="data-provider-choice"><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      {settings.data_providers.map((item) => (
+                        <SelectItem key={item.id} value={item.id}>{item.label}</SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="model-choice">LLM model</Label>
                   <Select value={selectedModel || settings.model} onValueChange={setSelectedModel} disabled={!canWrite || !settings.models.length}>
                     <SelectTrigger id="model-choice"><SelectValue /></SelectTrigger>
                     <SelectContent>
@@ -113,12 +208,106 @@ export function SettingsPage() {
                       ))}
                     </SelectContent>
                   </Select>
+                  <p className="text-[10px] text-muted-foreground">Provider: {settings.llm_provider} · source: {settings.provenance.llm_provider}</p>
                 </div>
-                <Button className="w-full" variant="secondary" onClick={() => void saveModel()} disabled={!canWrite || savingModel || !selectedModel || selectedModel === settings.model}>
-                  {savingModel ? "Applying…" : "Use model for this process"}
+                <div className="space-y-2">
+                  <Label htmlFor="llm-endpoint">LLM endpoint override</Label>
+                  <Input
+                    id="llm-endpoint"
+                    type="url"
+                    value={endpoint}
+                    onChange={(event) => setEndpoint(event.target.value)}
+                    maxLength={2048}
+                    placeholder="Optional · local HTTP or HTTPS"
+                    disabled={!canWrite || savingSettings}
+                  />
+                  <p className="text-[10px] text-muted-foreground">Source: {settings.provenance.endpoint} · credentials must not appear in the URL.</p>
+                </div>
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <div className="space-y-2">
+                    <Label htmlFor="llm-timeout">Request timeout (seconds)</Label>
+                    <Input
+                      id="llm-timeout"
+                      type="number"
+                      min={1}
+                      max={300}
+                      step={1}
+                      value={timeoutSeconds}
+                      onChange={(event) => setTimeoutSeconds(event.target.value)}
+                      disabled={!canWrite || savingSettings}
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <Label htmlFor="max-tokens">Maximum tokens</Label>
+                    <Input
+                      id="max-tokens"
+                      type="number"
+                      min={1}
+                      max={131072}
+                      step={1}
+                      value={maxTokens}
+                      onChange={(event) => setMaxTokens(event.target.value)}
+                      placeholder="Provider default"
+                      disabled={!canWrite || savingSettings}
+                    />
+                  </div>
+                  {supportsLocalContext ? (
+                    <div className="space-y-2">
+                      <Label htmlFor="context-size">Local context size</Label>
+                      <Input
+                        id="context-size"
+                        type="number"
+                        min={256}
+                        max={131072}
+                        step={256}
+                        value={contextSize}
+                        onChange={(event) => setContextSize(event.target.value)}
+                        placeholder="8192 · Ollama default"
+                        disabled={!canWrite || savingSettings}
+                      />
+                    </div>
+                  ) : null}
+                  <div className="space-y-2">
+                    <Label htmlFor="temperature">Temperature</Label>
+                    <Input
+                      id="temperature"
+                      type="number"
+                      min={0}
+                      max={2}
+                      step={0.1}
+                      value={temperature}
+                      onChange={(event) => setTemperature(event.target.value)}
+                      placeholder="Provider default"
+                      disabled={!canWrite || savingSettings}
+                    />
+                  </div>
+                  {supportsLocalContext ? (
+                    <div className="space-y-2">
+                      <Label htmlFor="top-p">Top-p</Label>
+                      <Input
+                        id="top-p"
+                        type="number"
+                        min={0}
+                        max={1}
+                        step={0.05}
+                        value={topP}
+                        onChange={(event) => setTopP(event.target.value)}
+                        placeholder="Provider default"
+                        disabled={!canWrite || savingSettings}
+                      />
+                    </div>
+                  ) : null}
+                </div>
+                <Button
+                  className="w-full"
+                  variant="secondary"
+                  onClick={() => void saveRuntimeSettings()}
+                  disabled={!canWrite || savingSettings || !selectedModel || !dataProvider || !runtimeSettingsChanged || !runtimeSettingsValid}
+                >
+                  {savingSettings ? "Saving…" : "Save runtime settings for this root"}
                 </Button>
                 <p className="text-[10px] leading-relaxed text-muted-foreground">
-                  Changing this setting does not submit a model request or edit the shared <span className="mono">.env</span> file. New research jobs record the model selected when submitted.
+                  Save makes no provider call and does not edit the shared <span className="mono">.env</span>. New operations capture these values; active captures remain unchanged.
                 </p>
               </CardContent>
             </Card>
@@ -163,9 +352,19 @@ export function SettingsPage() {
                         disabled={!canWrite || savingCredential}
                       />
                     </div>
-                    <Button className="w-full" onClick={() => void saveCredential()} disabled={!canWrite || savingCredential || !credential}>
+                    <Button className="w-full" onClick={() => void saveCredential()} disabled={!canWrite || savingCredential || !credential || !selectedCredentialProvider}>
                       {savingCredential ? "Saving securely…" : "Save credential"}
                     </Button>
+                    {selectedCredentialProvider?.configured ? (
+                      <Button
+                        className="w-full"
+                        variant="secondary"
+                        onClick={() => void deleteCredential()}
+                        disabled={!canWrite || savingCredential}
+                      >
+                        Remove {provider} credential
+                      </Button>
+                    ) : null}
                     <div className="space-y-2 border-t border-border pt-3">
                       <SectionTitle title="Provider readiness" note="Only a configured/missing flag is shown" />
                       {credentialProviders.map((item) => (
@@ -185,6 +384,39 @@ export function SettingsPage() {
               </CardContent>
             </Card>
           </div>
+          {!settings.active_captures_available ? (
+            <Alert tone="warning" className="mt-5">Active capture status is unavailable. Runtime edits do not authorize hot-swapping running work.</Alert>
+          ) : settings.active_captures.length ? (
+            <Card className="mt-5">
+              <CardHeader>
+                <SectionTitle title="Active execution snapshots" note="Running work keeps captured settings and credential versions" />
+              </CardHeader>
+              <CardContent className="grid gap-3 md:grid-cols-2">
+                {settings.active_captures.map((capture) => (
+                  <div key={capture.capture_id} className="rounded-lg border border-border bg-black/10 p-4">
+                    <div className="flex items-start justify-between gap-3">
+                      <div>
+                        <p className="text-sm font-semibold text-foreground">{capture.subject_id}</p>
+                        <p className="mt-1 text-[10px] uppercase tracking-[0.15em] text-muted-foreground">{capture.status}</p>
+                      </div>
+                      <Badge variant={capture.capture_details_available ? "positive" : "warning"}>
+                        {capture.capture_details_available ? "Captured" : "Details unavailable"}
+                      </Badge>
+                    </div>
+                    <div className="mt-4 grid grid-cols-2 gap-3 text-xs">
+                      <div><p className="text-muted-foreground">Model</p><p className="mono mt-1 text-foreground">{capture.model ?? "Unknown"}</p></div>
+                      <div><p className="text-muted-foreground">Data provider</p><p className="mono mt-1 text-foreground">{capture.data_provider ?? "Unknown"}</p></div>
+                      <div><p className="text-muted-foreground">LLM provider</p><p className="mt-1 text-foreground">{capture.llm_provider ?? "Unknown"}</p></div>
+                      <div><p className="text-muted-foreground">Settings version</p><p className="mono mt-1 text-foreground">{capture.settings_version ?? "Unknown"}</p></div>
+                    </div>
+                    {capture.restart_needed ? (
+                      <p className="mt-3 text-[10px] text-warning">New settings apply to later operations; this snapshot remains unchanged.</p>
+                    ) : null}
+                  </div>
+                ))}
+              </CardContent>
+            </Card>
+          ) : null}
           <Card className="mt-5">
             <CardHeader>
               <SectionTitle title="Execution boundary" note="Settings do not change process capabilities after startup." />

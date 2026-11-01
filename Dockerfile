@@ -1,12 +1,11 @@
 # The AI hedge fund in a container: the same app, two ways to run it.
 #
-#   Interactive TUI:   docker build -t aihf . && docker run -it --rm aihf
-#   Headless runner:   docker run -d --restart unless-stopped aihf paper run watchtower
+#   mkdir -p "$PWD/.aihf-demo-data"
+#   Interactive TUI: docker run -it --rm -v "$PWD/.aihf-demo-data:/data" aihf
+#   One local paper tick: docker run --rm -v "$PWD/.aihf-demo-data:/data" aihf --model gemma3:4b paper tick demo-alpha
 #
-# All state — funds, ledgers, caches, and the .env key file — lives in
-# ~/.hedge-fund, which you mount as a volume; nothing is baked into the
-# image. The runner's clock is New-York-aware internally, so the container's
-# own timezone does not matter.
+# Data lives under the explicitly mounted root. Runner example uses local
+# Ollama and free Yahoo data.
 
 FROM python:3.11-slim
 
@@ -23,21 +22,19 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
+RUN mkdir -p /data
 
 # Dependencies first: this layer only rebuilds when the lockfile changes.
 COPY pyproject.toml poetry.lock ./
 RUN pip install poetry==2.5.1 \
-    && poetry install -E yfinance --only main --no-root
+    && poetry install --only main --no-root
 
-# ttyd serves the TUI to a browser tab — used by the tui-web service in
-# docker-compose.linux.yml (e.g. a home server exposing it over Tailscale).
+# ttyd serves the legacy TUI to a loopback browser tab.
 RUN python -c "import urllib.request; urllib.request.urlretrieve('https://github.com/tsl0922/ttyd/releases/download/1.7.7/ttyd.x86_64', '/usr/local/bin/ttyd')" \
     && chmod +x /usr/local/bin/ttyd
 
 COPY hedge_fund ./hedge_fund
 COPY README.md ./
-RUN poetry install -E yfinance --only main
+RUN poetry install --only main
 
-# `aihf` alone starts the TUI; anything after the image name is passed to
-# it, e.g. `docker run ... aihf-image paper run watchtower`.
-ENTRYPOINT ["aihf"]
+ENTRYPOINT ["aihf", "--root", "/data"]

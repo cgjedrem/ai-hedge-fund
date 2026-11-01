@@ -1,5 +1,6 @@
 import threading
 import time
+from concurrent.futures import Future
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 
@@ -8,20 +9,29 @@ import yaml
 from fastapi.testclient import TestClient
 
 from hedge_fund.backtesting.test_fund import FakeAnalyst, FakeDataClient, SERIES
-from hedge_fund.data import data_provider
 from hedge_fund.fund import custom_strategy, Fund, load_spec
-from hedge_fund.llm import DEFAULT_MODEL, load_api_models
-from hedge_fund.llm.registry import is_supported
+from hedge_fund.llm import load_api_models
 from hedge_fund.paper.deployed import load_deployed
 from hedge_fund.pipeline.session import mandate_hash
-from hedge_fund.runtime.admission import AdmissionCoordinator, OwnershipState
+from hedge_fund.runtime.admission import AdmissionCoordinator, RootOwnerLease
 from hedge_fund.runtime.capture import freeze_capture
 from hedge_fund.runtime.configuration import resolve_settings
-from hedge_fund.runtime.operations import OperationStatus, OperationStore
+from hedge_fund.runtime.operations import (
+    OPERATIONS_ROOT,
+    OperationStatus,
+    OperationStore,
+)
 from hedge_fund.runtime.root import RootContext
 from hedge_fund.web.app import create_app
-from hedge_fund.web.jobs import JobCancelled, JobConflict, JobRegistry, OperationJobRegistry
-from hedge_fund.web.schemas import BacktestRequest, DeployRequest, ModelRequest
+from hedge_fund.web.jobs import JobCancelled, OperationJobRegistry
+from hedge_fund.web.schemas import (
+    BacktestRequest,
+    DeployRequest,
+    ModelRequest,
+    OperationAcceptRequest,
+    OperationCancelRequest,
+    OperationPreviewRequest,
+)
 from hedge_fund.web.services import DeskService, ServiceError
 
 _JOB_NOW = datetime(2026, 10, 31, 12, 0, tzinfo=timezone.utc)
@@ -32,12 +42,10 @@ def durable_job_context(tmp_path):
     root = tmp_path / "durable-jobs"
     root.mkdir()
     with RootContext.open(root) as root_context:
-        admission = AdmissionCoordinator(root_context, ownership=OwnershipState.VERIFIED)
-        store = OperationStore(
-            root_context,
-            admission=admission,
-            private_storage_verified=True,
-        )
+        root_context.prepare_private_storage()
+        owner_lease = RootOwnerLease.acquire(root_context)
+        admission = AdmissionCoordinator(root_context, owner_lease=owner_lease)
+        store = OperationStore(root_context, admission=admission)
         capture = freeze_capture(
             root=root_context,
             subject_id="alpha",
@@ -48,7 +56,10 @@ def durable_job_context(tmp_path):
             credential_versions={},
             code_version="synthetic-job-code",
         )
-        yield root_context, store, capture
+        try:
+            yield root_context, store, capture
+        finally:
+            owner_lease.close()
 
 
 def _accepted_operation(store, capture, request_id="job-request"):
@@ -152,7 +163,7 @@ def test_builder_canonical_validation_conflicts_and_deployment(tmp_path):
 
 def test_mandate_api_rejects_library_roster_and_model_weight_drift(tmp_path):
     app = create_app(root=tmp_path, allow_writes=True)
-    with TestClient(app) as client:
+    with TestClient(app, client=("127.0.0.1", 50000)) as client:
         headers = _write_headers(client)
         catalog = client.get("/api/catalog", headers={"host": "127.0.0.1"}).json()
         library = next(strategy for strategy in catalog["strategies"] if len(strategy["models"]) > 1)
@@ -203,7 +214,7 @@ def test_mandate_api_rejects_library_roster_and_model_weight_drift(tmp_path):
 )
 def test_custom_mandate_api_uses_canonical_registry_mode(tmp_path, names, mode):
     app = create_app(root=tmp_path, allow_writes=True)
-    with TestClient(app) as client:
+    with TestClient(app, client=("127.0.0.1", 50000)) as client:
         headers = _write_headers(client)
         payload = _spec(f"custom-{'-'.join(names)}")
         payload["strategies"] = [custom_strategy(names).model_dump(mode="json")]
@@ -216,7 +227,7 @@ def test_custom_mandate_api_uses_canonical_registry_mode(tmp_path, names, mode):
 
 def test_custom_mandate_api_rejects_dollar_neutral_override(tmp_path):
     app = create_app(root=tmp_path, allow_writes=True)
-    with TestClient(app) as client:
+    with TestClient(app, client=("127.0.0.1", 50000)) as client:
         headers = _write_headers(client)
         payload = _spec("custom-neutral")
         payload["strategies"] = [custom_strategy(["druckenmiller"]).model_dump(mode="json")]
@@ -228,47 +239,260 @@ def test_custom_mandate_api_rejects_dollar_neutral_override(tmp_path):
     app.state.service.close()
 
 
-def test_backtest_job_uses_fake_data_and_persists_report(demo_root):
+def test_reviewed_operation_preview_accept_persists_capture_and_report(demo_root, monkeypatch):
     data_client = ManagedFakeDataClient(SERIES)
-    service = DeskService(
-        demo_root,
+    app = create_app(
+        root=demo_root,
         allow_writes=True,
         network_enabled=True,
+        demo=True,
         data_client_factory=lambda: data_client,
         fund_factory=lambda spec: Fund(
             spec,
             models={"earnings-drift": [FakeAnalyst("pead", {"AAPL": 1.0})]},
         ),
     )
-    request = BacktestRequest(
-        fund="demo-quality",
-        universe=["AAPL"],
-        start="2024-06-03",
-        end="2024-06-07",
-        provider=data_provider(),
-        model=service.settings()["model"],
-        mandate_hash=_mandate_fingerprint(demo_root),
-    )
-    job = service.submit_backtest(request)
-    deadline = time.monotonic() + 5
-    while time.monotonic() < deadline:
-        current = service.get_job(job["id"])
-        if current["status"] in {"succeeded", "failed"}:
-            break
-        time.sleep(0.01)
+    store = app.state.service._operation_store
+    assert store is not None
+    apply_calls = []
+    apply_if_current = store.apply_if_current
 
-    assert current["status"] == "succeeded", current
-    assert current["progress"] == 100
+    def observe_effect(operation_id, fence, effect):
+        apply_calls.append(operation_id)
+        return apply_if_current(operation_id, fence, effect)
+
+    monkeypatch.setattr(store, "apply_if_current", observe_effect)
+    try:
+        with TestClient(app, client=("127.0.0.1", 50000)) as client:
+            headers = _write_headers(client)
+            settings = client.get("/api/settings", headers={"host": "127.0.0.1"}).json()
+            local_model = next(model_id for _, model_id, provider in load_api_models() if provider == "Ollama" and not model_id.endswith(":cloud"))
+            selected = client.post(
+                "/api/settings/model",
+                headers=headers,
+                json={"model": local_model, "expected_version": settings["version"]},
+            )
+            assert selected.status_code == 200, selected.text
+            payload = {
+                "fund": "demo-quality",
+                "universe": ["AAPL"],
+                "start": "2024-06-03",
+                "end": "2024-06-07",
+                "provider": "yfinance",
+                "model": local_model,
+                "mandate_hash": _mandate_fingerprint(demo_root),
+            }
+            preview_response = client.post(
+                "/api/operations/preview",
+                headers=headers,
+                json={
+                    "action": "backtest",
+                    "subject_id": "demo-quality",
+                    "expected_head": payload["mandate_hash"],
+                    "payload": payload,
+                },
+            )
+            assert preview_response.status_code == 201, preview_response.text
+            preview = preview_response.json()
+            assert preview["capture"]["settings_version"] == 1
+            assert preview["capture"]["model"] == local_model
+            assert preview["estimate"]["maximum_cost_usd"] is None
+            assert preview["warnings"] == ["Injected test providers only; no live provider call is authorized."]
+            accepted = client.post(
+                "/api/operations",
+                headers=headers,
+                json={
+                    "request_id": "reviewed-backtest-1",
+                    "action": "backtest",
+                    "subject_id": "demo-quality",
+                    "preview_id": preview["preview_id"],
+                    "preview_digest": preview["preview_digest"],
+                    "confirmation_token": preview["confirmation_token"],
+                    "expected_head": payload["mandate_hash"],
+                    "due_set": [],
+                    "payload": payload,
+                },
+            )
+            assert accepted.status_code == 202, accepted.text
+            operation_id = accepted.json()["operation_id"]
+            deadline = time.monotonic() + 20
+            while time.monotonic() < deadline:
+                current = client.get(
+                    f"/api/operations/{operation_id}",
+                    headers={"host": "127.0.0.1"},
+                ).json()
+                if current["status"] in {"completed", "failed", "interrupted"}:
+                    break
+                time.sleep(0.2)
+            operations = client.get(
+                "/api/operations",
+                headers={"host": "127.0.0.1"},
+            ).json()
+    finally:
+        app.state.service.close()
+
+    assert current["status"] == "completed", current
+    assert current["request_id"] == "reviewed-backtest-1"
+    assert current["capture_id"] == preview["capture_id"]
+    assert current["result"]["capture_digest"] == preview["capture_digest"]
     assert current["report_id"].endswith(".json")
-    report = service.research_report(current["report_id"])
-    assert report["fund"] == "demo-quality"
-    assert report["universe"] == ["AAPL"]
-    assert report["session_count"] == 5
-    assert len(report["sessions"]) == 5
-    assert (demo_root / "research" / current["report_id"]).is_file()
+    assert operations["items"][0]["operation_id"] == operation_id
+    assert apply_calls == [operation_id]
     assert data_client.entered is True
     assert data_client.exited is True
-    service.close()
+    assert (demo_root / "research" / current["report_id"]).is_file()
+    assert (demo_root / "runtime" / "private" / "v1" / "captures" / f"{preview['capture_id']}.json").is_file()
+
+
+def test_cancel_after_effect_returns_preserves_completed_result(durable_job_context):
+    _root, store, capture = durable_job_context
+    operation = _accepted_operation(store, capture, request_id="cancel-after-effect")
+    registry = OperationJobRegistry(store)
+    effect_finished = threading.Event()
+    release_worker = threading.Event()
+    effects = []
+
+    def work(_progress, _cancelled, apply_if_current):
+        result = apply_if_current(lambda: effects.append("report-committed") or {"report_id": "report.json"})
+        effect_finished.set()
+        assert release_worker.wait(timeout=5)
+        return result
+
+    try:
+        registry.submit(operation, work)
+        assert effect_finished.wait(timeout=5)
+        cancellation = registry.cancel(
+            operation.operation_id,
+            request_id="cancel-after-commit",
+        )
+        assert cancellation.status is OperationStatus.CANCEL_REQUESTED
+        release_worker.set()
+        completed = _wait_for_operation(
+            store,
+            operation.operation_id,
+            OperationStatus.COMPLETED,
+        )
+    finally:
+        release_worker.set()
+        registry.close()
+
+    assert effects == ["report-committed"]
+    assert completed.result == {"report_id": "report.json"}
+
+
+def test_injected_fund_factory_does_not_bypass_local_backtest_policy(demo_root):
+    called = False
+
+    def forbidden_client():
+        nonlocal called
+        called = True
+        raise AssertionError("policy denial must precede data-client construction")
+
+    service = DeskService(
+        demo_root,
+        allow_writes=True,
+        network_enabled=True,
+        data_client_factory=forbidden_client,
+        fund_factory=lambda spec: Fund(
+            spec,
+            models={"earnings-drift": [FakeAnalyst("pead", {"AAPL": 1.0})]},
+        ),
+    )
+    try:
+        payload = BacktestRequest(
+            fund="demo-quality",
+            universe=["AAPL"],
+            start="2024-06-03",
+            end="2024-06-04",
+            provider="yfinance",
+            model=service.settings()["model"],
+            mandate_hash=_mandate_fingerprint(demo_root),
+        )
+        with pytest.raises(ServiceError) as denied:
+            service.create_operation_preview(
+                OperationPreviewRequest(
+                    action="backtest",
+                    subject_id="demo-quality",
+                    expected_head=payload.mandate_hash,
+                    payload=payload,
+                ),
+                operator_session="synthetic-server-session",
+            )
+        assert denied.value.status_code == 422
+        assert "local Ollama" in denied.value.detail
+        assert service.list_operations()["items"] == []
+        assert not called
+    finally:
+        service.close()
+
+
+def test_reviewed_operation_rejects_changed_mandate_before_data_adapter(demo_root):
+    called = False
+
+    def forbidden_client():
+        nonlocal called
+        called = True
+        raise AssertionError("stale preview must not construct a data client")
+
+    service = DeskService(
+        demo_root,
+        allow_writes=True,
+        network_enabled=True,
+        data_client_factory=forbidden_client,
+        fund_factory=lambda spec: Fund(
+            spec,
+            models={"earnings-drift": [FakeAnalyst("pead", {"AAPL": 1.0})]},
+        ),
+    )
+    try:
+        local_model = next(model_id for _, model_id, provider in load_api_models() if provider == "Ollama" and not model_id.endswith(":cloud"))
+        service.set_model(ModelRequest(model=local_model, expected_version=service.settings()["version"]))
+        payload = BacktestRequest(
+            fund="demo-quality",
+            universe=["AAPL"],
+            start="2024-06-03",
+            end="2024-06-04",
+            provider="yfinance",
+            model=local_model,
+            mandate_hash=_mandate_fingerprint(demo_root),
+        )
+        preview = service.create_operation_preview(
+            OperationPreviewRequest(
+                action="backtest",
+                subject_id="demo-quality",
+                expected_head=payload.mandate_hash,
+                payload=payload,
+            ),
+            operator_session="synthetic-server-session",
+        )
+        research_dir = demo_root / "research"
+        research_before = {path.name for path in research_dir.iterdir()}
+        path = demo_root / "mandates" / "demo-quality.yaml"
+        data = load_spec(path).model_dump(mode="json")
+        data["risk"]["max_position_pct"] = 0.2
+        path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+        acceptance = OperationAcceptRequest(
+            request_id="stale-backtest-1",
+            action="backtest",
+            subject_id="demo-quality",
+            preview_id=preview["preview_id"],
+            preview_digest=preview["preview_digest"],
+            confirmation_token=preview["confirmation_token"],
+            expected_head=payload.mandate_hash,
+            due_set=[],
+            payload=payload,
+        )
+        with pytest.raises(ServiceError) as stale:
+            service.accept_operation(
+                acceptance,
+                operator_session="synthetic-server-session",
+            )
+        assert stale.value.status_code == 409
+        assert not called
+        assert service.list_operations()["items"] == []
+        assert {path.name for path in research_dir.iterdir()} == research_before
+    finally:
+        service.close()
 
 
 def test_network_capability_is_required_before_any_data_adapter(tmp_path):
@@ -285,25 +509,34 @@ def test_network_capability_is_required_before_any_data_adapter(tmp_path):
         network_enabled=False,
         data_client_factory=forbidden,
     )
-    with pytest.raises(ServiceError) as blocked:
-        service.submit_backtest(
-            BacktestRequest(
-                fund="missing",
-                universe=["AAPL"],
-                start="2024-06-03",
-                end="2024-06-04",
-                provider=data_provider(),
-                model=DEFAULT_MODEL,
-                mandate_hash="0" * 64,
-            )
+    try:
+        payload = BacktestRequest(
+            fund="missing",
+            universe=["AAPL"],
+            start="2024-06-03",
+            end="2024-06-04",
+            provider=service.settings()["data_provider"],
+            model=service.settings()["model"],
+            mandate_hash="0" * 64,
         )
-    assert blocked.value.status_code == 403
-    assert not called
-    assert not (tmp_path / "research").exists()
-    service.close()
+        with pytest.raises(ServiceError) as blocked:
+            service.create_operation_preview(
+                OperationPreviewRequest(
+                    action="backtest",
+                    subject_id="missing",
+                    expected_head=payload.mandate_hash,
+                    payload=payload,
+                ),
+                operator_session="synthetic-server-session",
+            )
+        assert blocked.value.status_code == 403
+        assert not called
+        assert not (tmp_path / "research").exists()
+    finally:
+        service.close()
 
 
-def test_backtest_rejects_same_count_mandate_drift_before_job_or_client(demo_root):
+def test_backtest_preview_rejects_same_count_mandate_drift_before_client(demo_root):
     called = False
 
     def forbidden():
@@ -322,134 +555,136 @@ def test_backtest_rejects_same_count_mandate_drift_before_job_or_client(demo_roo
         network_enabled=True,
         data_client_factory=forbidden,
     )
-
-    assert service.list_mandates()["items"][0]["agent_count"] == 1
-    with pytest.raises(ServiceError) as changed:
-        service.submit_backtest(
-            BacktestRequest(
-                fund="demo-quality",
-                universe=["AAPL"],
-                start="2024-06-03",
-                end="2024-06-04",
-                provider=data_provider(),
-                model=service.settings()["model"],
-                mandate_hash=fingerprint,
+    try:
+        local_model = next(model_id for _, model_id, provider in load_api_models() if provider == "Ollama" and not model_id.endswith(":cloud"))
+        service.set_model(
+            ModelRequest(
+                model=local_model,
+                expected_version=service.settings()["version"],
             )
         )
+        assert service.list_mandates()["items"][0]["agent_count"] == 1
+        payload = BacktestRequest(
+            fund="demo-quality",
+            universe=["AAPL"],
+            start="2024-06-03",
+            end="2024-06-04",
+            provider=service.settings()["data_provider"],
+            model=local_model,
+            mandate_hash=fingerprint,
+        )
+        with pytest.raises(ServiceError) as changed:
+            service.create_operation_preview(
+                OperationPreviewRequest(
+                    action="backtest",
+                    subject_id="demo-quality",
+                    expected_head=fingerprint,
+                    payload=payload,
+                ),
+                operator_session="synthetic-server-session",
+            )
+        assert changed.value.status_code == 409
+        assert not called
+        assert service.list_operations()["items"] == []
+    finally:
+        service.close()
 
-    assert changed.value.status_code == 409
-    assert not called
-    assert service.list_jobs()["items"] == []
-    service.close()
 
-
-def test_job_registry_is_single_worker_and_reports_completion():
-    registry = JobRegistry()
-    started = threading.Event()
-    release = threading.Event()
-
-    def slow_work(progress, _cancelled):
-        started.set()
-        release.wait(timeout=2)
-        progress(50)
-        return {"report_id": "sample.json"}
+def test_reviewed_backtest_executes_captured_mandate_after_template_edit(demo_root, monkeypatch):
+    data_client = ManagedFakeDataClient(SERIES)
+    observed_specs = []
+    selected_model = next(model_id for _, model_id, provider in load_api_models() if provider == "Ollama" and not model_id.endswith(":cloud"))
+    service = DeskService(
+        demo_root,
+        allow_writes=True,
+        network_enabled=True,
+        data_client_factory=lambda: data_client,
+        fund_factory=lambda spec: observed_specs.append(spec)
+        or Fund(
+            spec,
+            models={"earnings-drift": [FakeAnalyst("pead", {"AAPL": 1.0})]},
+        ),
+    )
+    service.set_model(
+        ModelRequest(
+            model=selected_model,
+            expected_version=service.settings()["version"],
+        )
+    )
+    worker = service._operation_jobs
+    store = service._operation_store
+    assert worker is not None
+    assert store is not None
+    original_submit = worker.submit
+    pending_work = []
+    monkeypatch.setattr(
+        worker,
+        "submit",
+        lambda operation, work: pending_work.append((operation, work)) or operation,
+    )
 
     try:
-        first = registry.submit("sample", "fake", "fake-model", slow_work)
-        assert started.wait(timeout=1)
-        with pytest.raises(JobConflict):
-            registry.submit("sample", "fake", "fake-model", slow_work)
+        payload = BacktestRequest(
+            fund="demo-quality",
+            universe=["AAPL"],
+            start="2024-06-03",
+            end="2024-06-07",
+            provider="yfinance",
+            model=selected_model,
+            mandate_hash=_mandate_fingerprint(demo_root),
+        )
+        preview = service.create_operation_preview(
+            OperationPreviewRequest(
+                action="backtest",
+                subject_id="demo-quality",
+                expected_head=payload.mandate_hash,
+                payload=payload,
+            ),
+            operator_session="synthetic-server-session",
+        )
+        accepted = service.accept_operation(
+            OperationAcceptRequest(
+                request_id="captured-mandate-backtest",
+                action="backtest",
+                subject_id="demo-quality",
+                preview_id=preview["preview_id"],
+                preview_digest=preview["preview_digest"],
+                confirmation_token=preview["confirmation_token"],
+                expected_head=preview["expected_head"],
+                due_set=[],
+                payload=payload,
+            ),
+            operator_session="synthetic-server-session",
+        )
+        assert accepted["status"] == "accepted"
+        assert len(pending_work) == 1
+
+        mandate_path = demo_root / "mandates" / "demo-quality.yaml"
+        changed = load_spec(mandate_path).model_dump(mode="json")
+        changed["risk"]["max_position_pct"] = 0.2
+        mandate_path.write_text(yaml.safe_dump(changed, sort_keys=False), encoding="utf-8")
+
+        original_submit(*pending_work[0])
+        future = worker._submitted[accepted["operation_id"]]
+        assert future is not None
+        future.result(timeout=30)
+        result = store.get_operation(accepted["operation_id"])
+        assert result.status is OperationStatus.COMPLETED, result.public_view()
+        assert len(observed_specs) == 1
+        assert observed_specs[0].risk.max_position_pct == pytest.approx(0.25)
+        assert data_client.entered is True
+        assert data_client.exited is True
     finally:
-        release.set()
-
-    deadline = time.monotonic() + 2
-    current = registry.get(first["id"])
-    while current["status"] not in {"succeeded", "failed"} and time.monotonic() < deadline:
-        time.sleep(0.01)
-        current = registry.get(first["id"])
-    registry.close()
-
-    assert current["status"] == "succeeded"
-    assert current["report_id"] == "sample.json"
+        service.close()
 
 
-def test_job_registry_cancels_cooperatively_without_retry_or_result():
-    registry = JobRegistry()
-    started = threading.Event()
-    release = threading.Event()
-    calls = 0
-
-    def slow_work(_progress, cancelled):
-        nonlocal calls
-        calls += 1
-        started.set()
-        release.wait(timeout=2)
-        if cancelled():
-            raise JobCancelled()
-        return {"report_id": "must-not-exist.json"}
-
-    try:
-        submitted = registry.submit("sample", "fake", "fake-model", slow_work)
-        assert started.wait(timeout=1)
-        cancelling = registry.cancel(submitted["id"])
-        assert cancelling["cancel_requested"] is True
-    finally:
-        release.set()
-
-    deadline = time.monotonic() + 2
-    current = registry.get(submitted["id"])
-    while current["status"] in {"queued", "running"} and time.monotonic() < deadline:
-        time.sleep(0.01)
-        current = registry.get(submitted["id"])
-    registry.close()
-
-    assert current["status"] == "cancelled"
-    assert current["report_id"] is None
-    assert calls == 1
-
-
-def test_job_registry_shutdown_requests_cancel_and_waits_for_boundary():
-    registry = JobRegistry()
-    started = threading.Event()
-    release = threading.Event()
-    shutdown_done = threading.Event()
-
-    def blocked_work(_progress, cancelled):
-        started.set()
-        release.wait(timeout=2)
-        if cancelled():
-            raise JobCancelled()
-        return {"report_id": "must-not-exist.json"}
-
-    submitted = registry.submit("sample", "fake", "fake-model", blocked_work)
-    assert started.wait(timeout=1)
-
-    shutdown = threading.Thread(target=lambda: (registry.close(), shutdown_done.set()))
-    shutdown.start()
-    deadline = time.monotonic() + 1
-    current = registry.get(submitted["id"])
-    while not current["cancel_requested"] and time.monotonic() < deadline:
-        time.sleep(0.01)
-        current = registry.get(submitted["id"])
-    assert current["cancel_requested"] is True
-    assert not shutdown_done.is_set()
-
-    release.set()
-    assert shutdown_done.wait(timeout=1)
-    shutdown.join(timeout=1)
-
-    current = registry.get(submitted["id"])
-    assert current["status"] == "cancelled"
-    assert current["report_id"] is None
-
-
-def test_backtest_cancellation_closes_fake_client_and_freezes_job_model(demo_root, monkeypatch):
+def test_reviewed_backtest_cancellation_closes_fake_client_and_freezes_model(demo_root, monkeypatch):
     import hedge_fund.web.services as services
 
     data_client = ManagedFakeDataClient(SERIES)
     entered = threading.Event()
     release = threading.Event()
-    selected_model = next(model_id for _, model_id, provider in load_api_models() if model_id != DEFAULT_MODEL and is_supported(provider))
+    selected_model = next(model_id for _, model_id, provider in load_api_models() if provider == "Ollama" and not model_id.endswith(":cloud"))
     service = DeskService(
         demo_root,
         allow_writes=True,
@@ -460,7 +695,13 @@ def test_backtest_cancellation_closes_fake_client_and_freezes_job_model(demo_roo
             models={"earnings-drift": [FakeAnalyst("pead", {"AAPL": 1.0})]},
         ),
     )
-    service.set_model(ModelRequest(model=selected_model))
+    service.set_model(
+        ModelRequest(
+            model=selected_model,
+            expected_version=service.settings()["version"],
+        )
+    )
+    captured_settings_version = service.settings()["version"]
 
     def paused_backtest(_fund, _start, _end, _client, _universe, *, on_valuation):
         on_valuation(0, 2, None)
@@ -469,31 +710,80 @@ def test_backtest_cancellation_closes_fake_client_and_freezes_job_model(demo_roo
         on_valuation(1, 2, None)
 
     monkeypatch.setattr(services, "backtest_fund", paused_backtest)
-    job = service.submit_backtest(
-        BacktestRequest(
-            fund="demo-quality",
-            universe=["AAPL"],
-            start="2024-06-03",
-            end="2024-06-04",
-            provider=data_provider(),
-            model=selected_model,
-            mandate_hash=_mandate_fingerprint(demo_root),
-        )
+    payload = BacktestRequest(
+        fund="demo-quality",
+        universe=["AAPL"],
+        start="2024-06-03",
+        end="2024-06-04",
+        provider=service.settings()["data_provider"],
+        model=selected_model,
+        mandate_hash=_mandate_fingerprint(demo_root),
     )
-    assert job["model"] == selected_model
-    assert entered.wait(timeout=1)
-    with pytest.raises(ServiceError) as active_change:
-        service.set_model(ModelRequest(model=service.catalog()["models"][0]["id"]))
-    assert active_change.value.status_code == 409
-    service.cancel_job(job["id"])
-    release.set()
-
-    deadline = time.monotonic() + 2
-    current = service.get_job(job["id"])
-    while current["status"] in {"queued", "running"} and time.monotonic() < deadline:
-        time.sleep(0.01)
-        current = service.get_job(job["id"])
-    service.close()
+    preview = service.create_operation_preview(
+        OperationPreviewRequest(
+            action="backtest",
+            subject_id="demo-quality",
+            expected_head=payload.mandate_hash,
+            payload=payload,
+        ),
+        operator_session="synthetic-server-session",
+    )
+    operation = service.accept_operation(
+        OperationAcceptRequest(
+            request_id="cancel-reviewed-backtest",
+            action="backtest",
+            subject_id="demo-quality",
+            preview_id=preview["preview_id"],
+            preview_digest=preview["preview_digest"],
+            confirmation_token=preview["confirmation_token"],
+            expected_head=preview["expected_head"],
+            due_set=preview["due_set"],
+            payload=payload,
+        ),
+        operator_session="synthetic-server-session",
+    )
+    try:
+        assert operation["model"] == selected_model
+        assert entered.wait(timeout=5)
+        changed_model = next(model_id for _, model_id, _provider in load_api_models() if model_id != selected_model)
+        service.set_model(
+            ModelRequest(
+                model=changed_model,
+                expected_version=service.settings()["version"],
+            )
+        )
+        captured = service._captures[operation["capture_id"]]
+        effective_settings = service.settings()
+        assert effective_settings["model"] == changed_model
+        assert captured.model == selected_model
+        assert captured.settings_version == captured_settings_version
+        assert effective_settings["active_captures"] == [
+            {
+                "capture_id": operation["capture_id"],
+                "subject_id": "demo-quality",
+                "status": "running",
+                "capture_details_available": True,
+                "settings_version": captured_settings_version,
+                "data_provider": "yfinance",
+                "llm_provider": "Ollama",
+                "model": selected_model,
+                "endpoint": None,
+                "restart_needed": True,
+            }
+        ]
+        service.cancel_operation(
+            operation["operation_id"],
+            OperationCancelRequest(request_id="cancel-reviewed-backtest-1"),
+        )
+        release.set()
+        deadline = time.monotonic() + 5
+        current = service.get_operation(operation["operation_id"])
+        while current["status"] in {"accepted", "running", "cancel-requested"} and time.monotonic() < deadline:
+            time.sleep(0.02)
+            current = service.get_operation(operation["operation_id"])
+    finally:
+        release.set()
+        service.close()
 
     assert current["status"] == "cancelled"
     assert current["report_id"] is None
@@ -502,72 +792,53 @@ def test_backtest_cancellation_closes_fake_client_and_freezes_job_model(demo_roo
     assert not (demo_root / "research" / "cancelled.json").exists()
 
 
-def test_cancel_endpoint_uses_write_gate_and_cooperative_job_boundary(demo_root, monkeypatch):
-    import hedge_fund.web.services as services
+def test_legacy_backtest_and_job_routes_cannot_start_work(demo_root):
+    called = False
 
-    data_client = ManagedFakeDataClient(SERIES)
-    entered = threading.Event()
-    release = threading.Event()
+    def forbidden_client():
+        nonlocal called
+        called = True
+        raise AssertionError("removed route must not construct a data client")
 
-    def paused_backtest(_fund, _start, _end, _client, _universe, *, on_valuation):
-        on_valuation(0, 2, None)
-        entered.set()
-        release.wait(timeout=2)
-        on_valuation(1, 2, None)
-
-    monkeypatch.setattr(services, "backtest_fund", paused_backtest)
     app = create_app(
         root=demo_root,
         allow_writes=True,
         network_enabled=True,
-        data_client_factory=lambda: data_client,
-        fund_factory=lambda spec: Fund(
-            spec,
-            models={"earnings-drift": [FakeAnalyst("pead", {"AAPL": 1.0})]},
-        ),
+        data_client_factory=forbidden_client,
     )
-    with TestClient(app) as client:
-        capabilities = client.get("/api/capabilities", headers={"host": "127.0.0.1"}).json()
+    research_before = {path.name for path in (demo_root / "research").iterdir()}
+    with TestClient(app, client=("127.0.0.1", 50000)) as client:
+        headers = _write_headers(client)
         settings = client.get("/api/settings", headers={"host": "127.0.0.1"}).json()
-        headers = {
-            "host": "127.0.0.1",
-            "origin": "http://127.0.0.1",
-            "x-csrf-token": capabilities["mutation_token"],
+        legacy_payload = {
+            "fund": "demo-quality",
+            "universe": ["AAPL"],
+            "start": "2024-06-03",
+            "end": "2024-06-04",
+            "provider": settings["data_provider"],
+            "model": settings["model"],
+            "mandate_hash": _mandate_fingerprint(demo_root),
         }
-        try:
-            response = client.post(
-                "/api/backtests",
-                headers=headers,
-                json={
-                    "fund": "demo-quality",
-                    "universe": ["AAPL"],
-                    "start": "2024-06-03",
-                    "end": "2024-06-04",
-                    "provider": data_provider(),
-                    "model": settings["model"],
-                    "mandate_hash": _mandate_fingerprint(demo_root),
-                },
-            )
-            assert response.status_code == 202
-            job_id = response.json()["id"]
-            assert entered.wait(timeout=1)
-            cancelled = client.post(f"/api/jobs/{job_id}/cancel", headers=headers)
-            assert cancelled.status_code == 200
-            assert cancelled.json()["cancel_requested"] is True
-            release.set()
+        start = client.post("/api/backtests", headers=headers, json=legacy_payload)
+        jobs = client.get("/api/jobs", headers={"host": "127.0.0.1"})
+        detail = client.get(
+            f"/api/jobs/{'a' * 32}",
+            headers={"host": "127.0.0.1"},
+        )
+        cancel = client.post(
+            f"/api/jobs/{'a' * 32}/cancel",
+            headers=headers,
+            json={"request_id": "legacy-cancel"},
+        )
 
-            deadline = time.monotonic() + 2
-            current = client.get(f"/api/jobs/{job_id}", headers={"host": "127.0.0.1"}).json()
-            while current["status"] in {"queued", "running"} and time.monotonic() < deadline:
-                time.sleep(0.01)
-                current = client.get(f"/api/jobs/{job_id}", headers={"host": "127.0.0.1"}).json()
-            assert current["status"] == "cancelled"
-            assert current["report_id"] is None
-        finally:
-            release.set()
-
-    assert data_client.entered is True
-    assert data_client.exited is True
+    assert [start.status_code, jobs.status_code, detail.status_code, cancel.status_code] == [
+        405,
+        404,
+        404,
+        405,
+    ]
+    assert not called
+    assert {path.name for path in (demo_root / "research").iterdir()} == research_before
 
 
 def test_operation_job_registry_persists_progress_and_result(durable_job_context):
@@ -577,7 +848,7 @@ def test_operation_job_registry_persists_progress_and_result(durable_job_context
     entered = threading.Event()
     release = threading.Event()
 
-    def work(progress, cancelled):
+    def work(progress, cancelled, _apply_if_current):
         assert not cancelled()
         progress(20)
         entered.set()
@@ -596,7 +867,7 @@ def test_operation_job_registry_persists_progress_and_result(durable_job_context
         completed = _wait_for_operation(store, operation.operation_id, OperationStatus.COMPLETED)
         assert completed.progress == 100
         assert completed.result == {"sessions": 1}
-        assert root_context.read_bytes(f"runtime/operations/results/{operation.operation_id}.json")
+        assert root_context.read_bytes(f"{OPERATIONS_ROOT}/results/{operation.operation_id}.json")
     finally:
         release.set()
         registry.close()
@@ -610,7 +881,7 @@ def test_operation_job_cancellation_stops_at_boundary_without_result(durable_job
     release = threading.Event()
     calls = []
 
-    def work(progress, cancelled):
+    def work(progress, cancelled, _apply_if_current):
         calls.append("started")
         progress(25)
         entered.set()
@@ -637,7 +908,44 @@ def test_operation_job_cancellation_stops_at_boundary_without_result(durable_job
         registry.close()
 
 
-def test_operation_job_restart_interrupts_and_never_resubmits(durable_job_context):
+def test_cancelled_queued_future_releases_operation_capacity(durable_job_context, monkeypatch):
+    _root_context, store, capture = durable_job_context
+    registry = OperationJobRegistry(
+        store,
+        max_active=1,
+        clock=lambda: _JOB_NOW,
+    )
+    first = _accepted_operation(store, capture, request_id="queued-first")
+    second = _accepted_operation(store, capture, request_id="queued-second")
+    futures = []
+
+    def queued_submit(*_args, **_kwargs):
+        future = Future()
+        futures.append(future)
+        return future
+
+    monkeypatch.setattr(registry._executor, "submit", queued_submit)
+
+    try:
+        registry.submit(first, lambda _progress, _cancelled, _effect: {"unexpected": True})
+        cancelled = registry.cancel(
+            first.operation_id,
+            request_id="cancel-queued-first",
+            now=_JOB_NOW,
+        )
+        assert cancelled.status is OperationStatus.CANCELLED
+
+        submitted = registry.submit(
+            second,
+            lambda _progress, _cancelled, _effect: {"unexpected": True},
+        )
+        assert submitted.operation_id == second.operation_id
+        assert len(futures) == 2
+    finally:
+        registry.close()
+
+
+def test_close_waits_for_worker_boundary_before_interruption(durable_job_context):
     _root_context, store, capture = durable_job_context
     registry = OperationJobRegistry(store, clock=lambda: _JOB_NOW)
     operation = _accepted_operation(store, capture)
@@ -646,7 +954,7 @@ def test_operation_job_restart_interrupts_and_never_resubmits(durable_job_contex
     shutdown_done = threading.Event()
     restarts = []
 
-    def work(_progress, cancelled):
+    def work(_progress, cancelled, _apply_if_current):
         entered.set()
         release.wait(timeout=2)
         if cancelled():
@@ -658,18 +966,20 @@ def test_operation_job_restart_interrupts_and_never_resubmits(durable_job_contex
     shutdown = threading.Thread(target=lambda: (registry.close(), shutdown_done.set()))
     shutdown.start()
     try:
-        interrupted = _wait_for_operation(store, operation.operation_id, OperationStatus.INTERRUPTED)
+        cancel_requested = _wait_for_operation(
+            store,
+            operation.operation_id,
+            OperationStatus.CANCEL_REQUESTED,
+        )
+        assert cancel_requested.status is OperationStatus.CANCEL_REQUESTED
+        assert not shutdown_done.wait(timeout=0.05)
     finally:
         release.set()
     assert shutdown_done.wait(timeout=2)
     shutdown.join(timeout=1)
 
-    restarted = OperationJobRegistry(store, clock=lambda: _JOB_NOW)
-    observed = restarted.submit(
-        interrupted,
-        lambda _progress, _cancelled: restarts.append("resumed"),
-    )
-    restarted.close()
+    observed = store.get_operation(operation.operation_id)
 
-    assert observed.status is OperationStatus.INTERRUPTED
+    assert observed.status is OperationStatus.CANCELLED
+    assert restarts == []
     assert restarts == []

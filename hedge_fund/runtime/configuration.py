@@ -12,9 +12,10 @@ from ipaddress import ip_address
 from types import MappingProxyType
 from urllib.parse import urlsplit, urlunsplit
 
-from hedge_fund.runtime.root import ensure_unique_resource_name, RootContext, RootPathError
+from hedge_fund.runtime.admission import AdmissionCoordinator, AdmissionError
+from hedge_fund.runtime.root import PRIVATE_ROOT, ensure_unique_resource_name, RootContext, RootPathError
 
-SETTINGS_PATH = "runtime/settings.json"
+SETTINGS_PATH = f"{PRIVATE_ROOT}/settings.json"
 DEFAULT_DATA_PROVIDER = "yfinance"
 DEFAULT_MODEL = "claude-opus-5-5"
 DEFAULT_TIMEOUT_SECONDS = 60.0
@@ -60,7 +61,7 @@ _ENVIRONMENT_FIELDS = {
     "HEDGE_FUND_LLM_ENDPOINT": "endpoint",
     "HEDGE_FUND_LLM_TIMEOUT_SECONDS": "timeout_seconds",
 }
-_PARAMETER_FIELDS = frozenset({"max_tokens", "temperature", "top_p"})
+_PARAMETER_FIELDS = frozenset({"context_size", "max_tokens", "temperature", "top_p"})
 _PROVENANCE_VALUES = frozenset({"default", "persisted", "environment", "launch"})
 
 
@@ -157,13 +158,14 @@ def environment_settings(
 def resolve_settings(
     root: RootContext,
     *,
+    admission: AdmissionCoordinator | None = None,
     launch: Mapping[str, object] | None = None,
     environment: Mapping[str, object] | None = None,
     persisted: Mapping[str, object] | RuntimeSettings | None = None,
 ) -> RuntimeSettings:
     """Resolve launch > environment > persisted > safe defaults."""
     _require_root(root)
-    stored = load_settings(root) if persisted is None else _parse_persisted(persisted)
+    stored = load_settings(root, admission=admission) if persisted is None else _parse_persisted(persisted)
     values: dict[str, object] = {
         "data_provider": DEFAULT_DATA_PROVIDER,
         "llm_provider": _DEFAULT_LLM_PROVIDER,
@@ -194,13 +196,40 @@ def resolve_settings(
     )
 
 
-def load_settings(root: RootContext) -> RuntimeSettings:
+def load_settings(
+    root: RootContext,
+    *,
+    admission: AdmissionCoordinator | None = None,
+) -> RuntimeSettings:
     """Load persisted non-secret settings; missing file means safe defaults."""
     _require_root(root)
     try:
+        root.file_info(SETTINGS_PATH)
+    except FileNotFoundError:
+        return RuntimeSettings()
+    if not root.verify_private_storage():
+        raise ConfigurationError("private settings storage is unverified")
+    if admission is None or not isinstance(admission, AdmissionCoordinator) or admission.root is not root:
+        raise ConfigurationError("settings snapshot admission is required")
+    try:
+        with admission.registry_read_lock(timeout=5.0):
+            return _load_settings_unlocked(root)
+    except AdmissionError as exc:
+        raise ConfigurationError("settings snapshot admission is unavailable") from exc
+
+
+def _load_settings_unlocked(root: RootContext) -> RuntimeSettings:
+    try:
+        info = root.file_info(SETTINGS_PATH)
+        if info.size > 65536:
+            raise ConfigurationError("persisted settings exceed their bound")
         raw = root.read_bytes(SETTINGS_PATH)
     except FileNotFoundError:
         return RuntimeSettings()
+    except ConfigurationError:
+        raise
+    except OSError as exc:
+        raise ConfigurationError("persisted settings are unavailable") from exc
     try:
         record = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
@@ -226,29 +255,38 @@ def save_settings(
     values: Mapping[str, object],
     *,
     expected_version: int,
+    admission: AdmissionCoordinator,
 ) -> RuntimeSettings:
     """Persist non-secret settings with compare-and-swap versioning."""
     _require_root(root)
+    if not isinstance(admission, AdmissionCoordinator) or admission.root is not root:
+        raise ConfigurationError("settings writer admission is required")
+    if not root.verify_private_storage():
+        raise ConfigurationError("private settings storage is unverified")
     if type(expected_version) is not int or expected_version < 0:
         raise ConfigurationError("expected settings version is invalid")
     overrides = _validate_overrides(values)
-    current = load_settings(root)
-    if current.version != expected_version:
-        raise SettingsConflict("settings version changed")
-    _derive_model_provider(overrides)
-    merged = current.to_mapping()
-    merged.update(overrides)
-    version = current.version + 1
-    settings = RuntimeSettings(
-        **_normalize_settings(merged),
-        version=version,
-        provenance={name: "persisted" for name in _SETTING_FIELDS},
-    )
-    root.mkdir("runtime", parents=True, mode=0o700)
-    record = {**settings.to_mapping(), "version": settings.version}
-    payload = json.dumps(record, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-    root.write_bytes(SETTINGS_PATH, payload, mode=stat.S_IRUSR | stat.S_IWUSR)
-    return settings
+    try:
+        with admission.registry_lock(timeout=5.0):
+            current = _load_settings_unlocked(root)
+            if current.version != expected_version:
+                raise SettingsConflict("settings version changed")
+            _derive_model_provider(overrides)
+            merged = current.to_mapping()
+            merged.update(overrides)
+            version = current.version + 1
+            settings = RuntimeSettings(
+                **_normalize_settings(merged),
+                version=version,
+                provenance={name: "persisted" for name in _SETTING_FIELDS},
+            )
+            root.mkdir("runtime", parents=True, mode=0o700)
+            record = {**settings.to_mapping(), "version": settings.version}
+            payload = json.dumps(record, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+            root.write_bytes(SETTINGS_PATH, payload, mode=stat.S_IRUSR | stat.S_IWUSR)
+            return settings
+    except AdmissionError as exc:
+        raise ConfigurationError("settings writer admission is unavailable") from exc
 
 
 def child_root_arguments(root: RootContext) -> tuple[str, str]:
@@ -387,6 +425,11 @@ def _normalize_settings(values: Mapping[str, object]) -> dict[str, object]:
     registered_provider = _MODEL_PROVIDERS.get(model)
     if registered_provider is not None and registered_provider != normalized_provider:
         raise ConfigurationError("model and provider do not match")
+    parameters = _normalize_parameters(values["parameters"])
+    if "context_size" in parameters and (
+        normalized_provider != "Ollama" or model.casefold().endswith(":cloud")
+    ):
+        raise ConfigurationError("context size is supported only by local Ollama")
     endpoint = _normalize_endpoint(values["endpoint"])
     timeout = values["timeout_seconds"]
     if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0 or timeout > 300:
@@ -397,7 +440,7 @@ def _normalize_settings(values: Mapping[str, object]) -> dict[str, object]:
         "model": model,
         "endpoint": endpoint,
         "timeout_seconds": float(timeout),
-        "parameters": _normalize_parameters(values["parameters"]),
+        "parameters": parameters,
     }
 
 
@@ -406,8 +449,9 @@ def _normalize_parameters(value: object) -> Mapping[str, int | float]:
         raise ConfigurationError("model parameters are invalid")
     result: dict[str, int | float] = {}
     for name, item in value.items():
-        if name == "max_tokens":
-            if type(item) is not int or not 1 <= item <= 131072:
+        if name in {"context_size", "max_tokens"}:
+            minimum = 256 if name == "context_size" else 1
+            if type(item) is not int or not minimum <= item <= 131072:
                 raise ConfigurationError("model parameters are invalid")
             result[name] = item
         else:

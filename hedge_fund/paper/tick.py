@@ -3,7 +3,7 @@
 This is what a human, a scheduler, or the runner calls when a session is
 due:
 
-    aihf paper tick <name>        # cron, launchd, or a human
+    aihf --root <root> paper tick <name>        # cron, launchd, or a human
 
 It loads the fund, replays the ledger into its state, works out the next
 session the fund owes, advances it, and appends the record. Calling it

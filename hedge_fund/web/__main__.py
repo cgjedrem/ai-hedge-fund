@@ -135,6 +135,7 @@ def _serve(context: RootContext, args: argparse.Namespace, host: str) -> None:
         network_enabled=args.enable_network,
         demo=args.demo,
         static_dir=_static_directory(),
+        container_bind=args.container_bind,
     )
     uvicorn.run(
         app,

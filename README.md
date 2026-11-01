@@ -27,49 +27,54 @@ By using this software, you agree to use it solely for learning purposes.
 pipx install aihf
 ```
 
-(or `uv tool install aihf`, or `pip install aihf` into an environment of your choice)
+(or `uv tool install aihf`, or `pip install aihf`)
 
-Then run it from anywhere:
+Choose an absolute data root. The CLI requires it on every launch:
 
 ```bash
-aihf
+export AIHF_ROOT="$HOME/.aihf-data"
+mkdir -p "$AIHF_ROOT"
+aihf --root "$AIHF_ROOT"
+```
+
+PowerShell:
+
+```powershell
+$env:AIHF_ROOT = Join-Path $HOME ".aihf-data"
+New-Item -ItemType Directory -Force $env:AIHF_ROOT | Out-Null
+aihf --root $env:AIHF_ROOT
 ```
 
 ### API keys
 
-The app asks for keys the first time it needs them and saves them to `~/.hedge-fund/.env` — nothing to configure up front. It needs:
+The app stores user state under the selected root. It needs:
 
-- A [Financial Datasets](https://financialdatasets.ai) API key, for prices, fundamentals, and earnings.
-- One model API key for the investor agents. Supported providers: Anthropic, OpenAI, DeepSeek, Google, xAI, Kimi, TypeSafe (Jev) — or Ollama, which runs locally and needs no key at all.
+- Market data defaults to credential-free Yahoo Finance. A [Financial Datasets](https://financialdatasets.ai) API key is needed only when explicitly selecting paid provider `fd`.
+- One model API key for the selected cloud investor provider — or Ollama, which runs locally and needs no key.
 
 Keys exported in your shell always win over the saved file.
 
-### Free market data (optional)
+### Market data
 
-Day-to-day paper trading and iteration can run on free Yahoo Finance data
-instead of spending Financial Datasets credits:
+Credential-free Yahoo Finance is the default and part of the base dependency
+set; no provider extra is required.
 
-```bash
-pip install aihf[yfinance]        # or: poetry install -E yfinance
-export HEDGE_FUND_DATA_PROVIDER=yfinance
-```
-
-One caveat: Yahoo serves fundamentals as reported *now*, not point-in-time
-— so backtests on the free provider leak the future into the past. Keep
-`HEDGE_FUND_DATA_PROVIDER=fd` (the default) for final backtest validation.
+Financial Datasets is an explicit paid provider selected with
+`HEDGE_FUND_DATA_PROVIDER=fd`. Yahoo fundamentals are reported as of now,
+not point-in-time; backtests using Yahoo data can leak future information.
 
 ## How to Run
 
 ### Interactive app
 
 ```bash
-aihf
+aihf --root "$AIHF_ROOT"
 ```
 
 With no arguments, this launches the interactive terminal app. It has two modes:
 
-- **Paper trading** — your funds, each with a ledger of real market days and fake money. Highlight a fund to see what its next run will do; press enter to review and run the next session, `y`/`n` to approve or reject a gated decision, `s` for history, and `h`/`r` for the kill switch. Build a new fund from the same list: strategies, capital, cadence, approval mode, tickers, and it is live. Every session is appended to a hash-chained ledger in `~/.hedge-fund/paper/<name>/`, so NAV is a track record, not a reset.
-- **Backtesting** — replay a fund over history and watch its equity curve draw against its benchmark. Results are saved to `~/.hedge-fund/research/`. Fund definitions live in `~/.hedge-fund/mandates/` and carry no tickers; you pick the universe per backtest.
+- **Paper trading** — your funds, each with a ledger of market days and paper money. Highlight a fund to review its next run; use `y`/`n` for gated decisions, `s` for history, and `h`/`r` for halt/resume. Sessions live in the selected root's `paper/<name>/`.
+- **Backtesting** — replay a fund over history and compare its equity curve with a benchmark. Results live in the selected root's `research/`; mandates live in `mandates/` and carry no tickers.
 
 ### Local React desk
 
@@ -83,7 +88,7 @@ make web
 ```
 
 `make web` installs frontend build dependencies, creates the static bundle, and
-starts a synthetic demo on `http://127.0.0.1:8765`. Demo files live in a temporary
+starts a synthetic demo on `http://127.0.0.1:8876`. Demo files live in a temporary
 directory and are removed when the server exits. Node is needed for the build,
 not for Python to serve an already-built bundle.
 
@@ -99,7 +104,9 @@ bundle, then starts the server. It requires Node.js and npm on `PATH`; a clean
 checkout also needs package-registry access for the initial npm install. The
 server does not need Node after the bundle exists. Running `aihf-web` from a
 source checkout without built assets exits with build instructions. Packaged
-wheels serve their included static bundle without Node.
+wheels serve their included static bundle without Node. Non-demo launches
+require an explicit existing `--root`; demo mode uses an isolated temporary
+root.
 
 #### Frontend development with Vite
 
@@ -125,26 +132,33 @@ loopback and proxies `/api` without changing `Host` or `Origin`. The FastAPI
 loopback, same-origin and CSRF checks remain active; no cross-origin exception
 is added.
 
-To inspect the configured `~/.hedge-fund` root, build the bundle and start the
-read-only, network-off server:
+To inspect an existing root, build the bundle and start the read-only,
+network-off server:
 
 ```bash
 make web-build
-poetry run aihf-web
+poetry run aihf-web --root "$AIHF_ROOT"
 ```
 
-An alternate local data root can be selected explicitly with `--root PATH`.
+For the same launch through Make, pass the selected root explicitly:
+
+```bash
+AIHF_ROOT="$HOME/.aihf-data" make web-local
+```
+
 General writes and external network access are separate, immutable startup
 capabilities. The default has neither. Backtests require both:
 
 ```bash
-poetry run aihf-web --allow-writes --enable-network
+poetry run aihf-web --root "$AIHF_ROOT" --allow-writes --enable-network
 ```
 
 Use those flags only when intentionally submitting local changes or historical
-provider requests. The default Financial Datasets provider is paid; no view
-fetches it automatically. Runner start/stop, manual runs, deletion, ledger redo,
-and live quote fetching remain unavailable in the web desk. See the
+provider requests. Reviewed web backtests permit free Yahoo data and local
+Ollama only. Explicit valuation refresh also requires both capabilities and
+uses free Yahoo quotes; page loads never fetch. Exchange-print freshness is
+unverified. Runner start/stop, manual runs, deletion, ledger redo, and paid
+market-data calls remain unavailable in the web desk. See the
 [TUI parity checklist](specs/004-react-web-ui/parity-checklist.md) for all
 supported and deferred workflows.
 
@@ -163,9 +177,16 @@ image. Compose publishes the service only on host loopback:
 docker compose --profile web up --build web
 ```
 
-Open `http://127.0.0.1:8765`. The service reads the mounted local data root and
-starts read-only with network access disabled. Do not publish this port on a
-non-loopback interface. On Linux, the override keeps the same loopback port
+Open `http://127.0.0.1:8876`. The service reads the mounted local data root and
+starts read-only with network access disabled. Set `AIHF_DATA_ROOT` to an
+existing absolute data root before running Compose; for example:
+
+```bash
+export AIHF_DATA_ROOT="$PWD/.aihf-demo-data"
+mkdir -p "$AIHF_DATA_ROOT"
+```
+
+Do not publish this port on a non-loopback interface. On Linux, the override keeps the same loopback port
 mapping and adds an explicit host-gateway alias for an Ollama workflow that a
 user separately enables:
 
@@ -184,8 +205,8 @@ Override cadence for a backtest or when creating a paper fund; the mandate
 file stays unchanged:
 
 ```bash
-aihf backtest ~/.hedge-fund/mandates/example.yaml --universe AAPL,MSFT --rebalance monthly
-aihf paper create alpha --mandate ~/.hedge-fund/mandates/example.yaml --universe AAPL,MSFT --rebalance daily
+aihf --root "$AIHF_ROOT" backtest "$AIHF_ROOT/mandates/example.yaml" --universe AAPL,MSFT --rebalance monthly
+aihf --root "$AIHF_ROOT" paper create alpha --mandate "$AIHF_ROOT/mandates/example.yaml" --universe AAPL,MSFT --rebalance daily
 ```
 
 ### Per-fund approval gate
@@ -196,10 +217,10 @@ decisions execute as they do today. Enable the gate on a new paper fund with
 builder, or `--approval` at CLI creation:
 
 ```bash
-aihf paper create alpha --mandate ~/.hedge-fund/mandates/example.yaml --universe AAPL,MSFT --approval
-aihf paper approve alpha             # queue approval for the next session
-aihf paper approve alpha --now       # execute now if a session is due
-aihf paper reject alpha
+aihf --root "$AIHF_ROOT" paper create alpha --mandate "$AIHF_ROOT/mandates/example.yaml" --universe AAPL,MSFT --approval
+aihf --root "$AIHF_ROOT" paper approve alpha             # queue approval for the next session
+aihf --root "$AIHF_ROOT" paper approve alpha --now       # execute now if a session is due
+aihf --root "$AIHF_ROOT" paper reject alpha
 ```
 
 In the TUI fund screen, `y` approves and `n` rejects a pending decision. A
@@ -216,50 +237,60 @@ their next decision period. The gate is separate from the kill switch:
 
 ### Docker
 
-The same app in a container. All state — funds, ledgers, caches, and the `.env` key file — stays in `~/.hedge-fund`, which is mounted as a volume; nothing is baked into the image.
+Containers require an explicit host data root. Compose runner profiles use
+local Ollama and free Yahoo data; no runner starts by default.
 
 ```bash
 docker build -t aihf .
+export AIHF_DATA_ROOT="$PWD/.aihf-demo-data"
+mkdir -p "$AIHF_DATA_ROOT"
 
-# Interactive TUI (needs a terminal):
-docker run -it --rm -v ~/.hedge-fund:/root/.hedge-fund aihf
+# Interactive TUI (needs a terminal). Image binds its root to /data:
+docker run -it --rm -v "$AIHF_DATA_ROOT:/data" aihf
 
-# Headless runner for one fund, surviving restarts:
-docker run -d --name aihf-watchtower --restart unless-stopped \
-    -v ~/.hedge-fund:/root/.hedge-fund aihf paper run watchtower
+# One bounded local tick for an existing demo-alpha paper fund:
+docker run --rm -v "$AIHF_DATA_ROOT:/data" \
+    -e OLLAMA_BASE_URL=http://host.docker.internal:11434 \
+    -e HEDGE_FUND_LLM_MODEL=gemma3:4b \
+    -e HEDGE_FUND_DATA_PROVIDER=yfinance \
+    aihf --model gemma3:4b paper tick demo-alpha
 ```
 
-Or with compose (`docker-compose.yml` in this repo): `docker compose up -d runner` for the runner, `docker compose run --rm tui` for the app. One runner per fund — copy the service and change the fund name; the compose file ships a second one, `runner-weekly`, for the `watchtower-weekly` comparison fund (the same mandate as `watchtower` on a weekly cadence). After a code change, rebuild every runner you use: `docker compose up -d --build runner runner-weekly`. Do not run the same fund's runner on the host and in a container at the same time: pid files cannot see across that boundary, so both would believe they own the fund.
+Compose paper-tick profiles are opt-in and use generic example subjects:
+
+```bash
+docker compose --profile runner run --rm runner
+docker compose run --rm tui
+docker compose --profile web up --build web
+```
+
+The web profile mounts the same root read-only. Rebuild only the selected
+service after code changes. Do not run one paper fund from multiple processes.
 
 #### Using Ollama models in the container
 
-Ollama models (the keyless ones, e.g. `kimi-k3:cloud`) run on the *host's* Ollama — inside a container, `localhost` is the container itself. Before starting any container:
+The local `gemma3:4b` model runs on the host's Ollama — inside a container,
+`localhost` is the container itself. Before starting a runner:
 
 1. **Run Ollama on the host** — install it and keep the daemon up (`ollama serve` or the desktop app; it listens on `localhost:11434`).
-2. **Check the model answers on the host first**: `ollama run kimi-k3:cloud "hi"` (cloud-hosted models may ask you to sign in once).
+2. **Check the model answers on the host first**: `ollama run gemma3:4b "hi"`.
 3. **Point the container at the host** — compose sets `OLLAMA_BASE_URL=http://host.docker.internal:11434` on both services; with plain `docker run`, add `-e OLLAMA_BASE_URL=http://host.docker.internal:11434`.
 4. **Sanity-check the wiring** — `curl http://localhost:11434/api/version` on the host should return JSON. If a container's LLM calls fail with "Connection refused", this env var is the first thing to check.
 
 On a Linux host, `host.docker.internal` needs one extra flag: `--add-host=host.docker.internal:host-gateway` for `docker run`, or `extra_hosts: ["host.docker.internal:host-gateway"]` on a compose service. For a Linux home server, prefer the `docker-compose.linux.yml` override instead — see the next section.
 
-#### Home server (Linux + Tailscale)
+#### Linux host networking (local-only)
 
 On a Linux host, Docker Desktop's `host.docker.internal` doesn't exist. Use the Linux override, which runs the containers on the host's own network — `localhost` inside the container *is* the host, so Ollama needs no extra wiring:
 
 ```bash
-docker compose -f docker-compose.yml -f docker-compose.linux.yml up -d runner   # headless runner
+docker compose -f docker-compose.yml -f docker-compose.linux.yml --profile runner run --rm runner   # one local tick
 docker compose -f docker-compose.yml -f docker-compose.linux.yml run --rm tui   # terminal TUI
 ```
 
-Moving a fund from another machine: stop the old runner first (one runner per fund, even across machines), copy the state with `rsync -a ~/.hedge-fund/ server:~/.hedge-fund/`, then start the runner on the server. The LLM cache travels with it, so nothing is recomputed.
-
-Remote access over Tailscale:
-
-1. On the server: install Tailscale and run `tailscale up --ssh` (Tailscale SSH is a Linux feature — your tailnet handles auth, no keys to manage).
-2. Terminal TUI from any tailnet device: `ssh <server>`, then `tmux new -s tui` (or `tmux attach -t tui`) and start the TUI with the compose command above. tmux keeps the session alive across disconnects.
-3. Browser TUI: `docker compose -f docker-compose.yml -f docker-compose.linux.yml up -d tui-web` serves the full app on `127.0.0.1:7681`. Publish it to your tailnet with HTTPS: `tailscale serve --bg 7681`, then open `https://<server-name>.<tailnet>.ts.net` from any device. Only devices on your tailnet can reach it.
-
-If Ollama runs on a different machine than the server, point `OLLAMA_BASE_URL` at that machine's tailnet IP (e.g. `http://100.x.y.z:11434`) and run Ollama there with `OLLAMA_HOST=0.0.0.0` so it accepts non-local connections.
+The web observer remains host-loopback-published. Remote access, reverse proxies,
+and non-loopback publication are unsupported. The legacy browser TUI also remains
+local-only.
 
 ## Development
 
@@ -267,7 +298,9 @@ If Ollama runs on a different machine than the server, point `OLLAMA_BASE_URL` a
 git clone https://github.com/virattt/ai-hedge-fund.git
 cd ai-hedge-fund
 poetry install
-poetry run aihf
+export AIHF_ROOT="$HOME/.aihf-data"
+mkdir -p "$AIHF_ROOT"
+poetry run aihf --root "$AIHF_ROOT"
 poetry run pytest hedge_fund
 ```
 

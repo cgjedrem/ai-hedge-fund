@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, within } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -7,8 +7,9 @@ import type {
   Capabilities,
   Catalog,
   HomeData,
-  Job,
   MandateCollection,
+  Operation,
+  OperationPreview,
   PaperCollection,
   PaperSnapshot,
   ResearchReport,
@@ -25,6 +26,10 @@ const capabilities: Capabilities = {
   read_only: true,
   writes: false,
   network: false,
+  local_operator_only: true,
+  csrf_authenticates_users: false,
+  container_observer: false,
+  write_unavailable_reason: null,
   protected_names: ["watchtower", "watchtower-weekly", "umbrella"],
   mutation_token: null,
   deferred_actions: {
@@ -32,7 +37,7 @@ const capabilities: Capabilities = {
     manual_run: "Manual execution is disabled.",
     delete: "Deletion is not available.",
     redo: "Redo is not available.",
-    live_value: "Live quotes are not fetched.",
+    live_value: "Valuation refresh is disabled.",
   },
 };
 
@@ -95,7 +100,18 @@ const paperDetail: PaperSnapshot = {
   halt_state: "clear",
   ledger: { ok: true, error: null },
   runner: { status: "unknown", available: false, reason: "Runner ownership is not verified; web process controls are disabled." },
-  live_value: { status: "unavailable", value: null, as_of: null, provenance: null, reason: "Live quotes are not fetched by the web process." },
+  live_value: {
+    status: "unavailable",
+    value: null,
+    partial_estimate: null,
+    as_of: null,
+    provenance: null,
+    expected_head: sourceHash,
+    recorded_nav: null,
+    coverage: { total: 0, quoted: 0, usable: 0, missing: 0, stale: 0, errors: 0 },
+    quotes: [],
+    reason: "Network capability is disabled.",
+  },
   scorecard: null,
   scorecard_error: null,
 };
@@ -140,9 +156,29 @@ const catalog: Catalog = {
 
 const settings: Settings = {
   model: "provider/model",
+  llm_provider: "Test provider",
+  endpoint: null,
+  timeout_seconds: 60,
+  parameters: {},
+  version: 3,
+  provenance: {
+    data_provider: "default",
+    llm_provider: "default",
+    model: "default",
+    endpoint: "default",
+    timeout_seconds: "default",
+    parameters: "default",
+  },
+  settings_error: null,
   models: catalog.models,
-  providers: [{ provider: "test-provider", requires_key: true, configured: false }],
+  providers: [{ provider: "test-provider", requires_key: true, configured: false, version: 0 }],
   data_provider: "yfinance",
+  data_providers: [
+    { id: "fd", label: "Financial Datasets" },
+    { id: "yfinance", label: "Yahoo Finance" },
+  ],
+  active_captures: [],
+  active_captures_available: true,
   network_enabled: false,
 };
 
@@ -273,7 +309,7 @@ function installApi(options?: {
     if (path === "/api/paper/demo-quality/sessions/2024-06-04") return response(sessionReport);
     if (path === "/api/research") return response({ items: [researchReport], errors: [] });
     if (path === "/api/research/demo-report.json") return response(researchReport);
-    if (path === "/api/jobs") return response({ items: [] });
+    if (path === "/api/operations") return response({ items: [] });
     return response({ detail: "Not found." }, 404);
   });
   vi.stubGlobal("fetch", fetchMock);
@@ -342,6 +378,73 @@ describe("local desk screens", () => {
     expect(screen.getByRole("button", { name: "Reject" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "Halt" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "Resume" })).toBeDisabled();
+  });
+
+  it("fetches valuation only after an explicit refresh and keeps recorded NAV separate", async () => {
+    const writeCaps: Capabilities = {
+      ...capabilities,
+      mode: "live",
+      writes: true,
+      read_only: false,
+      network: true,
+      mutation_token: "valuation-token",
+    };
+    const estimate = {
+      status: "estimated",
+      value: "100500.125",
+      partial_estimate: null,
+      as_of: "2026-10-29T12:00:00Z",
+      provenance: "yfinance",
+      expected_head: sourceHash,
+      recorded_nav: "101000",
+      request_id: "a".repeat(32),
+      deployment: "demo-quality",
+      coverage: { total: 1, quoted: 1, usable: 1, missing: 0, stale: 0, errors: 0 },
+      quotes: [{
+        ticker: "AAPL",
+        shares: "100",
+        price: "105.00125",
+        quote_time: "2026-10-29T11:59:55Z",
+        observation_age_seconds: 5,
+        status: "quoted",
+        freshness: "unknown",
+        reason: "Observation time is not an exchange print time; freshness is unverified.",
+      }],
+      reason: "Complete symbol coverage; provider print freshness is unverified.",
+    };
+    installApi({
+      caps: writeCaps,
+      override: (path, method) =>
+        path === "/api/paper/demo-quality/valuation" && method === "POST"
+          ? { payload: estimate }
+          : null,
+    });
+    window.history.replaceState({}, "", "/paper/demo-quality");
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findByRole("heading", { name: "demo-quality" });
+
+    expect(fetchRequests.some((item) => item.path.endsWith("/valuation"))).toBe(false);
+    const refresh = screen.getByRole("button", { name: "Refresh estimate" });
+    expect(refresh).toBeEnabled();
+    await user.click(refresh);
+
+    expect(await screen.findByText("Exact estimate · 100500.125")).toBeInTheDocument();
+    const recordedNote = screen.getByText(/Quote time is provider observation time/);
+    expect(recordedNote).toHaveTextContent(/Recorded NAV \$101,000 remains unchanged/);
+    expect(recordedNote).toHaveTextContent(/exchange print freshness is unverified/);
+    const request = fetchRequests.find((item) => item.path === "/api/paper/demo-quality/valuation" && item.method === "POST");
+    expect(request?.body).toEqual({ expected_head: sourceHash });
+    expect(request?.headers.get("x-csrf-token")).toBe("valuation-token");
+  });
+
+  it("keeps valuation refresh unavailable when network capability is off", async () => {
+    window.history.replaceState({}, "", "/paper/demo-quality");
+    render(<App />);
+
+    await screen.findByRole("heading", { name: "demo-quality" });
+    expect(screen.queryByRole("button", { name: "Refresh estimate" })).not.toBeInTheDocument();
+    expect(fetchRequests.some((item) => item.path.endsWith("/valuation"))).toBe(false);
   });
 
   it("shows a verified-ledger error without session metrics", async () => {
@@ -510,44 +613,134 @@ describe("local desk screens", () => {
     expect(input).toHaveValue("");
     expect(document.body).not.toHaveTextContent(sentinel);
     const request = fetchRequests.find((item) => item.path === "/api/settings/credentials" && item.method === "POST");
-    expect(request?.body).toEqual({ provider: "test-provider", value: sentinel });
+    expect(request?.body).toEqual({
+      provider: "test-provider",
+      value: sentinel,
+      expected_version: 0,
+    });
     expect(request?.headers.get("x-csrf-token")).toBe("settings-token");
 
     fireEvent.keyDown(document.body, { key: "k", ctrlKey: true });
     expect(await screen.findByPlaceholderText("Search pages…")).toBeInTheDocument();
   });
 
-  it("labels model selection as process-only", async () => {
+  it("labels effective runtime settings as root-persisted", async () => {
     window.history.replaceState({}, "", "/settings");
     render(<App />);
 
-    expect(await screen.findByText("Supported provider catalog · applies to this server process")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Use model for this process" })).toBeDisabled();
+    expect(await screen.findByText("Effective values · saved to this root")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Save runtime settings for this root" })).toBeDisabled();
   });
 
-  it("restores, selects, and persists a backtest job for monitoring and cancellation", async () => {
-    const activeJob: Job = {
+  it("persists effective runtime settings with the mutation token", async () => {
+    const writeCaps: Capabilities = {
+      ...capabilities,
+      mode: "live",
+      writes: true,
+      read_only: false,
+      mutation_token: "runtime-settings-token",
+    };
+    installApi({ caps: writeCaps });
+    window.history.replaceState({}, "", "/settings");
+    const user = userEvent.setup();
+    render(<App />);
+
+    await screen.findByText("Effective values · saved to this root");
+    await user.type(screen.getByLabelText("LLM endpoint override"), "https://api.example/v1");
+    await user.click(screen.getByRole("button", { name: "Save runtime settings for this root" }));
+
+    const request = fetchRequests.find((item) => item.path === "/api/settings" && item.method === "PUT");
+    expect(request?.body).toEqual({
+      data_provider: "yfinance",
+      model: "provider/model",
+      endpoint: "https://api.example/v1",
+      timeout_seconds: 60,
+      parameters: {},
+      expected_version: 3,
+    });
+    expect(request?.headers.get("x-csrf-token")).toBe("runtime-settings-token");
+    expect(await screen.findByText(/Runtime settings are saved in this root/)).toBeInTheDocument();
+  });
+
+  it("shows active captures with their frozen settings version", async () => {
+    const activeSettings: Settings = {
+      ...settings,
+      version: 4,
+      active_captures: [
+        {
+          capture_id: "c".repeat(32),
+          subject_id: "demo-quality",
+          status: "running",
+          capture_details_available: true,
+          settings_version: 3,
+          data_provider: "yfinance",
+          llm_provider: "Ollama",
+          model: "gemma3:4b",
+          endpoint: null,
+          restart_needed: true,
+        },
+      ],
+    };
+    installApi({
+      override: (path, method) =>
+        path === "/api/settings" && method === "GET"
+          ? { payload: activeSettings }
+          : null,
+    });
+    window.history.replaceState({}, "", "/settings");
+    render(<App />);
+
+    expect(await screen.findByText("Active execution snapshots")).toBeInTheDocument();
+    expect(screen.getByText("gemma3:4b")).toBeInTheDocument();
+    expect(screen.getByText("Settings version")).toBeInTheDocument();
+    expect(screen.getByText(/New settings apply to later operations/)).toBeInTheDocument();
+  });
+
+  it("restores, selects, and persists a durable backtest operation for monitoring and cancellation", async () => {
+    const activeOperation: Operation = {
+      operation_id: "a".repeat(32),
+      request_id: "active-backtest",
+      action: "backtest",
+      subject_id: "demo-quality",
+      capture_id: "c".repeat(32),
+      capture_digest: "d".repeat(64),
+      status: "running",
+      created_at: "2026-10-31T12:00:00+00:00",
+      updated_at: "2026-10-31T12:00:01+00:00",
+      payload: {
+        fund: "demo-quality",
+        universe: ["AAPL"],
+        start: "2026-10-01",
+        end: "2026-10-30",
+        provider: "yfinance",
+        model: "provider/model",
+        mandate_hash: hash,
+      },
+      result: null,
+      progress: 45,
       id: "a".repeat(32),
       fund: "demo-quality",
       provider: "yfinance",
       model: "provider/model",
-      status: "running",
-      progress: 45,
-      submitted_at: "2026-10-31T12:00:00+00:00",
-      started_at: "2026-10-31T12:00:01+00:00",
-      completed_at: null,
       report_id: null,
       error: null,
       cancel_requested: false,
+      status_url: "/api/operations/" + "a".repeat(32),
     };
-    const completedJob: Job = {
-      ...activeJob,
+    const completedOperation: Operation = {
+      ...activeOperation,
+      operation_id: "b".repeat(32),
+      request_id: "complete-backtest",
+      capture_id: "e".repeat(32),
       id: "b".repeat(32),
       fund: "archived-research",
-      status: "succeeded",
+      subject_id: "archived-research",
+      status: "completed",
       progress: 100,
-      completed_at: "2026-10-31T12:01:00+00:00",
+      created_at: "2026-10-31T12:00:30+00:00",
+      updated_at: "2026-10-31T12:01:00+00:00",
       report_id: "archived-report.json",
+      status_url: "/api/operations/" + "b".repeat(32),
     };
     const writeCaps: Capabilities = {
       ...capabilities,
@@ -555,19 +748,29 @@ describe("local desk screens", () => {
       writes: true,
       read_only: false,
       network: true,
-      mutation_token: "job-test-token",
+      mutation_token: "operation-test-token",
     };
-    let currentActiveJob = activeJob;
-    window.localStorage.removeItem("aihf.backtests.selected-job");
+    let currentActiveOperation = activeOperation;
+    window.localStorage.removeItem("aihf.backtests.selected-operation");
     installApi({
       caps: writeCaps,
       override: (path, method) => {
-        if (path === "/api/jobs" && method === "GET") return { payload: { items: [activeJob, completedJob] } };
-        if (path === `/api/jobs/${activeJob.id}` && method === "GET") return { payload: currentActiveJob };
-        if (path === `/api/jobs/${completedJob.id}` && method === "GET") return { payload: completedJob };
-        if (path === `/api/jobs/${activeJob.id}/cancel` && method === "POST") {
-          currentActiveJob = { ...activeJob, cancel_requested: true };
-          return { payload: currentActiveJob };
+        if (path === "/api/operations" && method === "GET") {
+          return { payload: { items: [currentActiveOperation, completedOperation] } };
+        }
+        if (path === `/api/operations/${activeOperation.id}` && method === "GET") {
+          return { payload: currentActiveOperation };
+        }
+        if (path === `/api/operations/${completedOperation.id}` && method === "GET") {
+          return { payload: completedOperation };
+        }
+        if (path === `/api/operations/${activeOperation.id}/cancel` && method === "POST") {
+          currentActiveOperation = {
+            ...currentActiveOperation,
+            status: "cancel-requested",
+            cancel_requested: true,
+          };
+          return { payload: currentActiveOperation };
         }
         return null;
       },
@@ -576,22 +779,141 @@ describe("local desk screens", () => {
     const user = userEvent.setup();
     const view = render(<App />);
 
-    expect(await screen.findByText(activeJob.id)).toBeInTheDocument();
+    expect(await screen.findByText(activeOperation.id)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Request cancellation" })).toBeEnabled();
     await user.click(screen.getByRole("button", { name: "Request cancellation" }));
-    expect(fetchRequests.some((item) => item.path === `/api/jobs/${activeJob.id}/cancel` && item.method === "POST")).toBe(true);
+    await screen.findByRole("button", { name: "Cancellation requested…" });
+    const cancelRequest = fetchRequests.find(
+      (item) => item.path === `/api/operations/${activeOperation.id}/cancel` && item.method === "POST",
+    );
+    expect(cancelRequest).toBeDefined();
+    expect((cancelRequest?.body as { request_id?: string }).request_id).toMatch(/^[a-f0-9]{32}$/);
 
-    await user.click(screen.getByRole("button", { name: `Monitor job ${completedJob.id}` }));
-    expect(await screen.findByText(completedJob.id)).toBeInTheDocument();
-    expect(window.localStorage.getItem("aihf.backtests.selected-job")).toBe(completedJob.id);
+    await user.click(screen.getByRole("button", { name: `Monitor operation ${completedOperation.id}` }));
+    expect(await screen.findByText(completedOperation.id)).toBeInTheDocument();
+    expect(window.localStorage.getItem("aihf.backtests.selected-operation")).toBe(completedOperation.id);
 
     await user.click(within(screen.getByRole("navigation", { name: "Primary navigation" })).getByRole("link", { name: "Research" }));
     expect(await screen.findByRole("heading", { name: "Research reports" })).toBeInTheDocument();
     await user.click(within(screen.getByRole("navigation", { name: "Primary navigation" })).getByRole("link", { name: "Backtests" }));
-    expect(await screen.findByText(completedJob.id)).toBeInTheDocument();
+    expect(await screen.findByText(completedOperation.id)).toBeInTheDocument();
 
     view.unmount();
     render(<App />);
-    expect(await screen.findByText(completedJob.id)).toBeInTheDocument();
+    expect(await screen.findByText(completedOperation.id)).toBeInTheDocument();
+  });
+
+  it("requires a fresh server preview before durable acceptance", async () => {
+    const writeCaps: Capabilities = {
+      ...capabilities,
+      mode: "live",
+      writes: true,
+      read_only: false,
+      network: true,
+      mutation_token: "review-test-token",
+    };
+    const payload = {
+      fund: "demo-quality",
+      universe: ["AAPL"],
+      start: "2026-10-01",
+      end: "2026-10-30",
+      provider: "yfinance",
+      model: "provider/model",
+      mandate_hash: mandates.items[0].mandate_hash,
+    };
+    const preview: OperationPreview = {
+      preview_id: "c".repeat(32),
+      preview_digest: "d".repeat(64),
+      confirmation_token: "synthetic-confirmation-token",
+      action: "backtest",
+      subject_id: "demo-quality",
+      expected_head: mandates.items[0].mandate_hash,
+      due_set: [],
+      capture_id: "e".repeat(32),
+      capture_digest: "f".repeat(64),
+      expires_at: "2026-10-31T12:10:00+00:00",
+      payload,
+      capture: { model: payload.model },
+      estimate: {
+        maximum_model_calls: 2,
+        maximum_cost_usd: 0,
+        market_data_provider: "yfinance",
+      },
+      warnings: [],
+    };
+    const acceptedOperation: Operation = {
+      operation_id: "1".repeat(32),
+      request_id: "accepted-backtest",
+      action: "backtest",
+      subject_id: "demo-quality",
+      capture_id: preview.capture_id,
+      capture_digest: preview.capture_digest,
+      status: "accepted",
+      created_at: "2026-10-31T12:00:00+00:00",
+      updated_at: "2026-10-31T12:00:00+00:00",
+      payload,
+      result: null,
+      progress: 0,
+      id: "1".repeat(32),
+      fund: "demo-quality",
+      provider: "yfinance",
+      model: "provider/model",
+      report_id: null,
+      error: null,
+      cancel_requested: false,
+      status_url: "/api/operations/" + "1".repeat(32),
+    };
+    let previewCount = 0;
+    let acceptCount = 0;
+    installApi({
+      caps: writeCaps,
+      override: (path, method, body) => {
+        if (path === "/api/operations/preview" && method === "POST") {
+          previewCount += 1;
+          expect(body).toMatchObject({
+            action: "backtest",
+            subject_id: "demo-quality",
+            expected_head: mandates.items[0].mandate_hash,
+          });
+          return { payload: preview, status: 201 };
+        }
+        if (path === "/api/operations" && method === "POST") {
+          acceptCount += 1;
+          expect(body).toMatchObject({
+            preview_id: preview.preview_id,
+            preview_digest: preview.preview_digest,
+            confirmation_token: preview.confirmation_token,
+            expected_head: preview.expected_head,
+          });
+          return { payload: acceptedOperation, status: 202 };
+        }
+        if (path === "/api/operations" && method === "GET") {
+          return { payload: { items: acceptCount ? [acceptedOperation] : [] } };
+        }
+        if (path === `/api/operations/${acceptedOperation.id}` && method === "GET") {
+          return { payload: acceptedOperation };
+        }
+        return null;
+      },
+    });
+    window.localStorage.removeItem("aihf.backtests.selected-operation");
+    window.history.replaceState({}, "", "/backtests");
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.type(await screen.findByLabelText("Ticker universe"), "AAPL");
+    const reviewButton = screen.getByRole("button", { name: "Review backtest" });
+    await waitFor(() => expect(reviewButton).toBeEnabled());
+    await user.click(reviewButton);
+    expect(await screen.findByRole("heading", { name: "Confirm reviewed backtest" })).toBeInTheDocument();
+    expect(previewCount).toBe(1);
+    expect(acceptCount).toBe(0);
+
+    await user.click(screen.getByRole("button", { name: "Accept reviewed operation" }));
+    expect(await screen.findByText(acceptedOperation.id)).toBeInTheDocument();
+    expect(acceptCount).toBe(1);
+    expect((fetchRequests.find((item) => item.path === "/api/operations" && item.method === "POST")?.body as { request_id?: string }).request_id).toMatch(/^[a-f0-9]{32}$/);
+    expect(window.localStorage.getItem("aihf.backtests.selected-operation")).toBe(acceptedOperation.id);
+    expect(window.localStorage.getItem("synthetic-confirmation-token")).toBeNull();
   });
 });

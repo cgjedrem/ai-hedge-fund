@@ -9,7 +9,7 @@ import {
   FileText,
   ShieldCheck,
 } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 
 import { ConfirmDialog } from "@/components/confirm-dialog";
@@ -36,6 +36,7 @@ import { useDesk, useResource } from "@/lib/hooks";
 import type {
   Approval,
   HaltState,
+  LiveValuation,
   PaperCollection,
   PaperSnapshot,
   PaperSummary,
@@ -134,12 +135,23 @@ export function PaperDetailPage() {
   const [haltDialogOpen, setHaltDialogOpen] = useState(false);
   const [haltReason, setHaltReason] = useState("");
   const [busy, setBusy] = useState(false);
+  const [valuationBusy, setValuationBusy] = useState(false);
+  const [valuationResult, setValuationResult] = useState<LiveValuation | null>(null);
   const [feedback, setFeedback] = useState<{ tone: "danger" | "neutral"; message: string } | null>(null);
+  const valuationRequest = useRef(0);
   const protectedName = capabilities?.protected_names.some((entry) => entry.toLowerCase() === name.toLowerCase()) ?? false;
   const canWrite = capabilities?.writes === true && !protectedName;
   const data = resource.data;
   const approvalRequired = data?.spec.approval_required === true;
   const canApprove = canWrite && approvalRequired && data?.halt_state === "clear" && data?.ledger.ok === true;
+  const canRefreshValuation = canWrite && capabilities?.network === true && data?.ledger.ok === true;
+  const liveValue = valuationResult ?? data?.live_value;
+
+  useEffect(() => {
+    valuationRequest.current += 1;
+    setValuationResult(null);
+    setValuationBusy(false);
+  }, [name, data?.last_record_hash]);
 
   async function submitAction(): Promise<void> {
     if (!confirmAction) return;
@@ -186,6 +198,26 @@ export function PaperDetailPage() {
       setFeedback({ tone: "danger", message: cause instanceof Error ? cause.message : "Halt request failed." });
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function refreshValuation(): Promise<void> {
+    if (!data || !canRefreshValuation) return;
+    const request = ++valuationRequest.current;
+    setValuationBusy(true);
+    setFeedback(null);
+    try {
+      const estimate = await apiPost<LiveValuation>(
+        `/api/paper/${encodeURIComponent(name)}/valuation`,
+        { expected_head: data.last_record_hash },
+      );
+      if (request !== valuationRequest.current) return;
+      setValuationResult(estimate);
+    } catch (cause) {
+      if (request !== valuationRequest.current) return;
+      setFeedback({ tone: "danger", message: cause instanceof Error ? cause.message : "Valuation refresh failed." });
+    } finally {
+      if (request === valuationRequest.current) setValuationBusy(false);
     }
   }
 
@@ -287,14 +319,55 @@ export function PaperDetailPage() {
               <Card>
                 <CardHeader>
                   <div className="flex items-center justify-between gap-3">
-                    <CardTitle>Live value</CardTitle>
-                    <Badge variant="muted">{data.live_value.status}</Badge>
+                    <CardTitle>Estimated value</CardTitle>
+                    <Badge variant={liveValue?.status === "estimated" ? "positive" : liveValue?.status === "unavailable" ? "muted" : "warning"}>
+                      {liveValue?.status ?? "unavailable"}
+                    </Badge>
                   </div>
                 </CardHeader>
-                <CardContent>
-                  <p className="mono text-xl text-muted-foreground">{money(data.live_value.value)}</p>
-                  <p className="mt-2 text-xs leading-relaxed text-muted-foreground">{data.live_value.reason}</p>
-                  <p className="mt-2 text-[10px] text-muted-foreground">No quote is fabricated from the last recorded mark.</p>
+                <CardContent className="space-y-3">
+                  <p className="mono text-xl text-muted-foreground">{estimateMoney(liveValue?.value ?? null)}</p>
+                  {liveValue?.value ? <p className="mono break-all text-[10px] text-muted-foreground">Exact estimate · {liveValue.value}</p> : null}
+                  {liveValue?.partial_estimate ? <p className="mono text-xs text-warning">Partial only · {liveValue.partial_estimate}</p> : null}
+                  <p className="text-xs leading-relaxed text-muted-foreground">{liveValue?.reason ?? "No valuation estimate is available."}</p>
+                  <p className="text-[10px] text-muted-foreground">
+                    Recorded NAV {money(data.nav)} remains unchanged. Quote time is provider observation time; exchange print freshness is unverified.
+                  </p>
+                  {liveValue ? (
+                    <>
+                      <p className="mono text-[10px] text-muted-foreground">
+                        {liveValue.provenance ?? "No source"} · {liveValue.coverage.usable}/{liveValue.coverage.total} within observation limit
+                        {liveValue.as_of ? ` · ${liveValue.as_of}` : ""}
+                      </p>
+                      {liveValue.quotes.length > 0 ? (
+                        <ul className="space-y-1 border-t border-border pt-2">
+                          {liveValue.quotes.map((quote) => (
+                            <li key={quote.ticker} className="flex flex-wrap justify-between gap-x-3 text-[10px]">
+                              <span className="mono">{quote.ticker} · {quote.status} · freshness {quote.freshness}</span>
+                              <span className="mono text-muted-foreground">
+                                {quote.price ?? "No mark"}{quote.quote_time ? ` · ${quote.quote_time}` : ""}
+                              </span>
+                            </li>
+                          ))}
+                        </ul>
+                      ) : null}
+                    </>
+                  ) : null}
+                  {capabilities?.network === true ? (
+                    <Button
+                      variant="outline"
+                      onClick={() => void refreshValuation()}
+                      disabled={!canRefreshValuation || valuationBusy}
+                      aria-busy={valuationBusy}
+                    >
+                      {valuationBusy ? "Refreshing quotes…" : "Refresh estimate"}
+                    </Button>
+                  ) : (
+                    <p className="text-[10px] text-muted-foreground">Refresh disabled; server network capability is off.</p>
+                  )}
+                  <p className="text-[10px] text-muted-foreground">
+                    Explicit request only · free Yahoo provider · maximum 25 ticker calls · no ledger writes.
+                  </p>
                 </CardContent>
               </Card>
 
@@ -446,6 +519,12 @@ function PositionsTable({ positions }: { positions: Position[] }) {
     { key: "value", label: "Recorded value", align: "right", render: (item) => <span className="mono text-foreground">{money(item.market_value)}</span> },
   ];
   return <DataTable columns={columns} rows={positions} rowKey={(item) => item.ticker} emptyTitle="No recorded positions" emptyDescription="Positions appear after a session is persisted." />;
+}
+
+function estimateMoney(value: string | null): string {
+  if (value === null) return "—";
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? money(numeric) : value;
 }
 
 function SessionsTable({ name, sessions }: { name: string; sessions: SessionSummary[] }) {

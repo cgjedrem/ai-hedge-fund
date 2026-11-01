@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
 import math
 import re
 import stat
@@ -18,22 +19,35 @@ from types import MappingProxyType
 from typing import Any, Iterator
 from uuid import uuid4
 
-from hedge_fund.runtime.admission import AdmissionCoordinator, AdmissionError
+from hedge_fund.runtime.admission import (
+    AdmissionCoordinator,
+    AdmissionError,
+    LOCK_DIRECTORY,
+)
 from hedge_fund.runtime.capture import _root_id, FrozenCapture
-from hedge_fund.runtime.root import ensure_unique_resource_name, RootContext, RootPathError
+from hedge_fund.runtime.root import (
+    ensure_unique_resource_name,
+    PRIVATE_ROOT,
+    RootContext,
+    RootPathError,
+)
 
-INDEX_PATH = "runtime/operations/index.json"
+OPERATIONS_ROOT = f"{PRIVATE_ROOT}/operations"
+CAPTURE_ROOT = f"{PRIVATE_ROOT}/captures"
+INDEX_PATH = f"{OPERATIONS_ROOT}/index.json"
 _SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
 _HEX_ID = re.compile(r"[a-f0-9]{32}")
 _SHA256 = re.compile(r"[a-f0-9]{64}")
 _ACTION = re.compile(r"[a-z][a-z0-9._-]{0,63}")
 _MAX_INDEX_BYTES = 16 * 1024 * 1024
+_MAX_INDEX_ENTRIES = 10000
 _MAX_PAYLOAD_BYTES = 65536
 _MAX_PAYLOAD_NODES = 1024
 _MAX_CAPTURE_BYTES = 1024 * 1024
 _MAX_LOCK_WAIT_SECONDS = 5.0
 _DENIED_FIELDS = ("apikey", "capability", "credential", "environment", "networkauthorized", "password", "pid", "process", "root", "secret", "token", "argv")
 _KEY_FIELDS = {"accesskey", "clientkey", "encryptionkey", "key", "keymaterial", "keyref", "keyvalue", "privatekey", "providerkey", "secretkey", "signingkey"}
+_LOGGER = logging.getLogger(__name__)
 
 
 class OperationError(RuntimeError):
@@ -163,6 +177,8 @@ class OperationRecord:
     result: Mapping[str, Any] | None = field(default=None, repr=False)
     progress: int = 0
     fence_generation: int = 0
+    created_at: str = ""
+    updated_at: str = ""
 
     def __post_init__(self) -> None:
         _validate_operation_id(self.operation_id)
@@ -183,6 +199,8 @@ class OperationRecord:
             raise OperationError("operation progress does not match state")
         if type(self.fence_generation) is not int or self.fence_generation < 0:
             raise OperationError("operation fence generation is invalid")
+        _parse_datetime(self.created_at)
+        _parse_datetime(self.updated_at)
         payload = _normalize_payload(self.payload)
         result = None if self.result is None else _normalize_payload(self.result)
         object.__setattr__(self, "subject_id", subject_id)
@@ -198,6 +216,8 @@ class OperationRecord:
             "capture_id": self.capture_id,
             "capture_digest": self.capture_digest,
             "status": self.status.value,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
             "payload": _thaw_json(self.payload),
             "result": None if self.result is None else _thaw_json(self.result),
             "progress": self.progress,
@@ -226,18 +246,16 @@ class OperationStore:
         root: RootContext,
         *,
         admission: AdmissionCoordinator,
-        private_storage_verified: bool = False,
     ) -> None:
         if not isinstance(root, RootContext) or not isinstance(admission, AdmissionCoordinator):
             raise OperationError("root and admission contexts are required")
         if admission._root is not root:
             raise OperationError("admission root does not match")
-        if type(private_storage_verified) is not bool:
-            raise OperationError("private storage status is invalid")
+        if not root.verify_private_storage():
+            raise OperationError("private storage protection is unverified")
         root.revalidate()
         self._root = root
         self._admission = admission
-        self._private_storage_verified = private_storage_verified
 
     def create_preview(
         self,
@@ -269,7 +287,7 @@ class OperationStore:
         capture_payload = capture.private_bytes()
         if len(capture_payload) > _MAX_CAPTURE_BYTES:
             raise OperationError("capture sidecar exceeds its bound")
-        capture_path = f"runtime/captures/{capture.capture_id}.json"
+        capture_path = f"{CAPTURE_ROOT}/{capture.capture_id}.json"
 
         preview_id = uuid4().hex
         token = token_urlsafe(32)
@@ -315,10 +333,21 @@ class OperationStore:
             index = self._read_index()
             if preview_id in index["previews"]:
                 raise OperationConflict("preview identity already exists")
-            self._write_capture_if_missing(capture_path, capture_payload)
-            self._write_json(f"runtime/operations/previews/{preview_id}.json", preview_record)
             index["previews"][preview_id] = preview_record
-            self._write_index(index)
+            self._check_index_bounds(index)
+            self._write_capture_if_missing(capture_path, capture_payload)
+            try:
+                self._write_index(index)
+                self._write_json(
+                    f"{OPERATIONS_ROOT}/previews/{preview_id}.json",
+                    preview_record,
+                )
+            except Exception as write_error:
+                if not self._repair_sidecars_after_error(
+                    write_error,
+                    previews={preview_id: preview_record},
+                ):
+                    raise
         return preview
 
     def accept_request(
@@ -336,6 +365,7 @@ class OperationStore:
         payload: Mapping[str, object],
         now: datetime,
         start_worker: Callable[[OperationRecord], object] | None = None,
+        current_state_resolver: Callable[[], tuple[str | None, tuple[str, ...]]] | None = None,
     ) -> OperationRecord:
         self._require_private_storage()
         request_id = _validate_request_id(request_id)
@@ -349,6 +379,8 @@ class OperationStore:
             raise ConfirmationRejected("confirmation is invalid")
         if start_worker is not None and not callable(start_worker):
             raise OperationError("worker launcher is invalid")
+        if current_state_resolver is not None and not callable(current_state_resolver):
+            raise OperationError("current state resolver is invalid")
         due_set = _validate_due_set(due_set)
         _validate_datetime(now)
         if expected_head is not None and not _safe_text(expected_head, maximum=512):
@@ -375,75 +407,106 @@ class OperationStore:
         operation: OperationRecord
         created = False
         with self._locked(subject_id):
-            index = self._read_index()
-            existing = index["requests"].get(request_id)
-            if existing is not None:
-                if existing.get("request_digest") != request_digest:
-                    raise OperationConflict("request identity conflicts with durable state")
-                stored = self._operation_entry(index, existing.get("operation_id"))
-                self._verify_operation_sidecars(stored)
-                self._verify_capture_sidecar(index["previews"][stored["preview_id"]])
-                operation = self._operation_from_index(index, existing.get("operation_id"))
-            else:
-                if request_id in index["cancel_requests"]:
-                    raise OperationConflict("request identity conflicts with durable state")
-                preview = index["previews"].get(preview_id)
-                if not isinstance(preview, dict) or preview.get("digest") != preview_digest:
-                    raise ConfirmationRejected("preview does not match")
-                self._verify_preview_sidecar(preview)
-                self._verify_capture_sidecar(preview)
-                if preview.get("state") != "issued":
-                    raise ConfirmationRejected("confirmation was consumed")
-                if not hmac.compare_digest(str(preview.get("confirmation_token_hash", "")), token_hash):
-                    raise ConfirmationRejected("confirmation does not match")
-                if preview.get("operator_session_hash") != operator_hash:
-                    raise ConfirmationRejected("operator session does not match")
-                expires_at = _parse_datetime(preview.get("expires_at"))
-                if now.astimezone(timezone.utc) >= expires_at:
-                    raise ConfirmationExpired("confirmation expired")
-                if preview.get("action") != action or preview.get("subject_id") != subject_id or preview.get("expected_head") != expected_head or preview.get("due_set") != list(due_set):
-                    raise StalePreview("reviewed head or due-set changed")
-                if preview.get("payload_digest") != payload_digest:
-                    raise StalePreview("reviewed payload changed")
+            lane = (
+                self._admission.manual_session(
+                    subject_id,
+                    timeout=_MAX_LOCK_WAIT_SECONDS,
+                )
+                if action.startswith("paper-")
+                else self._admission.deployment_lock(
+                    subject_id,
+                    timeout=_MAX_LOCK_WAIT_SECONDS,
+                )
+            )
+            with lane:
+                index = self._read_index()
+                existing = index["requests"].get(request_id)
+                if existing is not None:
+                    if existing.get("request_digest") != request_digest:
+                        raise OperationConflict("request identity conflicts with durable state")
+                    stored = self._operation_entry(index, existing.get("operation_id"))
+                    self._verify_operation_sidecars(stored)
+                    self._verify_capture_sidecar(index["previews"][stored["preview_id"]])
+                    operation = self._operation_from_index(index, existing.get("operation_id"))
+                else:
+                    if request_id in index["cancel_requests"]:
+                        raise OperationConflict("request identity conflicts with durable state")
+                    preview = index["previews"].get(preview_id)
+                    if not isinstance(preview, dict) or preview.get("digest") != preview_digest:
+                        raise ConfirmationRejected("preview does not match")
+                    self._verify_preview_sidecar(preview)
+                    self._verify_capture_sidecar(preview)
+                    if preview.get("state") != "issued":
+                        raise ConfirmationRejected("confirmation was consumed")
+                    if not hmac.compare_digest(str(preview.get("confirmation_token_hash", "")), token_hash):
+                        raise ConfirmationRejected("confirmation does not match")
+                    if preview.get("operator_session_hash") != operator_hash:
+                        raise ConfirmationRejected("operator session does not match")
+                    expires_at = _parse_datetime(preview.get("expires_at"))
+                    if now.astimezone(timezone.utc) >= expires_at:
+                        raise ConfirmationExpired("confirmation expired")
+                    if preview.get("action") != action or preview.get("subject_id") != subject_id or preview.get("expected_head") != expected_head or preview.get("due_set") != list(due_set):
+                        raise StalePreview("reviewed head or due-set changed")
+                    if preview.get("payload_digest") != payload_digest:
+                        raise StalePreview("reviewed payload changed")
+                    if current_state_resolver is not None:
+                        current_head, current_due_set = current_state_resolver()
+                        if current_head is not None and not _safe_text(current_head, maximum=512):
+                            raise OperationError("resolved head is invalid")
+                        current_due_set = _validate_due_set(current_due_set)
+                        if current_head != expected_head or current_due_set != due_set:
+                            raise StalePreview("current head or due-set changed")
 
-                operation_id = uuid4().hex
-                timestamp = _datetime_text(now)
-                operation_record = {
-                    "schema": 1,
-                    "operation_id": operation_id,
-                    "request_id": request_id,
-                    "request_digest": request_digest,
-                    "preview_id": preview_id,
-                    "action": action,
-                    "subject_id": subject_id,
-                    "capture_id": preview["capture_id"],
-                    "capture_digest": preview["capture_digest"],
-                    "status": OperationStatus.ACCEPTED.value,
-                    "payload": normalized_payload,
-                    "progress": 0,
-                    "created_at": timestamp,
-                    "updated_at": timestamp,
-                    "fence_generation": 0,
-                    "worker_id_hash": None,
-                    "worker_fence_hash": None,
-                    "events": [{"status": OperationStatus.ACCEPTED.value, "at": timestamp}],
-                    "result": None,
-                }
-                request_record = {
-                    "operation_id": operation_id,
-                    "request_digest": request_digest,
-                    "preview_id": preview_id,
-                    "payload_digest": payload_digest,
-                }
-                preview["state"] = "consumed"
-                preview["consumed_request_id"] = request_id
-                index["requests"][request_id] = request_record
-                index["operations"][operation_id] = operation_record
-                self._write_operation_sidecars(operation_record)
-                self._write_json(f"runtime/operations/previews/{preview_id}.json", preview)
-                self._write_index(index)
-                operation = self._operation_from_index(index, operation_id)
-                created = True
+                    operation_id = uuid4().hex
+                    timestamp = _datetime_text(now)
+                    operation_record = {
+                        "schema": 1,
+                        "operation_id": operation_id,
+                        "request_id": request_id,
+                        "request_digest": request_digest,
+                        "preview_id": preview_id,
+                        "action": action,
+                        "subject_id": subject_id,
+                        "capture_id": preview["capture_id"],
+                        "capture_digest": preview["capture_digest"],
+                        "status": OperationStatus.ACCEPTED.value,
+                        "payload": normalized_payload,
+                        "progress": 0,
+                        "created_at": timestamp,
+                        "updated_at": timestamp,
+                        "fence_generation": 0,
+                        "worker_id_hash": None,
+                        "worker_fence_hash": None,
+                        "events": [{"status": OperationStatus.ACCEPTED.value, "at": timestamp}],
+                        "result": None,
+                    }
+                    request_record = {
+                        "operation_id": operation_id,
+                        "request_digest": request_digest,
+                        "preview_id": preview_id,
+                        "payload_digest": payload_digest,
+                    }
+                    preview["state"] = "consumed"
+                    preview["consumed_request_id"] = request_id
+                    index["requests"][request_id] = request_record
+                    index["operations"][operation_id] = operation_record
+                    self._check_index_bounds(index)
+                    try:
+                        self._write_index(index)
+                        self._write_operation_sidecars(operation_record)
+                        self._write_json(
+                            f"{OPERATIONS_ROOT}/previews/{preview_id}.json",
+                            preview,
+                        )
+                    except Exception as write_error:
+                        if not self._repair_sidecars_after_error(
+                            write_error,
+                            previews={preview_id: preview},
+                            operations={operation_id: operation_record},
+                        ):
+                            raise
+                    operation = self._operation_from_index(index, operation_id)
+                    created = True
 
         if created and start_worker is not None:
             try:
@@ -460,52 +523,74 @@ class OperationStore:
         self._require_private_storage()
         if not isinstance(operation_id, str) or not _HEX_ID.fullmatch(operation_id):
             raise OperationError("operation identity is invalid")
-        index, _ = self._read_verified_operation(operation_id)
-        return self._operation_from_index(index, operation_id)
+        with self._read_snapshot() as index:
+            operation = self._operation_entry(index, operation_id)
+            self._verify_operation_sidecars(operation)
+            self._verify_operation_capture(index, operation)
+            return self._operation_from_index(index, operation_id)
 
     def get_by_request(self, request_id: str) -> OperationRecord | None:
         self._require_private_storage()
         request_id = _validate_request_id(request_id)
-        index = self._read_index()
-        record = index["requests"].get(request_id)
-        if record is None:
-            return None
-        operation_id = record.get("operation_id")
-        index, _ = self._read_verified_operation(operation_id)
-        return self._operation_from_index(index, operation_id)
+        with self._read_snapshot() as index:
+            record = index["requests"].get(request_id)
+            if record is None:
+                return None
+            operation_id = record.get("operation_id")
+            operation = self._operation_entry(index, operation_id)
+            self._verify_operation_sidecars(operation)
+            self._verify_operation_capture(index, operation)
+            return self._operation_from_index(index, operation_id)
 
     def list_operations(self, *, limit: int = 100) -> tuple[OperationRecord, ...]:
         self._require_private_storage()
         if type(limit) is not int or not 1 <= limit <= 100:
             raise OperationError("operation page size is invalid")
-        index = self._read_index()
-        ordered_ids = [
-            operation["operation_id"]
-            for operation in sorted(
+        with self._read_snapshot() as index:
+            ordered = sorted(
                 index["operations"].values(),
                 key=lambda operation: (operation["created_at"], operation["operation_id"]),
                 reverse=True,
             )[:limit]
-        ]
-        result = []
-        for operation_id in ordered_ids:
-            snapshot, _ = self._read_verified_operation(operation_id)
-            result.append(self._operation_from_index(snapshot, operation_id))
-        return tuple(result)
+            result = []
+            for operation in ordered:
+                self._verify_operation_sidecars(operation)
+                self._verify_operation_capture(index, operation)
+                result.append(self._operation_from_index(index, operation["operation_id"]))
+            return tuple(result)
 
     def _read_verified_operation(
         self,
         operation_id: str,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
+        with self._read_snapshot() as index:
+            operation = self._operation_entry(index, operation_id)
+            self._verify_operation_sidecars(operation)
+            self._verify_operation_capture(index, operation)
+            return index, operation
+
+    @contextmanager
+    def _read_snapshot(self) -> Iterator[dict[str, Any]]:
+        self._root.revalidate()
+        try:
+            self._root.file_info(INDEX_PATH)
+        except FileNotFoundError:
+            try:
+                self._root.file_info(f"{LOCK_DIRECTORY}/registry.lock")
+            except FileNotFoundError:
+                yield {
+                    "schema": 1,
+                    "previews": {},
+                    "requests": {},
+                    "cancel_requests": {},
+                    "operations": {},
+                }
+                return
         try:
             with self._admission.registry_read_lock(timeout=_MAX_LOCK_WAIT_SECONDS):
-                index = self._read_index()
-                operation = self._operation_entry(index, operation_id)
-                self._verify_operation_sidecars(operation)
-                self._verify_operation_capture(index, operation)
-                return index, operation
-        except AdmissionError:
-            raise OperationError("operation admission lock is unavailable") from None
+                yield self._read_index()
+        except AdmissionError as exc:
+            raise OperationError("operation admission lock is unavailable") from exc
 
     def claim_worker(
         self,
@@ -636,6 +721,7 @@ class OperationStore:
                 "request_digest": request_digest,
             }
             index["cancel_requests"][request_id] = cancellation
+            operation_changed = False
             if operation["status"] in {
                 OperationStatus.ACCEPTED.value,
                 OperationStatus.RUNNING.value,
@@ -643,9 +729,20 @@ class OperationStore:
                 self._append_event(operation, OperationStatus.CANCEL_REQUESTED, now)
                 operation["status"] = OperationStatus.CANCEL_REQUESTED.value
                 operation["updated_at"] = _datetime_text(now)
-                self._write_operation_sidecars(operation)
-            self._write_cancel_sidecar(request_id, cancellation)
-            self._write_index(index)
+                operation_changed = True
+            self._check_index_bounds(index)
+            try:
+                self._write_index(index)
+                if operation_changed:
+                    self._write_operation_sidecars(operation)
+                self._write_cancel_sidecar(request_id, cancellation)
+            except Exception as write_error:
+                if not self._repair_sidecars_after_error(
+                    write_error,
+                    operations={operation_id: operation},
+                    cancellations={request_id: cancellation},
+                ):
+                    raise
             return self._operation_from_index(index, operation_id)
 
     def acknowledge_cancel(
@@ -699,7 +796,10 @@ class OperationStore:
             self._verify_operation_sidecars(operation)
             self._verify_operation_capture(index, operation)
             self._require_current_fence(operation, operation_id, fence)
-            if operation["status"] != OperationStatus.RUNNING.value:
+            if operation["status"] not in {
+                OperationStatus.RUNNING.value,
+                OperationStatus.CANCEL_REQUESTED.value,
+            }:
                 raise WorkerFenced("operation cannot complete")
             operation["result"] = normalized_result
             operation["progress"] = 100
@@ -765,22 +865,19 @@ class OperationStore:
 
     def recover_unfinished(self, *, now: datetime) -> tuple[OperationRecord, ...]:
         self._require_private_storage()
+        self._admission.require_root_owner()
         _validate_datetime(now)
         recovered: list[OperationRecord] = []
         with self._admission.registry_lock(timeout=_MAX_LOCK_WAIT_SECONDS):
             index = self._read_index()
-            for preview_id, preview in index["previews"].items():
+            for preview in index["previews"].values():
                 self._verify_capture_sidecar(preview)
-                self._write_json(f"runtime/operations/previews/{preview_id}.json", preview)
-            for request_id, cancellation in index["cancel_requests"].items():
-                self._write_cancel_sidecar(request_id, cancellation)
             for operation_id, operation in index["operations"].items():
                 if operation["status"] not in {
                     OperationStatus.ACCEPTED.value,
                     OperationStatus.RUNNING.value,
                     OperationStatus.CANCEL_REQUESTED.value,
                 }:
-                    self._verify_operation_sidecars(operation)
                     continue
                 operation["fence_generation"] += 1
                 operation["worker_id_hash"] = None
@@ -788,10 +885,16 @@ class OperationStore:
                 operation["status"] = OperationStatus.INTERRUPTED.value
                 operation["updated_at"] = _datetime_text(now)
                 self._append_event(operation, OperationStatus.INTERRUPTED, now)
-                self._write_operation_sidecars(operation)
                 recovered.append(self._operation_from_index(index, operation_id))
+            self._check_index_bounds(index)
             if recovered:
                 self._write_index(index)
+            for preview_id, preview in index["previews"].items():
+                self._write_json(f"{OPERATIONS_ROOT}/previews/{preview_id}.json", preview)
+            for request_id, cancellation in index["cancel_requests"].items():
+                self._write_cancel_sidecar(request_id, cancellation)
+            for operation in index["operations"].values():
+                self._write_operation_sidecars(operation)
         return tuple(recovered)
 
     def interrupt(self, operation_id: str, *, now: datetime) -> OperationRecord:
@@ -821,16 +924,18 @@ class OperationStore:
                 self._persist_transition(index, operation)
 
     @contextmanager
-    def _locked(self, subject_id: str) -> Iterator[None]:
-        with self._admission.registry_lock(timeout=_MAX_LOCK_WAIT_SECONDS):
-            with self._admission.manual_session(subject_id, timeout=_MAX_LOCK_WAIT_SECONDS):
+    def _locked(self, _subject_id: str) -> Iterator[None]:
+        try:
+            with self._admission.registry_lock(timeout=_MAX_LOCK_WAIT_SECONDS):
                 yield
+        except AdmissionError as exc:
+            raise OperationError("operation writer admission is unavailable") from exc
 
     @contextmanager
     def _locked_for_operation(self, operation_id: str) -> Iterator[None]:
-        index = self._read_index()
-        operation = self._operation_entry(index, operation_id)
-        subject_id = operation["subject_id"]
+        with self._read_snapshot() as index:
+            operation = self._operation_entry(index, operation_id)
+            subject_id = operation["subject_id"]
         with self._locked(subject_id):
             current = self._operation_entry(self._read_index(), operation_id)
             if current["subject_id"] != subject_id:
@@ -838,7 +943,7 @@ class OperationStore:
             yield
 
     def _require_private_storage(self) -> None:
-        if not self._private_storage_verified:
+        if not self._root.verify_private_storage():
             raise OperationError("private storage protection is unverified")
         self._root.revalidate()
 
@@ -857,8 +962,8 @@ class OperationStore:
             }
         except OperationError:
             raise
-        except Exception:
-            raise OperationError("operation storage is unavailable") from None
+        except Exception as exc:
+            raise OperationError("operation storage is unavailable") from exc
         if len(raw) > _MAX_INDEX_BYTES:
             raise OperationError("operation storage exceeds its bound")
         try:
@@ -871,17 +976,25 @@ class OperationStore:
             raise OperationError("operation storage is invalid")
         if any(not isinstance(entry, dict) for name in ("previews", "requests", "cancel_requests", "operations") for entry in index[name].values()):
             raise OperationError("operation storage is invalid")
-        if any(len(index[name]) > 10000 for name in ("previews", "requests", "cancel_requests", "operations")):
+        if any(len(index[name]) > _MAX_INDEX_ENTRIES for name in ("previews", "requests", "cancel_requests", "operations")):
             raise OperationError("operation storage exceeds its bound")
         _validate_index(index)
         return index
 
     def _write_index(self, index: dict[str, Any]) -> None:
+        payload = self._check_index_bounds(index)
+        self._write_bytes(INDEX_PATH, payload)
+
+    def _check_index_bounds(self, index: dict[str, Any]) -> bytes:
         _validate_index(index)
+        if any(len(index[name]) > _MAX_INDEX_ENTRIES for name in ("previews", "requests", "cancel_requests", "operations")):
+            raise OperationError("operation storage exceeds its bound")
+        if any(len(operation["events"]) > _MAX_INDEX_ENTRIES for operation in index["operations"].values()):
+            raise OperationError("operation journal exceeds its bound")
         payload = _canonical_json(index)
         if len(payload) > _MAX_INDEX_BYTES:
             raise OperationError("operation storage exceeds its bound")
-        self._write_bytes(INDEX_PATH, payload)
+        return payload
 
     def _write_capture_if_missing(self, relative: str, payload: bytes) -> None:
         if len(payload) > _MAX_CAPTURE_BYTES:
@@ -895,8 +1008,8 @@ class OperationStore:
             return
         except OperationError:
             raise
-        except Exception:
-            raise OperationError("capture storage is unavailable") from None
+        except Exception as exc:
+            raise OperationError("capture storage is unavailable") from exc
         if existing != payload:
             raise OperationConflict("capture identity conflicts with stored contents")
 
@@ -910,8 +1023,8 @@ class OperationStore:
         self._root.mkdir(parent, parents=True, mode=0o700)
         try:
             self._root.write_bytes(relative, payload, mode=stat.S_IRUSR | stat.S_IWUSR)
-        except Exception:
-            raise OperationError("operation storage write failed") from None
+        except Exception as exc:
+            raise OperationError("operation storage write failed") from exc
 
     def _write_operation_sidecars(self, operation: dict[str, Any]) -> None:
         for relative, record in _operation_sidecar_records(operation):
@@ -922,19 +1035,19 @@ class OperationStore:
             self._verify_sidecar(relative, _canonical_json(record))
 
     def _verify_preview_sidecar(self, preview: dict[str, Any]) -> None:
-        relative = f"runtime/operations/previews/{preview['preview_id']}.json"
+        relative = f"{OPERATIONS_ROOT}/previews/{preview['preview_id']}.json"
         self._verify_sidecar(relative, _canonical_json(preview))
 
     def _verify_capture_sidecar(self, preview: dict[str, Any]) -> None:
-        relative = f"runtime/captures/{preview['capture_id']}.json"
+        relative = f"{CAPTURE_ROOT}/{preview['capture_id']}.json"
         try:
             if self._root.file_info(relative).size > _MAX_CAPTURE_BYTES:
                 raise OperationError("capture sidecar exceeds its bound")
             payload = self._root.read_bytes(relative)
         except OperationError:
             raise
-        except Exception:
-            raise OperationError("capture sidecar is unavailable") from None
+        except Exception as exc:
+            raise OperationError("capture sidecar is unavailable") from exc
         expected_hash = preview["capture_record_hash"]
         if not hmac.compare_digest(_sha256(payload), expected_hash):
             raise OperationError("capture sidecar does not match frozen configuration")
@@ -950,12 +1063,12 @@ class OperationStore:
         self._verify_capture_sidecar(preview)
 
     def _verify_cancel_sidecar(self, request_id: str, cancellation: dict[str, Any]) -> None:
-        relative = f"runtime/operations/cancellations/{_sha256(request_id.encode('utf-8'))}.json"
+        relative = f"{OPERATIONS_ROOT}/cancellations/{_sha256(request_id.encode('utf-8'))}.json"
         expected = {"schema": 1, "request_id": request_id, **cancellation}
         self._verify_sidecar(relative, _canonical_json(expected))
 
     def _write_cancel_sidecar(self, request_id: str, cancellation: dict[str, Any]) -> None:
-        relative = f"runtime/operations/cancellations/{_sha256(request_id.encode('utf-8'))}.json"
+        relative = f"{OPERATIONS_ROOT}/cancellations/{_sha256(request_id.encode('utf-8'))}.json"
         self._write_json(relative, {"schema": 1, "request_id": request_id, **cancellation})
 
     def _verify_sidecar(self, relative: str, expected: bytes) -> None:
@@ -965,14 +1078,72 @@ class OperationStore:
             actual = self._root.read_bytes(relative)
         except OperationError:
             raise
-        except Exception:
-            raise OperationError("operation sidecar is unavailable") from None
+        except Exception as exc:
+            raise OperationError("operation sidecar is unavailable") from exc
         if not hmac.compare_digest(actual, expected):
             raise OperationError("operation sidecar does not match durable state")
 
     def _persist_transition(self, index: dict[str, Any], operation: dict[str, Any]) -> None:
-        self._write_operation_sidecars(operation)
-        self._write_index(index)
+        self._check_index_bounds(index)
+        try:
+            self._write_index(index)
+            self._write_operation_sidecars(operation)
+        except Exception as write_error:
+            if not self._repair_sidecars_after_error(
+                write_error,
+                operations={operation["operation_id"]: operation},
+            ):
+                raise
+
+    def _repair_sidecars_after_error(
+        self,
+        write_error: Exception,
+        *,
+        previews: Mapping[str, dict[str, Any]] | None = None,
+        operations: Mapping[str, dict[str, Any]] | None = None,
+        cancellations: Mapping[str, dict[str, Any]] | None = None,
+    ) -> bool:
+        try:
+            index = self._read_index()
+            for preview_id, expected in (previews or {}).items():
+                actual = index["previews"].get(preview_id)
+                if not _same_record(actual, expected):
+                    raise OperationError("durable preview transition is unavailable")
+                self._write_json(
+                    f"{OPERATIONS_ROOT}/previews/{preview_id}.json",
+                    actual,
+                )
+            for operation_id, expected in (operations or {}).items():
+                actual = index["operations"].get(operation_id)
+                if not _same_record(actual, expected):
+                    raise OperationError("durable operation transition is unavailable")
+                self._write_operation_sidecars(actual)
+            for request_id, expected in (cancellations or {}).items():
+                actual = index["cancel_requests"].get(request_id)
+                if not _same_record(actual, expected):
+                    raise OperationError("durable cancellation transition is unavailable")
+                self._write_cancel_sidecar(request_id, actual)
+        except Exception as repair_error:
+            write_cause = write_error.__cause__ or write_error
+            repair_cause = repair_error.__cause__ or repair_error
+            _LOGGER.error(
+                "operation sidecar repair failed: write_type=%s write_errno=%s write_winerror=%s repair_type=%s repair_errno=%s repair_winerror=%s",
+                type(write_cause).__name__,
+                getattr(write_cause, "errno", None),
+                getattr(write_cause, "winerror", None),
+                type(repair_cause).__name__,
+                getattr(repair_cause, "errno", None),
+                getattr(repair_cause, "winerror", None),
+            )
+            return False
+        write_cause = write_error.__cause__ or write_error
+        _LOGGER.warning(
+            "operation sidecars repaired: write_type=%s errno=%s winerror=%s",
+            type(write_cause).__name__,
+            getattr(write_cause, "errno", None),
+            getattr(write_cause, "winerror", None),
+        )
+        return True
 
     def _operation_from_index(self, index: dict[str, Any], operation_id: object) -> OperationRecord:
         if not isinstance(operation_id, str) or not _HEX_ID.fullmatch(operation_id):
@@ -994,6 +1165,8 @@ class OperationStore:
                 result=result,
                 progress=entry["progress"],
                 fence_generation=entry["fence_generation"],
+                created_at=entry["created_at"],
+                updated_at=entry["updated_at"],
             )
         except (KeyError, ValueError, TypeError):
             raise OperationError("operation record is invalid") from None
@@ -1013,7 +1186,7 @@ class OperationStore:
             raise WorkerFenced("worker fence is stale")
 
     def _append_event(self, operation: dict[str, Any], status: OperationStatus, now: datetime) -> None:
-        if len(operation["events"]) >= 10000:
+        if len(operation["events"]) >= _MAX_INDEX_ENTRIES:
             raise OperationError("operation journal exceeds its bound")
         operation["events"].append({"status": status.value, "at": _datetime_text(now)})
 
@@ -1023,7 +1196,7 @@ def _operation_sidecar_records(operation: dict[str, Any]) -> tuple[tuple[str, di
     request_id = operation["request_id"]
     records = [
         (
-            f"runtime/operations/requests/{_sha256(request_id.encode('utf-8'))}.json",
+            f"{OPERATIONS_ROOT}/requests/{_sha256(request_id.encode('utf-8'))}.json",
             {
                 "schema": 1,
                 "request_id": request_id,
@@ -1033,11 +1206,11 @@ def _operation_sidecar_records(operation: dict[str, Any]) -> tuple[tuple[str, di
             },
         ),
         (
-            f"runtime/operations/journal/{operation_id}.json",
+            f"{OPERATIONS_ROOT}/journal/{operation_id}.json",
             {"schema": 1, "operation_id": operation_id, "events": operation["events"]},
         ),
         (
-            f"runtime/operations/state/{operation_id}.json",
+            f"{OPERATIONS_ROOT}/state/{operation_id}.json",
             {
                 "schema": 1,
                 "operation_id": operation_id,
@@ -1050,11 +1223,18 @@ def _operation_sidecar_records(operation: dict[str, Any]) -> tuple[tuple[str, di
     ]
     records.append(
         (
-            f"runtime/operations/results/{operation_id}.json",
+            f"{OPERATIONS_ROOT}/results/{operation_id}.json",
             {"schema": 1, "operation_id": operation_id, "result": operation["result"]},
         )
     )
     return tuple(records)
+
+
+def _same_record(actual: object, expected: dict[str, Any]) -> bool:
+    return isinstance(actual, dict) and hmac.compare_digest(
+        _canonical_json(actual),
+        _canonical_json(expected),
+    )
 
 
 def _preview_digest_fields(
@@ -1214,6 +1394,7 @@ def _validate_index(index: dict[str, Any]) -> None:
             OperationStatus.INTERRUPTED,
         },
         OperationStatus.CANCEL_REQUESTED: {
+            OperationStatus.COMPLETED,
             OperationStatus.CANCELLED,
             OperationStatus.INTERRUPTED,
         },

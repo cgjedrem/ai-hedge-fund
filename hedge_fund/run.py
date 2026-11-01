@@ -20,7 +20,7 @@ Usage::
         Deploy a paper fund: snapshot the mandate, fix the universe, open an
         empty ledger and a book with the mandate's capital.
 
-    aihf paper tick alpha
+    aihf --root /path/to/hedge-fund-data paper tick alpha
         Advance the fund by exactly one session and append it to the ledger:
         the oldest unrecorded completed close for a daily fund, the current
         bar at prints taken now for a minute fund. Idempotent; what a
@@ -31,16 +31,19 @@ Usage::
         A missed day is never skipped — the next tick advances the oldest
         unrecorded session. --session names it explicitly.
 
-    aihf paper run alpha
+    aihf --root /path/to/hedge-fund-data paper run alpha
         Stay up and do what tick does whenever a session is due: after each
         midnight for a daily fund, at every bar inside the window for a
         minute fund. One process per fund, found by its runner.pid; Ctrl-C,
-        SIGTERM or `aihf paper stop alpha` stop it after the session in
+        SIGTERM or `aihf --root /path/to/hedge-fund-data paper stop alpha` stop it after the session in
         flight. A minute fund's time down is logged as a gap, never back-filled.
 
-    aihf paper status alpha | list | halt alpha --reason "..." | resume alpha
+    aihf --root /path/to/hedge-fund-data paper status alpha
+    aihf --root /path/to/hedge-fund-data paper list
+    aihf --root /path/to/hedge-fund-data paper halt alpha --reason "..."
+    aihf --root /path/to/hedge-fund-data paper resume alpha
 
-    aihf paper scorecard alpha
+    aihf --root /path/to/hedge-fund-data paper scorecard alpha
         Grade every analyst (hit rate, slugging, IC) and every strategy
         (P&L between executions) on the fund's ledger. JSON on stdout.
 
@@ -343,7 +346,7 @@ def _fund_dir(name: str, parser: argparse.ArgumentParser) -> Path:
         parser.error(str(exc))
     directory = PAPER_DIR / name
     if not directory.is_dir():
-        parser.error(f"no paper fund named {name!r} under {PAPER_DIR} (see `aihf paper list`)")
+        parser.error(f"no paper fund named {name!r} under {PAPER_DIR} (see `aihf --root <root> paper list`)")
     return directory
 
 
@@ -415,7 +418,8 @@ def _paper(args, parser: argparse.ArgumentParser, console: Console) -> None:
         cadence = f"{spec.cadence_label}, {spec.window.label}" if spec.is_intraday else spec.cadence_label
         approval_note = "  ·  approval required" if spec.approval_required else ""
         console.print(f"[bold]{args.name}[/] deployed at {directory}  ·  mandate {spec.name}  ·  " f"{', '.join(universe)}  ·  ${spec.capital:,.0f}  ·  broker {spec.broker}  ·  {cadence}{approval_note}")
-        console.print(f"[dim]next: `aihf paper tick {args.name}` to run one session, `aihf paper run " f"{args.name}` to leave it running, `aihf paper status {args.name}` any time[/]")
+        root_argument = "--root <selected-root>"
+        console.print(f"[dim]next: `aihf {root_argument} paper tick {args.name}` to run one session, `aihf {root_argument} paper run {args.name}` to leave it running, `aihf {root_argument} paper status {args.name}` any time[/]")
         return
 
     if args.action == "list":
@@ -443,7 +447,8 @@ def _paper(args, parser: argparse.ArgumentParser, console: Console) -> None:
         deployed = load_deployed(directory)
         spec = deployed.spec
         cadence = f"{spec.cadence_label}, {spec.window.label}" if spec.is_intraday else spec.rebalance
-        console.print(f"[bold]{deployed.name}[/] running {cadence}  ·  " f"broker {deployed.broker}  ·  {', '.join(deployed.universe)}  ·  Ctrl-C or `aihf paper stop {deployed.name}` to stop")
+        root_argument = "--root <selected-root>"
+        console.print(f"[bold]{deployed.name}[/] running {cadence}  ·  " f"broker {deployed.broker}  ·  {', '.join(deployed.universe)}  ·  Ctrl-C or `aihf {root_argument} paper stop {deployed.name}` to stop")
 
         def _event(kind: str, fields: dict) -> None:
             detail = fields.get("reason") or (f"{fields.get('bars_skipped')} bars skipped" if "bars_skipped" in fields else "")

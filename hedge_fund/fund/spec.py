@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Literal, TypeAlias
+from typing import Any, Callable, Literal, TypeAlias
 
 import yaml
 from pydantic import (
@@ -354,7 +354,10 @@ class Fund:
         blind: bool = False,
         *,
         cache: PromptCache | None = None,
+        llm_factory: Callable[[ModelSpec], object] | None = None,
     ) -> None:
+        if llm_factory is not None and not callable(llm_factory):
+            raise ValueError("LLM factory must be callable")
         self.spec = spec
         self.strategies: list[tuple[StrategySpec, list[AlphaModel]]] = []
         for strategy in spec.strategies:
@@ -370,5 +373,7 @@ class Fund:
                 params = {**m.params, "blind": True} if blind and is_llm else m.params
                 if cache is not None and is_llm:
                     params = {**params, "cache": cache}
+                if llm_factory is not None and is_llm:
+                    params = {**params, "llm": llm_factory(m)}
                 staff.append(cls(**params))
             self.strategies.append((strategy, staff))

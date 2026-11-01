@@ -12,11 +12,16 @@ from types import MappingProxyType
 from uuid import uuid4
 
 from hedge_fund.runtime.configuration import ConfigurationError, RuntimeSettings
-from hedge_fund.runtime.root import ensure_unique_resource_name, RootContext, RootPathError
+from hedge_fund.runtime.root import (
+    ensure_unique_resource_name,
+    RootContext,
+    RootPathError,
+)
 
 _TICKER = re.compile(r"[A-Z0-9.^=-]{1,15}")
 _PROVIDER_ID = re.compile(r"[a-z][a-z0-9._-]{0,63}")
 _SHA256 = re.compile(r"[a-fA-F0-9]{64}")
+_MAX_MANDATE_SNAPSHOT_BYTES = 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,6 +65,7 @@ class FrozenCapture:
     credential_versions: Mapping[str, int] = field(repr=False)
     credential_handles: Mapping[str, CredentialHandle] = field(repr=False)
     code_version: str = field(repr=False)
+    mandate_snapshot: bytes | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.capture_id, str) or not re.fullmatch(r"[a-fA-F0-9]{32}", self.capture_id):
@@ -121,8 +127,13 @@ class FrozenCapture:
         if handles.keys() != versions.keys() or any(handles[key].version != version for key, version in versions.items()):
             raise ConfigurationError("credential references are invalid")
 
+        mandate_snapshot, mandate_snapshot_bytes = _validated_mandate_snapshot(
+            self.mandate_snapshot,
+            subject_id=subject_id,
+            mandate_digest=mandate_digest,
+        )
         payload = {
-            "schema": 1,
+            "schema": 2 if mandate_snapshot is not None else 1,
             "root_id": root_id,
             "subject_id": subject_id,
             "mandate_digest": mandate_digest,
@@ -134,6 +145,8 @@ class FrozenCapture:
             "credential_versions": versions,
             "code_version": self.code_version,
         }
+        if mandate_snapshot is not None:
+            payload["mandate_snapshot"] = mandate_snapshot
         canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
         expected_digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
         if self.digest.casefold() != expected_digest:
@@ -154,6 +167,7 @@ class FrozenCapture:
         object.__setattr__(self, "endpoint", settings.endpoint)
         object.__setattr__(self, "timeout_seconds", settings.timeout_seconds)
         object.__setattr__(self, "universe", tuple(self.universe))
+        object.__setattr__(self, "mandate_snapshot", mandate_snapshot_bytes)
 
     def public_view(self, *, current_settings_version: int | None = None) -> dict[str, object]:
         if current_settings_version is not None and (type(current_settings_version) is not int or current_settings_version < 0):
@@ -177,9 +191,9 @@ class FrozenCapture:
         }
 
     def private_bytes(self) -> bytes:
-        """Serialize metadata and version handles; never credential values."""
+        """Serialize frozen inputs and version handles; no credential values."""
         record = {
-            "schema": 1,
+            "schema": 2 if self.mandate_snapshot is not None else 1,
             "capture_id": self.capture_id,
             "digest": self.digest,
             "root_id": self.root_id,
@@ -206,6 +220,8 @@ class FrozenCapture:
             ],
             "code_version": self.code_version,
         }
+        if self.mandate_snapshot is not None:
+            record["mandate_snapshot"] = json.loads(self.mandate_snapshot)
         return json.dumps(record, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
 
@@ -219,6 +235,7 @@ def freeze_capture(
     settings: RuntimeSettings,
     credential_versions: Mapping[str, int],
     code_version: str,
+    mandate_snapshot: Mapping[str, object] | None = None,
 ) -> FrozenCapture:
     """Freeze validated execution metadata and root-scoped version handles."""
     if not isinstance(root, RootContext):
@@ -255,6 +272,11 @@ def freeze_capture(
         raise ConfigurationError("code version is invalid")
 
     root_id = _root_id(root)
+    snapshot_record, snapshot_bytes = _validated_mandate_snapshot(
+        mandate_snapshot,
+        subject_id=canonical_subject,
+        mandate_digest=mandate_digest.lower(),
+    )
     versions = {provider.casefold(): version for provider, version in credential_versions.items()}
     handles = {
         provider: CredentialHandle(
@@ -265,7 +287,7 @@ def freeze_capture(
         for provider, version in versions.items()
     }
     payload = {
-        "schema": 1,
+        "schema": 2 if snapshot_record is not None else 1,
         "root_id": root_id,
         "subject_id": canonical_subject,
         "mandate_digest": mandate_digest.lower(),
@@ -277,6 +299,8 @@ def freeze_capture(
         "credential_versions": versions,
         "code_version": code_version,
     }
+    if snapshot_record is not None:
+        payload["mandate_snapshot"] = snapshot_record
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     capture_id = uuid4().hex
     capture = FrozenCapture(
@@ -298,6 +322,7 @@ def freeze_capture(
         credential_versions=versions,
         credential_handles=handles,
         code_version=code_version,
+        mandate_snapshot=snapshot_bytes,
     )
     root.revalidate()
     return capture
@@ -315,3 +340,54 @@ def _root_id(root: RootContext) -> str:
     }
     canonical = json.dumps(identity, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _validated_mandate_snapshot(
+    value: bytes | Mapping[str, object] | None,
+    *,
+    subject_id: str,
+    mandate_digest: str,
+) -> tuple[dict[str, object] | None, bytes | None]:
+    if value is None:
+        return None, None
+    try:
+        if isinstance(value, bytes):
+            if len(value) > _MAX_MANDATE_SNAPSHOT_BYTES:
+                raise ConfigurationError("capture mandate snapshot exceeds its bound")
+            raw = json.loads(value.decode("utf-8"))
+        elif isinstance(value, Mapping):
+            encoded = json.dumps(
+                dict(value),
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            ).encode("utf-8")
+            if len(encoded) > _MAX_MANDATE_SNAPSHOT_BYTES:
+                raise ConfigurationError("capture mandate snapshot exceeds its bound")
+            raw = json.loads(encoded.decode("utf-8"))
+        else:
+            raise ConfigurationError("capture mandate snapshot is invalid")
+        if not isinstance(raw, dict):
+            raise ConfigurationError("capture mandate snapshot is invalid")
+        from hedge_fund.fund import FundSpec
+        from hedge_fund.pipeline.session import mandate_hash
+
+        spec = FundSpec.model_validate(raw)
+        if spec.name != subject_id or mandate_hash(spec) != mandate_digest:
+            raise ConfigurationError("capture mandate snapshot does not match identity")
+        record = spec.model_dump(mode="json")
+        canonical = json.dumps(
+            record,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+        if len(canonical) > _MAX_MANDATE_SNAPSHOT_BYTES:
+            raise ConfigurationError("capture mandate snapshot exceeds its bound")
+        return record, canonical
+    except ConfigurationError:
+        raise
+    except (TypeError, ValueError, UnicodeDecodeError):
+        raise ConfigurationError("capture mandate snapshot is invalid") from None

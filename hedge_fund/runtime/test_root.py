@@ -1,11 +1,24 @@
 import ctypes
 import os
+import stat
+import subprocess
+import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Event
 
 import pytest
 
 import hedge_fund.runtime.root as root_module
-from hedge_fund.runtime.root import ensure_unique_resource_name, FilesystemIdentity, RootConfigurationError, RootContext, RootPathError, UnsupportedFilesystemError, validate_filesystem
+from hedge_fund.runtime.root import (
+    ensure_unique_resource_name,
+    FilesystemIdentity,
+    RootConfigurationError,
+    RootContext,
+    RootPathError,
+    UnsupportedFilesystemError,
+    validate_filesystem,
+)
 
 
 @pytest.fixture
@@ -153,6 +166,147 @@ def test_handle_relative_atomic_write_replaces_and_reads_inside_root(tmp_path):
     assert (root / "record.json").read_bytes() == b"second"
     assert (root / "cache" / "llm" / "prompt.json").read_bytes() == b"prompt"
     assert list(root.glob(".*.tmp")) == []
+
+
+def test_open_reader_does_not_block_atomic_replacement(tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    root.mkdir()
+    opened = Event()
+    release = Event()
+
+    with RootContext.open(root) as context:
+        context.write_bytes("record.json", b"old")
+        if os.name == "nt":
+            original_read = root_module._windows_read_handle
+
+            def paused_read(handle):
+                opened.set()
+                assert release.wait(timeout=5)
+                return original_read(handle)
+
+            monkeypatch.setattr(root_module, "_windows_read_handle", paused_read)
+        else:
+            original_read = root_module._posix_read_relative
+
+            def paused_read(root_fd, parts):
+                opened.set()
+                assert release.wait(timeout=5)
+                return original_read(root_fd, parts)
+
+            monkeypatch.setattr(root_module, "_posix_read_relative", paused_read)
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            reader = pool.submit(context.read_bytes, "record.json")
+            assert opened.wait(timeout=5)
+            try:
+                context.write_bytes("record.json", b"new")
+            finally:
+                release.set()
+            assert reader.result(timeout=5) == b"old"
+
+        assert context.read_bytes("record.json") == b"new"
+
+
+def test_concurrent_root_validation_and_private_storage_checks(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    with RootContext.open(root) as context:
+        context.prepare_private_storage()
+        context.write_bytes("record.json", b"record")
+
+        def verify_private_storage():
+            return all(context.verify_private_storage() for _ in range(8))
+
+        def read_root_file():
+            return all(context.read_bytes("record.json") == b"record" for _ in range(32))
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            verify = pool.submit(verify_private_storage)
+            read = pool.submit(read_root_file)
+            assert verify.result(timeout=20)
+            assert read.result(timeout=20)
+
+
+def test_atomic_replace_failure_preserves_record_and_original_error(
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "root"
+    root.mkdir()
+    failure = OSError(5, "synthetic replace failure")
+
+    def fail_replace(*_args, **_kwargs):
+        raise failure
+
+    with RootContext.open(root) as context:
+        context.write_bytes("record.json", b"before")
+        if os.name == "nt":
+            monkeypatch.setattr(
+                root_module,
+                "_windows_rename_handle",
+                fail_replace,
+            )
+        else:
+            monkeypatch.setattr(
+                root_module.os,
+                "replace",
+                fail_replace,
+            )
+
+        with pytest.raises(OSError) as raised:
+            context.write_bytes("record.json", b"after")
+
+        assert raised.value is failure
+        assert context.read_bytes("record.json") == b"before"
+
+    assert list(root.glob(".*.tmp")) == []
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="POSIX FIFO is unavailable")
+def test_posix_fifo_read_fails_without_blocking(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    os.mkfifo(root / "pipe")
+    script = """
+import sys
+from hedge_fund.runtime.root import RootContext, RootPathError
+
+try:
+    with RootContext.open(sys.argv[1]) as context:
+        context.read_bytes("pipe")
+except RootPathError:
+    raise SystemExit(0)
+raise SystemExit(1)
+"""
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(root)],
+        capture_output=True,
+        text=True,
+        timeout=3,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+
+
+@pytest.mark.parametrize("alias", ["WATCHT~1", "watchtower~2", "PRIVAT~1.json"])
+def test_windows_short_name_aliases_are_rejected(alias):
+    with pytest.raises(RootPathError, match="short-name aliases"):
+        root_module._relative_parts(f"runtime/{alias}")
+
+
+def test_private_storage_verifies_native_permissions(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    with RootContext.open(root) as context:
+        assert context.private_storage_verified is False
+        context.prepare_private_storage()
+        assert context.private_storage_verified is True
+        if os.name != "nt":
+            private_root = root / root_module.PRIVATE_ROOT
+            assert stat.S_IMODE(private_root.stat().st_mode) == 0o700
+            private_root.chmod(0o755)
+            assert context.private_storage_verified is False
 
 
 def test_lock_file_handle_is_root_relative_and_closed(tmp_path):

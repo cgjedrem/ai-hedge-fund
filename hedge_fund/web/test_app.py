@@ -14,6 +14,8 @@ def test_default_capabilities_are_immutable_read_only_and_disk_quiet(tmp_path):
     assert response.json()["read_only"] is True
     assert response.json()["writes"] is False
     assert response.json()["network"] is False
+    assert response.json()["local_operator_only"] is True
+    assert response.json()["csrf_authenticates_users"] is False
     assert response.json()["mutation_token"] is None
     assert not (tmp_path / "paper").exists()
     assert not (tmp_path / "mandates").exists()
@@ -59,9 +61,9 @@ def test_read_only_mutation_is_denied_before_storage_or_domain_access(tmp_path, 
     assert not (tmp_path / "paper").exists()
 
 
-def test_writes_require_same_origin_and_per_launch_token(tmp_path):
+def test_writes_require_same_origin_token_and_loopback_peer(tmp_path):
     app = create_app(root=tmp_path, allow_writes=True)
-    with TestClient(app) as client:
+    with TestClient(app, client=("127.0.0.1", 50000)) as client:
         capabilities = client.get("/api/capabilities", headers=LOOPBACK).json()
         token = capabilities["mutation_token"]
         missing_origin = client.post(
@@ -83,11 +85,25 @@ def test_writes_require_same_origin_and_per_launch_token(tmp_path):
             },
             json={"reason": "test"},
         )
+        remote_peer = TestClient(
+            app,
+            client=("192.0.2.10", 50000),
+        ).post(
+            "/api/paper/demo/halt",
+            headers={
+                "host": "127.0.0.1",
+                "origin": "http://127.0.0.1",
+                "x-csrf-token": token,
+            },
+            json={"reason": "test"},
+        )
 
     assert isinstance(token, str) and len(token) >= 32
     assert missing_origin.status_code == 403
     assert missing_token.status_code == 403
     assert wrong_token.status_code == 403
+    assert remote_peer.status_code == 403
+    assert remote_peer.json()["detail"] == "Writable server requires a loopback client connection."
     assert not (tmp_path / "paper").exists()
 
 
@@ -128,7 +144,10 @@ def test_api_errors_never_fall_through_to_spa_and_assets_get_csp(tmp_path):
 
 
 def test_streamed_body_limit_checks_actual_bytes_without_content_length(tmp_path):
-    with TestClient(create_app(root=tmp_path, allow_writes=True)) as client:
+    with TestClient(
+        create_app(root=tmp_path, allow_writes=True),
+        client=("127.0.0.1", 50000),
+    ) as client:
         token = client.get("/api/capabilities", headers=LOOPBACK).json()["mutation_token"]
         headers = {
             "host": "127.0.0.1",
@@ -153,12 +172,71 @@ def test_streamed_body_limit_checks_actual_bytes_without_content_length(tmp_path
     assert "default-src 'self'" in over_limit.headers["content-security-policy"]
 
 
-def test_job_cancellation_requires_startup_write_capability(tmp_path):
+def test_operation_cancellation_requires_startup_write_capability(tmp_path):
     with TestClient(create_app(root=tmp_path)) as client:
         response = client.post(
-            "/api/jobs/" + "a" * 32 + "/cancel",
+            "/api/operations/" + "a" * 32 + "/cancel",
             headers=LOOPBACK,
+            json={"request_id": "read-only-cancel"},
         )
 
     assert response.status_code == 403
     assert response.json()["detail"] == "Write capability is disabled for this server."
+
+
+def test_root_owner_conflict_downgrades_second_server_before_adapters(tmp_path, monkeypatch):
+    first = create_app(root=tmp_path, allow_writes=True)
+    second = create_app(root=tmp_path, allow_writes=True)
+    called = False
+
+    def forbidden(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("owner conflict must block the write adapter")
+
+    monkeypatch.setattr(second.state.service, "halt_fund", forbidden)
+    try:
+        assert first.state.service.allow_writes is True
+        assert second.state.service.allow_writes is False
+        assert second.state.service.write_unavailable_reason == "root-owner-unavailable"
+        with TestClient(second) as client:
+            capabilities = client.get("/api/capabilities", headers=LOOPBACK).json()
+            response = client.post(
+                "/api/paper/demo/halt",
+                headers={"host": "127.0.0.1", "origin": "http://127.0.0.1"},
+                json={"reason": "test"},
+            )
+    finally:
+        first.state.service.close()
+
+    assert capabilities["writes"] is False
+    assert capabilities["mutation_token"] is None
+    assert response.status_code == 403
+    assert not called
+    assert not (tmp_path / "paper").exists()
+
+
+def test_container_observer_cannot_be_promoted_by_spoofed_host(tmp_path):
+    app = create_app(root=tmp_path, allow_writes=True, container_bind=True)
+
+    with TestClient(app, client=("127.0.0.1", 50000)) as client:
+        capabilities = client.get(
+            "/api/capabilities",
+            headers={"host": "127.0.0.1"},
+        ).json()
+        response = client.post(
+            "/api/paper/demo/halt",
+            headers={
+                "host": "127.0.0.1",
+                "origin": "http://127.0.0.1",
+                "x-csrf-token": "attacker-controlled",
+            },
+            json={"reason": "test"},
+        )
+
+    assert capabilities["container_observer"] is True
+    assert capabilities["writes"] is False
+    assert capabilities["network"] is False
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Write capability is disabled for this server."
+    assert not (tmp_path / "runtime" / "private").exists()

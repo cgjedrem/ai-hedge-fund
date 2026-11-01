@@ -22,7 +22,7 @@ const screenRoutes = [
   { path: "/paper/demo-quality/sessions/2024-06-04", heading: "2024-06-04", screenshot: "session-report" },
   { path: "/paper/demo-quality/scorecard", heading: "demo-quality scorecard", screenshot: "scorecard" },
   { path: "/research", heading: "Research reports", screenshot: "research-list" },
-  { path: "/backtests", heading: "Backtest jobs", screenshot: "backtests" },
+  { path: "/backtests", heading: "Backtest operations", screenshot: "backtests" },
   { path: "/settings", heading: "Settings", screenshot: "settings" },
 ];
 
@@ -154,6 +154,71 @@ test("production routes render at desktop and narrow widths without external req
   expect(externalRequests).toEqual([]);
 });
 
+test("paper valuation requires an explicit quote refresh", async ({ page }) => {
+  const capabilities = await (await page.request.get("/api/capabilities")).json();
+  const paper = await (await page.request.get("/api/paper/demo-quality")).json();
+  const valuationRequests: { body: unknown; token: string | null }[] = [];
+  const estimate = {
+    status: "estimated",
+    value: "123456.789",
+    partial_estimate: null,
+    as_of: "2026-10-29T12:00:00Z",
+    provenance: "yfinance",
+    expected_head: paper.last_record_hash,
+    recorded_nav: String(paper.nav),
+    request_id: "a".repeat(32),
+    deployment: "demo-quality",
+    coverage: { total: 1, quoted: 1, usable: 1, missing: 0, stale: 0, errors: 0 },
+    quotes: [{
+      ticker: "AAPL",
+      shares: "100",
+      price: "1234.56789",
+      quote_time: "2026-10-29T11:59:55Z",
+      observation_age_seconds: 5,
+      status: "quoted",
+      freshness: "unknown",
+      reason: "Observation time is not an exchange print time; freshness is unverified.",
+    }],
+    reason: "Complete symbol coverage; provider print freshness is unverified.",
+  };
+  await page.route("**/api/capabilities", (route) =>
+    route.fulfill({
+      json: {
+        ...capabilities,
+        writes: true,
+        read_only: false,
+        network: true,
+        mutation_token: "browser-valuation-token",
+      },
+    }),
+  );
+  await page.route("**/api/paper/demo-quality/valuation", async (route) => {
+    const request = route.request();
+    if (request.method() !== "POST") {
+      await route.continue();
+      return;
+    }
+    valuationRequests.push({
+      body: request.postDataJSON(),
+      token: request.headers()["x-csrf-token"] ?? null,
+    });
+    await route.fulfill({ json: estimate });
+  });
+  await page.goto("/paper/demo-quality");
+  await expect(page.getByRole("heading", { name: "demo-quality" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Refresh estimate" })).toBeEnabled();
+  expect(valuationRequests).toEqual([]);
+
+  await page.getByRole("button", { name: "Refresh estimate" }).click();
+  await expect(page.getByText("Exact estimate · 123456.789")).toBeVisible();
+  expect(valuationRequests).toEqual([
+    {
+      body: { expected_head: paper.last_record_hash },
+      token: "browser-valuation-token",
+    },
+  ]);
+});
+
 test("builder preserves canonical library models, weights, params, and blend policy", async ({ page }) => {
   const capabilities = await (await page.request.get("/api/capabilities")).json();
   const catalog = await (await page.request.get("/api/catalog")).json();
@@ -219,45 +284,88 @@ test("builder preserves canonical library models, weights, params, and blend pol
   expect(custom?.blend).toMatchObject({ mode: "long_short", method: "conviction_weighted", gross_target: 1 });
 });
 
-test("backtest requires review, captures inputs, and requests cooperative cancellation", async ({ page }) => {
+test("backtest requires a server preview, durable acceptance, and boundary cancellation", async ({ page }) => {
   const capabilities = await (await page.request.get("/api/capabilities")).json();
   const settings = await (await page.request.get("/api/settings")).json();
   const mandates = await (await page.request.get("/api/mandates")).json();
   const mandateHash = mandates.items.find((item: { name: string }) => item.name === "demo-quality").mandate_hash as string;
-  let submitted: Record<string, unknown> | null = null;
+  let previewRequest: Record<string, unknown> | null = null;
+  let acceptedRequest: Record<string, unknown> | null = null;
   let cancelRequested = false;
   let cancelCalls = 0;
-  const jobId = "a".repeat(32);
-  const fakeJob = () => ({
-    id: jobId,
+  let previewCount = 0;
+  const operationId = "a".repeat(32);
+  const previewResponse = () => {
+    previewCount += 1;
+    const body = previewRequest as { payload: Record<string, unknown> };
+    return {
+      preview_id: String(previewCount).padStart(32, "0"),
+      preview_digest: "d".repeat(64),
+      confirmation_token: `synthetic-confirmation-${previewCount}`,
+      action: "backtest",
+      subject_id: "demo-quality",
+      expected_head: mandateHash,
+      due_set: [],
+      capture_id: "c".repeat(32),
+      capture_digest: "e".repeat(64),
+      expires_at: "2026-10-31T12:10:00+00:00",
+      payload: body.payload,
+      capture: { model: settings.model },
+      estimate: {
+        maximum_model_calls: 24,
+        maximum_cost_usd: 0,
+        market_data_provider: settings.data_provider,
+      },
+      warnings: ["Synthetic browser fixture; no provider call."],
+    };
+  };
+  const fakeOperation = () => ({
+    operation_id: operationId,
+    request_id: "browser-backtest",
+    action: "backtest",
+    subject_id: "demo-quality",
+    capture_id: "c".repeat(32),
+    capture_digest: "e".repeat(64),
+    status: cancelRequested ? "cancel-requested" : "running",
+    created_at: "2026-10-31T12:00:00+00:00",
+    updated_at: "2026-10-31T12:00:01+00:00",
+    payload: acceptedRequest?.payload,
+    result: null,
+    progress: 40,
+    id: operationId,
     fund: "demo-quality",
     provider: settings.data_provider,
     model: settings.model,
-    status: "running",
-    progress: 40,
-    submitted_at: "2024-06-01T12:00:00+00:00",
-    started_at: "2024-06-01T12:00:01+00:00",
-    completed_at: null,
     report_id: null,
     error: null,
     cancel_requested: cancelRequested,
+    status_url: `/api/operations/${operationId}`,
   });
   await page.route("**/api/capabilities", (route) =>
     route.fulfill({ json: { ...capabilities, writes: true, read_only: false, network: true, mutation_token: "browser-test-token" } }),
   );
-  await page.route("**/api/backtests", async (route) => {
-    if (route.request().method() !== "POST") {
-      await route.continue();
+  await page.route("**/api/operations/preview", async (route) => {
+    previewRequest = route.request().postDataJSON() as Record<string, unknown>;
+    await route.fulfill({ status: 201, json: previewResponse() });
+  });
+  await page.route("**/api/operations", async (route) => {
+    if (route.request().method() === "POST") {
+      acceptedRequest = route.request().postDataJSON() as Record<string, unknown>;
+      await route.fulfill({ status: 202, json: fakeOperation() });
       return;
     }
-    submitted = route.request().postDataJSON() as Record<string, unknown>;
-    await route.fulfill({ status: 202, json: fakeJob() });
+    await route.fulfill({ json: { items: acceptedRequest ? [fakeOperation()] : [] } });
   });
-  await page.route(`**/api/jobs/${jobId}`, (route) => route.fulfill({ json: fakeJob() }));
-  await page.route(`**/api/jobs/${jobId}/cancel`, async (route) => {
+  await page.route(`**/api/operations/${operationId}`, (route) =>
+    route.fulfill({ json: fakeOperation() }),
+  );
+  await page.route(`**/api/operations/${operationId}/cancel`, async (route) => {
+    expect(route.request().headers()["x-csrf-token"]).toBe("browser-test-token");
+    const body = route.request().postDataJSON() as { request_id?: string };
+    expect(body.request_id).toMatch(/^[a-f0-9]{32}$/);
     cancelCalls += 1;
     cancelRequested = true;
-    await route.fulfill({ json: fakeJob() });
+    await route.fulfill({ json: fakeOperation() });
   });
 
   await page.goto("/backtests");
@@ -268,32 +376,55 @@ test("backtest requires review, captures inputs, and requests cooperative cancel
   const dialog = page.getByRole("dialog");
   await expect(dialog.getByText("Market-data provider")).toBeVisible();
   await expect(dialog.getByText("LLM model")).toBeVisible();
-  await expect(dialog.getByText("Agents")).toBeVisible();
-  await expect(dialog.getByText("Mandate hash")).toBeVisible();
+  await expect(dialog.getByText("Reviewed head")).toBeVisible();
+  await expect(dialog.getByText("Preview digest")).toBeVisible();
+  await expect(dialog.getByText("Max model calls")).toBeVisible();
   await expect(dialog.getByText(mandateHash, { exact: true })).toBeVisible();
   await expect(dialog.getByText("AAPL, MSFT")).toBeVisible();
   await expect(dialog.getByText("2024-06-03 → 2024-06-07")).toBeVisible();
   await expect(dialog.getByText("Write capability")).toBeVisible();
   await expect(dialog.getByText("Network capability")).toBeVisible();
+  expect(previewRequest).toMatchObject({
+    action: "backtest",
+    subject_id: "demo-quality",
+    expected_head: mandateHash,
+    payload: {
+      fund: "demo-quality",
+      universe: ["AAPL", "MSFT"],
+      provider: settings.data_provider,
+      model: settings.model,
+      mandate_hash: mandateHash,
+    },
+  });
   await page.getByRole("button", { name: "Review later" }).click();
-  expect(submitted).toBeNull();
+  expect(acceptedRequest).toBeNull();
 
   await page.getByRole("button", { name: "Review backtest" }).click();
-  await page.getByRole("button", { name: "Confirm and submit" }).click();
-  await expect(page.getByText("running", { exact: true })).toBeVisible();
-  expect(submitted).toMatchObject({
-    fund: "demo-quality",
-    universe: ["AAPL", "MSFT"],
-    start: "2024-06-03",
-    end: "2024-06-07",
-    provider: settings.data_provider,
-    model: settings.model,
-    mandate_hash: mandateHash,
+  await page.getByRole("button", { name: "Accept reviewed operation" }).click();
+  await expect(
+    page.getByRole("region", { name: "Scrollable data table" }).getByText("running", { exact: true }),
+  ).toBeVisible();
+  expect(acceptedRequest).toMatchObject({
+    action: "backtest",
+    subject_id: "demo-quality",
+    expected_head: mandateHash,
+    payload: {
+      fund: "demo-quality",
+      universe: ["AAPL", "MSFT"],
+      start: "2024-06-03",
+      end: "2024-06-07",
+      provider: settings.data_provider,
+      model: settings.model,
+      mandate_hash: mandateHash,
+    },
   });
+  expect(acceptedRequest?.request_id).toMatch(/^[a-f0-9]{32}$/);
+  expect(acceptedRequest?.preview_id).toBe("00000000000000000000000000000002");
+  expect(acceptedRequest?.confirmation_token).toBe("synthetic-confirmation-2");
 
   await page.getByRole("button", { name: "Request cancellation" }).click();
   await expect(page.getByText("Cancellation requested…")).toBeVisible();
-  await expect(page.getByText(/in-flight provider\/session step cannot be interrupted/)).toBeVisible();
+  await expect(page.getByText(/in-flight model or data step cannot be interrupted/)).toBeVisible();
   expect(cancelCalls).toBe(1);
 });
 
@@ -350,22 +481,38 @@ test("ungated and halted decisions never present enabled verdict actions", async
   await expect(page.getByRole("button", { name: "Resume" })).toBeDisabled();
 });
 
-test("restores a running job after navigation and reload", async ({ page }) => {
-  const jobId = "c".repeat(32);
+test("restores a running durable operation after navigation and reload", async ({ page }) => {
+  const operationId = "c".repeat(32);
   let cancelRequested = false;
-  const job = () => ({
-    id: jobId,
+  const operation = () => ({
+    operation_id: operationId,
+    request_id: "restored-backtest",
+    action: "backtest",
+    subject_id: "demo-quality",
+    capture_id: "d".repeat(32),
+    capture_digest: "e".repeat(64),
+    status: cancelRequested ? "cancel-requested" : "running",
+    created_at: "2026-10-31T12:00:00+00:00",
+    updated_at: "2026-10-31T12:00:01+00:00",
+    payload: {
+      fund: "demo-quality",
+      universe: ["AAPL"],
+      start: "2026-10-01",
+      end: "2026-10-30",
+      provider: "yfinance",
+      model: "provider/model",
+      mandate_hash: "a".repeat(64),
+    },
+    result: null,
+    progress: 40,
+    id: operationId,
     fund: "demo-quality",
     provider: "yfinance",
     model: "provider/model",
-    status: "running",
-    progress: 40,
-    submitted_at: "2026-10-31T12:00:00+00:00",
-    started_at: "2026-10-31T12:00:01+00:00",
-    completed_at: null,
     report_id: null,
     error: null,
     cancel_requested: cancelRequested,
+    status_url: `/api/operations/${operationId}`,
   });
 
   await page.route("**/api/capabilities", (route) =>
@@ -381,16 +528,18 @@ test("restores a running job after navigation and reload", async ({ page }) => {
       },
     }),
   );
-  await page.route("**/api/jobs", (route) => route.fulfill({ json: { items: [job()] } }));
-  await page.route(`**/api/jobs/${jobId}`, (route) => route.fulfill({ json: job() }));
-  await page.route(`**/api/jobs/${jobId}/cancel`, async (route) => {
+  await page.route("**/api/operations", (route) => route.fulfill({ json: { items: [operation()] } }));
+  await page.route(`**/api/operations/${operationId}`, (route) => route.fulfill({ json: operation() }));
+  await page.route(`**/api/operations/${operationId}/cancel`, async (route) => {
     expect(route.request().headers()["x-csrf-token"]).toBe("browser-test-token");
+    const body = route.request().postDataJSON() as { request_id?: string };
+    expect(body.request_id).toMatch(/^[a-f0-9]{32}$/);
     cancelRequested = true;
-    await route.fulfill({ json: job() });
+    await route.fulfill({ json: operation() });
   });
 
   await page.goto("/backtests");
-  await expect(page.getByText(jobId)).toBeVisible();
+  await expect(page.getByText(operationId)).toBeVisible();
   await expect(page.getByText("40%", { exact: true }).first()).toBeVisible();
   await page.getByRole("button", { name: "Request cancellation" }).click();
   await expect(page.getByRole("button", { name: "Cancellation requested…" })).toBeVisible();
@@ -399,9 +548,9 @@ test("restores a running job after navigation and reload", async ({ page }) => {
   await primaryNavigation.getByRole("link", { name: "Research" }).click();
   await expect(page.getByRole("heading", { name: "Research reports" })).toBeVisible();
   await primaryNavigation.getByRole("link", { name: "Backtests" }).click();
-  await expect(page.getByText(jobId)).toBeVisible();
+  await expect(page.getByText(operationId)).toBeVisible();
 
   await page.reload();
-  await expect(page.getByText(jobId)).toBeVisible();
+  await expect(page.getByText(operationId)).toBeVisible();
   await expect(page.getByText("40%", { exact: true }).first()).toBeVisible();
 });

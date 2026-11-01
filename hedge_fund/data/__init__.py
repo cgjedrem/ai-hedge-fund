@@ -41,26 +41,34 @@ __all__ = [
 ]
 
 
-def data_provider() -> str:
-    """The configured market-data provider: HEDGE_FUND_DATA_PROVIDER,
-    default "fd" (Financial Datasets)."""
-    return os.environ.get("HEDGE_FUND_DATA_PROVIDER", "fd").strip().lower()
-
-
-def make_data_client() -> DataClient:
-    """Construct the raw data provider selected by HEDGE_FUND_DATA_PROVIDER.
-
-    "fd" (default) is the paid Financial Datasets client — point-in-time,
-    safe for backtest validation. "yfinance" is the free Yahoo Finance
-    client — no key or credits, but NOT point-in-time (see
-    YFinanceClient's docstring); use it for day-to-day paper trading and
-    iteration. Wrap either in CachedDataClient as before.
-    """
-    provider = data_provider()
-    if provider in ("fd", "financialdatasets", "financial-datasets"):
-        return FDClient()
-    if provider in ("yfinance", "yf", "yahoo"):
-        return YFinanceClient()
-    raise ValueError(
-        f"unknown HEDGE_FUND_DATA_PROVIDER {provider!r}: expected 'fd' or 'yfinance'"
+def data_provider(provider: str | None = None) -> str:
+    """Configured provider: HEDGE_FUND_DATA_PROVIDER, default yfinance."""
+    value = (
+        os.environ.get("HEDGE_FUND_DATA_PROVIDER", "yfinance")
+        if provider is None
+        else provider
     )
+    if not isinstance(value, str):
+        raise ValueError("data provider must be text")
+    if provider is not None and value != value.strip():
+        raise ValueError("data provider is invalid")
+    normalized = value.strip().lower()
+    if normalized in ("fd", "financialdatasets", "financial-datasets"):
+        return "fd"
+    if normalized in ("yfinance", "yf", "yahoo"):
+        return "yfinance"
+    source = "HEDGE_FUND_DATA_PROVIDER" if provider is None else "provider"
+    raise ValueError(f"unsupported {source}")
+
+
+def make_data_client(provider: str | None = None) -> DataClient:
+    """Construct configured provider.
+
+    yfinance is free and not point-in-time. fd is paid and filing-date filtered.
+    """
+    selected = data_provider(provider)
+    if selected == "fd":
+        return FDClient()
+    if selected == "yfinance":
+        return YFinanceClient()
+    raise AssertionError("normalized data provider is unsupported")
