@@ -39,10 +39,19 @@ def paper_write_denial() -> str | None:
     except Exception:
         return "Paper writes are blocked because root enrollment cannot be verified."
     if status["state"] == "unenrolled":
-        return None
+        return "TUI paper writes require root admission the TUI does not hold; use the explicit-root CLI or web desk."
     if status["state"] == "enrolled":
         return "TUI paper writes are disabled on enrolled roots; use the web desk."
     return "Paper writes are blocked because root enrollment or ledger inventory is unavailable."
+
+
+def mandate_delete_denial() -> str:
+    """Mandate-library deletion is not admitted from the TUI.
+
+    Root storage offers no admitted delete primitive yet, and the web desk
+    does not delete mandates either, so the TUI keeps every file in place
+    rather than unlinking root paths outside registry/research admission."""
+    return "Mandate deletion is unavailable: the TUI cannot delete under root admission. Mandates and backtests were kept."
 
 
 class FundSelectScreen(Screen):
@@ -128,29 +137,15 @@ class FundSelectScreen(Screen):
         menu = self.query_one("#select-menu", OptionList)
         if not self._slots or menu.highlighted is None:
             return
-        # Remember what was asked for: the list repopulates on resume, so the
-        # highlighted index is not trustworthy by the time the callback fires.
-        entry = self._slots[menu.highlighted]
-        if entry.spec is None:
-            return
-        self._pending_delete = (entry.path, entry.spec)
-        path, spec = self._pending_delete
-        self.app.push_screen(
-            ConfirmDeleteScreen(path, spec, self._history(spec.name)),
-            self._finish_delete,
-        )
+        self.notify(mandate_delete_denial(), severity="warning")
 
     def _finish_delete(self, scope: str | None) -> None:
         """Callback from the confirm screen: None cancelled, otherwise the
         blast radius the user picked."""
         if scope is None:
             return
-        path, spec = self._pending_delete
-        gone = _delete_fund(path, spec.name, with_history=(scope == "all"))
-        self._summaries.clear()  # the cache is keyed on paths that just went
-        self._populate()
-        self.notify(f"Deleted {spec.name} — {gone} "
-                    f"{'file' if gone == 1 else 'files'} removed")
+        # Deletion stays denied even after the confirm: see mandate_delete_denial.
+        self.notify(mandate_delete_denial(), severity="warning")
 
     def _show_detail(self, i: int) -> None:
         spec = self._slots[i].spec
@@ -321,16 +316,6 @@ def short_tickers(universe: list[str], limit: int = 2) -> str:
     if len(universe) <= limit:
         return " ".join(universe)
     return f"{' '.join(universe[:limit])} +{len(universe) - limit}"
-
-
-def _delete_fund(path: Path, name: str, *, with_history: bool) -> int:
-    """Remove a mandate, and its backtest results too when asked. Returns how
-    many files went, so the caller can say so. Paper funds deployed from it
-    are untouched: they carry their own snapshot of the mandate."""
-    targets = [path, *(receipts(name) if with_history else [])]
-    for target in targets:
-        target.unlink(missing_ok=True)
-    return len(targets)
 
 
 def _wipe_manifest(name: str, then: str) -> Text:

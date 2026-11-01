@@ -194,3 +194,62 @@ limitation remain explicit.
 Retirement delta at `9694f619207e14fb5e55de1bef96deb79df7a360`: zero TUI tests,
 assertions, imports or dependencies removed. These additions do not close T148 or
 authorize TUI retirement.
+
+## TUI admission-repair modifications — not retirements
+
+**Why:** from `4c6eee4` onward every TUI paper write (deploy, mandate save, halt, resume,
+verdict, wipe) raised admission errors in production: the TUI holds no owner lease, paper
+lanes or admitted unlink primitive. The 14–15 TUI failures at `1acbf46`/`3042c85` were not
+regressions of a working feature; the old assertions passed only because the test fixture
+placed mandates/research outside the configured root, so the root guards never applied.
+The repair makes the TUI deny these writes with a message instead of crashing, and moves the
+fixture onto an enrolled synthetic root so the guards are exercised.
+
+These tests now assert the denial and that no bytes change. Their **original write
+obligations are not satisfied by the TUI** and remain PENDING in the web/CLI replacements
+named in the rows above. That is an explicit exception to the retirement rule: the rule
+protects working behavior, and these writes were already unavailable. Nothing was deleted.
+
+| Original test | Current test | Now asserts | Original obligation |
+| --- | --- | --- | --- |
+| `test_builder_existing_name_and_save_race_never_overwrite` | same name | Taken name is refused at the name step with no wipe modal; a save race still never overwrites. | PENDING — web replacement (T046, T055) |
+| `test_builder_paper_mode_builds_a_live_fund_and_refuses_taken_names` | `test_builder_paper_mode_denies_the_build_and_refuses_taken_names` | `+` row denied; taken names refused; final step denied; no mandate/paper bytes. | PENDING — web create (T046, T048, T054, T056) |
+| `test_builder_paper_mode_sets_approval_required` | `test_builder_paper_mode_records_approval_choice_then_denies_the_build` | Approval choice is recorded in wizard state; the build is denied. | PENDING — web create stores gate (T046, T054, T056) |
+| `test_builder_minute_path_sets_interval_and_window_and_offers_start_running` | `test_builder_minute_path_sets_interval_and_window_then_denies_the_build` | All interval/window validation steps kept; state holds 30s and 09:00–12:00; build denied; nothing written. | PENDING — web minute create/start (T026, T046, T048, T056) |
+| `test_builder_replaces_a_taken_name_only_after_yes_and_only_at_the_end` | `test_builder_refuses_to_replace_a_taken_name_and_wipes_nothing` | Replacement refused; mandates, research and paper trees byte-identical. | PENDING — web replacement (T095, T097, T104, T105) |
+| `test_builder_first_session_requires_cli_or_web_authorization` | `test_builder_first_session_is_unreachable_from_the_tui` | Build row denied before any provider client is created. | PENDING — web manual run (T026, T028, T033, T038) |
+| `test_builder_blocks_daily_saxo_and_deploys_minute_saxo` | `test_builder_blocks_daily_saxo_and_denies_the_minute_saxo_build` | Daily-Saxo refusal and minute-Saxo acceptance at the broker step kept; build denied. | PENDING — (T046, T096, T099) |
+| `test_home_offers_paper_trading_first_and_an_empty_paper_screen_builds` | `test_home_offers_paper_trading_first_and_an_empty_paper_screen_denies_builds` | Home ordering kept; empty-paper `+` denied; builder layout still asserted when pushed directly. | PENDING — (T039, T048) |
+| `test_paper_screen_records_approval_verdicts_from_y_and_n` | `test_paper_screen_denies_approval_verdicts_from_y_and_n` | y/n denied; no approval or event written; ledger head unchanged. | PENDING — web verdicts (T063, T065, T069, T071) |
+| `test_paper_screen_execution_denies_before_provider_or_ledger_effects` | same name | Run board fails with the root denial before any provider or ledger effect. | Unchanged obligation; message text only |
+| `test_paper_screen_works_the_kill_switch_and_sessions_reads_the_ledger` | same name | h/r/d denied with no bytes changed; externally recorded halt is displayed; sessions screen still reads the ledger. | PENDING — web halt/resume/delete (T064, T067–T069, T072) |
+| `test_paper_screen_enter_on_a_minute_fund_opens_the_same_approval_step` | `test_paper_screen_enter_on_a_minute_fund_reports_execution_unavailable` | Enter reports execution unavailable; no modal, no run, no ledger record. | PENDING — (T026, T028, T033, T038) |
+
+New regression tests: `hedge_fund/tui/test_admission_regressions.py`. They cover:
+
+- the unenrolled and enrolled denial messages;
+- a backtest-mode mandate save on an unenrolled root, which reports the denial without crashing;
+- resume failure keeping the fund halted, with the guard lifted;
+- mandate-library delete denied and byte-identical;
+- `_save_admitted` writing under `research/` with an owner lease and research lane;
+- `_save_admitted` failing closed on an unenrolled root.
+
+**Parity gap:** mandate and fund deletion is denied in the TUI and does not exist on the web desk
+(`hedge_fund/web/services.py` has no delete). TUI retirement must not proceed until an
+admitted web deletion/replacement path exists or the gap is explicitly accepted.
+
+### External TUI-importing test changed by the same repair
+
+`hedge_fund/paper/test_saxo_e2e.py::test_saxo_external_adapter_records_order_fill_in_ledger` used the
+TUI wizard only to create a minute Saxo deployment. Two things now block that route:
+
+- `HedgeFundApp.on_mount` requires an enrolled root.
+- The TUI paper build is denied.
+
+The test now deploys the identical spec through `hedge_fund.paper.deployed.deploy`. A temporary
+probe drove the wizard with the denial lifted and `deploy`/`save_spec` captured, and the captured
+`FundSpec` equalled the direct spec (`custom_strategy(["pead"])`, `DEFAULT_RISK`,
+`DEFAULT_CAPITAL`, minute, interval 1, window `09:30–15:59`, broker `saxo`, universe `AAPL`).
+All Saxo adapter, ledger and fill assertions are unchanged. The test no longer imports Textual.
+The wizard's Saxo obligation stays with
+`test_builder_blocks_daily_saxo_and_denies_the_minute_saxo_build`, still PENDING web parity.

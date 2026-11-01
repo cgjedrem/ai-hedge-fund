@@ -155,7 +155,7 @@ def test_credential_precedence(exported, local, expected, isolated_configuration
     assert os.environ["TYPESAFE_API_KEY"] == expected
 
 
-def test_home_offers_paper_trading_first_and_an_empty_paper_screen_builds():
+def test_home_offers_paper_trading_first_and_an_empty_paper_screen_denies_builds(monkeypatch):
     async def scenario():
         app = HedgeFundApp()
         async with app.run_test(size=(100, 35)) as pilot:
@@ -167,9 +167,17 @@ def test_home_offers_paper_trading_first_and_an_empty_paper_screen_builds():
             rail = app.screen.query_one("#paper-menu", OptionList)
             assert [rail.get_option_at_index(i).id for i in range(rail.option_count)] == ["build"]
             assert "No funds yet" in render(app.screen.query_one("#detail-body", Static).content)
-            # h/r/s have nothing to act on; enter still opens the builder.
+            # h/r/s have nothing to act on; enter on the build row is denied
+            # because the TUI holds no deployment admission.
             assert not app.screen.check_action("halt", ()) and not app.screen.check_action("sessions", ())
+            paper_screen = app.screen
+            notified: list[str] = []
+            monkeypatch.setattr(paper_screen, "notify", lambda message, **_kwargs: notified.append(message))
             await pilot.press("enter")
+            await pilot.pause()
+            assert app.screen is paper_screen
+            assert notified == ["TUI paper writes are disabled on enrolled roots; use the web desk."]
+            await app.push_screen(builder.BuilderScreen(mode="paper"))
             assert isinstance(app.screen, builder.BuilderScreen) and app.screen.mode == "paper"
             assert "BUILD A FUND" in render(app.screen.query_one(".rail-title", Static).content)
             assert app.screen.STEP_IDS[-1] == "step-tickers"

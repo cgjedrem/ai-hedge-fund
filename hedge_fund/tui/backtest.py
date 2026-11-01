@@ -57,6 +57,20 @@ from hedge_fund.tui.shared import (
 from hedge_fund.tui.widgets import first_selectable, StatTiles
 
 
+def _save_admitted(result: FundBacktestResult) -> Path:
+    """Save *result* under research admission for the configured root, the
+    same owner lease plus research lane `aihf backtest` takes. Fails closed
+    when another owner holds the root or it is not enrolled."""
+    from hedge_fund.runtime.admission import AdmissionCoordinator, RootOwnerLease
+
+    root = paths.root_context()
+    owner = RootOwnerLease.acquire(root, timeout=0)
+    try:
+        return save_result(result, admission=AdmissionCoordinator(root, owner_lease=owner))
+    finally:
+        owner.close()
+
+
 class BacktestScreen(Screen):
     """Pick a mandate → pick a window → warm → replay with a live equity curve.
 
@@ -258,7 +272,7 @@ class BacktestScreen(Screen):
                 result = backtest_fund(fund, start, end, CachedDataClient(raw),
                                        universe, on_cycle=tick, on_valuation=valuation)
 
-            path = save_result(result)  # where `aihf backtest` saves too; the mandate picker reads it
+            path = _save_admitted(result)  # where `aihf backtest` saves too; the mandate picker reads it
             app.call_from_thread(self._finish, result, path)
         except Exception as exc:  # fail loud, in the UI
             app.call_from_thread(self._fail, exc)

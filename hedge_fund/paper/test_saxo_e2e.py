@@ -1,30 +1,26 @@
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import json
 from datetime import datetime
 from importlib import import_module
 
 import pytest
-from textual.widgets import ContentSwitcher, Input, OptionList, SelectionList
 
-from hedge_fund import paths
 from hedge_fund.brokers.factory import build_broker
 from hedge_fund.brokers.protocol import OrderSubmissionDeferred
 from hedge_fund.brokers.saxo import SaxoBroker
 from hedge_fund.brokers.sim import SimBroker
 from hedge_fund.data.models import Price
 from hedge_fund.data.sessions import NEW_YORK
-from hedge_fund.fund import Fund, FundSpec
+from hedge_fund.fund import custom_strategy, Fund, FundSpec, TradingWindow
 from hedge_fund.models import Signal
 from hedge_fund.paper.deployed import deploy, load_deployed
 from hedge_fund.paper.ledger import Ledger
 from hedge_fund.paper.tick import _run
 from hedge_fund.pipeline.clock import Marked
 from hedge_fund.pipeline.session import advance, BookMismatch, FundState
-from hedge_fund.tui import builder
-from hedge_fund.tui.app import HedgeFundApp
+from hedge_fund.runtime.defaults import DEFAULT_CAPITAL, DEFAULT_RISK
 
 tick_module = import_module("hedge_fund.paper.tick")
 
@@ -379,34 +375,22 @@ def test_real_saxo_client_deferral_reaches_the_session_ledger(tmp_path):
 
 
 def test_saxo_external_adapter_records_order_fill_in_ledger(tmp_path, monkeypatch):
-    mandate_dir = tmp_path / "mandates"
-    mandate_dir.mkdir()
-    monkeypatch.setattr(paths, "PAPER_DIR", tmp_path)
-    monkeypatch.setattr(paths, "MANDATES_DIR", mandate_dir)
-
-    async def build_through_tui():
-        app = HedgeFundApp()
-        async with app.run_test(size=(120, 45)) as pilot:
-            await app.push_screen(builder.BuilderScreen(mode="paper"))
-            screen = app.screen
-            screen.query_one("#name-input", Input).value = "external"
-            await pilot.press("enter")
-            screen.query_one("#strategy-list", SelectionList).select(builder.CUSTOM)
-            await pilot.press("enter")
-            screen.query_one("#agent-list", SelectionList).select("pead")
-            await pilot.press("enter", "enter")
-            screen.query_one("#cadence-list", OptionList).highlighted = 0
-            await pilot.press("enter", "enter")
-            screen.query_one("#window-end-input", Input).value = "15:59"
-            await pilot.press("enter", "enter", "enter")
-            screen.query_one("#broker-list", OptionList).highlighted = 1
-            await pilot.press("enter")
-            screen.query_one("#tickers-input", Input).value = "AAPL"
-            await pilot.press("enter")
-            assert screen.query_one("#panes", ContentSwitcher).current == "step-done"
-
-    asyncio.run(build_through_tui())
-    directory = tmp_path / "external"
+    # TUI paper builds are denied (see hedge_fund/tui/test_builder_broker.py);
+    # deploy the spec the wizard built — custom pead, minute, 15:59 close, Saxo.
+    spec = FundSpec(
+        schema_version=2,
+        name="external",
+        strategies=[custom_strategy(["pead"]).model_dump()],
+        risk=DEFAULT_RISK,
+        capital=DEFAULT_CAPITAL,
+        rebalance="minute",
+        approval_required=False,
+        broker="saxo",
+        interval=1.0,
+        window=TradingWindow(start=TradingWindow().start, end="15:59"),
+    )
+    directory = deploy("external", spec, ["AAPL"], root=tmp_path)
+    assert directory == tmp_path / "external"
     deployed = load_deployed(directory)
     spec = deployed.spec
     secrets = SharedSecrets()

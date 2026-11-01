@@ -37,6 +37,7 @@ from hedge_fund.fund import (
     TradingWindow,
 )
 from hedge_fund.fund.spec import EARLIEST_WINDOW, LATEST_WINDOW, validate_saxo_window
+from hedge_fund.fund.storage import StorageAdmissionError
 from hedge_fund.paper import deploy, validate_fund_name
 from hedge_fund.runtime.defaults import (
     fast_caveat,
@@ -336,6 +337,12 @@ class BuilderScreen(Screen):
             self.notify(str(exc), severity="error")
             return
         if fund_name_taken(name) and self._state.get("replace") != name:
+            denial = paper_write_denial()
+            if denial is not None:
+                # Replacing wipes the old fund; refuse up front rather than
+                # after a wizard whose final step could only be denied.
+                self.notify(f"That name is taken and cannot be replaced here. {denial} Choose a different name.", severity="error")
+                return
             # Taken. Offer to replace it; nothing is removed until the new
             # fund is fully specified, so backing out of the wizard is free.
             self.app.push_screen(ConfirmWipeScreen(name, replacing=True), lambda ok: self._accept_name(name, replace=True) if ok else None)
@@ -521,7 +528,12 @@ class BuilderScreen(Screen):
         # it now, at the last moment, so an abandoned wizard costs nothing.
         replaced = self._state.get("replace") == spec.name
         if replaced:
-            wipe_fund(spec.name)
+            try:
+                wipe_fund(spec.name)
+            except RuntimeError as exc:
+                self.notify(str(exc), severity="warning")
+                self._goto("step-name")
+                return
         # Otherwise both modes refuse to overwrite: the name was checked on
         # the way in, but something may have taken it since. Paper mode needs
         # both the saved definition and the fund directory to be free.
@@ -535,6 +547,9 @@ class BuilderScreen(Screen):
             self.notify("A fund with that name already exists. Choose a different name.", severity="error")
             self._goto("step-name")
             return
+        except StorageAdmissionError:
+            self.notify("The mandate was not saved: root storage admission is unavailable. Use the web desk.", severity="error")
+            return
         self._built = (spec, path)
 
         staff = ", ".join(s.title for s in self._state["strategies"])
@@ -546,7 +561,7 @@ class BuilderScreen(Screen):
             self.notify(f"Replaced the previous {spec.name}.", severity="warning")
         if self.mode == "paper":
             universe = self._state["universe"]
-            deploy(spec.name, spec, universe, root=paths.PAPER_DIR)
+            directory = deploy(spec.name, spec, universe, root=paths.PAPER_DIR)
             menu = self.query_one("#done-menu", OptionList)
             menu.clear_options()
             menu.add_options(

@@ -1,4 +1,4 @@
-"""The fund wizard in both modes, including the minute cadence sub-steps."""
+﻿"""The fund wizard in both modes, including the minute cadence sub-steps."""
 
 import asyncio
 import json
@@ -15,7 +15,7 @@ from hedge_fund.data.sessions import NEW_YORK
 from hedge_fund.fund import FundSpec, load_spec, TradingWindow
 from hedge_fund.paper import deploy, Ledger, load_deployed
 from hedge_fund.signals import ALPHA_MODEL_REGISTRY
-from hedge_fund.tui import builder, funds, paper
+from hedge_fund.tui import builder, paper
 from hedge_fund.tui.app import HedgeFundApp
 from hedge_fund.tui.fixtures import make_session, make_spec, render
 from hedge_fund.tui.shared import cadence_identity, MODE_LABELS, strategy_description
@@ -85,8 +85,8 @@ def test_builder_existing_name_and_save_race_never_overwrite():
             screen = app.screen
             screen.query_one("#name-input", Input).value = "existing"
             await pilot.press("enter")
-            assert isinstance(app.screen, funds.ConfirmWipeScreen)  # taken: offered a replace
-            await pilot.press("escape")  # declined
+            # Taken: replacing would wipe it, which the TUI cannot admit, so no
+            # wipe modal is offered and the name step stays put.
             assert app.screen is screen
             assert screen.query_one("#panes", ContentSwitcher).current == "step-name"
             assert path.read_text() == original
@@ -107,25 +107,44 @@ def test_builder_existing_name_and_save_race_never_overwrite():
     asyncio.run(scenario())
 
 
-def test_builder_paper_mode_builds_a_live_fund_and_refuses_taken_names():
+def _capture_notices(monkeypatch, screen) -> list[str]:
+    notices: list[str] = []
+    monkeypatch.setattr(screen, "notify", lambda message, **_kwargs: notices.append(message))
+    return notices
+
+
+def _tree(directory) -> dict[str, bytes]:
+    return {p.relative_to(directory).as_posix(): p.read_bytes() for p in directory.rglob("*") if p.is_file()} if directory.exists() else {}
+
+
+def test_builder_paper_mode_denies_the_build_and_refuses_taken_names(monkeypatch):
+    """Paper builds need deployment admission the TUI never holds: the + row
+    and the final step both deny, and nothing is written. The wizard steps,
+    taken-name refusal and ticker prefill still behave as before."""
     deploy("taken", make_spec(["pead"], "taken"), ["NVDA", "AMD"], root=paths.PAPER_DIR)
     (paths.MANDATES_DIR / "saved.yaml").write_text(yaml.safe_dump(make_spec(["pead"], "saved").model_dump()))
+    before_paper, before_mandates = _tree(paths.PAPER_DIR), _tree(paths.MANDATES_DIR)
 
     async def scenario():
         app = HedgeFundApp()
         async with app.run_test(size=(120, 45)) as pilot:
             await app.push_screen(paper.PaperScreen())
             fund_list = app.screen
+            list_notices = _capture_notices(monkeypatch, fund_list)
             await pilot.press("end", "enter")  # the + row
+            await pilot.pause()
+            assert app.screen is fund_list
+            assert list_notices == ["TUI paper writes are disabled on enrolled roots; use the web desk."]
+            await app.push_screen(builder.BuilderScreen(mode="paper"))
             screen = app.screen
-            assert isinstance(screen, builder.BuilderScreen) and screen.mode == "paper"
+            notices = _capture_notices(monkeypatch, screen)
             assert screen.STEP_TITLES == ["Name", "Strategies", "Capital", "Cadence", "Approval", "Broker", "Tickers"]
             for taken in ("taken", "saved"):  # paper funds and saved definitions both count
                 screen.query_one("#name-input", Input).value = taken
                 await pilot.press("enter")
-                assert isinstance(app.screen, funds.ConfirmWipeScreen)
-                await pilot.press("escape")
+                assert app.screen is screen
                 assert screen.query_one("#panes", ContentSwitcher).current == "step-name"
+            assert len(notices) == 2 and all("cannot be replaced here" in n for n in notices)
             screen.query_one("#name-input", Input).value = "alpha"
             await pilot.press("enter")
             screen.query_one("#strategy-list", SelectionList).select(builder.CUSTOM)
@@ -138,32 +157,20 @@ def test_builder_paper_mode_builds_a_live_fund_and_refuses_taken_names():
             assert screen.query_one("#panes", ContentSwitcher).current == "step-tickers"
             tickers = screen.query_one("#tickers-input", Input)
             assert tickers.value == "NVDA, AMD"  # prefilled from the newest paper fund
-            assert not (paths.PAPER_DIR / "alpha").exists()  # nothing written before the last step
             tickers.value = "test, msft"
             await pilot.press("enter")
             await pilot.pause()
-            assert screen.query_one("#panes", ContentSwitcher).current == "step-done"
-            assert "alpha is live." in render(screen.query_one("#done-summary", Static).content)
-            menu = screen.query_one("#done-menu", OptionList)
-            assert [menu.get_option_at_index(i).id for i in range(menu.option_count)] == ["go-run", "go-back"]
-            assert menu.get_option("go-run").disabled
-            deployed = load_deployed(paths.PAPER_DIR / "alpha")
-            saved = load_spec(paths.MANDATES_DIR / "alpha.yaml")
-            assert deployed.universe == ["TEST", "MSFT"] and deployed.spec == saved
-            assert saved.rebalance == "weekly" and saved.strategies[0].models[0].name == "pead"
-            # Back lands on the fund list with the new fund highlighted.
-            menu.highlighted = menu.get_option_index("go-back")
-            await pilot.press("enter")
-            assert app.screen is fund_list
-            rail = fund_list.query_one("#paper-menu", OptionList)
-            assert rail.get_option_at_index(rail.highlighted).id == "paper:0"
-            assert "alpha" in render(rail.get_option("paper:0").prompt)
+            assert screen.query_one("#panes", ContentSwitcher).current == "step-tickers"
+            assert notices[-1] == "TUI paper writes are disabled on enrolled roots; use the web desk."
+            assert screen._built is None
 
     asyncio.run(scenario())
+    assert _tree(paths.PAPER_DIR) == before_paper
+    assert _tree(paths.MANDATES_DIR) == before_mandates
 
 
 @pytest.mark.parametrize("approval_required", [False, True])
-def test_builder_paper_mode_sets_approval_required(approval_required):
+def test_builder_paper_mode_records_approval_choice_then_denies_the_build(monkeypatch, approval_required):
     name = "approval-on" if approval_required else "approval-off"
 
     async def scenario():
@@ -171,6 +178,7 @@ def test_builder_paper_mode_sets_approval_required(approval_required):
         async with app.run_test(size=(120, 45)) as pilot:
             await app.push_screen(builder.BuilderScreen(mode="paper"))
             screen = app.screen
+            notices = _capture_notices(monkeypatch, screen)
             screen.query_one("#name-input", Input).value = name
             await pilot.press("enter")
             screen.query_one("#strategy-list", SelectionList).select(builder.CUSTOM)
@@ -183,21 +191,20 @@ def test_builder_paper_mode_sets_approval_required(approval_required):
             choices.highlighted = int(approval_required)
             await pilot.press("enter")
             assert screen.query_one("#panes", ContentSwitcher).current == "step-broker"
+            assert screen._state["approval_required"] is approval_required
             await pilot.press("enter")
             assert screen.query_one("#panes", ContentSwitcher).current == "step-tickers"
             screen.query_one("#tickers-input", Input).value = "TEST"
             await pilot.press("enter")
             await pilot.pause()
-
-            deployed = load_deployed(paths.PAPER_DIR / name)
-            saved = load_spec(paths.MANDATES_DIR / f"{name}.yaml")
-            assert deployed.spec.approval_required is approval_required
-            assert saved.approval_required is approval_required
+            assert notices == ["TUI paper writes are disabled on enrolled roots; use the web desk."]
 
     asyncio.run(scenario())
+    assert not (paths.PAPER_DIR / name).exists()
+    assert not (paths.MANDATES_DIR / f"{name}.yaml").exists()
 
 
-def test_builder_minute_path_sets_interval_and_window_and_offers_start_running():
+def test_builder_minute_path_sets_interval_and_window_then_denies_the_build(monkeypatch):
     async def scenario():
         app = HedgeFundApp()
         async with app.run_test(size=(120, 45)) as pilot:
@@ -268,20 +275,18 @@ def test_builder_minute_path_sets_interval_and_window_and_offers_start_running()
             end.focus()
             await pilot.press("enter")
             await pilot.press("enter")
+            await pilot.press("enter")  # broker
+            assert screen.query_one("#panes", ContentSwitcher).current == "step-tickers"
             screen.query_one("#tickers-input", Input).value = "TEST"
-            await pilot.press("enter")
+            notices = _capture_notices(monkeypatch, screen)
             await pilot.press("enter")
             await pilot.pause()
-            assert screen.query_one("#panes", ContentSwitcher).current == "step-done"
-            menu = screen.query_one("#done-menu", OptionList)
-            assert render(menu.get_option_at_index(0).prompt).strip() == "First session via explicit-root CLI or web desk"
-            summary = render(screen.query_one("#done-summary", Static).content)
-            assert "every 30s · 09:00–12:00 ET" in summary
-            assert "marks the book at the current bar" in summary and "Unattended runners are disabled" in summary
-            saved = load_spec(paths.MANDATES_DIR / "fast.yaml")
-            assert saved.rebalance == "minute" and saved.interval == 0.5
-            assert saved.window.start == "09:00" and saved.window.end == "12:00"
-            assert load_deployed(paths.PAPER_DIR / "fast").spec == saved
+            assert screen.query_one("#panes", ContentSwitcher).current == "step-tickers"
+            assert notices == ["TUI paper writes are disabled on enrolled roots; use the web desk."]
+            assert screen._state["rebalance"] == "minute" and screen._state["interval"] == 0.5
+            assert screen._state["window"] == TradingWindow(start="09:00", end="12:00")
+            assert not (paths.MANDATES_DIR / "fast.yaml").exists()
+            assert not (paths.PAPER_DIR / "fast").exists()
 
     asyncio.run(scenario())
 
@@ -305,7 +310,10 @@ def test_builder_minute_helpers_are_pure():
     assert cadence_identity(make_spec()) == "weekly"
 
 
-def test_builder_replaces_a_taken_name_only_after_yes_and_only_at_the_end():
+def test_builder_refuses_to_replace_a_taken_name_and_wipes_nothing(monkeypatch):
+    """Replacing a fund wipes its definition, backtests and ledger, which the
+    TUI cannot admit: a taken name is refused at the name step, every file
+    stays, and a fresh name still walks the wizard to the denied build."""
     old = make_spec(["buffett"], "alpha")
     old.rebalance = "monthly"
     (paths.MANDATES_DIR / "alpha.yaml").write_text(yaml.safe_dump(old.model_dump()))
@@ -315,36 +323,24 @@ def test_builder_replaces_a_taken_name_only_after_yes_and_only_at_the_end():
     ledger = Ledger(directory)
     ledger.append(make_session("2025-01-17", nav=100000))
     untouched = deploy("beta", old, ["AMD"], root=paths.PAPER_DIR)
+    before = (_tree(paths.MANDATES_DIR), _tree(paths.RESEARCH_DIR), _tree(paths.PAPER_DIR))
 
     async def scenario():
         app = HedgeFundApp()
         async with app.run_test(size=(120, 45)) as pilot:
             await app.push_screen(builder.BuilderScreen(mode="paper"))
             screen = app.screen
+            notices = _capture_notices(monkeypatch, screen)
             screen.query_one("#name-input", Input).value = "alpha"
             await pilot.press("enter")
-            modal = app.screen
-            assert isinstance(modal, funds.ConfirmWipeScreen)
-            manifest = render(modal.query_one("#confirm-files", Static).content)
-            assert "alpha.yaml" in manifest and "1 backtest" in manifest and "1 session of ledger" in manifest
-            await pilot.press("enter")  # yes, replace
-            assert screen.query_one("#panes", ContentSwitcher).current == "step-strategies"
-            # Nothing has gone yet: an abandoned wizard costs nothing.
-            assert receipt.exists() and len(ledger.records()) == 1
-            await pilot.press("escape")
+            assert app.screen is screen
             assert screen.query_one("#panes", ContentSwitcher).current == "step-name"
-            # Re-submitting the same name does not ask twice; a different name forgets the yes.
-            await pilot.press("enter")
-            assert screen.query_one("#panes", ContentSwitcher).current == "step-strategies"
-            await pilot.press("escape")
+            assert screen._state.get("replace") is None
+            assert notices and "cannot be replaced here" in notices[-1]
             screen.query_one("#name-input", Input).value = "gamma"
             await pilot.press("enter")
+            assert screen.query_one("#panes", ContentSwitcher).current == "step-strategies"
             assert screen._state["replace"] is None
-            await pilot.press("escape")
-            screen.query_one("#name-input", Input).value = "alpha"
-            await pilot.press("enter")
-            assert isinstance(app.screen, funds.ConfirmWipeScreen)
-            await pilot.press("enter")
             screen.query_one("#strategy-list", SelectionList).select(builder.CUSTOM)
             await pilot.press("enter")
             screen.query_one("#agent-list", SelectionList).select("pead")
@@ -354,47 +350,30 @@ def test_builder_replaces_a_taken_name_only_after_yes_and_only_at_the_end():
             screen.query_one("#tickers-input", Input).value = "TEST"
             await pilot.press("enter")
             await pilot.pause()
-            assert screen.query_one("#panes", ContentSwitcher).current == "step-done"
-            fresh = load_deployed(paths.PAPER_DIR / "alpha")
-            assert fresh.universe == ["TEST"] and fresh.spec.rebalance == "weekly"
-            assert fresh.spec.strategies[0].models[0].name == "pead"
-            assert Ledger(paths.PAPER_DIR / "alpha").records() == []  # a new track record
-            assert load_spec(paths.MANDATES_DIR / "alpha.yaml") == fresh.spec
-            assert not receipt.exists()
-            assert load_deployed(untouched).universe == ["AMD"]  # neighbours untouched
+            assert screen.query_one("#panes", ContentSwitcher).current == "step-tickers"
+            assert notices[-1] == "TUI paper writes are disabled on enrolled roots; use the web desk."
 
     asyncio.run(scenario())
+    assert (_tree(paths.MANDATES_DIR), _tree(paths.RESEARCH_DIR), _tree(paths.PAPER_DIR)) == before
+    assert receipt.exists() and len(ledger.records()) == 1
+    assert load_deployed(untouched).universe == ["AMD"]
 
 
-def test_builder_first_session_requires_cli_or_web_authorization(monkeypatch):
-    monkeypatch.setattr(paper, "make_data_client", lambda: Mock(__enter__=lambda s: s, __exit__=lambda s, *a: None))
-    monkeypatch.setattr(paper, "next_session", lambda data, benchmark, last: "2025-01-21")
-    for variable in ("FINANCIAL_DATASETS_API_KEY", "TYPESAFE_API_KEY"):
-        monkeypatch.setenv(variable, "x")
-    monkeypatch.setenv("HEDGE_FUND_LLM_MODEL", "jev-1.13.0")
+def test_builder_first_session_is_unreachable_from_the_tui(monkeypatch):
+    forbidden_client = Mock(side_effect=AssertionError("TUI reached provider setup"))
+    monkeypatch.setattr(paper, "make_data_client", forbidden_client)
 
     async def scenario():
         app = HedgeFundApp()
         async with app.run_test(size=(120, 45)) as pilot:
             await app.push_screen(paper.PaperScreen())
-            await pilot.press("enter")
-            screen = app.screen
-            screen.query_one("#name-input", Input).value = "alpha"
-            await pilot.press("enter")
-            screen.query_one("#strategy-list", SelectionList).select(builder.CUSTOM)
-            await pilot.press("enter")
-            screen.query_one("#agent-list", SelectionList).select("pead")
-            await pilot.press("enter", "enter", "enter")
-            await pilot.press("enter")
-            await pilot.press("enter")  # choose the default paper broker
-            screen.query_one("#tickers-input", Input).value = "TEST"
-            await pilot.press("enter")
+            fund_list = app.screen
+            notices = _capture_notices(monkeypatch, fund_list)
+            await pilot.press("enter")  # the + row of an empty list
             await pilot.pause()
-            menu = screen.query_one("#done-menu", OptionList)
-            assert menu.get_option("go-run").disabled
-            assert "Unattended runners are disabled" in render(screen.query_one("#done-summary", Static).content)
-            await pilot.press("enter")
-            await pilot.pause()
-            assert app.screen is screen
+            assert app.screen is fund_list
+            assert notices == ["TUI paper writes are disabled on enrolled roots; use the web desk."]
 
     asyncio.run(scenario())
+    forbidden_client.assert_not_called()
+    assert not paths.PAPER_DIR.exists() or not any(paths.PAPER_DIR.iterdir())

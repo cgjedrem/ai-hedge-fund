@@ -26,6 +26,7 @@ from hedge_fund.paper import (
     DeployedFund,
     is_running,
     Ledger,
+    LedgerError,
     list_deployed,
     load_deployed,
     next_session,
@@ -34,7 +35,9 @@ from hedge_fund.paper import (
     tick,
 )
 from hedge_fund.pipeline import DecisionRecord, FundState, SessionRecord
+from hedge_fund.runtime.admission import AdmissionError
 from hedge_fund.runtime.defaults import BOARD_REFRESH
+from hedge_fund.runtime.root import RootConfigurationError
 from hedge_fund.scorecard import score
 from hedge_fund.signals import ALPHA_MODEL_REGISTRY, LLMAgent
 from hedge_fund.tui.builder import BuilderScreen
@@ -265,10 +268,10 @@ class PaperScreen(Screen):
         self.app.pop_screen()
 
     def action_run(self) -> None:
-        if self._deny_paper_write():
-            return
         menu = self.query_one("#paper-menu", OptionList)
         if menu.highlighted is not None and (menu.get_option_at_index(menu.highlighted).id or "") == "build":
+            if self._deny_paper_write():
+                return
             self.app.push_screen(BuilderScreen(mode="paper"))
             return
         self.notify(
@@ -278,8 +281,6 @@ class PaperScreen(Screen):
 
     def action_runner(self) -> None:
         """Space reports disabled legacy unattended runner control."""
-        if self._deny_paper_write():
-            return
         self.notify(
             "Unattended paper runners are disabled. Use the explicit-root CLI or web desk for one authorized session.",
             severity="warning",
@@ -300,7 +301,11 @@ class PaperScreen(Screen):
         snap = self._current()
         if snap is None:
             return
-        snap.ledger.halt(APP_HALT)
+        try:
+            snap.ledger.halt(APP_HALT)
+        except (LedgerError, RootConfigurationError, AdmissionError) as exc:
+            self.notify(f"{snap.deployed.name} was not halted: {exc}", severity="error")
+            return
         self.notify(f"{snap.deployed.name} halted · r to resume", severity="warning")
         self._populate(snap.deployed.name)
 
@@ -310,7 +315,12 @@ class PaperScreen(Screen):
         snap = self._current()
         if snap is None:
             return
-        snap.ledger.resume()
+        try:
+            snap.ledger.resume()
+        except (LedgerError, RootConfigurationError, AdmissionError) as exc:
+            # Resume is reconciliation-bound; the fund stays halted.
+            self.notify(f"{snap.deployed.name} stays halted: {exc}", severity="warning")
+            return
         self.notify(f"{snap.deployed.name} resumed")
         self._populate(snap.deployed.name)
 
@@ -327,7 +337,11 @@ class PaperScreen(Screen):
         if snap is None or snap.error or not snap.gate or snap.pending is None or snap.halted is not None or snap.state is None or snap.state.prev_hash is None:
             return
         name = snap.deployed.name
-        snap.ledger.set_approval(verdict, snap.pending.as_of, snap.state.prev_hash, "tui")
+        try:
+            snap.ledger.set_approval(verdict, snap.pending.as_of, snap.state.prev_hash, "tui")
+        except (LedgerError, RootConfigurationError, AdmissionError) as exc:
+            self.notify(f"{name} verdict was not recorded: {exc}", severity="error")
+            return
         action = "approved" if verdict == "approve" else "rejected"
         self.notify(f"{name} decision {action} from {snap.pending.as_of}")
         self._populate(name)
@@ -346,7 +360,11 @@ class PaperScreen(Screen):
             return
         if self._deny_paper_write():
             return
-        wipe_fund(name)
+        try:
+            wipe_fund(name)
+        except RuntimeError as exc:
+            self.notify(str(exc), severity="warning")
+            return
         self.notify(f"Deleted {name}", severity="warning")
         self._populate(None)
 

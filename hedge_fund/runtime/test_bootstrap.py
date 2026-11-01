@@ -159,6 +159,8 @@ def test_cache_defaults_follow_configured_root(owned_test_process, tmp_path):
         "from hedge_fund.features.breakpoints import load_breakpoints\n"
         "from hedge_fund.llm.cache import DEFAULT_CACHE_DIR as llm_cache\n"
         "from hedge_fund.llm.cache import PromptCache\n"
+        "from hedge_fund.runtime.handover import enroll_fresh\n"
+        "enroll_fresh(context)\n"
         f"root = Path({root})\n"
         "assert data_cache == root / 'cache' / 'data'\n"
         "assert DEFAULT_CACHE_PATH == root / 'cache' / 'breakpoints' / 'ME_Breakpoints.csv'\n"
@@ -182,3 +184,17 @@ def test_cache_defaults_follow_configured_root(owned_test_process, tmp_path):
         "context.close()\n"
     )
     assert process.wait(timeout=10) == 0
+
+
+def test_cache_writes_deny_unenrolled_root(configured_root):
+    from hedge_fund.data.cached import CachedDataClient
+
+    class DataClient:
+        def get_company_facts(self, ticker):
+            return None
+
+    with pytest.raises(RootConfigurationError, match="root write admission"):
+        CachedDataClient(DataClient()).get_company_facts("AAPL")
+    with pytest.raises(RootConfigurationError, match="root write admission"):
+        paths.write_text(configured_root.path / "cache" / "llm" / "synthetic.json", "{}")
+    assert not (configured_root.path / "cache").exists()
