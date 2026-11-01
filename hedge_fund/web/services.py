@@ -9,7 +9,7 @@ import re
 import stat
 import threading
 import unicodedata
-from contextlib import contextmanager
+from contextlib import contextmanager, ExitStack
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from ipaddress import ip_address
@@ -91,7 +91,14 @@ from hedge_fund.runtime.handover import (
     enrollment_status,
     HandoverError,
     record_ledger_head,
+    require_enrollment,
     verify_root_inventory,
+)
+from hedge_fund.runtime.lifecycle import (
+    ArchiveConflict,
+    ArchiveError,
+    ArchiveNotFound,
+    LifecycleArchiveStore,
 )
 from hedge_fund.runtime.operations import (
     ConfirmationExpired,
@@ -105,7 +112,12 @@ from hedge_fund.runtime.operations import (
     OperationStore,
     StalePreview,
 )
-from hedge_fund.runtime.owned_runner import OwnedRunnerError, OwnedRunnerManager
+from hedge_fund.runtime.owned_runner import (
+    OwnedRunnerError,
+    OwnedRunnerManager,
+    runner_key,
+    RUNNER_ROOT,
+)
 from hedge_fund.runtime.policy import (
     AuthorizationDenied,
     classify_provider,
@@ -122,6 +134,8 @@ from hedge_fund.web.schemas import (
     CredentialRequest,
     DeployRequest,
     error_code_for,
+    LifecycleAcceptRequest,
+    LifecyclePreviewRequest,
     ModelRequest,
     OperationAcceptRequest,
     OperationCancelRequest,
@@ -272,6 +286,7 @@ class DeskService:
         self._captures: dict[str, FrozenCapture] = {}
         self._preview_captures: dict[str, str] = {}
         self._preview_expiries: dict[str, datetime] = {}
+        self._lifecycle_previews: dict[str, dict[str, object]] = {}
         try:
             self._environment_settings = environment_settings()
             self._runtime_settings = resolve_settings(
@@ -353,7 +368,7 @@ class DeskService:
             "deferred_actions": {
                 "runner": ("Finite local-paper runner start and stop require an explicit reviewed operation." if self.allow_writes else "Runner controls are unavailable because root writes are disabled."),
                 "manual_run": ("One-session local-paper ticks require a reviewed head and due-set confirmation." if self.allow_writes and self.network_enabled else "Manual ticks are unavailable because writes or network capability are disabled."),
-                "delete": "Fund and report deletion is not available.",
+                **({} if self.allow_writes and self._operation_store is not None else {"delete": "Scoped archival is unavailable because root writes or durable operation storage are disabled."}),
                 "redo": "Ledger redo is not available from the web UI.",
                 "live_value": ("Explicit free-Yahoo refresh is available; quote print freshness remains unverified." if self.network_enabled else "Valuation refresh is disabled because network capability is off."),
             },
@@ -1911,6 +1926,436 @@ class DeskService:
             except CredentialStoreError:
                 raise ServiceError(409, "Credential could not be deleted.") from None
         return {"provider": provider_name, "configured": False, "version": version}
+
+    @staticmethod
+    def _archive_view(record: dict) -> dict:
+        fields = (
+            "archive_id",
+            "kind",
+            "identity",
+            "source_path",
+            "digest",
+            "state",
+            "updated_at",
+            "restore_operation_id",
+            "recovery_required",
+            "recovery_action",
+            "recovery_error",
+        )
+        return {key: record[key] for key in fields if key in record}
+
+    def list_lifecycle_archives(self) -> dict:
+        try:
+            store = LifecycleArchiveStore(self.root_context, self._admission)
+            records = {item["archive_id"]: item for item in store.list_archives()}
+            for archive_id, record in records.items():
+                if self._has_unprepared_restore(record):
+                    records[archive_id] = self._inspect_lifecycle_recovery(store, archive_id, record=record)
+            if self._operation_store is not None:
+                for operation in self._operation_store.interrupted_lifecycle_archives():
+                    archive_id = operation.payload.get("archive_id")
+                    if archive_id not in records:
+                        records[archive_id] = self._inspect_lifecycle_recovery(store, archive_id, operation=operation)
+            return {"items": [self._archive_view(item) for item in records.values()]}
+        except (ArchiveError, AdmissionError, OperationError, HandoverError, OSError, RootPathError):
+            raise ServiceError(409, "Archive history is unavailable.") from None
+
+    def get_lifecycle_archive(self, archive_id: str) -> dict:
+        try:
+            store = LifecycleArchiveStore(self.root_context, self._admission)
+            try:
+                record = store.inspect(archive_id)
+                if self._has_unprepared_restore(record):
+                    record = self._inspect_lifecycle_recovery(store, archive_id, record=record)
+            except ArchiveNotFound:
+                matches = [] if self._operation_store is None else [operation for operation in self._operation_store.interrupted_lifecycle_archives() if operation.payload.get("archive_id") == archive_id]
+                if len(matches) != 1:
+                    raise
+                record = self._inspect_lifecycle_recovery(store, archive_id, operation=matches[0])
+            return self._archive_view(record)
+        except ArchiveNotFound:
+            raise ServiceError(404, "Archive not found.") from None
+        except (ArchiveError, AdmissionError, OperationError, HandoverError, OSError, RootPathError):
+            raise ServiceError(409, "Archive inspection is unavailable.") from None
+
+    def _inspect_lifecycle_recovery(self, archives: LifecycleArchiveStore, archive_id: str, *, record: dict | None = None, operation: OperationRecord | None = None) -> dict:
+        try:
+            return self._review_lifecycle_archive(archives, archive_id, action="recover")
+        except (ArchiveConflict, ArchiveNotFound):
+            if record is None:
+                if operation is None:
+                    raise ArchiveNotFound("interrupted archive evidence is unavailable") from None
+                payload = operation.payload
+                record = {
+                    "archive_id": archive_id,
+                    "kind": payload["kind"],
+                    "identity": payload["identity"],
+                    "source_path": payload["source_path"],
+                    "digest": payload["object_digest"],
+                    "state": "archive-unprepared",
+                    "updated_at": operation.updated_at,
+                }
+            return {
+                **record,
+                "recovery_required": True,
+                "recovery_action": "manual-review",
+                "recovery_error": "Safe automatic recovery cannot be verified. Preserve both locations and perform offline manual review.",
+            }
+
+    def _review_lifecycle_archive(self, archives: LifecycleArchiveStore, archive_id: str, *, action: str) -> dict:
+        try:
+            return archives.review_archive(archive_id, action=action)
+        except ArchiveNotFound:
+            if action != "recover" or self._operation_store is None:
+                raise
+            matches = [operation for operation in self._operation_store.interrupted_lifecycle_archives() if operation.payload.get("archive_id") == archive_id]
+            if len(matches) != 1:
+                raise ArchiveNotFound("interrupted archive identity is unavailable") from None
+            payload = matches[0].public_view()["payload"]
+            return archives.review_unprepared(payload["kind"], payload["identity"], archive_id=archive_id, expected_digest=payload["object_digest"], deployment_before=payload.get("deployment_before"))
+        except ArchiveConflict:
+            if action != "recover":
+                raise
+            record = archives.inspect(archive_id)
+            if not self._has_unprepared_restore(record):
+                raise
+            return archives.review_unprepared_restore(archive_id)
+
+    def _has_unprepared_restore(self, record: dict) -> bool:
+        if record["state"] != "archived" or self._operation_store is None:
+            return False
+        return any(operation.status is OperationStatus.INTERRUPTED and operation.action in {"lifecycle-restore", "lifecycle-recover"} and operation.payload.get("archive_id") == record["archive_id"] and operation.payload.get("object_digest") == record["digest"] and operation.operation_id not in record.get("reconciled_operations", []) for operation in self._operation_store.active_for_subject(record["lane_identity"]))
+
+    @contextmanager
+    def _lifecycle_lane(self, subject: str) -> Iterator[None]:
+        with ExitStack() as stack:
+            stack.enter_context(self._admission.registry_lock(timeout=0))
+            for lane, factory in (
+                ("deployment", self._admission.deployment_lock),
+                ("runner", self._admission.runner_reservation),
+                ("execution", self._admission.execution_lease),
+                ("control", self._admission.control_lane),
+                ("research", self._admission.research_lane),
+            ):
+                if not self._admission.lane_is_held(lane, subject):
+                    stack.enter_context(factory(subject, timeout=0))
+            yield
+
+    def _lifecycle_review(
+        self,
+        request: LifecyclePreviewRequest,
+        *,
+        archive_id: str | None = None,
+    ) -> tuple[str, dict]:
+        archives = LifecycleArchiveStore(self.root_context, self._admission)
+        if request.action == "archive":
+            record = archives.preview(request.kind, request.identity)
+            record["archive_id"] = archive_id
+        else:
+            record = self._review_lifecycle_archive(archives, request.archive_id, action=request.action)
+        subject = self._validated_name(record["lane_identity"])
+        self._guard_protected(subject)
+        kind, identity = record["kind"], record["identity"]
+        source = record.get("review_path", record["source_path"])
+        if kind == "deployment":
+            deployed = load_deployed(self.root_context.resolve(source))
+            if deployed.broker != "paper":
+                raise ServiceError(403, "Lifecycle mutations require a local-paper deployment.", code="broker-not-web-supported")
+        elif kind == "template":
+            spec = load_spec(self.root_context.resolve(source))
+            if spec.name != identity:
+                raise ServiceError(409, "Template identity does not match its contents.")
+            if spec.broker != "paper":
+                raise ServiceError(403, "Lifecycle mutations require a local-paper template.", code="broker-not-web-supported")
+        references = {"deployments": [], "research": []}
+        related_subjects = {subject}
+        paper = self._safe_child("paper")
+        entries = sorted(paper.iterdir()) if paper.exists() else []
+        if len(entries) > 10000:
+            raise ServiceError(409, "Deployment reference inventory exceeds its bound.")
+        heads = require_enrollment(self.root_context)["heads"]
+        for entry in entries:
+            directory = self._safe_child("paper", entry.name)
+            if not directory.is_dir() or not self._safe_child("paper", entry.name, "fund.yaml").is_file():
+                continue
+            self._guard_protected(directory.name)
+            deployed = load_deployed(directory)
+            if _windows_name_key(deployed.spec.name) == _windows_name_key(subject) or deployed.name == subject:
+                head = heads.get(_windows_name_key(deployed.name))
+                if not isinstance(head, dict):
+                    raise ServiceError(409, "Deployment reference head is unavailable.")
+                references["deployments"].append(
+                    {
+                        "identity": deployed.name,
+                        "mandate_digest": mandate_hash(deployed.spec),
+                        "broker": deployed.broker,
+                        "ledger_head": head.get("head_hash"),
+                    }
+                )
+                related_subjects.add(deployed.name)
+        research = self._safe_child("research")
+        reports = sorted(research.glob("*.json")) if research.exists() else []
+        if len(reports) > 10000:
+            raise ServiceError(409, "Research reference inventory exceeds its bound.")
+        for path in reports:
+            raw = self.root_context.read_bytes(f"research/{path.name}")
+            report = json.loads(raw.decode("utf-8"))
+            fund = report.get("fund") if isinstance(report, dict) else None
+            if not isinstance(fund, str):
+                raise ServiceError(409, "Research reference identity is unavailable.")
+            if _windows_name_key(fund) == _windows_name_key(subject):
+                references["research"].append(
+                    {
+                        "identity": path.name,
+                        "digest": hashlib.sha256(raw).hexdigest(),
+                    }
+                )
+        runner_states = {}
+        for related in sorted(related_subjects):
+            self._guard_protected(related)
+            runner = self._runner_state(related)
+            if runner.get("status") != "stopped":
+                raise ServiceError(409, "Lifecycle requires a verified stopped runner.", code="ownership-unknown")
+            observed = {"status": "stopped", "available": False}
+            for filename in ("state", "control"):
+                relative = f"{RUNNER_ROOT}/{runner_key(related)}/{filename}.json"
+                try:
+                    raw = self.root_context.read_bytes(relative)
+                except FileNotFoundError:
+                    observed[f"{filename}_digest"] = None
+                else:
+                    observed[f"{filename}_digest"] = hashlib.sha256(raw).hexdigest()
+            runner_states[related] = observed
+            for operation in self._operation_store.active_for_subject(related):
+                reconciled = False
+                if operation.status is OperationStatus.INTERRUPTED and operation.action in {
+                    "lifecycle-archive",
+                    "lifecycle-restore",
+                    "lifecycle-recover",
+                }:
+                    try:
+                        journal = archives.inspect(operation.payload.get("archive_id"))
+                    except ArchiveNotFound:
+                        journal = None
+                    if journal is not None and operation.operation_id in journal.get("reconciled_operations", []) and journal["digest"] == operation.payload.get("object_digest"):
+                        reconciled = True
+                recovering = request.action == "recover" and operation.status is OperationStatus.INTERRUPTED and operation.action in {"lifecycle-archive", "lifecycle-restore", "lifecycle-recover"} and operation.payload.get("archive_id") == record["archive_id"]
+                if not recovering and not reconciled:
+                    raise ServiceError(409, "Lifecycle conflicts with an unfinished operation.", code="writer-conflict")
+        payload = {
+            "action": request.action,
+            "kind": kind,
+            "identity": identity,
+            "archive_id": record["archive_id"],
+            "object_digest": record["digest"],
+            "source_path": record["source_path"],
+            "references": references,
+            "runner_state": runner_states,
+            "journal_state": record.get("state"),
+            "recovery_action": record.get("recovery_action"),
+            "review_digest": record.get("review_digest", record["digest"]),
+            "deployment_before": record.get("deployment_before") if request.action == "recover" else heads.get(_windows_name_key(identity)) if kind == "deployment" else None,
+        }
+        return subject, payload
+
+    @staticmethod
+    def _lifecycle_head(payload: dict) -> str:
+        reviewed = dict(payload)
+        if reviewed["action"] == "archive":
+            # The new journal identifier is not an existing object revision.
+            reviewed.pop("archive_id", None)
+        return hashlib.sha256(json.dumps(reviewed, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+    def _require_lifecycle_authority(self, action: str, offline_recovery: bool) -> None:
+        if type(offline_recovery) is not bool:
+            raise ServiceError(403, "Offline recovery authority is invalid.")
+        if offline_recovery and action == "recover" and self.emergency_halt_available and self._owner_lease is not None:
+            self._admission.require_root_owner()
+            return
+        self._require_writes()
+
+    def create_lifecycle_preview(
+        self,
+        request: LifecyclePreviewRequest,
+        *,
+        operator_session: str | None,
+        offline_recovery: bool = False,
+    ) -> dict:
+        self._require_lifecycle_authority(request.action, offline_recovery)
+        if not operator_session:
+            raise ServiceError(403, "A server-owned operator session is required.")
+        if self._operation_store is None:
+            raise ServiceError(409, "Durable operation storage is unavailable.")
+        try:
+            # Resolve once to select the lane, then review again while all writers are fenced.
+            archives = LifecycleArchiveStore(self.root_context, self._admission)
+            initial = archives.preview(request.kind, request.identity) if request.action == "archive" else self._review_lifecycle_archive(archives, request.archive_id, action=request.action)
+            subject = self._validated_name(initial["lane_identity"])
+            with self._settings_lock, self._lifecycle_lane(subject):
+                self._ensure_settings_available()
+                subject, payload = self._lifecycle_review(
+                    request,
+                    archive_id=uuid4().hex if request.action == "archive" else request.archive_id,
+                )
+                head = self._lifecycle_head(payload)
+                settings = self._runtime_settings
+                capture = freeze_capture(
+                    root=self.root_context,
+                    subject_id=subject,
+                    mandate_digest=head,
+                    universe=["SPY"],
+                    broker="paper",
+                    settings=settings,
+                    credential_versions={},
+                    code_version=code_version(),
+                )
+                now = _utcnow()
+                preview = self._operation_store.create_preview(
+                    action=f"lifecycle-{request.action}",
+                    subject_id=subject,
+                    expected_head=head,
+                    due_set=(),
+                    capture=capture,
+                    operator_session=operator_session,
+                    payload=payload,
+                    now=now,
+                    expires_at=now + timedelta(minutes=10),
+                )
+                self._cache_preview_capture(preview.preview_id, capture, preview.expires_at)
+                while len(self._lifecycle_previews) >= 1000:
+                    self._lifecycle_previews.pop(next(iter(self._lifecycle_previews)))
+                self._lifecycle_previews[preview.preview_id] = payload
+            return {
+                **preview.public_view(),
+                "confirmation_token": preview.confirmation_token,
+                "capture": capture.public_view(current_settings_version=settings.version),
+                "references": payload["references"],
+                "consequences": [
+                    "Only the exact reviewed object is moved; unrelated objects and immutable history are retained.",
+                    "Restore collision-checks the original identity and never starts a runner or replays decisions.",
+                    "No provider dispatch, permanent deletion, or replacement is authorized.",
+                ],
+            }
+        except ArchiveNotFound:
+            raise ServiceError(404, "Lifecycle object not found.") from None
+        except (ArchiveError, AdmissionError, OperationError, HandoverError, ConfigurationError, OSError, RootPathError, ValueError):
+            raise ServiceError(409, "Lifecycle review is unavailable.", code="writer-conflict") from None
+
+    def accept_lifecycle(
+        self,
+        request: LifecycleAcceptRequest,
+        *,
+        operator_session: str | None,
+        offline_recovery: bool = False,
+    ) -> dict:
+        self._require_lifecycle_authority(request.action, offline_recovery)
+        if not operator_session:
+            raise ServiceError(403, "A server-owned operator session is required.")
+        store = self._operation_store
+        if store is None:
+            raise ServiceError(409, "Durable operation storage is unavailable.")
+        try:
+            existing = store.get_by_request(request.request_id)
+            payload = dict(existing.payload) if existing is not None else self._lifecycle_previews.get(request.preview_id)
+            if payload is None:
+                raise StalePreview("lifecycle review is unavailable")
+            if request.action != payload.get("action") or (request.action == "archive" and (request.kind != payload.get("kind") or request.identity != payload.get("identity"))) or (request.action != "archive" and request.archive_id != payload.get("archive_id")):
+                raise StalePreview("lifecycle identity changed")
+            subject = existing.subject_id if existing is not None else self._captures[self._preview_captures[request.preview_id]].subject_id
+            arguments = dict(
+                request_id=request.request_id,
+                action=f"lifecycle-{request.action}",
+                subject_id=subject,
+                preview_id=request.preview_id,
+                preview_digest=request.preview_digest,
+                confirmation_token=request.confirmation_token,
+                operator_session=operator_session,
+                expected_head=request.expected_head,
+                due_set=(),
+                payload=payload,
+                now=_utcnow(),
+            )
+            # Authenticate durable replay before looking up a source that may already have moved.
+            if existing is not None:
+                return self._operation_view(store.accept_request(**arguments))
+            preview_request = LifecyclePreviewRequest(
+                action=request.action,
+                kind=request.kind,
+                identity=request.identity,
+                archive_id=request.archive_id,
+            )
+
+            def current_state():
+                current_subject, current_payload = self._lifecycle_review(
+                    preview_request,
+                    archive_id=payload["archive_id"],
+                )
+                if current_subject != subject:
+                    raise StalePreview("lifecycle subject changed")
+                return self._lifecycle_head(current_payload), ()
+
+            def execute(operation):
+                fence = store.claim_worker(operation.operation_id, worker_id=uuid4().hex, now=_utcnow())
+                store.mark_running(operation.operation_id, fence, now=_utcnow())
+                archives = LifecycleArchiveStore(self.root_context, self._admission)
+                try:
+                    if request.action == "archive":
+                        result = archives.archive(
+                            payload["kind"],
+                            payload["identity"],
+                            expected_digest=payload["object_digest"],
+                            archive_id=payload["archive_id"],
+                            operation_id=operation.operation_id,
+                        )
+                    elif request.action == "restore":
+                        result = archives.restore(
+                            payload["archive_id"],
+                            expected_digest=payload["object_digest"],
+                            operation_id=operation.operation_id,
+                        )
+                    else:
+                        reconciled = (operation.operation_id,) + tuple(prior.operation_id for prior in store.active_for_subject(subject) if prior.status is OperationStatus.INTERRUPTED and prior.action in {"lifecycle-archive", "lifecycle-restore", "lifecycle-recover"} and prior.payload.get("archive_id") == payload["archive_id"] and prior.payload.get("object_digest") == payload["object_digest"])
+                        if payload["recovery_action"] == "abandon-unprepared":
+                            result = archives.abandon_unprepared(
+                                payload["kind"],
+                                payload["identity"],
+                                archive_id=payload["archive_id"],
+                                expected_digest=payload["object_digest"],
+                                reconciled_operations=reconciled,
+                                review_digest=payload["review_digest"],
+                                deployment_before=payload.get("deployment_before"),
+                            )
+                        elif payload["recovery_action"] == "abandon-unprepared-restore":
+                            result = archives.reconcile_unprepared_restore(payload["archive_id"], expected_digest=payload["object_digest"], reconciled_operations=reconciled)
+                        else:
+                            result = archives.recover(payload["archive_id"], expected_digest=payload["object_digest"], reconciled_operations=reconciled)
+                except Exception:
+                    store.interrupt(operation.operation_id, now=_utcnow())
+                    # Only a new explicit recovery may reconcile an uncertain transition.
+                    raise
+                store.complete(
+                    operation.operation_id,
+                    fence,
+                    result=self._archive_view(result),
+                    now=_utcnow(),
+                )
+
+            with self._settings_lock, self._lifecycle_lane(subject):
+                operation = store.accept_request(
+                    **arguments,
+                    current_state_resolver=current_state,
+                    start_worker=execute,
+                    admission_held=True,
+                )
+                return self._operation_view(store.get_operation(operation.operation_id))
+        except ConfirmationExpired:
+            raise ServiceError(410, "Confirmation expired; review lifecycle again.") from None
+        except (ConfirmationRejected, StalePreview, ArchiveConflict, ArchiveNotFound):
+            raise ServiceError(409, "Lifecycle review is stale or mismatched.", code="stale-preview") from None
+        except OperationStartUncertain:
+            raise ServiceError(409, "Lifecycle transition was interrupted; inspect operation and archive journal.", code="ownership-unknown") from None
+        except (ArchiveError, AdmissionError, OperationError, HandoverError, OSError, RootPathError, ValueError, KeyError):
+            raise ServiceError(409, "Lifecycle admission is unavailable.", code="writer-conflict") from None
 
     def create_operation_preview(
         self,

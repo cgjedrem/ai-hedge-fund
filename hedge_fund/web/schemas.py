@@ -233,6 +233,43 @@ class OperationCancelRequest(RequestModel):
     request_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 
 
+class LifecyclePreviewRequest(RequestModel):
+    action: Literal["archive", "restore", "recover"]
+    kind: Literal["template", "deployment", "research"] | None = None
+    identity: str | None = Field(default=None, min_length=1, max_length=200)
+    archive_id: str | None = Field(default=None, pattern=r"^[a-f0-9]{32}$")
+
+    @model_validator(mode="after")
+    def _identity_matches_action(self) -> LifecyclePreviewRequest:
+        if self.action == "archive":
+            if self.kind is None or self.identity is None or self.archive_id is not None:
+                raise ValueError("archive preview requires a kind and identity")
+        elif self.archive_id is None or self.kind is not None or self.identity is not None:
+            raise ValueError("restore or recovery preview requires an archive identity")
+        return self
+
+
+class LifecycleAcceptRequest(RequestModel):
+    request_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+    action: Literal["archive", "restore", "recover"]
+    kind: Literal["template", "deployment", "research"] | None = None
+    identity: str | None = Field(default=None, min_length=1, max_length=200)
+    archive_id: str | None = Field(default=None, pattern=r"^[a-f0-9]{32}$")
+    preview_id: str = Field(pattern=r"^[a-f0-9]{32}$")
+    preview_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+    confirmation_token: str = Field(min_length=32, max_length=512)
+    expected_head: str = Field(pattern=r"^[a-f0-9]{64}$")
+
+    @model_validator(mode="after")
+    def _identity_matches_action(self) -> LifecycleAcceptRequest:
+        if self.action == "archive":
+            if self.kind is None or self.identity is None or self.archive_id is not None:
+                raise ValueError("archive acceptance requires a kind and identity")
+        elif self.archive_id is None or self.kind is not None or self.identity is not None:
+            raise ValueError("restore or recovery acceptance requires an archive identity")
+        return self
+
+
 class PaperTickPreviewRequest(RequestModel):
     expected_head: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
 

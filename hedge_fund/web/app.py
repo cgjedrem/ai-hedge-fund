@@ -22,6 +22,8 @@ from hedge_fund.web.schemas import (
     DeployRequest,
     error_payload,
     HaltRequest,
+    LifecycleAcceptRequest,
+    LifecyclePreviewRequest,
     MandateCreateRequest,
     MandateRevisionRequest,
     ModelRequest,
@@ -231,6 +233,28 @@ def create_app(
     @app.get("/api/home")
     def home():
         return service.home()
+
+    @app.get("/api/lifecycle/archives")
+    def lifecycle_archives():
+        return service.list_lifecycle_archives()
+
+    @app.get("/api/lifecycle/archives/{archive_id}")
+    def lifecycle_archive(archive_id: str):
+        return service.get_lifecycle_archive(archive_id)
+
+    @app.post("/api/lifecycle/preview")
+    def lifecycle_preview(body: LifecyclePreviewRequest, request: Request):
+        return service.create_lifecycle_preview(
+            body,
+            operator_session=request.state.operator_session,
+        )
+
+    @app.post("/api/lifecycle/accept", status_code=202)
+    def lifecycle_accept(body: LifecycleAcceptRequest, request: Request):
+        return service.accept_lifecycle(
+            body,
+            operator_session=request.state.operator_session,
+        )
 
     @app.get("/api/mandates")
     def mandates():

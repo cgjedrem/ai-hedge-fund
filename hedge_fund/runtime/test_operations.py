@@ -327,7 +327,8 @@ def test_admission_revalidates_exact_head_and_due_set_before_worker_start(operat
     assert operation_store.get_by_request("request-2") is None
 
 
-def test_accept_persists_before_worker_start_and_does_not_replay_uncertain_start(operation_store, frozen_capture):
+@pytest.mark.parametrize("advance_worker", [False, True])
+def test_accept_persists_before_worker_start_and_does_not_replay_uncertain_start(operation_store, frozen_capture, advance_worker):
     preview = _preview(operation_store, frozen_capture)
     starts = []
 
@@ -335,6 +336,9 @@ def test_accept_persists_before_worker_start_and_does_not_replay_uncertain_start
         stored = operation_store.get_operation(operation.operation_id)
         assert stored.status is OperationStatus.ACCEPTED
         starts.append(operation.operation_id)
+        if advance_worker:
+            fence = operation_store.claim_worker(operation.operation_id, worker_id="synthetic", now=_NOW + timedelta(seconds=1))
+            operation_store.mark_running(operation.operation_id, fence, now=_NOW + timedelta(seconds=2))
         raise RuntimeError("synthetic start acknowledgement lost")
 
     with pytest.raises(OperationStartUncertain):

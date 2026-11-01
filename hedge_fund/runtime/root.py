@@ -472,6 +472,33 @@ class RootContext:
         self.revalidate()
         return self.path.joinpath(*destination_parts)
 
+    def rename_directory(
+        self,
+        source: str | os.PathLike[str],
+        destination: str | os.PathLike[str],
+    ) -> Path:
+        source_parts = _relative_parts(source)
+        destination_parts = _relative_parts(destination)
+        if source_parts == destination_parts:
+            raise ValueError("source and destination must differ")
+        self.revalidate()
+        if os.name == "nt":
+            _windows_rename_relative(
+                self._handles[-1],
+                source_parts,
+                destination_parts,
+                directory=True,
+            )
+        else:
+            _posix_rename_relative(
+                self._fd,
+                source_parts,
+                destination_parts,
+                directory=True,
+            )
+        self.revalidate()
+        return self.path.joinpath(*destination_parts)
+
     def mkdir(
         self,
         relative: str | os.PathLike[str],
@@ -600,6 +627,8 @@ def _posix_rename_relative(
     root_fd: int,
     source_parts: tuple[str, ...],
     destination_parts: tuple[str, ...],
+    *,
+    directory: bool = False,
 ) -> None:
     source_parent = _posix_parent_fd(root_fd, source_parts[:-1])
     destination_parent = None
@@ -610,8 +639,9 @@ def _posix_rename_relative(
             dir_fd=source_parent,
             follow_symlinks=False,
         )
-        if not stat.S_ISREG(info.st_mode):
-            raise RootPathError("root rename requires a regular file")
+        expected = stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode)
+        if not expected:
+            raise RootPathError("root rename source has the wrong type")
         if not sys.platform.startswith("linux"):
             raise UnsupportedFilesystemError("atomic no-replace rename is unsupported")
         libc = ctypes.CDLL(None, use_errno=True)
@@ -1412,6 +1442,8 @@ def _windows_rename_relative(
     root_handle: int,
     source_parts: tuple[str, ...],
     destination_parts: tuple[str, ...],
+    *,
+    directory: bool = False,
 ) -> None:
     source_parent = root_handle
     source_owned = None
@@ -1430,11 +1462,11 @@ def _windows_rename_relative(
         handle = _nt_open_child(
             source_parent,
             source_parts[-1],
-            directory=False,
+            directory=directory,
             access=0x00010000 | 0x00000080 | 0x00100000,
             share_delete=True,
         )
-        _validate_windows_handle(handle, directory=False)
+        _validate_windows_handle(handle, directory=directory)
         _windows_rename_handle(
             handle,
             destination_parent,

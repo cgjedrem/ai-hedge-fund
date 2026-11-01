@@ -371,6 +371,7 @@ class OperationStore:
         now: datetime,
         start_worker: Callable[[OperationRecord], object] | None = None,
         current_state_resolver: Callable[[], tuple[str | None, tuple[str, ...]]] | None = None,
+        admission_held: bool = False,
     ) -> OperationRecord:
         self._require_private_storage()
         request_id = _validate_request_id(request_id)
@@ -386,6 +387,8 @@ class OperationStore:
             raise OperationError("worker launcher is invalid")
         if current_state_resolver is not None and not callable(current_state_resolver):
             raise OperationError("current state resolver is invalid")
+        if type(admission_held) is not bool:
+            raise OperationError("admission state is invalid")
         due_set = _validate_due_set(due_set)
         _validate_datetime(now)
         if expected_head is not None and not _safe_text(expected_head, maximum=512):
@@ -422,17 +425,25 @@ class OperationStore:
                 self._verify_capture_sidecar(index["previews"][stored["preview_id"]])
                 return self._operation_from_index(index, existing.get("operation_id"))
 
-        lane = (
-            self._admission.manual_session(
-                subject_id,
-                timeout=_MAX_LOCK_WAIT_SECONDS,
+        if admission_held:
+            required = self._admission.lane_is_held("deployment", subject_id) and (not action.startswith("paper-") or (self._admission.lane_is_held("runner", subject_id) and self._admission.lane_is_held("execution", subject_id)))
+            if not required:
+                raise OperationError("required admission lanes are not held")
+            from contextlib import nullcontext
+
+            lane = nullcontext()
+        else:
+            lane = (
+                self._admission.manual_session(
+                    subject_id,
+                    timeout=_MAX_LOCK_WAIT_SECONDS,
+                )
+                if action.startswith("paper-")
+                else self._admission.deployment_lock(
+                    subject_id,
+                    timeout=_MAX_LOCK_WAIT_SECONDS,
+                )
             )
-            if action.startswith("paper-")
-            else self._admission.deployment_lock(
-                subject_id,
-                timeout=_MAX_LOCK_WAIT_SECONDS,
-            )
-        )
         with lane:
             resolved_state = None
             if current_state_resolver is not None:
@@ -575,6 +586,34 @@ class OperationStore:
                 self._verify_operation_capture(index, operation)
                 result.append(self._operation_from_index(index, operation["operation_id"]))
             return tuple(result)
+
+    def active_for_subject(self, subject_id: str) -> tuple[OperationRecord, ...]:
+        """Return every unfinished operation for one exact resource."""
+        self._require_private_storage()
+        subject_id = _validate_subject(subject_id)
+        active = {
+            OperationStatus.ACCEPTED,
+            OperationStatus.RUNNING,
+            OperationStatus.CANCEL_REQUESTED,
+            OperationStatus.INTERRUPTED,
+        }
+        with self._read_snapshot() as index:
+            selected = [operation for operation in index["operations"].values() if operation.get("subject_id") == subject_id and operation.get("status") in {status.value for status in active}]
+            selected.sort(key=lambda operation: (operation["created_at"], operation["operation_id"]))
+            for operation in selected:
+                self._verify_operation_sidecars(operation)
+                self._verify_operation_capture(index, operation)
+            return tuple(self._operation_from_index(index, operation["operation_id"]) for operation in selected)
+
+    def interrupted_lifecycle_archives(self) -> tuple[OperationRecord, ...]:
+        """Read the complete durable set, not a truncated recent-operation page."""
+        self._require_private_storage()
+        with self._read_snapshot() as index:
+            selected = [operation for operation in index["operations"].values() if operation.get("action") == "lifecycle-archive" and operation.get("status") == OperationStatus.INTERRUPTED.value]
+            for operation in selected:
+                self._verify_operation_sidecars(operation)
+                self._verify_operation_capture(index, operation)
+            return tuple(self._operation_from_index(index, operation["operation_id"]) for operation in selected)
 
     def _read_verified_operation(
         self,
@@ -932,12 +971,14 @@ class OperationStore:
                 OperationStatus.RUNNING.value,
                 OperationStatus.CANCEL_REQUESTED.value,
             }:
+                # Synchronous launchers can advance the worker after accept's timestamp.
+                interrupted_at = max(now, _parse_datetime(operation["updated_at"]))
                 operation["fence_generation"] += 1
                 operation["worker_id_hash"] = None
                 operation["worker_fence_hash"] = None
                 operation["status"] = OperationStatus.INTERRUPTED.value
-                operation["updated_at"] = _datetime_text(now)
-                self._append_event(operation, OperationStatus.INTERRUPTED, now)
+                operation["updated_at"] = _datetime_text(interrupted_at)
+                self._append_event(operation, OperationStatus.INTERRUPTED, interrupted_at)
                 self._persist_transition(index, operation)
 
     @contextmanager

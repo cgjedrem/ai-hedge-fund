@@ -38,6 +38,13 @@ Usage::
         Grade every analyst (hit rate, slugging, IC) and every strategy
         (P&L between executions) on the fund's ledger. JSON on stdout.
 
+    aihf --root ROOT lifecycle preview --action archive --kind template --identity alpha
+    aihf --root ROOT lifecycle archive template alpha --expected-head SHA256 --request-id ID
+    aihf --root ROOT lifecycle restore|recover ARCHIVE_ID --expected-head SHA256 --request-id ID
+    aihf --root ROOT lifecycle list|inspect [ARCHIVE_ID]
+        Offline, separately scoped reversible archive and explicit journal recovery.
+        Preview the exact identity and references first; mutation requires its head.
+
 A mandate is the desk — strategies, staff, risk, capital, cadence — and
 never names tickers; the universe is fixed when a fund is deployed (paper)
 or given per study (backtest).
@@ -116,6 +123,11 @@ def main(argv: list[str] | None = None) -> None:
 
     try:
         with paths.bound_root(context):
+            if args.command == "lifecycle":
+                if args.load_dotenv or args.model or args.enable_network:
+                    parser.error("offline lifecycle does not accept dotenv, model, or network settings")
+                _lifecycle(args, parser, context)
+                return
             if args.command == "handover":
                 if args.load_dotenv or args.model or args.enable_network:
                     parser.error("offline handover does not accept dotenv or model settings")
@@ -395,6 +407,28 @@ def _parser() -> argparse.ArgumentParser:
         required=True,
         help="exact statement printed by `aihf --root ROOT handover inspect`",
     )
+    lifecycle = commands.add_parser("lifecycle", help="review and reversibly archive exact objects offline")
+    lifecycle_actions = lifecycle.add_subparsers(dest="lifecycle_action", required=True)
+    lifecycle_actions.add_parser("list", help="list archive journal identities")
+    inspection = lifecycle_actions.add_parser("inspect", help="inspect an exact archive journal")
+    inspection.add_argument("archive_id")
+    preview = lifecycle_actions.add_parser("preview", help="review an exact lifecycle transition")
+    preview.add_argument("--action", choices=("archive", "restore", "recover"), required=True)
+    preview.add_argument("--kind", choices=("template", "deployment", "research"))
+    preview.add_argument("--identity")
+    preview.add_argument("--archive-id")
+    archival = lifecycle_actions.add_parser("archive", help="archive one reviewed object; never permanently delete")
+    archival.add_argument("kind", choices=("template", "deployment", "research"))
+    archival.add_argument("identity")
+    for action, command in (
+        ("archive", archival),
+        ("restore", lifecycle_actions.add_parser("restore", help="restore one reviewed archive without starting work")),
+        ("recover", lifecycle_actions.add_parser("recover", help="explicitly reconcile a reviewed interrupted archive journal")),
+    ):
+        if action != "archive":
+            command.add_argument("archive_id")
+        command.add_argument("--expected-head", required=True, help="exact expected_head from lifecycle preview")
+        command.add_argument("--request-id", required=True, help="durable invocation identity")
     return parser
 
 
@@ -428,6 +462,70 @@ def _fund_dir(name: str, parser: argparse.ArgumentParser) -> Path:
     if not directory.is_dir():
         parser.error(f"no paper fund named {name!r} under {PAPER_DIR} (see `aihf --root <root> paper list`)")
     return directory
+
+
+def _lifecycle(args, parser: argparse.ArgumentParser, root: RootContext) -> None:
+    from hedge_fund.runtime.admission import AdmissionError
+    from hedge_fund.runtime.operations import OperationError
+    from hedge_fund.web.schemas import LifecycleAcceptRequest, LifecyclePreviewRequest
+    from hedge_fund.web.services import DeskService, ServiceError
+
+    action = args.action if args.lifecycle_action == "preview" else args.lifecycle_action
+    service = DeskService(root.path, root_context=root, allow_writes=action not in {"list", "inspect"})
+    session = f"headless-lifecycle-{hashlib.sha256(str(root.path).encode('utf-8')).hexdigest()}"
+    try:
+        if action == "list":
+            result = service.list_lifecycle_archives()
+        elif action == "inspect":
+            result = service.get_lifecycle_archive(args.archive_id)
+        else:
+            request = LifecyclePreviewRequest(
+                action=action,
+                kind=getattr(args, "kind", None),
+                identity=getattr(args, "identity", None),
+                archive_id=getattr(args, "archive_id", None),
+            )
+            if args.lifecycle_action != "preview":
+                # The root-owned headless caller may observe an existing result, but never
+                # starts a second transition for the same invocation identity.
+                if service._operation_store is None:
+                    raise ServiceError(409, "Durable operation storage is unavailable.")
+                existing = service._operation_store.get_by_request(args.request_id)
+                if existing is not None:
+                    stored = existing.public_view()["payload"]
+                    matching = existing.action == f"lifecycle-{action}" and stored.get("action") == action and service._lifecycle_head(stored) == args.expected_head and ((action == "archive" and stored.get("kind") == request.kind and stored.get("identity") == request.identity) or (action != "archive" and stored.get("archive_id") == request.archive_id))
+                    if not matching:
+                        raise ServiceError(409, "Lifecycle invocation conflicts with durable state.")
+                    print(json.dumps(service.get_operation(existing.operation_id), sort_keys=True))
+                    return
+            preview = service.create_lifecycle_preview(
+                request,
+                operator_session=session,
+                offline_recovery=action == "recover",
+            )
+            if args.lifecycle_action == "preview":
+                result = preview
+            else:
+                if preview["expected_head"] != args.expected_head:
+                    raise ServiceError(409, "Lifecycle head or references changed; preview again.")
+                acceptance = LifecycleAcceptRequest(
+                    **request.model_dump(),
+                    request_id=args.request_id,
+                    preview_id=preview["preview_id"],
+                    preview_digest=preview["preview_digest"],
+                    confirmation_token=preview["confirmation_token"],
+                    expected_head=args.expected_head,
+                )
+                result = service.accept_lifecycle(
+                    acceptance,
+                    operator_session=session,
+                    offline_recovery=action == "recover",
+                )
+        print(json.dumps(result, sort_keys=True))
+    except (ServiceError, AdmissionError, OperationError, RootPathError, ValueError) as exc:
+        parser.error(f"offline lifecycle denied ({type(exc).__name__}): {exc}")
+    finally:
+        service.close()
 
 
 def _handover(args, parser: argparse.ArgumentParser, root: RootContext) -> None:
@@ -518,8 +616,7 @@ def _paper_writer_admission() -> Iterator[tuple[RootContext, object] | None]:
     root = paths.root_context()
     status = enrollment_status(root, verify_inventory=True)
     if status["state"] == "unenrolled":
-        yield None
-        return
+        raise PaperWriterDenied("Paper writes are blocked until explicit offline enrollment.")
     if status["state"] != "enrolled":
         raise PaperWriterDenied("Paper writes are blocked by root enrollment or ledger drift.")
 

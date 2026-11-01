@@ -3,6 +3,8 @@ import { useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 
 import { DataTable, type TableColumn } from "@/components/data-table";
+import { ArchivePanel } from "@/components/archive-panel";
+import { LifecycleActions } from "@/components/lifecycle-actions";
 import { ErrorState, PageHeader, SectionTitle } from "@/components/page";
 import { Alert } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
@@ -93,6 +95,7 @@ export function MandatesPage() {
           </Card>
         </div>
       ) : null}
+      <ArchivePanel kind="template" onChange={resource.refresh} />
     </>
   );
 }
@@ -163,6 +166,7 @@ export function MandateDetailPage() {
             <Button onClick={() => { setError(null); setDialogOpen(true); }} disabled={!canWrite}>
               Deploy to paper
             </Button>
+            <LifecycleActions kind="template" identity={name} onComplete={() => navigate("/mandates")} />
           </>
         }
       />

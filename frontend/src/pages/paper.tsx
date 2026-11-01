@@ -10,9 +10,11 @@ import {
   ShieldCheck,
 } from "lucide-react";
 import { useEffect, useRef, useState, type FormEvent } from "react";
-import { Link, useParams } from "react-router-dom";
+import { Link, useNavigate, useParams } from "react-router-dom";
 
 import { ConfirmDialog } from "@/components/confirm-dialog";
+import { ArchivePanel } from "@/components/archive-panel";
+import { LifecycleActions } from "@/components/lifecycle-actions";
 import { DataTable, type TableColumn } from "@/components/data-table";
 import { EquityChart } from "@/components/equity-chart";
 import { MetricCard } from "@/components/metric-card";
@@ -129,6 +131,7 @@ export function PaperPage() {
           </Card>
         </div>
       ) : null}
+      <ArchivePanel kind="deployment" onChange={resource.refresh} />
     </>
   );
 }
@@ -137,6 +140,7 @@ type PendingAction = "approve" | "reject" | "resume";
 
 export function PaperDetailPage() {
   const { name = "" } = useParams();
+  const navigate = useNavigate();
   const { capabilities } = useDesk();
   const resource = useResource<PaperSnapshot>(name ? `/api/paper/${encodeURIComponent(name)}` : null);
   const [sessionSearchText, setSessionSearchText] = useState("");
@@ -439,6 +443,7 @@ export function PaperDetailPage() {
           <>
             <Button asChild variant="secondary"><Link to="/paper"><ArrowLeft className="h-3.5 w-3.5" /> All paper funds</Link></Button>
             <Button asChild variant="outline"><Link to={`/paper/${encodeURIComponent(name)}/scorecard`}>Scorecard <ArrowRight className="h-3.5 w-3.5" /></Link></Button>
+            <LifecycleActions kind="deployment" identity={name} onComplete={() => navigate("/paper")} />
           </>
         }
       />
