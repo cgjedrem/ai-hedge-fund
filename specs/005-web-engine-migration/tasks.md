@@ -10,17 +10,22 @@ description: "Executable, mandatory-test work plan for complete web-only engine 
 `docs\governance\web-migration-contract.md`.
 **Prerequisite gate:** [exact Git/API receipt](tasks-gate-2026-10-31.md): clean/pushed
 spec and plan at `193d16dc754567710c8dd5703e4f427184c9079f`, open main-targeting PR #8.
-**Current state:** user-directed implementation authorized. **17/148 tasks complete:**
-T001–T014 and T016–T018. T009–T011 include completed test-design/red phases. T018 passes
+**Current state:** user-directed implementation authorized. **18/148 tasks complete:**
+T001–T014, T016–T018 and T137. T009–T011 include completed test-design/red phases. T018 passes
 its implementation/test criteria on synthetic Windows/NTFS, including reviewed local-paper
 ticks and bounded owned-runner controls. T015 and T021 remain partial: operator attestation
 does not fence unaware writers, stale-reservation recovery is absent, and `fund/storage.py`
 plus `backtesting/research.py` are not integrated. T019–T020 and T022–T136 remain open.
-T139, T141 and T146 have bounded partial evidence but remain unchecked; the remaining
-convergence tasks T137–T148 are not complete.
+T137's scoped implementation criteria pass at commit
+`4177741ee06a1daddf4751eb441f0924c4f7407a`; exact source/diff identity and fake-only
+evidence are in `implementation-evidence.md`. No live provider call, installed T137
+artifact or full-migration acceptance is claimed. Only one verified paid provider can be
+authorized per operation; combined paid Financial Datasets plus TypeSafe is unsupported.
+T139, T141 and T146 have bounded partial evidence but remain unchecked; convergence tasks
+T138–T148 remain open.
 T006/T007/T012/T014/T016/T017 do not establish Linux/ext4, actual NTFS ACL or live-runtime
 acceptance. T003's isolated production build/browser harness passed; T004–T005 inventories
-are complete. Credential material/version retention, complete writer/provider integration,
+are complete. Credential material/version retention, complete direct-writer integration,
 Linux/ext4 and legacy TUI dotenv cleanup remain future work. No merge is authorized.
 Runtime work remains subject to the isolation and evidence gates below.
 
@@ -545,7 +550,7 @@ tasks supplement, not rewrite or renumber, T001–T136. Passing a unit/fake test
 close native, paid-provider, package, browser, or platform evidence. Never retire Textual
 while a required acceptance row remains blocked or inconclusive.
 
-- [ ] T137 Enforce per-transport-call authorization, expiry, Halt/fence checks, resource bounds and worst-case cost reservations beneath real LLM/data factories for CLI, manual, backtest and runner paths; remove hidden paid defaults and automatic paid retries, and validate approved destinations with DNS-rebinding-resistant address pinning. Paid one-shot/backtest calls require finite operator authorization; paid/cloud loops remain prohibited. Add fake transports below production guards; never make paid/network acceptance calls.
+- [X] T137 Enforce per-transport-call authorization, expiry, Halt/fence checks, resource bounds and worst-case cost reservations beneath real LLM/data factories for CLI, manual, backtest and runner paths; remove hidden paid defaults and automatic paid retries, and validate approved destinations with DNS-rebinding-resistant address pinning. Paid one-shot/backtest calls require finite operator authorization; paid/cloud loops remain prohibited. Add fake transports below production guards; never make paid/network acceptance calls.
 - [ ] T138 Integrate `RootContext`, shared admission and controlled handover with `fund/storage.py`, `backtesting/research.py` and every supported direct writer; guard or deny each writer, preserve independent-fund lanes and document that legacy/out-of-band binaries remain unfenced unless excluded.
 - [ ] T139 Deny every web SIM execution, control, approval, redo and lifecycle action before effects. Preserve only explicitly provisioned, headless SIM under fake exclusive account binding; provisioning grants no execution authority.
 - [ ] T140 Implement head-bound durable reconciliation receipts for ambiguous post-fill outcomes, including identity/head, broker book/fills, evidence, capture, operator decision, time, expiry and single-use semantics. Resume requires verified replay plus reconciliation; expose latest-session redo only after quiescence. Keep emergency Halt on a bounded control lane that never waits for a long LLM lock.

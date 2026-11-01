@@ -111,3 +111,11 @@ if ($installExit -ne 0) { throw 'Local wheel install failed.' }
 ## Next stop
 
 Keep PR #8 open and explicitly marked partial/not merge-ready. Do not merge. Before any existing-root deployment or TUI-removal proposal, complete T015/T021, remaining T137–T148, native Linux/ext4 and actual ACL acceptance, and full-suite completion. Use a new discriminating review plan if those gates remain stalled.
+
+## Implementation-owner addendum — T137 (2026-11-01)
+
+The disposition and closure table above describe the earlier candidate revision `5c7e2a902d85aaf5ce18963aa3e5e7de6b734514`. After that snapshot, the scoped T137 implementation was committed as `4177741ee06a1daddf4751eb441f0924c4f7407a`. This addendum is not an independent QA review and does not change overall readiness.
+
+T137 now has operation-bound paid authorization at supported synchronous production HTTP boundaries, per-attempt reservations, target/destination/fence/deadline checks, explicit CLI/web consent, and scheduled paid/cloud denial. Fake-transport regressions cover the supported Financial Datasets self-service and TypeSafe Jev `1.13.0` paths, plus denial and free/local wiring; only one paid provider may be used per operation. Other paid/cloud modes, combined paid FD+TypeSafe, async dispatch and unattended paid retries remain fail-closed. Exact implementation and test evidence is in [`implementation-evidence.md`](implementation-evidence.md).
+
+This source-run/fake-test result does not provide live-provider evidence, an installed T137 artifact, full Python-suite completion, Linux/ext4 or actual ACL evidence. T015/T021 and the remaining T138–T148 work stay open/partial. Overall status remains **PARTIAL — NOT READY TO MERGE**; keep PR #8 open and do not merge.

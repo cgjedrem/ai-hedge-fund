@@ -65,3 +65,13 @@
 - T015/T021 remain partial. T137/T138/T140/T142–T145/T147/T148 remain open; T139/T141/T146 have bounded partial evidence but stay unchecked. Full migration and TUI retirement remain blocked.
 
 See `qa-final-disposition.md` for readiness, open stop conditions and safe preview instructions.
+
+## Implementation-owner addendum — T137 (2026-11-01)
+
+The rows above are a historical evidence snapshot for code revision `5c7e2a902d85aaf5ce18963aa3e5e7de6b734514`; they do not include the later T137 implementation. Scoped T137 work is now committed as `4177741ee06a1daddf4751eb441f0924c4f7407a` on `cgjedrem-vigilant-robot`. The implementation commit is bound to the exact binary-diff, committed-tree and tested-worktree identities in [`implementation-evidence.md`](implementation-evidence.md). This addendum is implementation-owner evidence, not independent QA.
+
+Provider dispatch now requires explicit operation-bound paid authorization, bounded budget and deadline; production HTTP transport reserves each paid attempt and enforces target, destination, DNS pinning and fence checks. Supported paid one-shot paths are limited to Financial Datasets self-service data and TypeSafe Jev `1.13.0`, one paid provider per operation. Other paid/cloud modes, combined FD+TypeSafe, async dispatch and scheduled paid work fail closed. Environment credentials alone do not authorize spending. CLI/web integrations and denial-before-effects, retry/pagination charging, model-target binding, scheduled denial and credential isolation are covered by fake-transport tests.
+
+On the isolated Python 3.13.7 Windows environment, the final provider/data/cost/dispatch/capture/LLM/signal/fund slice passed **491 tests**, CLI/tick/runner/child passed **104**, web operation/settings/action/app/valuation passed **119**, and the final LLM client module passed **149**. An additional real-yfinance-wrapper failure-path test passed **1** using a monkeypatched transport method; no provider endpoint was contacted. Exact commands, timestamps, environment, code-vs-fake limits and static results are recorded in `implementation-evidence.md`.
+
+No live provider/broker request, installed T137 wheel, full-suite pass, Linux/ext4 or actual ACL acceptance is claimed. The older `aihf-2.6.1` wheel and loopback smoke above predate commit `4177741`; they are not T137 runtime evidence. Overall disposition remains **PARTIAL / NOT READY TO MERGE**. T015/T021 and the remaining T138–T148 obligations, full-suite completion and native platform gates remain incomplete.
