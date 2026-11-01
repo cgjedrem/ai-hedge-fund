@@ -9,6 +9,7 @@ import threading
 import unicodedata
 from contextlib import contextmanager
 from datetime import date, timedelta
+from decimal import Decimal
 from ipaddress import ip_address
 from pathlib import Path
 from typing import Callable, Iterator
@@ -18,6 +19,7 @@ from uuid import uuid4
 from hedge_fund.backtesting.fund import backtest_fund, FundBacktestResult
 from hedge_fund.backtesting.research import save_result
 from hedge_fund.data import CachedDataClient, make_data_client, PriceSnapshot
+from hedge_fund.data.sessions import NEW_YORK
 from hedge_fund.fund import (
     custom_strategy,
     Fund,
@@ -44,7 +46,7 @@ from hedge_fund.paper.deployed import (
     validate_fund_name,
 )
 from hedge_fund.paper.ledger import Ledger, LedgerError
-from hedge_fund.paper.tick import following_session
+from hedge_fund.paper.tick import following_session, next_session, tick
 from hedge_fund.pipeline.session import code_version, mandate_hash, SessionRecord
 from hedge_fund.runtime.admission import (
     AdmissionCoordinator,
@@ -65,6 +67,12 @@ from hedge_fund.runtime.credentials import (
     CredentialStoreError,
     CredentialVersionConflict,
 )
+from hedge_fund.runtime.handover import (
+    enrollment_status,
+    HandoverError,
+    record_ledger_head,
+    verify_root_inventory,
+)
 from hedge_fund.runtime.operations import (
     ConfirmationExpired,
     ConfirmationRejected,
@@ -75,6 +83,15 @@ from hedge_fund.runtime.operations import (
     OperationStatus,
     OperationStore,
     StalePreview,
+)
+from hedge_fund.runtime.owned_runner import OwnedRunnerError, OwnedRunnerManager
+from hedge_fund.runtime.policy import (
+    AuthorizationDenied,
+    authorize_dispatch,
+    classify_provider,
+    OperationScope,
+    ProviderClass,
+    ProviderTarget,
 )
 from hedge_fund.runtime.root import RootContext, RootPathError
 from hedge_fund.scorecard import score
@@ -88,6 +105,10 @@ from hedge_fund.web.schemas import (
     OperationAcceptRequest,
     OperationCancelRequest,
     OperationPreviewRequest,
+    PaperTickAcceptRequest,
+    PaperTickPreviewRequest,
+    RunnerPreviewRequest,
+    RunnerStartAcceptRequest,
     RuntimeSettingsRequest,
     ValuationRefreshRequest,
 )
@@ -122,6 +143,8 @@ class DeskService:
             raise TypeError("write and network capabilities must be booleans")
         if type(demo) is not bool or type(container_observer) is not bool:
             raise TypeError("service mode flags must be booleans")
+        if container_observer:
+            raise ValueError("container observer projection is unavailable")
         if root_context is None:
             root_context = RootContext.open(root)
             self._owns_root_context = True
@@ -134,22 +157,29 @@ class DeskService:
             self._owns_root_context = False
         self.root_context = root_context
         self.root = root_context.path
-        self.container_observer = container_observer
+        self.container_observer = False
+        status = enrollment_status(root_context, verify_inventory=True)
+        self.enrollment_state = status["state"]
         self._owner_lease: RootOwnerLease | None = None
         self._admission = AdmissionCoordinator(root_context)
         self.allow_writes = False
-        self.write_unavailable_reason: str | None = None
-        if allow_writes and not container_observer:
+        self.emergency_halt_available = False
+        self.write_unavailable_reason: str | None = status["reason"]
+        if not allow_writes and status["state"] == "enrolled":
+            self.write_unavailable_reason = "write-capability-disabled"
+        if allow_writes and status["state"] in {"enrolled", "drift"}:
+            owner = None
             try:
-                root_context.prepare_private_storage()
                 owner = RootOwnerLease.acquire(root_context)
+                admission = AdmissionCoordinator(root_context, owner_lease=owner)
                 self._owner_lease = owner
-                self._admission = AdmissionCoordinator(root_context, owner_lease=owner)
-                self.allow_writes = True
+                self._admission = admission
+                self.allow_writes = status["state"] == "enrolled"
+                self.emergency_halt_available = status["state"] == "drift"
             except (AdmissionError, OSError, RootPathError, ValueError):
+                if owner is not None:
+                    owner.close()
                 self.write_unavailable_reason = "private-storage-unverified" if not root_context.verify_private_storage() else "root-owner-unavailable"
-        elif container_observer:
-            self.write_unavailable_reason = "container-observer"
         self.network_enabled = bool(network_enabled and self.allow_writes and not container_observer)
         self.demo = bool(demo)
         self._data_client_factory = data_client_factory
@@ -167,6 +197,7 @@ class DeskService:
         self._credential_store: CredentialStore | None = None
         self._operation_store: OperationStore | None = None
         self._operation_jobs: OperationJobRegistry | None = None
+        self._paper_operation_jobs: OperationJobRegistry | None = None
         self._captures: dict[str, FrozenCapture] = {}
         self._preview_captures: dict[str, str] = {}
         try:
@@ -193,12 +224,18 @@ class DeskService:
                         self._operation_store,
                         max_active=1,
                     )
+                    paper_operation_jobs = OperationJobRegistry(
+                        self._operation_store,
+                        max_active=2,
+                    )
                     try:
                         operation_jobs.recover_unfinished()
                     except Exception:
                         operation_jobs.close()
+                        paper_operation_jobs.close()
                         raise
                     self._operation_jobs = operation_jobs
+                    self._paper_operation_jobs = paper_operation_jobs
             except (AdmissionError, JobConflict, OperationError, OSError, ValueError):
                 self._operation_store = None
                 if self.allow_writes:
@@ -209,19 +246,24 @@ class DeskService:
                         self._owner_lease.close()
                         self._owner_lease = None
                     self._admission = AdmissionCoordinator(root_context)
+        self._runner_manager = OwnedRunnerManager(root_context, self._admission)
 
     def close(self) -> None:
         try:
-            if self._operation_jobs is not None:
-                self._operation_jobs.close()
+            if self._paper_operation_jobs is not None:
+                self._paper_operation_jobs.close()
         finally:
             try:
-                if self._owner_lease is not None:
-                    self._owner_lease.close()
-                    self._owner_lease = None
+                if self._operation_jobs is not None:
+                    self._operation_jobs.close()
             finally:
-                if self._owns_root_context:
-                    self.root_context.close()
+                try:
+                    if self._owner_lease is not None:
+                        self._owner_lease.close()
+                        self._owner_lease = None
+                finally:
+                    if self._owns_root_context:
+                        self.root_context.close()
 
     def capabilities(self, mutation_token: str | None) -> dict:
         return {
@@ -232,12 +274,13 @@ class DeskService:
             "local_operator_only": True,
             "csrf_authenticates_users": False,
             "container_observer": self.container_observer,
+            "enrollment_state": self.enrollment_state,
             "write_unavailable_reason": self.write_unavailable_reason,
             "protected_names": list(PROTECTED_NAMES),
-            "mutation_token": mutation_token if self.allow_writes else None,
+            "mutation_token": mutation_token if self.allow_writes or self.emergency_halt_available else None,
             "deferred_actions": {
-                "runner": "Runner ownership is not verified by the web process; start and stop controls are disabled.",
-                "manual_run": "Manual execution is disabled; the web process does not own the fund runner.",
+                "runner": ("Finite local-paper runner start and stop require an explicit reviewed operation." if self.allow_writes else "Runner controls are unavailable because root writes are disabled."),
+                "manual_run": ("One-session local-paper ticks require a reviewed head and due-set confirmation." if self.allow_writes and self.network_enabled else "Manual ticks are unavailable because writes or network capability are disabled."),
                 "delete": "Fund and report deletion is not available.",
                 "redo": "Ledger redo is not available from the web UI.",
                 "live_value": ("Explicit free-Yahoo refresh is available; quote print freshness remains unverified." if self.network_enabled else "Valuation refresh is disabled because network capability is off."),
@@ -348,18 +391,31 @@ class DeskService:
         except ValueError:
             raise ServiceError(422, "Deployment universe is invalid.") from None
         with self._fund_lock(normalized):
-            spec = self._load_mandate_by_name(normalized)
-            _reject_secret_fields(spec.model_dump(mode="python"))
-            paper_root = self._ensure_dir("paper")
-            self._assert_unique(paper_root, normalized)
-            try:
-                directory = deploy(normalized, spec, universe, root=paper_root)
-            except FileExistsError:
-                raise ServiceError(409, "A paper fund with this name already exists.") from None
-            except ValueError as exc:
-                raise ServiceError(422, f"Deployment validation failed ({type(exc).__name__}).") from None
-            except OSError as exc:
-                raise ServiceError(409, f"Deployment could not be written ({type(exc).__name__}).") from None
+            with self._paper_deployment_lane(normalized):
+                self._verify_root_inventory()
+                spec = self._load_mandate_by_name(normalized)
+                _reject_secret_fields(spec.model_dump(mode="python"))
+                paper_root = self._ensure_dir("paper")
+                self._assert_unique(paper_root, normalized)
+                try:
+                    directory = deploy(normalized, spec, universe, root=paper_root)
+                except FileExistsError:
+                    raise ServiceError(409, "A paper fund with this name already exists.") from None
+                except ValueError as exc:
+                    raise ServiceError(422, f"Deployment validation failed ({type(exc).__name__}).") from None
+                except OSError as exc:
+                    raise ServiceError(409, f"Deployment could not be written ({type(exc).__name__}).") from None
+                try:
+                    record_ledger_head(
+                        self.root_context,
+                        normalized,
+                        admission=self._admission,
+                    )
+                except HandoverError:
+                    raise ServiceError(
+                        409,
+                        "Deployment was written; root head inventory requires offline review.",
+                    ) from None
         return {"name": normalized, "universe": universe, "path": directory.name, "status": "deployed"}
 
     def list_paper(self) -> dict:
@@ -392,7 +448,7 @@ class DeskService:
                         "ledger_ok": snapshot["ledger"]["ok"],
                         "halted": snapshot.get("halted"),
                         "halt_state": snapshot["halt_state"],
-                        "runner": self._runner_state(),
+                        "runner": self._runner_state(deployed.name),
                     }
                 )
                 if not snapshot["ledger"]["ok"]:
@@ -413,6 +469,631 @@ class DeskService:
         except ValueError as exc:
             raise ServiceError(422, f"Paper fund is invalid ({type(exc).__name__}).") from None
         return self._paper_snapshot(deployed, directory, include_records=True)
+
+    def create_manual_tick_preview(
+        self,
+        name: str,
+        request: PaperTickPreviewRequest,
+        *,
+        operator_session: str | None,
+    ) -> dict:
+        if not isinstance(request, PaperTickPreviewRequest):
+            raise ServiceError(422, "Paper tick preview is invalid.")
+        return self._create_local_paper_preview(
+            name,
+            expected_head=request.expected_head,
+            action="paper-tick",
+            operator_session=operator_session,
+            require_due=True,
+            payload_builder=lambda head, due, _spec, _calls, _universe_size: {
+                "kind": "manual-tick",
+                "session": due[0],
+                "expected_head": head,
+            },
+        )
+
+    def create_runner_preview(
+        self,
+        name: str,
+        request: RunnerPreviewRequest,
+        *,
+        operator_session: str | None,
+    ) -> dict:
+        if not isinstance(request, RunnerPreviewRequest):
+            raise ServiceError(422, "Runner preview is invalid.")
+
+        def payload(head, due, spec, model_calls, universe_size):
+            max_calls, max_resources = _runner_limits(
+                spec,
+                universe_size=universe_size,
+                max_sessions=request.max_sessions,
+                max_runtime_minutes=request.max_runtime_minutes,
+            )
+            return {
+                "kind": "runner-start",
+                "expected_head": head,
+                "initial_due_set": list(due),
+                "max_sessions": request.max_sessions,
+                "max_runtime_minutes": request.max_runtime_minutes,
+                "max_calls": max_calls,
+                "max_resources": max_resources,
+                "maximum_model_calls_per_session": model_calls,
+            }
+
+        return self._create_local_paper_preview(
+            name,
+            expected_head=request.expected_head,
+            action="paper-runner-start",
+            operator_session=operator_session,
+            require_due=False,
+            payload_builder=payload,
+        )
+
+    def runner_status(self, name: str) -> dict:
+        normalized = self._validated_name(name)
+        return self._runner_state(normalized)
+
+    def stop_runner(self, name: str) -> dict:
+        self._require_writes()
+        normalized = self._validated_name(name)
+        self._guard_protected(normalized)
+        with self._fund_lock(normalized):
+            with self._paper_control_lane(normalized):
+                try:
+                    return self._runner_manager.request_stop(normalized)
+                except OwnedRunnerError:
+                    raise ServiceError(409, "Owned runner identity is unavailable; no process was signalled.") from None
+
+    def _create_local_paper_preview(
+        self,
+        name: str,
+        *,
+        expected_head: str | None,
+        action: str,
+        operator_session: str | None,
+        require_due: bool,
+        payload_builder: Callable[
+            [str | None, tuple[str, ...], FundSpec, int, int],
+            dict[str, object],
+        ],
+    ) -> dict:
+        self._require_writes()
+        if not operator_session:
+            raise ServiceError(403, "A server-owned operator session is required.")
+        if not self.network_enabled:
+            raise ServiceError(403, "Network capability is disabled for this server.")
+        if self._operation_store is None:
+            raise ServiceError(409, "Durable operation storage is unavailable.")
+        normalized = self._validated_name(name)
+        self._guard_protected(normalized)
+        with self._fund_lock(normalized):
+            with self._paper_manual_lane(normalized):
+                self._verify_root_inventory()
+                directory, deployed, _ledger, state, latest = self._paper_state(normalized)
+                if deployed.broker != "paper":
+                    raise ServiceError(403, "Paper operations require a local-paper deployment.")
+                current_head = latest.hash if latest is not None else None
+                if expected_head != current_head:
+                    raise ServiceError(409, "Paper ledger changed; reload before previewing.")
+                if state.halted is not None:
+                    raise ServiceError(409, "Halted funds cannot accept a paper operation.")
+                with self._settings_lock:
+                    self._ensure_settings_available()
+                    settings = self._runtime_settings
+                    self._require_local_paper_policy(settings)
+                    model_calls = _estimate_paper_model_calls(
+                        deployed.spec,
+                        len(deployed.universe),
+                    )
+                    if model_calls > 1000:
+                        raise ServiceError(422, "Estimated local model calls exceed the 1000-call bound.")
+                    now = _utcnow()
+                    try:
+                        capture = freeze_capture(
+                            root=self.root_context,
+                            subject_id=normalized,
+                            mandate_digest=mandate_hash(deployed.spec),
+                            universe=tuple(deployed.universe),
+                            broker=deployed.broker,
+                            settings=settings,
+                            credential_versions={},
+                            code_version=code_version(),
+                            mandate_snapshot=deployed.spec.model_dump(mode="json"),
+                        )
+                        self._authorize_manual_capture(
+                            capture,
+                            now=now,
+                            model_calls=model_calls,
+                        )
+                        due = self._next_paper_session(
+                            deployed,
+                            state.last_session,
+                            provider=capture.data_provider,
+                            now=now,
+                        )
+                        due_set = (due,) if due is not None else ()
+                        if require_due and not due_set:
+                            raise ServiceError(409, "No paper session is currently due.")
+                        payload = payload_builder(
+                            current_head,
+                            due_set,
+                            deployed.spec,
+                            model_calls,
+                            len(deployed.universe),
+                        )
+                        preview = self._operation_store.create_preview(
+                            action=action,
+                            subject_id=normalized,
+                            expected_head=current_head,
+                            due_set=due_set,
+                            capture=capture,
+                            operator_session=operator_session,
+                            payload=payload,
+                            now=now,
+                            expires_at=now + timedelta(minutes=10),
+                        )
+                    except ServiceError:
+                        raise
+                    except (AdmissionError, HandoverError, OperationError, OSError, ValueError):
+                        raise ServiceError(409, "Paper operation preview could not be verified or persisted.") from None
+                    self._cache_preview_capture(preview.preview_id, capture)
+                    return {
+                        **preview.public_view(),
+                        "confirmation_token": preview.confirmation_token,
+                        "reviewed_head": current_head,
+                        "due_set": list(due_set),
+                        "capture": capture.public_view(
+                            current_settings_version=settings.version,
+                        ),
+                        "estimate": {
+                            "maximum_model_calls_per_session": model_calls,
+                            "maximum_calls": payload.get("max_calls", 3),
+                            "maximum_resources": payload.get(
+                                "max_resources",
+                                max(1, model_calls),
+                            ),
+                            "maximum_cost_usd": 0.0,
+                            "market_data_provider": capture.data_provider,
+                        },
+                        "warnings": ["Only free market data and the captured local Ollama model are authorized."],
+                    }
+
+    def accept_manual_tick(
+        self,
+        name: str,
+        request: PaperTickAcceptRequest,
+        *,
+        operator_session: str | None,
+    ) -> dict:
+        if not isinstance(request, PaperTickAcceptRequest):
+            raise ServiceError(422, "Paper tick acceptance is invalid.")
+        if len(request.due_set) != 1:
+            raise ServiceError(422, "Manual tick requires exactly one reviewed session.")
+        payload = {
+            "kind": "manual-tick",
+            "session": request.due_set[0],
+            "expected_head": request.expected_head,
+        }
+        return self._accept_local_paper_operation(
+            name,
+            request,
+            action="paper-tick",
+            operator_session=operator_session,
+            payload=payload,
+        )
+
+    def accept_runner_start(
+        self,
+        name: str,
+        request: RunnerStartAcceptRequest,
+        *,
+        operator_session: str | None,
+    ) -> dict:
+        if not isinstance(request, RunnerStartAcceptRequest):
+            raise ServiceError(422, "Runner acceptance is invalid.")
+        normalized = self._validated_name(name)
+        _directory, deployed, _ledger, _state, _latest = self._paper_state(normalized)
+        if deployed.broker != "paper":
+            raise ServiceError(403, "Runner requires a local-paper deployment.")
+        model_calls = _estimate_paper_model_calls(
+            deployed.spec,
+            len(deployed.universe),
+        )
+        max_calls, max_resources = _runner_limits(
+            deployed.spec,
+            universe_size=len(deployed.universe),
+            max_sessions=request.max_sessions,
+            max_runtime_minutes=request.max_runtime_minutes,
+        )
+        payload = {
+            "kind": "runner-start",
+            "expected_head": request.expected_head,
+            "initial_due_set": list(request.due_set),
+            "max_sessions": request.max_sessions,
+            "max_runtime_minutes": request.max_runtime_minutes,
+            "max_calls": max_calls,
+            "max_resources": max_resources,
+            "maximum_model_calls_per_session": model_calls,
+        }
+        return self._accept_local_paper_operation(
+            normalized,
+            request,
+            action="paper-runner-start",
+            operator_session=operator_session,
+            payload=payload,
+        )
+
+    def _accept_local_paper_operation(
+        self,
+        name: str,
+        request: PaperTickAcceptRequest | RunnerStartAcceptRequest,
+        *,
+        action: str,
+        operator_session: str | None,
+        payload: dict[str, object],
+    ) -> dict:
+        self._require_writes()
+        if not operator_session:
+            raise ServiceError(403, "A server-owned operator session is required.")
+        if not self.network_enabled:
+            raise ServiceError(403, "Network capability is disabled for this server.")
+        store = self._operation_store
+        worker = self._paper_operation_jobs
+        if store is None or worker is None:
+            raise ServiceError(409, "Paper operation worker is unavailable.")
+        normalized = self._validated_name(name)
+        self._guard_protected(normalized)
+        capture_id = self._preview_captures.get(request.preview_id)
+        capture = self._captures.get(capture_id or "")
+        if capture is None or capture.subject_id != normalized:
+            raise ServiceError(409, "Paper preview is no longer available; review again.")
+        if request.due_set != payload.get("initial_due_set", request.due_set):
+            raise ServiceError(409, "Reviewed session set changed; review again.")
+        if payload.get("expected_head") != request.expected_head:
+            raise ServiceError(409, "Reviewed ledger head changed; review again.")
+
+        def current_state() -> tuple[str | None, tuple[str, ...]]:
+            return self._resolve_paper_schedule(normalized, capture)
+
+        def start_worker(operation: OperationRecord) -> None:
+            selected_capture = self._captures.get(operation.capture_id)
+            if selected_capture is None or selected_capture.digest != operation.capture_digest:
+                raise OperationError("captured paper inputs are unavailable")
+
+            def work(progress, cancelled, _apply_if_current):
+                if action == "paper-tick":
+                    return self._execute_manual_tick(
+                        operation,
+                        selected_capture,
+                        progress,
+                        cancelled,
+                    )
+                return self._execute_runner_start(
+                    operation,
+                    selected_capture,
+                    progress,
+                    cancelled,
+                )
+
+            worker.submit(operation, work)
+
+        with self._settings_lock:
+            self._ensure_settings_available()
+            if self._runtime_settings.version != capture.settings_version or self._runtime_settings.model != capture.model or self._runtime_settings.data_provider != capture.data_provider or self._runtime_settings.llm_provider != capture.llm_provider:
+                raise ServiceError(409, "Runtime settings changed; review the paper operation again.")
+            self._require_local_paper_policy(self._runtime_settings)
+            try:
+                operation = store.accept_request(
+                    request_id=request.request_id,
+                    action=action,
+                    subject_id=normalized,
+                    preview_id=request.preview_id,
+                    preview_digest=request.preview_digest,
+                    confirmation_token=request.confirmation_token,
+                    operator_session=operator_session,
+                    expected_head=request.expected_head,
+                    due_set=tuple(request.due_set),
+                    payload=payload,
+                    now=_utcnow(),
+                    start_worker=start_worker,
+                    current_state_resolver=current_state,
+                )
+            except ConfirmationExpired:
+                raise ServiceError(410, "Confirmation expired; review the paper operation again.") from None
+            except (ConfirmationRejected, StalePreview):
+                raise ServiceError(409, "Reviewed paper operation is stale or no longer valid.") from None
+            except OperationStartUncertain:
+                raise ServiceError(409, "Paper operation start is uncertain; inspect its durable status.") from None
+            except (AdmissionError, JobConflict, OperationConflict):
+                raise ServiceError(409, "Paper operation conflicts with current runner or execution state.") from None
+            except OperationError:
+                raise ServiceError(409, "Paper operation could not be accepted.") from None
+        return self._operation_view(operation)
+
+    def _execute_manual_tick(
+        self,
+        operation: OperationRecord,
+        capture: FrozenCapture,
+        progress: Callable[[int], None],
+        cancelled: Callable[[], bool],
+    ) -> dict[str, object]:
+        payload = dict(operation.payload)
+        expected = {"kind", "session", "expected_head"}
+        if set(payload) != expected or payload.get("kind") != "manual-tick":
+            raise OperationError("stored paper tick request is invalid")
+        if capture.code_version != code_version() or capture.broker != "paper":
+            raise OperationError("captured paper tick is incompatible")
+        if capture.mandate_snapshot is None:
+            raise OperationError("captured mandate is unavailable")
+        try:
+            spec = FundSpec.model_validate_json(capture.mandate_snapshot)
+        except ValueError:
+            raise OperationError("captured mandate is invalid") from None
+        if spec.name != operation.subject_id or mandate_hash(spec) != capture.mandate_digest or capture.credential_versions or capture.credential_handles:
+            raise OperationError("captured paper inputs changed")
+        session = payload.get("session")
+        if not isinstance(session, str):
+            raise OperationError("stored paper session is invalid")
+        model_calls = _estimate_paper_model_calls(spec, len(capture.universe))
+        if model_calls > 1000:
+            raise AuthorizationDenied("manual model-call bound is invalid")
+        now = _utcnow()
+        self._authorize_manual_capture(capture, now=now, model_calls=model_calls)
+        progress(10)
+        if cancelled():
+            raise JobCancelled()
+
+        directory = self._safe_child("paper", operation.subject_id)
+        try:
+            with self._fund_lock(operation.subject_id):
+                with self._paper_manual_lane(operation.subject_id):
+                    self._verify_root_inventory()
+                    deployed = load_deployed(directory)
+                    if deployed.broker != "paper" or mandate_hash(deployed.spec) != capture.mandate_digest or tuple(deployed.universe) != tuple(capture.universe):
+                        raise ServiceError(409, "Paper deployment changed after review.")
+                    state, latest = self._replay_paper_state(
+                        deployed,
+                        Ledger(directory),
+                    )
+                    head = latest.hash if latest is not None else None
+                    if head != payload["expected_head"]:
+                        raise ServiceError(409, "Paper ledger head changed after review.")
+                    if state.halted is not None:
+                        raise ServiceError(409, "Halted funds cannot run a paper tick.")
+                    with self._make_data_client(capture.data_provider) as client:
+                        due = self._next_paper_session(
+                            deployed,
+                            state.last_session,
+                            provider=capture.data_provider,
+                            now=now,
+                            data_client=client,
+                        )
+                        if due != session:
+                            raise ServiceError(409, "Paper due-set changed after review.")
+                        record = tick(
+                            directory,
+                            client,
+                            session=session,
+                            build_fund=self._captured_fund_factory(capture),
+                            now=lambda: now.astimezone(NEW_YORK),
+                        )
+        except ServiceError:
+            raise
+        except (AdmissionError, HandoverError, LedgerError, OSError, ValueError):
+            raise ServiceError(409, "Paper tick could not be executed safely.") from None
+        try:
+            record_ledger_head(
+                self.root_context,
+                operation.subject_id,
+                admission=self._admission,
+            )
+        except HandoverError:
+            raise ServiceError(409, "Paper tick recorded; root head inventory requires offline review.") from None
+        progress(95)
+        return {
+            "session": record.session,
+            "ledger_head": record.hash,
+            "capture_id": capture.capture_id,
+            "capture_digest": capture.digest,
+        }
+
+    def _execute_runner_start(
+        self,
+        operation: OperationRecord,
+        capture: FrozenCapture,
+        progress: Callable[[int], None],
+        cancelled: Callable[[], bool],
+    ) -> dict[str, object]:
+        payload = dict(operation.payload)
+        expected = {
+            "kind",
+            "expected_head",
+            "initial_due_set",
+            "max_sessions",
+            "max_runtime_minutes",
+            "max_calls",
+            "max_resources",
+            "maximum_model_calls_per_session",
+        }
+        if set(payload) != expected or payload.get("kind") != "runner-start":
+            raise OperationError("stored runner request is invalid")
+        if capture.code_version != code_version() or capture.broker != "paper":
+            raise OperationError("captured runner is incompatible")
+        if capture.mandate_snapshot is None:
+            raise OperationError("captured mandate is unavailable")
+        try:
+            spec = FundSpec.model_validate_json(capture.mandate_snapshot)
+        except ValueError:
+            raise OperationError("captured mandate is invalid") from None
+        if spec.name != operation.subject_id or mandate_hash(spec) != capture.mandate_digest or capture.credential_versions or capture.credential_handles:
+            raise OperationError("captured runner inputs changed")
+        initial_due = payload.get("initial_due_set")
+        if not isinstance(initial_due, (list, tuple)) or len(initial_due) > 1 or any(not isinstance(session, str) for session in initial_due):
+            raise OperationError("stored runner due-set is invalid")
+        max_sessions = payload.get("max_sessions")
+        max_runtime_minutes = payload.get("max_runtime_minutes")
+        max_calls, max_resources = _runner_limits(
+            spec,
+            universe_size=len(capture.universe),
+            max_sessions=max_sessions,
+            max_runtime_minutes=max_runtime_minutes,
+        )
+        if max_calls != payload.get("max_calls") or max_resources != payload.get("max_resources") or _estimate_paper_model_calls(spec, len(capture.universe)) != payload.get("maximum_model_calls_per_session"):
+            raise OperationError("stored runner bounds changed")
+        if cancelled():
+            raise JobCancelled()
+        progress(10)
+        try:
+            state = self._runner_manager.start(
+                operation.subject_id,
+                capture,
+                expected_head=payload["expected_head"],
+                initial_due_set=tuple(initial_due),
+                max_sessions=max_sessions,
+                expires_at=_utcnow() + timedelta(minutes=max_runtime_minutes),
+                max_calls=max_calls,
+                max_resources=max_resources,
+            )
+        except (OwnedRunnerError, AdmissionError, OSError, ValueError):
+            raise ServiceError(409, "Owned runner could not be started safely.") from None
+        if cancelled() and state.get("available"):
+            try:
+                self._runner_manager.request_stop(operation.subject_id)
+            except OwnedRunnerError:
+                pass
+        progress(95)
+        return {
+            "runner": state,
+            "capture_id": capture.capture_id,
+            "capture_digest": capture.digest,
+        }
+
+    def _resolve_paper_schedule(
+        self,
+        name: str,
+        capture: FrozenCapture,
+    ) -> tuple[str | None, tuple[str, ...]]:
+        self._verify_root_inventory()
+        directory, deployed, _ledger, state, latest = self._paper_state(name)
+        if deployed.broker != "paper" or mandate_hash(deployed.spec) != capture.mandate_digest or tuple(deployed.universe) != tuple(capture.universe):
+            raise ServiceError(409, "Paper deployment changed after review.")
+        if state.halted is not None:
+            raise ServiceError(409, "Halted funds cannot accept a paper operation.")
+        head = latest.hash if latest is not None else None
+        due = self._next_paper_session(
+            deployed,
+            state.last_session,
+            provider=capture.data_provider,
+            now=_utcnow(),
+        )
+        return head, (due,) if due is not None else ()
+
+    def _next_paper_session(
+        self,
+        deployed: DeployedFund,
+        last_session: str | None,
+        *,
+        provider: str,
+        now,
+        data_client=None,
+    ) -> str | None:
+        moment = now.astimezone(NEW_YORK)
+        if deployed.spec.is_intraday:
+            return next_session(
+                None,
+                deployed.spec,
+                last_session,
+                now=lambda: moment,
+            )
+        if data_client is not None:
+            return next_session(
+                data_client,
+                deployed.spec,
+                last_session,
+                now=lambda: moment,
+            )
+        with self._make_data_client(provider) as client:
+            return next_session(
+                client,
+                deployed.spec,
+                last_session,
+                now=lambda: moment,
+            )
+
+    def _authorize_manual_capture(
+        self,
+        capture: FrozenCapture,
+        *,
+        now,
+        model_calls: int,
+    ) -> None:
+        if not self.network_enabled:
+            raise ServiceError(403, "Network capability is disabled for this server.")
+        try:
+            data_target = ProviderTarget(
+                kind="data",
+                provider=capture.data_provider,
+            )
+            llm_target = ProviderTarget(
+                kind="llm",
+                provider=capture.llm_provider,
+                model=capture.model,
+                endpoint=capture.endpoint,
+            )
+            data_class = authorize_dispatch(
+                data_target,
+                scope=OperationScope.MANUAL_ONE_SHOT,
+                root_id=capture.root_id,
+                subject_id=capture.subject_id,
+                capture_digest=capture.digest,
+                now=now,
+                network_authorized=self.network_enabled,
+                upper_bound_cost=Decimal("0"),
+                resource_units=max(1, len(capture.universe)),
+            )
+            llm_class = authorize_dispatch(
+                llm_target,
+                scope=OperationScope.MANUAL_ONE_SHOT,
+                root_id=capture.root_id,
+                subject_id=capture.subject_id,
+                capture_digest=capture.digest,
+                now=now,
+                upper_bound_cost=Decimal("0"),
+                resource_units=max(1, model_calls),
+                approved_local_models={capture.model},
+            )
+            if data_class is not ProviderClass.FREE_DATA or llm_class is not ProviderClass.LOCAL:
+                raise AuthorizationDenied("manual paper providers are not local/free")
+        except AuthorizationDenied:
+            raise ServiceError(403, "Paper operations require free market data and a local model.") from None
+
+    def _require_local_paper_policy(self, settings: RuntimeSettings) -> None:
+        if not self.network_enabled:
+            raise ServiceError(403, "Network capability is disabled for this server.")
+        data = ProviderTarget(kind="data", provider=settings.data_provider)
+        llm = ProviderTarget(
+            kind="llm",
+            provider=settings.llm_provider,
+            model=settings.model,
+            endpoint=settings.endpoint,
+        )
+        if classify_provider(data) is not ProviderClass.FREE_DATA:
+            raise ServiceError(422, "Paper operations require free yfinance market data.")
+        if classify_provider(llm, approved_local_models={settings.model}) is not ProviderClass.LOCAL:
+            raise ServiceError(422, "Paper operations require a local Ollama model endpoint.")
+
+    def _captured_fund_factory(self, capture: FrozenCapture) -> Callable[[FundSpec], Fund]:
+        if self._custom_fund_factory:
+            return self._fund_factory
+        return lambda spec: self._default_fund_factory(spec, capture)
+
+    def _verify_root_inventory(self) -> None:
+        try:
+            verify_root_inventory(self.root_context)
+        except LedgerError:
+            raise ServiceError(409, "Paper state is invalid (LedgerError).") from None
+        except HandoverError:
+            raise ServiceError(409, "Offline paper ledger inventory changed; writes are denied.") from None
 
     def get_valuation(self, name: str) -> dict:
         """Return current-head estimate; never contacts a provider."""
@@ -1030,13 +1711,14 @@ class DeskService:
         return {"verdict": vote["verdict"], "decision_as_of": vote["decision_as_of"], "saved": True}
 
     def halt_fund(self, name: str, reason: str) -> dict:
-        self._require_writes()
+        if not self.allow_writes and not self.emergency_halt_available:
+            self._require_writes()
         normalized = self._validated_name(name)
         self._guard_protected(normalized)
         if not isinstance(reason, str) or not reason.strip() or len(reason) > 240 or any(ord(char) < 32 or ord(char) == 127 for char in reason):
             raise ServiceError(422, "Halt reason is invalid.")
         with self._fund_lock(normalized):
-            with self._paper_control_lane(normalized):
+            with self._paper_control_lane(normalized, verify_inventory=False):
                 _, _, ledger = self._paper_control_state(normalized)
                 try:
                     ledger.halt(reason)
@@ -1045,7 +1727,8 @@ class DeskService:
         return {"name": normalized, "halted": True}
 
     def resume_fund(self, name: str) -> dict:
-        self._require_writes()
+        if not self.allow_writes and not self.emergency_halt_available:
+            self._require_writes()
         normalized = self._validated_name(name)
         self._guard_protected(normalized)
         with self._fund_lock(normalized):
@@ -1057,9 +1740,16 @@ class DeskService:
                 )
 
     @contextmanager
-    def _paper_control_lane(self, name: str) -> Iterator[None]:
+    def _paper_control_lane(
+        self,
+        name: str,
+        *,
+        verify_inventory: bool = True,
+    ) -> Iterator[None]:
         try:
             with self._admission.control_lane(name, timeout=0.1):
+                if verify_inventory:
+                    self._verify_root_inventory()
                 yield
         except AdmissionError:
             raise ServiceError(409, "Paper control admission is unavailable.") from None
@@ -1071,6 +1761,22 @@ class DeskService:
                 yield
         except AdmissionError:
             raise ServiceError(409, "Paper execution admission is unavailable.") from None
+
+    @contextmanager
+    def _paper_manual_lane(self, name: str) -> Iterator[None]:
+        try:
+            with self._admission.manual_session(name, timeout=0.1):
+                yield
+        except AdmissionError:
+            raise ServiceError(409, "Paper session admission is unavailable.") from None
+
+    @contextmanager
+    def _paper_deployment_lane(self, name: str) -> Iterator[None]:
+        try:
+            with self._admission.deployment_lock(name, timeout=0.1):
+                yield
+        except AdmissionError:
+            raise ServiceError(409, "Paper deployment admission is unavailable.") from None
 
     def _cached_valuation_view(self, name: str, expected_head: str | None) -> dict[str, object]:
         identity = _windows_name_key(name)
@@ -1166,7 +1872,7 @@ class DeskService:
             "halted": halted,
             "halt_state": halt_state,
             "ledger": ledger_status,
-            "runner": self._runner_state(),
+            "runner": self._runner_state(deployed.name),
             "live_value": self._cached_valuation_view(
                 deployed.name,
                 latest.hash if latest is not None else None,
@@ -1380,12 +2086,15 @@ class DeskService:
         with make_data_client(provider=selected_provider) as client:
             yield CachedDataClient(client, cache_dir=cache)
 
-    def _runner_state(self) -> dict:
-        return {
-            "status": "unknown",
-            "available": False,
-            "reason": "Runner ownership is not verified; web process controls are disabled.",
-        }
+    def _runner_state(self, name: str) -> dict:
+        try:
+            return self._runner_manager.status(name)
+        except OwnedRunnerError:
+            return {
+                "status": "unknown",
+                "available": False,
+                "reason": "Runner ownership is not verified.",
+            }
 
     def _safe_child(self, *parts: str) -> Path:
         try:
@@ -1471,6 +2180,17 @@ class DeskService:
     def _require_writes(self) -> None:
         if not self.allow_writes:
             raise ServiceError(403, "Write capability is disabled for this server.")
+        status = enrollment_status(self.root_context)
+        if status["state"] != "enrolled":
+            self.allow_writes = False
+            self.network_enabled = False
+            self.enrollment_state = status["state"]
+            self.write_unavailable_reason = status["reason"] or "handover-unavailable"
+            if self._owner_lease is not None:
+                self._owner_lease.close()
+                self._owner_lease = None
+            self._admission = AdmissionCoordinator(self.root_context)
+            raise ServiceError(403, "Offline root enrollment is unavailable.")
 
     def _credential_status_map(self) -> dict[str, dict[str, int | bool]]:
         if self._credential_store is None:
@@ -1638,6 +2358,32 @@ def _estimate_backtest_calls(
     weekdays = sum(1 for offset in range((end - start).days + 1) if (start + timedelta(days=offset)).weekday() < 5)
     agent_count = sum(len(strategy.models) for strategy in spec.strategies)
     return weekdays * universe_size * max(1, agent_count)
+
+
+def _estimate_paper_model_calls(spec: FundSpec, universe_size: int) -> int:
+    if not isinstance(spec, FundSpec) or type(universe_size) is not int or not 1 <= universe_size <= 25:
+        raise ServiceError(422, "Paper model-call estimate is invalid.")
+    calls = universe_size * sum(len(strategy.models) for strategy in spec.strategies) * 2
+    if type(calls) is not int or not 1 <= calls <= 1000:
+        raise ServiceError(422, "Paper model-call estimate exceeds the 1000-call bound.")
+    return calls
+
+
+def _runner_limits(
+    spec: FundSpec,
+    *,
+    universe_size: int,
+    max_sessions: int,
+    max_runtime_minutes: int,
+) -> tuple[int, int]:
+    if not isinstance(spec, FundSpec) or type(universe_size) is not int or not 1 <= universe_size <= 25 or type(max_sessions) is not int or not 1 <= max_sessions <= 100 or type(max_runtime_minutes) is not int or not 1 <= max_runtime_minutes <= 1440:
+        raise ServiceError(422, "Finite runner bounds are invalid.")
+    model_calls = _estimate_paper_model_calls(spec, universe_size)
+    max_calls = max_runtime_minutes + 1 + max_sessions * 2
+    max_resources = (max_runtime_minutes + 1) * universe_size + max_sessions * (2 * universe_size + model_calls)
+    if not 1 <= max_calls <= 10000 or not 1 <= max_resources <= 1_000_000:
+        raise ServiceError(422, "Finite runner resource estimate exceeds its bound.")
+    return max_calls, max_resources
 
 
 def _reject_secret_fields(value) -> None:

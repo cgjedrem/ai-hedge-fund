@@ -61,7 +61,17 @@ def deploy(
     """Create paper/<name>/ with an empty ledger and broker book if local."""
     validate_fund_name(name)
     universe = normalize_universe(universe)
-    directory = Path(root) / name
+    paper_root = Path(root)
+    from hedge_fund.runtime.admission import require_paper_write_lanes
+
+    require_paper_write_lanes(
+        paper_root,
+        name,
+        lane_sets=(("deployment",),),
+        paper_root=True,
+        verify_inventory=True,
+    )
+    directory = paper_root / name
     if directory.exists():
         raise FileExistsError(f"paper fund {name!r} already exists at {directory}")
     deployed = DeployedFund(

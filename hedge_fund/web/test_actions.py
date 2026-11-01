@@ -12,6 +12,35 @@ from hedge_fund.web.schemas import ApprovalRequest
 from hedge_fund.web.services import DeskService, ServiceError
 
 
+@contextmanager
+def _demo_control_lane(root, name):
+    from hedge_fund.runtime.admission import AdmissionCoordinator, RootOwnerLease
+    from hedge_fund.runtime.root import RootContext
+
+    with RootContext.open(root) as context:
+        owner = RootOwnerLease.acquire(context, timeout=0)
+        admission = AdmissionCoordinator(context, owner_lease=owner)
+        try:
+            with admission.control_lane(name, timeout=0):
+                yield
+        finally:
+            owner.close()
+
+
+def _record_demo_head(root, name):
+    from hedge_fund.runtime.admission import AdmissionCoordinator, RootOwnerLease
+    from hedge_fund.runtime.handover import record_ledger_head
+    from hedge_fund.runtime.root import RootContext
+
+    with RootContext.open(root) as context:
+        owner = RootOwnerLease.acquire(context, timeout=0)
+        admission = AdmissionCoordinator(context, owner_lease=owner)
+        try:
+            record_ledger_head(context, name, admission=admission)
+        finally:
+            owner.close()
+
+
 def test_approval_is_bound_to_the_displayed_timestamp_and_source_hash(write_client, demo_root):
     client, headers = write_client
     before = Ledger(demo_root / "paper" / "demo-quality").sessions()
@@ -53,12 +82,13 @@ def test_stale_and_expired_approvals_fail_without_rebinding(write_client, demo_r
     assert not (demo_root / "paper" / "demo-quality" / "pending-approval.json").exists()
 
     ledger = Ledger(demo_root / "paper" / "demo-quality")
-    ledger.log_event(
-        "expire",
-        decision_as_of=pending["decision_as_of"],
-        decision_hash=pending["source_record_hash"],
-        reason="test expiry",
-    )
+    with _demo_control_lane(demo_root, "demo-quality"):
+        ledger.log_event(
+            "expire",
+            decision_as_of=pending["decision_as_of"],
+            decision_hash=pending["source_record_hash"],
+            reason="test expiry",
+        )
     expired = client.post(
         "/api/paper/demo-quality/approval",
         headers=headers,
@@ -75,32 +105,35 @@ def test_stale_and_expired_approvals_fail_without_rebinding(write_client, demo_r
 
 def test_approval_is_rejected_when_gate_is_disabled(write_client, demo_root):
     client, headers = write_client
-    fund_path = demo_root / "paper" / "demo-quality" / "fund.yaml"
-    deployed = yaml.safe_load(fund_path.read_text(encoding="utf-8"))
-    deployed["spec"].pop("approval_required", None)
-    fund_path.write_text(yaml.safe_dump(deployed, sort_keys=False), encoding="utf-8")
-    pending = client.get("/api/paper/demo-quality", headers={"host": "127.0.0.1"}).json()["pending"]
+    from hedge_fund.fund import load_spec
+    from hedge_fund.web.schemas import DeployRequest
+
+    service = client.app.state.service
+    spec = load_spec(demo_root / "mandates" / "demo-quality.yaml").model_copy(update={"name": "no-gate", "approval_required": False})
+    service.create_mandate(spec.model_dump(mode="python"))
+    service.deploy_mandate("no-gate", DeployRequest(universe=["AAPL", "MSFT"]))
 
     response = client.post(
-        "/api/paper/demo-quality/approval",
+        "/api/paper/no-gate/approval",
         headers=headers,
         json={
             "verdict": "approve",
-            "decision_as_of": pending["decision_as_of"],
-            "source_record_hash": pending["source_record_hash"],
+            "decision_as_of": "2024-06-05",
+            "source_record_hash": "0" * 64,
         },
     )
 
     assert response.status_code == 409
     assert response.json()["detail"] == "This fund does not require approval."
-    assert not (demo_root / "paper" / "demo-quality" / "pending-approval.json").exists()
+    assert not (demo_root / "paper" / "no-gate" / "pending-approval.json").exists()
 
 
 def test_approval_is_rejected_for_halted_fund(write_client, demo_root):
     client, headers = write_client
     ledger = Ledger(demo_root / "paper" / "demo-quality")
     pending = client.get("/api/paper/demo-quality", headers={"host": "127.0.0.1"}).json()["pending"]
-    ledger.halt("test pause")
+    with _demo_control_lane(demo_root, "demo-quality"):
+        ledger.halt("test pause")
 
     response = client.post(
         "/api/paper/demo-quality/approval",
@@ -191,7 +224,44 @@ def test_halt_works_for_corrupt_ledger_but_resume_still_requires_valid_replay(de
     assert ledger.halted() == "ledger review"
 
 
+def test_emergency_halt_recovers_an_unreadable_control_file(demo_root):
+    control = demo_root / "paper" / "demo-quality" / "control.json"
+    control.write_text("{", encoding="utf-8")
+    with TestClient(
+        create_app(root=demo_root, allow_writes=True, demo=True),
+        client=("127.0.0.1", 50000),
+    ) as client:
+        capabilities = client.get(
+            "/api/capabilities",
+            headers={"host": "127.0.0.1"},
+        ).json()
+        token = capabilities["mutation_token"]
+        headers = {
+            "host": "127.0.0.1",
+            "origin": "http://127.0.0.1",
+            "x-csrf-token": token,
+        }
+        halted = client.post(
+            "/api/paper/demo-quality/halt",
+            headers=headers,
+            json={"reason": "control recovery"},
+        )
+
+    ledger = Ledger(demo_root / "paper" / "demo-quality")
+    assert capabilities["read_only"] is True
+    assert capabilities["writes"] is False
+    assert capabilities["write_unavailable_reason"] == "ledger-drift"
+    assert isinstance(token, str) and token
+    assert halted.status_code == 200
+    assert ledger.halted() == "control recovery"
+
+
 def test_protected_name_guard_runs_before_fund_adapter(tmp_path, monkeypatch):
+    from hedge_fund.runtime.handover import enroll_fresh
+    from hedge_fund.runtime.root import RootContext
+
+    with RootContext.open(tmp_path) as context:
+        enroll_fresh(context)
     app = create_app(root=tmp_path, allow_writes=True)
     service = app.state.service
     called = False
@@ -220,7 +290,15 @@ def test_protected_name_guard_runs_before_fund_adapter(tmp_path, monkeypatch):
 
 
 def test_protected_windows_aliases_are_rejected_before_control_writes(tmp_path, monkeypatch):
+    from hedge_fund.runtime.handover import enroll_fresh
+    from hedge_fund.runtime.root import RootContext
+
     root = tmp_path / "temporary-root"
+    root.mkdir()
+    with RootContext.open(root) as context:
+        enroll_fresh(context)
+    app = create_app(root=root, allow_writes=True)
+    service = app.state.service
     fund_dir = root / "paper" / "watchtower"
     fund_dir.mkdir(parents=True)
     control = fund_dir / "control.json"
@@ -229,8 +307,6 @@ def test_protected_windows_aliases_are_rejected_before_control_writes(tmp_path, 
     events.write_text("", encoding="utf-8")
     before_control = control.read_bytes()
     before_events = events.read_bytes()
-    app = create_app(root=root, allow_writes=True)
-    service = app.state.service
     called = False
 
     def forbidden(*_args, **_kwargs):
@@ -266,6 +342,7 @@ def test_nonlocal_broker_mutations_stop_before_ledger_adapter(demo_root, monkeyp
     deployed = yaml.safe_load(deployed_path.read_text(encoding="utf-8"))
     deployed["broker"] = "saxo"
     deployed_path.write_text(yaml.safe_dump(deployed, sort_keys=False), encoding="utf-8")
+    _record_demo_head(demo_root, "demo-quality")
     pending = Ledger(directory).replay(
         deployed["spec"]["capital"],
         full=True,
@@ -329,11 +406,15 @@ def test_web_halt_enters_shared_control_lane(tmp_path, monkeypatch):
 
 def test_capabilities_explain_deferred_runner_ownership(tmp_path):
     app = create_app(root=tmp_path)
-    result = app.state.service.capabilities(None)
+    service = app.state.service
+    try:
+        result = service.capabilities(None)
+    finally:
+        service.close()
 
-    assert "ownership" in result["deferred_actions"]["runner"]
+    assert "unavailable" in result["deferred_actions"]["runner"]
     assert "disabled" in result["deferred_actions"]["manual_run"]
-    app.state.service.close()
+    assert result["write_unavailable_reason"] == "handover-required"
 
 
 @pytest.mark.parametrize(

@@ -16,12 +16,14 @@ from hedge_fund.pipeline.session import mandate_hash
 from hedge_fund.runtime.admission import AdmissionCoordinator, RootOwnerLease
 from hedge_fund.runtime.capture import freeze_capture
 from hedge_fund.runtime.configuration import resolve_settings
+from hedge_fund.runtime.handover import enroll_fresh
 from hedge_fund.runtime.operations import (
     OPERATIONS_ROOT,
     OperationStatus,
     OperationStore,
 )
 from hedge_fund.runtime.root import RootContext
+from hedge_fund.test_support.handover import enroll_synthetic_root
 from hedge_fund.web.app import create_app
 from hedge_fund.web.jobs import JobCancelled, OperationJobRegistry
 from hedge_fund.web.schemas import (
@@ -42,7 +44,7 @@ def durable_job_context(tmp_path):
     root = tmp_path / "durable-jobs"
     root.mkdir()
     with RootContext.open(root) as root_context:
-        root_context.prepare_private_storage()
+        enroll_fresh(root_context)
         owner_lease = RootOwnerLease.acquire(root_context)
         admission = AdmissionCoordinator(root_context, owner_lease=owner_lease)
         store = OperationStore(root_context, admission=admission)
@@ -138,6 +140,7 @@ def _mandate_fingerprint(root, name="demo-quality"):
 
 
 def test_builder_canonical_validation_conflicts_and_deployment(tmp_path):
+    enroll_synthetic_root(tmp_path)
     service = DeskService(tmp_path, allow_writes=True)
     created = service.create_mandate(_spec())
 
@@ -162,6 +165,7 @@ def test_builder_canonical_validation_conflicts_and_deployment(tmp_path):
 
 
 def test_mandate_api_rejects_library_roster_and_model_weight_drift(tmp_path):
+    enroll_synthetic_root(tmp_path)
     app = create_app(root=tmp_path, allow_writes=True)
     with TestClient(app, client=("127.0.0.1", 50000)) as client:
         headers = _write_headers(client)
@@ -213,6 +217,7 @@ def test_mandate_api_rejects_library_roster_and_model_weight_drift(tmp_path):
     ],
 )
 def test_custom_mandate_api_uses_canonical_registry_mode(tmp_path, names, mode):
+    enroll_synthetic_root(tmp_path)
     app = create_app(root=tmp_path, allow_writes=True)
     with TestClient(app, client=("127.0.0.1", 50000)) as client:
         headers = _write_headers(client)
@@ -226,6 +231,7 @@ def test_custom_mandate_api_uses_canonical_registry_mode(tmp_path, names, mode):
 
 
 def test_custom_mandate_api_rejects_dollar_neutral_override(tmp_path):
+    enroll_synthetic_root(tmp_path)
     app = create_app(root=tmp_path, allow_writes=True)
     with TestClient(app, client=("127.0.0.1", 50000)) as client:
         headers = _write_headers(client)
@@ -945,41 +951,93 @@ def test_cancelled_queued_future_releases_operation_capacity(durable_job_context
         registry.close()
 
 
-def test_close_waits_for_worker_boundary_before_interruption(durable_job_context):
+def test_close_waits_for_worker_boundary_before_interruption(durable_job_context, monkeypatch):
     _root_context, store, capture = durable_job_context
     registry = OperationJobRegistry(store, clock=lambda: _JOB_NOW)
     operation = _accepted_operation(store, capture)
     entered = threading.Event()
-    release = threading.Event()
+    request_cancel_entered = threading.Event()
+    release_request_cancel = threading.Event()
+    request_cancel_persisted = threading.Event()
+    probe_worker = threading.Event()
+    release_worker = threading.Event()
+    worker_checked = threading.Event()
     shutdown_done = threading.Event()
     restarts = []
+    cancel_results = []
+    acknowledgements = []
+    interruptions = []
+    original_request_cancel = store.request_cancel
+    original_acknowledge = store.acknowledge_cancel
+    original_interrupt = store.interrupt
+
+    def delay_request_cancel(*args, **kwargs):
+        request_cancel_entered.set()
+        if not release_request_cancel.wait(timeout=5):
+            raise TimeoutError("shutdown cancellation barrier timed out")
+        result = original_request_cancel(*args, **kwargs)
+        request_cancel_persisted.set()
+        return result
+
+    def observe(method, results):
+        def call(*args, **kwargs):
+            try:
+                result = method(*args, **kwargs)
+            except Exception as exc:
+                results.append(f"{type(exc).__name__}:{exc}")
+                raise
+            results.append(result.status.value)
+            return result
+
+        return call
+
+    monkeypatch.setattr(store, "request_cancel", delay_request_cancel)
+    monkeypatch.setattr(store, "acknowledge_cancel", observe(original_acknowledge, acknowledgements))
+    monkeypatch.setattr(store, "interrupt", observe(original_interrupt, interruptions))
 
     def work(_progress, cancelled, _apply_if_current):
         entered.set()
-        release.wait(timeout=2)
+        if not probe_worker.wait(timeout=5):
+            raise TimeoutError("worker probe barrier timed out")
+        cancel_results.append(cancelled())
+        worker_checked.set()
+        if cancel_results[-1]:
+            raise JobCancelled()
+        if not release_worker.wait(timeout=5):
+            raise TimeoutError("worker release barrier timed out")
         if cancelled():
             raise JobCancelled()
         return {"unexpected": True}
 
     registry.submit(operation, work)
     assert entered.wait(timeout=5)
-    shutdown = threading.Thread(target=lambda: (registry.close(), shutdown_done.set()))
+
+    def close_registry():
+        registry.close()
+        shutdown_done.set()
+
+    shutdown = threading.Thread(target=close_registry)
     shutdown.start()
     try:
-        cancel_requested = _wait_for_operation(
-            store,
-            operation.operation_id,
-            OperationStatus.CANCEL_REQUESTED,
-        )
-        assert cancel_requested.status is OperationStatus.CANCEL_REQUESTED
+        assert request_cancel_entered.wait(timeout=5)
         assert not shutdown_done.wait(timeout=0.05)
+        probe_worker.set()
+        assert worker_checked.wait(timeout=5)
+        assert cancel_results == [False]
+        release_request_cancel.set()
+        assert request_cancel_persisted.wait(timeout=5)
+        release_worker.set()
     finally:
-        release.set()
-    assert shutdown_done.wait(timeout=2)
-    shutdown.join(timeout=1)
+        release_request_cancel.set()
+        release_worker.set()
+        shutdown.join(timeout=10)
+
+    assert shutdown_done.is_set()
+    assert not shutdown.is_alive()
 
     observed = store.get_operation(operation.operation_id)
 
-    assert observed.status is OperationStatus.CANCELLED
-    assert restarts == []
+    assert observed.status is OperationStatus.CANCELLED, f"checked={cancel_results!r}, ack={acknowledgements!r}, interrupt={interruptions!r}"
+    assert acknowledgements == ["cancelled"]
+    assert interruptions == []
     assert restarts == []

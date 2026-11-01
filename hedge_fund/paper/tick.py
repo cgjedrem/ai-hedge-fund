@@ -187,6 +187,14 @@ def tick(
     set. *now* is the clock; tests inject it.
     """
     directory = Path(directory)
+    from hedge_fund.runtime.admission import require_paper_write_lanes
+
+    require_paper_write_lanes(
+        directory,
+        directory.name,
+        lane_sets=(("runner", "execution"),),
+        verify_inventory=True,
+    )
     deployed = load_deployed(directory)
     spec = deployed.spec
     ledger = Ledger(directory)
@@ -238,6 +246,14 @@ def redo(
     FundHalted when the kill switch is set.
     """
     directory = Path(directory)
+    from hedge_fund.runtime.admission import require_paper_write_lanes
+
+    require_paper_write_lanes(
+        directory,
+        directory.name,
+        lane_sets=(("runner", "execution"),),
+        verify_inventory=True,
+    )
     deployed = load_deployed(directory)
     if deployed.broker != "paper":
         raise ValueError(f"redo is only supported for paper broker funds, not {deployed.broker}")

@@ -79,6 +79,7 @@ def run(
     fails).
     """
     directory = Path(directory)
+    _require_legacy_unenrolled(directory)
     deployed = load_deployed(directory)
     stop = stop or threading.Event()
     now = now or (lambda: datetime.now(NEW_YORK))
@@ -215,6 +216,7 @@ def serve(
     """`run` as a process: one per fund, found by its pid file, stopped by
     SIGTERM or SIGINT after the bar in flight. Refuses to start twice."""
     directory = Path(directory)
+    _require_legacy_unenrolled(directory)
     # A pid file naming this very process is a stale incarnation: its writer
     # is dead and its pid was reused by us (pid 1 across container restarts).
     if is_running(directory) and _read_pid(directory) != os.getpid():
@@ -248,6 +250,7 @@ def is_running(directory: str | Path) -> bool:
 
 def stop_runner(directory: str | Path) -> bool:
     """Ask the fund's runner to stop after its current bar. False if none."""
+    _require_legacy_unenrolled(Path(directory))
     pid = _read_pid(directory)
     if pid is None or not is_running(directory):
         return False
@@ -266,6 +269,7 @@ def spawn_runner(directory: Path, *, root: Path) -> int:
         raise ValueError("runner directory and root must be absolute")
     if directory.parent != root / "paper":
         raise ValueError("runner directory is outside the configured root")
+    _require_legacy_unenrolled(directory)
     log = (directory / _RUNNER_LOG).open("a")
     with log:
         child = subprocess.Popen(
@@ -286,6 +290,21 @@ def spawn_runner(directory: Path, *, root: Path) -> int:
             cwd=str(directory),
         )
     return child.pid
+
+
+def _require_legacy_unenrolled(directory: Path) -> None:
+    if directory.parent.name.casefold() != "paper":
+        return
+    from hedge_fund.runtime.handover import enrollment_status
+    from hedge_fund.runtime.root import RootContext
+
+    try:
+        with RootContext.open(directory.parent.parent) as root:
+            status = enrollment_status(root, verify_inventory=True)
+    except Exception:
+        raise RuntimeError("Legacy paper runner is blocked because root enrollment cannot be verified.") from None
+    if status["state"] != "unenrolled":
+        raise RuntimeError("Legacy paper runner is disabled on enrolled or unverifiable roots.")
 
 
 def _read_pid(directory: str | Path) -> int | None:

@@ -407,18 +407,36 @@ class OperationStore:
         operation: OperationRecord
         created = False
         with self._locked(subject_id):
-            lane = (
-                self._admission.manual_session(
-                    subject_id,
-                    timeout=_MAX_LOCK_WAIT_SECONDS,
-                )
-                if action.startswith("paper-")
-                else self._admission.deployment_lock(
-                    subject_id,
-                    timeout=_MAX_LOCK_WAIT_SECONDS,
-                )
+            index = self._read_index()
+            existing = index["requests"].get(request_id)
+            if existing is not None:
+                if existing.get("request_digest") != request_digest:
+                    raise OperationConflict("request identity conflicts with durable state")
+                stored = self._operation_entry(index, existing.get("operation_id"))
+                self._verify_operation_sidecars(stored)
+                self._verify_capture_sidecar(index["previews"][stored["preview_id"]])
+                return self._operation_from_index(index, existing.get("operation_id"))
+
+        lane = (
+            self._admission.manual_session(
+                subject_id,
+                timeout=_MAX_LOCK_WAIT_SECONDS,
             )
-            with lane:
+            if action.startswith("paper-")
+            else self._admission.deployment_lock(
+                subject_id,
+                timeout=_MAX_LOCK_WAIT_SECONDS,
+            )
+        )
+        with lane:
+            resolved_state = None
+            if current_state_resolver is not None:
+                current_head, current_due_set = current_state_resolver()
+                if current_head is not None and not _safe_text(current_head, maximum=512):
+                    raise OperationError("resolved head is invalid")
+                current_due_set = _validate_due_set(current_due_set)
+                resolved_state = (current_head, current_due_set)
+            with self._locked(subject_id):
                 index = self._read_index()
                 existing = index["requests"].get(request_id)
                 if existing is not None:
@@ -427,86 +445,80 @@ class OperationStore:
                     stored = self._operation_entry(index, existing.get("operation_id"))
                     self._verify_operation_sidecars(stored)
                     self._verify_capture_sidecar(index["previews"][stored["preview_id"]])
-                    operation = self._operation_from_index(index, existing.get("operation_id"))
-                else:
-                    if request_id in index["cancel_requests"]:
-                        raise OperationConflict("request identity conflicts with durable state")
-                    preview = index["previews"].get(preview_id)
-                    if not isinstance(preview, dict) or preview.get("digest") != preview_digest:
-                        raise ConfirmationRejected("preview does not match")
-                    self._verify_preview_sidecar(preview)
-                    self._verify_capture_sidecar(preview)
-                    if preview.get("state") != "issued":
-                        raise ConfirmationRejected("confirmation was consumed")
-                    if not hmac.compare_digest(str(preview.get("confirmation_token_hash", "")), token_hash):
-                        raise ConfirmationRejected("confirmation does not match")
-                    if preview.get("operator_session_hash") != operator_hash:
-                        raise ConfirmationRejected("operator session does not match")
-                    expires_at = _parse_datetime(preview.get("expires_at"))
-                    if now.astimezone(timezone.utc) >= expires_at:
-                        raise ConfirmationExpired("confirmation expired")
-                    if preview.get("action") != action or preview.get("subject_id") != subject_id or preview.get("expected_head") != expected_head or preview.get("due_set") != list(due_set):
-                        raise StalePreview("reviewed head or due-set changed")
-                    if preview.get("payload_digest") != payload_digest:
-                        raise StalePreview("reviewed payload changed")
-                    if current_state_resolver is not None:
-                        current_head, current_due_set = current_state_resolver()
-                        if current_head is not None and not _safe_text(current_head, maximum=512):
-                            raise OperationError("resolved head is invalid")
-                        current_due_set = _validate_due_set(current_due_set)
-                        if current_head != expected_head or current_due_set != due_set:
-                            raise StalePreview("current head or due-set changed")
+                    return self._operation_from_index(index, existing.get("operation_id"))
+                if request_id in index["cancel_requests"]:
+                    raise OperationConflict("request identity conflicts with durable state")
+                preview = index["previews"].get(preview_id)
+                if not isinstance(preview, dict) or preview.get("digest") != preview_digest:
+                    raise ConfirmationRejected("preview does not match")
+                self._verify_preview_sidecar(preview)
+                self._verify_capture_sidecar(preview)
+                if preview.get("state") != "issued":
+                    raise ConfirmationRejected("confirmation was consumed")
+                if not hmac.compare_digest(str(preview.get("confirmation_token_hash", "")), token_hash):
+                    raise ConfirmationRejected("confirmation does not match")
+                if preview.get("operator_session_hash") != operator_hash:
+                    raise ConfirmationRejected("operator session does not match")
+                expires_at = _parse_datetime(preview.get("expires_at"))
+                if now.astimezone(timezone.utc) >= expires_at:
+                    raise ConfirmationExpired("confirmation expired")
+                if preview.get("action") != action or preview.get("subject_id") != subject_id or preview.get("expected_head") != expected_head or preview.get("due_set") != list(due_set):
+                    raise StalePreview("reviewed head or due-set changed")
+                if preview.get("payload_digest") != payload_digest:
+                    raise StalePreview("reviewed payload changed")
+                if resolved_state is not None and resolved_state != (expected_head, due_set):
+                    raise StalePreview("current head or due-set changed")
 
-                    operation_id = uuid4().hex
-                    timestamp = _datetime_text(now)
-                    operation_record = {
-                        "schema": 1,
-                        "operation_id": operation_id,
-                        "request_id": request_id,
-                        "request_digest": request_digest,
-                        "preview_id": preview_id,
-                        "action": action,
-                        "subject_id": subject_id,
-                        "capture_id": preview["capture_id"],
-                        "capture_digest": preview["capture_digest"],
-                        "status": OperationStatus.ACCEPTED.value,
-                        "payload": normalized_payload,
-                        "progress": 0,
-                        "created_at": timestamp,
-                        "updated_at": timestamp,
-                        "fence_generation": 0,
-                        "worker_id_hash": None,
-                        "worker_fence_hash": None,
-                        "events": [{"status": OperationStatus.ACCEPTED.value, "at": timestamp}],
-                        "result": None,
-                    }
-                    request_record = {
-                        "operation_id": operation_id,
-                        "request_digest": request_digest,
-                        "preview_id": preview_id,
-                        "payload_digest": payload_digest,
-                    }
-                    preview["state"] = "consumed"
-                    preview["consumed_request_id"] = request_id
-                    index["requests"][request_id] = request_record
-                    index["operations"][operation_id] = operation_record
-                    self._check_index_bounds(index)
-                    try:
-                        self._write_index(index)
-                        self._write_operation_sidecars(operation_record)
-                        self._write_json(
-                            f"{OPERATIONS_ROOT}/previews/{preview_id}.json",
-                            preview,
-                        )
-                    except Exception as write_error:
-                        if not self._repair_sidecars_after_error(
-                            write_error,
-                            previews={preview_id: preview},
-                            operations={operation_id: operation_record},
-                        ):
-                            raise
-                    operation = self._operation_from_index(index, operation_id)
-                    created = True
+                operation_id = uuid4().hex
+                timestamp = _datetime_text(now)
+                operation_record = {
+                    "schema": 1,
+                    "operation_id": operation_id,
+                    "request_id": request_id,
+                    "request_digest": request_digest,
+                    "preview_id": preview_id,
+                    "action": action,
+                    "subject_id": subject_id,
+                    "capture_id": preview["capture_id"],
+                    "capture_digest": preview["capture_digest"],
+                    "status": OperationStatus.ACCEPTED.value,
+                    "payload": normalized_payload,
+                    "progress": 0,
+                    "created_at": timestamp,
+                    "updated_at": timestamp,
+                    "fence_generation": 0,
+                    "worker_id_hash": None,
+                    "worker_fence_hash": None,
+                    "events": [{"status": OperationStatus.ACCEPTED.value, "at": timestamp}],
+                    "result": None,
+                }
+                request_record = {
+                    "operation_id": operation_id,
+                    "request_digest": request_digest,
+                    "preview_id": preview_id,
+                    "payload_digest": payload_digest,
+                }
+                preview["state"] = "consumed"
+                preview["consumed_request_id"] = request_id
+                index["requests"][request_id] = request_record
+                index["operations"][operation_id] = operation_record
+                self._check_index_bounds(index)
+                try:
+                    self._write_index(index)
+                    self._write_operation_sidecars(operation_record)
+                    self._write_json(
+                        f"{OPERATIONS_ROOT}/previews/{preview_id}.json",
+                        preview,
+                    )
+                except Exception as write_error:
+                    if not self._repair_sidecars_after_error(
+                        write_error,
+                        previews={preview_id: preview},
+                        operations={operation_id: operation_record},
+                    ):
+                        raise
+                operation = self._operation_from_index(index, operation_id)
+                created = True
 
         if created and start_worker is not None:
             try:

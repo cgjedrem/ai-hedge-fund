@@ -40,7 +40,7 @@ from hedge_fund.runtime.defaults import BOARD_REFRESH
 from hedge_fund.scorecard import score
 from hedge_fund.signals import ALPHA_MODEL_REGISTRY, LLMAgent
 from hedge_fund.tui.builder import BuilderScreen
-from hedge_fund.tui.funds import ConfirmWipeScreen, wipe_fund
+from hedge_fund.tui.funds import ConfirmWipeScreen, paper_write_denial, wipe_fund
 from hedge_fund.tui.home import demand_run_keys
 from hedge_fund.tui.palette import BRIGHT, CYAN, GREEN, MUTED, RED, TEXT
 from hedge_fund.tui.paper_view import (
@@ -101,6 +101,7 @@ class PaperScreen(Screen):
         self._run_on_mount = run  # ...and open its approval step right away
         self._quotes: dict[str, dict[str, PriceSnapshot]] = {}  # fund name -> latest prints
         self._quote_timer: Timer | None = None
+        self._write_denial: str | None = None
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="select"):
@@ -131,6 +132,7 @@ class PaperScreen(Screen):
     # ---- the list ---------------------------------------------------------
 
     def _populate(self, select: str | None) -> None:
+        self._write_denial = paper_write_denial()
         menu = self.query_one("#paper-menu", OptionList)
         menu.clear_options()
         self._snaps = []
@@ -177,7 +179,20 @@ class PaperScreen(Screen):
             snap = self._snaps[int(oid.split(":")[1])]
             if snap is not None:
                 width = detail.content_size.width or 60
-                detail.update(paper_detail(snap, min(width, 100), self._quotes.get(snap.deployed.name)))
+                body = paper_detail(
+                    snap,
+                    min(width, 100),
+                    self._quotes.get(snap.deployed.name),
+                )
+                if self._write_denial is not None:
+                    detail.update(
+                        Group(
+                            body,
+                            Text(f"WRITE UNAVAILABLE — {self._write_denial}", style=f"bold {RED}"),
+                        )
+                    )
+                else:
+                    detail.update(body)
                 self._poll_quotes()
         elif oid == "build":
             blurb = Text()
@@ -192,6 +207,8 @@ class PaperScreen(Screen):
                 "the next session is the next close or the next bar.",
                 style=MUTED,
             )
+            if self._write_denial is not None:
+                blurb.append(f"\n\n{self._write_denial}", style=f"bold {RED}")
             detail.update(blurb)
 
     # ---- live quotes ------------------------------------------------------
@@ -226,6 +243,13 @@ class PaperScreen(Screen):
 
     # ---- actions ----------------------------------------------------------
 
+    def _deny_paper_write(self) -> bool:
+        denial = paper_write_denial()
+        if denial is None:
+            return False
+        self.notify(denial, severity="warning")
+        return True
+
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool:
         if action in ("back", "run"):
             return True  # run also handles the build row
@@ -250,6 +274,8 @@ class PaperScreen(Screen):
         self.app.pop_screen()
 
     def action_run(self) -> None:
+        if self._deny_paper_write():
+            return
         menu = self.query_one("#paper-menu", OptionList)
         if menu.highlighted is None:
             return
@@ -277,6 +303,8 @@ class PaperScreen(Screen):
         """Space: stop the fund's runner if one is up, else start one (a
         detached `aihf paper run`, so it outlives this screen). The runner
         does what enter does, unattended, at the fund's cadence."""
+        if self._deny_paper_write():
+            return
         snap = self._current()
         if snap is None or snap.error:
             return
@@ -315,6 +343,8 @@ class PaperScreen(Screen):
             self.app.push_screen(SessionsScreen(snap.directory))
 
     def action_halt(self) -> None:
+        if self._deny_paper_write():
+            return
         snap = self._current()
         if snap is None:
             return
@@ -323,6 +353,8 @@ class PaperScreen(Screen):
         self._populate(snap.deployed.name)
 
     def action_resume(self) -> None:
+        if self._deny_paper_write():
+            return
         snap = self._current()
         if snap is None:
             return
@@ -337,6 +369,8 @@ class PaperScreen(Screen):
         self._record_approval("reject")
 
     def _record_approval(self, verdict: str) -> None:
+        if self._deny_paper_write():
+            return
         snap = self._current()
         if snap is None or snap.error or not snap.gate or snap.pending is None or snap.halted is not None or snap.state is None or snap.state.prev_hash is None:
             return
@@ -347,6 +381,8 @@ class PaperScreen(Screen):
         self._populate(name)
 
     def action_delete(self) -> None:
+        if self._deny_paper_write():
+            return
         snap = self._current()
         if snap is None:
             return
@@ -355,6 +391,8 @@ class PaperScreen(Screen):
 
     def _finish_delete(self, name: str, yes: bool | None) -> None:
         if not yes:
+            return
+        if self._deny_paper_write():
             return
         wipe_fund(name)
         self.notify(f"Deleted {name}", severity="warning")
@@ -498,6 +536,10 @@ class RunSessionScreen(Screen):
     def _run(self) -> None:
         app = self.app
         directory = self._directory
+        denial = paper_write_denial()
+        if denial is not None:
+            app.call_from_thread(self._fail, RuntimeError(denial))
+            return
         try:
             deployed = load_deployed(directory)
             spec = deployed.spec

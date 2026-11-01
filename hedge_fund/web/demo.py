@@ -15,6 +15,9 @@ from hedge_fund.paper.deployed import deploy
 from hedge_fund.paper.ledger import Ledger
 from hedge_fund.pipeline.models import CycleRecord, DecisionRecord, StrategyRecord
 from hedge_fund.pipeline.session import mandate_hash, SessionRecord
+from hedge_fund.runtime.admission import AdmissionCoordinator, RootOwnerLease
+from hedge_fund.runtime.handover import enroll_fresh, record_ledger_head
+from hedge_fund.runtime.root import RootContext
 
 
 def seed_demo(root: str | Path) -> Path:
@@ -24,6 +27,17 @@ def seed_demo(root: str | Path) -> Path:
     if any(data_root.iterdir()):
         raise ValueError("demo root must be empty")
 
+    with RootContext.open(data_root) as context:
+        enroll_fresh(context)
+        owner = RootOwnerLease.acquire(context)
+        admission = AdmissionCoordinator(context, owner_lease=owner)
+        try:
+            return _seed_demo_data(data_root, admission, context)
+        finally:
+            owner.close()
+
+
+def _seed_demo_data(data_root: Path, admission: AdmissionCoordinator, context: RootContext) -> Path:
     spec = FundSpec.model_validate(
         {
             "schema_version": 2,
@@ -45,7 +59,9 @@ def seed_demo(root: str | Path) -> Path:
         }
     )
     save_spec(spec, data_root / "mandates")
-    paper_dir = deploy("demo-quality", spec, ["AAPL", "MSFT"], root=data_root / "paper")
+    with admission.deployment_lock(spec.name, timeout=0):
+        paper_dir = deploy("demo-quality", spec, ["AAPL", "MSFT"], root=data_root / "paper")
+    record_ledger_head(context, spec.name, admission=admission)
     ledger = Ledger(paper_dir)
 
     first = _decision(spec, "2024-06-03", 100.0, 0.8)
@@ -57,8 +73,10 @@ def seed_demo(root: str | Path) -> Path:
     record_two = _record(spec, second, cycle_one, 100_495, 89_995, {"AAPL": 100}, {"AAPL": 105.0}, 505.0, record_one)
     record_three = _record(spec, third, cycle_two, 100_995, 89_995, {"AAPL": 100}, {"AAPL": 110.0}, 502.5, record_two)
     records = [record_one, record_two, record_three]
-    for record in records:
-        ledger.append(record)
+    with admission.manual_session(spec.name, timeout=0):
+        for record in records:
+            ledger.append(record)
+    record_ledger_head(context, spec.name, admission=admission)
 
     dates = [record.session for record in records]
     nav = [record.nav for record in records]

@@ -8,6 +8,7 @@ import os
 import stat
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from pathlib import Path
 from ipaddress import ip_address
 from types import MappingProxyType
 from urllib.parse import urlsplit, urlunsplit
@@ -321,7 +322,7 @@ def build_child_environment(
     source = os.environ if inherited_environment is None else inherited_environment
     if not isinstance(source, Mapping):
         raise ConfigurationError("child environment is invalid")
-    allowed = ("PATH", "SystemRoot", "WINDIR", "COMSPEC", "PATHEXT") if os.name == "nt" else ("PATH", "LANG", "LC_ALL", "TZ")
+    allowed = ("PATH", "SystemRoot", "WINDIR", "COMSPEC", "PATHEXT", "COMPUTERNAME") if os.name == "nt" else ("PATH", "LANG", "LC_ALL", "TZ")
     child: dict[str, str] = {}
     for name in allowed:
         value = _environment_value(source, name)
@@ -332,6 +333,8 @@ def build_child_environment(
         {
             "HOME": home,
             "USERPROFILE": home,
+            "HOMEDRIVE": Path(home).drive,
+            "HOMEPATH": home.removeprefix(Path(home).drive),
             "TEMP": temp,
             "TMP": temp,
             "PYTHON_DOTENV_DISABLED": "1",
@@ -361,6 +364,22 @@ def build_child_environment(
         ):
             root.mkdir(relative, parents=True, mode=0o700)
             child[name] = os.fspath(root.resolve(relative))
+    if source.get("HEDGE_FUND_TEST_MODE") == "1":
+        test_root = source.get("HEDGE_FUND_TEST_ROOT")
+        if not isinstance(test_root, str) or not os.path.isabs(test_root):
+            raise ConfigurationError("test child root is invalid")
+        repository = Path(__file__).resolve().parents[2]
+        support = Path(__file__).resolve().parents[1] / "test_support"
+        child.update(
+            {
+                "HEDGE_FUND_TEST_MODE": "1",
+                "HEDGE_FUND_TEST_ROOT": test_root,
+                "HEDGE_FUND_TEST_CHILD_HOME": home,
+                "HEDGE_FUND_TEST_CHILD_TMP": temp,
+                "HEDGE_FUND_TEST_BLOCK_LOOPBACK": "1",
+                "PYTHONPATH": os.pathsep.join((os.fspath(support), os.fspath(repository))),
+            }
+        )
     root.revalidate()
     return child
 

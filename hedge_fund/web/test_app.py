@@ -1,5 +1,8 @@
+import pytest
 from fastapi.testclient import TestClient
 
+from hedge_fund.runtime.admission import WriterConflict
+from hedge_fund.test_support.handover import enroll_synthetic_root
 from hedge_fund.web.app import create_app
 
 LOOPBACK = {"host": "127.0.0.1"}
@@ -62,6 +65,7 @@ def test_read_only_mutation_is_denied_before_storage_or_domain_access(tmp_path, 
 
 
 def test_writes_require_same_origin_token_and_loopback_peer(tmp_path):
+    enroll_synthetic_root(tmp_path)
     app = create_app(root=tmp_path, allow_writes=True)
     with TestClient(app, client=("127.0.0.1", 50000)) as client:
         capabilities = client.get("/api/capabilities", headers=LOOPBACK).json()
@@ -144,6 +148,7 @@ def test_api_errors_never_fall_through_to_spa_and_assets_get_csp(tmp_path):
 
 
 def test_streamed_body_limit_checks_actual_bytes_without_content_length(tmp_path):
+    enroll_synthetic_root(tmp_path)
     with TestClient(
         create_app(root=tmp_path, allow_writes=True),
         client=("127.0.0.1", 50000),
@@ -184,59 +189,28 @@ def test_operation_cancellation_requires_startup_write_capability(tmp_path):
     assert response.json()["detail"] == "Write capability is disabled for this server."
 
 
-def test_root_owner_conflict_downgrades_second_server_before_adapters(tmp_path, monkeypatch):
+def test_shared_participants_join_while_fund_lanes_remain_exclusive(tmp_path):
+    enroll_synthetic_root(tmp_path)
     first = create_app(root=tmp_path, allow_writes=True)
     second = create_app(root=tmp_path, allow_writes=True)
-    called = False
-
-    def forbidden(*_args, **_kwargs):
-        nonlocal called
-        called = True
-        raise AssertionError("owner conflict must block the write adapter")
-
-    monkeypatch.setattr(second.state.service, "halt_fund", forbidden)
     try:
         assert first.state.service.allow_writes is True
-        assert second.state.service.allow_writes is False
-        assert second.state.service.write_unavailable_reason == "root-owner-unavailable"
-        with TestClient(second) as client:
-            capabilities = client.get("/api/capabilities", headers=LOOPBACK).json()
-            response = client.post(
-                "/api/paper/demo/halt",
-                headers={"host": "127.0.0.1", "origin": "http://127.0.0.1"},
-                json={"reason": "test"},
-            )
+        assert second.state.service.allow_writes is True
+        with first.state.service._admission.manual_session("alpha", timeout=0):
+            with pytest.raises(WriterConflict):
+                with second.state.service._admission.manual_session("alpha", timeout=0):
+                    pass
+        with second.state.service._admission.manual_session("beta", timeout=0):
+            pass
     finally:
         first.state.service.close()
+        second.state.service.close()
 
-    assert capabilities["writes"] is False
-    assert capabilities["mutation_token"] is None
-    assert response.status_code == 403
-    assert not called
     assert not (tmp_path / "paper").exists()
 
 
 def test_container_observer_cannot_be_promoted_by_spoofed_host(tmp_path):
-    app = create_app(root=tmp_path, allow_writes=True, container_bind=True)
+    with pytest.raises(ValueError, match="projection is unavailable"):
+        create_app(root=tmp_path, allow_writes=True, container_bind=True)
 
-    with TestClient(app, client=("127.0.0.1", 50000)) as client:
-        capabilities = client.get(
-            "/api/capabilities",
-            headers={"host": "127.0.0.1"},
-        ).json()
-        response = client.post(
-            "/api/paper/demo/halt",
-            headers={
-                "host": "127.0.0.1",
-                "origin": "http://127.0.0.1",
-                "x-csrf-token": "attacker-controlled",
-            },
-            json={"reason": "test"},
-        )
-
-    assert capabilities["container_observer"] is True
-    assert capabilities["writes"] is False
-    assert capabilities["network"] is False
-    assert response.status_code == 403
-    assert response.json()["detail"] == "Write capability is disabled for this server."
     assert not (tmp_path / "runtime" / "private").exists()

@@ -55,10 +55,13 @@ or given per study (backtest).
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
+from contextlib import contextmanager
 from datetime import date as _date
 from pathlib import Path
+from typing import Iterator
 
 from rich.console import Console
 
@@ -100,6 +103,10 @@ strategy_table = None
 _CONFIGURED_PAPER_DIR: Path | None = None
 
 
+class PaperWriterDenied(RuntimeError):
+    """Enrolled-root paper writer could not acquire verified admission."""
+
+
 def main(argv: list[str] | None = None) -> None:
     # Persona/LLM text is arbitrary unicode; a Windows console defaults to
     # cp1252 and would crash on it. Force UTF-8 (with replacement) on both
@@ -116,6 +123,11 @@ def main(argv: list[str] | None = None) -> None:
 
     try:
         with paths.bound_root(context):
+            if args.command == "handover":
+                if args.load_dotenv or args.model:
+                    parser.error("offline handover does not accept dotenv or model settings")
+                _handover(args, parser, context)
+                return
             try:
                 paths.load_root_dotenv(context, enabled=args.load_dotenv)
             except (RootPathError, UnicodeError, ValueError) as exc:
@@ -138,6 +150,9 @@ def main(argv: list[str] | None = None) -> None:
                 else:
                     _paper(args, parser, console)
             except (FundHalted, NothingDue, LedgerError) as exc:
+                console.print(f"[red]{exc}[/]")
+                sys.exit(1)
+            except PaperWriterDenied as exc:
                 console.print(f"[red]{exc}[/]")
                 sys.exit(1)
     finally:
@@ -315,6 +330,33 @@ def _parser() -> argparse.ArgumentParser:
 
     reject = actions.add_parser("reject", help="reject a pending decision")
     reject.add_argument("name")
+
+    handover = commands.add_parser(
+        "handover",
+        help="inspect or explicitly enroll this root offline",
+    )
+    handover_actions = handover.add_subparsers(
+        dest="handover_action",
+        required=True,
+    )
+    handover_actions.add_parser(
+        "inspect",
+        help="show current paper head inventory and migration digest",
+    )
+    handover_actions.add_parser(
+        "enroll-fresh",
+        help="enroll only a genuinely empty root",
+    )
+    migration = handover_actions.add_parser(
+        "migrate-existing",
+        help="enroll an existing root after quiescent-writer attestation",
+    )
+    migration.add_argument("--inventory-digest", required=True)
+    migration.add_argument(
+        "--operator-attestation",
+        required=True,
+        help="exact statement printed by `aihf --root ROOT handover inspect`",
+    )
     return parser
 
 
@@ -348,6 +390,198 @@ def _fund_dir(name: str, parser: argparse.ArgumentParser) -> Path:
     if not directory.is_dir():
         parser.error(f"no paper fund named {name!r} under {PAPER_DIR} (see `aihf --root <root> paper list`)")
     return directory
+
+
+def _handover(args, parser: argparse.ArgumentParser, root: RootContext) -> None:
+    from hedge_fund.runtime.admission import RootMigrationLease
+    from hedge_fund.runtime.handover import (
+        build_head_inventory,
+        enroll_fresh,
+        enrollment_status,
+        HANDOVER_PATH,
+        HandoverError,
+        inventory_digest,
+        migrate_existing,
+        OPERATOR_ATTESTATION,
+    )
+
+    try:
+        if args.handover_action == "inspect":
+            status = enrollment_status(root, verify_inventory=True)
+            orphaned_admission = status["state"] == "invalid" and status["reason"] == "admission-state-without-handover"
+            inspectable = status["state"] in {"unenrolled", "enrolled"} or orphaned_admission
+            if not inspectable:
+                raise HandoverError("root enrollment or ledger inventory is unavailable")
+            if any(root.path.iterdir()):
+                if not root.verify_private_storage():
+                    root.prepare_private_storage()
+                with RootMigrationLease.acquire(root, timeout=0):
+                    heads = build_head_inventory(root)
+                    try:
+                        root.file_info(HANDOVER_PATH)
+                    except FileNotFoundError:
+                        if status["state"] == "enrolled":
+                            raise HandoverError("root enrollment changed during inspection")
+                    else:
+                        status = enrollment_status(root, verify_inventory=True)
+                        if status["state"] != "enrolled":
+                            raise HandoverError("root enrollment or ledger inventory changed")
+            else:
+                heads = build_head_inventory(root)
+            print(
+                json.dumps(
+                    {
+                        "state": status["state"],
+                        "heads": heads,
+                        "inventory_digest": inventory_digest(heads),
+                        "operator_attestation": OPERATOR_ATTESTATION,
+                    },
+                    sort_keys=True,
+                    indent=2,
+                )
+            )
+            return
+
+        if args.handover_action == "enroll-fresh":
+            record = enroll_fresh(root)
+        else:
+            record = migrate_existing(
+                root,
+                expected_inventory_digest=args.inventory_digest,
+                operator_attestation=args.operator_attestation,
+            )
+    except Exception as exc:
+        parser.error(f"offline handover failed ({type(exc).__name__}): {exc}")
+    print(
+        json.dumps(
+            {
+                "state": "enrolled",
+                "mode": record["mode"],
+                "inventory_digest": record["inventory_digest"],
+            },
+            sort_keys=True,
+        )
+    )
+
+
+@contextmanager
+def _paper_writer_admission() -> Iterator[tuple[RootContext, object] | None]:
+    from hedge_fund.runtime.admission import (
+        AdmissionCoordinator,
+        AdmissionError,
+        RootOwnerLease,
+    )
+    from hedge_fund.runtime.handover import (
+        enrollment_status,
+        HandoverError,
+        verify_root_inventory,
+    )
+
+    root = paths.root_context()
+    status = enrollment_status(root, verify_inventory=True)
+    if status["state"] == "unenrolled":
+        yield None
+        return
+    if status["state"] != "enrolled":
+        raise PaperWriterDenied("Paper writes are blocked by root enrollment or ledger drift.")
+
+    owner = None
+    try:
+        owner = RootOwnerLease.acquire(root, timeout=0)
+        admission = AdmissionCoordinator(root, owner_lease=owner)
+        verify_root_inventory(root)
+    except (AdmissionError, HandoverError, OSError, RootPathError, ValueError) as exc:
+        if owner is not None:
+            owner.close()
+        raise PaperWriterDenied("Paper writes are blocked because root admission is unavailable.") from exc
+    try:
+        yield root, admission
+    finally:
+        owner.close()
+
+
+@contextmanager
+def _paper_lane(participant, name: str, lane: str) -> Iterator[None]:
+    if participant is None:
+        yield
+        return
+    if lane not in {"deployment_lock", "manual_session", "control_lane"}:
+        raise ValueError("paper admission lane is invalid")
+    _root, admission = participant
+    try:
+        with getattr(admission, lane)(name, timeout=0):
+            yield
+    except Exception as exc:
+        from hedge_fund.runtime.admission import AdmissionError
+
+        if isinstance(exc, AdmissionError):
+            raise PaperWriterDenied(f"Paper {lane.replace('_', ' ')} is busy or unavailable.") from exc
+        raise
+
+
+def _verify_enrolled_inventory(participant) -> None:
+    if participant is None:
+        return
+    from hedge_fund.runtime.handover import HandoverError, verify_root_inventory
+
+    root, _admission = participant
+    try:
+        verify_root_inventory(root)
+    except HandoverError as exc:
+        raise PaperWriterDenied("Paper writes are blocked by ledger inventory drift.") from exc
+
+
+def _verify_enrolled_head(participant, name: str) -> None:
+    if participant is None:
+        return
+    from hedge_fund.runtime.handover import HandoverError, verify_ledger_head
+
+    root, _admission = participant
+    try:
+        verify_ledger_head(root, name)
+    except HandoverError as exc:
+        raise PaperWriterDenied("Paper writes are blocked by ledger head drift.") from exc
+
+
+def _record_enrolled_head(participant, name: str) -> None:
+    if participant is None:
+        return
+    from hedge_fund.runtime.handover import HandoverError, record_ledger_head
+
+    root, admission = participant
+    try:
+        record_ledger_head(root, name, admission=admission)
+    except HandoverError as exc:
+        raise PaperWriterDenied("Paper ledger head could not be recorded safely.") from exc
+
+
+def _run_cli_tick(
+    directory: Path,
+    name: str,
+    deployed,
+    console: Console,
+    *,
+    session: str | None,
+    again: bool,
+    participant,
+):
+    def execute():
+        _verify_enrolled_head(participant, name)
+        with make_data_client() as raw:
+            data = CachedDataClient(raw, live=deployed.spec.is_intraday)
+            verb = "running the latest session again" if again else "advancing one session"
+            with console.status(
+                f"[cyan]{deployed.name}: {verb} over {', '.join(deployed.universe)}…",
+                spinner="dots",
+            ):
+                return redo(directory, data, build_fund=None) if again else tick(directory, data, session=session)
+
+    if participant is None:
+        return execute()
+    with _paper_lane(participant, name, "manual_session"):
+        record = execute()
+    _record_enrolled_head(participant, name)
+    return record
 
 
 # ---------------------------------------------------------------------------
@@ -412,7 +646,14 @@ def _paper(args, parser: argparse.ArgumentParser, console: Console) -> None:
         if args.approval:
             spec = spec.model_copy(update={"approval_required": True})
         try:
-            directory = deploy(args.name, spec, universe, root=PAPER_DIR)
+            with _paper_writer_admission() as participant:
+                if participant is None:
+                    directory = deploy(args.name, spec, universe, root=PAPER_DIR)
+                else:
+                    with _paper_lane(participant, args.name, "deployment_lock"):
+                        _verify_enrolled_inventory(participant)
+                        directory = deploy(args.name, spec, universe, root=PAPER_DIR)
+                    _record_enrolled_head(participant, args.name)
         except FileExistsError as exc:
             parser.error(str(exc))
         cadence = f"{spec.cadence_label}, {spec.window.label}" if spec.is_intraday else spec.cadence_label
@@ -431,14 +672,16 @@ def _paper(args, parser: argparse.ArgumentParser, console: Console) -> None:
 
     if args.action == "tick":
         deployed = load_deployed(directory)
-        with make_data_client() as raw:
-            fd = CachedDataClient(raw, live=deployed.spec.is_intraday)
-            verb = "running the latest session again" if args.again else "advancing one session"
-            with console.status(
-                f"[cyan]{deployed.name}: {verb} over {', '.join(deployed.universe)}…",
-                spinner="dots",
-            ):
-                record = redo(directory, fd, build_fund=None) if args.again else tick(directory, fd, session=args.session)
+        with _paper_writer_admission() as participant:
+            record = _run_cli_tick(
+                directory,
+                args.name,
+                deployed,
+                console,
+                session=args.session,
+                again=args.again,
+                participant=participant,
+            )
         print(record.model_dump_json(indent=2))
         console.print(_tick_summary(deployed.name, record))
         return
@@ -454,20 +697,26 @@ def _paper(args, parser: argparse.ArgumentParser, console: Console) -> None:
             detail = fields.get("reason") or (f"{fields.get('bars_skipped')} bars skipped" if "bars_skipped" in fields else "")
             console.print(f"[yellow]{kind}[/] {fields.get('from') or 'start'} → {fields.get('to')}  {detail}".rstrip())
 
-        with make_data_client() as raw:
-            try:
-                serve(directory, CachedDataClient(raw, live=spec.is_intraday), on_record=lambda record: console.print(_tick_summary(deployed.name, record)), on_event=_event)
-            except RuntimeError as exc:  # already running
-                console.print(f"[red]{exc}[/]")
-                sys.exit(1)
+        with _paper_writer_admission() as participant:
+            if participant is not None:
+                raise PaperWriterDenied("Legacy paper runners are disabled on enrolled roots; use the owned runner.")
+            with make_data_client() as raw:
+                try:
+                    serve(directory, CachedDataClient(raw, live=spec.is_intraday), on_record=lambda record: console.print(_tick_summary(deployed.name, record)), on_event=_event)
+                except RuntimeError as exc:  # already running
+                    console.print(f"[red]{exc}[/]")
+                    sys.exit(1)
         console.print(f"[dim]{deployed.name} stopped[/]")
         return
 
     if args.action == "stop":
-        if stop_runner(directory):
-            console.print(f"[green]{args.name}[/] asked to stop; it finishes the session in flight first")
-        else:
-            console.print(f"[dim]{args.name} is not running[/]")
+        with _paper_writer_admission() as participant:
+            if participant is not None:
+                raise PaperWriterDenied("Legacy runner control is disabled on enrolled roots; use the owned runner.")
+            if stop_runner(directory):
+                console.print(f"[green]{args.name}[/] asked to stop; it finishes the session in flight first")
+            else:
+                console.print(f"[dim]{args.name} is not running[/]")
         return
 
     if args.action == "status":
@@ -508,40 +757,51 @@ def _paper(args, parser: argparse.ArgumentParser, console: Console) -> None:
     if args.action in {"approve", "reject"}:
         deployed = load_deployed(directory)
         ledger = Ledger(directory)
-        state = ledger.replay(deployed.spec.capital)
-        if state.halted is not None:
-            raise FundHalted(f"{args.name} is halted: {state.halted}")
-        if not deployed.spec.approval_required:
-            parser.error(f"approval gate is not enabled for '{args.name}'")
-        if state.pending is None:
-            parser.error(f"nothing is awaiting approval for '{args.name}'")
-        if state.prev_hash is None:
-            parser.error(f"pending decision for '{args.name}' has no source record hash")
-        ledger.set_approval(args.action, state.pending.as_of, state.prev_hash, "cli")
-        if args.action == "approve":
-            console.print(f"[green]{args.name}[/] approved decision from {state.pending.as_of}")
-        else:
-            console.print(f"[yellow]{args.name}[/] rejected decision from {state.pending.as_of}")
-        if args.action == "approve" and args.now:
-            try:
-                with make_data_client() as raw:
-                    fd = CachedDataClient(raw, live=deployed.spec.is_intraday)
-                    with console.status(f"[cyan]{deployed.name}: advancing one session…", spinner="dots"):
-                        record = tick(directory, fd)
-            except NothingDue:
-                console.print(f"{args.name}: will execute at the next close")
-                return
-            print(record.model_dump_json(indent=2))
-            console.print(_tick_summary(deployed.name, record))
+        with _paper_writer_admission() as participant:
+            with _paper_lane(participant, args.name, "control_lane"):
+                _verify_enrolled_head(participant, args.name)
+                state = ledger.replay(deployed.spec.capital)
+                if state.halted is not None:
+                    raise FundHalted(f"{args.name} is halted: {state.halted}")
+                if not deployed.spec.approval_required:
+                    parser.error(f"approval gate is not enabled for '{args.name}'")
+                if state.pending is None:
+                    parser.error(f"nothing is awaiting approval for '{args.name}'")
+                if state.prev_hash is None:
+                    parser.error(f"pending decision for '{args.name}' has no source record hash")
+                ledger.set_approval(args.action, state.pending.as_of, state.prev_hash, "cli")
+            if args.action == "approve":
+                console.print(f"[green]{args.name}[/] approved decision from {state.pending.as_of}")
+            else:
+                console.print(f"[yellow]{args.name}[/] rejected decision from {state.pending.as_of}")
+            if args.action == "approve" and args.now:
+                try:
+                    record = _run_cli_tick(
+                        directory,
+                        args.name,
+                        deployed,
+                        console,
+                        session=None,
+                        again=False,
+                        participant=participant,
+                    )
+                except NothingDue:
+                    console.print(f"{args.name}: will execute at the next close")
+                    return
+                print(record.model_dump_json(indent=2))
+                console.print(_tick_summary(deployed.name, record))
         return
 
     ledger = Ledger(directory)
-    if args.action == "halt":
-        ledger.halt(args.reason)
-        console.print(f"[red]{args.name} halted:[/] {args.reason}")
-    elif args.action == "resume":
-        ledger.resume()
-        console.print(f"[green]{args.name} resumed[/]")
+    with _paper_writer_admission() as participant:
+        with _paper_lane(participant, args.name, "control_lane"):
+            _verify_enrolled_head(participant, args.name)
+            if args.action == "halt":
+                ledger.halt(args.reason)
+                console.print(f"[red]{args.name} halted:[/] {args.reason}")
+            elif args.action == "resume":
+                ledger.resume()
+                console.print(f"[green]{args.name} resumed[/]")
 
 
 def _status_line(directory: Path) -> str:

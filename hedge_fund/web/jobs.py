@@ -132,7 +132,6 @@ class OperationJobRegistry:
             if self._closed:
                 return
             self._closed = True
-            self._shutdown_requested.set()
             operation_ids = tuple(self._submitted)
             futures = tuple(future for future in self._submitted.values() if future is not None)
         for operation_id in operation_ids:
@@ -149,6 +148,7 @@ class OperationJobRegistry:
                     )
             except Exception:
                 pass
+        self._shutdown_requested.set()
         for future in futures:
             future.cancel()
         self._executor.shutdown(wait=True, cancel_futures=True)

@@ -86,6 +86,137 @@ def test_cli_requires_explicit_root(monkeypatch, capsys):
     assert "--root" in capsys.readouterr().err
 
 
+def test_offline_handover_cli_skips_runtime_and_mandate_setup(tmp_path, monkeypatch, capsys):
+    root = tmp_path / "fresh-root"
+    root.mkdir()
+    monkeypatch.setattr(run, "PAPER_DIR", root / "paper")
+    forbidden = Mock(side_effect=AssertionError("offline handover initialized the engine"))
+    monkeypatch.setattr(run, "_load_runtime", forbidden)
+    monkeypatch.setattr(run, "ensure_mandates_dir", forbidden)
+    monkeypatch.setattr(paths, "load_root_dotenv", forbidden)
+
+    _main(monkeypatch, "handover", "enroll-fresh")
+
+    enrolled = json.loads(capsys.readouterr().out)
+    assert enrolled["state"] == "enrolled"
+    assert enrolled["mode"] == "fresh"
+    assert (root / "runtime" / "private" / "v1" / "handover.json").is_file()
+    assert not (root / "mandates").exists()
+    assert forbidden.call_count == 0
+
+
+def test_cli_writer_admission_rejects_missing_handover_with_admission_artifacts(
+    tmp_path,
+    monkeypatch,
+):
+    from hedge_fund.runtime.handover import enroll_fresh, HANDOVER_PATH
+    from hedge_fund.runtime.root import RootContext
+
+    root = tmp_path / "former-enrolled-root"
+    root.mkdir()
+    with RootContext.open(root) as context:
+        enroll_fresh(context)
+        (root / HANDOVER_PATH).unlink()
+        monkeypatch.setattr(paths, "root_context", lambda: context)
+
+        with pytest.raises(run.PaperWriterDenied, match="blocked"):
+            with run._paper_writer_admission():
+                pytest.fail("orphaned admission state entered legacy writer mode")
+
+
+def test_handover_cli_inspects_then_migrates_with_exact_attestation(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    root = tmp_path / "legacy-root"
+    root.mkdir()
+    (root / "mandates").mkdir()
+    monkeypatch.setattr(run, "PAPER_DIR", root / "paper")
+    forbidden = Mock(side_effect=AssertionError("offline handover initialized the engine"))
+    monkeypatch.setattr(run, "_load_runtime", forbidden)
+    monkeypatch.setattr(paths, "load_root_dotenv", forbidden)
+
+    _main(monkeypatch, "handover", "inspect")
+    inspection = json.loads(capsys.readouterr().out)
+    assert inspection["state"] == "unenrolled"
+    assert inspection["heads"] == {}
+    assert inspection["inventory_digest"]
+    assert inspection["operator_attestation"]
+
+    _main(
+        monkeypatch,
+        "handover",
+        "migrate-existing",
+        "--inventory-digest",
+        inspection["inventory_digest"],
+        "--operator-attestation",
+        inspection["operator_attestation"],
+    )
+    migrated = json.loads(capsys.readouterr().out)
+    assert migrated["state"] == "enrolled"
+    assert migrated["mode"] == "migrate-existing"
+    assert migrated["inventory_digest"] == inspection["inventory_digest"]
+    assert forbidden.call_count == 0
+
+
+def test_handover_inspects_orphaned_admission_for_explicit_offline_recovery(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    from hedge_fund.runtime.handover import enroll_fresh, HANDOVER_PATH
+    from hedge_fund.runtime.root import RootContext
+
+    root = tmp_path / "orphaned-admission-root"
+    root.mkdir()
+    with RootContext.open(root) as context:
+        enroll_fresh(context)
+        (root / HANDOVER_PATH).unlink()
+    monkeypatch.setattr(run, "PAPER_DIR", root / "paper")
+
+    _main(monkeypatch, "handover", "inspect")
+    inspection = json.loads(capsys.readouterr().out)
+    assert inspection["state"] == "invalid"
+    assert inspection["heads"] == {}
+    assert inspection["inventory_digest"]
+    assert not (root / HANDOVER_PATH).exists()
+
+    _main(
+        monkeypatch,
+        "handover",
+        "migrate-existing",
+        "--inventory-digest",
+        inspection["inventory_digest"],
+        "--operator-attestation",
+        inspection["operator_attestation"],
+    )
+    migrated = json.loads(capsys.readouterr().out)
+    assert migrated["state"] == "enrolled"
+    assert migrated["mode"] == "migrate-existing"
+
+
+def test_handover_cli_refuses_any_legacy_runner_pid_without_signaling(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    root = tmp_path / "legacy-root"
+    runner = root / "paper" / "alpha" / "runner.pid"
+    runner.parent.mkdir(parents=True)
+    runner.write_text("stale-or-unknown", encoding="utf-8")
+    before = runner.read_bytes()
+    monkeypatch.setattr(run, "PAPER_DIR", root / "paper")
+
+    with pytest.raises(SystemExit) as exc:
+        _main(monkeypatch, "handover", "inspect")
+
+    assert exc.value.code == 2
+    assert "runner.pid" in capsys.readouterr().err
+    assert runner.read_bytes() == before
+    assert not (root / "runtime" / "private" / "v1" / "handover.json").exists()
+
+
 def test_documented_cli_examples_include_explicit_root():
     commands = [
         line.strip()
@@ -412,6 +543,64 @@ def test_paper_flow_create_tick_status_halt_resume(tmp_path, monkeypatch, capsys
     assert exc.value.code == 2 and "no paper fund named 'nobody'" in capsys.readouterr().err
 
 
+def test_enrolled_cli_tick_lane_conflict_leaves_ledger_unchanged(
+    tmp_path,
+    owned_test_process,
+):
+    from hedge_fund.paper.deployed import deploy
+    from hedge_fund.runtime.admission import AdmissionCoordinator, RootOwnerLease
+    from hedge_fund.runtime.handover import (
+        build_head_inventory,
+        enroll_fresh,
+        record_ledger_head,
+    )
+    from hedge_fund.runtime.root import RootContext
+
+    root = Path(os.environ["HEDGE_FUND_TEST_ROOT"]) / "cli-tick-conflict"
+    root.mkdir()
+    spec = FundSpec(
+        schema_version=2,
+        name="alpha",
+        strategies=[custom_strategy(["buffett"])],
+        risk={"max_position_pct": 0.25, "max_gross_exposure": 1},
+    )
+    result_path = root.parent / "cli-tick-result.txt"
+    with RootContext.open(root) as context:
+        enroll_fresh(context)
+        owner = RootOwnerLease.acquire(context, timeout=0)
+        admission = AdmissionCoordinator(context, owner_lease=owner)
+        try:
+            with admission.deployment_lock("alpha", timeout=0):
+                directory = deploy("alpha", spec, ["AAPL"], root=root / "paper")
+            record_ledger_head(context, "alpha", admission=admission)
+            before_inventory = build_head_inventory(context)
+            before_files = {path.relative_to(directory).as_posix(): path.read_bytes() for path in directory.rglob("*") if path.is_file()}
+            script = "\n".join(
+                [
+                    "import sys",
+                    "from pathlib import Path",
+                    "from hedge_fund import run",
+                    f"sys.argv = ['aihf', '--root', {str(root)!r}, 'paper', 'tick', 'alpha']",
+                    "try:",
+                    "    run.main()",
+                    "except SystemExit as exc:",
+                    f"    Path({str(result_path)!r}).write_text(str(exc.code), encoding='utf-8')",
+                    "else:",
+                    f"    Path({str(result_path)!r}).write_text('returned', encoding='utf-8')",
+                ]
+            )
+            with admission.manual_session("alpha", timeout=0):
+                child = owned_test_process(script)
+                assert child.wait(timeout=20) == 0
+        finally:
+            owner.close()
+
+        assert result_path.read_text(encoding="utf-8") == "1"
+        assert build_head_inventory(context) == before_inventory
+        after_files = {path.relative_to(directory).as_posix(): path.read_bytes() for path in directory.rglob("*") if path.is_file()}
+        assert after_files == before_files
+
+
 def test_cli_resolves_relative_mandate_under_root(tmp_path, monkeypatch, capsys, offline):
     root_mandate = tmp_path / "mandates"
     root_mandate.mkdir()
@@ -514,7 +703,8 @@ def test_paper_minute_fund_ticks_and_runs_like_a_daily_one(tmp_path, monkeypatch
     assert "fast" in err and "every 30s" in err and "gap start → 2025-01-07T09:30:00  3 bars skipped" in err
     assert "stopped" in err
 
-    (seen["pid"]).write_text(str(os.getpid()))
+    (seen["pid"]).write_text("test-owned")
+    monkeypatch.setattr(run, "is_running", lambda _directory: True)
     _main(monkeypatch, "paper", "list")
     assert "running" in capsys.readouterr().out
     monkeypatch.setattr(run, "stop_runner", lambda directory: True)

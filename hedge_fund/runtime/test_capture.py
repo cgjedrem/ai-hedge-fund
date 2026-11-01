@@ -1,9 +1,11 @@
+import os
 from dataclasses import FrozenInstanceError, replace
+from pathlib import Path
 
 import pytest
 
 from hedge_fund.runtime.admission import AdmissionCoordinator, RootOwnerLease
-from hedge_fund.runtime.capture import CredentialHandle, freeze_capture
+from hedge_fund.runtime.capture import CredentialHandle, freeze_capture, FrozenCapture
 from hedge_fund.runtime.configuration import (
     build_child_environment,
     child_root_arguments,
@@ -14,6 +16,7 @@ from hedge_fund.runtime.configuration import (
     save_settings,
     SettingsConflict,
 )
+from hedge_fund.runtime.handover import enroll_fresh
 from hedge_fund.runtime.root import RootContext
 
 
@@ -27,7 +30,7 @@ def root_context(tmp_path):
 
 @pytest.fixture
 def root_owner(root_context):
-    root_context.prepare_private_storage()
+    enroll_fresh(root_context)
     owner = RootOwnerLease.acquire(root_context)
     try:
         yield AdmissionCoordinator(root_context, owner_lease=owner)
@@ -289,6 +292,37 @@ def test_frozen_capture_copies_versions_and_redacts_private_references(root_cont
         CredentialHandle(root_id="invalid", provider_id="openai", version=4)
 
 
+def test_frozen_capture_restores_only_verified_root_private_bytes(root_context, tmp_path):
+    settings = resolve_settings(
+        root_context,
+        launch={"data_provider": "yfinance", "model": "gemma3:4b"},
+    )
+    capture = freeze_capture(
+        root=root_context,
+        subject_id="alpha",
+        mandate_digest="b" * 64,
+        universe=("AAA",),
+        broker="paper",
+        settings=settings,
+        credential_versions={},
+        code_version="synthetic-code-stamp",
+    )
+
+    restored = FrozenCapture.from_private_bytes(root_context, capture.private_bytes())
+    assert restored == capture
+
+    with pytest.raises(ConfigurationError):
+        other = tmp_path / "other"
+        other.mkdir()
+        with RootContext.open(other) as other_root:
+            FrozenCapture.from_private_bytes(other_root, capture.private_bytes())
+    with pytest.raises(ConfigurationError):
+        FrozenCapture.from_private_bytes(
+            root_context,
+            capture.private_bytes().replace(b"gemma3:4b", b"tampered-model"),
+        )
+
+
 def test_capture_rejects_casefolded_duplicate_credential_providers(root_context):
     settings = resolve_settings(root_context)
 
@@ -314,6 +348,7 @@ def test_child_environment_isolated_and_root_bound(root_context, tmp_path):
     inherited = {
         "PATH": "synthetic-path",
         "SystemRoot": "synthetic-system-root",
+        "COMPUTERNAME": "synthetic-host",
         "OPENAI_API_KEY": "synthetic-secret-value",
         "HEDGE_FUND_ROOT": str(decoy_root),
         "AIHF_ROOT": str(decoy_root),
@@ -338,6 +373,10 @@ def test_child_environment_isolated_and_root_bound(root_context, tmp_path):
     assert child["HEDGE_FUND_LLM_MODEL"] == "local-model"
     assert child["PATH"] == "synthetic-path"
     assert child["SystemRoot"] == "synthetic-system-root"
+    if os.name == "nt":
+        assert child["COMPUTERNAME"] == "synthetic-host"
+    else:
+        assert "COMPUTERNAME" not in child
     assert "--root" in child_root_arguments(root_context)
     assert str(root_context.path) in child_root_arguments(root_context)
     assert "OPENAI_API_KEY" not in child
@@ -355,3 +394,32 @@ def test_child_environment_isolated_and_root_bound(root_context, tmp_path):
             settings=settings,
             inherited_environment=inherited,
         )
+
+
+def test_owned_child_environment_carries_network_guard_without_secrets(root_context):
+    settings = resolve_settings(
+        root_context,
+        launch={
+            "data_provider": "yfinance",
+            "llm_provider": "Ollama",
+            "model": "gemma3:4b",
+            "endpoint": "http://127.0.0.1:11434",
+        },
+    )
+    inherited = os.environ.copy()
+    inherited["OPENAI_API_KEY"] = "synthetic-secret"
+    child = build_child_environment(
+        root_context,
+        child_id="guard-probe",
+        settings=settings,
+        inherited_environment=inherited,
+    )
+
+    test_root = Path(inherited["HEDGE_FUND_TEST_ROOT"])
+    assert "OPENAI_API_KEY" not in child
+    assert "synthetic-secret" not in child.values()
+    assert child["HEDGE_FUND_TEST_MODE"] == "1"
+    assert child["HEDGE_FUND_TEST_BLOCK_LOOPBACK"] == "1"
+    assert Path(child["HOME"]).is_relative_to(test_root)
+    assert child["HEDGE_FUND_TEST_CHILD_HOME"] == child["HOME"]
+    assert "test_support" in child["PYTHONPATH"]

@@ -31,6 +31,20 @@ from hedge_fund.tui.palette import BRIGHT, CYAN, GREEN, MUTED, RED, TEXT
 from hedge_fund.tui.shared import cadence_identity, MODE_LABELS, strategy_description
 
 
+def paper_write_denial() -> str | None:
+    from hedge_fund.runtime.handover import enrollment_status
+
+    try:
+        status = enrollment_status(paths.root_context(), verify_inventory=True)
+    except Exception:
+        return "Paper writes are blocked because root enrollment cannot be verified."
+    if status["state"] == "unenrolled":
+        return None
+    if status["state"] == "enrolled":
+        return "TUI paper writes are disabled on enrolled roots; use the web desk."
+    return "Paper writes are blocked because root enrollment or ledger inventory is unavailable."
+
+
 class FundSelectScreen(Screen):
     """'Backtest a mandate', master-detail: mandate slots on the left, the
     highlighted mandate's latest backtest stats and its backtest history
@@ -290,6 +304,9 @@ def wipe_fund(name: str) -> None:
     backtest results, and the paper fund — ledger, book, events — if one was
     deployed. Called only after the user has said yes to `ConfirmWipeScreen`,
     whether to delete the fund or to let a new one take its name."""
+    denial = paper_write_denial()
+    if denial is not None:
+        raise RuntimeError(denial)
     (paths.MANDATES_DIR / f"{name}.yaml").unlink(missing_ok=True)
     for receipt in receipts(name):
         receipt.unlink(missing_ok=True)

@@ -199,7 +199,7 @@ class RunnerAuthorization:
         _validate_expiry_value(self.expires_at)
         if not isinstance(self.provider_ids, tuple) or not self.provider_ids or any(not isinstance(value, str) or not value for value in self.provider_ids) or len(set(self.provider_ids)) != len(self.provider_ids):
             raise ValueError("runner providers are invalid")
-        if not isinstance(self.initial_due_set, tuple) or not self.initial_due_set or any(not isinstance(value, str) or not _safe_text(value, maximum=256) for value in self.initial_due_set) or len(set(self.initial_due_set)) != len(self.initial_due_set):
+        if not isinstance(self.initial_due_set, tuple) or any(not isinstance(value, str) or not _safe_text(value, maximum=256) for value in self.initial_due_set) or len(set(self.initial_due_set)) != len(self.initial_due_set):
             raise ValueError("runner due-set is invalid")
         if type(self.max_sessions) is not int or self.max_sessions <= 0 or type(self.max_calls) is not int or self.max_calls <= 0 or type(self.max_resources) is not int or self.max_resources <= 0:
             raise ValueError("runner bounds are invalid")
@@ -287,7 +287,7 @@ def authorize_session(
     state = authorization._state
     with state.session_lock:
         next_session = authorization.sessions_started + 1
-        if next_session == 1 and due_set != authorization.initial_due_set:
+        if next_session == 1 and authorization.initial_due_set and due_set != authorization.initial_due_set:
             raise AuthorizationDenied("reviewed due-set changed")
         if next_session > authorization.max_sessions:
             raise AuthorizationDenied("runner session bound exhausted")
@@ -362,7 +362,8 @@ def authorize_dispatch(
         capture_digest=capture_digest,
         now=now,
     )
-    if runner.sessions_started <= 0 or target.identity not in runner.provider_ids:
+    preflight_data = runner.sessions_started == 0 and target.kind == "data" and provider_class is ProviderClass.FREE_DATA
+    if (runner.sessions_started <= 0 and not preflight_data) or target.identity not in runner.provider_ids:
         raise AuthorizationDenied("runner provider is not authorized")
     runner._state.budget.reserve(
         upper_bound_cost=Decimal("0"),

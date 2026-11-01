@@ -50,6 +50,7 @@ from hedge_fund.tui.funds import (
     ConfirmWipeScreen,
     fund_name_taken,
     newest_paper_universe,
+    paper_write_denial,
     short_tickers,
     wipe_fund,
 )
@@ -498,6 +499,11 @@ class BuilderScreen(Screen):
     # ---- finish -----------------------------------------------------------
 
     def _finish_build(self) -> None:
+        if self.mode == "paper":
+            denial = paper_write_denial()
+            if denial is not None:
+                self.notify(denial, severity="warning")
+                return
         # Equal capital slices; master risk defaults. Power users edit the YAML.
         intraday = self._state["rebalance"] == "minute"
         spec = FundSpec(

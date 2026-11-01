@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 
 from hedge_fund.paper.deployed import load_deployed
 from hedge_fund.paper.ledger import Ledger
+from hedge_fund.test_support.handover import enroll_synthetic_root
 from hedge_fund.web.app import create_app
 from hedge_fund.web.schemas import DeployRequest
 from hedge_fund.web.services import DeskService, ServiceError
@@ -72,6 +73,18 @@ def test_service_revalidates_its_bound_root_before_storage_access(tmp_path):
         service.close()
 
 
+def test_read_only_enrolled_service_reports_explicit_write_denial(demo_root):
+    service = DeskService(demo_root, allow_writes=False)
+    try:
+        capabilities = service.capabilities(None)
+    finally:
+        service.close()
+
+    assert capabilities["enrollment_state"] == "enrolled"
+    assert capabilities["writes"] is False
+    assert capabilities["write_unavailable_reason"] == "write-capability-disabled"
+
+
 def test_catalog_preserves_canonical_library_models_and_blend(demo_root):
     service = DeskService(demo_root)
     strategies = {item["name"]: item for item in service.catalog()["strategies"]}
@@ -118,6 +131,7 @@ def test_deploy_resolves_yml_file_by_spec_name(demo_root, tmp_path):
     directory = tmp_path / "mandates"
     directory.mkdir()
     (directory / "legacy-file.yml").write_text(yaml.safe_dump(payload), encoding="utf-8")
+    enroll_synthetic_root(tmp_path)
     service = DeskService(tmp_path, allow_writes=True)
 
     deployed = service.deploy_mandate("legacy-mandate", DeployRequest(universe=["AAPL"]))
@@ -144,6 +158,7 @@ def test_create_mandate_rejects_duplicate_canonical_name(demo_root, tmp_path, ex
     existing.write_text(original, encoding="utf-8")
     requested = dict(payload)
     requested["name"] = requested_name
+    enroll_synthetic_root(tmp_path)
     service = DeskService(tmp_path, allow_writes=True)
 
     try:
@@ -189,8 +204,18 @@ def test_mandate_detail_keeps_invalid_exact_file_error(tmp_path):
 
 
 def test_corrupt_ledger_is_reported_instead_of_becoming_an_empty_valid_snapshot(demo_root):
+    from hedge_fund.runtime.admission import AdmissionCoordinator, RootOwnerLease
+    from hedge_fund.runtime.root import RootContext
+
     ledger = Ledger(demo_root / "paper" / "demo-quality")
-    ledger.halt("preserve control state")
+    with RootContext.open(demo_root) as context:
+        owner = RootOwnerLease.acquire(context, timeout=0)
+        admission = AdmissionCoordinator(context, owner_lease=owner)
+        try:
+            with admission.control_lane("demo-quality", timeout=0):
+                ledger.halt("preserve control state")
+        finally:
+            owner.close()
     path = demo_root / "paper" / "demo-quality" / "ledger" / "2024-06-04.json"
     payload = json.loads(path.read_text(encoding="utf-8"))
     payload["cash"] = 1
@@ -258,8 +283,9 @@ def test_session_report_returns_the_record_verified_during_replay(demo_root, mon
                 return record.model_copy(update={"nav": -1})
         return record
 
+    app = create_app(root=demo_root, demo=True)
     monkeypatch.setattr(Ledger, "read", swap_on_reread)
-    with TestClient(create_app(root=demo_root, demo=True)) as client:
+    with TestClient(app) as client:
         response = client.get(
             f"/api/paper/demo-quality/sessions/{target_session}",
             headers={"host": "127.0.0.1"},
@@ -288,8 +314,8 @@ def test_paper_snapshot_uses_records_captured_by_the_verified_replay(demo_root, 
             swapped = True
         return record
 
-    monkeypatch.setattr(Ledger, "read", swap_after_verified_read)
     service = DeskService(demo_root)
+    monkeypatch.setattr(Ledger, "read", swap_after_verified_read)
     try:
         snapshot = service._paper_snapshot(load_deployed(directory), directory)
     finally:

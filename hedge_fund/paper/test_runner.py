@@ -72,6 +72,32 @@ def _tape(now):
     return Tape(path, now=now)
 
 
+def test_legacy_runner_rejects_missing_handover_with_admission_artifacts(
+    tmp_path,
+    monkeypatch,
+):
+    from hedge_fund.runtime.handover import enroll_fresh, HANDOVER_PATH
+    from hedge_fund.runtime.root import RootContext
+
+    root = tmp_path / "former-enrolled-root"
+    root.mkdir()
+    directory = root / "paper" / "alpha"
+    with RootContext.open(root) as context:
+        enroll_fresh(context)
+        directory.mkdir(parents=True)
+        (root / HANDOVER_PATH).unlink()
+        monkeypatch.setattr(
+            runner_module,
+            "load_deployed",
+            lambda *_args, **_kwargs: pytest.fail(
+                "legacy runner reached deployed-fund loading",
+            ),
+        )
+
+        with pytest.raises(RuntimeError, match="Legacy paper runner is disabled"):
+            runner_module.run(directory, object())
+
+
 class Loop:
     """Drives `run`: sleeping moves the fake clock; stops after N records,
     or when the clock passes *until* (a runaway loop in a test ends there)."""
@@ -367,6 +393,14 @@ def test_serve_holds_a_pid_file_and_stops_on_sigterm(
     tmp_path, monkeypatch, owned_test_process
 ):
     directory = deploy("bars", _spec(), ["AAPL"], root=tmp_path)
+    active_pid = {"value": None}
+
+    def safe_is_running(path):
+        pid = runner_module._read_pid(path)
+        return pid is not None and pid == active_pid["value"]
+
+    monkeypatch.setattr(runner_module, "is_running", safe_is_running)
+    monkeypatch.setattr(sys.modules[__name__], "is_running", safe_is_running)
     assert not is_running(directory) and not stop_runner(directory)
     (directory / PID_FILE).write_text("999999999")
     assert not is_running(directory)  # a stale pid is not a runner
@@ -388,6 +422,7 @@ def test_serve_holds_a_pid_file_and_stops_on_sigterm(
 
     monkeypatch.setattr(runner, "run", quick)
 
+    active_pid["value"] = os.getpid()
     serve(directory, _tape(_at(DAY, "12:59:00")))
     assert seen == {"pid": os.getpid(), "running": True, "stopped": True}
     assert not (directory / PID_FILE).exists() and not is_running(directory)
@@ -396,10 +431,12 @@ def test_serve_holds_a_pid_file_and_stops_on_sigterm(
     # this process is a stale incarnation (pid reuse across container
     # restarts) and must not block a start.
     sleeper = owned_test_process("import time; time.sleep(30)")
+    active_pid["value"] = sleeper.pid
     (directory / PID_FILE).write_text(str(sleeper.pid))
     with pytest.raises(RuntimeError, match="already running"):
         serve(directory, _tape(_at(DAY, "12:59:00")))
     assert sleeper.poll() is None
+    active_pid["value"] = os.getpid()
     (directory / PID_FILE).write_text(str(os.getpid()))
     serve(directory, _tape(_at(DAY, "12:59:00")))
 
@@ -449,4 +486,45 @@ def test_spawn_runner_rejects_root_mismatch_before_launch(tmp_path, monkeypatch)
     with pytest.raises(ValueError, match="outside the configured root"):
         runner_module.spawn_runner(directory, root=tmp_path / "other")
 
+    assert not (directory / "runner.log").exists()
+
+
+def test_enrolled_root_blocks_legacy_runner_start_and_pid_signaling(tmp_path, monkeypatch):
+    from hedge_fund.runtime.admission import AdmissionCoordinator, RootOwnerLease
+    from hedge_fund.runtime.handover import enroll_fresh, record_ledger_head
+    from hedge_fund.runtime.root import RootContext
+
+    root = tmp_path / "root"
+    root.mkdir()
+    with RootContext.open(root) as context:
+        enroll_fresh(context)
+        owner = RootOwnerLease.acquire(context, timeout=0)
+        admission = AdmissionCoordinator(context, owner_lease=owner)
+        try:
+            with admission.deployment_lock("alpha", timeout=0):
+                directory = deploy("alpha", _spec(name="alpha"), ["AAPL"], root=root / "paper")
+            record_ledger_head(context, "alpha", admission=admission)
+        finally:
+            owner.close()
+
+    pid_file = directory / PID_FILE
+    pid_file.write_text("999999999", encoding="utf-8")
+    pid_before = pid_file.read_bytes()
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("legacy runner attempted process control")
+
+    monkeypatch.setattr(runner_module.subprocess, "Popen", forbidden)
+    monkeypatch.setattr(runner_module.os, "kill", forbidden)
+
+    with pytest.raises(RuntimeError, match="Legacy paper runner"):
+        runner_module.spawn_runner(directory, root=root)
+    with pytest.raises(RuntimeError, match="Legacy paper runner"):
+        runner_module.serve(directory, _tape(_at(DAY, "13:00:00")))
+    with pytest.raises(RuntimeError, match="Legacy paper runner"):
+        runner_module.stop_runner(directory)
+    with pytest.raises(RuntimeError, match="Legacy paper runner"):
+        runner_module.run(directory, _tape(_at(DAY, "13:00:00")))
+
+    assert pid_file.read_bytes() == pid_before
     assert not (directory / "runner.log").exists()

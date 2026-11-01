@@ -9,6 +9,7 @@ import pytest
 
 from hedge_fund.runtime import credentials
 from hedge_fund.runtime.admission import AdmissionCoordinator, RootOwnerLease
+from hedge_fund.runtime.handover import enroll_fresh
 from hedge_fund.runtime.root import RootContext
 
 
@@ -17,7 +18,7 @@ def credential_store(tmp_path):
     root_path = tmp_path / "credential-root"
     root_path.mkdir()
     root = RootContext.open(root_path)
-    root.prepare_private_storage()
+    enroll_fresh(root)
     owner = RootOwnerLease.acquire(root)
     store = credentials.CredentialStore(root, AdmissionCoordinator(root, owner_lease=owner))
     try:

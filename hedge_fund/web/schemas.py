@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from datetime import date
 from typing import Any, Literal
 
@@ -111,6 +112,41 @@ class OperationCancelRequest(RequestModel):
     request_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 
 
+class PaperTickPreviewRequest(RequestModel):
+    expected_head: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+
+
+class RunnerPreviewRequest(RequestModel):
+    expected_head: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    max_sessions: StrictInt = Field(default=1, ge=1, le=100)
+    max_runtime_minutes: StrictInt = Field(default=60, ge=1, le=1440)
+
+
+class PaperOperationAcceptRequest(RequestModel):
+    request_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+    preview_id: str = Field(pattern=r"^[a-f0-9]{32}$")
+    preview_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+    confirmation_token: str = Field(min_length=32, max_length=512)
+    expected_head: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    due_set: list[str] = Field(default_factory=list, max_length=1)
+
+    @field_validator("due_set")
+    @classmethod
+    def _valid_due_set(cls, value: list[str]) -> list[str]:
+        if any(not re.fullmatch(r"\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}:\d{2})?", item) for item in value):
+            raise ValueError("due-set entries must be paper session keys")
+        return value
+
+
+class PaperTickAcceptRequest(PaperOperationAcceptRequest):
+    due_set: list[str] = Field(min_length=1, max_length=1)
+
+
+class RunnerStartAcceptRequest(PaperOperationAcceptRequest):
+    max_sessions: StrictInt = Field(ge=1, le=100)
+    max_runtime_minutes: StrictInt = Field(ge=1, le=1440)
+
+
 class ModelRequest(RequestModel):
     model: str = Field(min_length=1, max_length=120)
     expected_version: int = Field(ge=0, le=2**31 - 1)
@@ -139,6 +175,7 @@ class CapabilitiesResponse(BaseModel):
     local_operator_only: bool
     csrf_authenticates_users: Literal[False]
     container_observer: bool
+    enrollment_state: Literal["unenrolled", "enrolled", "invalid", "drift"]
     write_unavailable_reason: str | None
     protected_names: list[str]
     mutation_token: str | None

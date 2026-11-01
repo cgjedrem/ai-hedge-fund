@@ -25,6 +25,7 @@ from hedge_fund.paper import (
     deploy,
     following_session,
     Ledger,
+    LedgerError,
     list_deployed,
     load_deployed,
     next_session,
@@ -129,6 +130,15 @@ def test_deploy_lays_out_the_fund_directory(tmp_path, SPEC):
     assert list_deployed(tmp_path / "nowhere") == []
     with pytest.raises(FileExistsError, match="already exists"):
         deploy("alpha", SPEC, ["AAPL"], root=tmp_path)
+
+
+def test_legacy_deploy_creates_a_missing_paper_root(tmp_path, SPEC):
+    root = tmp_path / "new-root"
+    directory = deploy("alpha", SPEC, ["AAPL"], root=root / "paper")
+
+    assert directory == root / "paper" / "alpha"
+    assert directory.is_dir()
+    assert not (root / "runtime").exists()
 
 
 def test_default_approval_deploy_yaml_matches_pre_feature_bytes(tmp_path, SPEC):
@@ -627,3 +637,104 @@ def test_assessment_dates_name_the_refresh_and_the_new_decision(SPEC):
     fresh = DecisionRecord.model_construct(as_of="2025-01-21T13:00:00")
     state = FundState(cash=100_000, last_session="2025-01-21T13:00:00", pending=fresh)
     assert assessment_dates(state, "2025-01-21T13:05:00", spec) == ["2025-01-21T13:05:00"]
+
+
+def _enrolled_paper_directory(root: Path, spec: FundSpec) -> Path:
+    from hedge_fund.runtime.admission import AdmissionCoordinator, RootOwnerLease
+    from hedge_fund.runtime.handover import enroll_fresh, record_ledger_head
+    from hedge_fund.runtime.root import RootContext
+
+    root.mkdir()
+    with RootContext.open(root) as context:
+        enroll_fresh(context)
+        owner = RootOwnerLease.acquire(context)
+        admission = AdmissionCoordinator(context, owner_lease=owner)
+        try:
+            with admission.deployment_lock("alpha", timeout=0):
+                directory = deploy(
+                    "alpha",
+                    spec,
+                    ["AAPL"],
+                    root=root / "paper",
+                )
+            record_ledger_head(context, "alpha", admission=admission)
+        finally:
+            owner.close()
+    return directory
+
+
+def test_enrolled_deploy_requires_a_held_deployment_lane(tmp_path, SPEC):
+    from hedge_fund.runtime.admission import AdmissionError
+    from hedge_fund.runtime.handover import enroll_fresh
+    from hedge_fund.runtime.root import RootContext
+
+    root = tmp_path / "enrolled"
+    root.mkdir()
+    with RootContext.open(root) as context:
+        enroll_fresh(context)
+
+    with pytest.raises(AdmissionError, match="admission"):
+        deploy("alpha", SPEC, ["AAPL"], root=root / "paper")
+
+    assert not (root / "paper" / "alpha").exists()
+
+
+def test_enrolled_tick_redo_and_ledger_writes_require_admission(tmp_path, SPEC):
+    from hedge_fund.runtime.admission import AdmissionError
+
+    directory = _enrolled_paper_directory(tmp_path / "enrolled", SPEC)
+    ledger = Ledger(directory)
+    control_before = ledger.control_path.read_bytes()
+
+    with pytest.raises(AdmissionError, match="admission"):
+        tick(directory, object())
+    with pytest.raises(AdmissionError, match="admission"):
+        redo(directory, object())
+    with pytest.raises(LedgerError, match="admission"):
+        ledger.append(object())
+    with pytest.raises(LedgerError, match="admission"):
+        ledger.halt("unadmitted")
+    with pytest.raises(LedgerError, match="admission"):
+        ledger.resume()
+    with pytest.raises(LedgerError, match="admission"):
+        ledger.set_approval("approve", "2024-06-03", "0" * 64, "cli")
+    with pytest.raises(LedgerError, match="admission"):
+        ledger.clear_approval()
+    with pytest.raises(LedgerError, match="admission"):
+        ledger.log_event("unadmitted")
+
+    assert ledger.sessions() == []
+    assert ledger.control_path.read_bytes() == control_before
+    assert not ledger.events_path.exists()
+
+
+def test_enrolled_tick_rejects_inventory_drift_before_data_access(tmp_path, SPEC):
+    from hedge_fund.runtime.admission import (
+        AdmissionCoordinator,
+        AdmissionError,
+        RootOwnerLease,
+    )
+    from hedge_fund.runtime.root import RootContext
+
+    directory = _enrolled_paper_directory(tmp_path / "enrolled", SPEC)
+    root = RootContext.open(directory.parent.parent)
+    owner = RootOwnerLease.acquire(root)
+    admission = AdmissionCoordinator(root, owner_lease=owner)
+    ledger = Ledger(directory)
+    (directory / "fund.yaml").write_bytes((directory / "fund.yaml").read_bytes() + b"\n")
+    before = {path.relative_to(directory): path.read_bytes() for path in directory.rglob("*") if path.is_file()}
+
+    class UnavailableDataClient:
+        def __getattr__(self, _name):
+            raise AssertionError("tick accessed data before verifying the enrolled inventory")
+
+    try:
+        with admission.manual_session("alpha", timeout=0):
+            with pytest.raises(AdmissionError, match="inventory"):
+                tick(directory, UnavailableDataClient())
+        after = {path.relative_to(directory): path.read_bytes() for path in directory.rglob("*") if path.is_file()}
+        assert after == before
+        assert ledger.sessions() == []
+    finally:
+        owner.close()
+        root.close()

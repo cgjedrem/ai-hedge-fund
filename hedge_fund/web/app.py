@@ -25,6 +25,10 @@ from hedge_fund.web.schemas import (
     OperationAcceptRequest,
     OperationCancelRequest,
     OperationPreviewRequest,
+    PaperTickAcceptRequest,
+    PaperTickPreviewRequest,
+    RunnerPreviewRequest,
+    RunnerStartAcceptRequest,
     RuntimeSettingsRequest,
     ValuationRefreshRequest,
 )
@@ -111,6 +115,8 @@ def create_app(
     """Create a disk-backed app; reads never initialize or mutate the root."""
     if type(container_bind) is not bool:
         raise TypeError("container observer mode must be a boolean")
+    if container_bind:
+        raise ValueError("container observer projection is unavailable")
     service = DeskService(
         root,
         allow_writes=allow_writes,
@@ -121,7 +127,7 @@ def create_app(
         root_context=root_context,
         container_observer=container_bind,
     )
-    token = secrets.token_urlsafe(32) if service.allow_writes else None
+    token = secrets.token_urlsafe(32) if service.allow_writes or service.emergency_halt_available else None
     requested_static = Path(static_dir) if static_dir is not None else Path(__file__).with_name("static")
     static_root = requested_static.resolve() if requested_static.is_dir() else None
     app = FastAPI(
@@ -148,44 +154,34 @@ def create_app(
             app.state.session_signing_key,
         )
         request.state.operator_session = operator_session
+        method = request.method.upper()
+        emergency_control = not service.allow_writes and service.emergency_halt_available and method == "POST" and _is_emergency_control_path(request.url.path)
+        mutation_allowed = service.allow_writes or emergency_control
         if parsed_host is None:
             response = JSONResponse({"detail": "Host must be a loopback address."}, status_code=403)
         else:
             origin = request.headers.get("origin")
             if origin is not None and not _same_origin(origin, host, request.url.scheme):
                 response = JSONResponse({"detail": "Origin must match the loopback host."}, status_code=403)
-            elif request.method.upper() not in _SAFE_METHODS and not service.allow_writes:
+            elif method not in _SAFE_METHODS and not mutation_allowed:
                 response = JSONResponse({"detail": "Write capability is disabled for this server."}, status_code=403)
-            elif (
-                request.method.upper() not in _SAFE_METHODS
-                and service.allow_writes
-                and not _is_loopback_peer(request.client.host if request.client else None)
-            ):
+            elif method not in _SAFE_METHODS and mutation_allowed and not _is_loopback_peer(request.client.host if request.client else None):
                 response = JSONResponse(
                     {"detail": "Writable server requires a loopback client connection."},
                     status_code=403,
                 )
-            elif (
-                request.method.upper() not in _SAFE_METHODS
-                and service.allow_writes
-                and operator_session is None
-            ):
+            elif method not in _SAFE_METHODS and mutation_allowed and operator_session is None:
                 response = JSONResponse(
                     {"detail": "A valid server-owned operator session is required."},
                     status_code=403,
                 )
-            elif request.method.upper() not in _SAFE_METHODS and origin is None:
+            elif method not in _SAFE_METHODS and origin is None:
                 response = JSONResponse({"detail": "Mutation requires a same-origin request."}, status_code=403)
-            elif request.method.upper() not in _SAFE_METHODS and not _valid_token(request.headers.get("x-csrf-token"), token):
+            elif method not in _SAFE_METHODS and not _valid_token(request.headers.get("x-csrf-token"), token):
                 response = JSONResponse({"detail": "Mutation token is missing or invalid."}, status_code=403)
             else:
                 response = await call_next(request)
-        if (
-            operator_session is None
-            and service.allow_writes
-            and _is_loopback_peer(request.client.host if request.client else None)
-            and parsed_host is not None
-        ):
+        if operator_session is None and (service.allow_writes or service.emergency_halt_available) and _is_loopback_peer(request.client.host if request.client else None) and parsed_host is not None:
             session_id = secrets.token_hex(16)
             signature = _sign_operator_session(
                 session_id,
@@ -251,6 +247,46 @@ def create_app(
     @app.get("/api/paper/{name}")
     def paper_detail(name: str):
         return service.paper_detail(name)
+
+    @app.post("/api/paper/{name}/tick/preview", status_code=201)
+    def paper_tick_preview(name: str, request: PaperTickPreviewRequest, http_request: Request):
+        return service.create_manual_tick_preview(
+            name,
+            request,
+            operator_session=http_request.state.operator_session,
+        )
+
+    @app.post("/api/paper/{name}/tick", status_code=202)
+    def paper_tick(name: str, request: PaperTickAcceptRequest, http_request: Request):
+        return service.accept_manual_tick(
+            name,
+            request,
+            operator_session=http_request.state.operator_session,
+        )
+
+    @app.post("/api/paper/{name}/runner/preview", status_code=201)
+    def runner_preview(name: str, request: RunnerPreviewRequest, http_request: Request):
+        return service.create_runner_preview(
+            name,
+            request,
+            operator_session=http_request.state.operator_session,
+        )
+
+    @app.post("/api/paper/{name}/runner", status_code=202)
+    def runner_start(name: str, request: RunnerStartAcceptRequest, http_request: Request):
+        return service.accept_runner_start(
+            name,
+            request,
+            operator_session=http_request.state.operator_session,
+        )
+
+    @app.get("/api/paper/{name}/runner")
+    def runner_status(name: str):
+        return service.runner_status(name)
+
+    @app.post("/api/paper/{name}/runner/stop")
+    def runner_stop(name: str):
+        return service.stop_runner(name)
 
     @app.get("/api/paper/{name}/valuation")
     def paper_valuation(name: str):
@@ -427,6 +463,11 @@ def _same_origin(origin: str, host: str, request_scheme: str) -> bool:
 
 def _valid_token(supplied: str | None, expected: str | None) -> bool:
     return supplied is not None and expected is not None and hmac.compare_digest(supplied, expected)
+
+
+def _is_emergency_control_path(value: str) -> bool:
+    parts = value.split("/")
+    return len(parts) == 5 and parts[0] == "" and parts[1] == "api" and parts[2] == "paper" and bool(parts[3]) and parts[4] in {"halt", "resume"}
 
 
 def _security_headers(response: Response, path: str) -> None:

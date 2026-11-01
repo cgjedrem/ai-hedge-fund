@@ -224,6 +224,107 @@ class FrozenCapture:
             record["mandate_snapshot"] = json.loads(self.mandate_snapshot)
         return json.dumps(record, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
+    @classmethod
+    def from_private_bytes(cls, root: RootContext, data: bytes) -> FrozenCapture:
+        """Restore a bounded capture from root-private bytes."""
+        if not isinstance(root, RootContext) or not isinstance(data, bytes):
+            raise ConfigurationError("capture input is invalid")
+        if len(data) > 1024 * 1024:
+            raise ConfigurationError("capture exceeds its bound")
+        root.revalidate()
+        try:
+            record = json.loads(data.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise ConfigurationError("capture is malformed") from None
+        fields = {
+            "schema",
+            "capture_id",
+            "digest",
+            "root_id",
+            "subject_id",
+            "mandate_digest",
+            "universe",
+            "broker",
+            "settings_version",
+            "settings",
+            "credential_handles",
+            "code_version",
+        }
+        if not isinstance(record, dict) or frozenset(record) not in {
+            frozenset(fields),
+            frozenset(fields | {"mandate_snapshot"}),
+        }:
+            raise ConfigurationError("capture fields are invalid")
+        if type(record["schema"]) is not int or record["schema"] not in {1, 2}:
+            raise ConfigurationError("capture schema is invalid")
+        settings_record = record["settings"]
+        if not isinstance(settings_record, dict) or set(settings_record) != {
+            "data_provider",
+            "llm_provider",
+            "model",
+            "endpoint",
+            "timeout_seconds",
+            "parameters",
+            "provenance",
+        }:
+            raise ConfigurationError("capture settings are invalid")
+        try:
+            settings = RuntimeSettings(
+                **settings_record,
+                version=record["settings_version"],
+            )
+            root_id = _root_id(root)
+            if record["root_id"] != root_id:
+                raise ConfigurationError("capture root identity does not match")
+            handles_record = record["credential_handles"]
+            if not isinstance(handles_record, list):
+                raise ConfigurationError("capture credential handles are invalid")
+            handles = {}
+            versions = {}
+            for entry in handles_record:
+                if not isinstance(entry, dict) or set(entry) != {"provider_id", "version"}:
+                    raise ConfigurationError("capture credential handles are invalid")
+                provider = entry["provider_id"]
+                version = entry["version"]
+                if not isinstance(provider, str) or provider.casefold() in handles:
+                    raise ConfigurationError("capture credential handles are invalid")
+                handle = CredentialHandle(root_id, provider, version)
+                handles[handle.provider_id] = handle
+                versions[handle.provider_id] = handle.version
+            snapshot = None
+            if "mandate_snapshot" in record:
+                snapshot = json.dumps(
+                    record["mandate_snapshot"],
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                ).encode("utf-8")
+            capture = cls(
+                capture_id=record["capture_id"],
+                digest=record["digest"],
+                root_id=root_id,
+                subject_id=record["subject_id"],
+                mandate_digest=record["mandate_digest"],
+                universe=tuple(record["universe"]),
+                broker=record["broker"],
+                settings_version=settings.version,
+                data_provider=settings.data_provider,
+                llm_provider=settings.llm_provider,
+                model=settings.model,
+                endpoint=settings.endpoint,
+                timeout_seconds=settings.timeout_seconds,
+                parameters=settings.parameters,
+                provenance=settings.provenance,
+                credential_versions=versions,
+                credential_handles=handles,
+                code_version=record["code_version"],
+                mandate_snapshot=snapshot,
+            )
+        except (ConfigurationError, TypeError, ValueError, KeyError):
+            raise ConfigurationError("capture is invalid") from None
+        root.revalidate()
+        return capture
+
 
 def freeze_capture(
     *,

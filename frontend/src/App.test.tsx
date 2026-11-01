@@ -10,8 +10,10 @@ import type {
   MandateCollection,
   Operation,
   OperationPreview,
+  PaperOperationPreview,
   PaperCollection,
   PaperSnapshot,
+  RunnerState,
   ResearchReport,
   ScoreMetrics,
   SessionReport,
@@ -29,6 +31,7 @@ const capabilities: Capabilities = {
   local_operator_only: true,
   csrf_authenticates_users: false,
   container_observer: false,
+  enrollment_state: "unenrolled",
   write_unavailable_reason: null,
   protected_names: ["watchtower", "watchtower-weekly", "umbrella"],
   mutation_token: null,
@@ -333,7 +336,7 @@ describe("local desk screens", () => {
     await user.click(await screen.findByRole("link", { name: /demo-quality/ }));
     expect(await screen.findByRole("heading", { name: "demo-quality" })).toBeInTheDocument();
     expect(await screen.findAllByText("$101,000")).toHaveLength(2);
-    expect(screen.getAllByText("Runner ownership is not verified; web process controls are disabled.")).toHaveLength(2);
+    expect(screen.getAllByText("Runner ownership is not verified; web process controls are disabled.")).toHaveLength(1);
 
     await user.click(screen.getByRole("link", { name: /2024-06-04/ }));
     expect(await screen.findByRole("heading", { name: "2024-06-04" })).toBeInTheDocument();
@@ -352,6 +355,24 @@ describe("local desk screens", () => {
     expect(await screen.findByRole("heading", { name: "demo-quality scorecard" })).toBeInTheDocument();
     expect(screen.getAllByText("$1,000")).toHaveLength(2);
     expect(await screen.findByText("$5.00")).toBeInTheDocument();
+  });
+
+  it("shows enrolled-root write denial instead of a green recorded book state", async () => {
+    installApi({
+      caps: {
+        ...capabilities,
+        mode: "live",
+        enrollment_state: "enrolled",
+        write_unavailable_reason: "write-capability-disabled",
+      },
+    });
+    window.history.replaceState({}, "", "/paper/demo-quality");
+    render(<App />);
+
+    expect(await screen.findByRole("heading", { name: "demo-quality" })).toBeInTheDocument();
+    expect(screen.getByText(/Root enrollment:/)).toHaveTextContent("enrolled");
+    expect(screen.getAllByRole("status").some((status) => status.textContent?.includes("write-capability-disabled"))).toBe(true);
+    expect(screen.getByText("Writes unavailable")).toBeInTheDocument();
   });
 
   it("shows unreadable halt state in list and detail and disables paper actions", async () => {
@@ -915,5 +936,273 @@ describe("local desk screens", () => {
     expect((fetchRequests.find((item) => item.path === "/api/operations" && item.method === "POST")?.body as { request_id?: string }).request_id).toMatch(/^[a-f0-9]{32}$/);
     expect(window.localStorage.getItem("aihf.backtests.selected-operation")).toBe(acceptedOperation.id);
     expect(window.localStorage.getItem("synthetic-confirmation-token")).toBeNull();
+  });
+
+  it("reviews one manual tick, accepts once, and restores progress after reload", async () => {
+    const operationId = "2".repeat(32);
+    const operation: Operation = {
+      operation_id: operationId,
+      request_id: "manual-tick-test",
+      action: "paper-tick",
+      subject_id: "demo-quality",
+      capture_id: "3".repeat(32),
+      capture_digest: "4".repeat(64),
+      status: "running",
+      created_at: "2026-10-31T12:00:00+00:00",
+      updated_at: "2026-10-31T12:00:01+00:00",
+      payload: { kind: "manual-tick", session: "2024-06-06" },
+      result: null,
+      progress: 25,
+      id: operationId,
+      fund: "demo-quality",
+      provider: null,
+      model: null,
+      report_id: null,
+      error: null,
+      cancel_requested: false,
+      status_url: `/api/operations/${operationId}`,
+    };
+    const preview: PaperOperationPreview = {
+      preview_id: "5".repeat(32),
+      preview_digest: "6".repeat(64),
+      confirmation_token: "offline-confirmation-token",
+      action: "paper-tick",
+      subject_id: "demo-quality",
+      expected_head: sourceHash,
+      due_set: ["2024-06-06"],
+      capture_id: "3".repeat(32),
+      capture_digest: "4".repeat(64),
+      expires_at: "2026-10-31T12:10:00+00:00",
+      payload: { kind: "manual-tick", session: "2024-06-06" },
+      capture: { data_provider: "yfinance", llm_provider: "Ollama", model: "gemma3:4b" },
+      estimate: {
+        maximum_model_calls_per_session: 4,
+        maximum_calls: 3,
+        maximum_resources: 4,
+        maximum_cost_usd: 0,
+        market_data_provider: "yfinance",
+      },
+      warnings: ["Only free market data and the captured local Ollama model are authorized."],
+    };
+    const stoppedRunner: RunnerState = {
+      status: "stopped",
+      available: false,
+      reason: "No owned runner is active.",
+      started_at: null,
+      expires_at: null,
+      sessions_completed: 0,
+      max_sessions: null,
+      last_session: null,
+    };
+    const writeCaps: Capabilities = {
+      ...capabilities,
+      mode: "live",
+      writes: true,
+      read_only: false,
+      network: true,
+      enrollment_state: "enrolled",
+      mutation_token: "manual-tick-token",
+    };
+    let acceptCount = 0;
+    window.localStorage.removeItem("aihf.paper.demo-quality.operation");
+    installApi({
+      caps: writeCaps,
+      override: (path, method, body) => {
+        if (path === "/api/paper/demo-quality/runner" && method === "GET") {
+          return { payload: stoppedRunner };
+        }
+        if (path === "/api/paper/demo-quality/tick/preview" && method === "POST") {
+          expect(body).toEqual({ expected_head: sourceHash });
+          return { payload: preview, status: 201 };
+        }
+        if (path === "/api/paper/demo-quality/tick" && method === "POST") {
+          acceptCount += 1;
+          expect(body).toMatchObject({
+            preview_id: preview.preview_id,
+            preview_digest: preview.preview_digest,
+            confirmation_token: preview.confirmation_token,
+            expected_head: sourceHash,
+            due_set: ["2024-06-06"],
+          });
+          return { payload: operation, status: 202 };
+        }
+        if (path === `/api/operations/${operationId}` && method === "GET") {
+          return { payload: operation };
+        }
+        return null;
+      },
+    });
+    window.history.replaceState({}, "", "/paper/demo-quality");
+    const user = userEvent.setup();
+    const view = render(<App />);
+
+    await screen.findByRole("heading", { name: "demo-quality" });
+    const review = await screen.findByRole("button", { name: "Manual one-session tick" });
+    await waitFor(() => expect(review).toBeEnabled());
+    await user.click(review);
+    expect(await screen.findByRole("heading", { name: "Confirm one-session paper tick" })).toBeInTheDocument();
+    expect(acceptCount).toBe(0);
+
+    const accept = screen.getByRole("button", { name: "Accept one-session tick" });
+    fireEvent.click(accept);
+    fireEvent.click(accept);
+    expect(await screen.findByText("Manual tick · running")).toBeInTheDocument();
+    expect(acceptCount).toBe(1);
+    expect(window.localStorage.getItem("aihf.paper.demo-quality.operation")).toBe(operationId);
+    const acceptRequest = fetchRequests.find(
+      (item) => item.path === "/api/paper/demo-quality/tick" && item.method === "POST",
+    );
+    expect((acceptRequest?.body as { request_id?: string }).request_id).toMatch(/^[a-f0-9]{32}$/);
+
+    view.unmount();
+    const postCount = fetchRequests.filter((item) => item.method === "POST").length;
+    render(<App />);
+    expect(await screen.findByText("Manual tick · running")).toBeInTheDocument();
+    expect(screen.getByRole("progressbar", { name: "Paper operation progress" })).toHaveAttribute("aria-valuenow", "25");
+    expect(fetchRequests.filter((item) => item.method === "POST")).toHaveLength(postCount);
+  });
+
+  it("reviews finite runner bounds and confirms cooperative stop without PID fields", async () => {
+    const operationId = "7".repeat(32);
+    const preview: PaperOperationPreview = {
+      preview_id: "8".repeat(32),
+      preview_digest: "9".repeat(64),
+      confirmation_token: "runner-confirmation-token",
+      action: "paper-runner-start",
+      subject_id: "demo-quality",
+      expected_head: sourceHash,
+      due_set: [],
+      capture_id: "a".repeat(32),
+      capture_digest: "b".repeat(64),
+      expires_at: "2026-10-31T12:10:00+00:00",
+      payload: {
+        kind: "runner-start",
+        max_sessions: 1,
+        max_runtime_minutes: 60,
+        max_calls: 63,
+        max_resources: 130,
+      },
+      capture: { data_provider: "yfinance", llm_provider: "Ollama", model: "gemma3:4b" },
+      estimate: {
+        maximum_model_calls_per_session: 4,
+        maximum_calls: 63,
+        maximum_resources: 130,
+        maximum_cost_usd: 0,
+        market_data_provider: "yfinance",
+      },
+      warnings: ["Only free market data and the captured local Ollama model are authorized."],
+    };
+    const operation: Operation = {
+      operation_id: operationId,
+      request_id: "runner-start-test",
+      action: "paper-runner-start",
+      subject_id: "demo-quality",
+      capture_id: preview.capture_id,
+      capture_digest: preview.capture_digest,
+      status: "completed",
+      created_at: "2026-10-31T12:00:00+00:00",
+      updated_at: "2026-10-31T12:00:01+00:00",
+      payload: preview.payload,
+      result: { runner: { status: "running" } },
+      progress: 100,
+      id: operationId,
+      fund: "demo-quality",
+      provider: null,
+      model: null,
+      report_id: null,
+      error: null,
+      cancel_requested: false,
+      status_url: `/api/operations/${operationId}`,
+    };
+    const stoppedRunner: RunnerState = {
+      status: "stopped",
+      available: false,
+      reason: "No owned runner is active.",
+      sessions_completed: 0,
+      max_sessions: null,
+      started_at: null,
+      expires_at: null,
+      last_session: null,
+    };
+    let currentRunner = stoppedRunner;
+    let startCount = 0;
+    let stopCount = 0;
+    const writeCaps: Capabilities = {
+      ...capabilities,
+      mode: "live",
+      writes: true,
+      read_only: false,
+      network: true,
+      enrollment_state: "enrolled",
+      mutation_token: "runner-control-token",
+    };
+    window.localStorage.removeItem("aihf.paper.demo-quality.operation");
+    installApi({
+      caps: writeCaps,
+      override: (path, method, body) => {
+        if (path === "/api/paper/demo-quality/runner" && method === "GET") {
+          return { payload: currentRunner };
+        }
+        if (path === "/api/paper/demo-quality/runner/preview" && method === "POST") {
+          expect(body).toEqual({
+            expected_head: sourceHash,
+            max_sessions: 1,
+            max_runtime_minutes: 60,
+          });
+          return { payload: preview, status: 201 };
+        }
+        if (path === "/api/paper/demo-quality/runner" && method === "POST") {
+          startCount += 1;
+          expect(body).toMatchObject({
+            preview_id: preview.preview_id,
+            max_sessions: 1,
+            max_runtime_minutes: 60,
+            due_set: [],
+          });
+          currentRunner = {
+            ...stoppedRunner,
+            status: "running",
+            available: true,
+            reason: null,
+            max_sessions: 1,
+            expires_at: "2026-10-31T13:00:00+00:00",
+          };
+          return { payload: operation, status: 202 };
+        }
+        if (path === `/api/operations/${operationId}` && method === "GET") {
+          return { payload: operation };
+        }
+        if (path === "/api/paper/demo-quality/runner/stop" && method === "POST") {
+          stopCount += 1;
+          currentRunner = { ...currentRunner, status: "stopping" };
+          return { payload: currentRunner };
+        }
+        return null;
+      },
+    });
+    window.history.replaceState({}, "", "/paper/demo-quality");
+    const user = userEvent.setup();
+    render(<App />);
+
+    const start = await screen.findByRole("button", { name: "Start runner" });
+    await waitFor(() => expect(start).toBeEnabled());
+    await user.click(start);
+    expect(await screen.findByRole("heading", { name: "Confirm finite runner start" })).toBeInTheDocument();
+    expect(startCount).toBe(0);
+    await user.click(screen.getByRole("button", { name: "Accept finite runner" }));
+    await waitFor(() => expect(startCount).toBe(1));
+    const stop = await screen.findByRole("button", { name: "Stop runner" });
+    await waitFor(() => expect(stop).toBeEnabled());
+    await user.click(stop);
+    expect(await screen.findByRole("heading", { name: "Stop owned runner for demo-quality" })).toBeInTheDocument();
+    expect(stopCount).toBe(0);
+    await user.click(screen.getByRole("button", { name: "Request runner stop" }));
+    await waitFor(() => expect(stopCount).toBe(1));
+    const stopRequest = fetchRequests.find(
+      (item) => item.path === "/api/paper/demo-quality/runner/stop" && item.method === "POST",
+    );
+    expect(stopRequest?.body).toEqual({});
+    expect(JSON.stringify(stopRequest?.body)).not.toContain("pid");
+    expect(window.localStorage.getItem("aihf.paper.demo-quality.operation")).toBe(operationId);
   });
 });

@@ -8,6 +8,9 @@ from fastapi.testclient import TestClient
 
 from hedge_fund.data.models import PriceSnapshot
 from hedge_fund.paper.ledger import Ledger
+from hedge_fund.runtime.admission import AdmissionCoordinator, RootOwnerLease
+from hedge_fund.runtime.handover import record_ledger_head
+from hedge_fund.runtime.root import RootContext
 from hedge_fund.web.app import create_app
 from hedge_fund.web.valuation import estimate_valuation
 
@@ -215,7 +218,19 @@ def test_refresh_returns_estimate_without_changing_recorded_series(demo_root):
 
 def test_refresh_discards_result_when_ledger_head_changes_during_quote(demo_root):
     directory = demo_root / "paper" / "demo-quality"
-    provider = FakeQuoteClient(on_quote=lambda: Ledger(directory).rewind())
+
+    def mutate_head():
+        with RootContext.open(demo_root) as root:
+            owner = RootOwnerLease.acquire(root)
+            admission = AdmissionCoordinator(root, owner_lease=owner)
+            try:
+                with admission.manual_session("demo-quality", timeout=0):
+                    Ledger(directory).rewind()
+                record_ledger_head(root, "demo-quality", admission=admission)
+            finally:
+                owner.close()
+
+    provider = FakeQuoteClient(on_quote=mutate_head)
     with _client(demo_root, provider, network=True) as client:
         headers = _mutation_headers(client)
         detail = client.get("/api/paper/demo-quality", headers={"host": "127.0.0.1"}).json()

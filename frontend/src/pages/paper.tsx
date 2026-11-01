@@ -38,10 +38,13 @@ import type {
   HaltState,
   LiveValuation,
   PaperCollection,
+  PaperOperationPreview,
   PaperSnapshot,
   PaperSummary,
   PendingDecision,
+  Operation,
   Position,
+  RunnerState,
   ScoreMetrics,
   SessionReport,
   SessionSummary,
@@ -77,8 +80,12 @@ export function PaperPage() {
             <Badge variant="warning">Halt state unknown</Badge>
           ) : item.halt_state === "halted" ? (
             <Badge variant="warning">Halted</Badge>
+          ) : item.runner.status === "unknown" ? (
+            <Badge variant="warning">Runner unverified</Badge>
+          ) : item.runner.available ? (
+            <Badge variant="positive">Runner {item.runner.status}</Badge>
           ) : (
-            <Badge variant="muted">Runner unknown</Badge>
+            <Badge variant="muted">Runner {item.runner.status}</Badge>
           )}
         </div>
       ),
@@ -131,27 +138,106 @@ export function PaperDetailPage() {
   const { name = "" } = useParams();
   const { capabilities } = useDesk();
   const resource = useResource<PaperSnapshot>(name ? `/api/paper/${encodeURIComponent(name)}` : null);
+  const runnerResource = useResource<RunnerState>(
+    name ? `/api/paper/${encodeURIComponent(name)}/runner` : null,
+  );
+  const [operationId, setOperationId] = useState<string | null>(null);
+  const operationResource = useResource<Operation>(
+    operationId ? `/api/operations/${encodeURIComponent(operationId)}` : null,
+  );
   const [confirmAction, setConfirmAction] = useState<PendingAction | null>(null);
   const [haltDialogOpen, setHaltDialogOpen] = useState(false);
   const [haltReason, setHaltReason] = useState("");
   const [busy, setBusy] = useState(false);
+  const [paperActionBusy, setPaperActionBusy] = useState(false);
+  const [paperPreview, setPaperPreview] = useState<PaperOperationPreview | null>(null);
+  const [paperPreviewKind, setPaperPreviewKind] = useState<"tick" | "runner" | null>(null);
+  const [stopRunnerDialogOpen, setStopRunnerDialogOpen] = useState(false);
+  const [maxSessions, setMaxSessions] = useState("1");
+  const [maxRuntimeMinutes, setMaxRuntimeMinutes] = useState("60");
   const [valuationBusy, setValuationBusy] = useState(false);
   const [valuationResult, setValuationResult] = useState<LiveValuation | null>(null);
   const [feedback, setFeedback] = useState<{ tone: "danger" | "neutral"; message: string } | null>(null);
   const valuationRequest = useRef(0);
+  const paperActionInFlight = useRef(false);
+  const refreshedOperation = useRef<string | null>(null);
   const protectedName = capabilities?.protected_names.some((entry) => entry.toLowerCase() === name.toLowerCase()) ?? false;
   const canWrite = capabilities?.writes === true && !protectedName;
   const data = resource.data;
+  const writeUnavailable = capabilities?.write_unavailable_reason != null;
+  const enrollmentState = capabilities?.enrollment_state ?? "unenrolled";
+  const runner = runnerResource.data ?? data?.runner;
+  const operation = operationResource.data?.id === operationId ? operationResource.data : null;
   const approvalRequired = data?.spec.approval_required === true;
   const canApprove = canWrite && approvalRequired && data?.halt_state === "clear" && data?.ledger.ok === true;
   const canRefreshValuation = canWrite && capabilities?.network === true && data?.ledger.ok === true;
   const liveValue = valuationResult ?? data?.live_value;
+  const paperOperationActive = Boolean(
+    operation && ["accepted", "running", "cancel-requested"].includes(operation.status),
+  );
+  const runnerInactive = Boolean(
+    runner
+    && !runner.available
+    && ["stopped", "completed", "failed"].includes(runner.status),
+  );
+  const canOperatePaper = Boolean(
+    canWrite
+    && capabilities?.network === true
+    && data?.broker === "paper"
+    && data.ledger.ok
+    && data.halt_state === "clear"
+    && runnerInactive
+    && !paperOperationActive,
+  );
+  const canStopRunner = Boolean(
+    canWrite
+    && runner?.available
+    && runner.status === "running",
+  );
 
   useEffect(() => {
     valuationRequest.current += 1;
     setValuationResult(null);
     setValuationBusy(false);
   }, [name, data?.last_record_hash]);
+
+  useEffect(() => {
+    setOperationId(readPaperOperationId(name));
+    setPaperPreview(null);
+    setPaperPreviewKind(null);
+  }, [name]);
+
+  useEffect(() => {
+    if (!operation || !["accepted", "running", "cancel-requested"].includes(operation.status)) return;
+    const timer = window.setTimeout(operationResource.refresh, 900);
+    return () => window.clearTimeout(timer);
+  }, [operation?.status, operation?.progress, operationResource.refresh]);
+
+  useEffect(() => {
+    if (!runner?.available) return;
+    const timer = window.setTimeout(() => {
+      runnerResource.refresh();
+      if (operation?.status === "completed") resource.refresh();
+    }, 900);
+    return () => window.clearTimeout(timer);
+  }, [
+    runner?.available,
+    runner?.status,
+    operation?.status,
+    runnerResource.refresh,
+    resource.refresh,
+  ]);
+
+  useEffect(() => {
+    if (
+      operation?.status === "completed"
+      && refreshedOperation.current !== operation.id
+    ) {
+      refreshedOperation.current = operation.id;
+      resource.refresh();
+      runnerResource.refresh();
+    }
+  }, [operation?.id, operation?.status, resource.refresh, runnerResource.refresh]);
 
   async function submitAction(): Promise<void> {
     if (!confirmAction) return;
@@ -221,6 +307,106 @@ export function PaperDetailPage() {
     }
   }
 
+  async function requestPaperPreview(kind: "tick" | "runner"): Promise<void> {
+    if (!data || !canOperatePaper || paperActionInFlight.current) return;
+    let bounds: { max_sessions: number; max_runtime_minutes: number } | null = null;
+    if (kind === "runner") {
+      const sessions = Number(maxSessions);
+      const runtime = Number(maxRuntimeMinutes);
+      if (!Number.isInteger(sessions) || sessions < 1 || sessions > 100) {
+        setFeedback({ tone: "danger", message: "Runner session bound must be an integer from 1 to 100." });
+        return;
+      }
+      if (!Number.isInteger(runtime) || runtime < 1 || runtime > 1440) {
+        setFeedback({ tone: "danger", message: "Runner deadline must be an integer from 1 to 1440 minutes." });
+        return;
+      }
+      bounds = { max_sessions: sessions, max_runtime_minutes: runtime };
+    }
+
+    paperActionInFlight.current = true;
+    setPaperActionBusy(true);
+    setFeedback(null);
+    try {
+      const preview = await apiPost<PaperOperationPreview>(
+        `/api/paper/${encodeURIComponent(name)}/${kind === "tick" ? "tick" : "runner"}/preview`,
+        {
+          expected_head: data.last_record_hash,
+          ...(bounds ?? {}),
+        },
+      );
+      setPaperPreview(preview);
+      setPaperPreviewKind(kind);
+    } catch (cause) {
+      setFeedback({ tone: "danger", message: cause instanceof Error ? cause.message : "Paper preview failed." });
+    } finally {
+      paperActionInFlight.current = false;
+      setPaperActionBusy(false);
+    }
+  }
+
+  async function acceptPaperPreview(): Promise<void> {
+    if (!paperPreview || !paperPreviewKind || !canOperatePaper || paperActionInFlight.current) return;
+    const request: Record<string, unknown> = {
+      request_id: newRequestId(),
+      preview_id: paperPreview.preview_id,
+      preview_digest: paperPreview.preview_digest,
+      confirmation_token: paperPreview.confirmation_token,
+      expected_head: paperPreview.expected_head,
+      due_set: paperPreview.due_set,
+    };
+    if (paperPreviewKind === "runner") {
+      request.max_sessions = paperPreview.payload.max_sessions;
+      request.max_runtime_minutes = paperPreview.payload.max_runtime_minutes;
+    }
+
+    paperActionInFlight.current = true;
+    setPaperActionBusy(true);
+    setFeedback(null);
+    try {
+      const operation = await apiPost<Operation>(
+        `/api/paper/${encodeURIComponent(name)}/${paperPreviewKind === "tick" ? "tick" : "runner"}`,
+        request,
+      );
+      setOperationId(operation.id);
+      persistPaperOperationId(name, operation.id);
+      setPaperPreview(null);
+      setPaperPreviewKind(null);
+      setFeedback({
+        tone: "neutral",
+        message: paperPreviewKind === "tick"
+          ? "Reviewed one-session paper tick accepted. Progress is durable and will reload with this page."
+          : "Reviewed finite runner start accepted. Process control remains limited to this server-owned child.",
+      });
+      runnerResource.refresh();
+    } catch (cause) {
+      setFeedback({ tone: "danger", message: cause instanceof Error ? cause.message : "Paper operation was not accepted." });
+      setPaperPreview(null);
+      setPaperPreviewKind(null);
+    } finally {
+      paperActionInFlight.current = false;
+      setPaperActionBusy(false);
+    }
+  }
+
+  async function stopOwnedRunner(): Promise<void> {
+    if (!canStopRunner || paperActionInFlight.current) return;
+    paperActionInFlight.current = true;
+    setPaperActionBusy(true);
+    setFeedback(null);
+    try {
+      await apiPost(`/api/paper/${encodeURIComponent(name)}/runner/stop`);
+      setStopRunnerDialogOpen(false);
+      setFeedback({ tone: "neutral", message: "Owned runner stop requested. An in-flight session may finish before it exits." });
+      runnerResource.refresh();
+    } catch (cause) {
+      setFeedback({ tone: "danger", message: cause instanceof Error ? cause.message : "Runner stop request failed." });
+    } finally {
+      paperActionInFlight.current = false;
+      setPaperActionBusy(false);
+    }
+  }
+
   return (
     <>
       <PageHeader
@@ -239,6 +425,11 @@ export function PaperDetailPage() {
       {data ? (
         <>
           {!data.ledger.ok ? <Alert tone="danger" className="mb-5"><strong>Ledger verification failed.</strong> <span>{data.ledger.error}</span></Alert> : null}
+          {writeUnavailable ? (
+            <Alert tone="warning" className="mb-5">
+              Root enrollment: <span className="mono">{enrollmentState}</span>. Writes unavailable: <span className="mono">{capabilities?.write_unavailable_reason}</span>.
+            </Alert>
+          ) : null}
           {data.halt_state === "unreadable" ? (
             <Alert tone="warning" className="mb-5">Halt state is unreadable. Paper controls and approval writes are disabled.</Alert>
           ) : null}
@@ -251,9 +442,9 @@ export function PaperDetailPage() {
             <MetricCard label="Next forecast" value={data.next_run ? dateLabel(data.next_run) : "Unavailable"} note="Schedule estimate only · no process signal" icon={CalendarClock} />
             <MetricCard
               label="Book state"
-              value={!data.ledger.ok ? "Unverified" : data.halt_state === "unreadable" ? "Halt state unknown" : data.halt_state === "halted" ? "Halted" : "Recorded"}
-              note={data.halt_state === "unreadable" ? "Halt state cannot be verified." : data.runner.available ? "Runner available" : data.runner.reason}
-              tone={!data.ledger.ok ? "negative" : data.halt_state === "unreadable" || data.halt_state === "halted" ? "warning" : "positive"}
+              value={!data.ledger.ok ? "Unverified" : writeUnavailable ? "Writes unavailable" : data.halt_state === "unreadable" ? "Halt state unknown" : data.halt_state === "halted" ? "Halted" : "Recorded"}
+            note={writeUnavailable ? `${enrollmentState} · ${capabilities?.write_unavailable_reason}` : data.halt_state === "unreadable" ? "Halt state cannot be verified." : runner?.available ? "Owned runner active" : runner?.reason ?? "Runner state unavailable."}
+              tone={!data.ledger.ok ? "negative" : writeUnavailable || data.halt_state === "unreadable" || data.halt_state === "halted" ? "warning" : "positive"}
               icon={data.halt_state === "halted" ? CirclePause : ShieldCheck}
             />
           </div>
@@ -283,13 +474,32 @@ export function PaperDetailPage() {
                 <CardHeader>
                   <div className="flex items-center justify-between gap-3">
                     <CardTitle>Control panel</CardTitle>
-                    <Badge variant={data.halt_state === "clear" ? "muted" : "warning"}>
-                      {data.halt_state === "unreadable" ? "Halt state unknown" : data.halt_state === "halted" ? "Halted" : "Runner unverified"}
+                    <Badge
+                      variant={
+                        data.halt_state !== "clear" || runner?.status === "unknown"
+                          ? "warning"
+                          : runner?.available
+                            ? "positive"
+                            : "muted"
+                      }
+                    >
+                      {data.halt_state === "unreadable"
+                        ? "Halt state unknown"
+                        : data.halt_state === "halted"
+                          ? "Halted"
+                          : runner?.status === "unknown"
+                            ? "Runner unverified"
+                            : `Runner ${runner?.status ?? "unavailable"}`}
                     </Badge>
                   </div>
                 </CardHeader>
                 <CardContent className="space-y-4">
-                  <p className="text-xs leading-relaxed text-muted-foreground">{data.runner.reason}</p>
+                  <p className="text-xs leading-relaxed text-muted-foreground">
+                    Enrollment: <span className="mono">{enrollmentState}</span>.{" "}
+                    {writeUnavailable
+                      ? `Writes unavailable: ${capabilities?.write_unavailable_reason}.`
+                      : runner?.reason ?? "Runner ownership verified by this server."}
+                  </p>
                   <div className="grid grid-cols-2 gap-2">
                     <Button variant="danger" onClick={() => { setFeedback(null); setHaltDialogOpen(true); }} disabled={!canWrite || data.halt_state !== "clear"}>
                       <CirclePause className="h-3.5 w-3.5" /> Halt
@@ -306,12 +516,108 @@ export function PaperDetailPage() {
                   <div className="border-t border-border pt-3">
                     <p className="mono text-[9px] uppercase tracking-[0.16em] text-muted-foreground">Runner controls</p>
                     <p className="mt-2 text-[11px] leading-relaxed text-muted-foreground">
-                      Start, stop, and manual run are disabled because this process cannot prove ownership of the existing runner.
+                      Paper mutations require explicit review, exact ledger head, free market data, and the captured local Ollama model. Stop requests never signal an unknown process.
                     </p>
                     <div className="mt-3 grid grid-cols-2 gap-2">
-                      <Button variant="outline" disabled title={data.runner.reason}>Start runner</Button>
-                      <Button variant="outline" disabled title={data.runner.reason}>Manual run</Button>
+                      <div className="space-y-1">
+                        <Label htmlFor="runner-max-sessions" className="text-[10px] text-muted-foreground">Session cap</Label>
+                        <Input
+                          id="runner-max-sessions"
+                          type="number"
+                          min={1}
+                          max={100}
+                          step={1}
+                          value={maxSessions}
+                          onChange={(event) => setMaxSessions(event.target.value)}
+                          disabled={!canOperatePaper || paperActionBusy}
+                        />
+                      </div>
+                      <div className="space-y-1">
+                        <Label htmlFor="runner-max-runtime" className="text-[10px] text-muted-foreground">Deadline · minutes</Label>
+                        <Input
+                          id="runner-max-runtime"
+                          type="number"
+                          min={1}
+                          max={1440}
+                          step={1}
+                          value={maxRuntimeMinutes}
+                          onChange={(event) => setMaxRuntimeMinutes(event.target.value)}
+                          disabled={!canOperatePaper || paperActionBusy}
+                        />
+                      </div>
+                      <Button
+                        variant="outline"
+                        onClick={() => void requestPaperPreview("runner")}
+                        disabled={!canOperatePaper || paperActionBusy}
+                        title={runner?.reason ?? "Review finite local-paper runner bounds."}
+                      >
+                        Start runner
+                      </Button>
+                      <Button
+                        variant="outline"
+                        onClick={() => setStopRunnerDialogOpen(true)}
+                        disabled={!canStopRunner || paperActionBusy}
+                        title={!canStopRunner ? (runner?.reason ?? "No owned active runner is available.") : "Request a cooperative stop."}
+                      >
+                        {runner?.status === "stopping" ? "Stop requested" : "Stop runner"}
+                      </Button>
+                      <Button
+                        className="col-span-2"
+                        onClick={() => void requestPaperPreview("tick")}
+                        disabled={!canOperatePaper || paperActionBusy}
+                        title={runner?.reason ?? "Review exactly one due paper session."}
+                      >
+                        Manual one-session tick
+                      </Button>
                     </div>
+                    {!canOperatePaper ? (
+                      <p className="mt-2 text-[10px] leading-relaxed text-muted-foreground">
+                        {writeUnavailable
+                          ? `Unavailable: ${capabilities?.write_unavailable_reason}.`
+                          : capabilities?.network !== true
+                            ? "Enable startup network capability for free market-data preflight."
+                            : data.halt_state !== "clear"
+                              ? "Paper operations require a verified clear halt state."
+                              : !data.ledger.ok
+                                ? "Paper operations require a replayable ledger."
+                                : data.broker !== "paper"
+                                  ? "Only local-paper deployments are supported."
+                                  : runner?.status === "unknown"
+                                    ? runner.reason
+                                    : "An owned runner or manual session is already active."}
+                      </p>
+                    ) : null}
+                    {runner ? (
+                      <p className="mono mt-2 text-[10px] text-muted-foreground">
+                        {runner.sessions_completed ?? 0}/{runner.max_sessions ?? "—"} sessions ·{" "}
+                        {runner.last_session ? dateLabel(runner.last_session) : "no session recorded"}
+                        {runner.expires_at ? ` · deadline ${dateLabel(runner.expires_at)}` : ""}
+                      </p>
+                    ) : null}
+                    {operation ? (
+                      <div className="mt-4 rounded-lg border border-border bg-black/10 p-3" aria-live="polite">
+                        <div className="flex items-center justify-between gap-3">
+                          <span className="mono text-[10px] text-foreground">
+                            {operation.action === "paper-tick" ? "Manual tick" : "Runner start"} · {operation.status}
+                          </span>
+                          <span className="mono text-[10px] text-muted-foreground">{Math.min(100, Math.max(0, operation.progress))}%</span>
+                        </div>
+                        <div
+                          className="mt-2 h-1.5 overflow-hidden rounded-full bg-white/10"
+                          role="progressbar"
+                          aria-label="Paper operation progress"
+                          aria-valuenow={Math.min(100, Math.max(0, operation.progress))}
+                          aria-valuemin={0}
+                          aria-valuemax={100}
+                        >
+                          <div className="h-full rounded-full bg-accent transition-[width]" style={{ width: `${Math.min(100, Math.max(0, operation.progress))}%` }} />
+                        </div>
+                        <p className="mono mt-2 break-all text-[9px] text-muted-foreground">{operation.id}</p>
+                        {operation.error ? <p className="mt-2 text-[10px] text-rose-300">{operation.error}</p> : null}
+                      </div>
+                    ) : null}
+                    {operationResource.error ? <Alert tone="warning" className="mt-3">{operationResource.error}</Alert> : null}
+                    {runnerResource.error ? <Alert tone="warning" className="mt-3">{runnerResource.error}</Alert> : null}
                   </div>
                 </CardContent>
               </Card>
@@ -394,6 +700,86 @@ export function PaperDetailPage() {
         busy={busy}
         onConfirm={() => void submitAction()}
       />
+      <Dialog
+        open={paperPreview !== null}
+        onOpenChange={(open) => {
+          if (!open && !paperActionBusy) {
+            setPaperPreview(null);
+            setPaperPreviewKind(null);
+          }
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>
+              {paperPreviewKind === "tick" ? "Confirm one-session paper tick" : "Confirm finite runner start"}
+            </DialogTitle>
+            <DialogDescription>
+              No paper write occurs until you accept. The server rechecks the exact ledger head and due-set.
+            </DialogDescription>
+          </DialogHeader>
+          {paperPreview ? (
+            <div className="space-y-3 rounded-lg border border-border bg-black/10 p-3">
+              <p className="text-xs">
+                Ledger head: <span className="mono">{paperPreview.expected_head ? shortHash(paperPreview.expected_head) : "empty ledger"}</span>
+              </p>
+              <p className="text-xs">
+                Reviewed due-set:{" "}
+                <span className="mono">
+                  {paperPreview.due_set.length > 0
+                    ? paperPreview.due_set.map(dateLabel).join(" · ")
+                    : "No session due now; runner waits for the next eligible session."}
+                </span>
+              </p>
+              <p className="text-xs">
+                Data: <span className="mono">{paperPreview.estimate.market_data_provider}</span> · model calls/session{" "}
+                <span className="mono">{paperPreview.estimate.maximum_model_calls_per_session}</span>
+              </p>
+              {paperPreviewKind === "runner" ? (
+                <p className="text-xs">
+                  Bound: <span className="mono">{String(paperPreview.payload.max_sessions)} sessions / {String(paperPreview.payload.max_runtime_minutes)} minutes</span>
+                  {" · "}
+                  <span className="mono">{paperPreview.estimate.maximum_calls} calls / {paperPreview.estimate.maximum_resources} resources max</span>
+                </p>
+              ) : null}
+              <p className="mono text-[10px] text-muted-foreground">
+                Maximum provider cost: ${paperPreview.estimate.maximum_cost_usd.toFixed(2)} · expires {dateLabel(paperPreview.expires_at)}
+              </p>
+              {paperPreview.warnings.map((warning) => (
+                <p key={warning} className="text-[10px] leading-relaxed text-muted-foreground">{warning}</p>
+              ))}
+            </div>
+          ) : null}
+          <DialogFooter>
+            <Button
+              variant="ghost"
+              onClick={() => { setPaperPreview(null); setPaperPreviewKind(null); }}
+              disabled={paperActionBusy}
+            >
+              Cancel
+            </Button>
+            <Button
+              onClick={() => void acceptPaperPreview()}
+              disabled={!paperPreview || !canOperatePaper || paperActionBusy}
+            >
+              {paperActionBusy
+                ? "Accepting…"
+                : paperPreviewKind === "tick"
+                  ? "Accept one-session tick"
+                  : "Accept finite runner"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+      <ConfirmDialog
+        open={stopRunnerDialogOpen}
+        onOpenChange={setStopRunnerDialogOpen}
+        title={`Stop owned runner for ${name}`}
+        description="This writes a cooperative stop request to the exact server-owned runner. An in-flight session can finish; unknown PIDs are never signalled."
+        confirmLabel="Request runner stop"
+        busy={paperActionBusy}
+        onConfirm={() => void stopOwnedRunner()}
+      />
       <Dialog open={haltDialogOpen} onOpenChange={setHaltDialogOpen}>
         <DialogContent>
           <DialogHeader>
@@ -420,6 +806,33 @@ async function submitVerdict(name: string, verdict: "approve" | "reject", pendin
     decision_as_of: pending.decision_as_of,
     source_record_hash: pending.source_record_hash,
   });
+}
+
+function paperOperationStorageKey(name: string): string {
+  return `aihf.paper.${encodeURIComponent(name)}.operation`;
+}
+
+function readPaperOperationId(name: string): string | null {
+  try {
+    const stored = window.localStorage.getItem(paperOperationStorageKey(name));
+    return stored && /^[a-f0-9]{32}$/.test(stored) ? stored : null;
+  } catch {
+    return null;
+  }
+}
+
+function persistPaperOperationId(name: string, operationId: string): void {
+  try {
+    window.localStorage.setItem(paperOperationStorageKey(name), operationId);
+  } catch {
+    return;
+  }
+}
+
+function newRequestId(): string {
+  const bytes = new Uint8Array(16);
+  window.crypto.getRandomValues(bytes);
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
 function confirmTitle(action: PendingAction | null): string {

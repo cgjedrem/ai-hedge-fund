@@ -66,9 +66,11 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> None:
     parser = _parser()
     args = parser.parse_args(argv)
+    if args.container_bind:
+        parser.error("container observer projection is unavailable")
     if not args.demo and args.root is None:
         parser.error("--root is required unless --demo is selected")
-    host = "0.0.0.0" if args.container_bind else "127.0.0.1"
+    host = "127.0.0.1"
 
     if not args.demo:
         try:

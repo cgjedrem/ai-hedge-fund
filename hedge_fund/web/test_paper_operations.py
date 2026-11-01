@@ -1,0 +1,526 @@
+import os
+import threading
+import time
+from datetime import datetime, timedelta
+from pathlib import Path
+
+import pytest
+
+import hedge_fund.runtime.owned_runner as owned_runner
+import hedge_fund.web.services as web_services
+from hedge_fund.data.models import Price
+from hedge_fund.data.sessions import NEW_YORK
+from hedge_fund.fund import FundSpec, load_spec
+from hedge_fund.models import Signal
+from hedge_fund.paper.deployed import load_deployed
+from hedge_fund.paper.ledger import Ledger
+from hedge_fund.pipeline.session import code_version, mandate_hash, SessionRecord
+from hedge_fund.runtime.configuration import RuntimeSettings
+from hedge_fund.runtime.handover import record_ledger_head
+from hedge_fund.runtime.owned_runner import read_runner_record, runner_key
+from hedge_fund.test_support.handover import enroll_synthetic_root
+from hedge_fund.web.schemas import (
+    DeployRequest,
+    PaperTickAcceptRequest,
+    PaperTickPreviewRequest,
+    RunnerPreviewRequest,
+    RunnerStartAcceptRequest,
+)
+from hedge_fund.web.services import DeskService, ServiceError
+
+
+class _OfflineDataClient:
+    def __init__(self):
+        self.calls = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc_info):
+        return None
+
+    def get_prices(self, ticker, start_date, end_date, **_kwargs):
+        self.calls.append((ticker, start_date, end_date))
+        if start_date <= end_date:
+            return [
+                Price(
+                    open=100,
+                    close=101,
+                    high=102,
+                    low=99,
+                    volume=1000,
+                    time=f"{end_date}T16:00:00-04:00",
+                )
+            ]
+        return []
+
+
+class _OfflineAnalyst:
+    name = "pead"
+
+    def predict(self, ticker, as_of, _view):
+        return Signal(
+            model_name=self.name,
+            ticker=ticker,
+            date=as_of,
+            value=0.1,
+            reasoning="offline test signal",
+            components={},
+        )
+
+
+class _OfflineFund:
+    def __init__(self, spec: FundSpec):
+        self.spec = spec
+        self.strategies = [(spec.strategies[0], [_OfflineAnalyst()])]
+
+
+def _local_settings() -> RuntimeSettings:
+    return RuntimeSettings(
+        data_provider="yfinance",
+        llm_provider="Ollama",
+        model="gemma3:4b",
+        endpoint="http://127.0.0.1:11434",
+        timeout_seconds=1,
+        parameters={"max_tokens": 32},
+        version=0,
+    )
+
+
+def _wait_for_operation(
+    service: DeskService,
+    operation_id: str,
+    *,
+    timeout: float = 20,
+) -> dict:
+    deadline = time.monotonic() + timeout
+    latest = None
+    while time.monotonic() < deadline:
+        latest = service.get_operation(operation_id)
+        if latest["status"] in {"completed", "failed", "cancelled", "interrupted"}:
+            return latest
+        time.sleep(0.01)
+    raise AssertionError(f"paper operation did not reach a terminal state: {latest}")
+
+
+def _wait_for_runner_status(
+    service: DeskService,
+    name: str,
+    expected: str,
+    *,
+    timeout: float = 10,
+) -> dict:
+    deadline = time.monotonic() + timeout
+    latest = None
+    while time.monotonic() < deadline:
+        latest = service.runner_status(name)
+        if latest["status"] == expected:
+            return latest
+        time.sleep(0.02)
+    raise AssertionError(f"runner did not reach {expected!r}: {latest}")
+
+
+def test_reviewed_manual_tick_executes_one_session_with_local_fakes(
+    demo_root,
+    monkeypatch,
+):
+    data_client = _OfflineDataClient()
+
+    def no_provider_client(*_args, **_kwargs):
+        raise AssertionError("manual tick must use the injected offline data client")
+
+    monkeypatch.setattr(web_services, "make_data_client", no_provider_client)
+    service = DeskService(
+        demo_root,
+        allow_writes=True,
+        network_enabled=True,
+        data_client_factory=lambda: data_client,
+        fund_factory=_OfflineFund,
+    )
+    service._runtime_settings = _local_settings()
+    try:
+        spec = load_spec(demo_root / "mandates" / "demo-quality.yaml").model_copy(update={"name": "manual-test"})
+        service.create_mandate(spec.model_dump(mode="python"))
+        service.deploy_mandate("manual-test", DeployRequest(universe=["AAPL", "MSFT"]))
+        ledger = Ledger(demo_root / "paper" / "manual-test")
+        before = ledger.sessions()
+
+        preview = service.create_manual_tick_preview(
+            "manual-test",
+            PaperTickPreviewRequest(expected_head=None),
+            operator_session="offline-test-session",
+        )
+        due_session = preview["due_set"][0]
+        assert preview["reviewed_head"] is None
+        assert preview["estimate"]["maximum_cost_usd"] == 0.0
+        assert preview["capture"]["llm_provider"] == "Ollama"
+
+        request = PaperTickAcceptRequest(
+            request_id="offline-manual-tick-1",
+            preview_id=preview["preview_id"],
+            preview_digest=preview["preview_digest"],
+            confirmation_token=preview["confirmation_token"],
+            expected_head=None,
+            due_set=[due_session],
+        )
+        accepted = service.accept_manual_tick(
+            "manual-test",
+            request,
+            operator_session="offline-test-session",
+        )
+        completed = _wait_for_operation(service, accepted["operation_id"])
+        replayed = service.accept_manual_tick(
+            "manual-test",
+            request,
+            operator_session="offline-test-session",
+        )
+        after = ledger.sessions()
+        snapshot = service.paper_detail("manual-test")
+    finally:
+        service.close()
+
+    assert completed["status"] == "completed"
+    assert completed["result"]["session"] == due_session
+    assert replayed["operation_id"] == accepted["operation_id"]
+    assert after == [*before, due_session]
+    assert snapshot["last_session"] == due_session
+    assert len(data_client.calls) > 0
+
+
+def test_manual_tick_denies_runner_lane_conflict_without_ledger_change(demo_root):
+    data_client = _OfflineDataClient()
+    service = DeskService(
+        demo_root,
+        allow_writes=True,
+        network_enabled=True,
+        data_client_factory=lambda: data_client,
+        fund_factory=_OfflineFund,
+    )
+    service._runtime_settings = _local_settings()
+    ledger = Ledger(demo_root / "paper" / "demo-quality")
+    before = ledger.sessions()
+    head = ledger.latest().hash
+
+    try:
+        with service._admission.runner_reservation("demo-quality", timeout=0):
+            with pytest.raises(ServiceError) as conflict:
+                service.create_manual_tick_preview(
+                    "demo-quality",
+                    PaperTickPreviewRequest(expected_head=head),
+                    operator_session="offline-test-session",
+                )
+        after = ledger.sessions()
+    finally:
+        service.close()
+
+    assert conflict.value.status_code == 409
+    assert after == before
+
+
+def test_manual_tick_rejects_stale_head_before_creating_operation(
+    demo_root,
+    monkeypatch,
+):
+    data_client = _OfflineDataClient()
+
+    def no_provider_client(*_args, **_kwargs):
+        raise AssertionError("manual tick must use the injected offline data client")
+
+    monkeypatch.setattr(web_services, "make_data_client", no_provider_client)
+    service = DeskService(
+        demo_root,
+        allow_writes=True,
+        network_enabled=True,
+        data_client_factory=lambda: data_client,
+        fund_factory=_OfflineFund,
+    )
+    service._runtime_settings = _local_settings()
+    ledger = Ledger(demo_root / "paper" / "demo-quality")
+    try:
+        latest = ledger.latest()
+        preview = service.create_manual_tick_preview(
+            "demo-quality",
+            PaperTickPreviewRequest(expected_head=latest.hash),
+            operator_session="offline-stale-head-session",
+        )
+        due_session = preview["due_set"][0]
+        stale_sessions = ledger.sessions()
+        deployed = load_deployed(demo_root / "paper" / "demo-quality")
+        changed = SessionRecord(
+            fund=deployed.name,
+            session=due_session,
+            universe=list(deployed.universe),
+            nav=latest.nav,
+            cash=latest.cash,
+            positions=dict(latest.positions),
+            marks=dict(latest.marks),
+            benchmark=deployed.spec.benchmark,
+            benchmark_close=latest.benchmark_close,
+            rebalance=False,
+            prev_hash=latest.hash,
+            code_version=code_version(),
+            mandate_hash=mandate_hash(deployed.spec),
+        )
+        changed.hash = changed.compute_hash()
+        with service._admission.runner_reservation("demo-quality", timeout=0):
+            with service._admission.execution_lease("demo-quality", timeout=0):
+                ledger.append(changed)
+        record_ledger_head(
+            service.root_context,
+            "demo-quality",
+            admission=service._admission,
+        )
+        sessions_after_head_change = ledger.sessions()
+        request = PaperTickAcceptRequest(
+            request_id="offline-stale-manual-tick-1",
+            preview_id=preview["preview_id"],
+            preview_digest=preview["preview_digest"],
+            confirmation_token=preview["confirmation_token"],
+            expected_head=latest.hash,
+            due_set=[due_session],
+        )
+
+        with pytest.raises(ServiceError) as conflict:
+            service.accept_manual_tick(
+                "demo-quality",
+                request,
+                operator_session="offline-stale-head-session",
+            )
+        after = ledger.sessions()
+        accepted = service._operation_store.get_by_request(
+            "offline-stale-manual-tick-1",
+        )
+    finally:
+        service.close()
+
+    assert conflict.value.status_code == 409
+    assert sessions_after_head_change == [*stale_sessions, due_session]
+    assert after == sessions_after_head_change
+    assert accepted is None
+
+
+def test_owned_runner_child_starts_and_stops_with_exact_process_identity(
+    demo_root,
+):
+    name = "owned-runner-test"
+    root_path = Path(os.environ["HEDGE_FUND_TEST_ROOT"]) / "owned-runner-root"
+    root_path.mkdir()
+    enroll_synthetic_root(root_path)
+    service = DeskService(
+        root_path,
+        allow_writes=True,
+        network_enabled=True,
+    )
+    service._runtime_settings = _local_settings()
+    process = None
+    try:
+        payload = load_spec(demo_root / "mandates" / "demo-quality.yaml").model_dump(mode="python")
+        payload.update(
+            {
+                "name": name,
+                "rebalance": "minute",
+                "interval": 1.0,
+                "window": {"start": "04:30", "end": "04:35"},
+            }
+        )
+        spec = FundSpec.model_validate(payload)
+        service.create_mandate(spec.model_dump(mode="python"))
+        service.deploy_mandate(name, DeployRequest(universe=["AAPL", "MSFT"]))
+        ledger = Ledger(root_path / "paper" / name)
+        session_record = SessionRecord(
+            fund=name,
+            session=f"{datetime.now(NEW_YORK).date().isoformat()}T04:35:00",
+            universe=["AAPL", "MSFT"],
+            nav=spec.capital,
+            cash=spec.capital,
+            positions={},
+            marks={},
+            benchmark=spec.benchmark,
+            benchmark_close=100.0,
+            rebalance=True,
+            code_version=code_version(),
+            mandate_hash=mandate_hash(spec),
+        )
+        session_record.hash = session_record.compute_hash()
+        with service._admission.manual_session(name, timeout=0):
+            ledger.append(session_record)
+        record_ledger_head(
+            service.root_context,
+            name,
+            admission=service._admission,
+        )
+        head = ledger.latest().hash
+        preview = service.create_runner_preview(
+            name,
+            RunnerPreviewRequest(
+                expected_head=head,
+                max_sessions=1,
+                max_runtime_minutes=1,
+            ),
+            operator_session="owned-runner-test-session",
+        )
+        assert preview["due_set"] == []
+        assert preview["capture"]["llm_provider"] == "Ollama"
+
+        accepted = service.accept_runner_start(
+            name,
+            RunnerStartAcceptRequest(
+                request_id="owned-runner-start-1",
+                preview_id=preview["preview_id"],
+                preview_digest=preview["preview_digest"],
+                confirmation_token=preview["confirmation_token"],
+                expected_head=head,
+                due_set=preview["due_set"],
+                max_sessions=1,
+                max_runtime_minutes=1,
+            ),
+            operator_session="owned-runner-test-session",
+        )
+        completed = _wait_for_operation(service, accepted["operation_id"])
+        state = read_runner_record(service.root_context, name, "state")
+        assert completed["status"] == "completed", {
+            "error": completed.get("error"),
+            "runner": service.runner_status(name),
+            "state": state,
+            "control": read_runner_record(service.root_context, name, "control"),
+        }
+        running = service.runner_status(name)
+        key = runner_key(name)
+        process_ref = service._runner_manager._processes[key]
+        process = process_ref.process
+        runner_record = state
+
+        assert completed["status"] == "completed"
+        assert running["status"] == "running"
+        assert running["available"] is True
+        assert runner_record["pid"] == process.pid
+        assert runner_record["process_identity"] == process_ref.identity
+        assert runner_record["sessions_completed"] == 0
+        assert process.poll() is None
+
+        stopping = service.stop_runner(name)
+        stopped = _wait_for_runner_status(service, name, "stopped")
+        assert stopping["status"] == "stopping"
+        assert stopped["available"] is False
+        assert stopped["sessions_completed"] == 0
+        after = Ledger(root_path / "paper" / name)
+        assert after.sessions() == [session_record.session]
+        assert after.latest().hash == head
+        assert process.wait(timeout=10) == 0
+    finally:
+        try:
+            if service.runner_status(name)["status"] in {
+                "starting",
+                "running",
+                "stopping",
+            }:
+                service.stop_runner(name)
+        finally:
+            try:
+                process_ref = service._runner_manager._processes.get(runner_key(name))
+                if process_ref is not None and process_ref.process.poll() is None:
+                    process_ref.process.wait(timeout=10)
+            finally:
+                service.close()
+
+
+def test_runner_start_rejects_head_changed_after_acceptance_before_spawn(
+    demo_root,
+    monkeypatch,
+):
+    name = "stale-runner-start"
+    data_client = _OfflineDataClient()
+    service = DeskService(
+        demo_root,
+        allow_writes=True,
+        network_enabled=True,
+        data_client_factory=lambda: data_client,
+        fund_factory=_OfflineFund,
+    )
+    service._runtime_settings = _local_settings()
+    ledger = Ledger(demo_root / "paper" / name)
+    start_entered = threading.Event()
+    release_start = threading.Event()
+    popen_calls = []
+    original_start = service._runner_manager.start
+
+    def delayed_start(*args, **kwargs):
+        start_entered.set()
+        if not release_start.wait(timeout=10):
+            raise TimeoutError("runner start barrier timed out")
+        return original_start(*args, **kwargs)
+
+    def forbidden_spawn(*_args, **_kwargs):
+        popen_calls.append(True)
+        raise OSError("stale runner preview must not spawn")
+
+    monkeypatch.setattr(service._runner_manager, "start", delayed_start)
+    monkeypatch.setattr(owned_runner.subprocess, "Popen", forbidden_spawn)
+    accepted = None
+    completed = None
+    changed = None
+    try:
+        payload = load_spec(demo_root / "mandates" / "demo-quality.yaml").model_dump(mode="python")
+        payload["name"] = name
+        spec = FundSpec.model_validate(payload)
+        service.create_mandate(spec.model_dump(mode="python"))
+        service.deploy_mandate(name, DeployRequest(universe=["AAPL", "MSFT"]))
+        service._runtime_settings = _local_settings()
+        preview = service.create_runner_preview(
+            name,
+            RunnerPreviewRequest(
+                expected_head=None,
+                max_sessions=1,
+                max_runtime_minutes=1,
+            ),
+            operator_session="stale-runner-start-session",
+        )
+        accepted = service.accept_runner_start(
+            name,
+            RunnerStartAcceptRequest(
+                request_id="stale-runner-start-1",
+                preview_id=preview["preview_id"],
+                preview_digest=preview["preview_digest"],
+                confirmation_token=preview["confirmation_token"],
+                expected_head=None,
+                due_set=preview["due_set"],
+                max_sessions=1,
+                max_runtime_minutes=1,
+            ),
+            operator_session="stale-runner-start-session",
+        )
+        assert start_entered.wait(timeout=10)
+
+        deployed = load_deployed(demo_root / "paper" / name)
+        changed = SessionRecord(
+            fund=name,
+            session=(datetime.now().date() + timedelta(days=1)).isoformat(),
+            universe=list(deployed.universe),
+            nav=deployed.spec.capital,
+            cash=deployed.spec.capital,
+            positions={},
+            marks={},
+            benchmark=deployed.spec.benchmark,
+            benchmark_close=100.0,
+            rebalance=False,
+            prev_hash=None,
+            code_version=code_version(),
+            mandate_hash=mandate_hash(deployed.spec),
+        )
+        changed.hash = changed.compute_hash()
+        with service._admission.manual_session(name, timeout=0):
+            ledger.append(changed)
+        record_ledger_head(
+            service.root_context,
+            name,
+            admission=service._admission,
+        )
+        release_start.set()
+        completed = _wait_for_operation(service, accepted["operation_id"])
+    finally:
+        release_start.set()
+        service.close()
+
+    assert completed["status"] == "failed"
+    assert popen_calls == []
+    assert ledger.latest().hash == changed.hash

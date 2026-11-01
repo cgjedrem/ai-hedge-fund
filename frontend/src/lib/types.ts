@@ -6,6 +6,7 @@ export interface Capabilities {
   local_operator_only: boolean;
   csrf_authenticates_users: false;
   container_observer: boolean;
+  enrollment_state: "unenrolled" | "enrolled" | "invalid" | "drift";
   write_unavailable_reason: string | null;
   protected_names: string[];
   mutation_token: string | null;
@@ -114,7 +115,12 @@ export interface PaperCollection {
 export interface RunnerState {
   status: string;
   available: boolean;
-  reason: string;
+  reason: string | null;
+  started_at?: string | null;
+  expires_at?: string | null;
+  sessions_completed?: number;
+  max_sessions?: number | null;
+  last_session?: string | null;
 }
 
 export interface Position {
@@ -386,7 +392,7 @@ export interface Operation {
   status: OperationStatus;
   created_at: string;
   updated_at: string;
-  payload: BacktestPayload;
+  payload: Record<string, unknown>;
   result: Record<string, unknown> | null;
   progress: number;
   id: string;
@@ -415,6 +421,29 @@ export interface OperationPreview {
   estimate: {
     maximum_model_calls: number;
     maximum_cost_usd: number | null;
+    market_data_provider: string;
+  };
+  warnings: string[];
+}
+
+export interface PaperOperationPreview {
+  preview_id: string;
+  preview_digest: string;
+  confirmation_token: string;
+  action: "paper-tick" | "paper-runner-start";
+  subject_id: string;
+  expected_head: string | null;
+  due_set: string[];
+  capture_id: string;
+  capture_digest: string;
+  expires_at: string;
+  payload: Record<string, unknown>;
+  capture: Record<string, unknown>;
+  estimate: {
+    maximum_model_calls_per_session: number;
+    maximum_calls: number;
+    maximum_resources: number;
+    maximum_cost_usd: number;
     market_data_provider: string;
   };
   warnings: string[];

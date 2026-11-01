@@ -11,9 +11,17 @@ import sys
 import threading
 import time
 from contextlib import contextmanager, ExitStack
+from pathlib import Path
 from typing import Iterator
 
-from hedge_fund.runtime.root import PRIVATE_ROOT, ensure_unique_resource_name, RootContext, RootPathError, UnsupportedFilesystemError
+from hedge_fund.runtime.root import (
+    ensure_unique_resource_name,
+    PRIVATE_ROOT,
+    RootConfigurationError,
+    RootContext,
+    RootPathError,
+    UnsupportedFilesystemError,
+)
 
 PROTOCOL_VERSION = 1
 LOCK_DIRECTORY = f"{PRIVATE_ROOT}/admission/v{PROTOCOL_VERSION}"
@@ -21,6 +29,7 @@ OWNER_LOCK_PATH = f"{LOCK_DIRECTORY}/owner.lock"
 MAX_LOCK_WAIT_SECONDS = 5.0
 MAX_CONTROL_WAIT_SECONDS = 0.5
 _LOCK_POLL_SECONDS = 0.01
+_LOCK_STATE = threading.local()
 
 
 class AdmissionError(RuntimeError):
@@ -46,18 +55,21 @@ class _Overlapped(ctypes.Structure):
 
 
 class RootOwnerLease:
-    """Hold exclusive root-write ownership for one process lifetime."""
+    """Hold shared root participation for one process lifetime."""
 
     def __init__(
         self,
         root: RootContext,
         handle,
         token,
+        *,
+        exclusive: bool = False,
     ) -> None:
         self._root = root
         self._root_identity = root._root_identity
         self._handle = handle
         self._token = token
+        self._exclusive = exclusive
         self._closed = False
         self._guard = threading.Lock()
 
@@ -73,21 +85,40 @@ class RootOwnerLease:
         wait = _validate_timeout(timeout, MAX_LOCK_WAIT_SECONDS)
         if not root.verify_private_storage():
             raise OwnershipUnknown("Private root storage is not verified.")
+        from hedge_fund.runtime.handover import require_enrollment
+
+        require_enrollment(root)
         root.mkdir(LOCK_DIRECTORY, parents=True, mode=0o700)
         handle = root.open_lock_file(OWNER_LOCK_PATH, mode=0o600)
+        token = None
         try:
-            token = _acquire_os_lock(handle, wait)
+            token = _acquire_os_lock(handle, wait, exclusive=False)
             root.revalidate()
+            require_enrollment(root)
             return cls(root, handle, token)
         except BaseException:
-            handle.close()
+            try:
+                if token is not None:
+                    _release_os_lock(handle, token)
+            except Exception:
+                pass
+            finally:
+                handle.close()
             raise
 
     def matches(self, root: RootContext) -> bool:
         with self._guard:
-            if self._closed or self._root is not root or root._root_identity != self._root_identity:
+            if self._closed or self._exclusive or self._root is not root or root._root_identity != self._root_identity:
                 return False
-        return root.verify_private_storage()
+        if not root.verify_private_storage():
+            return False
+        from hedge_fund.runtime.handover import require_enrollment
+
+        try:
+            require_enrollment(root)
+        except Exception:
+            return False
+        return True
 
     def close(self) -> None:
         with self._guard:
@@ -113,6 +144,42 @@ class RootOwnerLease:
 
     def __exit__(self, *_exc_info) -> None:
         self.close()
+
+
+class RootMigrationLease(RootOwnerLease):
+    """Hold exclusive root ownership during offline enrollment."""
+
+    @classmethod
+    def acquire(
+        cls,
+        root: RootContext,
+        *,
+        timeout: float = 0.0,
+    ) -> RootMigrationLease:
+        if not isinstance(root, RootContext):
+            raise TypeError("an explicit RootContext is required")
+        wait = _validate_timeout(timeout, MAX_LOCK_WAIT_SECONDS)
+        if not root.verify_private_storage():
+            raise OwnershipUnknown("Private root storage is not verified.")
+        root.mkdir(LOCK_DIRECTORY, parents=True, mode=0o700)
+        handle = root.open_lock_file(OWNER_LOCK_PATH, mode=0o600)
+        token = None
+        try:
+            token = _acquire_os_lock(handle, wait, exclusive=True)
+            root.revalidate()
+            return cls(root, handle, token, exclusive=True)
+        except BaseException:
+            try:
+                if token is not None:
+                    _release_os_lock(handle, token)
+            except Exception:
+                pass
+            finally:
+                handle.close()
+            raise
+
+
+RootParticipantLease = RootOwnerLease
 
 
 class AdmissionCoordinator:
@@ -144,12 +211,31 @@ class AdmissionCoordinator:
     def require_root_owner(self) -> None:
         self._require_verified_owner()
 
+    def lane_is_held(self, lane: str, identity: str | None = None) -> bool:
+        if lane == "registry":
+            key = "registry"
+        elif lane in {"deployment", "runner", "execution", "control"} and identity is not None:
+            key = f"{lane}:{_resource_identity(identity)}"
+        else:
+            raise AdmissionError("admission lane is invalid")
+        filename = f"{LOCK_DIRECTORY}/{_lock_filename(key)}"
+        return _thread_lock_key(self._root, filename) in _held_locks()
+
     @contextmanager
     def registry_read_lock(self, *, timeout: float = 0.0) -> Iterator[None]:
         """Serialize snapshots without writer-ownership authority."""
         wait = _validate_timeout(timeout, MAX_LOCK_WAIT_SECONDS)
         relative = f"{LOCK_DIRECTORY}/{_lock_filename('registry')}"
         self._root.revalidate()
+        lock_key = _thread_lock_key(self._root, relative)
+        held = _held_locks()
+        if lock_key in held:
+            held[lock_key] += 1
+            try:
+                yield
+            finally:
+                held[lock_key] -= 1
+            return
         try:
             self._root.file_info(relative)
             handle = self._root.open_lock_file(relative, mode=0o600)
@@ -162,8 +248,10 @@ class AdmissionCoordinator:
             token = _acquire_os_lock(handle, wait)
             acquired = True
             self._root.revalidate()
+            held[lock_key] = 1
             yield
         finally:
+            held.pop(lock_key, None)
             try:
                 if acquired:
                     _release_os_lock(handle, token)
@@ -224,9 +312,21 @@ class AdmissionCoordinator:
     ) -> Iterator[None]:
         resource = _resource_identity(identity)
         wait = _validate_timeout(timeout, MAX_LOCK_WAIT_SECONDS)
+        deadline = time.monotonic() + wait
         with ExitStack() as stack:
+            stack.enter_context(
+                self._lock(
+                    f"deployment:{resource}",
+                    timeout=_remaining(deadline),
+                )
+            )
             stack.enter_context(self._lock(f"runner:{resource}", timeout=0.0))
-            stack.enter_context(self._lock(f"execution:{resource}", timeout=wait))
+            stack.enter_context(
+                self._lock(
+                    f"execution:{resource}",
+                    timeout=_remaining(deadline),
+                )
+            )
             yield
 
     @contextmanager
@@ -260,9 +360,12 @@ class AdmissionCoordinator:
         self._require_verified_owner()
         wait = _validate_timeout(timeout, MAX_LOCK_WAIT_SECONDS)
         filename = _lock_filename(key)
+        relative = f"{LOCK_DIRECTORY}/{filename}"
+        lock_key = _thread_lock_key(self._root, relative)
+        held = _held_locks()
         self._root.mkdir(LOCK_DIRECTORY, parents=True, mode=0o700)
         handle = self._root.open_lock_file(
-            f"{LOCK_DIRECTORY}/{filename}",
+            relative,
             mode=0o600,
         )
         acquired = False
@@ -272,8 +375,10 @@ class AdmissionCoordinator:
             token = _acquire_os_lock(handle, wait)
             acquired = True
             self._root.revalidate()
+            held[lock_key] = 1
             yield
         finally:
+            held.pop(lock_key, None)
             try:
                 if acquired:
                     _release_os_lock(handle, token)
@@ -284,6 +389,101 @@ class AdmissionCoordinator:
         if self._owner_lease is None or not self._owner_lease.matches(self._root):
             raise OwnershipUnknown("Writer ownership is unknown.")
         self._root.revalidate()
+
+
+def require_paper_write_lanes(
+    path: str | os.PathLike[str],
+    identity: str,
+    *,
+    lane_sets: tuple[tuple[str, ...], ...],
+    paper_root: bool = False,
+    verify_inventory: bool = False,
+) -> bool:
+    """Require one held lane set for a conventional enrolled paper path."""
+    if not isinstance(path, (str, os.PathLike)):
+        raise AdmissionError("paper path must be text or path-like")
+    if type(paper_root) is not bool or type(verify_inventory) is not bool:
+        raise AdmissionError("paper admission flags must be booleans")
+    if not isinstance(lane_sets, tuple) or not lane_sets:
+        raise AdmissionError("paper admission lane sets are invalid")
+    allowed_lanes = {"deployment", "runner", "execution", "control"}
+    for lane_set in lane_sets:
+        if not isinstance(lane_set, tuple) or not lane_set or any(not isinstance(lane, str) for lane in lane_set) or len(set(lane_set)) != len(lane_set) or any(lane not in allowed_lanes for lane in lane_set):
+            raise AdmissionError("paper admission lane sets are invalid")
+    try:
+        candidate = Path(os.path.abspath(os.fspath(path)))
+    except (TypeError, ValueError, OSError) as exc:
+        raise AdmissionError("paper path is invalid") from exc
+    if paper_root:
+        if not _is_paper_component(candidate.name):
+            return False
+        root_path = candidate.parent
+    else:
+        if not _is_paper_component(candidate.parent.name):
+            return False
+        resource = _resource_identity(identity)
+        if _resource_identity(candidate.name) != resource:
+            raise AdmissionError("paper path identity does not match the fund")
+        root_path = candidate.parent.parent
+    if paper_root:
+        resource = _resource_identity(identity)
+
+    try:
+        root = RootContext.open(root_path)
+    except RootConfigurationError as exc:
+        if isinstance(exc.__cause__, FileNotFoundError) and not _handover_marker_may_exist(root_path):
+            return False
+        raise OwnershipUnknown("Conventional paper root identity is invalid.") from exc
+    except UnsupportedFilesystemError as exc:
+        if _handover_marker_may_exist(root_path):
+            raise OwnershipUnknown("Enrolled paper root identity is unavailable.") from exc
+        return False
+    except RootPathError as exc:
+        raise OwnershipUnknown("Conventional paper root identity is invalid.") from exc
+    except OSError as exc:
+        if _handover_marker_may_exist(root_path):
+            raise OwnershipUnknown("Enrolled paper root identity is unavailable.") from exc
+        return False
+
+    try:
+        from hedge_fund.runtime.handover import (
+            require_enrollment,
+            root_is_enrolled,
+            verify_root_inventory,
+        )
+
+        if not root_is_enrolled(root):
+            for marker in (LOCK_DIRECTORY, OWNER_LOCK_PATH):
+                try:
+                    root.file_info(marker)
+                except FileNotFoundError:
+                    continue
+                except Exception as exc:
+                    raise OwnershipUnknown("Paper admission state is unavailable.") from exc
+                raise OwnershipUnknown("Admission state exists without a handover record.")
+            return False
+        try:
+            private_storage_verified = root.verify_private_storage()
+        except Exception as exc:
+            raise OwnershipUnknown("Private root storage cannot be verified.") from exc
+        if not private_storage_verified:
+            raise OwnershipUnknown("Private root storage is not verified.")
+        try:
+            require_enrollment(root)
+        except Exception as exc:
+            raise OwnershipUnknown("Paper root enrollment is invalid.") from exc
+        if verify_inventory:
+            try:
+                verify_root_inventory(root)
+            except Exception as exc:
+                raise AdmissionError("Paper ledger inventory differs from offline handover.") from exc
+
+        coordinator = AdmissionCoordinator(root)
+        if not any(all(coordinator.lane_is_held(lane, resource) for lane in lane_set) for lane_set in lane_sets):
+            raise WriterConflict("Enrolled paper write requires a held admission lane.")
+        return True
+    finally:
+        root.close()
 
 
 def _resource_identity(identity: str) -> str:
@@ -317,10 +517,10 @@ def _lock_filename(key: str) -> str:
     return f"{namespace}-{digest}.lock"
 
 
-def _acquire_os_lock(handle, timeout: float):
+def _acquire_os_lock(handle, timeout: float, *, exclusive: bool = True):
     deadline = time.monotonic() + timeout
     while True:
-        acquired, token = _try_acquire_os_lock(handle)
+        acquired, token = _try_acquire_os_lock(handle, exclusive=exclusive)
         if acquired:
             return token
         remaining = deadline - time.monotonic()
@@ -329,12 +529,13 @@ def _acquire_os_lock(handle, timeout: float):
         time.sleep(min(_LOCK_POLL_SECONDS, remaining))
 
 
-def _try_acquire_os_lock(handle) -> tuple[bool, object | None]:
+def _try_acquire_os_lock(handle, *, exclusive: bool = True) -> tuple[bool, object | None]:
     if handle.fd is not None and sys.platform.startswith("linux"):
         import fcntl
 
         try:
-            fcntl.flock(handle.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            mode = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+            fcntl.flock(handle.fd, mode | fcntl.LOCK_NB)
         except OSError as exc:
             if exc.errno in {errno.EACCES, errno.EAGAIN}:
                 return False, None
@@ -343,9 +544,12 @@ def _try_acquire_os_lock(handle) -> tuple[bool, object | None]:
     if handle.handle is not None and os.name == "nt":
         kernel32 = _windows_lock_api()
         overlapped = _Overlapped()
+        flags = 0x00000001
+        if exclusive:
+            flags |= 0x00000002
         if kernel32.LockFileEx(
             ctypes.c_void_p(handle.handle),
-            0x00000001 | 0x00000002,
+            flags,
             0,
             1,
             0,
@@ -403,3 +607,30 @@ def _windows_lock_api():
     ]
     kernel32.UnlockFileEx.restype = ctypes.c_int
     return kernel32
+
+
+def _held_locks() -> dict[tuple[tuple[int, ...], str], int]:
+    held = getattr(_LOCK_STATE, "held", None)
+    if held is None:
+        held = {}
+        _LOCK_STATE.held = held
+    return held
+
+
+def _thread_lock_key(root: RootContext, relative: str) -> tuple[tuple[int, ...], str]:
+    return tuple(root._root_identity), relative
+
+
+def _is_paper_component(value: str) -> bool:
+    return value == "paper" or (os.name == "nt" and value.casefold() == "paper")
+
+
+def _handover_marker_may_exist(root_path: Path) -> bool:
+    marker = root_path / PRIVATE_ROOT / "handover.json"
+    try:
+        marker.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return True

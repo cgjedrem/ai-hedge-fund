@@ -357,3 +357,112 @@ def test_runner_accepts_later_due_sets_only_within_finite_session_limit():
         authorize_session(authorization, due_set=("2026-11-02",), **identity)
 
     assert authorization.sessions_started == 2
+
+
+def test_runner_with_no_initially_due_session_uses_finite_future_schedule():
+    now = datetime(2026, 10, 31, 12, 0, tzinfo=timezone.utc)
+    authorization = RunnerAuthorization(
+        root_id="synthetic-root",
+        deployment_id="deployment-1",
+        capture_digest="capture-digest",
+        provider_ids=("provider-identity",),
+        expires_at=now + timedelta(hours=1),
+        max_sessions=2,
+        max_calls=2,
+        max_resources=2,
+        initial_due_set=(),
+    )
+    identity = {
+        "root_id": "synthetic-root",
+        "deployment_id": "deployment-1",
+        "capture_digest": "capture-digest",
+        "now": now,
+    }
+
+    assert (
+        authorize_session(
+            authorization,
+            due_set=("2026-11-02",),
+            **identity,
+        )
+        == 1
+    )
+    assert (
+        authorize_session(
+            authorization,
+            due_set=("2026-11-03",),
+            **identity,
+        )
+        == 2
+    )
+    with pytest.raises(AuthorizationDenied):
+        authorize_session(
+            authorization,
+            due_set=("2026-11-04",),
+            **identity,
+        )
+
+    assert authorization.sessions_started == 2
+
+
+def test_runner_allows_bounded_free_data_preflight_before_first_session():
+    now = datetime(2026, 10, 31, 12, 0, tzinfo=timezone.utc)
+    target = ProviderTarget(kind="data", provider="yfinance")
+    authorization = RunnerAuthorization(
+        root_id="synthetic-root",
+        deployment_id="deployment-1",
+        capture_digest="capture-digest",
+        provider_ids=(target.identity,),
+        expires_at=now + timedelta(hours=1),
+        max_sessions=1,
+        max_calls=2,
+        max_resources=2,
+        initial_due_set=(),
+    )
+
+    assert (
+        authorize_dispatch(
+            target,
+            scope=OperationScope.SCHEDULED,
+            root_id="synthetic-root",
+            subject_id="deployment-1",
+            capture_digest="capture-digest",
+            now=now,
+            runner=authorization,
+            upper_bound_cost=Decimal("0"),
+        )
+        is ProviderClass.FREE_DATA
+    )
+    assert authorization.calls_reserved == 1
+    authorization = RunnerAuthorization(
+        root_id="synthetic-root",
+        deployment_id="deployment-1",
+        capture_digest="capture-digest",
+        provider_ids=("provider-identity",),
+        expires_at=now + timedelta(hours=1),
+        max_sessions=1,
+        max_calls=2,
+        max_resources=2,
+        initial_due_set=(),
+    )
+
+    assert (
+        authorize_session(
+            authorization,
+            root_id="synthetic-root",
+            deployment_id="deployment-1",
+            capture_digest="capture-digest",
+            due_set=("2026-11-02",),
+            now=now,
+        )
+        == 1
+    )
+    with pytest.raises(AuthorizationDenied):
+        authorize_session(
+            authorization,
+            root_id="synthetic-root",
+            deployment_id="deployment-1",
+            capture_digest="capture-digest",
+            due_set=("2026-11-03",),
+            now=now,
+        )

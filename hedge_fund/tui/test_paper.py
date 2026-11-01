@@ -3,6 +3,7 @@
 import asyncio
 import os
 from datetime import datetime
+from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
@@ -48,6 +49,109 @@ def test_all_modes_can_be_backtested_and_paper_traded(mode, size):
             assert load_deployed(directory).spec == spec
 
     asyncio.run(scenario())
+
+
+def test_enrolled_root_displays_tui_write_denial_and_blocks_paper_controls(monkeypatch):
+    from hedge_fund.runtime.admission import AdmissionCoordinator, RootOwnerLease
+    from hedge_fund.runtime.handover import enroll_fresh, record_ledger_head
+    from hedge_fund.runtime.root import RootContext
+
+    root = Path(os.environ["HEDGE_FUND_TEST_ROOT"]) / "tui-enrolled"
+    root.mkdir()
+    spec = make_spec(["pead"], "alpha").model_copy(update={"approval_required": True})
+    forbidden_client = Mock(side_effect=AssertionError("TUI reached provider setup"))
+    forbidden_action = Mock(side_effect=AssertionError("TUI reached a paper writer"))
+    monkeypatch.setattr(paper, "make_data_client", forbidden_client)
+    monkeypatch.setattr(paper, "tick", forbidden_action)
+    monkeypatch.setattr(paper, "redo", forbidden_action)
+    monkeypatch.setattr(paper, "spawn_runner", forbidden_action)
+    monkeypatch.setattr(paper, "stop_runner", forbidden_action)
+    monkeypatch.setattr(paper, "demand_run_keys", forbidden_action)
+
+    with RootContext.open(root) as context, paths.bound_root(context):
+        enroll_fresh(context)
+        owner = RootOwnerLease.acquire(context, timeout=0)
+        admission = AdmissionCoordinator(context, owner_lease=owner)
+        try:
+            with admission.deployment_lock("alpha", timeout=0):
+                directory = deploy("alpha", spec, ["TEST"], root=paths.PAPER_DIR)
+            ledger = Ledger(directory)
+            pending = make_pending("2025-01-20")
+            with admission.manual_session("alpha", timeout=0):
+                ledger.append(make_session("2025-01-20", decision=pending))
+            record_ledger_head(context, "alpha", admission=admission)
+            before_files = {path.relative_to(root).as_posix(): path.read_bytes() for path in root.rglob("*") if path.is_file() and "runtime/private" not in path.relative_to(root).as_posix()}
+
+            async def scenario():
+                app = HedgeFundApp()
+                async with app.run_test(size=(140, 50)) as pilot:
+                    await app.push_screen(paper.PaperScreen(select="alpha"))
+                    screen = app.screen
+                    detail = render(screen.query_one("#detail-body", Static).content)
+                    assert "WRITE UNAVAILABLE" in detail
+                    assert "enrolled roots" in detail
+
+                    screen.action_run()
+                    assert app.screen is screen
+                    screen.action_runner()
+                    assert app.screen is screen
+                    screen.action_halt()
+                    screen.action_resume()
+                    screen.action_approve()
+                    screen.action_reject()
+                    screen.action_delete()
+                    screen._finish_delete("alpha", True)
+                    assert app.screen is screen
+
+                    await app.push_screen(paper.RunSessionScreen(directory))
+                    for _ in range(20):
+                        await pilot.pause(0.05)
+                        if app.screen._phase == "failed":
+                            break
+                    assert app.screen._phase == "failed"
+                    assert "TUI paper writes are disabled on enrolled roots" in render(app.screen.query_one("#run-phase", Static).content)
+
+                    await app.push_screen(paper.BuilderScreen(mode="paper"))
+                    app.screen._finish_build()
+
+            asyncio.run(scenario())
+            with pytest.raises(RuntimeError, match="TUI paper writes are disabled"):
+                funds.wipe_fund("alpha")
+
+            after_files = {path.relative_to(root).as_posix(): path.read_bytes() for path in root.rglob("*") if path.is_file() and "runtime/private" not in path.relative_to(root).as_posix()}
+            assert after_files == before_files
+            assert not (root / "mandates").exists()
+            forbidden_client.assert_not_called()
+            forbidden_action.assert_not_called()
+        finally:
+            owner.close()
+
+
+def test_tui_delete_denies_orphaned_admission_state_without_side_effects(tmp_path):
+    from hedge_fund.runtime.handover import enroll_fresh, HANDOVER_PATH
+    from hedge_fund.runtime.root import RootContext
+
+    root = tmp_path / "tui-orphan"
+    root.mkdir()
+    with RootContext.open(root) as context:
+        enroll_fresh(context)
+        mandate = root / "mandates" / "alpha.yaml"
+        mandate.parent.mkdir()
+        mandate.write_text("synthetic: true\n", encoding="utf-8")
+        paper_record = root / "paper" / "alpha" / "ledger" / "record.json"
+        paper_record.parent.mkdir(parents=True)
+        paper_record.write_text("synthetic-ledger\n", encoding="utf-8")
+        (root / HANDOVER_PATH).unlink()
+
+        with paths.bound_root(context):
+            with pytest.raises(
+                RuntimeError,
+                match="root enrollment or ledger inventory is unavailable",
+            ):
+                funds.wipe_fund("alpha")
+
+        assert mandate.read_text(encoding="utf-8") == "synthetic: true\n"
+        assert paper_record.read_text(encoding="utf-8") == "synthetic-ledger\n"
 
 
 def test_paper_screen_records_approval_verdicts_from_y_and_n():
@@ -273,7 +377,11 @@ def test_session_report_separates_the_executed_cycle_from_the_new_decision(size,
     asyncio.run(scenario())
 
 
-def test_paper_screen_works_the_kill_switch_and_sessions_reads_the_ledger(tmp_path):
+def test_paper_screen_works_the_kill_switch_and_sessions_reads_the_ledger(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(paper, "fetch_snapshots", lambda _tickers: {})
     spec = make_spec(["pead"], "alpha")
     directory = deploy("alpha", spec, ["TEST"], root=paths.PAPER_DIR)
     ledger = Ledger(directory)
@@ -399,23 +507,27 @@ def test_paper_screen_enter_on_a_minute_fund_opens_the_same_approval_step(monkey
 def test_paper_screen_space_starts_and_stops_a_runner_at_any_cadence(monkeypatch, cadence):
     spec = make_minute_spec() if cadence == "minute" else make_spec(["pead"], "alpha")
     directory = deploy(spec.name, spec, ["TEST"], root=paths.PAPER_DIR)
-    for variable in ("FINANCIAL_DATASETS_API_KEY", "TYPESAFE_API_KEY"):
-        monkeypatch.setenv(variable, "x")
-    monkeypatch.setenv("HEDGE_FUND_LLM_MODEL", "jev-1.13.0")
+    monkeypatch.setattr(paper, "demand_run_keys", lambda _app, _resume: True)
+    running = {"value": False}
     spawned, stopped = [], []
 
-    def spawn(path):
+    def spawn(path, *, root):
+        assert root == paths.root_context().path
         spawned.append(path)
-        (path / PID_FILE).write_text(str(os.getpid()))  # what the real runner does on start
+        running["value"] = True
+        (path / PID_FILE).write_text("test-owned")
         return os.getpid()
 
     def stop(path):
         stopped.append(path)
+        running["value"] = False
         (path / PID_FILE).unlink()
         return True
 
     monkeypatch.setattr(paper, "spawn_runner", spawn)
     monkeypatch.setattr(paper, "stop_runner", stop)
+    monkeypatch.setattr(paper, "is_running", lambda _path: running["value"])
+    monkeypatch.setattr(paper_view, "is_running", lambda _path: running["value"])
 
     async def scenario():
         app = HedgeFundApp()

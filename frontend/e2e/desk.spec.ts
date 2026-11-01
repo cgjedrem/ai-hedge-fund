@@ -54,6 +54,39 @@ async function assertCustomMode(page: Page, mode: string): Promise<void> {
   await expect(heading.locator("xpath=..").getByText(mode, { exact: true })).toBeVisible();
 }
 
+async function installSyntheticPaperCapabilities(page: Page): Promise<string> {
+  const [capabilitiesResponse, paperResponse] = await Promise.all([
+    page.request.get("/api/capabilities"),
+    page.request.get("/api/paper/demo-quality"),
+  ]);
+  expect(capabilitiesResponse.ok()).toBe(true);
+  expect(paperResponse.ok()).toBe(true);
+  const capabilities = await capabilitiesResponse.json();
+  const paper = await paperResponse.json();
+  expect(paper.broker).toBe("paper");
+  expect(paper.ledger.ok).toBe(true);
+  expect(paper.halt_state).toBe("clear");
+  const head = paper.last_record_hash as string;
+  expect(head).toMatch(/^[a-f0-9]{64}$/);
+
+  await page.route("**/api/capabilities", (route) =>
+    route.fulfill({
+      json: {
+        ...capabilities,
+        mode: "live",
+        read_only: false,
+        writes: true,
+        network: true,
+        enrollment_state: "enrolled",
+        write_unavailable_reason: null,
+        protected_names: [],
+        mutation_token: "browser-paper-control-token",
+      },
+    }),
+  );
+  return head;
+}
+
 test("production routes render at desktop and narrow widths without external requests", async ({ page }) => {
   mkdirSync(screenshotDir, { recursive: true });
   const externalRequests: string[] = [];
@@ -217,6 +250,341 @@ test("paper valuation requires an explicit quote refresh", async ({ page }) => {
       token: "browser-valuation-token",
     },
   ]);
+});
+
+test("manual tick review accepts once and reload restores durable progress", async ({ page }) => {
+  const head = await installSyntheticPaperCapabilities(page);
+  const operationId = "2".repeat(32);
+  const dueSession = "2024-06-06";
+  const stoppedRunner = {
+    status: "stopped",
+    available: false,
+    reason: "No owned runner is active.",
+    started_at: null,
+    expires_at: null,
+    sessions_completed: 0,
+    max_sessions: null,
+    last_session: null,
+  };
+  const preview = {
+    preview_id: "5".repeat(32),
+    preview_digest: "6".repeat(64),
+    confirmation_token: "browser-manual-tick-confirmation",
+    action: "paper-tick",
+    subject_id: "demo-quality",
+    expected_head: head,
+    due_set: [dueSession],
+    capture_id: "3".repeat(32),
+    capture_digest: "4".repeat(64),
+    expires_at: "2026-10-31T12:10:00+00:00",
+    payload: { kind: "manual-tick", session: dueSession, expected_head: head },
+    capture: { data_provider: "yfinance", llm_provider: "Ollama", model: "gemma3:4b" },
+    estimate: {
+      maximum_model_calls_per_session: 4,
+      maximum_calls: 3,
+      maximum_resources: 4,
+      maximum_cost_usd: 0,
+      market_data_provider: "yfinance",
+    },
+    warnings: ["Synthetic browser fixture; no provider call."],
+  };
+  const operation = {
+    operation_id: operationId,
+    request_id: "browser-manual-tick",
+    action: "paper-tick",
+    subject_id: "demo-quality",
+    capture_id: preview.capture_id,
+    capture_digest: preview.capture_digest,
+    status: "running",
+    created_at: "2026-10-31T12:00:00+00:00",
+    updated_at: "2026-10-31T12:00:01+00:00",
+    payload: preview.payload,
+    result: null,
+    progress: 25,
+    id: operationId,
+    fund: "demo-quality",
+    provider: null,
+    model: null,
+    report_id: null,
+    error: null,
+    cancel_requested: false,
+    status_url: `/api/operations/${operationId}`,
+  };
+  let previewCount = 0;
+  let acceptCount = 0;
+
+  await page.route("**/api/paper/demo-quality/runner", (route) =>
+    route.fulfill({ json: stoppedRunner }),
+  );
+  await page.route("**/api/paper/demo-quality/tick/preview", async (route) => {
+    previewCount += 1;
+    expect(route.request().headers()["x-csrf-token"]).toBe("browser-paper-control-token");
+    expect(route.request().postDataJSON()).toEqual({ expected_head: head });
+    await route.fulfill({ status: 201, json: preview });
+  });
+  await page.route("**/api/paper/demo-quality/tick", async (route) => {
+    acceptCount += 1;
+    expect(route.request().headers()["x-csrf-token"]).toBe("browser-paper-control-token");
+    const body = route.request().postDataJSON() as Record<string, unknown>;
+    expect(body).toMatchObject({
+      preview_id: preview.preview_id,
+      preview_digest: preview.preview_digest,
+      confirmation_token: preview.confirmation_token,
+      expected_head: head,
+      due_set: [dueSession],
+    });
+    expect(body.request_id).toMatch(/^[a-f0-9]{32}$/);
+    await route.fulfill({ status: 202, json: operation });
+  });
+  await page.route(`**/api/operations/${operationId}`, (route) =>
+    route.fulfill({ json: operation }),
+  );
+
+  await page.goto("/paper/demo-quality");
+  await expect(page.getByRole("heading", { name: "demo-quality" })).toBeVisible();
+  const review = page.getByRole("button", { name: "Manual one-session tick" });
+  await expect(review).toBeEnabled();
+  await review.click();
+  const dialog = page.getByRole("dialog", { name: "Confirm one-session paper tick" });
+  await expect(dialog).toBeVisible();
+  expect(previewCount).toBe(1);
+  expect(acceptCount).toBe(0);
+
+  const accept = dialog.getByRole("button", { name: "Accept one-session tick" });
+  await accept.evaluate((element) => {
+    const button = element as HTMLButtonElement;
+    button.click();
+    button.click();
+  });
+  await expect(page.getByText("Manual tick · running")).toBeVisible();
+  await expect(page.getByRole("progressbar", { name: "Paper operation progress" })).toHaveAttribute("aria-valuenow", "25");
+  await expect(page.getByText(operationId)).toBeVisible();
+  expect(acceptCount).toBe(1);
+
+  await page.reload();
+  await expect(page.getByText("Manual tick · running")).toBeVisible();
+  await expect(page.getByRole("progressbar", { name: "Paper operation progress" })).toHaveAttribute("aria-valuenow", "25");
+  expect(acceptCount).toBe(1);
+  expect(previewCount).toBe(1);
+  const unchangedPaper = await (await page.request.get("/api/paper/demo-quality")).json();
+  expect(unchangedPaper.last_record_hash).toBe(head);
+});
+
+test("manual tick rejects stale-head acceptance without creating an operation", async ({ page }) => {
+  const head = await installSyntheticPaperCapabilities(page);
+  const dueSession = "2024-06-06";
+  const preview = {
+    preview_id: "5".repeat(32),
+    preview_digest: "6".repeat(64),
+    confirmation_token: "browser-stale-head-confirmation",
+    action: "paper-tick",
+    subject_id: "demo-quality",
+    expected_head: head,
+    due_set: [dueSession],
+    capture_id: "3".repeat(32),
+    capture_digest: "4".repeat(64),
+    expires_at: "2026-10-31T12:10:00+00:00",
+    payload: { kind: "manual-tick", session: dueSession, expected_head: head },
+    capture: { data_provider: "yfinance", llm_provider: "Ollama", model: "gemma3:4b" },
+    estimate: {
+      maximum_model_calls_per_session: 4,
+      maximum_calls: 3,
+      maximum_resources: 4,
+      maximum_cost_usd: 0,
+      market_data_provider: "yfinance",
+    },
+    warnings: ["Synthetic browser fixture; no provider call."],
+  };
+  let acceptCount = 0;
+  await page.route("**/api/paper/demo-quality/runner", (route) =>
+    route.fulfill({
+      json: {
+        status: "stopped",
+        available: false,
+        reason: "No owned runner is active.",
+        started_at: null,
+        expires_at: null,
+        sessions_completed: 0,
+        max_sessions: null,
+        last_session: null,
+      },
+    }),
+  );
+  await page.route("**/api/paper/demo-quality/tick/preview", async (route) => {
+    expect(route.request().postDataJSON()).toEqual({ expected_head: head });
+    await route.fulfill({ status: 201, json: preview });
+  });
+  await page.route("**/api/paper/demo-quality/tick", async (route) => {
+    acceptCount += 1;
+    const body = route.request().postDataJSON() as Record<string, unknown>;
+    expect(body.expected_head).toBe(head);
+    expect(body.due_set).toEqual([dueSession]);
+    await route.fulfill({
+      status: 409,
+      json: { detail: "Ledger head changed; reload before submitting a tick." },
+    });
+  });
+
+  await page.goto("/paper/demo-quality");
+  await expect(page.getByRole("heading", { name: "demo-quality" })).toBeVisible();
+  await page.getByRole("button", { name: "Manual one-session tick" }).click();
+  const dialog = page.getByRole("dialog", { name: "Confirm one-session paper tick" });
+  await expect(dialog).toBeVisible();
+  await dialog.getByRole("button", { name: "Accept one-session tick" }).click();
+  await expect(page.getByText("Ledger head changed; reload before submitting a tick.")).toBeVisible();
+  expect(acceptCount).toBe(1);
+  expect(await page.evaluate(() => localStorage.getItem("aihf.paper.demo-quality.operation"))).toBeNull();
+  await expect(page.getByText(/Manual tick ·/)).toHaveCount(0);
+  const unchangedPaper = await (await page.request.get("/api/paper/demo-quality")).json();
+  expect(unchangedPaper.last_record_hash).toBe(head);
+});
+
+test("runner browser controls accept finite bounds and request cooperative stop", async ({ page }) => {
+  const head = await installSyntheticPaperCapabilities(page);
+  const operationId = "7".repeat(32);
+  const preview = {
+    preview_id: "8".repeat(32),
+    preview_digest: "9".repeat(64),
+    confirmation_token: "browser-runner-confirmation",
+    action: "paper-runner-start",
+    subject_id: "demo-quality",
+    expected_head: head,
+    due_set: [],
+    capture_id: "a".repeat(32),
+    capture_digest: "b".repeat(64),
+    expires_at: "2026-10-31T12:10:00+00:00",
+    payload: {
+      kind: "runner-start",
+      max_sessions: 1,
+      max_runtime_minutes: 60,
+      max_calls: 63,
+      max_resources: 130,
+    },
+    capture: { data_provider: "yfinance", llm_provider: "Ollama", model: "gemma3:4b" },
+    estimate: {
+      maximum_model_calls_per_session: 4,
+      maximum_calls: 63,
+      maximum_resources: 130,
+      maximum_cost_usd: 0,
+      market_data_provider: "yfinance",
+    },
+    warnings: ["Synthetic browser fixture; no provider call."],
+  };
+  const operation = {
+    operation_id: operationId,
+    request_id: "browser-runner-start",
+    action: "paper-runner-start",
+    subject_id: "demo-quality",
+    capture_id: preview.capture_id,
+    capture_digest: preview.capture_digest,
+    status: "completed",
+    created_at: "2026-10-31T12:00:00+00:00",
+    updated_at: "2026-10-31T12:00:01+00:00",
+    payload: preview.payload,
+    result: { runner: { status: "running" } },
+    progress: 100,
+    id: operationId,
+    fund: "demo-quality",
+    provider: null,
+    model: null,
+    report_id: null,
+    error: null,
+    cancel_requested: false,
+    status_url: `/api/operations/${operationId}`,
+  };
+  let currentRunner: Record<string, unknown> = {
+    status: "stopped",
+    available: false,
+    reason: "No owned runner is active.",
+    started_at: null,
+    expires_at: null,
+    sessions_completed: 0,
+    max_sessions: null,
+    last_session: null,
+  };
+  let startCount = 0;
+  let stopCount = 0;
+
+  await page.route("**/api/paper/demo-quality/runner", async (route) => {
+    if (route.request().method() === "GET") {
+      await route.fulfill({ json: currentRunner });
+      return;
+    }
+    if (route.request().method() === "POST") {
+      startCount += 1;
+      expect(route.request().headers()["x-csrf-token"]).toBe("browser-paper-control-token");
+      const body = route.request().postDataJSON() as Record<string, unknown>;
+      expect(body).toMatchObject({
+        preview_id: preview.preview_id,
+        preview_digest: preview.preview_digest,
+        confirmation_token: preview.confirmation_token,
+        expected_head: head,
+        due_set: [],
+        max_sessions: 1,
+        max_runtime_minutes: 60,
+      });
+      expect(body.request_id).toMatch(/^[a-f0-9]{32}$/);
+      currentRunner = {
+        status: "running",
+        available: true,
+        reason: null,
+        started_at: "2026-10-31T12:00:00+00:00",
+        expires_at: "2026-10-31T13:00:00+00:00",
+        sessions_completed: 0,
+        max_sessions: 1,
+        last_session: null,
+      };
+      await route.fulfill({ status: 202, json: operation });
+      return;
+    }
+    await route.continue();
+  });
+  await page.route("**/api/paper/demo-quality/runner/preview", async (route) => {
+    expect(route.request().headers()["x-csrf-token"]).toBe("browser-paper-control-token");
+    expect(route.request().postDataJSON()).toEqual({
+      expected_head: head,
+      max_sessions: 1,
+      max_runtime_minutes: 60,
+    });
+    await route.fulfill({ status: 201, json: preview });
+  });
+  await page.route(`**/api/operations/${operationId}`, (route) =>
+    route.fulfill({ json: operation }),
+  );
+  await page.route("**/api/paper/demo-quality/runner/stop", async (route) => {
+    stopCount += 1;
+    expect(route.request().headers()["x-csrf-token"]).toBe("browser-paper-control-token");
+    const body = route.request().postDataJSON() as Record<string, unknown>;
+    expect(body).toEqual({});
+    expect(JSON.stringify(body)).not.toContain("pid");
+    currentRunner = { ...currentRunner, status: "stopping", reason: "Stop requested." };
+    await route.fulfill({ json: currentRunner });
+  });
+
+  await page.goto("/paper/demo-quality");
+  await expect(page.getByRole("heading", { name: "demo-quality" })).toBeVisible();
+  const start = page.getByRole("button", { name: "Start runner" });
+  await expect(start).toBeEnabled();
+  await start.click();
+  const startDialog = page.getByRole("dialog", { name: "Confirm finite runner start" });
+  await expect(startDialog).toBeVisible();
+  expect(startCount).toBe(0);
+  await startDialog.getByRole("button", { name: "Accept finite runner" }).click();
+  await expect(page.getByRole("button", { name: "Stop runner" })).toBeEnabled();
+  expect(startCount).toBe(1);
+
+  await page.getByRole("button", { name: "Stop runner" }).click();
+  const stopDialog = page.getByRole("dialog", { name: "Stop owned runner for demo-quality" });
+  await expect(stopDialog).toBeVisible();
+  expect(stopCount).toBe(0);
+  await stopDialog.getByRole("button", { name: "Request runner stop" }).click();
+  await expect(page.getByText("Owned runner stop requested. An in-flight session may finish before it exits.")).toBeVisible();
+  expect(stopCount).toBe(1);
+  expect(await page.evaluate(() => localStorage.getItem("aihf.paper.demo-quality.operation"))).toBe(operationId);
+  const unchangedPaper = await (await page.request.get("/api/paper/demo-quality")).json();
+  expect(unchangedPaper.last_record_hash).toBe(head);
+  const realRunner = await (await page.request.get("/api/paper/demo-quality/runner")).json();
+  expect(realRunner.available).toBe(false);
 });
 
 test("builder preserves canonical library models, weights, params, and blend policy", async ({ page }) => {

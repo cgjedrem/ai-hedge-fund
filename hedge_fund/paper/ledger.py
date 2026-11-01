@@ -50,6 +50,9 @@ EVENTS_FILE = "events.jsonl"
 _DAY = re.compile(r"\d{4}-\d{2}-\d{2}")
 _BAR_FILE = re.compile(r"(\d{2})(\d{2})(\d{2})")
 _HASH = re.compile(r"[0-9a-f]{64}")
+_DEPLOYMENT_LANES = (("deployment",),)
+_EXECUTION_LANES = (("runner", "execution"),)
+_CONTROL_LANES = (("control",), ("runner", "execution"))
 
 
 class LedgerError(RuntimeError):
@@ -64,10 +67,32 @@ class Ledger:
         self.approval_path = self.directory / APPROVAL_FILE
         self.events_path = self.directory / EVENTS_FILE
 
+    def _require_write_lanes(
+        self,
+        lane_sets: tuple[tuple[str, ...], ...],
+        *,
+        verify_inventory: bool = False,
+    ) -> None:
+        from hedge_fund.runtime.admission import (
+            AdmissionError,
+            require_paper_write_lanes,
+        )
+
+        try:
+            require_paper_write_lanes(
+                self.directory,
+                self.directory.name,
+                lane_sets=lane_sets,
+                verify_inventory=verify_inventory,
+            )
+        except AdmissionError as exc:
+            raise LedgerError(f"{self.directory}: paper write admission denied: {exc}") from exc
+
     # ---- records ----------------------------------------------------------
 
     def init(self) -> None:
         """Create an empty ledger with the kill switch off."""
+        self._require_write_lanes(_DEPLOYMENT_LANES)
         self.records_dir.mkdir(parents=True, exist_ok=True)
         if not self.control_path.exists():
             write_atomic(self.control_path, json.dumps({"halted": False}, indent=2))
@@ -113,6 +138,7 @@ class Ledger:
     def append(self, record: SessionRecord) -> Path:
         """Append *record*, refusing a duplicate session, an out-of-order
         session, a broken hash chain, or a record whose hash is not its own."""
+        self._require_write_lanes(_EXECUTION_LANES)
         path = self.path(record.session)
         if path.exists():
             raise LedgerError(f"{record.fund}: session {record.session} is already recorded")
@@ -134,6 +160,7 @@ class Ledger:
         named with its hash, where it no longer counts but can still be read.
         A checkpoint that remembered it is dropped. The broker's book is the
         caller's to restore."""
+        self._require_write_lanes(_EXECUTION_LANES)
         latest = self.latest()
         if latest is None:
             raise LedgerError(f"{self.directory.name}: nothing recorded to rewind")
@@ -194,6 +221,7 @@ class Ledger:
         """Remember *state* as the state after its last session's day. Only a
         state whose last session is the newest recorded one can be kept:
         a checkpoint is a shortcut to the chain's head, not a fork."""
+        self._require_write_lanes(_EXECUTION_LANES)
         if state.last_session is None or not is_intraday(state.last_session):
             raise LedgerError(f"{self.directory.name}: only a minute fund's day is checkpointed")
         latest = self.latest()
@@ -249,14 +277,17 @@ class Ledger:
         return reason or "halted"
 
     def halt(self, reason: str) -> None:
+        self._require_write_lanes(_CONTROL_LANES)
         self._write_control(True, reason)
         self.log_event("halt", reason=reason)
 
     def resume(self) -> None:
+        self._require_write_lanes(_CONTROL_LANES)
         self._write_control(False, None)
         self.log_event("resume")
 
     def _write_control(self, halted: bool, reason: str | None) -> None:
+        self._require_write_lanes(_CONTROL_LANES)
         write_atomic(
             self.control_path,
             json.dumps(
@@ -369,6 +400,7 @@ class Ledger:
             raise ValueError("decision_hash must be a lowercase SHA-256 hash")
         if not isinstance(by, str) or by not in {"cli", "tui", "web"}:
             raise ValueError("by must be 'cli', 'tui' or 'web'")
+        self._require_write_lanes(_CONTROL_LANES, verify_inventory=True)
         value = {
             "verdict": verdict,
             "decision_as_of": decision_as_of,
@@ -382,6 +414,7 @@ class Ledger:
 
     def clear_approval(self, expected: dict[str, str] | None = None) -> bool:
         """Clear expected verdict. Read/compare/unlink race accepted at human voting speed."""
+        self._require_write_lanes(_CONTROL_LANES)
         if expected is not None and self.approval() != expected:
             return False
         try:
@@ -405,6 +438,7 @@ class Ledger:
     # ---- events -----------------------------------------------------------
 
     def log_event(self, kind: str, **fields) -> None:
+        self._require_write_lanes(_CONTROL_LANES)
         line = json.dumps({"time": _now(), "kind": kind, **fields}, default=str)
         with self.events_path.open("a") as handle:
             handle.write(line + "\n")

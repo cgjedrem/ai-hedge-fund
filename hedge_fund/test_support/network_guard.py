@@ -116,19 +116,39 @@ def configure_test_child() -> None:
 
     root_value = os.environ.get("HEDGE_FUND_TEST_ROOT", "")
     root = _validate_test_root(Path(root_value))
-    home = root / "home"
-    temporary = root / "tmp"
+    child_home_value = os.environ.get("HEDGE_FUND_TEST_CHILD_HOME")
+    child_temp_value = os.environ.get("HEDGE_FUND_TEST_CHILD_TMP")
+    if bool(child_home_value) != bool(child_temp_value):
+        raise RuntimeError("test child isolation path mismatch")
+    if child_home_value and child_temp_value:
+        home = _validate_test_child_path(root, Path(child_home_value))
+        temporary = _validate_test_child_path(root, Path(child_temp_value))
+        if home.parent != temporary.parent:
+            raise RuntimeError("test child isolation path mismatch")
+    else:
+        home = root / "home"
+        temporary = root / "tmp"
     expected_paths = {
         "HOME": home,
         "USERPROFILE": home,
         "TEMP": temporary,
         "TMP": temporary,
-        "APPDATA": home / "AppData" / "Roaming",
-        "LOCALAPPDATA": home / "AppData" / "Local",
-        "XDG_CACHE_HOME": home / ".cache",
-        "XDG_CONFIG_HOME": home / ".config",
-        "XDG_DATA_HOME": home / ".local" / "share",
     }
+    if os.name == "nt":
+        expected_paths.update(
+            {
+                "APPDATA": home / "AppData" / "Roaming",
+                "LOCALAPPDATA": home / "AppData" / "Local",
+            }
+        )
+    else:
+        expected_paths.update(
+            {
+                "XDG_CACHE_HOME": home / ".cache",
+                "XDG_CONFIG_HOME": home / ".config",
+                "XDG_DATA_HOME": home / ".local" / "share",
+            }
+        )
     for name, path in expected_paths.items():
         if not _path_matches(os.environ.get(name, ""), path):
             raise RuntimeError("test child isolation path mismatch")
@@ -228,6 +248,7 @@ def cleanup_test_root(test_root: Path, marker: Path) -> bool:
 
 
 def install_network_guard() -> None:
+    block_loopback = os.environ.get("HEDGE_FUND_TEST_BLOCK_LOOPBACK") == "1"
     for name in ("connect", "connect_ex", "sendto"):
         original = getattr(socket.socket, name)
         if getattr(original, _GUARD, False):
@@ -242,7 +263,7 @@ def install_network_guard() -> None:
                 "AF_UNIX",
                 object(),
             )
-            if not is_unix and not _is_loopback_address(address):
+            if not is_unix and (block_loopback or not _is_loopback_address(address)):
                 raise AssertionError("external network disabled in tests")
             return _original(sock, *args, **kwargs)
 
@@ -265,15 +286,15 @@ def install_network_guard() -> None:
             host = args[0] if args else kwargs.get("host")
             if _name == "create_connection":
                 address = host
-                allowed = _is_loopback_address(address)
+                allowed = not block_loopback and _is_loopback_address(address)
             elif _name == "getaddrinfo":
                 flags = args[5] if len(args) > 5 else kwargs.get("flags", 0)
-                allowed = host is not None and _is_loopback_host(host)
+                allowed = not block_loopback and host is not None and _is_loopback_host(host)
                 passive_flag = getattr(socket, "AI_PASSIVE", 0)
-                passive = host is None and bool(flags & passive_flag)
+                passive = not block_loopback and host is None and bool(flags & passive_flag)
                 allowed = allowed or passive
             else:
-                allowed = _is_loopback_host(host)
+                allowed = not block_loopback and _is_loopback_host(host)
             if not allowed:
                 raise AssertionError("external network disabled in tests")
             return _original(*args, **kwargs)
@@ -299,6 +320,30 @@ def _validate_test_root(test_root: Path) -> Path:
     if root.parent != output_root:
         raise RuntimeError("test root escaped checkout outputs")
     return root
+
+
+def _validate_test_child_path(test_root: Path, candidate: Path) -> Path:
+    if not candidate.is_absolute():
+        raise RuntimeError("test child isolation path mismatch")
+    candidate = Path(os.path.abspath(os.fspath(candidate)))
+    try:
+        relative = candidate.relative_to(test_root)
+    except ValueError:
+        raise RuntimeError("test child isolation path mismatch") from None
+    if not relative.parts:
+        raise RuntimeError("test child isolation path mismatch")
+    current = test_root
+    for part in relative.parts:
+        current = current / part
+        if _is_reparse_point(current):
+            raise RuntimeError("test child isolation path mismatch")
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError:
+        raise RuntimeError("test child isolation path mismatch") from None
+    if resolved != candidate:
+        raise RuntimeError("test child isolation path mismatch")
+    return resolved
 
 
 def _remove_test_tree(root: Path) -> None:

@@ -9,6 +9,7 @@ import pytest
 from hedge_fund.runtime.admission import AdmissionCoordinator, RootOwnerLease
 from hedge_fund.runtime.capture import freeze_capture
 from hedge_fund.runtime.configuration import resolve_settings
+from hedge_fund.runtime.handover import enroll_fresh
 from hedge_fund.runtime.operations import (
     CAPTURE_ROOT,
     ConfirmationExpired,
@@ -33,7 +34,7 @@ def root_context(tmp_path):
     root = tmp_path / "root"
     root.mkdir()
     with RootContext.open(root) as context:
-        context.prepare_private_storage()
+        enroll_fresh(context)
         yield context
 
 
@@ -240,6 +241,21 @@ def test_confirmation_is_single_use_and_same_request_replay_is_idempotent(operat
 
     with pytest.raises(ConfirmationRejected):
         _accept(operation_store, preview, request_id="request-2")
+
+
+def test_idempotent_paper_replay_does_not_wait_for_runner_lane(operation_store, frozen_capture):
+    preview = _preview(operation_store, frozen_capture)
+    first = _accept(operation_store, preview)
+
+    with operation_store._admission.runner_reservation("alpha", timeout=0):
+        replay = _accept(
+            operation_store,
+            preview,
+            start_worker=lambda _operation: pytest.fail("replay started another worker"),
+        )
+
+    assert replay.operation_id == first.operation_id
+    assert replay.status is OperationStatus.ACCEPTED
 
 
 def test_confirmation_race_admits_only_one_request(operation_store, frozen_capture):

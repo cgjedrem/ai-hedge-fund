@@ -9,9 +9,11 @@ from hedge_fund.runtime.admission import (
     AdmissionError,
     LOCK_DIRECTORY,
     OwnershipUnknown,
+    RootMigrationLease,
     RootOwnerLease,
     WriterConflict,
 )
+from hedge_fund.runtime.handover import enroll_fresh
 from hedge_fund.runtime.root import PRIVATE_ROOT, RootContext
 
 
@@ -20,7 +22,7 @@ def admission_root(tmp_path):
     root = tmp_path / "root"
     root.mkdir()
     context = RootContext.open(root)
-    context.prepare_private_storage()
+    enroll_fresh(context)
     owner_lease = RootOwnerLease.acquire(context)
     coordinator = AdmissionCoordinator(context, owner_lease=owner_lease)
     try:
@@ -69,22 +71,51 @@ def test_multi_deployment_rejects_canonical_aliases_before_lane_creation(admissi
     assert not list((root / LOCK_DIRECTORY).glob("deployment-*.lock"))
 
 
-def test_second_process_cannot_claim_root_owner_lease(
+def test_second_process_can_join_shared_root_participants(
     admission_root,
     owned_test_process,
     tmp_path,
 ):
     root, _context, _owner, _coordinator = admission_root
-    result = tmp_path / "owner-conflict"
+    result = tmp_path / "participant-ready"
     script = "\n".join(
         [
             "from pathlib import Path",
-            "from hedge_fund.runtime.admission import RootOwnerLease, WriterConflict",
+            "from hedge_fund.runtime.admission import RootOwnerLease",
+            "from hedge_fund.runtime.root import RootContext",
+            f"context = RootContext.open({str(root)!r})",
+            "try:",
+            "    lease = RootOwnerLease.acquire(context, timeout=0)",
+            f"    Path({str(result)!r}).write_text('joined', encoding='utf-8')",
+            "    lease.close()",
+            "finally:",
+            "    context.close()",
+        ]
+    )
+    child = owned_test_process(script)
+
+    _wait_for(result, child)
+
+    assert child.wait(timeout=10) == 0
+    assert result.read_text(encoding="utf-8") == "joined"
+
+
+def test_exclusive_migration_cannot_join_active_root_participant(
+    admission_root,
+    owned_test_process,
+    tmp_path,
+):
+    root, _context, _owner, _coordinator = admission_root
+    result = tmp_path / "migration-conflict"
+    script = "\n".join(
+        [
+            "from pathlib import Path",
+            "from hedge_fund.runtime.admission import RootMigrationLease, WriterConflict",
             "from hedge_fund.runtime.root import RootContext",
             f"context = RootContext.open({str(root)!r})",
             "try:",
             "    try:",
-            "        RootOwnerLease.acquire(context, timeout=0)",
+            "        RootMigrationLease.acquire(context, timeout=0)",
             "    except WriterConflict:",
             f"        Path({str(result)!r}).write_text('conflict', encoding='utf-8')",
             "    else:",
@@ -114,6 +145,41 @@ def test_subject_sessions_conflict_while_controls_remain_independent(admission_r
             pass
 
 
+def test_manual_session_conflicts_with_runner_startup_deployment_lane(
+    admission_root,
+    owned_test_process,
+    tmp_path,
+):
+    root, _context, _owner, coordinator = admission_root
+    result = tmp_path / "manual-startup-admission"
+    script = "\n".join(
+        [
+            "from pathlib import Path",
+            "from hedge_fund.runtime.admission import AdmissionCoordinator, RootOwnerLease, WriterConflict",
+            "from hedge_fund.runtime.root import RootContext",
+            f"context = RootContext.open({str(root)!r})",
+            "lease = RootOwnerLease.acquire(context, timeout=0)",
+            "admission = AdmissionCoordinator(context, owner_lease=lease)",
+            "try:",
+            "    try:",
+            "        with admission.manual_session('alpha', timeout=0):",
+            f"            Path({str(result)!r}).write_text('entered', encoding='utf-8')",
+            "    except WriterConflict:",
+            f"        Path({str(result)!r}).write_text('blocked', encoding='utf-8')",
+            "finally:",
+            "    lease.close()",
+            "    context.close()",
+        ]
+    )
+
+    with coordinator.deployment_lock("alpha", timeout=0):
+        child = owned_test_process(script)
+        _wait_for(result, child)
+        assert child.wait(timeout=10) == 0
+
+    assert result.read_text(encoding="utf-8") == "blocked"
+
+
 def test_closed_owner_lease_denies_writes_and_reacquisition_restores_them(admission_root):
     _root, context, owner_lease, coordinator = admission_root
     owner_lease.close()
@@ -132,6 +198,23 @@ def test_closed_owner_lease_denies_writes_and_reacquisition_restores_them(admiss
             pass
     finally:
         replacement.close()
+
+
+def test_participant_constructor_failure_releases_shared_native_lock(admission_root, monkeypatch):
+    _root, context, owner, _coordinator = admission_root
+    owner.close()
+    original_init = RootOwnerLease.__init__
+
+    def failed_init(*_args, **_kwargs):
+        raise RuntimeError("synthetic lease constructor failure")
+
+    monkeypatch.setattr(RootOwnerLease, "__init__", failed_init)
+    with pytest.raises(RuntimeError, match="constructor"):
+        RootOwnerLease.acquire(context, timeout=0)
+    monkeypatch.setattr(RootOwnerLease, "__init__", original_init)
+
+    migration = RootMigrationLease.acquire(context, timeout=0)
+    migration.close()
 
 
 def test_unowned_root_denies_mutations_without_creating_private_state(tmp_path):
