@@ -71,6 +71,18 @@ class InventoryObservationUnavailable(HandoverError):
     """A coordinated inventory observation could not obtain admission."""
 
 
+class WriteAuthorityDenied(HandoverError):
+    """Raised when a root cannot hold protocol-native production write authority."""
+
+
+PROTOCOL_NATIVE_MODES = frozenset({"fresh", "relocated"})
+LEGACY_HOME_NAME = ".hedge-fund"
+RELOCATED_TOP_LEVEL = ("mandates", "paper", "research")
+_MAX_RELOCATION_FILES = 50000
+_MAX_RELOCATION_FILE_BYTES = 256 * 1024 * 1024
+_MAX_RELOCATION_TOTAL_BYTES = 2 * 1024 * 1024 * 1024
+
+
 _OBSERVATION_CONTEXT = threading.local()
 _T = TypeVar("_T")
 
@@ -248,7 +260,7 @@ def require_enrollment(root: RootContext) -> dict[str, Any]:
         raise EnrollmentInvalid("handover protocol is incompatible")
     if record["build_id"] != code_version():
         raise EnrollmentInvalid("handover build is incompatible")
-    if record["mode"] not in {"fresh", "migrate-existing"}:
+    if record["mode"] not in {"fresh", "migrate-existing", "relocated"}:
         raise EnrollmentInvalid("handover mode is invalid")
     if record["root"] != root_binding(root):
         raise EnrollmentInvalid("handover root identity does not match")
@@ -273,8 +285,184 @@ def require_enrollment(root: RootContext) -> dict[str, Any]:
             raise EnrollmentInvalid("migration attestation is invalid")
         if attestation["statement"] != OPERATOR_ATTESTATION or not isinstance(attestation["inventory_digest"], str) or not _SHA256.fullmatch(attestation["inventory_digest"]):
             raise EnrollmentInvalid("migration attestation is invalid")
+    if record["mode"] == "relocated":
+        provenance = record["attestation"]
+        if not isinstance(provenance, dict) or set(provenance) != {"source_inventory_digest", "source_content_digest"}:
+            raise EnrollmentInvalid("relocation provenance is invalid")
+        if any(not isinstance(provenance[key], str) or not _SHA256.fullmatch(provenance[key]) for key in provenance):
+            raise EnrollmentInvalid("relocation provenance is invalid")
     root.revalidate()
     return record
+
+
+def write_authority(root: RootContext) -> dict[str, str | None]:
+    """Classify whether this process may claim production write authority.
+
+    Only protocol-native roots qualify: roots enrolled empty by this protocol or
+    populated exclusively by a verified relocation import. An operator
+    attestation is recorded evidence, not exclusion, so attested migrations are
+    ``ownership-unknown`` and read-only. A protocol-native root that a shipped
+    legacy writer could address (``<HOME>/.hedge-fund`` layout or alias) or that
+    carries a legacy runner marker is also ``ownership-unknown``.
+    """
+    try:
+        record = require_enrollment(root)
+    except HandoverRequired:
+        return {"authority": "unavailable", "reason": "handover-required"}
+    except Exception:
+        return {"authority": "unavailable", "reason": "handover-unavailable"}
+    if record["mode"] not in PROTOCOL_NATIVE_MODES:
+        return {"authority": "ownership-unknown", "reason": "attested-migration-read-only"}
+    reason = None
+    try:
+        reason = legacy_reachability_reason(root)
+    except Exception:
+        reason = "legacy-reachability-unverified"
+    if reason is not None:
+        return {"authority": "ownership-unknown", "reason": reason}
+    return {"authority": "protocol-native", "reason": None}
+
+
+def require_write_authority(root: RootContext) -> dict[str, Any]:
+    """Return the enrollment record only when write authority is protocol-native."""
+    record = require_enrollment(root)
+    if record["mode"] not in PROTOCOL_NATIVE_MODES:
+        raise WriteAuthorityDenied("attested migration is read-only; relocate into a protocol-native root")
+    try:
+        reason = legacy_reachability_reason(root)
+    except Exception as exc:
+        raise WriteAuthorityDenied(f"root write authority is unverified ({type(exc).__name__})") from None
+    if reason is not None:
+        raise WriteAuthorityDenied(f"root write authority is ownership-unknown ({reason})")
+    return record
+
+
+def legacy_reachability_reason(root: RootContext) -> str | None:
+    """Return why a shipped legacy writer could address this root, if it can.
+
+    Legacy CLI/TUI/cron/compose writers only address ``Path.home()/.hedge-fund``.
+    This check denies roots that are, contain, sit inside, or resolve to such a
+    directory for the current account, plus roots with a legacy ``runner.pid``.
+    It is not a claim that arbitrary third-party processes are fenced.
+    """
+    if not isinstance(root, RootContext):
+        raise TypeError("an explicit RootContext is required")
+    if any(part.casefold() == LEGACY_HOME_NAME for part in root.path.parts):
+        return "legacy-layout-path"
+    try:
+        os.lstat(root.path / LEGACY_HOME_NAME)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        return "legacy-reachability-unverified"
+    else:
+        return "legacy-layout-nested"
+    try:
+        root_info = os.stat(root.path)
+        root_real = os.path.normcase(os.path.realpath(root.path))
+    except OSError:
+        return "legacy-reachability-unverified"
+    for home in _legacy_home_candidates():
+        candidate = home / LEGACY_HOME_NAME
+        try:
+            info = os.stat(candidate)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return "legacy-reachability-unverified"
+        if (info.st_dev, info.st_ino) == (root_info.st_dev, root_info.st_ino):
+            return "legacy-home-alias"
+        try:
+            if _legacy_tree_reaches(candidate, root_real):
+                return "legacy-home-alias"
+        except (OSError, HandoverError):
+            return "legacy-reachability-unverified"
+    try:
+        if _paper_runner_pid_present(root):
+            return "legacy-runner-present"
+    except Exception:
+        return "legacy-reachability-unverified"
+    root.revalidate()
+    return None
+
+
+_MAX_LEGACY_ALIAS_ENTRIES = 65_536
+
+
+def _overlaps(first: str, second: str) -> bool:
+    try:
+        return os.path.commonpath([first, second]) in {first, second}
+    except ValueError:
+        return False
+
+
+def _legacy_tree_reaches(candidate: Path, root_real: str) -> bool:
+    """True when ``candidate`` or an entry a legacy writer opens beneath it resolves into the root.
+
+    Legacy writers open ``<legacy>/<top>`` and ``<legacy>/<top>/<item>`` (for example
+    ``paper/<fund>``), so aliases at those two levels are resolved. Plain entries
+    cannot reach the root unless ``candidate`` itself already overlaps it.
+    """
+    if _overlaps(os.path.normcase(os.path.realpath(candidate)), root_real):
+        return True
+    seen = 0
+    pending = [(candidate, 0)]
+    while pending:
+        directory, depth = pending.pop()
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                seen += 1
+                if seen > _MAX_LEGACY_ALIAS_ENTRIES:
+                    raise HandoverError("legacy home inventory exceeds its bound")
+                info = entry.stat(follow_symlinks=False)
+                aliased = stat.S_ISLNK(info.st_mode) or bool(getattr(info, "st_file_attributes", 0) & _FILE_ATTRIBUTE_REPARSE_POINT)
+                if aliased and _overlaps(os.path.normcase(os.path.realpath(entry.path)), root_real):
+                    return True
+                if depth == 0 and entry.is_dir(follow_symlinks=True):
+                    pending.append((Path(entry.path), 1))
+    return False
+
+
+_FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+
+
+def _legacy_home_candidates() -> list[Path]:
+    candidates: list[Path] = []
+    try:
+        candidates.append(Path.home())
+    except (KeyError, RuntimeError, OSError):
+        pass
+    for variable in ("HOME", "USERPROFILE"):
+        value = os.environ.get(variable)
+        if value:
+            candidates.append(Path(value))
+    drive, home_path = os.environ.get("HOMEDRIVE"), os.environ.get("HOMEPATH")
+    if drive and home_path:
+        candidates.append(Path(drive + home_path))
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        if not candidate.is_absolute():
+            continue
+        key = os.path.normcase(os.path.normpath(str(candidate)))
+        if key not in seen:
+            seen.add(key)
+            unique.append(candidate)
+    return unique
+
+
+def _paper_runner_pid_present(root: RootContext) -> bool:
+    paper = root.path / "paper"
+    try:
+        entries = list(os.scandir(paper))
+    except FileNotFoundError:
+        return False
+    if len(entries) > _MAX_INVENTORY_FUNDS:
+        raise HandoverError("paper inventory exceeds its bound")
+    for entry in entries:
+        if entry.is_dir(follow_symlinks=False) and os.path.lexists(os.path.join(entry.path, "runner.pid")):
+            return True
+    return False
 
 
 def enroll_fresh(root: RootContext) -> dict[str, Any]:
@@ -286,6 +474,9 @@ def enroll_fresh(root: RootContext) -> dict[str, Any]:
         raise EnrollmentInvalid("root already has a handover record")
     if any(root.path.iterdir()):
         raise HandoverError("fresh enrollment requires an empty root")
+    reason = legacy_reachability_reason(root)
+    if reason is not None:
+        raise WriteAuthorityDenied(f"fresh enrollment requires a root no legacy writer can address ({reason})")
     root.prepare_private_storage()
     try:
         with RootMigrationLease.acquire(root, timeout=0):
@@ -342,6 +533,191 @@ def migrate_existing(
             return require_enrollment(root)
     except WriterConflict as exc:
         raise HandoverError("root participant is active; migration requires quiescence") from exc
+
+
+_INTERRUPTED_ARTIFACT = re.compile(r"^\..+\.\d+\.[0-9a-f]{32}\.tmp$")
+_PAPER_LANE_LOCK = re.compile(r"^\.paper-[a-z]+\.lock$")
+_SECRET_DOTENV = re.compile(r"^\.env(\..*)?$", re.IGNORECASE)
+
+
+def inspect_relocation_source(source: RootContext) -> dict[str, Any]:
+    """Describe a source root for relocation without writing anything to it."""
+    snapshot = _relocation_source_snapshot(source)
+    return {
+        "inventory_digest": snapshot["inventory_digest"],
+        "content_digest": snapshot["content_digest"],
+        "funds": len(snapshot["heads"]),
+        "files": sum(1 for entry in snapshot["entries"].values() if entry["type"] == "file"),
+        "bytes": sum(entry["size"] for entry in snapshot["entries"].values() if entry["type"] == "file"),
+    }
+
+
+def relocate_existing(
+    target: RootContext,
+    *,
+    source: RootContext,
+    expected_content_digest: str,
+) -> dict[str, Any]:
+    """Import a quiescent legacy root into an empty protocol-native target.
+
+    The source is only read. Mandates, deployed paper funds and research are
+    copied after a reviewed content digest matches, and the source must be
+    byte-identical before and after the copy. Credentials, caches and runtime
+    state never transfer. The target is the only root that gains write
+    authority; the source remains whatever it was and is never enrolled.
+    """
+    if not isinstance(target, RootContext) or not isinstance(source, RootContext):
+        raise TypeError("explicit RootContexts are required")
+    if not isinstance(expected_content_digest, str) or not _SHA256.fullmatch(expected_content_digest):
+        raise HandoverError("source content digest is invalid")
+    target.revalidate()
+    source.revalidate()
+    _require_disjoint_roots(source, target)
+    if _record_exists(target):
+        raise EnrollmentInvalid("root already has a handover record")
+    if any(target.path.iterdir()):
+        raise HandoverError("relocation requires an empty target root")
+    reason = legacy_reachability_reason(target)
+    if reason is not None:
+        raise WriteAuthorityDenied(f"relocation target must be unreachable by legacy writers ({reason})")
+    before = _relocation_source_snapshot(source)
+    if before["content_digest"] != expected_content_digest:
+        raise HandoverError("source content changed; inspect the source and retry")
+    target.prepare_private_storage()
+    try:
+        with RootMigrationLease.acquire(target, timeout=0):
+            if not _fresh_bootstrap_only(target):
+                raise HandoverError("target changed during relocation")
+            for relative, entry in before["entries"].items():
+                if entry["type"] == "dir":
+                    target.mkdir(relative, parents=True)
+                    continue
+                data = source.read_bytes(relative)
+                if len(data) != entry["size"] or hashlib.sha256(data).hexdigest() != entry["sha256"]:
+                    raise HandoverError("source content changed during relocation")
+                target.write_bytes(relative, data, mode=stat.S_IRUSR | stat.S_IWUSR)
+            after = _relocation_source_snapshot(source)
+            if after["content_digest"] != before["content_digest"] or after["heads"] != before["heads"]:
+                raise HandoverError("source content changed during relocation")
+            copied = _relocation_entries(target)
+            if _digest(copied) != before["content_digest"]:
+                raise HandoverError("relocated content does not match the source")
+            heads = build_head_inventory(target)
+            if heads != before["heads"]:
+                raise HandoverError("relocated ledger heads do not match the source")
+            record = _new_record(
+                target,
+                mode="relocated",
+                heads=heads,
+                attestation={
+                    "source_inventory_digest": before["inventory_digest"],
+                    "source_content_digest": before["content_digest"],
+                },
+            )
+            _write_record(target, record)
+            return require_enrollment(target)
+    except WriterConflict as exc:
+        raise HandoverError("another target participant is active") from exc
+
+
+def _require_disjoint_roots(source: RootContext, target: RootContext) -> None:
+    try:
+        source_info = os.stat(source.path)
+        target_info = os.stat(target.path)
+        source_real = os.path.normcase(os.path.realpath(source.path))
+        target_real = os.path.normcase(os.path.realpath(target.path))
+    except OSError as exc:
+        raise HandoverError("relocation roots cannot be compared") from exc
+    if (source_info.st_dev, source_info.st_ino) == (target_info.st_dev, target_info.st_ino):
+        raise HandoverError("relocation source and target must differ")
+    try:
+        common = os.path.commonpath([source_real, target_real])
+    except ValueError:
+        return
+    if common in {source_real, target_real}:
+        raise HandoverError("relocation source and target must not overlap")
+
+
+def _relocation_source_snapshot(source: RootContext) -> dict[str, Any]:
+    if not isinstance(source, RootContext):
+        raise TypeError("an explicit RootContext is required")
+    source.revalidate()
+    entries = _relocation_entries(source)
+    if any(relative.rsplit("/", 1)[-1] == "runner.pid" for relative in entries):
+        raise HandoverError("runner.pid is present; unknown owners block relocation")
+    heads = build_head_inventory(source)
+    from hedge_fund.paper.deployed import load_deployed
+
+    for relative in entries:
+        parts = relative.split("/")
+        if len(parts) == 3 and parts[0] == "paper" and parts[2] == "fund.yaml":
+            try:
+                broker = load_deployed(source.path / "paper" / parts[1]).spec.broker
+            except (OSError, ValueError, RootPathError) as exc:
+                raise HandoverError(f"paper deployment is unreadable ({type(exc).__name__})") from None
+            if broker != "paper":
+                raise HandoverError("broker-backed deployments cannot be relocated")
+    source.revalidate()
+    return {
+        "heads": heads,
+        "inventory_digest": _digest(heads),
+        "entries": entries,
+        "content_digest": _digest(entries),
+    }
+
+
+def _relocation_entries(root: RootContext) -> dict[str, dict[str, Any]]:
+    entries: dict[str, dict[str, Any]] = {}
+    total = 0
+
+    def fail_walk(exc: OSError) -> None:
+        raise exc
+
+    try:
+        for top in RELOCATED_TOP_LEVEL:
+            base = root.path / top
+            try:
+                info = base.lstat()
+            except FileNotFoundError:
+                continue
+            if _is_reparse_point(base) or not stat.S_ISDIR(info.st_mode):
+                raise HandoverError(f"{top} is not a plain directory")
+            entries[top] = {"type": "dir"}
+            for directory, subdirs, files in os.walk(base, followlinks=False, onerror=fail_walk):
+                current = Path(directory)
+                subdirs.sort()
+                for name in subdirs:
+                    child = current / name
+                    if _is_reparse_point(child):
+                        raise HandoverError("relocation source contains a reparse point")
+                    entries[child.relative_to(root.path).as_posix()] = {"type": "dir"}
+                for name in sorted(files):
+                    child = current / name
+                    relative = child.relative_to(root.path).as_posix()
+                    if _INTERRUPTED_ARTIFACT.fullmatch(name):
+                        raise HandoverError("relocation source contains an interrupted write")
+                    if _SECRET_DOTENV.fullmatch(name):
+                        raise HandoverError("relocation source contains a .env file under engine data; remove it first")
+                    if top == "paper" and _PAPER_LANE_LOCK.fullmatch(name):
+                        continue
+                    child_info = child.lstat()
+                    if _is_reparse_point(child) or not stat.S_ISREG(child_info.st_mode):
+                        raise HandoverError("relocation source contains a non-regular file")
+                    if child_info.st_size > _MAX_RELOCATION_FILE_BYTES:
+                        raise HandoverError("relocation source file exceeds its bound")
+                    total += child_info.st_size
+                    if total > _MAX_RELOCATION_TOTAL_BYTES or len(entries) >= _MAX_RELOCATION_FILES:
+                        raise HandoverError("relocation source exceeds its bound")
+                    data = root.read_bytes(relative)
+                    entries[relative] = {"type": "file", "size": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+                if len(entries) > _MAX_RELOCATION_FILES:
+                    raise HandoverError("relocation source exceeds its bound")
+    except HandoverError:
+        raise
+    except (OSError, RootPathError) as exc:
+        raise HandoverError(f"relocation source is unreadable ({type(exc).__name__})") from None
+    root.revalidate()
+    return dict(sorted(entries.items()))
 
 
 def build_head_inventory(root: RootContext) -> dict[str, dict[str, Any]]:
@@ -788,7 +1164,7 @@ def recover_stale_reservation(
     except WriterConflict as exc:
         raise HandoverError("root participant is active; stale recovery requires quiescence") from exc
     try:
-        enrollment = require_enrollment(root)
+        enrollment = require_write_authority(root)
         verify_root_inventory(root, record=enrollment)
         if _has_legacy_runner_pid(root.path):
             raise HandoverError("legacy runner marker blocks stale recovery")

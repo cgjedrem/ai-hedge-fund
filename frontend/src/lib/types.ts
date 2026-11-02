@@ -7,6 +7,7 @@ export interface Capabilities {
   csrf_authenticates_users: false;
   container_observer: boolean;
   enrollment_state: "unenrolled" | "enrolled" | "invalid" | "drift";
+  write_authority?: "protocol-native" | "ownership-unknown" | "unavailable";
   write_unavailable_reason: string | null;
   protected_names: string[];
   mutation_token: string | null;

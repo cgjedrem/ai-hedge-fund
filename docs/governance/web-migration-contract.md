@@ -141,6 +141,45 @@ lost access. A successful attestation or lock probe is therefore not production
 handover acceptance. If exclusion cannot be established outside this protocol, keep
 the desk read-only. T015/T021/T138 remain incomplete on that criterion.
 
+**Write-authority classification (implemented).** `handover.write_authority(root)`
+separates enrollment from write authority. Only `fresh` and `relocated` roots that the
+legacy-reachability checks below do not flag are `protocol-native` (the checks cover the
+legacy home itself and aliases at its `<top>` and `<top>/<item>` levels; deeper per-file
+symlinks/hardlinks are left to inventory/head drift detection); every other enrolled root is
+`ownership-unknown` (or `unavailable` when enrollment is invalid) and read-only:
+
+- `migrate-existing` (attested in-place) roots → `attested-migration-read-only`.
+- Root path containing a `.hedge-fund` component (case-insensitive), a nested `.hedge-fund`
+  entry, or a root that is, contains, or sits inside `<HOME>/.hedge-fund`, or that any
+  `<HOME>/.hedge-fund/<top>` or `<top>/<item>` alias resolves into (junction/symlink, by
+  device/inode and resolved path; bounded scan) → `legacy-layout-*` / `legacy-home-alias`.
+- Any `paper/*/runner.pid` → `legacy-runner-present`; unverifiable or over-bound probes →
+  `legacy-reachability-unverified`.
+
+`RootOwnerLease.acquire`/`matches`, `root_registry_writer`, `require_paper_write_lanes` and
+stale-reservation recovery enforce it, so web, CLI, owned-runner child, research/mandate and
+emergency Halt writers all fail closed once authority is lost, including writers already
+holding lanes. The web desk re-classifies on every capabilities read and write attempt,
+reports `write_authority`, and drops its mutation token and owner lease on denial.
+`aihf --root SOURCE handover inspect-source` (read-only) plus
+`aihf --root TARGET handover relocate-from SOURCE --content-digest D` copies engine data
+(`mandates`, `paper`, `research`) into an empty, disjoint, legacy-unreachable target. The
+top-level `.env`, `cache` and `runtime` are never copied, and any `.env`/`.env.*` file under
+the copied trees refuses relocation before its bytes are read. The copy is digest-pinned and verified per file, the
+source is re-snapshotted unchanged, and target heads must equal source heads. The source
+is never written. A failed copy leaves the target `invalid` and read-only.
+Raw-write audit (this slice, source grep of non-test modules for file write/replace/unlink
+calls): enrolled-root writes in `paths.py`, `backtesting/research.py`, `fund/storage.py`,
+`paper/ledger.py` and `web/services.py` sit behind the owner-lease lanes,
+`require_paper_write_lanes` or `root_registry_writer`; TUI wipe always denies via
+`paper_write_denial`; the legacy paper runner entrypoint is disabled. This is a static audit
+plus the tests above, not the T021 exhaustive interleaving matrix.
+Residual (open): arbitrary same-account out-of-band writers that target a protocol-native
+root by explicit path are detected by inventory/head drift (→ read-only), not prevented.
+Whether drift detection on a legacy-unaddressable root satisfies A3's "inability to exclude"
+clause, or whether production writes additionally need OS isolation (dedicated account/ACL),
+is an unresolved contract decision. T015 stays open until it is resolved and evidenced.
+
 Scoped archive/restore uses registry-before-object admission and a retained
 `archive-prepared`/`restore-prepared` journal outside the active stores. After a
 move, inventory changes compare-and-set the reviewed deployment entry, retain the

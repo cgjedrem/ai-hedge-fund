@@ -399,9 +399,23 @@ def _parser() -> argparse.ArgumentParser:
         "enroll-fresh",
         help="enroll only a genuinely empty root",
     )
+    handover_actions.add_parser(
+        "inspect-source",
+        help="read-only: show the relocation content digest of this legacy root without writing to it",
+    )
+    relocation = handover_actions.add_parser(
+        "relocate-from",
+        help="copy a quiescent legacy root into this empty root; only relocated or fresh roots gain write authority",
+    )
+    relocation.add_argument("source", help="absolute path of the legacy root to copy (never written)")
+    relocation.add_argument(
+        "--content-digest",
+        required=True,
+        help="exact content_digest printed by `aihf --root SOURCE handover inspect-source`",
+    )
     migration = handover_actions.add_parser(
         "migrate-existing",
-        help="enroll an existing root after quiescent-writer attestation",
+        help="record an attested existing root; the root stays read-only (ownership-unknown)",
     )
     migration.add_argument("--inventory-digest", required=True)
     migration.add_argument(
@@ -539,11 +553,17 @@ def _handover(args, parser: argparse.ArgumentParser, root: RootContext) -> None:
         HANDOVER_PATH,
         HandoverError,
         inventory_digest,
+        inspect_relocation_source,
         migrate_existing,
         OPERATOR_ATTESTATION,
+        relocate_existing,
+        write_authority,
     )
 
     try:
+        if args.handover_action == "inspect-source":
+            print(json.dumps(inspect_relocation_source(root), sort_keys=True, indent=2))
+            return
         if args.handover_action == "inspect":
             status = enrollment_status(root, verify_inventory=True)
             orphaned_admission = status["state"] == "invalid" and status["reason"] == "admission-state-without-handover"
@@ -570,6 +590,7 @@ def _handover(args, parser: argparse.ArgumentParser, root: RootContext) -> None:
                 json.dumps(
                     {
                         "state": status["state"],
+                        "write_authority": write_authority(root) if status["state"] == "enrolled" else {"authority": "unavailable", "reason": status["reason"]},
                         "heads": heads,
                         "inventory_digest": inventory_digest(heads),
                         "operator_attestation": OPERATOR_ATTESTATION,
@@ -582,6 +603,9 @@ def _handover(args, parser: argparse.ArgumentParser, root: RootContext) -> None:
 
         if args.handover_action == "enroll-fresh":
             record = enroll_fresh(root)
+        elif args.handover_action == "relocate-from":
+            with RootContext.open(args.source) as source:
+                record = relocate_existing(root, source=source, expected_content_digest=args.content_digest)
         else:
             record = migrate_existing(
                 root,
@@ -596,6 +620,7 @@ def _handover(args, parser: argparse.ArgumentParser, root: RootContext) -> None:
                 "state": "enrolled",
                 "mode": record["mode"],
                 "inventory_digest": record["inventory_digest"],
+                "write_authority": write_authority(root)["authority"],
             },
             sort_keys=True,
         )
@@ -613,6 +638,7 @@ def _paper_writer_admission(*, verify_inventory: bool = True) -> Iterator[tuple[
         enrollment_status,
         HandoverError,
         verify_root_inventory,
+        write_authority,
     )
 
     root = paths.root_context()
@@ -621,6 +647,9 @@ def _paper_writer_admission(*, verify_inventory: bool = True) -> Iterator[tuple[
         raise PaperWriterDenied("Paper writes are blocked until explicit offline enrollment.")
     if status["state"] != "enrolled":
         raise PaperWriterDenied("Paper writes are blocked by root enrollment or ledger drift.")
+    authority = write_authority(root)
+    if authority["authority"] != "protocol-native":
+        raise PaperWriterDenied(f"Paper writes are blocked: root write authority is {authority['authority']} ({authority['reason']}); relocate into a protocol-native root.")
 
     owner = None
     try:

@@ -99,21 +99,9 @@ def _main(monkeypatch, *argv):
 
 
 def _enroll_test_root(root):
-    from hedge_fund.runtime.handover import (
-        build_head_inventory,
-        inventory_digest,
-        migrate_existing,
-        OPERATOR_ATTESTATION,
-    )
-    from hedge_fund.runtime.root import RootContext
+    from hedge_fund.test_support.handover import enroll_synthetic_root
 
-    with RootContext.open(root) as context:
-        heads = build_head_inventory(context)
-        migrate_existing(
-            context,
-            expected_inventory_digest=inventory_digest(heads),
-            operator_attestation=OPERATOR_ATTESTATION,
-        )
+    enroll_synthetic_root(root)
 
 
 def test_cli_requires_explicit_root(monkeypatch, capsys):
@@ -227,6 +215,52 @@ def test_handover_cli_inspects_then_migrates_with_exact_attestation(
     assert migrated["mode"] == "migrate-existing"
     assert migrated["inventory_digest"] == inspection["inventory_digest"]
     assert forbidden.call_count == 0
+
+
+def test_handover_cli_relocates_legacy_root_without_writing_source(tmp_path, monkeypatch, capsys):
+    from hedge_fund.paper.deployed import deploy
+
+    source = tmp_path / "legacy-source"
+    (source / "paper").mkdir(parents=True)
+    deploy("alpha", FundSpec(schema_version=2, name="alpha", strategies=[custom_strategy(["buffett"])], risk={"max_position_pct": 0.25, "max_gross_exposure": 1}), ["AAPL"], root=source / "paper")
+    (source / ".env").write_text("SYNTHETIC_ONLY=1\n", encoding="utf-8")
+    before = {item.relative_to(source).as_posix(): (item.is_dir() or item.read_bytes()) for item in sorted(source.rglob("*"))}
+    target = tmp_path / "native-target"
+    target.mkdir()
+    forbidden = Mock(side_effect=AssertionError("offline handover initialized the engine"))
+    monkeypatch.setattr(run, "_load_runtime", forbidden)
+    monkeypatch.setattr(paths, "load_root_dotenv", forbidden)
+
+    monkeypatch.setattr(run, "PAPER_DIR", source / "paper")
+    _main(monkeypatch, "handover", "inspect-source")
+    described = json.loads(capsys.readouterr().out)
+    assert described["funds"] == 1
+
+    monkeypatch.setattr(run, "PAPER_DIR", target / "paper")
+    _main(monkeypatch, "handover", "relocate-from", str(source), "--content-digest", described["content_digest"])
+    relocated = json.loads(capsys.readouterr().out)
+    assert relocated == {"state": "enrolled", "mode": "relocated", "inventory_digest": relocated["inventory_digest"], "write_authority": "protocol-native"}
+    assert before == {item.relative_to(source).as_posix(): (item.is_dir() or item.read_bytes()) for item in sorted(source.rglob("*"))}
+    assert not (target / ".env").exists()
+    assert forbidden.call_count == 0
+
+    with pytest.raises(SystemExit) as again:
+        _main(monkeypatch, "handover", "relocate-from", str(source), "--content-digest", described["content_digest"])
+    assert again.value.code == 2
+
+
+def test_cli_paper_writer_denies_attested_migration_as_ownership_unknown(tmp_path, monkeypatch):
+    from hedge_fund.runtime.handover import build_head_inventory, inventory_digest, migrate_existing, OPERATOR_ATTESTATION
+    from hedge_fund.runtime.root import RootContext
+
+    root = tmp_path / "attested-root"
+    (root / "mandates").mkdir(parents=True)
+    with RootContext.open(root) as context:
+        migrate_existing(context, expected_inventory_digest=inventory_digest(build_head_inventory(context)), operator_attestation=OPERATOR_ATTESTATION)
+        monkeypatch.setattr(paths, "root_context", lambda: context)
+        with pytest.raises(run.PaperWriterDenied, match="ownership-unknown \\(attested-migration-read-only\\)"):
+            with run._paper_writer_admission():
+                pytest.fail("attested root entered writer mode")
 
 
 def test_handover_inspects_orphaned_admission_for_explicit_offline_recovery(

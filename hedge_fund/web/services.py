@@ -102,6 +102,7 @@ from hedge_fund.runtime.credentials import (
 )
 from hedge_fund.runtime.dispatch import make_one_shot_dispatch, ProviderDispatch
 from hedge_fund.runtime.handover import (
+    write_authority,
     enrollment_status,
     HandoverError,
     LedgerHeadPublicationError,
@@ -290,9 +291,13 @@ class DeskService:
         self.allow_writes = False
         self.emergency_halt_available = False
         self.write_unavailable_reason: str | None = status["reason"]
-        if not allow_writes and status["state"] == "enrolled":
+        authority = write_authority(root_context) if status["state"] in {"enrolled", "drift"} else None
+        self.write_authority = authority["authority"] if authority is not None else "unavailable"
+        if authority is not None and authority["authority"] != "protocol-native":
+            self.write_unavailable_reason = authority["reason"] if status["state"] == "enrolled" else status["reason"]
+        elif not allow_writes and status["state"] == "enrolled":
             self.write_unavailable_reason = "write-capability-disabled"
-        if allow_writes and status["state"] in {"enrolled", "drift"}:
+        if allow_writes and status["state"] in {"enrolled", "drift"} and self.write_authority == "protocol-native":
             owner = None
             try:
                 owner = RootOwnerLease.acquire(root_context)
@@ -301,7 +306,7 @@ class DeskService:
                 self._admission = admission
                 self.allow_writes = status["state"] == "enrolled"
                 self.emergency_halt_available = status["state"] == "drift"
-            except (AdmissionError, OSError, RootPathError, ValueError):
+            except (AdmissionError, OSError, RootPathError, ValueError, RuntimeError):
                 if owner is not None:
                     owner.close()
                 self.write_unavailable_reason = "private-storage-unverified" if not root_context.verify_private_storage() else "root-owner-unavailable"
@@ -393,6 +398,8 @@ class DeskService:
                         self.root_context.close()
 
     def capabilities(self, mutation_token: str | None) -> dict:
+        if self.allow_writes or self.emergency_halt_available:
+            self._refresh_write_authority()
         return {
             "mode": "demo" if self.demo else "live",
             "read_only": not self.allow_writes,
@@ -402,6 +409,7 @@ class DeskService:
             "csrf_authenticates_users": False,
             "container_observer": self.container_observer,
             "enrollment_state": self.enrollment_state,
+            "write_authority": self.write_authority,
             "write_unavailable_reason": self.write_unavailable_reason,
             "protected_names": list(PROTECTED_NAMES),
             "mutation_token": mutation_token if self.allow_writes or self.emergency_halt_available else None,
@@ -3606,17 +3614,36 @@ class DeskService:
     def _require_writes(self) -> None:
         if not self.allow_writes:
             raise ServiceError(403, "Write capability is disabled for this server.")
-        status = enrollment_status(self.root_context)
-        if status["state"] != "enrolled":
-            self.allow_writes = False
-            self.network_enabled = False
-            self.enrollment_state = status["state"]
-            self.write_unavailable_reason = status["reason"] or "handover-unavailable"
-            if self._owner_lease is not None:
-                self._owner_lease.close()
-                self._owner_lease = None
-            self._admission = AdmissionCoordinator(self.root_context)
-            raise ServiceError(403, "Offline root enrollment is unavailable.")
+        if not self._refresh_write_authority():
+            raise ServiceError(403, "Offline root enrollment is unavailable." if self.write_authority == "unavailable" else "Root write authority is unavailable; the root is read-only.")
+
+    def _refresh_write_authority(self) -> bool:
+        """Re-classify the root; revoke write capabilities unless it is still protocol-native.
+
+        Ordinary writes need an enrolled root. A service that started in drift keeps its
+        emergency halt while the root stays protocol-native; mid-session drift revokes all.
+        """
+        try:
+            status = enrollment_status(self.root_context)
+        except Exception:
+            status = {"state": "unavailable", "reason": "handover-unavailable"}
+        authority = write_authority(self.root_context) if status["state"] in {"enrolled", "drift"} else None
+        native = authority is not None and authority["authority"] == "protocol-native"
+        if native and status["state"] == "enrolled":
+            return True
+        if native and not self.allow_writes and self.emergency_halt_available:
+            return False
+        self.allow_writes = False
+        self.emergency_halt_available = False
+        self.network_enabled = False
+        self.enrollment_state = status["state"]
+        self.write_unavailable_reason = (authority["reason"] if authority is not None else status["reason"]) or "handover-unavailable"
+        self.write_authority = authority["authority"] if authority is not None else "unavailable"
+        if self._owner_lease is not None:
+            self._owner_lease.close()
+            self._owner_lease = None
+        self._admission = AdmissionCoordinator(self.root_context)
+        return False
 
     def _credential_status_map(self) -> dict[str, dict[str, int | bool]]:
         provider_ids = {provider.casefold() for provider in (*PROVIDER_ENV_VARS, *DATA_PROVIDER_ENV_VARS)}

@@ -109,16 +109,14 @@ class RootOwnerLease:
         wait = _validate_timeout(timeout, MAX_LOCK_WAIT_SECONDS)
         if not root.verify_private_storage():
             raise OwnershipUnknown("Private root storage is not verified.")
-        from hedge_fund.runtime.handover import require_enrollment
-
-        require_enrollment(root)
+        _require_protocol_native_authority(root)
         root.mkdir(LOCK_DIRECTORY, parents=True, mode=0o700)
         handle = root.open_lock_file(OWNER_LOCK_PATH, mode=0o600)
         token = None
         try:
             token = _acquire_os_lock(handle, wait, exclusive=False)
             root.revalidate()
-            require_enrollment(root)
+            _require_protocol_native_authority(root)
             return cls(root, handle, token)
         except BaseException:
             try:
@@ -137,10 +135,8 @@ class RootOwnerLease:
                 return False
         if not root.verify_private_storage():
             return False
-        from hedge_fund.runtime.handover import require_enrollment
-
         try:
-            require_enrollment(root)
+            _require_protocol_native_authority(root)
         except Exception:
             return False
         return True
@@ -215,6 +211,20 @@ class RootMigrationLease(RootOwnerLease):
 
 
 RootParticipantLease = RootOwnerLease
+
+
+def _require_protocol_native_authority(root: RootContext) -> None:
+    """Enrollment alone is not write authority; only protocol-native roots qualify."""
+    from hedge_fund.runtime.handover import HandoverError, require_write_authority, WriteAuthorityDenied
+
+    try:
+        require_write_authority(root)
+    except WriteAuthorityDenied as exc:
+        raise OwnershipUnknown(str(exc)) from None
+    except HandoverError:
+        raise
+    except Exception as exc:
+        raise OwnershipUnknown(f"root write authority is unavailable ({type(exc).__name__})") from None
 
 
 class AdmissionCoordinator:
@@ -569,6 +579,7 @@ def root_registry_writer(
             verify_root_inventory(root)
 
     try:
+        _require_protocol_native_authority(root)
         if coordinator.lane_is_held("registry"):
             verify_inventory()
             yield coordinator
@@ -892,6 +903,7 @@ def require_paper_write_lanes(
             require_enrollment(root)
         except Exception as exc:
             raise OwnershipUnknown("Paper root enrollment is invalid.") from exc
+        _require_protocol_native_authority(root)
         if verify_inventory:
             try:
                 verify_root_inventory(root)

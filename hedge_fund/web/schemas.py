@@ -414,6 +414,7 @@ class CapabilitiesResponse(BaseModel):
     csrf_authenticates_users: Literal[False]
     container_observer: bool
     enrollment_state: Literal["unenrolled", "enrolled", "invalid", "drift"]
+    write_authority: Literal["protocol-native", "ownership-unknown", "unavailable"]
     write_unavailable_reason: str | None
     protected_names: list[str]
     mutation_token: str | None
