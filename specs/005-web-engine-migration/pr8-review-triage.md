@@ -838,6 +838,7 @@ responsiveness evidence, not a throughput or starvation guarantee.
 | `18:01:38Z` `web-halt-reconciliation-contract` | **1 passed** after updating that final assertion to 423. | Current candidate includes the test-only correction; log SHA-256 `ad0f5b661b857e49269985ef7aeF761722eb6f31757d0d50d444b3f04305bcff`. |
 | `18:03:38Z` `pr8-final-adjacent-modules` | **222 passed** for pipeline, signal/LLM-agent, and fund-spec tests. | Log SHA-256 `32713e1592731686b5c56969d67ae04ee7f823b57e693f6309a14a15dab3c069`. |
 | `18:03:39Z` `pr8-final-static-current` | isort, critical flake8 rules, Black check, and cleanup exited 0 for 44 Python files. | Log SHA-256 `cb1479ffb1f4fb93b350cd1b0ebb5739e8dac20633ea626bf619d1a45679d792`; `git diff --check` also exited 0. |
+| `18:10:36Z` `postcommit-focused-smoke` | **156 passed** on commit `0a6d1097a73213346ff5c0e40a1b636883825b1a`; Python source identity matched `bdb771ef...` and frontend identity matched `c8b4c9e4...`. | Log SHA-256 `0b2d563faace4b380e31fe42f54ecf2390c5a854b5aaa8310d692462973b492f`; cleanup exited 0. |
 
 This is not a claim that the full `hedge_fund` suite passed on the current
 candidate: the combined run had one stale assertion, subsequently corrected
