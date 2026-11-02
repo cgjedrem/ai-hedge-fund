@@ -25,7 +25,7 @@ export function ArchivePanel({ kind, onChange }: { kind: ArchiveKind; onChange: 
         <p className="text-xs text-muted-foreground">Exact-scope retained history. Restore never starts a runner. Interrupted transitions require deliberate recovery.</p>
       </CardHeader>
       <CardContent>
-        {resource.error ? <ErrorState message={resource.error} /> : null}
+        {resource.error ? <ErrorState message={resource.error} error={resource.apiError} onRetry={resource.refresh} /> : null}
         {resource.loading ? <p className="text-xs text-muted-foreground">Loading archive records...</p> : null}
         {!resource.loading && !resource.error && items.length === 0 ? <p className="text-xs text-muted-foreground">No archived {kind} objects.</p> : null}
         <div className="space-y-4">

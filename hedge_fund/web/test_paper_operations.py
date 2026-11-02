@@ -663,3 +663,69 @@ def test_runner_start_rejects_head_changed_after_acceptance_before_spawn(
     assert completed["status"] == "failed"
     assert popen_calls == []
     assert ledger.latest().hash == changed.hash
+
+
+@pytest.mark.parametrize(
+    ("fault", "code", "policy"),
+    [
+        ("busy", "writer-conflict", "retry-later"),
+        ("conflict", "request-conflict", "reload"),
+        ("admission", "writer-conflict", "inspect-status"),
+    ],
+)
+def test_paper_accept_retries_only_busy_storage_and_records_no_effects(demo_root, monkeypatch, fault, code, policy):
+    from hedge_fund.runtime.admission import AdmissionError
+    from hedge_fund.runtime.operations import OperationBusy, OperationConflict
+    from hedge_fund.web.schemas import error_payload
+
+    faults = {
+        "busy": OperationBusy("synthetic busy"),
+        "conflict": OperationConflict("synthetic conflict"),
+        "admission": AdmissionError("synthetic admission"),
+    }
+    data_client = _OfflineDataClient()
+    service = DeskService(
+        demo_root,
+        allow_writes=True,
+        network_enabled=True,
+        data_client_factory=lambda: data_client,
+        fund_factory=_OfflineFund,
+    )
+    service._runtime_settings = _local_settings()
+    try:
+        spec = load_spec(demo_root / "mandates" / "demo-quality.yaml").model_copy(update={"name": "fault-test"})
+        service.create_mandate(spec.model_dump(mode="python"))
+        service.deploy_mandate("fault-test", DeployRequest(universe=["AAPL", "MSFT"]))
+        ledger = Ledger(demo_root / "paper" / "fault-test")
+        before = ledger.sessions()
+        preview = service.create_manual_tick_preview(
+            "fault-test",
+            PaperTickPreviewRequest(expected_head=None),
+            operator_session="offline-test-session",
+        )
+
+        def fail(*_args, **_kwargs):
+            raise faults[fault]
+
+        monkeypatch.setattr(service._operation_store, "accept_request", fail)
+        with pytest.raises(ServiceError) as denied:
+            service.accept_manual_tick(
+                "fault-test",
+                PaperTickAcceptRequest(
+                    request_id=f"offline-fault-{fault}",
+                    preview_id=preview["preview_id"],
+                    preview_digest=preview["preview_digest"],
+                    confirmation_token=preview["confirmation_token"],
+                    expected_head=None,
+                    due_set=preview["due_set"],
+                ),
+                operator_session="offline-test-session",
+            )
+        after = ledger.sessions()
+    finally:
+        service.close()
+
+    body = error_payload(denied.value.status_code, denied.value.detail, code=denied.value.code, retry_policy=denied.value.retry_policy)
+    assert (denied.value.status_code, body["code"], body["retry_policy"]) == (409, code, policy)
+    assert "synthetic" not in denied.value.detail
+    assert after == before

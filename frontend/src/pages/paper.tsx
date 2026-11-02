@@ -18,7 +18,7 @@ import { LifecycleActions } from "@/components/lifecycle-actions";
 import { DataTable, type TableColumn } from "@/components/data-table";
 import { EquityChart } from "@/components/equity-chart";
 import { MetricCard } from "@/components/metric-card";
-import { EmptyState, ErrorState, PageHeader, SectionTitle } from "@/components/page";
+import { EmptyState, ErrorNotice, ErrorState, PageHeader, SectionTitle } from "@/components/page";
 import { Alert } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -34,6 +34,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { apiPost } from "@/lib/api";
+import { toActionableError, type ActionableError } from "@/lib/errors";
 import { useDesk, useResource } from "@/lib/hooks";
 import type {
   Approval,
@@ -104,7 +105,7 @@ export function PaperPage() {
         actions={<Button asChild variant="secondary"><Link to="/mandates"><FileCheck2 className="h-3.5 w-3.5" /> Browse mandates</Link></Button>}
       />
       {resource.loading ? <div className="h-56 animate-pulse rounded-xl border border-border bg-white/[0.025]" /> : null}
-      {resource.error ? <ErrorState message={resource.error} /> : null}
+      {resource.error ? <ErrorState message={resource.error} error={resource.apiError} onRetry={resource.refresh} /> : null}
       {resource.data ? (
         <div className="min-w-0 space-y-5">
           {resource.data.errors.length > 0 ? (
@@ -141,7 +142,7 @@ type PendingAction = "approve" | "reject" | "resume";
 export function PaperDetailPage() {
   const { name = "" } = useParams();
   const navigate = useNavigate();
-  const { capabilities } = useDesk();
+  const { capabilities, reconnect } = useDesk();
   const resource = useResource<PaperSnapshot>(name ? `/api/paper/${encodeURIComponent(name)}` : null);
   const [sessionSearchText, setSessionSearchText] = useState("");
   const [sessionSearch, setSessionSearch] = useState("");
@@ -172,7 +173,7 @@ export function PaperDetailPage() {
   const [maxRuntimeMinutes, setMaxRuntimeMinutes] = useState("60");
   const [valuationBusy, setValuationBusy] = useState(false);
   const [valuationResult, setValuationResult] = useState<LiveValuation | null>(null);
-  const [feedback, setFeedback] = useState<{ tone: "danger" | "neutral"; message: string } | null>(null);
+  const [feedback, setFeedback] = useState<{ tone: "danger" | "neutral"; message: string; error?: ActionableError } | null>(null);
   const valuationRequest = useRef(0);
   const paperActionInFlight = useRef(false);
   const refreshedOperation = useRef<string | null>(null);
@@ -209,6 +210,29 @@ export function PaperDetailPage() {
     && runner?.available
     && runner.status === "running",
   );
+  const fail = (cause: unknown, fallback: string) => {
+    const error = toActionableError(cause, fallback);
+    setFeedback({ tone: "danger", message: error.message, error });
+  };
+  // Recovery never resubmits: it refreshes durable state so the operator reviews again.
+  const recover = (error: ActionableError) => {
+    if (error.action === "reconnect") {
+      void reconnect();
+      return;
+    }
+    setPaperPreview(null);
+    setPaperPreviewKind(null);
+    setConfirmAction(null);
+    setFeedback(null);
+    resource.refresh();
+    runnerResource.refresh();
+    if (operationId) operationResource.refresh();
+  };
+  const staleOperation = Boolean(operationId && operationResource.apiError?.code === "not-found");
+  const forgetStaleOperation = () => {
+    clearPaperOperationId(name);
+    setOperationId(null);
+  };
   const submitSessionSearch = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     setSessionCursorStack([null]);
@@ -285,7 +309,9 @@ export function PaperDetailPage() {
       setConfirmAction(null);
       resource.refresh();
     } catch (cause) {
-      setFeedback({ tone: "danger", message: cause instanceof Error ? cause.message : "Action failed." });
+      fail(cause, "Action failed.");
+      // The reviewed confirmation is spent; close it so the recovery notice is reachable.
+      setConfirmAction(null);
     } finally {
       setBusy(false);
     }
@@ -307,7 +333,8 @@ export function PaperDetailPage() {
       setFeedback({ tone: "neutral", message: "Halt state recorded in the ledger. Runner process control is not available here." });
       resource.refresh();
     } catch (cause) {
-      setFeedback({ tone: "danger", message: cause instanceof Error ? cause.message : "Halt request failed." });
+      fail(cause, "Halt request failed.");
+      setHaltDialogOpen(false);
     } finally {
       setBusy(false);
     }
@@ -327,7 +354,7 @@ export function PaperDetailPage() {
       setValuationResult(estimate);
     } catch (cause) {
       if (request !== valuationRequest.current) return;
-      setFeedback({ tone: "danger", message: cause instanceof Error ? cause.message : "Valuation refresh failed." });
+      fail(cause, "Valuation refresh failed.");
     } finally {
       if (request === valuationRequest.current) setValuationBusy(false);
     }
@@ -364,7 +391,7 @@ export function PaperDetailPage() {
       setPaperPreview(preview);
       setPaperPreviewKind(kind);
     } catch (cause) {
-      setFeedback({ tone: "danger", message: cause instanceof Error ? cause.message : "Paper preview failed." });
+      fail(cause, "Paper preview failed.");
     } finally {
       paperActionInFlight.current = false;
       setPaperActionBusy(false);
@@ -406,7 +433,7 @@ export function PaperDetailPage() {
       });
       runnerResource.refresh();
     } catch (cause) {
-      setFeedback({ tone: "danger", message: cause instanceof Error ? cause.message : "Paper operation was not accepted." });
+      fail(cause, "Paper operation was not accepted.");
       setPaperPreview(null);
       setPaperPreviewKind(null);
     } finally {
@@ -426,7 +453,8 @@ export function PaperDetailPage() {
       setFeedback({ tone: "neutral", message: "Owned runner stop requested. An in-flight session may finish before it exits." });
       runnerResource.refresh();
     } catch (cause) {
-      setFeedback({ tone: "danger", message: cause instanceof Error ? cause.message : "Runner stop request failed." });
+      fail(cause, "Runner stop request failed.");
+      setStopRunnerDialogOpen(false);
     } finally {
       paperActionInFlight.current = false;
       setPaperActionBusy(false);
@@ -448,7 +476,7 @@ export function PaperDetailPage() {
         }
       />
       {resource.loading ? <div className="h-52 animate-pulse rounded-xl border border-border bg-white/[0.025]" /> : null}
-      {resource.error ? <ErrorState message={resource.error} /> : null}
+      {resource.error ? <ErrorState message={resource.error} error={resource.apiError} onRetry={resource.refresh} /> : null}
       {data ? (
         <>
           {!data.ledger.ok ? <Alert tone="danger" className="mb-5"><strong>Ledger verification failed.</strong> <span>{data.ledger.error}</span></Alert> : null}
@@ -461,7 +489,9 @@ export function PaperDetailPage() {
             <Alert tone="warning" className="mb-5">Halt state is unreadable. Paper controls and approval writes are disabled.</Alert>
           ) : null}
           {protectedName ? <Alert tone="warning" className="mb-5">This protected fund can be inspected but not modified through the web desk.</Alert> : null}
-          {feedback ? <Alert tone={feedback.tone} className="mb-5">{feedback.message}</Alert> : null}
+          {feedback?.error ? (
+            <ErrorNotice className="mb-5" error={feedback.error} onAction={() => recover(feedback.error as ActionableError)} />
+          ) : feedback ? <Alert tone={feedback.tone} className="mb-5">{feedback.message}</Alert> : null}
 
           <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
             <MetricCard label="Recorded NAV" value={money(data.nav)} note={data.last_session ? `As of ${dateLabel(data.last_session)}` : "No recorded session"} icon={BadgeDollarSign} />
@@ -511,7 +541,7 @@ export function PaperDetailPage() {
                     />
                     <Button type="submit" variant="secondary" disabled={sessionResource.loading}>Search</Button>
                   </form>
-                  {sessionResource.error ? <ErrorState message={sessionResource.error} /> : null}
+                  {sessionResource.error ? <ErrorState message={sessionResource.error} error={sessionResource.apiError} onRetry={sessionResource.refresh} /> : null}
                   {sessionResource.data?.errors.length ? (
                     <Alert tone="warning" className="mb-4">
                       {sessionResource.data.errors.map((item) => (
@@ -694,8 +724,15 @@ export function PaperDetailPage() {
                         {operation.error ? <p className="mt-2 text-[10px] text-rose-300">{operation.error}</p> : null}
                       </div>
                     ) : null}
-                    {operationResource.error ? <Alert tone="warning" className="mt-3">{operationResource.error}</Alert> : null}
-                    {runnerResource.error ? <Alert tone="warning" className="mt-3">{runnerResource.error}</Alert> : null}
+                    {staleOperation ? (
+                      <Alert tone="warning" className="mt-3">
+                        <p>The remembered operation {shortHash(operationId ?? "")} is no longer known to this server. Its outcome is recorded in the ledger and session history.</p>
+                        <Button className="mt-2" size="sm" variant="secondary" onClick={forgetStaleOperation}>Forget operation</Button>
+                      </Alert>
+                    ) : operationResource.apiError ? (
+                      <ErrorNotice className="mt-3" error={operationResource.apiError} onAction={operationResource.refresh} actionLabel="Inspect status" />
+                    ) : null}
+                    {runnerResource.apiError ? <ErrorNotice className="mt-3" error={runnerResource.apiError} onAction={runnerResource.refresh} /> : null}
                   </div>
                 </CardContent>
               </Card>
@@ -907,6 +944,14 @@ function persistPaperOperationId(name: string, operationId: string): void {
   }
 }
 
+function clearPaperOperationId(name: string): void {
+  try {
+    window.localStorage.removeItem(paperOperationStorageKey(name));
+  } catch {
+    return;
+  }
+}
+
 function newRequestId(): string {
   const bytes = new Uint8Array(16);
   window.crypto.getRandomValues(bytes);
@@ -1062,7 +1107,7 @@ export function PaperScorecardPage() {
         actions={<Button asChild variant="secondary"><Link to={`/paper/${encodeURIComponent(name)}`}><ArrowLeft className="h-3.5 w-3.5" /> Paper fund</Link></Button>}
       />
       {resource.loading ? <div className="h-48 animate-pulse rounded-xl border border-border bg-white/[0.025]" /> : null}
-      {resource.error ? <ErrorState message={resource.error} /> : null}
+      {resource.error ? <ErrorState message={resource.error} error={resource.apiError} onRetry={resource.refresh} /> : null}
       {card ? (
         <>
           <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
@@ -1115,7 +1160,7 @@ export function SessionReportPage() {
         actions={<Button asChild variant="secondary"><Link to={`/paper/${encodeURIComponent(name)}`}><ArrowLeft className="h-3.5 w-3.5" /> Paper fund</Link></Button>}
       />
       {resource.loading ? <div className="h-48 animate-pulse rounded-xl border border-border bg-white/[0.025]" /> : null}
-      {resource.error ? <ErrorState message={resource.error} /> : null}
+      {resource.error ? <ErrorState message={resource.error} error={resource.apiError} onRetry={resource.refresh} /> : null}
       {report ? (
         <>
           <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">

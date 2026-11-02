@@ -867,3 +867,60 @@ No other session process, checkout, preview or the worktree itself was removed.
   installed-artifact gates; historical native/smoke rows are not current artifact proof.
 - T019/T020 envelope gaps, full browser/visual parity, final packaging and TUI removal
   remain open. No merge or complete-migration claim.
+
+## T019 / T020 error-envelope and reconnect recovery slice (2026-11-02)
+
+**Status: implemented bounded slice; T019/T020 remain unchecked (PARTIAL). Migration remains 20/148, NOT READY TO MERGE.**
+
+### Candidate and isolation
+
+- Verified base and remote PR8 head before work and before publication: `89e0b49bb9cee2d7aaeb44a125e128acfbcce296`
+  (`origin/cgjedrem-vigilant-robot`); publication is a non-force push to that branch, no duplicate PR or merge.
+- Code/test identity captured `2026-11-02T02:34:28+01:00`: **`492ce48e005eab554c625e838a5ddb55d990b62dbc30e3ef546ce4c4c73281f0`**,
+  **30 paths / 779,905 bytes** (sorted repo-relative paths, NUL, staged blob bytes, NUL; docs/screenshots excluded).
+  Every staged blob was compared with the working tree (CRLF->LF normalization only) and matched.
+- Windows 11 / NTFS, Python 3.13.7 Poetry venv, Node/Vitest/Playwright Chromium; `PYTHON_DOTENV_DISABLED=1`, isolated synthetic roots,
+  HOME/TEMP/provider/proxy/credential env cleared by the existing harnesses; loopback only. No live root, runner, credential,
+  provider, LLM, paid or broker call; no other checkout/process (8765, 49292, PID 54644) touched.
+
+### Behavior implemented (source)
+
+- `schemas.error_payload`/`ErrorResponse`: optional `subject_id`, `request_id`, `current_head` echoed only when they fully match bounded
+  opaque-token patterns (hostile values dropped); explicit `refresh_required`/`retry_policy` overrides validated against `RETRY_POLICIES`.
+- Contract code->status table with `error_code_status_matches`; `halted`/`replay-corrupt`/`reconciliation-required` moved 409->423,
+  request validation 422->400 `invalid-request`, stored-artifact readiness 422 `readiness-denied`; new codes `protected-root`,
+  `unsupported-filesystem`, `private-storage-unverified`, `budget-exhausted`.
+- Retry semantics: `writer-conflict` defaults to `inspect-status`; only pre-acceptance registry-lock `OperationBusy` (paper/lifecycle/operation
+  accept) opts into `retry-later` with neutral wording ("this request was not processed now ... inspect its operation status first").
+  A busy status read after a durable lifecycle transition returns the accepted record; busy replay of a known request is `inspect-status`.
+  An unavailable operation store reads as 503 `observation-conflict`/`retry-read-only` (not 404).
+- A mutation rejected for an absent/expired operator session (e.g. after server restart) returns 403 `reload`; Host/Origin/CSRF checks unchanged.
+- Frontend: `ApiError` + `errors.ts` actionable guidance (Review again, Refresh status, Reload session, Reconnect; no retry for permanent faults;
+  mutations never auto-resubmitted); `ConnectionBanner`; per-page recovery; connection epoch so a pre-loss response cannot report recovery;
+  Reconnect issues a fresh capabilities read bounded to 10 s.
+
+### Results (source-bound unless stated)
+
+- Full Python suite (post all repairs): **1640 passed, 42 skipped, 0 failed in 1233.76 s** (skips: live-key smoke, Linux-only, FIFO).
+  Only trailing blank-line removal in three test files followed this run.
+- Targeted: `test_lifecycle.py` **25 passed** (254 s); `test_app.py` **43 passed**; paper accept fault matrix **3 passed**.
+- Frontend Vitest (`npm test`): **5 files, 49 passed**; `npm run build` (tsc + vite) OK; e2e safety **6/6**.
+- Owned real-API Playwright (runtime against the source-built static bundle, synthetic root, port 8876, no `page.route` fakes):
+  `recovery.spec.ts` **3 passed in 4 consecutive runs**; `lifecycle.spec.ts` **1 passed**; desk suite **12 passed, 4 skipped**.
+- Lint: changed-file flake8 and isort clean; Black failures only in `test_actions.py`/`test_settings.py`, identical at HEAD; `git diff --check` clean.
+
+### QA cycles and failed attempts
+
+- Initial independent QA: 3 findings (writer-conflict always `retry-later`; misleading reload guidance; missing store as 404 offering Forget). Repaired.
+- First discriminating test for lifecycle busy-only retry vacuously skipped; rewritten to patch `OperationStore.get_by_request` so it exercises the path.
+- Final QA 1: busy status read after durable transition misreported as nothing accepted -> fixed, new regression. Final QA 2: busy replay
+  wording -> fixed. Final QA 3 (fresh reviewer): **no blocking findings**.
+- Recovery e2e offline test failed 2 of 3 runs: a background read sent before the loss completed afterwards and flipped the banner online,
+  and Reconnect could reuse a hung in-flight request. Fixed via connection epoch and fresh bounded reconnect; then 4/4 runs green.
+
+### Open (keeps T019/T020 unchecked)
+
+- No production site emits 429 `capacity-denied`/`budget-exhausted`; worker-capacity rejection occurs after durable acceptance and surfaces as
+  409 `ownership-unknown`. Next: a pre-acceptance capacity check that preserves idempotent replay, plus its envelope regression.
+- No observation stream/channel exists (polling only); T023 identity-aware polling and late-response rejection remain open.
+- No current-source wheel/container/installed-artifact, bare-metal Linux or cross-browser evidence for this slice.

@@ -70,7 +70,7 @@ export function ResearchPage() {
         <Button type="submit" variant="secondary" disabled={resource.loading}>Search</Button>
       </form>
       {resource.loading ? <div className="h-52 animate-pulse rounded-xl border border-border bg-white/[0.025]" /> : null}
-      {resource.error ? <ErrorState message={resource.error} /> : null}
+      {resource.error ? <ErrorState message={resource.error} error={resource.apiError} onRetry={resource.refresh} /> : null}
       {resource.data ? (
         <>
           {resource.data.errors.length > 0 ? (
@@ -162,7 +162,7 @@ export function ResearchReportPage() {
         </>}
       />
       {resource.loading ? <div className="h-48 animate-pulse rounded-xl border border-border bg-white/[0.025]" /> : null}
-      {resource.error ? <ErrorState message={resource.error} /> : null}
+      {resource.error ? <ErrorState message={resource.error} error={resource.apiError} onRetry={resource.refresh} /> : null}
       {report ? (
         <>
           <div className="mb-5 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">

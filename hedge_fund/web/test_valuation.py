@@ -179,7 +179,7 @@ def test_stale_head_is_rejected_before_provider_call(demo_root):
         )
 
     assert response.status_code == 409
-    assert invalid.status_code == 422
+    assert invalid.status_code == 400
     assert provider.calls == []
 
 

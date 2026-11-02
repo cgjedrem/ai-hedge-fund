@@ -16,6 +16,7 @@ export interface Capabilities {
 export type ApiErrorCode =
   | "invalid-request"
   | "capability-denied"
+  | "protected-root"
   | "read-only"
   | "broker-not-web-supported"
   | "not-found"
@@ -26,8 +27,12 @@ export type ApiErrorCode =
   | "halted"
   | "replay-corrupt"
   | "reconciliation-required"
+  | "readiness-denied"
+  | "unsupported-filesystem"
+  | "private-storage-unverified"
   | "expired-confirmation"
   | "capacity-denied"
+  | "budget-exhausted"
   | "payload-too-large"
   | "observation-conflict"
   | "assets-unavailable"
@@ -47,6 +52,9 @@ export interface ApiErrorShape {
   message?: string;
   refresh_required?: boolean;
   retry_policy?: ApiRetryPolicy;
+  subject_id?: string | null;
+  request_id?: string | null;
+  current_head?: string | null;
 }
 
 export interface ModelOption {

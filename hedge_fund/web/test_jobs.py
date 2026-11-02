@@ -213,7 +213,7 @@ def test_builder_canonical_validation_conflicts_and_deployment(tmp_path):
     invalid["interval"] = 1.0
     with pytest.raises(ServiceError) as cadence:
         service.create_mandate(invalid)
-    assert cadence.value.status_code == 422
+    assert cadence.value.status_code == 400
     service.close()
 
 
@@ -257,7 +257,7 @@ def test_mandate_api_preserves_advanced_model_roster_and_weights_and_rejects_unk
     assert partial_response.json()["spec"]["strategies"][0]["models"] == partial["strategies"][0]["models"]
     assert weight_response.status_code == 201
     assert weight_response.json()["spec"]["strategies"][0]["models"][0]["weight"] == changed_weight["strategies"][0]["models"][0]["weight"]
-    assert params_response.status_code == 422
+    assert params_response.status_code == 400
     assert (tmp_path / "mandates" / "partial-library.yaml").is_file()
     assert (tmp_path / "mandates" / "changed-library-weight.yaml").is_file()
     assert not (tmp_path / "mandates" / "changed-library-params.yaml").exists()

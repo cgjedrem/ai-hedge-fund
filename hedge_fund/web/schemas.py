@@ -22,6 +22,7 @@ from pydantic import (
 ErrorCode = Literal[
     "invalid-request",
     "capability-denied",
+    "protected-root",
     "read-only",
     "broker-not-web-supported",
     "not-found",
@@ -32,8 +33,12 @@ ErrorCode = Literal[
     "halted",
     "replay-corrupt",
     "reconciliation-required",
+    "readiness-denied",
+    "unsupported-filesystem",
+    "private-storage-unverified",
     "expired-confirmation",
     "capacity-denied",
+    "budget-exhausted",
     "payload-too-large",
     "observation-conflict",
     "assets-unavailable",
@@ -49,16 +54,42 @@ _DEFAULT_ERROR_CODES: dict[int, str] = {
     409: "request-conflict",
     410: "expired-confirmation",
     413: "payload-too-large",
-    422: "invalid-request",
+    422: "readiness-denied",
     423: "halted",
     429: "capacity-denied",
     503: "assets-unavailable",
+}
+# Contract statuses per code; a code raised with another status is a programming error.
+_ERROR_CODE_STATUSES: dict[str, frozenset[int]] = {
+    "invalid-request": frozenset({400, 405}),
+    "capability-denied": frozenset({403}),
+    "protected-root": frozenset({403}),
+    "read-only": frozenset({403}),
+    "broker-not-web-supported": frozenset({403}),
+    "not-found": frozenset({404}),
+    "stale-preview": frozenset({409}),
+    "request-conflict": frozenset({409}),
+    "writer-conflict": frozenset({409}),
+    "ownership-unknown": frozenset({409}),
+    "halted": frozenset({423}),
+    "replay-corrupt": frozenset({423}),
+    "reconciliation-required": frozenset({423}),
+    "readiness-denied": frozenset({422}),
+    "unsupported-filesystem": frozenset({422}),
+    "private-storage-unverified": frozenset({422}),
+    "expired-confirmation": frozenset({410}),
+    "capacity-denied": frozenset({429}),
+    "budget-exhausted": frozenset({429}),
+    "payload-too-large": frozenset({413}),
+    "observation-conflict": frozenset({503}),
+    "assets-unavailable": frozenset({503}),
 }
 _ERROR_RETRY_POLICIES: dict[str, str] = {
     "stale-preview": "review-again",
     "expired-confirmation": "review-again",
     "request-conflict": "reload",
-    "writer-conflict": "retry-later",
+    # Only registry-lock OperationBusy sites opt into retry-later explicitly; other writer conflicts need status inspection.
+    "writer-conflict": "inspect-status",
     "capacity-denied": "retry-later",
     "ownership-unknown": "inspect-status",
     "replay-corrupt": "inspect-status",
@@ -69,6 +100,12 @@ _ERROR_RETRY_POLICIES: dict[str, str] = {
 }
 _REFRESH_REQUIRED_CODES = frozenset({"stale-preview", "expired-confirmation", "ownership-unknown"})
 _ERROR_CODES = frozenset(ErrorCode.__args__)
+RETRY_POLICIES = frozenset(RetryPolicy.__args__)
+_RETRY_POLICIES = RETRY_POLICIES
+# Identity echoes are bounded opaque tokens; anything else is dropped, never repaired.
+_SAFE_SUBJECT_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,180}")
+_SAFE_REQUEST_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
+_SAFE_HEAD = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
 
 
 class ErrorResponse(BaseModel):
@@ -81,6 +118,9 @@ class ErrorResponse(BaseModel):
     message: str
     refresh_required: bool
     retry_policy: RetryPolicy
+    subject_id: str | None = None
+    request_id: str | None = None
+    current_head: str | None = None
 
 
 def error_code_for(status_code: int, code: str | None = None) -> str:
@@ -93,15 +133,55 @@ def error_code_for(status_code: int, code: str | None = None) -> str:
     return _DEFAULT_ERROR_CODES.get(status_code, "invalid-request")
 
 
-def error_payload(status_code: int, detail: str | list[dict[str, Any]], *, code: str | None = None) -> dict[str, Any]:
+def error_code_status_matches(status_code: int, code: str) -> bool:
+    """Whether ``code`` is a contract code for ``status_code`` (used by contract tests)."""
+    if code == "internal-error":
+        return status_code >= 500 and status_code != 503
+    return status_code in _ERROR_CODE_STATUSES.get(code, frozenset())
+
+
+def safe_identity(value: object, pattern: re.Pattern[str]) -> str | None:
+    if isinstance(value, str) and pattern.fullmatch(value):
+        return value
+    return None
+
+
+def safe_subject_id(value: object) -> str | None:
+    return safe_identity(value, _SAFE_SUBJECT_ID)
+
+
+def safe_request_id(value: object) -> str | None:
+    return safe_identity(value, _SAFE_REQUEST_ID)
+
+
+def safe_head(value: object) -> str | None:
+    return safe_identity(value, _SAFE_HEAD)
+
+
+def error_payload(
+    status_code: int,
+    detail: str | list[dict[str, Any]],
+    *,
+    code: str | None = None,
+    subject_id: object = None,
+    request_id: object = None,
+    current_head: object = None,
+    refresh_required: bool | None = None,
+    retry_policy: str | None = None,
+) -> dict[str, Any]:
     resolved = error_code_for(status_code, code)
+    if retry_policy is not None and retry_policy not in _RETRY_POLICIES:
+        raise ValueError(f"unknown retry policy: {retry_policy}")
     message = detail if isinstance(detail, str) else "Invalid request."
     return ErrorResponse(
         detail=detail,
         code=resolved,
         message=message,
-        refresh_required=resolved in _REFRESH_REQUIRED_CODES,
-        retry_policy=_ERROR_RETRY_POLICIES.get(resolved, "none"),
+        refresh_required=(resolved in _REFRESH_REQUIRED_CODES) if refresh_required is None else refresh_required,
+        retry_policy=retry_policy or _ERROR_RETRY_POLICIES.get(resolved, "none"),
+        subject_id=safe_subject_id(subject_id),
+        request_id=safe_request_id(request_id),
+        current_head=safe_head(current_head),
     ).model_dump()
 
 

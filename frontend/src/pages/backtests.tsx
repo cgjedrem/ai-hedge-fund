@@ -3,7 +3,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 
 import { DataTable, type TableColumn } from "@/components/data-table";
-import { ErrorState, PageHeader, SectionTitle } from "@/components/page";
+import { ErrorNotice, ErrorState, PageHeader, SectionTitle } from "@/components/page";
 import { Alert } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -26,6 +26,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { apiPost } from "@/lib/api";
+import { toActionableError, type ActionableError } from "@/lib/errors";
 import { useDesk, useResource } from "@/lib/hooks";
 import type { MandateCollection, Operation, OperationPreview, OperationStatus, Settings } from "@/lib/types";
 import { dateLabel } from "@/lib/utils";
@@ -61,7 +62,7 @@ function newRequestId(): string {
 }
 
 export function BacktestsPage() {
-  const { capabilities } = useDesk();
+  const { capabilities, reconnect } = useDesk();
   const mandates = useResource<MandateCollection>("/api/mandates");
   const settings = useResource<Settings>("/api/settings");
   const operations = useResource<{ items: Operation[] }>("/api/operations");
@@ -86,7 +87,7 @@ export function BacktestsPage() {
   const [busy, setBusy] = useState(false);
   const [cancelling, setCancelling] = useState(false);
   const [confirmation, setConfirmation] = useState<OperationPreview | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<string | ActionableError | null>(null);
   const selectOperation = useCallback((selectedId: string | null) => {
     setOperationId(selectedId);
     persistSelectedOperationId(selectedId);
@@ -250,7 +251,7 @@ export function BacktestsPage() {
       });
       setConfirmation(preview);
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "Backtest preview could not be created.");
+      setError(toActionableError(cause, "Backtest preview could not be created."));
     } finally {
       setBusy(false);
     }
@@ -281,7 +282,8 @@ export function BacktestsPage() {
       setConfirmation(null);
       operations.refresh();
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "Backtest could not be submitted.");
+      setError(toActionableError(cause, "Backtest could not be submitted."));
+      setConfirmation(null);
     } finally {
       setBusy(false);
     }
@@ -299,11 +301,30 @@ export function BacktestsPage() {
       currentOperation.refresh();
       operations.refresh();
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "Cancellation request failed.");
+      setError(toActionableError(cause, "Cancellation request failed."));
     } finally {
       setCancelling(false);
     }
   }
+
+  // Recovery never resubmits; it refreshes reviewed inputs or durable operation status.
+  function recover(failure: ActionableError): void {
+    if (failure.action === "reconnect") {
+      void reconnect();
+      return;
+    }
+    setError(null);
+    if (failure.action === "inspect-status") {
+      operations.refresh();
+      if (operationId) currentOperation.refresh();
+      return;
+    }
+    setConfirmation(null);
+    mandates.refresh();
+    settings.refresh();
+  }
+
+  const staleOperation = Boolean(operationId && currentOperation.apiError?.code === "not-found");
 
   return (
     <>
@@ -313,13 +334,14 @@ export function BacktestsPage() {
         description="Review a bounded historical research operation. Paid providers require per-operation consent and a finite transport budget."
         actions={<Button asChild variant="secondary"><Link to="/research">Saved reports <ArrowRight className="h-3.5 w-3.5" /></Link></Button>}
       />
-      {error ? <Alert tone="danger" className="mb-5"><AlertCircle className="mr-2 inline h-4 w-4" />{error}</Alert> : null}
+      {typeof error === "string" ? <Alert tone="danger" className="mb-5"><AlertCircle className="mr-2 inline h-4 w-4" />{error}</Alert> : null}
+      {error && typeof error !== "string" ? <ErrorNotice className="mb-5" error={error} onAction={() => recover(error)} /> : null}
       {!canRun && capabilities ? (
         <Alert tone="warning" className="mb-5">
           Backtests are disabled. Start a separate local server with explicit <span className="mono">--allow-writes --enable-network</span> only when you intend to use historical data providers.
         </Alert>
       ) : null}
-      {mandates.error ? <div className="mb-5"><ErrorState message={mandates.error} /></div> : null}
+      {mandates.error ? <div className="mb-5"><ErrorState message={mandates.error} error={mandates.apiError} onRetry={mandates.refresh} /></div> : null}
       {mandates.data?.errors.length ? (
         <Alert tone="warning" className="mb-5">
           {mandates.data.errors.map((item) => `${item.name}: ${item.error}`).join(" · ")}
@@ -426,7 +448,14 @@ export function BacktestsPage() {
           </CardHeader>
           <CardContent>
             {currentOperation.loading ? <div className="h-28 animate-pulse rounded-lg border border-border bg-white/[0.025]" /> : null}
-            {currentOperation.error ? <Alert tone="danger">{currentOperation.error}</Alert> : null}
+            {staleOperation ? (
+              <Alert tone="warning">
+                <p>The remembered operation is no longer known to this server. Saved reports remain under Research.</p>
+                <Button className="mt-2" size="sm" variant="secondary" onClick={() => selectOperation(null)}>Forget operation</Button>
+              </Alert>
+            ) : currentOperation.apiError ? (
+              <ErrorNotice error={currentOperation.apiError} onAction={currentOperation.refresh} actionLabel="Inspect status" />
+            ) : null}
             {activeOperation ? (
               <div className="rounded-lg border border-border bg-black/10 p-4" aria-live="polite">
                 <div className="flex flex-wrap items-center justify-between gap-3">
@@ -484,7 +513,7 @@ export function BacktestsPage() {
         </CardHeader>
         <CardContent>
           {operations.loading ? <div className="h-24 animate-pulse rounded-lg border border-border bg-white/[0.025]" /> : null}
-          {operations.error ? <ErrorState message={operations.error} /> : null}
+          {operations.error ? <ErrorState message={operations.error} error={operations.apiError} onRetry={operations.refresh} /> : null}
           {operations.data ? (
             <DataTable
               columns={operationColumns}

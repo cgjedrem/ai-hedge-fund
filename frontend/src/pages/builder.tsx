@@ -2,7 +2,7 @@ import { AlertCircle, ArrowRight, Plus, Save, Trash2 } from "lucide-react";
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 
-import { PageHeader } from "@/components/page";
+import { ErrorNotice, ErrorState, PageHeader } from "@/components/page";
 import { Alert } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -17,6 +17,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { apiPost, apiPut } from "@/lib/api";
+import { toActionableError, type ActionableError } from "@/lib/errors";
 import { useDesk, useResource } from "@/lib/hooks";
 import type { AnalystOption, Catalog, StrategyModelOption, StrategyOption } from "@/lib/types";
 
@@ -45,7 +46,7 @@ interface SaveResult {
 }
 
 export function BuilderPage() {
-  const { capabilities } = useDesk();
+  const { capabilities, reconnect } = useDesk();
   const [searchParams] = useSearchParams();
   const catalogResource = useResource<Catalog>("/api/catalog");
   const editSource = searchParams.get("edit");
@@ -71,7 +72,7 @@ export function BuilderPage() {
   const [windowEnd, setWindowEnd] = useState("16:00");
   const [universeText, setUniverseText] = useState("");
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<string | ActionableError | null>(null);
   const [saved, setSaved] = useState<SaveResult | null>(null);
   const [deployed, setDeployed] = useState(false);
   const [deploymentMessage, setDeploymentMessage] = useState<string | null>(null);
@@ -111,7 +112,9 @@ export function BuilderPage() {
       return <div className="h-52 animate-pulse rounded-xl border border-border bg-white/[0.025]" />;
     }
     if (sourceResource.error || !sourceResource.data?.spec) {
-      return <Alert tone="danger">{sourceResource.error ?? "Mandate specification is unavailable."}</Alert>;
+      return sourceResource.error
+        ? <ErrorState message={sourceResource.error} error={sourceResource.apiError} onRetry={sourceResource.refresh} />
+        : <Alert tone="danger">Mandate specification is unavailable.</Alert>;
     }
     const protectedSource = capabilities?.protected_names.some(
       (entry) => entry.toLowerCase() === sourceName.toLowerCase(),
@@ -124,6 +127,7 @@ export function BuilderPage() {
         sourceHash={sourceResource.data.mandate_hash}
         sourceSpec={sourceResource.data.spec}
         canWrite={canWrite && !protectedSource}
+        onReloadSource={sourceResource.refresh}
       />
     );
   }
@@ -263,7 +267,7 @@ export function BuilderPage() {
       const result = await apiPost<SaveResult>("/api/mandates", { spec });
       setSaved(result);
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "Mandate could not be saved.");
+      setError(toActionableError(cause, "Mandate could not be saved."));
     } finally {
       setBusy(false);
     }
@@ -310,7 +314,10 @@ export function BuilderPage() {
       {catalogResource.loading ? <div className="mb-5 h-20 animate-pulse rounded-xl border border-border bg-white/[0.025]" /> : null}
       {catalogResource.error ? <Alert tone="danger" className="mb-5">{catalogResource.error}</Alert> : null}
       {!canWrite && capabilities ? <Alert tone="warning" className="mb-5">This server is read-only. Fields remain inspectable; saving and deployment are disabled.</Alert> : null}
-      {error ? <Alert tone="danger" className="mb-5"><AlertCircle className="mr-2 inline h-4 w-4" />{error}</Alert> : null}
+      {typeof error === "string" ? <Alert tone="danger" className="mb-5"><AlertCircle className="mr-2 inline h-4 w-4" />{error}</Alert> : null}
+      {error && typeof error !== "string" ? (
+        <ErrorNotice className="mb-5" error={error} onAction={error.action === "reconnect" ? () => void reconnect() : undefined} />
+      ) : null}
 
       <div className="grid items-start gap-5 xl:grid-cols-[minmax(0,1.45fr)_minmax(300px,0.75fr)]">
         <div className="space-y-5">
@@ -558,6 +565,7 @@ interface AdvancedMandateEditorProps {
   sourceName?: string;
   sourceHash?: string;
   sourceSpec?: Record<string, unknown>;
+  onReloadSource?: () => void;
 }
 
 function AdvancedMandateEditor({
@@ -566,7 +574,9 @@ function AdvancedMandateEditor({
   sourceName,
   sourceHash,
   sourceSpec,
+  onReloadSource,
 }: AdvancedMandateEditorProps) {
+  const { reconnect } = useDesk();
   const initialSpec = sourceSpec
     ? {
         ...sourceSpec,
@@ -593,7 +603,7 @@ function AdvancedMandateEditor({
       };
   const [json, setJson] = useState(() => JSON.stringify(initialSpec, null, 2));
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<string | ActionableError | null>(null);
   const [saved, setSaved] = useState<SaveResult | null>(null);
 
   async function save(): Promise<void> {
@@ -634,7 +644,7 @@ function AdvancedMandateEditor({
       }
       setSaved(result);
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "Mandate could not be saved.");
+      setError(toActionableError(cause, "Mandate could not be saved."));
     } finally {
       setBusy(false);
     }
@@ -664,7 +674,21 @@ function AdvancedMandateEditor({
         }
       />
       {!canWrite ? <Alert tone="warning" className="mb-5">Saving is disabled because write capability or mandate access is unavailable.</Alert> : null}
-      {error ? <Alert tone="danger" className="mb-5">{error}</Alert> : null}
+      {typeof error === "string" ? <Alert tone="danger" className="mb-5">{error}</Alert> : null}
+      {error && typeof error !== "string" ? (
+        <ErrorNotice
+          className="mb-5"
+          error={error}
+          actionLabel={error.action === "review-again" ? "Load latest revision" : undefined}
+          onAction={
+            error.action === "reconnect"
+              ? () => void reconnect()
+              : error.action === "review-again" && onReloadSource
+                ? onReloadSource
+                : undefined
+          }
+        />
+      ) : null}
       {saved ? (
         <Alert tone="neutral" className="mb-5">
           Saved revision <span className="mono">{saved.mandate_hash}</span>. Deployments remain separate.

@@ -1,9 +1,11 @@
 import { useEffect, useRef, useState } from "react";
 
+import { ErrorNotice } from "@/components/page";
 import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { apiPost } from "@/lib/api";
+import { toActionableError, type ActionableError } from "@/lib/errors";
 import { useDesk } from "@/lib/hooks";
 
 export type ArchiveKind = "template" | "deployment" | "research";
@@ -33,12 +35,12 @@ export function LifecycleActions({
   recovery?: boolean;
   onComplete: () => void;
 }) {
-  const { capabilities } = useDesk();
+  const { capabilities, reconnect } = useDesk();
   const action = recovery ? "recover" : archiveId ? "restore" : "archive";
   const request: LifecycleRequest = archiveId ? { action: recovery ? "recover" : "restore", archive_id: archiveId } : { action: "archive", kind, identity };
   const [preview, setPreview] = useState<LifecyclePreview | null>(null);
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<ActionableError | null>(null);
   const [expired, setExpired] = useState(false);
   const requestVersion = useRef(0);
   const canWrite = capabilities?.writes === true
@@ -76,7 +78,7 @@ export function LifecycleActions({
       setExpired(false);
       setPreview(result);
     } catch (cause) {
-      if (version === requestVersion.current) setError(cause instanceof Error ? cause.message : "Lifecycle review failed.");
+      if (version === requestVersion.current) setError(toActionableError(cause, "Lifecycle review failed."));
     } finally {
       if (version === requestVersion.current) setBusy(false);
     }
@@ -98,16 +100,39 @@ export function LifecycleActions({
       });
       if (version !== requestVersion.current) return;
       if (result.status !== "completed") {
-        throw new Error("Lifecycle operation is not completed. Inspect archive recovery and operation status before taking further action.");
+        setPreview(null);
+        setError({
+          message: "Lifecycle operation is not completed.",
+          guidance: "Inspect archive recovery and operation status before taking further action.",
+          action: "inspect-status",
+          retryPolicy: "inspect-status",
+          code: null,
+          reference: null,
+          offline: false,
+        });
+        onComplete();
+        return;
       }
       setPreview(null);
       onComplete();
     } catch (cause) {
       if (version !== requestVersion.current) return;
       setPreview(null);
-      setError(cause instanceof Error ? cause.message : "Lifecycle outcome is uncertain. Inspect recovery before reviewing again.");
+      setError(toActionableError(cause, "Lifecycle outcome is uncertain. Inspect recovery before reviewing again."));
     } finally {
       if (version === requestVersion.current) setBusy(false);
+    }
+  }
+
+  function recover(current: ActionableError) {
+    // Recovery never resubmits the rejected confirmation: it either re-reviews or refreshes durable status.
+    if (current.action === "inspect-status") {
+      setError(null);
+      onComplete();
+    } else if (current.action === "reconnect") {
+      void reconnect();
+    } else if (current.action === "review-again" || current.action === "retry") {
+      void review();
     }
   }
 
@@ -116,7 +141,7 @@ export function LifecycleActions({
       <Button variant="outline" disabled={!canWrite || busy} onClick={() => void review()}>
         {busy ? "Working..." : `Review ${action}`}
       </Button>
-      {error ? <Alert tone="danger">{error}</Alert> : null}
+      {error ? <ErrorNotice error={error} onAction={canWrite ? () => recover(error) : undefined} /> : null}
       <Dialog open={preview !== null} onOpenChange={(open) => { if (!open && !busy) setPreview(null); }}>
         <DialogContent>
           <DialogHeader>
@@ -131,7 +156,12 @@ export function LifecycleActions({
               <p className="break-all">Reviewed identity / revision: <span className="mono">{preview.expected_head}</span></p>
               <p>Expires: {preview.expires_at}</p>
               <pre className="max-h-64 overflow-auto whitespace-pre-wrap break-all rounded-lg border border-border bg-black/10 p-3">{JSON.stringify(preview.payload, null, 2)}</pre>
-              {expired ? <Alert tone="warning">Review expired. Close this dialog and request a fresh review.</Alert> : null}
+              {expired ? (
+                <Alert tone="warning" className="flex flex-wrap items-center justify-between gap-2">
+                  <span>Review expired. Nothing was submitted; request a fresh review.</span>
+                  <Button size="sm" variant="secondary" disabled={busy} onClick={() => void review()}>Review again</Button>
+                </Alert>
+              ) : null}
             </div>
           ) : null}
           <DialogFooter>

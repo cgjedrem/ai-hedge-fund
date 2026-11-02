@@ -1614,3 +1614,188 @@ describe("local desk screens", () => {
     expect(window.localStorage.getItem("aihf.paper.demo-quality.operation")).toBe(operationId);
   });
 });
+
+describe("error recovery and reconnect", () => {
+  const writeCaps: Capabilities = {
+    ...capabilities,
+    mode: "live",
+    writes: true,
+    read_only: false,
+    mutation_token: "launch-token-for-test",
+  };
+
+  afterEach(() => {
+    window.localStorage.clear();
+  });
+
+  it("offers Review again for a stale verdict and refreshes without resubmitting", async () => {
+    installApi({
+      caps: writeCaps,
+      override: (path, method) =>
+        path === "/api/paper/demo-quality/approval" && method === "POST"
+          ? {
+              status: 409,
+              payload: {
+                detail: "Pending decision changed; reload before submitting a verdict.",
+                code: "stale-preview",
+                message: "Pending decision changed; reload before submitting a verdict.",
+                refresh_required: true,
+                retry_policy: "review-again",
+                subject_id: "demo-quality",
+                request_id: null,
+                current_head: "c".repeat(64),
+              },
+            }
+          : null,
+    });
+    window.history.replaceState({}, "", "/paper/demo-quality");
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findByRole("heading", { name: "demo-quality" });
+    await user.click(screen.getByRole("button", { name: "Approve" }));
+    const dialog = await screen.findByRole("dialog", { name: "Approve pending decision" });
+    await user.click(within(dialog).getByRole("button", { name: "Approve displayed decision" }));
+
+    const notice = await screen.findByText("Pending decision changed; reload before submitting a verdict.");
+    const alert = notice.closest("[role=alert]") as HTMLElement;
+    expect(alert).toHaveTextContent(/Nothing was submitted/);
+    expect(alert).toHaveTextContent("Ref demo-quality");
+    const detailReads = () => fetchRequests.filter((item) => item.path === "/api/paper/demo-quality" && item.method === "GET").length;
+    const readsBefore = detailReads();
+    await user.click(within(alert).getByRole("button", { name: "Review again" }));
+
+    await waitFor(() => expect(detailReads()).toBeGreaterThan(readsBefore));
+    expect(screen.queryByRole("dialog", { name: "Approve pending decision" })).not.toBeInTheDocument();
+    expect(fetchRequests.filter((item) => item.path === "/api/paper/demo-quality/approval")).toHaveLength(1);
+  });
+
+  it("renews an expired operator session with a read-only reload and never resubmits the mutation", async () => {
+    let renewed = false;
+    installApi({
+      caps: writeCaps,
+      override: (path, method) => {
+        if (path === "/api/capabilities" && fetchRequests.some((item) => item.path === "/api/paper/demo-quality/halt")) {
+          renewed = true;
+          return { payload: { ...writeCaps, mutation_token: "renewed-token-for-test" } };
+        }
+        return path === "/api/paper/demo-quality/halt" && method === "POST"
+          ? {
+              status: 403,
+              payload: {
+                detail: "A valid server-owned operator session is required.",
+                code: "capability-denied",
+                message: "A valid server-owned operator session is required.",
+                refresh_required: true,
+                retry_policy: "reload",
+                subject_id: null,
+                request_id: null,
+                current_head: null,
+              },
+            }
+          : null;
+      },
+    });
+    window.history.replaceState({}, "", "/paper/demo-quality");
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findByRole("heading", { name: "demo-quality" });
+    await user.click(screen.getByRole("button", { name: "Halt" }));
+    const dialog = await screen.findByRole("dialog");
+    await user.type(within(dialog).getByRole("textbox"), "synthetic stop");
+    await user.click(within(dialog).getByRole("button", { name: "Record halt" }));
+
+    expect(await screen.findByText(/Operator session was renewed\. The rejected request was not submitted/)).toBeInTheDocument();
+    await waitFor(() => expect(renewed).toBe(true));
+    expect(fetchRequests.filter((item) => item.path === "/api/paper/demo-quality/halt")).toHaveLength(1);
+    expect(fetchRequests.filter((item) => item.path === "/api/capabilities").every((item) => item.method === "GET")).toBe(true);
+    await user.click(screen.getByRole("button", { name: "Dismiss" }));
+    expect(screen.queryByText(/Operator session was renewed/)).not.toBeInTheDocument();
+  });
+
+  it("shows a lost connection banner and reloads views after an explicit reconnect", async () => {
+    installApi();
+    const working = globalThis.fetch;
+    let offline = false;
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (offline) throw new TypeError("Failed to fetch");
+      return working(input, init);
+    }));
+    window.history.replaceState({}, "", "/paper");
+    const user = userEvent.setup();
+    offline = true;
+    render(<App />);
+
+    const banner = await screen.findByText(/Connection to the local desk was lost/);
+    expect((await screen.findAllByText("The local desk server is unreachable.")).length).toBeGreaterThan(0);
+    offline = false;
+    await user.click(within(banner.closest("[role=alert]") as HTMLElement).getByRole("button", { name: "Reconnect" }));
+
+    await waitFor(() => expect(screen.queryByText(/Connection to the local desk was lost/)).not.toBeInTheDocument());
+    expect(await screen.findByRole("link", { name: "demo-quality" })).toBeInTheDocument();
+    expect(fetchRequests.every((item) => item.method === "GET")).toBe(true);
+  });
+
+  it("lets the operator forget a remembered paper operation the server no longer knows", async () => {
+    const staleId = "f".repeat(32);
+    window.localStorage.setItem("aihf.paper.demo-quality.operation", staleId);
+    installApi({
+      caps: writeCaps,
+      override: (path) =>
+        path === `/api/operations/${staleId}`
+          ? {
+              status: 404,
+              payload: {
+                detail: "Operation not found.",
+                code: "not-found",
+                message: "Operation not found.",
+                refresh_required: false,
+                retry_policy: "none",
+                subject_id: staleId,
+                request_id: null,
+                current_head: null,
+              },
+            }
+          : null,
+    });
+    window.history.replaceState({}, "", "/paper/demo-quality");
+    const user = userEvent.setup();
+    render(<App />);
+
+    expect(await screen.findByText(/is no longer known to this server/)).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Forget operation" }));
+    expect(window.localStorage.getItem("aihf.paper.demo-quality.operation")).toBeNull();
+    expect(screen.queryByText(/is no longer known to this server/)).not.toBeInTheDocument();
+    expect(fetchRequests.every((item) => item.method === "GET")).toBe(true);
+  });
+
+  it("keeps a remembered operation when status storage is unavailable instead of offering to forget it", async () => {
+    const operationId = "e".repeat(32);
+    window.localStorage.setItem("aihf.paper.demo-quality.operation", operationId);
+    installApi({
+      caps: writeCaps,
+      override: (path) =>
+        path === `/api/operations/${operationId}`
+          ? {
+              status: 503,
+              payload: {
+                detail: "Operation status storage is unavailable; the operation outcome is unknown. Retry the read.",
+                code: "observation-conflict",
+                message: "Operation status storage is unavailable; the operation outcome is unknown. Retry the read.",
+                refresh_required: false,
+                retry_policy: "retry-read-only",
+                subject_id: operationId,
+                request_id: null,
+                current_head: null,
+              },
+            }
+          : null,
+    });
+    window.history.replaceState({}, "", "/paper/demo-quality");
+    render(<App />);
+
+    expect(await screen.findByText(/operation outcome is unknown/)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Forget operation" })).not.toBeInTheDocument();
+    expect(window.localStorage.getItem("aihf.paper.demo-quality.operation")).toBe(operationId);
+    expect(fetchRequests.every((item) => item.method === "GET")).toBe(true);
+  });
+});

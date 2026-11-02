@@ -582,3 +582,34 @@ def test_unprepared_deployment_archive_recovery_preserves_legitimate_new_session
         assert _accept(service, fresh, "archive-current-head")[0]["status"] == "completed"
     finally:
         service.close()
+
+
+def test_busy_status_read_after_durable_archive_is_not_reported_as_nothing_accepted(demo_root, monkeypatch):
+    from hedge_fund.runtime.operations import OperationBusy, OperationStore
+
+    service = DeskService(demo_root, allow_writes=True, demo=True)
+    try:
+        preview = service.create_lifecycle_preview(
+            LifecyclePreviewRequest(action="archive", kind="template", identity="demo-quality"),
+            operator_session="operator-test",
+        )
+
+        def busy(*_args, **_kwargs):
+            raise OperationBusy("synthetic registry read timeout")
+
+        monkeypatch.setattr(OperationStore, "get_operation", busy)
+        accepted, request = _accept(service, preview, "archive-busy-read")
+        assert accepted["request_id"] == "archive-busy-read"
+        assert not (demo_root / "mandates" / "demo-quality.yaml").exists()
+
+        monkeypatch.setattr(OperationStore, "accept_request", busy)
+        with pytest.raises(ServiceError) as replay:
+            service.accept_lifecycle(request, operator_session="operator-test")
+        assert replay.value.status_code == 409
+        assert replay.value.code == "writer-conflict"
+        assert replay.value.retry_policy is None
+        assert "nothing was accepted" not in replay.value.detail
+        monkeypatch.undo()
+        assert service.get_operation(accepted["id"])["status"] == "completed"
+    finally:
+        service.close()

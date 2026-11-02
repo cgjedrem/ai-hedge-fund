@@ -173,11 +173,12 @@ def create_app(
             elif method not in _SAFE_METHODS and mutation_allowed and not _is_loopback_peer(request.client.host if request.client else None):
                 response = _error_response(403, "Writable server requires a loopback client connection.")
             elif method not in _SAFE_METHODS and mutation_allowed and operator_session is None:
-                response = _error_response(403, "A valid server-owned operator session is required.")
+                # A server restart rotates the signing key; the browser can renew read-only and resubmit only by review.
+                response = _renewable_denial("A valid server-owned operator session is required.")
             elif method not in _SAFE_METHODS and origin is None:
                 response = _error_response(403, "Mutation requires a same-origin request.")
             elif method not in _SAFE_METHODS and not _valid_token(request.headers.get("x-csrf-token"), token):
-                response = _error_response(403, "Mutation token is missing or invalid.")
+                response = _renewable_denial("Mutation token is missing or invalid.")
             else:
                 response = await call_next(request)
         if operator_session is None and (service.allow_writes or service.emergency_halt_available) and _is_loopback_peer(request.client.host if request.client else None) and parsed_host is not None:
@@ -199,8 +200,16 @@ def create_app(
         return response
 
     @app.exception_handler(ServiceError)
-    async def service_error_handler(_request: Request, exc: ServiceError):
-        return _error_response(exc.status_code, exc.detail, code=exc.code)
+    async def service_error_handler(request: Request, exc: ServiceError):
+        return _error_response(
+            exc.status_code,
+            exc.detail,
+            code=exc.code,
+            subject_id=exc.subject_id if exc.subject_id is not None else _path_subject(request),
+            request_id=exc.request_id,
+            current_head=exc.current_head,
+            retry_policy=exc.retry_policy,
+        )
 
     @app.exception_handler(StarletteHTTPException)
     async def http_error_handler(_request: Request, exc: StarletteHTTPException):
@@ -211,9 +220,9 @@ def create_app(
         return response
 
     @app.exception_handler(RequestValidationError)
-    async def request_validation_handler(_request: Request, exc: RequestValidationError):
+    async def request_validation_handler(request: Request, exc: RequestValidationError):
         details = [{"loc": [_safe_loc_part(part) for part in error.get("loc", ())], "type": _safe_loc_part(error.get("type", "value_error")), "message": "Invalid request."} for error in exc.errors()]
-        return _error_response(422, details, code="invalid-request")
+        return _error_response(400, details, code="invalid-request", subject_id=_path_subject(request))
 
     @app.exception_handler(Exception)
     async def safe_unhandled_handler(request: Request, _exc: Exception):
@@ -251,9 +260,10 @@ def create_app(
 
     @app.post("/api/lifecycle/accept", status_code=202)
     def lifecycle_accept(body: LifecycleAcceptRequest, request: Request):
-        return service.accept_lifecycle(
-            body,
-            operator_session=request.state.operator_session,
+        return _with_request_identity(
+            lambda: service.accept_lifecycle(body, operator_session=request.state.operator_session),
+            request_id=body.request_id,
+            subject_id=body.archive_id or body.identity,
         )
 
     @app.get("/api/mandates")
@@ -306,10 +316,10 @@ def create_app(
 
     @app.post("/api/paper/{name}/tick", status_code=202)
     def paper_tick(name: str, request: PaperTickAcceptRequest, http_request: Request):
-        return service.accept_manual_tick(
-            name,
-            request,
-            operator_session=http_request.state.operator_session,
+        return _with_request_identity(
+            lambda: service.accept_manual_tick(name, request, operator_session=http_request.state.operator_session),
+            request_id=request.request_id,
+            subject_id=name,
         )
 
     @app.post("/api/paper/{name}/runner/preview", status_code=201)
@@ -322,10 +332,10 @@ def create_app(
 
     @app.post("/api/paper/{name}/runner", status_code=202)
     def runner_start(name: str, request: RunnerStartAcceptRequest, http_request: Request):
-        return service.accept_runner_start(
-            name,
-            request,
-            operator_session=http_request.state.operator_session,
+        return _with_request_identity(
+            lambda: service.accept_runner_start(name, request, operator_session=http_request.state.operator_session),
+            request_id=request.request_id,
+            subject_id=name,
         )
 
     @app.get("/api/paper/{name}/runner")
@@ -394,9 +404,10 @@ def create_app(
 
     @app.post("/api/operations", status_code=202)
     def accept_operation(request: OperationAcceptRequest, http_request: Request):
-        return service.accept_operation(
-            request,
-            operator_session=http_request.state.operator_session,
+        return _with_request_identity(
+            lambda: service.accept_operation(request, operator_session=http_request.state.operator_session),
+            request_id=request.request_id,
+            subject_id=request.subject_id,
         )
 
     @app.get("/api/operations")
@@ -409,7 +420,11 @@ def create_app(
 
     @app.post("/api/operations/{operation_id}/cancel")
     def cancel_operation(operation_id: str, request: OperationCancelRequest):
-        return service.cancel_operation(operation_id, request)
+        return _with_request_identity(
+            lambda: service.cancel_operation(operation_id, request),
+            request_id=request.request_id,
+            subject_id=operation_id,
+        )
 
     @app.get("/api/settings")
     def settings():
@@ -538,8 +553,32 @@ def _safe_loc_part(part):
     return "<redacted>"
 
 
-def _error_response(status_code: int, detail, *, code: str | None = None) -> JSONResponse:
-    return JSONResponse(error_payload(status_code, detail, code=code), status_code=status_code)
+def _error_response(status_code: int, detail, *, code: str | None = None, **identity) -> JSONResponse:
+    return JSONResponse(error_payload(status_code, detail, code=code, **identity), status_code=status_code)
+
+
+def _renewable_denial(detail: str) -> JSONResponse:
+    """Session/token denial after restart or expiry: renew via read-only capabilities, never auto-resubmit."""
+    return _error_response(403, detail, refresh_required=True, retry_policy="reload")
+
+
+_SUBJECT_PATH_PARAMS = ("operation_id", "archive_id", "report_id", "name")
+
+
+def _path_subject(request: Request) -> str | None:
+    params = request.path_params or {}
+    for key in _SUBJECT_PATH_PARAMS:
+        value = params.get(key)
+        if value is not None:
+            return value
+    return None
+
+
+def _with_request_identity(call, *, request_id: str, subject_id: str | None = None):
+    try:
+        return call()
+    except ServiceError as exc:
+        raise exc.attach(subject_id=subject_id, request_id=request_id)
 
 
 def _security_headers(response: Response, path: str) -> None:
