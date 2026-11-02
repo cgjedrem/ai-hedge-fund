@@ -178,6 +178,7 @@ class FrozenCapture:
         if current_settings_version is not None and (type(current_settings_version) is not int or current_settings_version < 0):
             raise ConfigurationError("current settings version is invalid")
         restart_needed = None if current_settings_version is None else current_settings_version != self.settings_version
+        endpoint_redacted = self.provenance.get("endpoint") in {"environment", "launch"}
         return {
             "capture_id": self.capture_id,
             "digest": self.digest,
@@ -188,7 +189,8 @@ class FrozenCapture:
             "data_provider": self.data_provider,
             "llm_provider": self.llm_provider,
             "model": self.model,
-            "endpoint": self.endpoint,
+            "endpoint": None if endpoint_redacted else self.endpoint,
+            "endpoint_redacted": endpoint_redacted,
             "timeout_seconds": self.timeout_seconds,
             "parameters": dict(self.parameters),
             "provenance": dict(self.provenance),

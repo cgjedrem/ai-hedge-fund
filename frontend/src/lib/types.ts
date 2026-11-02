@@ -568,5 +568,58 @@ export interface Settings {
     restart_needed: boolean | null;
   }[];
   active_captures_available: boolean;
+  configuration?: ConfigurationProvenance;
+  endpoint_redacted?: boolean;
   network_enabled: boolean;
+}
+
+export type SettingsSource = "default" | "persisted" | "environment" | "launch";
+
+export interface ConfigurationField {
+  field: string;
+  source: SettingsSource;
+  override: string | null;
+  stored_source: SettingsSource | null;
+  stored: unknown;
+  effective: unknown;
+  redacted: boolean;
+  diverges: boolean;
+  shadowed: boolean;
+}
+
+export type RestartReason = "stored-version-changed" | "override-shadows-stored";
+
+export interface ConfigurationProvenance {
+  stored: { available: boolean; version: number | null; present: boolean };
+  effective: { version: number; startup_version: number };
+  fields: ConfigurationField[];
+  overrides: { field: string; source: SettingsSource; variable: string }[];
+  restart_required: boolean;
+  restart_reasons: RestartReason[];
+  stored_values: {
+    data_provider: string;
+    llm_provider: string;
+    model: string;
+    endpoint: string | null;
+    timeout_seconds: number;
+    parameters: Record<string, number>;
+  } | null;
+  active: { available: boolean; count: number; stale_count: number };
+  credential_captures: {
+    capture_id: string;
+    subject_id: string;
+    status: string;
+    provider: string;
+    captured_version: number;
+    current_version: number | null;
+    configured: boolean | null;
+    captured_version_retained: boolean | null;
+    state: "current" | "superseded" | "deleted-after-capture" | "not-captured" | "unavailable";
+  }[];
+  policy: {
+    hot_reload: boolean;
+    environment_read_at: string;
+    process_environment_credentials_used: boolean;
+    restart_action: string;
+  };
 }

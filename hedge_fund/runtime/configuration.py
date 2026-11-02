@@ -153,6 +153,102 @@ def environment_settings(
     return values
 
 
+def endpoint_scope(endpoint: str | None) -> str | None:
+    """Classify an endpoint without exposing its origin."""
+    if endpoint is None:
+        return None
+    try:
+        hostname = urlsplit(endpoint).hostname
+    except ValueError:
+        return "remote"
+    if hostname is None:
+        return "remote"
+    if hostname.casefold() == "localhost":
+        return "loopback"
+    try:
+        return "loopback" if ip_address(hostname).is_loopback else "remote"
+    except ValueError:
+        return "remote"
+
+
+def _safe_field_value(name: str, value: object) -> object:
+    if name == "endpoint":
+        return endpoint_scope(value)  # type: ignore[arg-type]
+    if name == "parameters":
+        return dict(value)  # type: ignore[call-overload]
+    return value
+
+
+def describe_configuration(
+    *,
+    stored: RuntimeSettings | None,
+    effective: RuntimeSettings,
+    startup_version: int,
+) -> dict[str, object]:
+    """Describe stored/effective provenance without secrets, origins or paths.
+
+    ``stored`` is the root's persisted record read now; ``effective`` is what
+    this process resolved and captures for new operations. Overrides are named
+    by their allowlisted variable only; their values are never echoed beyond
+    allowlisted catalog values, and endpoints are reduced to a scope label.
+    """
+    if not isinstance(effective, RuntimeSettings):
+        raise ConfigurationError("effective settings are required")
+    if stored is not None and not isinstance(stored, RuntimeSettings):
+        raise ConfigurationError("stored settings are invalid")
+    if type(startup_version) is not int or startup_version < 0:
+        raise ConfigurationError("startup settings version is invalid")
+    variables = {name: variable for variable, name in _ENVIRONMENT_FIELDS.items()}
+    fields: list[dict[str, object]] = []
+    overrides: list[dict[str, object]] = []
+    shadowed = False
+    for name in _SETTING_FIELDS:
+        source = effective.provenance[name]
+        override = None
+        if source == "environment":
+            override = variables.get(name)
+        elif source == "launch":
+            override = "launch-argument"
+        effective_value = getattr(effective, name)
+        stored_value = getattr(stored, name) if stored is not None else None
+        stored_source = stored.provenance[name] if stored is not None else None
+        diverges = stored is not None and stored_value != effective_value
+        is_shadowed = override is not None and stored_source == "persisted" and diverges
+        shadowed = shadowed or is_shadowed
+        if override is not None:
+            overrides.append({"field": name, "source": source, "variable": override})
+        fields.append(
+            {
+                "field": name,
+                "source": source,
+                "override": override,
+                "stored_source": stored_source,
+                "stored": _safe_field_value(name, stored_value) if stored is not None else None,
+                "effective": _safe_field_value(name, effective_value),
+                "redacted": name == "endpoint",
+                "diverges": diverges,
+                "shadowed": is_shadowed,
+            }
+        )
+    reasons: list[str] = []
+    if stored is not None and stored.version != effective.version:
+        reasons.append("stored-version-changed")
+    if shadowed:
+        reasons.append("override-shadows-stored")
+    return {
+        "stored": {
+            "available": stored is not None,
+            "version": stored.version if stored is not None else None,
+            "present": stored is not None and stored.version > 0,
+        },
+        "effective": {"version": effective.version, "startup_version": startup_version},
+        "fields": fields,
+        "overrides": overrides,
+        "restart_required": bool(reasons),
+        "restart_reasons": reasons,
+    }
+
+
 def resolve_settings(
     root: RootContext,
     *,

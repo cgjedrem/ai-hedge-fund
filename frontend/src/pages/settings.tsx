@@ -1,6 +1,7 @@
 import { AlertCircle, CheckCircle2, KeyRound, LockKeyhole, RadioTower, Settings2 } from "lucide-react";
 import { useEffect, useState } from "react";
 
+import { ConfigurationProvenancePanel } from "@/components/configuration-provenance";
 import { MetricCard } from "@/components/metric-card";
 import { ErrorNotice, ErrorState, PageHeader, SectionTitle } from "@/components/page";
 import { Alert } from "@/components/ui/alert";
@@ -45,18 +46,33 @@ export function SettingsPage() {
   const canWrite = capabilities?.writes === true;
   const credentialProviders = settings?.providers.filter((item) => item.requires_key) ?? [];
   const selectedCredentialProvider = credentialProviders.find((item) => item.provider === provider);
+  const configuration = settings?.configuration;
+  // The form edits the stored record; overrides and captured work are shown separately.
+  const baseline = settings
+    ? configuration
+      ? configuration.stored_values
+      : {
+          data_provider: settings.data_provider,
+          model: settings.model,
+          endpoint: settings.endpoint,
+          timeout_seconds: settings.timeout_seconds,
+          parameters: settings.parameters,
+        }
+    : null;
+  const storedAhead = configuration?.restart_reasons.includes("stored-version-changed") === true;
+  const hasOverrides = (configuration?.overrides.length ?? 0) > 0;
 
   useEffect(() => {
-    if (!settings || selectedModel) return;
-    setSelectedModel(settings.model);
-    setDataProvider(settings.data_provider);
-    setEndpoint(settings.endpoint ?? "");
-    setTimeoutSeconds(String(settings.timeout_seconds));
-    setMaxTokens(settings.parameters.max_tokens?.toString() ?? "");
-    setContextSize(settings.parameters.context_size?.toString() ?? "");
-    setTemperature(settings.parameters.temperature?.toString() ?? "");
-    setTopP(settings.parameters.top_p?.toString() ?? "");
-  }, [selectedModel, settings]);
+    if (!baseline || selectedModel) return;
+    setSelectedModel(baseline.model);
+    setDataProvider(baseline.data_provider);
+    setEndpoint(baseline.endpoint ?? "");
+    setTimeoutSeconds(String(baseline.timeout_seconds));
+    setMaxTokens(baseline.parameters.max_tokens?.toString() ?? "");
+    setContextSize(baseline.parameters.context_size?.toString() ?? "");
+    setTemperature(baseline.parameters.temperature?.toString() ?? "");
+    setTopP(baseline.parameters.top_p?.toString() ?? "");
+  }, [baseline, selectedModel]);
 
   useEffect(() => {
     if (credentialProviders.length && !provider) setProvider(credentialProviders[0].provider);
@@ -91,17 +107,18 @@ export function SettingsPage() {
     (!supportsLocalContext ||
       topPValue === undefined ||
       (Number.isFinite(topPValue) && topPValue >= 0 && topPValue <= 1));
-  const runtimeSettingsChanged = settings
-    ? selectedModel !== settings.model ||
-      dataProvider !== settings.data_provider ||
-      endpointValue !== settings.endpoint ||
-      timeoutValue !== settings.timeout_seconds ||
-      Object.keys(parameters).length !== Object.keys(settings.parameters).length ||
-      Object.entries(parameters).some(([name, value]) => settings.parameters[name] !== value)
+  const runtimeSettingsChanged = baseline
+    ? selectedModel !== baseline.model ||
+      dataProvider !== baseline.data_provider ||
+      endpointValue !== baseline.endpoint ||
+      timeoutValue !== baseline.timeout_seconds ||
+      Object.keys(parameters).length !== Object.keys(baseline.parameters).length ||
+      Object.entries(parameters).some(([name, value]) => baseline.parameters[name] !== value)
     : false;
+  const saveBlockedByRestart = Boolean(settings) && (storedAhead || !baseline);
 
   async function saveRuntimeSettings(): Promise<void> {
-    if (!selectedModel || !dataProvider || !canWrite || !settings || !runtimeSettingsValid) return;
+    if (!selectedModel || !dataProvider || !canWrite || !settings || !runtimeSettingsValid || saveBlockedByRestart) return;
     setSavingSettings(true);
     setFeedback(null);
     try {
@@ -113,7 +130,12 @@ export function SettingsPage() {
         parameters,
         expected_version: settings.version,
       });
-      setFeedback({ tone: "neutral", message: "Runtime settings are saved in this root. New operations capture this version; active captures and the shared .env file are unchanged." });
+      setFeedback({
+        tone: "neutral",
+        message: hasOverrides
+          ? "Runtime settings are saved in this root. New operations capture this version; active captures and the shared .env file are unchanged. Fields shadowed by a process environment override keep the override until restart without it."
+          : "Runtime settings are saved in this root. New operations capture this version; active captures and the shared .env file are unchanged.",
+      });
       resource.refresh();
     } catch (cause) {
       fail(cause, "Runtime settings could not be saved.");
@@ -151,7 +173,10 @@ export function SettingsPage() {
       await apiDelete(
         `/api/settings/credentials/${encodeURIComponent(provider)}?expected_version=${selectedCredentialProvider.version}`,
       );
-      setFeedback({ tone: "neutral", message: `Credential removed for ${provider}. Existing captures retain their prior version.` });
+      setFeedback({
+        tone: "neutral",
+        message: `Credential removed for ${provider}. New and not-yet-dispatched work cannot use it; running work keeps the version it already captured and is not stopped by this page.`,
+      });
       resource.refresh();
     } catch (cause) {
       fail(cause, "Credential could not be deleted.");
@@ -238,7 +263,12 @@ export function SettingsPage() {
                     placeholder="Optional · local HTTP or HTTPS"
                     disabled={!canWrite || savingSettings}
                   />
-                  <p className="text-[10px] text-muted-foreground">Source: {settings.provenance.endpoint} · credentials must not appear in the URL.</p>
+                  <p className="text-[10px] text-muted-foreground">
+                    {settings.endpoint_redacted
+                      ? `Effective endpoint comes from ${settings.provenance.endpoint === "launch" ? "a launch-argument" : "a process-environment"} override and is hidden; this field edits the saved value only.`
+                      : `Source: ${settings.provenance.endpoint}`}{" "}
+                    · credentials must not appear in the URL.
+                  </p>
                 </div>
                 <div className="grid gap-3 sm:grid-cols-2">
                   <div className="space-y-2">
@@ -319,10 +349,15 @@ export function SettingsPage() {
                   className="w-full"
                   variant="secondary"
                   onClick={() => void saveRuntimeSettings()}
-                  disabled={!canWrite || savingSettings || !selectedModel || !dataProvider || !runtimeSettingsChanged || !runtimeSettingsValid}
+                  disabled={!canWrite || savingSettings || saveBlockedByRestart || !selectedModel || !dataProvider || !runtimeSettingsChanged || !runtimeSettingsValid}
                 >
                   {savingSettings ? "Saving…" : "Save runtime settings for this root"}
                 </Button>
+                {saveBlockedByRestart ? (
+                  <p className="text-[10px] leading-relaxed text-warning">
+                    Saved settings changed outside this server or are unavailable. Saving is blocked to avoid overwriting them; restart the server manually to load the saved version.
+                  </p>
+                ) : null}
                 <p className="text-[10px] leading-relaxed text-muted-foreground">
                   Save makes no provider call and does not edit the shared <span className="mono">.env</span>. New operations capture these values; active captures remain unchanged.
                 </p>
@@ -401,6 +436,7 @@ export function SettingsPage() {
               </CardContent>
             </Card>
           </div>
+          {configuration ? <ConfigurationProvenancePanel configuration={configuration} /> : null}
           {!settings.active_captures_available ? (
             <Alert tone="warning" className="mt-5">Active capture status is unavailable. Runtime edits do not authorize hot-swapping running work.</Alert>
           ) : settings.active_captures.length ? (

@@ -136,6 +136,14 @@ class CredentialStore:
         except AdmissionError as exc:
             raise CredentialStoreError("credential writer admission is unavailable") from exc
 
+    def retains_version(self, provider: str, version: int) -> bool:
+        """Report whether an immutable captured version is still readable."""
+        provider_id = _provider_id(provider)
+        if type(version) is not int or not 1 <= version <= _MAX_CREDENTIAL_VERSION:
+            raise CredentialStoreError("credential version is invalid")
+        with self._snapshot():
+            return self._exists(_credential_path(provider_id, version))
+
     def read_version(self, provider: str, version: int) -> str | None:
         provider_id = _provider_id(provider)
         if type(version) is not int or not 0 <= version <= _MAX_CREDENTIAL_VERSION:

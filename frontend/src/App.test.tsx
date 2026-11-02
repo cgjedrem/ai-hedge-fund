@@ -1503,6 +1503,100 @@ describe("local desk screens", () => {
     expect(await screen.findByText(/Runtime settings are saved in this root/)).toBeInTheDocument();
   });
 
+  it("edits the stored record instead of persisting environment overrides", async () => {
+    const writeCaps: Capabilities = {
+      ...capabilities,
+      mode: "live",
+      writes: true,
+      read_only: false,
+      mutation_token: "runtime-settings-token",
+    };
+    const overridden: Settings = {
+      ...settings,
+      model: "provider/override",
+      endpoint: null,
+      endpoint_redacted: true,
+      provenance: { ...settings.provenance, model: "environment", endpoint: "environment" },
+      configuration: {
+        stored: { available: true, version: 3, present: true },
+        effective: { version: 3, startup_version: 3 },
+        fields: [],
+        overrides: [
+          { field: "model", source: "environment", variable: "AIHF_MODEL" },
+          { field: "endpoint", source: "environment", variable: "AIHF_ENDPOINT" },
+        ],
+        restart_required: true,
+        restart_reasons: ["override-shadows-stored"],
+        stored_values: {
+          data_provider: "yfinance",
+          llm_provider: "Ollama",
+          model: "provider/model",
+          endpoint: "http://127.0.0.1:11434",
+          timeout_seconds: 60,
+          parameters: {},
+        },
+        active: { available: true, count: 0, stale_count: 0 },
+        credential_captures: [],
+        policy: { hot_reload: false, environment_read_at: "startup", process_environment_credentials_used: false, restart_action: "manual" },
+      },
+    };
+    installApi({
+      caps: writeCaps,
+      override: (path, method) => (path === "/api/settings" && method === "GET" ? { payload: overridden } : null),
+    });
+    window.history.replaceState({}, "", "/settings");
+    const user = userEvent.setup();
+    render(<App />);
+
+    const endpoint = await screen.findByLabelText("LLM endpoint override");
+    expect(endpoint).toHaveValue("http://127.0.0.1:11434");
+    expect(screen.getByText(/process-environment override and is hidden; this field edits the saved value only/)).toBeInTheDocument();
+    expect(screen.getByText("Configuration provenance")).toBeInTheDocument();
+    await user.clear(screen.getByLabelText("Request timeout (seconds)"));
+    await user.type(screen.getByLabelText("Request timeout (seconds)"), "90");
+    await user.click(screen.getByRole("button", { name: "Save runtime settings for this root" }));
+
+    const request = fetchRequests.find((item) => item.path === "/api/settings" && item.method === "PUT");
+    expect(request?.body).toEqual({
+      data_provider: "yfinance",
+      model: "provider/model",
+      endpoint: "http://127.0.0.1:11434",
+      timeout_seconds: 90,
+      parameters: {},
+      expected_version: 3,
+    });
+    expect(await screen.findByText(/keep the override until restart without it/)).toBeInTheDocument();
+  });
+
+  it("blocks saving when the stored version changed outside this server", async () => {
+    const writeCaps: Capabilities = { ...capabilities, mode: "live", writes: true, read_only: false, mutation_token: "t" };
+    const ahead: Settings = {
+      ...settings,
+      configuration: {
+        stored: { available: true, version: 5, present: true },
+        effective: { version: 3, startup_version: 3 },
+        fields: [],
+        overrides: [],
+        restart_required: true,
+        restart_reasons: ["stored-version-changed"],
+        stored_values: null,
+        active: { available: true, count: 0, stale_count: 0 },
+        credential_captures: [],
+        policy: { hot_reload: false, environment_read_at: "startup", process_environment_credentials_used: false, restart_action: "manual" },
+      },
+    };
+    installApi({
+      caps: writeCaps,
+      override: (path, method) => (path === "/api/settings" && method === "GET" ? { payload: ahead } : null),
+    });
+    window.history.replaceState({}, "", "/settings");
+    render(<App />);
+
+    expect(await screen.findByText(/Saving is blocked to avoid overwriting them; restart the server manually/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Save runtime settings for this root" })).toBeDisabled();
+    expect(screen.getByText(/saves from this page are rejected as stale/)).toBeInTheDocument();
+  });
+
   it("shows active captures with their frozen settings version", async () => {
     const activeSettings: Settings = {
       ...settings,

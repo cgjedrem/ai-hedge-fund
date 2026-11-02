@@ -82,7 +82,9 @@ from hedge_fund.runtime.admission import (
 from hedge_fund.runtime.capture import freeze_capture, FrozenCapture
 from hedge_fund.runtime.configuration import (
     ConfigurationError,
+    describe_configuration,
     environment_settings,
+    load_settings,
     resolve_settings,
     RuntimeSettings,
     save_settings,
@@ -341,6 +343,7 @@ class DeskService:
             )
         except ConfigurationError:
             self._settings_error = "private-settings-unavailable"
+        self._startup_settings_version = self._runtime_settings.version
         if root_context.verify_private_storage():
             try:
                 self._credential_store = CredentialStore(root_context, self._admission)
@@ -1834,7 +1837,11 @@ class DeskService:
     def settings(self) -> dict:
         model_options = [{"label": label, "id": model_id, "provider": provider} for label, model_id, provider in load_api_models() if is_supported(provider)]
         credential_status = self._credential_status_map()
-        active_captures, active_captures_available = self._active_capture_views()
+        with self._settings_lock:
+            effective = self._runtime_settings
+        active_items = self._active_operation_captures()
+        active_captures, active_captures_available = self._active_capture_views(active_items, effective)
+        configuration = self._configuration_view(effective, active_items)
         providers = []
         for provider in [
             *PROVIDER_ENV_VARS,
@@ -1854,8 +1861,9 @@ class DeskService:
                     "version": saved["version"] if env_var else 0,
                 }
             )
+        public = _public_settings(effective)
         return {
-            **self._runtime_settings.public_view(),
+            **public,
             "settings_error": self._settings_error,
             "models": model_options,
             "providers": providers,
@@ -1883,6 +1891,7 @@ class DeskService:
             ],
             "active_captures": active_captures,
             "active_captures_available": active_captures_available,
+            "configuration": configuration,
             "network_enabled": self.network_enabled,
         }
 
@@ -1927,7 +1936,7 @@ class DeskService:
             expected_version=request.expected_version,
         )
         return {
-            **updated.public_view(),
+            **_public_settings(updated),
             "scope": "root",
         }
 
@@ -3655,23 +3664,35 @@ class DeskService:
             self._settings_error = "private-credentials-unavailable"
             return {provider: {"version": 0, "configured": False} for provider in provider_ids}
 
-    def _active_capture_views(self) -> tuple[list[dict[str, object]], bool]:
+    def _active_operation_captures(self) -> list[tuple[object, FrozenCapture | None]] | None:
         if self._operation_store is None:
-            return [], False
+            return None
         try:
             operations = self._operation_store.list_operations(limit=100)
         except OperationError:
-            return [], False
-        active = []
-        for operation in operations:
-            if operation.status not in {
+            return None
+        return [
+            (operation, self._captures.get(operation.capture_id))
+            for operation in operations
+            if operation.status
+            in {
                 OperationStatus.ACCEPTED,
                 OperationStatus.RUNNING,
                 OperationStatus.CANCEL_REQUESTED,
-            }:
-                continue
-            capture = self._captures.get(operation.capture_id)
-            view = capture.public_view(current_settings_version=self._runtime_settings.version) if capture is not None else {}
+            }
+        ]
+
+    def _active_capture_views(
+        self,
+        items: list[tuple[object, FrozenCapture | None]] | None,
+        effective: RuntimeSettings,
+    ) -> tuple[list[dict[str, object]], bool]:
+        if items is None:
+            return [], False
+        active = []
+        for operation, capture in items:
+            view = capture.public_view(current_settings_version=effective.version) if capture is not None else {}
+            endpoint = view.get("endpoint")
             active.append(
                 {
                     "capture_id": operation.capture_id,
@@ -3685,11 +3706,87 @@ class DeskService:
                     ),
                     "llm_provider": view.get("llm_provider"),
                     "model": view.get("model", operation.payload.get("model")),
-                    "endpoint": view.get("endpoint"),
+                    "endpoint": endpoint,
                     "restart_needed": view.get("restart_needed"),
                 }
             )
         return active, True
+
+    def _configuration_view(
+        self,
+        effective: RuntimeSettings,
+        items: list[tuple[object, FrozenCapture | None]] | None,
+    ) -> dict[str, object]:
+        stored: RuntimeSettings | None = None
+        if self._settings_error is None:
+            try:
+                stored = load_settings(self.root_context, admission=self._admission)
+            except (ConfigurationError, OSError, RootPathError):
+                stored = None
+        view = describe_configuration(
+            stored=stored,
+            effective=effective,
+            startup_version=self._startup_settings_version,
+        )
+        stale = 0
+        credentials: list[dict[str, object]] = []
+        for operation, capture in items or []:
+            if capture is None:
+                continue
+            if capture.settings_version != effective.version:
+                stale += 1
+            for provider_id, version in sorted(capture.credential_versions.items()):
+                current: int | None = None
+                configured: bool | None = None
+                retained: bool | None = None
+                if self._credential_store is not None:
+                    try:
+                        current, configured = self._credential_store.version(provider_id)
+                        retained = self._credential_store.retains_version(provider_id, version) if version >= 1 else False
+                    except CredentialStoreError:
+                        current, configured, retained = None, None, None
+                if current is None:
+                    state = "unavailable"
+                elif version < 1:
+                    state = "not-captured"
+                elif current == version and configured:
+                    state = "current"
+                elif not configured:
+                    state = "deleted-after-capture"
+                else:
+                    state = "superseded"
+                credentials.append(
+                    {
+                        "capture_id": operation.capture_id,
+                        "subject_id": operation.subject_id,
+                        "status": operation.status.value,
+                        "provider": provider_id,
+                        "captured_version": version,
+                        "current_version": current,
+                        "configured": configured,
+                        "captured_version_retained": retained,
+                        "state": state,
+                    }
+                )
+        stored_values = None
+        if stored is not None and stored.version == effective.version:
+            stored_values = stored.to_mapping()
+        return {
+            **view,
+            "stored_values": stored_values,
+            "active": {
+                "available": items is not None,
+                "count": len(items or []),
+                "stale_count": stale,
+            },
+            "credential_captures": credentials,
+            "policy": {
+                "hot_reload": False,
+                "environment_read_at": "startup",
+                "process_environment_credentials_used": False,
+                "restart_action": "manual",
+            },
+        }
 
     def _ensure_settings_available(self) -> None:
         if self._settings_error is not None:
@@ -3750,6 +3847,16 @@ def _is_reparse_point(path: Path) -> bool:
 
 def _windows_name_key(name: str) -> str:
     return unicodedata.normalize("NFKC", name).rstrip(" .").casefold()
+
+
+def _public_settings(settings: RuntimeSettings) -> dict[str, object]:
+    """Public settings view; override-sourced endpoint origins are never echoed."""
+    public = settings.public_view()
+    redacted = settings.provenance["endpoint"] in {"environment", "launch"}
+    if redacted:
+        public["endpoint"] = None
+    public["endpoint_redacted"] = redacted
+    return public
 
 
 def _credential_provider(value: str) -> str:
