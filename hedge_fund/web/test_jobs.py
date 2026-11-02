@@ -322,6 +322,7 @@ def test_operation_status_read_under_writer_contention_is_retryable_503(demo_roo
             assert held.wait(timeout=_WAIT_SECONDS)
             busy_list = client.get("/api/operations", headers={"host": "127.0.0.1"})
             busy_item = client.get(f"/api/operations/{'a' * 32}", headers={"host": "127.0.0.1"})
+            busy_request = client.get("/api/operations/by-request/job-request", headers={"host": "127.0.0.1"})
             release.set()
             holder.join(timeout=_WAIT_SECONDS)
             recovered = client.get("/api/operations", headers={"host": "127.0.0.1"})
@@ -329,7 +330,7 @@ def test_operation_status_read_under_writer_contention_is_retryable_503(demo_roo
         release.set()
         service.close()
 
-    for response in (busy_list, busy_item):
+    for response in (busy_list, busy_item, busy_request):
         body = response.json()
         assert response.status_code == 503, body
         assert body["code"] == "observation-conflict"
@@ -339,6 +340,65 @@ def test_operation_status_read_under_writer_contention_is_retryable_503(demo_roo
         assert "lock" not in response.text.lower()
     assert recovered.status_code == 200
     assert recovered.json() == {"items": []}
+
+
+def test_operation_request_lookup_is_read_only_verified_and_loopback_guarded(durable_job_context):
+    root_context, store, capture = durable_job_context
+    operation = _accepted_operation(store, capture, request_id="synthetic-request-1")
+    app = create_app(root=root_context.path)
+
+    def storage_snapshot():
+        runtime = root_context.path / "runtime"
+        paths = sorted(path for path in runtime.rglob("*") if path.is_file())
+        return (
+            {str(path.relative_to(runtime)) for path in paths},
+            {str(path.relative_to(runtime)): path.read_bytes() for path in paths if path.suffix != ".lock"},
+        )
+
+    before = storage_snapshot()
+    with TestClient(app) as client:
+        found = client.get("/api/operations/by-request/synthetic-request-1", headers={"host": "127.0.0.1"})
+        missing = client.get("/api/operations/by-request/synthetic-request-missing", headers={"host": "127.0.0.1"})
+        invalid = client.get("/api/operations/by-request/bad%20identity", headers={"host": "127.0.0.1"})
+        remote = client.get("/api/operations/by-request/synthetic-request-1", headers={"host": "attacker.example"})
+        foreign = client.get(
+            "/api/operations/by-request/synthetic-request-1",
+            headers={"host": "127.0.0.1", "origin": "http://attacker.example"},
+        )
+
+    assert found.status_code == 200, found.text
+    assert found.json()["operation_id"] == operation.operation_id
+    assert found.json()["request_id"] == "synthetic-request-1"
+    assert found.json()["action"] == "backtest"
+    assert found.json()["subject_id"] == "alpha"
+    assert missing.status_code == 404
+    assert missing.json()["code"] == "not-found"
+    assert invalid.status_code == 400
+    assert invalid.json()["code"] == "invalid-request"
+    assert remote.status_code == 403
+    assert foreign.status_code == 403
+    assert storage_snapshot() == before
+
+
+def test_operation_request_lookup_rejects_a_corrupt_sidecar(durable_job_context):
+    root_context, store, capture = durable_job_context
+    operation = _accepted_operation(store, capture, request_id="synthetic-corrupt-request")
+    app = create_app(root=root_context.path)
+    root_context.write_bytes(
+        f"{OPERATIONS_ROOT}/state/{operation.operation_id}.json",
+        b'{"schema":1,"status":"completed"}',
+    )
+
+    with TestClient(app) as client:
+        response = client.get(
+            "/api/operations/by-request/synthetic-corrupt-request",
+            headers={"host": "127.0.0.1"},
+        )
+
+    assert response.status_code == 409
+    assert response.json()["code"] != "not-found"
+    assert "outcome is unknown" in response.json()["message"]
+    assert str(root_context.path) not in response.text
 
 
 def test_operation_lock_failure_other_than_timeout_is_not_retryable(demo_root, monkeypatch):

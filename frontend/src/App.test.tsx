@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -284,7 +284,8 @@ function response(payload: unknown, status = 200): Response {
 
 function installApi(options?: {
   caps?: Capabilities;
-  override?: (path: string, method: string, body: unknown) => { payload: unknown; status?: number } | null;
+  override?: (path: string, method: string, body: unknown) =>
+    { payload: unknown; status?: number } | null | Promise<{ payload: unknown; status?: number } | null>;
 }): void {
   fetchRequests.length = 0;
   const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -299,7 +300,7 @@ function installApi(options?: {
       }
     }
     fetchRequests.push({ path, method, body, headers: new Headers(init?.headers) });
-    const override = options?.override?.(path, method, body);
+    const override = await options?.override?.(path, method, body);
     if (override) return response(override.payload, override.status);
     if (path === "/api/capabilities") return response(options?.caps ?? capabilities);
     if (path === "/api/home") return response(home);
@@ -365,15 +366,480 @@ function installApi(options?: {
 }
 
 beforeEach(() => {
+  window.localStorage.clear();
+  window.sessionStorage.clear();
   window.history.replaceState({}, "", "/");
   installApi();
 });
 
 afterEach(() => {
+  vi.restoreAllMocks();
   vi.unstubAllGlobals();
 });
 
 describe("local desk screens", () => {
+  it("recovers a pending backtest request after reload without another mutation", async () => {
+    const requestId = "a".repeat(32);
+    const operationId = "b".repeat(32);
+    const pendingKey = `aihf.pending-operation.${requestId}`;
+    const operation: Operation = {
+      id: operationId,
+      operation_id: operationId,
+      request_id: requestId,
+      action: "backtest",
+      subject_id: "demo-quality",
+      fund: "demo-quality",
+      capture_id: "c".repeat(32),
+      capture_digest: "d".repeat(64),
+      created_at: "2026-01-01T00:00:00Z",
+      updated_at: "2026-01-01T00:00:01Z",
+      status: "running",
+      progress: 10,
+      payload: {},
+      result: null,
+      provider: null,
+      model: null,
+      report_id: null,
+      error: null,
+      cancel_requested: false,
+      status_url: `/api/operations/${operationId}`,
+    };
+    window.localStorage.setItem(pendingKey, JSON.stringify({
+      requestId, action: operation.action, subjectId: operation.subject_id,
+    }));
+    installApi({
+      override: (path, method) => method === "GET" && (
+        path === `/api/operations/by-request/${requestId}` || path === `/api/operations/${operationId}`
+      ) ? { payload: operation } : null,
+    });
+    window.history.replaceState({}, "", "/backtests");
+    render(<App />);
+
+    expect(await screen.findByText(operationId)).toBeInTheDocument();
+    expect(window.localStorage.getItem("aihf.backtests.selected-operation")).toBe(operationId);
+    expect(window.localStorage.getItem(pendingKey)).toBeNull();
+    expect(fetchRequests.some((item) => item.path === `/api/operations/by-request/${requestId}`)).toBe(true);
+    expect(fetchRequests.every((item) => item.method === "GET")).toBe(true);
+  });
+
+  it("retains a missing pending request and warns that forgetting cannot prove its outcome", async () => {
+    const requestId = "e".repeat(32);
+    const pendingKey = `aihf.pending-operation.${requestId}`;
+    window.localStorage.setItem(pendingKey, JSON.stringify({
+      requestId, action: "backtest", subjectId: "demo-quality",
+    }));
+    window.history.replaceState({}, "", "/backtests");
+    const user = userEvent.setup();
+    render(<App />);
+
+    expect(await screen.findByText(/no operation was found.*outcome.*unknown/i)).toBeInTheDocument();
+    expect(window.localStorage.getItem(pendingKey)).not.toBeNull();
+    expect(screen.getByText(/forgetting.*does not prove/i)).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: /forget pending request/i }));
+    expect(window.localStorage.getItem(pendingKey)).toBeNull();
+    expect(fetchRequests.every((item) => item.method === "GET")).toBe(true);
+  });
+
+  it("observes another tab's pending identity and blocks a new backtest without overwriting it", async () => {
+    installApi({
+      caps: { ...capabilities, writes: true, read_only: false, network: true, enrollment_state: "enrolled", mutation_token: "synthetic-csrf" },
+    });
+    window.history.replaceState({}, "", "/backtests");
+    render(<App />);
+    const universe = await screen.findByLabelText("Ticker universe");
+    await waitFor(() => expect(universe).toBeEnabled());
+
+    const requestId = "f".repeat(32);
+    const key = `aihf.pending-operation.${requestId}`;
+    const value = JSON.stringify({ requestId, action: "backtest", subjectId: "demo-quality" });
+    window.localStorage.setItem(key, value);
+    act(() => window.dispatchEvent(new StorageEvent("storage", { key, newValue: value })));
+    expect(await screen.findByText(/no operation was found.*outcome.*unknown/i)).toBeInTheDocument();
+    expect(universe).toBeDisabled();
+    expect(window.localStorage.getItem(key)).toBe(value);
+    expect(fetchRequests.every((item) => item.method === "GET")).toBe(true);
+  });
+
+  it.each(["backtest", "paper-tick"] as const)(
+    "keeps both %s identities when concurrent requests are recovered",
+    async (action) => {
+      const operations: Operation[] = ["1", "2"].map((digit, index) => {
+        const requestId = digit.repeat(32);
+        const operationId = (index === 0 ? "a" : "b").repeat(32);
+        return {
+          id: operationId, operation_id: operationId, request_id: requestId,
+          action, subject_id: "demo-quality", fund: "demo-quality",
+          capture_id: "c".repeat(32), capture_digest: "d".repeat(64),
+          created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:01Z",
+          status: "completed", progress: 100, payload: {}, result: null,
+          provider: null, model: null, report_id: null, error: null,
+          cancel_requested: false, status_url: `/api/operations/${operationId}`,
+        };
+      });
+      for (const operation of operations) {
+        window.localStorage.setItem(`aihf.pending-operation.${operation.request_id}`, JSON.stringify({
+          requestId: operation.request_id, action, subjectId: operation.subject_id,
+        }));
+      }
+      installApi({
+        override: (path, method) => {
+          const operation = operations.find((item) =>
+            path === `/api/operations/by-request/${item.request_id}` || path === `/api/operations/${item.id}`,
+          );
+          return method === "GET" && operation ? { payload: operation } : null;
+        },
+      });
+      window.history.replaceState({}, "", action === "backtest" ? "/backtests" : "/paper/demo-quality");
+      const user = userEvent.setup();
+      render(<App />);
+
+      for (const operation of operations) {
+        expect(await screen.findByRole("button", { name: `Monitor saved operation ${operation.id}` })).toBeVisible();
+        expect(JSON.parse(window.localStorage.getItem(`aihf.operation-identity.${operation.request_id}`) ?? "null"))
+          .toMatchObject({ requestId: operation.request_id, operationId: operation.id });
+      }
+      await user.click(screen.getByRole("button", { name: `Monitor saved operation ${operations[0].id}` }));
+      const key = action === "backtest" ? "aihf.backtests.selected-operation" : "aihf.paper.demo-quality.operation";
+      expect(window.localStorage.getItem(key)).toBe(operations[0].id);
+      expect(fetchRequests.every((item) => item.method === "GET")).toBe(true);
+    },
+  );
+
+  it.each([
+    ["backtest", "running", true],
+    ["backtest", "unknown", true],
+    ["backtest", "mismatch", true],
+    ["backtest", "completed", false],
+    ["paper-tick", "running", true],
+    ["paper-tick", "unknown", true],
+    ["paper-tick", "mismatch", true],
+    ["paper-tick", "completed", false],
+  ] as const)(
+    "checks every saved %s monitor before enabling another operation (%s)",
+    async (action, firstStatus, blocked) => {
+      const operations: Operation[] = ["1", "2"].map((digit, index) => {
+        const requestId = digit.repeat(32);
+        const operationId = (index === 0 ? "a" : "b").repeat(32);
+        return {
+          id: operationId, operation_id: operationId, request_id: requestId,
+          action, subject_id: "demo-quality", fund: "demo-quality",
+          capture_id: "c".repeat(32), capture_digest: "d".repeat(64),
+          created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:01Z",
+          status: index === 0 && firstStatus === "running" ? "running" : "completed",
+          progress: index === 0 && firstStatus === "running" ? 25 : 100,
+          payload: {}, result: null, provider: null, model: null, report_id: null,
+          error: null, cancel_requested: false, status_url: `/api/operations/${operationId}`,
+        };
+      });
+      for (const operation of operations) {
+        window.localStorage.setItem(`aihf.operation-identity.${operation.request_id}`, JSON.stringify({
+          requestId: operation.request_id, action, subjectId: operation.subject_id, operationId: operation.id,
+        }));
+      }
+      const selectionKey = action === "backtest" ? "aihf.backtests.selected-operation" : "aihf.paper.demo-quality.operation";
+      window.localStorage.setItem(selectionKey, operations[1].id);
+      installApi({
+        caps: { ...capabilities, writes: true, read_only: false, network: true, enrollment_state: "enrolled", mutation_token: "synthetic-csrf" },
+        override: (path, method) => {
+          if (path === "/api/paper/demo-quality/runner" && method === "GET") {
+            return { payload: { status: "stopped", available: false, reason: null } };
+          }
+          const operation = operations.find((item) => path === `/api/operations/${item.id}`);
+          if (method !== "GET" || !operation) return null;
+          if (operation.id === operations[0].id && firstStatus === "unknown") {
+            return { status: 503, payload: { detail: "Status unavailable.", code: "observation-conflict", retry_policy: "retry-read-only" } };
+          }
+          if (operation.id === operations[0].id && firstStatus === "mismatch") {
+            return { payload: { ...operation, request_id: "different-request" } };
+          }
+          return { payload: operation };
+        },
+      });
+      window.history.replaceState({}, "", action === "backtest" ? "/backtests" : "/paper/demo-quality");
+      render(<App />);
+      const control = action === "backtest"
+        ? await screen.findByLabelText("Ticker universe")
+        : await screen.findByRole("button", { name: "Manual one-session tick" });
+      await waitFor(() => expect(fetchRequests.some((item) => item.path === `/api/operations/${operations[0].id}`)).toBe(true));
+      await waitFor(() => blocked ? expect(control).toBeDisabled() : expect(control).toBeEnabled());
+      expect(fetchRequests.every((item) => item.method === "GET")).toBe(true);
+    },
+  );
+
+  it("limits simultaneous saved-operation observations and blocks unobserved identities", async () => {
+    const operations: Operation[] = Array.from({ length: 17 }, (_, index) => {
+      const requestId = `request-${index}`;
+      const operationId = (index + 1).toString(16).padStart(32, "0");
+      window.localStorage.setItem(`aihf.operation-identity.${requestId}`, JSON.stringify({
+        requestId, action: "backtest", subjectId: "demo-quality", operationId,
+      }));
+      return {
+        id: operationId, operation_id: operationId, request_id: requestId,
+        action: "backtest", subject_id: "demo-quality", fund: "demo-quality",
+        capture_id: "c".repeat(32), capture_digest: "d".repeat(64),
+        created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:01Z",
+        status: "completed", progress: 100, payload: {}, result: null,
+        provider: null, model: null, report_id: null, error: null,
+        cancel_requested: false, status_url: `/api/operations/${operationId}`,
+      };
+    });
+    installApi({
+      caps: { ...capabilities, writes: true, read_only: false, network: true, enrollment_state: "enrolled", mutation_token: "synthetic-csrf" },
+      override: (path, method) => {
+        const operation = operations.find((item) => path === `/api/operations/${item.id}`);
+        return method === "GET" && operation ? { payload: operation } : null;
+      },
+    });
+    window.history.replaceState({}, "", "/backtests");
+    render(<App />);
+    const control = await screen.findByLabelText("Ticker universe");
+    expect(await screen.findByText(/observation limit reached/i)).toBeVisible();
+    await waitFor(() => expect(fetchRequests.filter((item) => /^\/api\/operations\/[a-f0-9]{32}$/.test(item.path))).toHaveLength(16));
+    expect(fetchRequests.some((item) => item.path === `/api/operations/${operations[16].id}`)).toBe(false);
+    expect(control).toBeDisabled();
+  });
+
+  it.each([
+    { code: "expired-confirmation", forgotten: true },
+    { code: null, forgotten: false },
+  ])("clears only a confirmed expired paper admission ($code)", async ({ code, forgotten }) => {
+    const preview: PaperOperationPreview = {
+      preview_id: "5".repeat(32), preview_digest: "6".repeat(64),
+      confirmation_token: "offline-confirmation-token", action: "paper-tick",
+      subject_id: "demo-quality", expected_head: sourceHash, due_set: ["2024-06-06"],
+      capture_id: "3".repeat(32), capture_digest: "4".repeat(64),
+      expires_at: "2026-10-31T12:10:00+00:00", payload: { kind: "manual-tick" },
+      capture: { data_provider: "yfinance", llm_provider: "Ollama", model: "gemma3:4b" },
+      estimate: { maximum_model_calls_per_session: 4, maximum_calls: 3, maximum_resources: 4, maximum_cost_usd: 0, market_data_provider: "yfinance" },
+      warnings: [],
+    };
+    let requestId = "";
+    installApi({
+      caps: { ...capabilities, writes: true, read_only: false, network: true, enrollment_state: "enrolled", mutation_token: "synthetic-csrf" },
+      override: (path, method, body) => {
+        if (path === "/api/paper/demo-quality/runner" && method === "GET") {
+          return { payload: { status: "stopped", available: false, reason: null } };
+        }
+        if (path === "/api/paper/demo-quality/tick/preview" && method === "POST") return { payload: preview };
+        if (path === "/api/paper/demo-quality/tick" && method === "POST") {
+          requestId = (body as { request_id: string }).request_id;
+          return { status: 410, payload: { detail: "Confirmation expired.", code, retry_policy: "review-again" } };
+        }
+        return null;
+      },
+    });
+    window.history.replaceState({}, "", "/paper/demo-quality");
+    const user = userEvent.setup();
+    render(<App />);
+    const review = await screen.findByRole("button", { name: "Manual one-session tick" });
+    await waitFor(() => expect(review).toBeEnabled());
+    await user.click(review);
+    await user.click(await screen.findByRole("button", { name: "Accept one-session tick" }));
+    await waitFor(() => expect(requestId).not.toBe(""));
+    await waitFor(() => expect(window.localStorage.getItem(`aihf.pending-operation.${requestId}`) === null).toBe(forgotten));
+    expect(fetchRequests.filter((item) => item.path === "/api/paper/demo-quality/tick" && item.method === "POST")).toHaveLength(1);
+  });
+
+  it("recovers a pending paper request for the matching fund without another mutation", async () => {
+    const requestId = "1".repeat(32);
+    const operationId = "2".repeat(32);
+    const pendingKey = `aihf.pending-operation.${requestId}`;
+    const operation: Operation = {
+      id: operationId, operation_id: operationId, request_id: requestId,
+      action: "paper-tick", subject_id: "demo-quality", fund: "demo-quality",
+      capture_id: "3".repeat(32), capture_digest: "4".repeat(64),
+      created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:01Z",
+      status: "running", progress: 25, payload: {}, result: null,
+      provider: null, model: null, report_id: null, error: null,
+      cancel_requested: false, status_url: `/api/operations/${operationId}`,
+    };
+    window.localStorage.setItem(pendingKey, JSON.stringify({
+      requestId, action: operation.action, subjectId: operation.subject_id,
+    }));
+    installApi({
+      override: (path, method) => method === "GET" && (
+        path === `/api/operations/by-request/${requestId}` || path === `/api/operations/${operationId}`
+      ) ? { payload: operation } : null,
+    });
+    window.history.replaceState({}, "", "/paper/demo-quality");
+    render(<App />);
+
+    expect(await screen.findByText("Manual tick · running")).toBeInTheDocument();
+    expect(window.localStorage.getItem("aihf.paper.demo-quality.operation")).toBe(operationId);
+    expect(window.localStorage.getItem(pendingKey)).toBeNull();
+    expect(fetchRequests.every((item) => item.method === "GET")).toBe(true);
+  });
+
+  it("retains a lost paper admission and recovers it after reload without resubmitting", async () => {
+    const operationId = "9".repeat(32);
+    const preview: PaperOperationPreview = {
+      preview_id: "5".repeat(32), preview_digest: "6".repeat(64),
+      confirmation_token: "offline-confirmation-token", action: "paper-tick",
+      subject_id: "demo-quality", expected_head: sourceHash, due_set: ["2024-06-06"],
+      capture_id: "3".repeat(32), capture_digest: "4".repeat(64),
+      expires_at: "2026-10-31T12:10:00+00:00", payload: { kind: "manual-tick" },
+      capture: { data_provider: "yfinance", llm_provider: "Ollama", model: "gemma3:4b" },
+      estimate: { maximum_model_calls_per_session: 4, maximum_calls: 3, maximum_resources: 4, maximum_cost_usd: 0, market_data_provider: "yfinance" },
+      warnings: [],
+    };
+    const operation: Operation = {
+      id: operationId, operation_id: operationId, request_id: "",
+      action: "paper-tick", subject_id: "demo-quality", fund: "demo-quality",
+      capture_id: preview.capture_id, capture_digest: preview.capture_digest,
+      created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:01Z",
+      status: "running", progress: 25, payload: {}, result: null,
+      provider: null, model: null, report_id: null, error: null,
+      cancel_requested: false, status_url: `/api/operations/${operationId}`,
+    };
+    let recoverable = false;
+    installApi({
+      caps: { ...capabilities, writes: true, read_only: false, network: true, enrollment_state: "enrolled", mutation_token: "synthetic-csrf" },
+      override: (path, method, body) => {
+        if (path === "/api/paper/demo-quality/runner" && method === "GET") {
+          return { payload: { status: "stopped", available: false, reason: null } };
+        }
+        if (path === "/api/paper/demo-quality/tick/preview" && method === "POST") return { payload: preview, status: 201 };
+        if (path === "/api/paper/demo-quality/tick" && method === "POST") {
+          operation.request_id = (body as { request_id: string }).request_id;
+          expect(window.localStorage.getItem(`aihf.pending-operation.${operation.request_id}`)).not.toBeNull();
+          throw new TypeError("synthetic response lost");
+        }
+        if (path === `/api/operations/by-request/${operation.request_id}` && method === "GET") {
+          return recoverable ? { payload: operation } : { status: 404, payload: { detail: "Not found.", code: "not-found" } };
+        }
+        if (path === `/api/operations/${operationId}` && method === "GET") return { payload: operation };
+        return null;
+      },
+    });
+    window.history.replaceState({}, "", "/paper/demo-quality");
+    const user = userEvent.setup();
+    const view = render(<App />);
+    const review = await screen.findByRole("button", { name: "Manual one-session tick" });
+    await waitFor(() => expect(review).toBeEnabled());
+    await user.click(review);
+    await user.click(await screen.findByRole("button", { name: "Accept one-session tick" }));
+
+    expect(await screen.findByText(/no operation was found.*outcome.*unknown/i)).toBeInTheDocument();
+    const pendingKey = `aihf.pending-operation.${operation.request_id}`;
+    expect(window.localStorage.getItem(pendingKey)).not.toBeNull();
+    expect(JSON.stringify(window.localStorage)).not.toContain(preview.confirmation_token);
+    expect(JSON.stringify(window.sessionStorage)).not.toContain(preview.confirmation_token);
+    expect(fetchRequests.filter((item) => item.path === "/api/paper/demo-quality/tick" && item.method === "POST")).toHaveLength(1);
+
+    view.unmount();
+    recoverable = true;
+    render(<App />);
+    expect(await screen.findByText("Manual tick · running")).toBeInTheDocument();
+    expect(window.localStorage.getItem(pendingKey)).toBeNull();
+    expect(window.localStorage.getItem("aihf.paper.demo-quality.operation")).toBe(operationId);
+    expect(fetchRequests.filter((item) => item.path === "/api/paper/demo-quality/tick" && item.method === "POST")).toHaveLength(1);
+  });
+
+  it("does not submit and closes the review if request identity storage fails", async () => {
+    const preview: PaperOperationPreview = {
+      preview_id: "5".repeat(32), preview_digest: "6".repeat(64),
+      confirmation_token: "offline-confirmation-token", action: "paper-tick",
+      subject_id: "demo-quality", expected_head: sourceHash, due_set: ["2024-06-06"],
+      capture_id: "3".repeat(32), capture_digest: "4".repeat(64),
+      expires_at: "2026-10-31T12:10:00+00:00", payload: { kind: "manual-tick" },
+      capture: { data_provider: "yfinance", llm_provider: "Ollama", model: "gemma3:4b" },
+      estimate: { maximum_model_calls_per_session: 4, maximum_calls: 3, maximum_resources: 4, maximum_cost_usd: 0, market_data_provider: "yfinance" },
+      warnings: [],
+    };
+    const originalSet = Storage.prototype.setItem;
+    vi.spyOn(Storage.prototype, "setItem").mockImplementation(function (this: Storage, key, value) {
+      if (key.startsWith("aihf.pending-operation.")) throw new DOMException("Storage denied");
+      return originalSet.call(this, key, value);
+    });
+    installApi({
+      caps: { ...capabilities, writes: true, read_only: false, network: true, enrollment_state: "enrolled", mutation_token: "synthetic-csrf" },
+      override: (path, method) => {
+        if (path === "/api/paper/demo-quality/runner" && method === "GET") return { payload: { status: "stopped", available: false, reason: null } };
+        if (path === "/api/paper/demo-quality/tick/preview" && method === "POST") return { payload: preview, status: 201 };
+        return null;
+      },
+    });
+    window.history.replaceState({}, "", "/paper/demo-quality");
+    const user = userEvent.setup();
+    render(<App />);
+    const review = await screen.findByRole("button", { name: "Manual one-session tick" });
+    await waitFor(() => expect(review).toBeEnabled());
+    await user.click(review);
+    await user.click(await screen.findByRole("button", { name: "Accept one-session tick" }));
+
+    expect(await screen.findByText(/request identity could not be preserved/i)).toBeInTheDocument();
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Retry browser storage" })).toBeVisible();
+    expect(fetchRequests.filter((item) => item.path === "/api/paper/demo-quality/tick" && item.method === "POST")).toHaveLength(0);
+  });
+
+  it("does not move a completed paper admission into a different fund after navigation", async () => {
+    const preview: PaperOperationPreview = {
+      preview_id: "5".repeat(32), preview_digest: "6".repeat(64),
+      confirmation_token: "offline-confirmation-token", action: "paper-tick",
+      subject_id: "demo-quality", expected_head: sourceHash, due_set: ["2024-06-06"],
+      capture_id: "3".repeat(32), capture_digest: "4".repeat(64),
+      expires_at: "2026-10-31T12:10:00+00:00", payload: { kind: "manual-tick" },
+      capture: { data_provider: "yfinance", llm_provider: "Ollama", model: "gemma3:4b" },
+      estimate: { maximum_model_calls_per_session: 4, maximum_calls: 3, maximum_resources: 4, maximum_cost_usd: 0, market_data_provider: "yfinance" },
+      warnings: [],
+    };
+    const first: Operation = {
+      id: "a".repeat(32), operation_id: "a".repeat(32), request_id: "",
+      action: "paper-tick", subject_id: "demo-quality", fund: "demo-quality",
+      capture_id: preview.capture_id, capture_digest: preview.capture_digest,
+      created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:01Z",
+      status: "running", progress: 10, payload: {}, result: null,
+      provider: null, model: null, report_id: null, error: null,
+      cancel_requested: false, status_url: `/api/operations/${"a".repeat(32)}`,
+    };
+    const second: Operation = {
+      ...first, id: "b".repeat(32), operation_id: "b".repeat(32), request_id: "second-request",
+      subject_id: "second-fund", fund: "second-fund", progress: 25,
+    };
+    let resolveAccept: ((value: { payload: unknown; status: number }) => void) | undefined;
+    window.localStorage.setItem("aihf.paper.second-fund.operation", second.id);
+    installApi({
+      caps: { ...capabilities, writes: true, read_only: false, network: true, enrollment_state: "enrolled", mutation_token: "synthetic-csrf" },
+      override: (path, method, body) => {
+        if (path === "/api/paper/demo-quality/runner" && method === "GET") return { payload: { status: "stopped", available: false, reason: null } };
+        if (path === "/api/paper/second-fund/runner" && method === "GET") return { payload: { status: "stopped", available: false, reason: null } };
+        if (path === "/api/paper/second-fund" && method === "GET") return { payload: { ...paperDetail, name: "second-fund" } };
+        if (path.startsWith("/api/paper/second-fund/sessions?") && method === "GET") return { payload: { items: [], errors: [], next_cursor: null, limit: 50, total: 0, search: "", ledger: { ok: true, error: null } } };
+        if (path === "/api/paper/demo-quality/tick/preview" && method === "POST") return { payload: preview, status: 201 };
+        if (path === "/api/paper/demo-quality/tick" && method === "POST") {
+          first.request_id = (body as { request_id: string }).request_id;
+          return new Promise((resolve) => { resolveAccept = resolve; });
+        }
+        if (path === `/api/operations/${first.id}` && method === "GET") return { payload: first };
+        if (path === `/api/operations/${second.id}` && method === "GET") return { payload: second };
+        return null;
+      },
+    });
+    window.history.replaceState({}, "", "/paper/demo-quality");
+    const user = userEvent.setup();
+    render(<App />);
+    const review = await screen.findByRole("button", { name: "Manual one-session tick" });
+    await waitFor(() => expect(review).toBeEnabled());
+    await user.click(review);
+    await user.click(await screen.findByRole("button", { name: "Accept one-session tick" }));
+    await waitFor(() => expect(resolveAccept).toBeDefined());
+
+    act(() => {
+      window.history.pushState({}, "", "/paper/second-fund");
+      window.dispatchEvent(new PopStateEvent("popstate"));
+    });
+    expect(await screen.findByRole("heading", { name: "second-fund" })).toBeInTheDocument();
+    expect(await screen.findByText("Manual tick · running")).toBeInTheDocument();
+    await act(async () => { resolveAccept!({ payload: first, status: 202 }); });
+
+    expect(screen.getByText("Manual tick · running")).toBeInTheDocument();
+    expect(screen.queryByText(/reviewed one-session paper tick accepted/i)).not.toBeInTheDocument();
+    expect(window.localStorage.getItem("aihf.paper.demo-quality.operation")).toBe(first.id);
+    expect(window.localStorage.getItem("aihf.paper.second-fund.operation")).toBe(second.id);
+    expect(fetchRequests.some((item) => item.path === `/api/operations/${first.id}` && item.method === "GET")).toBe(false);
+  });
+
   it("navigates from overview through ledger, session report, and scorecard", async () => {
     const user = userEvent.setup();
     render(<App />);
@@ -1071,6 +1537,90 @@ describe("local desk screens", () => {
     expect(screen.getByText(/New settings apply to later operations/)).toBeInTheDocument();
   });
 
+  it("keeps a remembered backtest even when it is outside the bounded recent-operations list", async () => {
+    const operationId = "9".repeat(32);
+    const saved: Operation = {
+      operation_id: operationId,
+      id: operationId,
+      request_id: "remembered-request",
+      action: "backtest",
+      subject_id: "synthetic-fund",
+      fund: "synthetic-fund",
+      capture_id: "8".repeat(32),
+      capture_digest: "7".repeat(64),
+      status: "completed",
+      created_at: "2026-01-01T00:00:00Z",
+      updated_at: "2026-01-01T00:00:01Z",
+      payload: {},
+      result: null,
+      progress: 100,
+      provider: null,
+      model: null,
+      report_id: null,
+      error: null,
+      cancel_requested: false,
+      status_url: `/api/operations/${operationId}`,
+    };
+    window.localStorage.setItem("aihf.backtests.selected-operation", operationId);
+    installApi({
+      override: (path, method) => {
+        if (path === "/api/operations" && method === "GET") return { payload: { items: [] } };
+        if (path === `/api/operations/${operationId}` && method === "GET") return { payload: saved };
+        return null;
+      },
+    });
+    window.history.replaceState({}, "", "/backtests");
+    render(<App />);
+
+    expect(await screen.findByText(operationId)).toBeInTheDocument();
+    expect(window.localStorage.getItem("aihf.backtests.selected-operation")).toBe(operationId);
+    expect(fetchRequests.some((item) => item.path === `/api/operations/${operationId}`)).toBe(true);
+    expect(fetchRequests.every((item) => item.method === "GET")).toBe(true);
+  });
+
+  it("identifies a non-backtest receipt before offering cancellation", async () => {
+    const operationId = "6".repeat(32);
+    const operation: Operation = {
+      operation_id: operationId,
+      id: operationId,
+      request_id: "synthetic-paper-tick",
+      action: "paper-tick",
+      subject_id: "demo-quality",
+      fund: "demo-quality",
+      capture_id: "7".repeat(32),
+      capture_digest: "8".repeat(64),
+      status: "running",
+      created_at: "2026-10-31T12:00:00+00:00",
+      updated_at: "2026-10-31T12:00:01+00:00",
+      payload: {},
+      result: null,
+      progress: 10,
+      provider: null,
+      model: null,
+      report_id: null,
+      error: null,
+      cancel_requested: false,
+      status_url: `/api/operations/${operationId}`,
+    };
+    window.localStorage.setItem("aihf.backtests.selected-operation", operationId);
+    installApi({
+      caps: { ...capabilities, writes: true, read_only: false, mutation_token: "synthetic" },
+      override: (path, method) => {
+        if (path === "/api/operations" && method === "GET") return { payload: { items: [operation] } };
+        if (path === `/api/operations/${operationId}` && method === "GET") return { payload: operation };
+        return null;
+      },
+    });
+    window.history.replaceState({}, "", "/backtests");
+    render(<App />);
+
+    expect(await screen.findByText(operationId)).toBeInTheDocument();
+    expect(screen.queryByText(/cancellation is cooperative at valuation boundaries/i)).not.toBeInTheDocument();
+    expect(screen.getByText("Action · paper-tick")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Request cancellation" })).toBeEnabled();
+    expect(fetchRequests.every((item) => item.method === "GET")).toBe(true);
+  });
+
   it("restores, selects, and persists a durable backtest operation for monitoring and cancellation", async () => {
     const activeOperation: Operation = {
       operation_id: "a".repeat(32),
@@ -1155,14 +1705,18 @@ describe("local desk screens", () => {
     const view = render(<App />);
 
     expect(await screen.findByText(activeOperation.id)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Request cancellation" })).toBeEnabled();
-    await user.click(screen.getByRole("button", { name: "Request cancellation" }));
+    const cancel = screen.getByRole("button", { name: "Request cancellation" });
+    expect(cancel).toBeEnabled();
+    act(() => {
+      fireEvent.click(cancel);
+      fireEvent.click(cancel);
+    });
     await screen.findByRole("button", { name: "Cancellation requested…" });
-    const cancelRequest = fetchRequests.find(
+    const cancelRequests = fetchRequests.filter(
       (item) => item.path === `/api/operations/${activeOperation.id}/cancel` && item.method === "POST",
     );
-    expect(cancelRequest).toBeDefined();
-    expect((cancelRequest?.body as { request_id?: string }).request_id).toMatch(/^[a-f0-9]{32}$/);
+    expect(cancelRequests).toHaveLength(1);
+    expect((cancelRequests[0].body as { request_id?: string }).request_id).toMatch(/^[a-f0-9]{32}$/);
 
     await user.click(screen.getByRole("button", { name: `Monitor operation ${completedOperation.id}` }));
     expect(await screen.findByText(completedOperation.id)).toBeInTheDocument();
@@ -1341,6 +1895,12 @@ describe("local desk screens", () => {
             confirmation_token: preview.confirmation_token,
             expected_head: preview.expected_head,
           });
+          acceptedOperation.request_id = (body as { request_id: string }).request_id;
+          expect(JSON.parse(window.localStorage.getItem(`aihf.pending-operation.${acceptedOperation.request_id}`) ?? "null")).toEqual({
+            requestId: acceptedOperation.request_id,
+            action: "backtest",
+            subjectId: "demo-quality",
+          });
           return { payload: acceptedOperation, status: 202 };
         }
         if (path === "/api/operations" && method === "GET") {
@@ -1364,18 +1924,29 @@ describe("local desk screens", () => {
     expect(reviewButton).toBeDisabled();
     await user.click(screen.getByLabelText(/I confirm this account uses public Financial Datasets self-service pricing/));
     await waitFor(() => expect(reviewButton).toBeEnabled());
-    await user.click(reviewButton);
+    act(() => {
+      fireEvent.click(reviewButton);
+      fireEvent.click(reviewButton);
+    });
     expect(await screen.findByRole("heading", { name: "Confirm reviewed backtest" })).toBeInTheDocument();
     expect(screen.getByText("Self-service; custom Enterprise pricing unsupported")).toBeInTheDocument();
     expect(previewCount).toBe(1);
     expect(acceptCount).toBe(0);
 
-    await user.click(screen.getByRole("button", { name: "Accept reviewed operation" }));
+    const accept = screen.getByRole("button", { name: "Accept reviewed operation" });
+    act(() => {
+      fireEvent.click(accept);
+      fireEvent.click(accept);
+    });
     expect(await screen.findByText(acceptedOperation.id)).toBeInTheDocument();
     expect(acceptCount).toBe(1);
     expect((fetchRequests.find((item) => item.path === "/api/operations" && item.method === "POST")?.body as { request_id?: string }).request_id).toMatch(/^[a-f0-9]{32}$/);
     expect(window.localStorage.getItem("aihf.backtests.selected-operation")).toBe(acceptedOperation.id);
     expect(window.localStorage.getItem("synthetic-confirmation-token")).toBeNull();
+    expect(JSON.stringify(window.localStorage)).not.toContain(preview.confirmation_token);
+    expect(JSON.stringify(window.localStorage)).not.toContain(writeCaps.mutation_token);
+    expect(JSON.stringify(window.sessionStorage)).not.toContain(preview.confirmation_token);
+    expect(JSON.stringify(window.sessionStorage)).not.toContain(writeCaps.mutation_token);
   });
 
   it("reviews one manual tick, accepts once, and restores progress after reload", async () => {
@@ -1463,6 +2034,12 @@ describe("local desk screens", () => {
             confirmation_token: preview.confirmation_token,
             expected_head: sourceHash,
             due_set: ["2024-06-06"],
+          });
+          operation.request_id = (body as { request_id: string }).request_id;
+          expect(JSON.parse(window.localStorage.getItem(`aihf.pending-operation.${operation.request_id}`) ?? "null")).toEqual({
+            requestId: operation.request_id,
+            action: "paper-tick",
+            subjectId: "demo-quality",
           });
           return { payload: operation, status: 202 };
         }
@@ -1598,6 +2175,12 @@ describe("local desk screens", () => {
             max_sessions: 1,
             max_runtime_minutes: 60,
             due_set: [],
+          });
+          operation.request_id = (body as { request_id: string }).request_id;
+          expect(JSON.parse(window.localStorage.getItem(`aihf.pending-operation.${operation.request_id}`) ?? "null")).toEqual({
+            requestId: operation.request_id,
+            action: "paper-runner-start",
+            subjectId: "demo-quality",
           });
           currentRunner = {
             ...stoppedRunner,
@@ -1797,6 +2380,47 @@ describe("error recovery and reconnect", () => {
     await user.click(screen.getByRole("button", { name: "Forget operation" }));
     expect(window.localStorage.getItem("aihf.paper.demo-quality.operation")).toBeNull();
     expect(screen.queryByText(/is no longer known to this server/)).not.toBeInTheDocument();
+    expect(fetchRequests.every((item) => item.method === "GET")).toBe(true);
+  });
+
+  it("does not label a same-fund non-paper receipt as a runner start", async () => {
+    const operationId = "d".repeat(32);
+    const operation: Operation = {
+      operation_id: operationId,
+      id: operationId,
+      request_id: "synthetic-lifecycle",
+      action: "lifecycle-archive",
+      subject_id: "demo-quality",
+      fund: "demo-quality",
+      capture_id: "1".repeat(32),
+      capture_digest: "2".repeat(64),
+      status: "completed",
+      created_at: "2026-10-31T12:00:00+00:00",
+      updated_at: "2026-10-31T12:00:01+00:00",
+      payload: {},
+      result: null,
+      progress: 100,
+      provider: null,
+      model: null,
+      report_id: null,
+      error: null,
+      cancel_requested: false,
+      status_url: `/api/operations/${operationId}`,
+    };
+    window.localStorage.setItem("aihf.paper.demo-quality.operation", operationId);
+    installApi({
+      caps: writeCaps,
+      override: (path) => path === `/api/operations/${operationId}` ? { payload: operation } : null,
+    });
+    window.history.replaceState({}, "", "/paper/demo-quality");
+    const user = userEvent.setup();
+    render(<App />);
+
+    expect(await screen.findByText(/remembered operation is not a paper tick or runner start/i)).toBeInTheDocument();
+    expect(screen.queryByText("Runner start · completed")).not.toBeInTheDocument();
+    expect(window.localStorage.getItem("aihf.paper.demo-quality.operation")).toBe(operationId);
+    await user.click(screen.getByRole("button", { name: "Forget operation" }));
+    expect(window.localStorage.getItem("aihf.paper.demo-quality.operation")).toBeNull();
     expect(fetchRequests.every((item) => item.method === "GET")).toBe(true);
   });
 

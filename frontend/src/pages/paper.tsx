@@ -18,6 +18,7 @@ import { LifecycleActions } from "@/components/lifecycle-actions";
 import { DataTable, type TableColumn } from "@/components/data-table";
 import { EquityChart } from "@/components/equity-chart";
 import { MetricCard } from "@/components/metric-card";
+import { PendingOperationRecovery } from "@/components/pending-operation-recovery";
 import { EmptyState, ErrorNotice, ErrorState, PageHeader, SectionTitle } from "@/components/page";
 import { Alert } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
@@ -33,9 +34,11 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { apiPost } from "@/lib/api";
+import { apiPost, isExpiredConfirmation, requireMutationOperationReceipt } from "@/lib/api";
 import { toActionableError, type ActionableError } from "@/lib/errors";
-import { useDesk, useResource } from "@/lib/hooks";
+import { useDesk, useOperation, useResource } from "@/lib/hooks";
+import type { PendingOperation } from "@/lib/pending-operations";
+import { usePendingOperations } from "@/lib/use-pending-operations";
 import type {
   Approval,
   HaltState,
@@ -46,7 +49,6 @@ import type {
   PaperSnapshot,
   PaperSummary,
   PendingDecision,
-  Operation,
   Position,
   RunnerState,
   ScoreMetrics,
@@ -158,9 +160,8 @@ export function PaperDetailPage() {
     name ? `/api/paper/${encodeURIComponent(name)}/runner` : null,
   );
   const [operationId, setOperationId] = useState<string | null>(null);
-  const operationResource = useResource<Operation>(
-    operationId ? `/api/operations/${encodeURIComponent(operationId)}` : null,
-  );
+  const operationResource = useOperation(operationId, name);
+  const pendingOperations = usePendingOperations("paper", name);
   const [confirmAction, setConfirmAction] = useState<PendingAction | null>(null);
   const [haltDialogOpen, setHaltDialogOpen] = useState(false);
   const [haltReason, setHaltReason] = useState("");
@@ -177,13 +178,20 @@ export function PaperDetailPage() {
   const valuationRequest = useRef(0);
   const paperActionInFlight = useRef(false);
   const refreshedOperation = useRef<string | null>(null);
+  const activeFundName = useRef(name);
+  activeFundName.current = name;
   const protectedName = capabilities?.protected_names.some((entry) => entry.toLowerCase() === name.toLowerCase()) ?? false;
   const canWrite = capabilities?.writes === true && !protectedName;
   const data = resource.data;
   const writeUnavailable = capabilities?.write_unavailable_reason != null;
   const enrollmentState = capabilities?.enrollment_state ?? "unenrolled";
   const runner = runnerResource.data ?? data?.runner;
-  const operation = operationResource.data?.id === operationId ? operationResource.data : null;
+  const observedOperation = operationResource.data?.id === operationId ? operationResource.data : null;
+  const unexpectedOperation = observedOperation
+    && !["paper-tick", "paper-runner-start"].includes(observedOperation.action)
+    ? observedOperation
+    : null;
+  const operation = unexpectedOperation ? null : observedOperation;
   const approvalRequired = data?.spec.approval_required === true;
   const canWritePaper = canWrite && data?.broker === "paper";
   const canApprove = canWritePaper && approvalRequired && data?.halt_state === "clear" && data?.ledger.ok === true;
@@ -203,7 +211,8 @@ export function PaperDetailPage() {
     && data.ledger.ok
     && data.halt_state === "clear"
     && runnerInactive
-    && !paperOperationActive,
+    && !paperOperationActive
+    && !pendingOperations.blocked,
   );
   const canStopRunner = Boolean(
     canWritePaper
@@ -229,7 +238,7 @@ export function PaperDetailPage() {
     if (operationId) operationResource.refresh();
   };
   const staleOperation = Boolean(operationId && operationResource.apiError?.code === "not-found");
-  const forgetStaleOperation = () => {
+  const forgetPaperOperation = () => {
     clearPaperOperationId(name);
     setOperationId(null);
   };
@@ -250,12 +259,6 @@ export function PaperDetailPage() {
     setPaperPreview(null);
     setPaperPreviewKind(null);
   }, [name]);
-
-  useEffect(() => {
-    if (!operation || !["accepted", "running", "cancel-requested"].includes(operation.status)) return;
-    const timer = window.setTimeout(operationResource.refresh, 900);
-    return () => window.clearTimeout(timer);
-  }, [operation?.status, operation?.progress, operationResource.refresh]);
 
   useEffect(() => {
     if (!runner?.available) return;
@@ -400,8 +403,20 @@ export function PaperDetailPage() {
 
   async function acceptPaperPreview(): Promise<void> {
     if (!paperPreview || !paperPreviewKind || !canOperatePaper || paperActionInFlight.current) return;
+    const expectedAction = paperPreviewKind === "tick" ? "paper-tick" : "paper-runner-start";
+    if (paperPreview.action !== expectedAction || paperPreview.subject_id !== name) {
+      setFeedback({ tone: "danger", message: "Paper preview identity is inconsistent; review the operation again." });
+      setPaperPreview(null);
+      setPaperPreviewKind(null);
+      return;
+    }
+    const pendingRequest: PendingOperation = {
+      requestId: newRequestId(),
+      action: expectedAction,
+      subjectId: name,
+    };
     const request: Record<string, unknown> = {
-      request_id: newRequestId(),
+      request_id: pendingRequest.requestId,
       preview_id: paperPreview.preview_id,
       preview_digest: paperPreview.preview_digest,
       confirmation_token: paperPreview.confirmation_token,
@@ -416,26 +431,42 @@ export function PaperDetailPage() {
     paperActionInFlight.current = true;
     setPaperActionBusy(true);
     setFeedback(null);
+    if (!pendingOperations.remember(pendingRequest)) {
+      setFeedback({ tone: "danger", message: "The request identity could not be preserved or another request is unresolved. No operation was submitted." });
+      setPaperPreview(null);
+      setPaperPreviewKind(null);
+      paperActionInFlight.current = false;
+      setPaperActionBusy(false);
+      return;
+    }
     try {
-      const operation = await apiPost<Operation>(
+      const receipt = await apiPost<unknown>(
         `/api/paper/${encodeURIComponent(name)}/${paperPreviewKind === "tick" ? "tick" : "runner"}`,
         request,
       );
+      const operation = requireMutationOperationReceipt(receipt, pendingRequest, pendingRequest.requestId);
+      const saved = pendingOperations.save(pendingRequest, operation.id) && persistPaperOperationId(name, operation.id);
+      if (saved) pendingOperations.forget(pendingRequest);
+      if (activeFundName.current !== name) return;
       setOperationId(operation.id);
-      persistPaperOperationId(name, operation.id);
       setPaperPreview(null);
       setPaperPreviewKind(null);
       setFeedback({
-        tone: "neutral",
-        message: paperPreviewKind === "tick"
-          ? "Reviewed one-session paper tick accepted. Progress is durable and will reload with this page."
-          : "Reviewed finite runner start accepted. Process control remains limited to this server-owned child.",
+        tone: saved ? "neutral" : "danger",
+        message: !saved
+          ? "Browser storage could not preserve the operation monitor. The request identity remains saved."
+          : paperPreviewKind === "tick"
+            ? "Reviewed one-session paper tick accepted. Progress is durable and will reload with this page."
+            : "Reviewed finite runner start accepted. Process control remains limited to this server-owned child.",
       });
       runnerResource.refresh();
     } catch (cause) {
-      fail(cause, "Paper operation was not accepted.");
-      setPaperPreview(null);
-      setPaperPreviewKind(null);
+      if (isExpiredConfirmation(cause)) pendingOperations.forget(pendingRequest);
+      if (activeFundName.current === name) {
+        fail(cause, "Paper operation outcome could not be confirmed.");
+        setPaperPreview(null);
+        setPaperPreviewKind(null);
+      }
     } finally {
       paperActionInFlight.current = false;
       setPaperActionBusy(false);
@@ -474,6 +505,29 @@ export function PaperDetailPage() {
             <LifecycleActions kind="deployment" identity={name} onComplete={() => navigate("/paper")} />
           </>
         }
+      />
+      <PendingOperationRecovery
+        items={pendingOperations.items}
+        saved={pendingOperations.saved}
+        error={pendingOperations.error}
+        onRefresh={pendingOperations.refresh}
+        onForget={pendingOperations.forget}
+        onMonitor={(item) => {
+          if (!persistPaperOperationId(name, item.operationId)) {
+            setFeedback({ tone: "danger", message: "Browser storage could not preserve the operation monitor." });
+            return;
+          }
+          setOperationId(item.operationId);
+        }}
+        onForgetSaved={pendingOperations.forgetSaved}
+        onObserve={pendingOperations.observe}
+        onRecovered={(item, operation) => {
+          if (item.subjectId !== name || !pendingOperations.save(item, operation.id)) return false;
+          setOperationId(operation.id);
+          if (!persistPaperOperationId(name, operation.id)) return false;
+          runnerResource.refresh();
+          return pendingOperations.forget(item);
+        }}
       />
       {resource.loading ? <div className="h-52 animate-pulse rounded-xl border border-border bg-white/[0.025]" /> : null}
       {resource.error ? <ErrorState message={resource.error} error={resource.apiError} onRetry={resource.refresh} /> : null}
@@ -604,7 +658,9 @@ export function PaperDetailPage() {
                 <CardContent className="space-y-4">
                   <p className="text-xs leading-relaxed text-muted-foreground">
                     Enrollment: <span className="mono">{enrollmentState}</span>.{" "}
-                    {writeUnavailable
+                    {pendingOperations.blocked
+                      ? "Resolve or inspect the pending operation request before starting another paper operation."
+                      : writeUnavailable
                       ? `Writes unavailable: ${capabilities?.write_unavailable_reason}.`
                       : runner?.reason ?? "Runner ownership verified by this server."}
                   </p>
@@ -724,10 +780,16 @@ export function PaperDetailPage() {
                         {operation.error ? <p className="mt-2 text-[10px] text-rose-300">{operation.error}</p> : null}
                       </div>
                     ) : null}
-                    {staleOperation ? (
+                    {unexpectedOperation ? (
+                      <Alert tone="warning" className="mt-3">
+                        <p>The remembered operation is not a paper tick or runner start. Inspect its durable status before forgetting it.</p>
+                        <p className="mono mt-1 break-all text-[9px]">{unexpectedOperation.id}</p>
+                        <Button className="mt-2" size="sm" variant="secondary" onClick={forgetPaperOperation}>Forget operation</Button>
+                      </Alert>
+                    ) : staleOperation ? (
                       <Alert tone="warning" className="mt-3">
                         <p>The remembered operation {shortHash(operationId ?? "")} is no longer known to this server. Its outcome is recorded in the ledger and session history.</p>
-                        <Button className="mt-2" size="sm" variant="secondary" onClick={forgetStaleOperation}>Forget operation</Button>
+                        <Button className="mt-2" size="sm" variant="secondary" onClick={forgetPaperOperation}>Forget operation</Button>
                       </Alert>
                     ) : operationResource.apiError ? (
                       <ErrorNotice className="mt-3" error={operationResource.apiError} onAction={operationResource.refresh} actionLabel="Inspect status" />
@@ -937,11 +999,15 @@ function readPaperOperationId(name: string): string | null {
   }
 }
 
-function persistPaperOperationId(name: string, operationId: string): void {
+function persistPaperOperationId(name: string, operationId: string): boolean {
   try {
-    window.localStorage.setItem(paperOperationStorageKey(name), operationId);
+    if (/^[a-f0-9]{32}$/.test(operationId)) {
+      window.localStorage.setItem(paperOperationStorageKey(name), operationId);
+      return window.localStorage.getItem(paperOperationStorageKey(name)) === operationId;
+    }
+    return false;
   } catch {
-    return;
+    return false;
   }
 }
 

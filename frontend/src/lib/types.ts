@@ -436,9 +436,30 @@ export interface BacktestPayload {
   mandate_hash: string;
   authorize_paid_provider?: boolean;
   confirm_fd_self_service_pricing?: boolean;
+  cost_model_id?: string | null;
+  cost_model_version?: string | null;
   paid_max_calls?: number | null;
   paid_max_cost_usd?: string | null;
   paid_max_attempt_cost_usd?: string | null;
+}
+
+export interface OperationPreviewRequest {
+  action: "backtest";
+  subject_id: string;
+  expected_head: string;
+  payload: BacktestPayload;
+}
+
+export interface OperationAcceptRequest extends OperationPreviewRequest {
+  request_id: string;
+  preview_id: string;
+  preview_digest: string;
+  confirmation_token: string;
+  due_set: string[];
+}
+
+export interface OperationCancelRequest {
+  request_id: string;
 }
 
 export interface Operation {
@@ -468,9 +489,9 @@ export interface OperationPreview {
   preview_id: string;
   preview_digest: string;
   confirmation_token: string;
-  action: string;
+  action: "backtest";
   subject_id: string;
-  expected_head: string | null;
+  expected_head: string;
   due_set: string[];
   capture_id: string;
   capture_digest: string;

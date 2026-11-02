@@ -1,6 +1,6 @@
 import { afterEach, expect, it, vi } from "vitest";
 
-import { ApiError, apiGet, apiPost, setMutationToken, subscribeApiEvents, type ApiEvent } from "@/lib/api";
+import { ApiError, acceptOperation, apiDelete, apiGet, apiPost, cancelOperation, getOperation, previewOperation, setMutationToken, subscribeApiEvents, type ApiEvent } from "@/lib/api";
 import { toActionableError } from "@/lib/errors";
 
 function stubFetch(status: number, body: unknown) {
@@ -12,6 +12,153 @@ function stubFetch(status: number, body: unknown) {
 afterEach(() => {
   vi.unstubAllGlobals();
   setMutationToken(null);
+});
+
+it("submits a backtest preview once through the same-origin CSRF-guarded client", async () => {
+  const request = {
+    action: "backtest" as const,
+    subject_id: "synthetic-fund",
+    expected_head: "a".repeat(64),
+    payload: {
+      fund: "synthetic-fund",
+      universe: ["TEST"],
+      start: "2026-01-01",
+      end: "2026-01-02",
+      provider: "fixture",
+      model: "fixture",
+      mandate_hash: "a".repeat(64),
+    },
+  };
+  const response = { preview_id: "b".repeat(32), confirmation_token: "synthetic-confirmation" };
+  const fake = stubFetch(201, response);
+  setMutationToken("synthetic-csrf");
+
+  expect(await previewOperation(request)).toEqual(response);
+  expect(fake).toHaveBeenCalledTimes(1);
+  expect(fake).toHaveBeenCalledWith("/api/operations/preview", expect.objectContaining({
+    method: "POST",
+    mode: "same-origin",
+    credentials: "same-origin",
+    cache: "no-store",
+    body: JSON.stringify(request),
+    headers: expect.objectContaining({
+      "content-type": "application/json",
+      "x-csrf-token": "synthetic-csrf",
+    }),
+  }));
+});
+
+it("does not retry or persist an admission when its response is lost", async () => {
+  const request = {
+    request_id: "synthetic-request",
+    action: "backtest" as const,
+    subject_id: "synthetic-fund",
+    preview_id: "b".repeat(32),
+    preview_digest: "c".repeat(64),
+    confirmation_token: "synthetic-confirmation",
+    expected_head: "a".repeat(64),
+    due_set: [],
+    payload: {
+      fund: "synthetic-fund",
+      universe: ["TEST"],
+      start: "2026-01-01",
+      end: "2026-01-02",
+      provider: "fixture",
+      model: "fixture",
+      mandate_hash: "a".repeat(64),
+    },
+  };
+  const fake = vi.fn(async () => { throw new TypeError("response lost"); });
+  vi.stubGlobal("fetch", fake);
+  setMutationToken("synthetic-csrf");
+  window.localStorage.clear();
+  window.sessionStorage.clear();
+
+  await expect(acceptOperation(request)).rejects.toMatchObject({
+    status: 0,
+    retryPolicy: "inspect-status",
+  });
+  expect(fake).toHaveBeenCalledTimes(1);
+  expect(fake).toHaveBeenCalledWith("/api/operations", expect.objectContaining({
+    method: "POST",
+    body: JSON.stringify(request),
+    headers: expect.objectContaining({ "x-csrf-token": "synthetic-csrf" }),
+  }));
+  expect(window.localStorage.length).toBe(0);
+  expect(window.sessionStorage.length).toBe(0);
+});
+
+it("reads only a valid durable operation ID from the local status endpoint", async () => {
+  const operationId = "d".repeat(32);
+  const receipt = { operation_id: operationId, status: "running" };
+  const fake = stubFetch(200, receipt);
+
+  expect(await getOperation(operationId)).toEqual(receipt);
+  await expect(getOperation("../settings")).rejects.toThrow("Invalid operation ID.");
+  expect(fake).toHaveBeenCalledTimes(1);
+  expect(fake).toHaveBeenCalledWith(
+    `/api/operations/${operationId}`,
+    expect.objectContaining({ method: "GET", mode: "same-origin", credentials: "same-origin" }),
+  );
+});
+
+it("does not issue a read that was already cancelled", async () => {
+  const fake = vi.fn(async () => new Response("{}"));
+  vi.stubGlobal("fetch", fake);
+  const controller = new AbortController();
+  controller.abort();
+  const events: ApiEvent[] = [];
+  const unsubscribe = subscribeApiEvents((event) => events.push(event));
+  try {
+    await expect(getOperation("a".repeat(32), { signal: controller.signal })).rejects.toMatchObject({ name: "AbortError" });
+    expect(fake).not.toHaveBeenCalled();
+    expect(events).not.toContain("connection-lost");
+  } finally {
+    unsubscribe();
+  }
+});
+
+it("sends a separately identified cancellation once and reports a lost response as ambiguous", async () => {
+  const operationId = "e".repeat(32);
+  const receipt = {
+    id: operationId, operation_id: operationId, request_id: "original-request",
+    action: "backtest", subject_id: "synthetic-fund", fund: "synthetic-fund",
+    capture_id: "f".repeat(32), capture_digest: "a".repeat(64),
+    created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:01Z",
+    status: "cancel-requested", progress: 10,
+  };
+  const fake = vi.fn()
+    .mockResolvedValueOnce(new Response(JSON.stringify(receipt), { status: 200 }))
+    .mockRejectedValueOnce(new TypeError("response lost"));
+  vi.stubGlobal("fetch", fake);
+  setMutationToken("synthetic-csrf");
+
+  expect(await cancelOperation(operationId, { request_id: "cancel-one" })).toEqual(receipt);
+  await expect(cancelOperation(operationId, { request_id: "cancel-two" })).rejects.toMatchObject({
+    status: 0,
+    retryPolicy: "inspect-status",
+  });
+  await expect(cancelOperation("../settings", { request_id: "cancel-three" })).rejects.toThrow("Invalid operation ID.");
+  expect(fake).toHaveBeenCalledTimes(2);
+  expect(fake).toHaveBeenNthCalledWith(1, `/api/operations/${operationId}/cancel`, expect.objectContaining({
+    method: "POST",
+    body: JSON.stringify({ request_id: "cancel-one" }),
+    headers: expect.objectContaining({ "x-csrf-token": "synthetic-csrf" }),
+  }));
+  expect(fake).toHaveBeenNthCalledWith(2, `/api/operations/${operationId}/cancel`, expect.objectContaining({
+    body: JSON.stringify({ request_id: "cancel-two" }),
+  }));
+});
+
+it("does not report an incomplete cancellation receipt as a successful cancellation", async () => {
+  const operationId = "e".repeat(32);
+  const fake = stubFetch(200, { operation_id: operationId, status: "cancel-requested" });
+  await expect(cancelOperation(operationId, { request_id: "cancel-incomplete" })).rejects.toMatchObject({
+    status: 200,
+    retryPolicy: "inspect-status",
+    requestId: "cancel-incomplete",
+  });
+  expect(fake).toHaveBeenCalledTimes(1);
 });
 
 it("exposes the common error envelope on ApiError", async () => {
@@ -57,6 +204,23 @@ it("keeps validation details generic", async () => {
   expect(error).toMatchObject({ message: "Invalid request.", status: 400, code: "invalid-request" });
 });
 
+it("handles malformed entries in an error detail array without losing retry guidance", async () => {
+  stubFetch(503, {
+    detail: [null, 12, { message: 42 }, { message: "Status temporarily unavailable." }],
+    code: "observation-conflict",
+    retry_policy: "retry-read-only",
+  });
+  await expect(apiGet("/api/operations")).rejects.toMatchObject({
+    message: "Status temporarily unavailable.", status: 503, retryPolicy: "retry-read-only",
+  });
+
+  const fake = stubFetch(503, { detail: [null, 12, { message: "Admission unavailable." }] });
+  await expect(apiPost("/api/operations", {})).rejects.toMatchObject({
+    message: "Admission unavailable.", status: 503, retryPolicy: "inspect-status",
+  });
+  expect(fake).toHaveBeenCalledTimes(1);
+});
+
 it("keeps safe identity echoes and drops hostile ones", async () => {
   stubFetch(409, {
     detail: "Mandate changed after review.",
@@ -89,6 +253,70 @@ it("maps a lost read to retry and a lost mutation to inspect-status without retr
   expect(toActionableError(write)).toMatchObject({ action: "reconnect", guidance: expect.stringMatching(/inspect durable status/) });
   expect(fake).toHaveBeenCalledTimes(2);
   expect(events).toEqual(["connection-lost", "connection-lost"]);
+});
+
+it("treats an unreadable successful response as an ambiguous mutation or retryable read", async () => {
+  const fake = vi.fn()
+    .mockResolvedValueOnce(new Response("{", { status: 202 }))
+    .mockResolvedValueOnce(new Response("{", { status: 200 }))
+    .mockResolvedValueOnce(new Response("{", { status: 409 }));
+  vi.stubGlobal("fetch", fake);
+  const events: ApiEvent[] = [];
+  const unsubscribe = subscribeApiEvents((event) => events.push(event));
+  try {
+    const write = await apiPost("/api/operations", { request_id: "r1" }).catch((caught: unknown) => caught);
+    const read = await apiGet("/api/operations").catch((caught: unknown) => caught);
+    const denied = await apiPost("/api/operations", {}).catch((caught: unknown) => caught);
+    expect(write).toMatchObject({ status: 202, retryPolicy: "inspect-status" });
+    expect(toActionableError(write).guidance).toMatch(/inspect|status/i);
+    expect(read).toMatchObject({ status: 200, retryPolicy: "retry-read-only" });
+    expect(denied).toMatchObject({ status: 409, retryPolicy: "inspect-status" });
+    expect(fake).toHaveBeenCalledTimes(3);
+    expect(events).not.toContain("connection-lost");
+  } finally {
+    unsubscribe();
+  }
+});
+
+it("keeps unreadable server errors safe for reads and ambiguous for mutations", async () => {
+  const fake = vi.fn()
+    .mockResolvedValueOnce(new Response("{", { status: 503 }))
+    .mockResolvedValueOnce(new Response("null", { status: 503 }))
+    .mockResolvedValueOnce(new Response("{", { status: 503 }))
+    .mockResolvedValueOnce(new Response('"unexpected"', { status: 503 }))
+    .mockResolvedValueOnce(new Response("[]", { status: 503 }))
+    .mockResolvedValueOnce(new Response('"unexpected"', { status: 409 }))
+    .mockResolvedValueOnce(new Response("{}", { status: 503 }))
+    .mockResolvedValueOnce(new Response('{"error":"unavailable"}', { status: 503 }))
+    .mockResolvedValueOnce(new Response('{"detail":"Existing conflict."}', { status: 409 }));
+  vi.stubGlobal("fetch", fake);
+
+  await expect(apiGet("/api/operations")).rejects.toMatchObject({ status: 503, retryPolicy: "retry-read-only" });
+  await expect(apiGet("/api/operations")).rejects.toMatchObject({ status: 503, retryPolicy: "retry-read-only" });
+  await expect(apiPost("/api/operations", {})).rejects.toMatchObject({ status: 503, retryPolicy: "inspect-status" });
+  await expect(apiGet("/api/operations")).rejects.toMatchObject({ status: 503, retryPolicy: "retry-read-only" });
+  await expect(apiGet("/api/operations")).rejects.toMatchObject({ status: 503, retryPolicy: "retry-read-only" });
+  await expect(apiPost("/api/operations", {})).rejects.toMatchObject({ status: 409, retryPolicy: "inspect-status" });
+  await expect(apiGet("/api/operations")).rejects.toMatchObject({ status: 503, retryPolicy: "retry-read-only" });
+  await expect(apiPost("/api/operations", {})).rejects.toMatchObject({ status: 503, retryPolicy: "inspect-status" });
+  await expect(apiPost("/api/operations", {})).rejects.toMatchObject({
+    message: "Existing conflict.", status: 409, retryPolicy: "inspect-status",
+  });
+  expect(fake).toHaveBeenCalledTimes(9);
+});
+
+it("allows an explicitly empty DELETE response without accepting an empty operation receipt", async () => {
+  const fake = vi.fn()
+    .mockResolvedValueOnce(new Response(null, { status: 204 }))
+    .mockResolvedValueOnce(new Response(null, { status: 204 }));
+  vi.stubGlobal("fetch", fake);
+
+  await expect(apiDelete("/api/settings/credentials/synthetic")).resolves.toBeUndefined();
+  await expect(apiPost("/api/operations", { request_id: "r1" })).rejects.toMatchObject({
+    status: 204,
+    retryPolicy: "inspect-status",
+  });
+  expect(fake).toHaveBeenCalledTimes(2);
 });
 
 it("signals session renewal only for rejected mutations that require reload", async () => {

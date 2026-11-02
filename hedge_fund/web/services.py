@@ -2679,6 +2679,20 @@ class DeskService:
             raise ServiceError(status, "Operation is unavailable.") from None
         return self._operation_view(operation)
 
+    def get_operation_by_request(self, request_id: str) -> dict:
+        store = self._operation_store
+        if store is None:
+            raise ServiceError(503, "Operation status storage is unavailable; the request outcome is unknown. Retry the read.", code="observation-conflict", request_id=request_id)
+        try:
+            operation = store.get_by_request(request_id)
+        except OperationBusy:
+            raise ServiceError(503, "Operation status is busy; retry the read.", code="observation-conflict", request_id=request_id) from None
+        except OperationError:
+            raise ServiceError(409, "Operation status is unavailable; the request outcome is unknown.", request_id=request_id) from None
+        if operation is None:
+            raise ServiceError(404, "No operation was found for this request; the outcome is still unknown.", code="not-found", request_id=request_id)
+        return self._operation_view(operation)
+
     def list_operations(self, *, limit: int = 100) -> dict:
         if type(limit) is not int or not 1 <= limit <= 100:
             raise ServiceError(400, "Operation page size is invalid.")

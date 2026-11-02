@@ -1,4 +1,14 @@
-import type { ApiErrorCode, ApiErrorShape, ApiRetryPolicy } from "@/lib/types";
+import type {
+  ApiErrorCode,
+  ApiErrorShape,
+  ApiRetryPolicy,
+  Operation,
+  OperationAcceptRequest,
+  OperationCancelRequest,
+  OperationPreview,
+  OperationPreviewRequest,
+} from "@/lib/types";
+import { matchesOperationIdentity, type ExpectedOperationIdentity } from "@/lib/operation-identity";
 
 const API_ERROR_CODES: ReadonlySet<string> = new Set<ApiErrorCode>([
   "invalid-request",
@@ -100,9 +110,24 @@ export function setMutationToken(token: string | null): void {
   mutationToken = token;
 }
 
-export async function apiGet<T>(path: string, options: { timeoutMs?: number } = {}): Promise<T> {
-  // A bounded read fails as an unreachable server instead of hanging; only read-only callers opt in.
-  return request<T>(path, options.timeoutMs ? { method: "GET", signal: AbortSignal.timeout(options.timeoutMs) } : { method: "GET" });
+export interface ApiGetOptions {
+  timeoutMs?: number;
+  signal?: AbortSignal;
+}
+
+export async function apiGet<T>(path: string, options: ApiGetOptions = {}): Promise<T> {
+  if (options.signal?.aborted) throw new DOMException("Read cancelled.", "AbortError");
+  if (!options.timeoutMs && !options.signal) return request<T>(path, { method: "GET" });
+  const controller = new AbortController();
+  const cancel = () => controller.abort();
+  options.signal?.addEventListener("abort", cancel, { once: true });
+  const timer = options.timeoutMs ? setTimeout(cancel, options.timeoutMs) : undefined;
+  try {
+    return await request<T>(path, { method: "GET", signal: controller.signal }, options.signal);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+    options.signal?.removeEventListener("abort", cancel);
+  }
 }
 
 export async function apiPost<T>(path: string, body?: unknown): Promise<T> {
@@ -115,6 +140,52 @@ export async function apiPost<T>(path: string, body?: unknown): Promise<T> {
   });
 }
 
+export function previewOperation(request: OperationPreviewRequest): Promise<OperationPreview> {
+  return apiPost<OperationPreview>("/api/operations/preview", request);
+}
+
+export function requireMutationOperationReceipt(
+  value: unknown,
+  expected: ExpectedOperationIdentity,
+  requestId: string,
+  status = 202,
+): Operation {
+  if (!matchesOperationIdentity(value, expected)) {
+    throw new ApiError("The operation receipt is incomplete or inconsistent; inspect durable status.", status, {
+      retryPolicy: "inspect-status",
+      requestId,
+    });
+  }
+  return value;
+}
+
+export async function acceptOperation(request: OperationAcceptRequest): Promise<Operation> {
+  const receipt = await apiPost<unknown>("/api/operations", request);
+  return requireMutationOperationReceipt(receipt, {
+    requestId: request.request_id,
+    action: request.action,
+    subjectId: request.subject_id,
+  }, request.request_id);
+}
+
+function operationPath(operationId: string): string {
+  if (!/^[a-f0-9]{32}$/.test(operationId)) throw new Error("Invalid operation ID.");
+  return `/api/operations/${operationId}`;
+}
+
+export async function getOperation(operationId: string, options: ApiGetOptions = {}): Promise<Operation> {
+  return apiGet<Operation>(operationPath(operationId), options);
+}
+
+export async function cancelOperation(operationId: string, request: OperationCancelRequest): Promise<Operation> {
+  const receipt = await apiPost<unknown>(`${operationPath(operationId)}/cancel`, request);
+  return requireMutationOperationReceipt(receipt, { operationId }, request.request_id, 200);
+}
+
+export function isExpiredConfirmation(cause: unknown): boolean {
+  return cause instanceof ApiError && cause.status === 410 && cause.code === "expired-confirmation";
+}
+
 export async function apiPut<T>(path: string, body: unknown): Promise<T> {
   const headers = new Headers({ "Content-Type": "application/json" });
   if (mutationToken) headers.set("X-CSRF-Token", mutationToken);
@@ -125,21 +196,39 @@ export async function apiPut<T>(path: string, body: unknown): Promise<T> {
   });
 }
 
-export async function apiDelete<T>(path: string): Promise<T> {
+export async function apiDelete<T = void>(path: string): Promise<T | undefined> {
   const headers = new Headers();
   if (mutationToken) headers.set("X-CSRF-Token", mutationToken);
-  return request<T>(path, { method: "DELETE", headers });
+  return request<T | undefined>(path, { method: "DELETE", headers });
 }
 
-async function request<T>(path: string, init: RequestInit): Promise<T> {
+function abortable<T>(promise: Promise<T>, signal: AbortSignal | null | undefined): Promise<T> {
+  if (!signal) return promise;
+  return new Promise<T>((resolve, reject) => {
+    const abort = () => reject(new DOMException("Read cancelled.", "AbortError"));
+    if (signal.aborted) {
+      void promise.catch(() => undefined);
+      abort();
+      return;
+    }
+    signal.addEventListener("abort", abort, { once: true });
+    promise.then(
+      (value) => { signal.removeEventListener("abort", abort); resolve(value); },
+      (cause: unknown) => { signal.removeEventListener("abort", abort); reject(cause); },
+    );
+  });
+}
+
+async function request<T>(path: string, init: RequestInit, cancelledBy?: AbortSignal): Promise<T> {
   if (!path.startsWith("/api/")) {
     throw new Error("API paths must stay under /api.");
   }
   const mutation = (init.method ?? "GET") !== "GET";
   const startedEpoch = connectionEpoch;
   let response: Response;
+  let payload: unknown;
   try {
-    response = await fetch(path, {
+    response = await abortable(fetch(path, {
       ...init,
       mode: "same-origin",
       credentials: "same-origin",
@@ -148,8 +237,44 @@ async function request<T>(path: string, init: RequestInit): Promise<T> {
         Accept: "application/json",
         ...Object.fromEntries(new Headers(init.headers).entries()),
       },
-    });
-  } catch {
+    }), init.signal);
+    if (startedEpoch === connectionEpoch) emit("connection-ok");
+    if (response.status === 204 && init.method === "DELETE") return undefined as T;
+    try {
+      payload = await abortable(response.json(), init.signal);
+    } catch (cause) {
+      if (init.signal?.aborted) throw cause;
+      if (response.ok) {
+        throw new ApiError(
+          mutation
+            ? "The response could not be read; the request outcome is unknown."
+            : "The response could not be read; retry the observation.",
+          response.status,
+          { retryPolicy: mutation ? "inspect-status" : "retry-read-only" },
+        );
+      }
+      payload = null;
+    }
+    if (response.ok && mutation && payload === null) {
+      throw new ApiError("The response was empty; the request outcome is unknown.", response.status, { retryPolicy: "inspect-status" });
+    }
+    const hasErrorObject = payload !== null && typeof payload === "object" && !Array.isArray(payload);
+    const shape = hasErrorObject ? payload as ApiErrorShape : null;
+    const hasErrorEnvelope = shape !== null && typeof shape.code === "string" && API_ERROR_CODES.has(shape.code)
+      && typeof shape.retry_policy === "string" && RETRY_POLICIES.has(shape.retry_policy);
+    if (!response.ok && !hasErrorEnvelope && (mutation || response.status >= 500 || response.status === 429)) {
+      const detail = errorMessage(shape);
+      throw new ApiError(
+        detail !== "Request failed." ? detail : mutation
+          ? "The error response could not be read; inspect the request outcome."
+          : "The error response could not be read; retry the observation.",
+        response.status,
+        { retryPolicy: mutation ? "inspect-status" : "retry-read-only" },
+      );
+    }
+  } catch (cause) {
+    if (cancelledBy?.aborted) throw cause;
+    if (cause instanceof ApiError) throw cause;
     connectionEpoch += 1;
     emit("connection-lost");
     // A lost mutation may have reached the server; only durable status can tell, so never auto-retry it.
@@ -157,8 +282,6 @@ async function request<T>(path: string, init: RequestInit): Promise<T> {
       ? new ApiError("Connection to the local desk was lost; the request outcome is unknown.", 0, { retryPolicy: "inspect-status" })
       : new ApiError("The local desk server is unreachable.", 0, { retryPolicy: "retry-read-only" });
   }
-  if (startedEpoch === connectionEpoch) emit("connection-ok");
-  const payload: unknown = await response.json().catch(() => null);
   if (!response.ok) {
     const shape = payload as ApiErrorShape | null;
     const error = new ApiError(errorMessage(shape), response.status, errorEnvelope(shape));
@@ -185,12 +308,12 @@ function errorEnvelope(payload: ApiErrorShape | null) {
 }
 
 function errorMessage(payload: ApiErrorShape | null): string {
-  if (!payload || !("detail" in payload)) return "Request failed.";
+  if (!payload || typeof payload !== "object" || Array.isArray(payload) || !("detail" in payload)) return "Request failed.";
   if (typeof payload.detail === "string") return payload.detail;
   if (Array.isArray(payload.detail)) {
     return payload.detail
-      .map((item) => item.message)
-      .filter((message): message is string => Boolean(message))
+      .map((item) => item?.message)
+      .filter((message): message is string => typeof message === "string" && message.length > 0)
       .join(" ") || "Request validation failed.";
   }
   return "Request failed.";

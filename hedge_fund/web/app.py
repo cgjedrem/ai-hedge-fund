@@ -10,6 +10,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from fastapi import FastAPI, Query, Request
+from fastapi import Path as ApiPath
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, Response
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -413,6 +414,12 @@ def create_app(
     @app.get("/api/operations")
     def operations(limit: int = Query(default=100, ge=1, le=100)):
         return service.list_operations(limit=limit)
+
+    @app.get("/api/operations/by-request/{request_id}")
+    def operation_by_request(
+        request_id: str = ApiPath(pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"),
+    ):
+        return service.get_operation_by_request(request_id)
 
     @app.get("/api/operations/{operation_id}")
     def operation(operation_id: str):

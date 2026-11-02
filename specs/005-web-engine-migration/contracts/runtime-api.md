@@ -61,6 +61,16 @@ Implementation notes (2026-11-02 error-recovery slice, source-tested; 429 row st
   capabilities reload and asks the operator to submit again.
 - An unavailable operation store is 503 `observation-conflict` / `retry-read-only`, not 404, so a
   remembered operation is not offered for forgetting.
+- The partial implementation also supports read-only GET
+  `/api/operations/by-request/{request_id}` to recover a lost admission response. It verifies
+  durable request, operation and capture linkage; 404 leaves the outcome unknown rather than
+  proving no effects. The browser retains only non-secret request/operation identities, keeps
+  recovered identities independently, and does not resubmit on reload or reconnect. It observes
+  at most 16 saved identities per surface at once; active, unavailable, mismatched and unobserved
+  identities block a new admission until terminal status is verified or the operator explicitly
+  removes the monitor. Removing a monitor does not cancel the operation or establish its outcome.
+  A structured 410 `expired-confirmation` from this single admission attempt is a pre-admission
+  denial; malformed or ambiguous responses remain subject to status inspection.
 - Observation is polling only (no stream/channel). The client tracks a connection epoch: a
   response to a request sent before a connection loss does not report recovery; Reconnect issues a
   fresh capabilities read bounded to 10 s.

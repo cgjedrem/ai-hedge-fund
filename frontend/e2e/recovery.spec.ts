@@ -40,7 +40,13 @@ test("stale lifecycle review shows a real 409 and Review again requests a fresh 
   expect(capabilities.network).toBe(false);
   const archivesBefore = await archiveCount(page);
 
+  const previewResponse = page.waitForResponse((response) =>
+    new URL(response.url()).pathname === "/api/lifecycle/preview"
+    && response.request().method() === "POST",
+  );
   await page.getByRole("button", { name: "Review archive", exact: true }).click();
+  const initialPreview = await previewResponse;
+  expect(initialPreview.status(), await initialPreview.text()).toBe(200);
   const review = page.getByRole("dialog");
   await expect(review.getByRole("button", { name: "Confirm archive" })).toBeEnabled();
   const mandate = await (await page.request.get("/api/mandates/demo-quality")).json();

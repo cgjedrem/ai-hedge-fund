@@ -548,10 +548,13 @@ def test_unavailable_operation_storage_is_not_reported_as_an_unknown_operation(t
     app.state.service._operation_store = None
     with TestClient(app) as client:
         response = client.get("/api/operations/" + "f" * 32, headers=LOOPBACK)
+        by_request = client.get("/api/operations/by-request/synthetic-request", headers=LOOPBACK)
 
     body = _assert_envelope(response, 503, "observation-conflict", root=tmp_path)
     assert body["code"] != "not-found"
     assert (body["retry_policy"], body["subject_id"]) == ("retry-read-only", "f" * 32)
+    request_body = _assert_envelope(by_request, 503, "observation-conflict", root=tmp_path)
+    assert request_body["retry_policy"] == "retry-read-only"
 
 
 def test_service_error_rejects_unknown_retry_policy():

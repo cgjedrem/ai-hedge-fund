@@ -1,8 +1,9 @@
 import { AlertCircle, ArrowRight, CircleStop, Clock3, FlaskConical, RefreshCw } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 
 import { DataTable, type TableColumn } from "@/components/data-table";
+import { PendingOperationRecovery } from "@/components/pending-operation-recovery";
 import { ErrorNotice, ErrorState, PageHeader, SectionTitle } from "@/components/page";
 import { Alert } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
@@ -25,9 +26,10 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { apiPost } from "@/lib/api";
+import { acceptOperation, cancelOperation, isExpiredConfirmation, previewOperation } from "@/lib/api";
 import { toActionableError, type ActionableError } from "@/lib/errors";
-import { useDesk, useResource } from "@/lib/hooks";
+import { useDesk, useOperation, useResource } from "@/lib/hooks";
+import { usePendingOperations } from "@/lib/use-pending-operations";
 import type { MandateCollection, Operation, OperationPreview, OperationStatus, Settings } from "@/lib/types";
 import { dateLabel } from "@/lib/utils";
 
@@ -42,12 +44,13 @@ function readSelectedOperationId(): string | null {
   }
 }
 
-function persistSelectedOperationId(operationId: string | null): void {
+function persistSelectedOperationId(operationId: string | null): boolean {
   try {
-    if (operationId) window.localStorage.setItem(SELECTED_OPERATION_STORAGE_KEY, operationId);
+    if (operationId && /^[a-f0-9]{32}$/.test(operationId)) window.localStorage.setItem(SELECTED_OPERATION_STORAGE_KEY, operationId);
     else window.localStorage.removeItem(SELECTED_OPERATION_STORAGE_KEY);
+    return window.localStorage.getItem(SELECTED_OPERATION_STORAGE_KEY) === operationId;
   } catch {
-    return;
+    return false;
   }
 }
 
@@ -66,11 +69,10 @@ export function BacktestsPage() {
   const mandates = useResource<MandateCollection>("/api/mandates");
   const settings = useResource<Settings>("/api/settings");
   const operations = useResource<{ items: Operation[] }>("/api/operations");
+  const pending = usePendingOperations("backtest");
   const [operationId, setOperationId] = useState<string | null>(readSelectedOperationId);
   const [operationSelectionRestored, setOperationSelectionRestored] = useState(false);
-  const currentOperation = useResource<Operation>(
-    operationId ? `/api/operations/${encodeURIComponent(operationId)}` : null,
-  );
+  const currentOperation = useOperation(operationId);
   const [fund, setFund] = useState("");
   const [universeText, setUniverseText] = useState("");
   const [start, setStart] = useState(() => {
@@ -88,12 +90,18 @@ export function BacktestsPage() {
   const [cancelling, setCancelling] = useState(false);
   const [confirmation, setConfirmation] = useState<OperationPreview | null>(null);
   const [error, setError] = useState<string | ActionableError | null>(null);
+  const previewInFlight = useRef(false);
+  const admissionInFlight = useRef(false);
+  const cancellationInFlight = useRef(false);
   const selectOperation = useCallback((selectedId: string | null) => {
     setOperationId(selectedId);
-    persistSelectedOperationId(selectedId);
+    const saved = persistSelectedOperationId(selectedId);
+    if (!saved) setError("Browser storage could not preserve the operation monitor. Any pending request identity is retained.");
+    return saved;
   }, []);
   const canWrite = capabilities?.writes === true;
-  const canRun = canWrite && capabilities?.network === true;
+  const hasRunCapability = canWrite && capabilities?.network === true;
+  const canRun = hasRunCapability && !pending.blocked;
   const activeOperation = currentOperation.data?.id === operationId ? currentOperation.data : null;
   const selectedMandate = mandates.data?.items.find((item) => item.name === fund) ?? null;
   const selectedModel = settings.data?.models.find((item) => item.id === settings.data?.model) ?? null;
@@ -135,17 +143,10 @@ export function BacktestsPage() {
   }, [settings.data?.data_provider, settings.data?.llm_provider, settings.data?.model, settings.data?.version]);
 
   useEffect(() => {
-    if (!activeOperation || !["accepted", "running", "cancel-requested"].includes(activeOperation.status)) return;
-    const timer = window.setTimeout(currentOperation.refresh, 1200);
-    return () => window.clearTimeout(timer);
-  }, [activeOperation?.status, activeOperation?.progress, currentOperation.refresh]);
-
-  useEffect(() => {
     if (!operations.data || operationSelectionRestored) return;
     const items = operations.data.items;
-    const selected = operationId && items.some((item) => item.id === operationId)
-      ? operationId
-      : items.find((item) => ["accepted", "running", "cancel-requested"].includes(item.status))?.id
+    const selected = operationId
+      ?? items.find((item) => ["accepted", "running", "cancel-requested"].includes(item.status))?.id
         ?? items[0]?.id
         ?? null;
     if (selected !== operationId) selectOperation(selected);
@@ -159,6 +160,7 @@ export function BacktestsPage() {
   const operationColumns = useMemo<TableColumn<Operation>[]>(
     () => [
       { key: "fund", label: "Mandate", render: (item) => <span className="mono text-foreground">{item.fund}</span> },
+      { key: "action", label: "Action", render: (item) => <span className="mono text-xs">{item.action}</span> },
       { key: "provider", label: "Provider / model", render: (item) => <span className="text-xs">{item.provider} · {item.model}</span> },
       { key: "submitted", label: "Created", render: (item) => <span className="mono text-[10px]">{dateLabel(item.created_at)}</span> },
       { key: "status", label: "Status", render: (item) => <OperationStatusBadge status={item.status} /> },
@@ -184,9 +186,12 @@ export function BacktestsPage() {
   );
 
   async function requestConfirmation(): Promise<void> {
+    if (previewInFlight.current) return;
     setError(null);
     if (!canRun) {
-      setError("Backtests require startup write capability and explicit network consent.");
+      setError(hasRunCapability
+        ? "Resolve or inspect the pending and saved operation monitors before starting another backtest."
+        : "Backtests require startup write capability and explicit network consent.");
       return;
     }
     const universe = universeText
@@ -241,9 +246,10 @@ export function BacktestsPage() {
           }
         : {}),
     };
+    previewInFlight.current = true;
     setBusy(true);
     try {
-      const preview = await apiPost<OperationPreview>("/api/operations/preview", {
+      const preview = await previewOperation({
         action: "backtest",
         subject_id: fund,
         expected_head: selectedMandate.mandate_hash,
@@ -253,22 +259,38 @@ export function BacktestsPage() {
     } catch (cause) {
       setError(toActionableError(cause, "Backtest preview could not be created."));
     } finally {
+      previewInFlight.current = false;
       setBusy(false);
     }
   }
 
   async function submitConfirmed(): Promise<void> {
-    if (!confirmation) return;
+    if (!confirmation || admissionInFlight.current) return;
     if (!canRun) {
-      setError("Backtests require both startup write capability and explicit network consent.");
+      setError(hasRunCapability
+        ? "Resolve or inspect the pending and saved operation monitors before starting another backtest."
+        : "Backtests require both startup write capability and explicit network consent.");
       setConfirmation(null);
       return;
     }
+    admissionInFlight.current = true;
     setBusy(true);
     setError(null);
+    const pendingRequest = {
+      requestId: newRequestId(),
+      action: confirmation.action,
+      subjectId: confirmation.subject_id,
+    };
+    if (!pending.remember(pendingRequest)) {
+      setError("The request identity could not be preserved or another request is unresolved. No operation was submitted.");
+      setConfirmation(null);
+      admissionInFlight.current = false;
+      setBusy(false);
+      return;
+    }
     try {
-      const operation = await apiPost<Operation>("/api/operations", {
-        request_id: newRequestId(),
+      const operation = await acceptOperation({
+        request_id: pendingRequest.requestId,
         action: confirmation.action,
         subject_id: confirmation.subject_id,
         preview_id: confirmation.preview_id,
@@ -278,31 +300,32 @@ export function BacktestsPage() {
         due_set: confirmation.due_set,
         payload: confirmation.payload,
       });
-      selectOperation(operation.id);
+      if (pending.save(pendingRequest, operation.id) && selectOperation(operation.id)) pending.forget(pendingRequest);
       setConfirmation(null);
       operations.refresh();
     } catch (cause) {
+      if (isExpiredConfirmation(cause)) pending.forget(pendingRequest);
       setError(toActionableError(cause, "Backtest could not be submitted."));
       setConfirmation(null);
     } finally {
+      admissionInFlight.current = false;
       setBusy(false);
     }
   }
 
   async function cancelActiveOperation(): Promise<void> {
-    if (!activeOperation || !running || !canWrite || cancelling) return;
+    if (!activeOperation || !running || !canWrite || cancelling || cancellationInFlight.current) return;
+    cancellationInFlight.current = true;
     setCancelling(true);
     setError(null);
     try {
-      await apiPost(
-        `/api/operations/${encodeURIComponent(activeOperation.id)}/cancel`,
-        { request_id: newRequestId() },
-      );
+      await cancelOperation(activeOperation.id, { request_id: newRequestId() });
       currentOperation.refresh();
       operations.refresh();
     } catch (cause) {
       setError(toActionableError(cause, "Cancellation request failed."));
     } finally {
+      cancellationInFlight.current = false;
       setCancelling(false);
     }
   }
@@ -336,7 +359,23 @@ export function BacktestsPage() {
       />
       {typeof error === "string" ? <Alert tone="danger" className="mb-5"><AlertCircle className="mr-2 inline h-4 w-4" />{error}</Alert> : null}
       {error && typeof error !== "string" ? <ErrorNotice className="mb-5" error={error} onAction={() => recover(error)} /> : null}
-      {!canRun && capabilities ? (
+      <PendingOperationRecovery
+        items={pending.items}
+        saved={pending.saved}
+        error={pending.error}
+        onRefresh={pending.refresh}
+        onForget={pending.forget}
+        onMonitor={(item) => { selectOperation(item.operationId); }}
+        onForgetSaved={pending.forgetSaved}
+        onObserve={pending.observe}
+        onRecovered={(item, operation) => {
+          if (!pending.save(item, operation.id)) return false;
+          if (!selectOperation(operation.id)) return false;
+          operations.refresh();
+          return pending.forget(item);
+        }}
+      />
+      {!hasRunCapability && capabilities ? (
         <Alert tone="warning" className="mb-5">
           Backtests are disabled. Start a separate local server with explicit <span className="mono">--allow-writes --enable-network</span> only when you intend to use historical data providers.
         </Alert>
@@ -462,6 +501,7 @@ export function BacktestsPage() {
                   <div>
                     <p className="mono text-sm text-foreground">{activeOperation.fund}</p>
                     <p className="mono mt-1 text-[9px] text-muted-foreground">{activeOperation.id}</p>
+                    <p className="mono mt-1 text-[10px] text-muted-foreground">Action · {activeOperation.action}</p>
                   </div>
                   <OperationStatusBadge status={activeOperation.status} />
                 </div>
@@ -492,7 +532,9 @@ export function BacktestsPage() {
                       {cancelling || activeOperation.cancel_requested ? "Cancellation requested…" : "Request cancellation"}
                     </Button>
                     <p className="text-[10px] leading-relaxed text-muted-foreground">
-                      Cancellation is cooperative at valuation boundaries. An in-flight model or data step cannot be interrupted. Closing this page does not cancel the operation; shutdown fences unfinished work.
+                      {activeOperation.action === "backtest"
+                        ? "Cancellation is cooperative at valuation boundaries. An in-flight model or data step cannot be interrupted. Closing this page does not cancel the operation; shutdown fences unfinished work."
+                        : "Cancellation is a request at the operation's safe boundaries. Completed effects are not undone. Closing this page does not cancel the operation."}
                     </p>
                   </div>
                 ) : null}
