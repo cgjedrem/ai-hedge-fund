@@ -999,3 +999,63 @@ No other session process, checkout, preview or the worktree itself was removed.
   for audit but not verified. Linux path (cmdline/euid/cwd) has no native run in this slice.
 - Depends on incomplete T015/T021; existing-root read-only uncertainty remains. No browser (Playwright) restart run — API
   restart proven through FastAPI TestClient only.
+
+## T019 / T020 operation capacity and continuity slice (2026-11-03)
+
+**Status: implemented bounded slice; T019/T020 remain unchecked (PARTIAL). Migration remains 20/148, NOT READY TO MERGE.**
+
+### Candidate and isolation
+
+- Base and remote PR8 head verified before and after work: `5f3f909c4f9151d531b571dd37bdebe368ee127c` (`cgjedrem-vigilant-robot`).
+  Built in a separate worktree/branch (`cgjedrem-implement-t019-t020-recovery-gaps`); committed locally only, not pushed, pending
+  reconciliation with the concurrent T021 writer-race work. No write-authority, admission, ledger, cache, handover or race-matrix file changed.
+- Source/test identity (sorted repo-relative paths, NUL, staged blob bytes, NUL; `specs/` excluded): **`172ec10fc8e370d4e36e48674bf60e0e0e1023cc2aed4e7e02ebba1352f13fe5`**, **15 paths / 672,823 bytes**.
+- Windows/NTFS, Python 3.13.7 (an existing project venv used read-only with `PYTHONPATH` bound to this worktree), Node/Vitest/Playwright with
+  Edge channel. `PYTHON_DOTENV_DISABLED=1`, scratch HOME/TEMP removed after each run, credential/provider/proxy variables scrubbed;
+  loopback only; synthetic roots and fakes only. Ports 8765/49292 untouched; the owned browser harness used 8876 and released it.
+
+### Behavior implemented (source)
+
+- `OperationStore.accept_request(capacity=(actions, limit))`: under the registry lock and after replay, preview, expiry and stale checks,
+  counts root-wide unfinished records for the pool's actions; at the bound it raises `OperationCapacityExceeded` before any record is
+  written (preview stays issued, token unconsumed). Limit is validated as an integer 0..16 over a non-empty action set.
+- `OperationJobRegistry`: `try_reserve`/`release`/`submit(reservation=)` reserve an in-process worker slot before acceptance; startup
+  recovery refuses while slots are reserved. Records this process accepted but could not start or settle (status-read, start, interrupt,
+  fail or acknowledgement write failures) are tracked and re-interrupted by `reclaim_stranded()` at the next successful reservation;
+  active and foreign records are never touched.
+- Services: backtest pool capacity 1; paper tick/runner-start shared pool capacity 2. Either bound denies with 429 `capacity-denied` /
+  `retry-later`, `Retry-After: 30` and `retry_after_seconds: 30`, echoing subject and request. A replay of an accepted request still
+  returns its record at capacity.
+- Schema: `retry_after_seconds` allowed only on 429/503 for `capacity-denied`, `budget-exhausted`, `observation-conflict`,
+  `assets-unavailable`, integer 1..300; omitted otherwise. The handler mirrors it into the `Retry-After` header.
+- Frontend: `ApiError.retryAfterSeconds` (body first, header fallback, out-of-bound ignored), capacity guidance with the advisory wait,
+  and `isPreAdmissionDenial` releasing a pending identity only for 410 `expired-confirmation` or a same-request echoed 429
+  `capacity-denied`. No automatic resubmission. Existing polling (single in-flight read, 10 s timeout, abort on unmount, late
+  identity/cursor rejection, bounded read retries) is unchanged.
+
+### Results
+
+- Focused Python (`test_jobs.py`, `test_app.py`, `test_operations.py`, `test_actions.py`, `test_paper_operations.py`) before the final
+  review fix: **204 passed in 760.22 s**. After the fix: `test_jobs.py` + `test_paper_operations.py` + `test_operations.py` **117 passed in 563.55 s**; `test_app.py` **50 passed in 9.06 s**; `test_actions.py` was not rerun after the jobs-only fix.
+- Frontend `npm test`: **7 files, 110 passed**; `npm run build` (tsc + vite) passed; `npm run test:e2e-safety` 0 failures.
+- Owned real-API Playwright (`node e2e/run-owned.mjs --lifecycle`, port 8876, synthetic root; `page.route` only aborts non-origin
+  traffic): full run **9 passed, 6 failed, 2 did not run**. The same 6 failures occur identically at the unmodified base
+  `5f3f909` in this environment: lifecycle/mandate preview returns `writer-conflict` / "writer admission is unavailable" on the
+  harness demo root, a write-authority precondition outside this slice. Targeted rerun of lost-session renewal, server-loss
+  reconnect, stale-head tick rejection and running-operation reload restore: **4 passed**.
+- Style: changed-file Black/isort/flake8 (max line 420) findings equal to `HEAD` per file after isort repair; `git diff --check` clean.
+
+### Reviews and failed attempts
+
+- Initial independent review: one medium finding (own unsettled record held the durable bound until restart) -> stranded tracking and reclaim.
+- Final independent review: one medium finding (a `submit` failing before activation left an ACCEPTED record unreclaimed) -> stranded on
+  status-read and capacity/history refusal, with a regression test. No other findings.
+- First Vitest run failed 9 App tests because some fetch fakes lack `headers`; header read is now guarded. First build failed on the option
+  type (header string); fixed.
+
+### Open (keeps T019/T020 unchecked)
+
+- No production site emits 429 `budget-exhausted`.
+- Records orphaned by a crashed other process hold capacity until server-start recovery (fail-closed). `Retry-After` is advisory.
+- The capacity 429 is proven at the HTTP/app level, not browser-driven: demo work cannot be held deterministically without a production hook.
+- No observation stream/channel (polling only). Full Python suite, wheel/container, Linux and cross-browser evidence not run for this slice.

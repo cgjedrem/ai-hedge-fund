@@ -1,6 +1,6 @@
 import { afterEach, expect, it, vi } from "vitest";
 
-import { ApiError, acceptOperation, apiDelete, apiGet, apiPost, cancelOperation, getOperation, previewOperation, setMutationToken, subscribeApiEvents, type ApiEvent } from "@/lib/api";
+import { ApiError, acceptOperation, apiDelete, apiGet, apiPost, cancelOperation, getOperation, isPreAdmissionDenial, previewOperation, setMutationToken, subscribeApiEvents, type ApiEvent } from "@/lib/api";
 import { toActionableError } from "@/lib/errors";
 
 function stubFetch(status: number, body: unknown) {
@@ -388,4 +388,72 @@ it("does not let a response sent before a connection loss report recovery", asyn
   } finally {
     unsubscribe();
   }
+});
+
+it("surfaces a capacity denial once with its bounded retry hint and never resubmits", async () => {
+  const request = {
+    request_id: "capacity-request",
+    action: "backtest" as const,
+    subject_id: "synthetic-fund",
+    preview_id: "b".repeat(32),
+    preview_digest: "c".repeat(64),
+    confirmation_token: "synthetic-confirmation",
+    expected_head: "a".repeat(64),
+    due_set: [],
+    payload: {
+      fund: "synthetic-fund",
+      universe: ["TEST"],
+      start: "2026-01-01",
+      end: "2026-01-02",
+      provider: "fixture",
+      model: "fixture",
+      mandate_hash: "a".repeat(64),
+    },
+  };
+  const denial = {
+    detail: "Operation capacity is full; this request was not accepted and nothing was started.",
+    code: "capacity-denied",
+    refresh_required: false,
+    retry_policy: "retry-later",
+    subject_id: "synthetic-fund",
+    request_id: "capacity-request",
+    retry_after_seconds: 30,
+  };
+  const fake = vi.fn(async () => new Response(JSON.stringify(denial), { status: 429, headers: { "Content-Type": "application/json", "Retry-After": "30" } }));
+  vi.stubGlobal("fetch", fake);
+  setMutationToken("synthetic-csrf");
+
+  const caught = await acceptOperation(request).catch((cause: unknown) => cause);
+
+  expect(fake).toHaveBeenCalledTimes(1);
+  expect(caught).toMatchObject({ status: 429, code: "capacity-denied", retryPolicy: "retry-later", retryAfterSeconds: 30, requestId: "capacity-request" });
+  expect(isPreAdmissionDenial(caught, "capacity-request")).toBe(true);
+  expect(isPreAdmissionDenial(caught, "another-request")).toBe(false);
+  expect(toActionableError(caught)).toMatchObject({
+    action: "retry",
+    guidance: expect.stringMatching(/Nothing was accepted or started.*about 30 s/),
+  });
+});
+
+it("ignores out-of-bound or misplaced retry hints and uses the header only as a fallback", async () => {
+  const base = { detail: "Full.", code: "capacity-denied", refresh_required: false, retry_policy: "retry-later" };
+  for (const [status, body, header, expected] of [
+    [429, { ...base }, "45", 45],
+    [429, { ...base, retry_after_seconds: 12 }, "45", 12],
+    [429, { ...base }, "0", null],
+    [429, { ...base }, "301", null],
+    [429, { ...base }, "Wed, 21 Oct 2026 07:28:00 GMT", null],
+    [409, { ...base, code: "writer-conflict", retry_after_seconds: 30 }, "30", null],
+  ] as const) {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json", "Retry-After": header } })));
+    const caught = await apiPost("/api/operations", {}).catch((cause: unknown) => cause) as ApiError;
+    expect(caught.retryAfterSeconds).toBe(expected);
+  }
+});
+
+it("does not treat an unechoed or non-capacity 429 as proof that nothing was accepted", () => {
+  expect(isPreAdmissionDenial(new ApiError("Full.", 429, { code: "capacity-denied", retryPolicy: "retry-later" }), "r1")).toBe(false);
+  expect(isPreAdmissionDenial(new ApiError("Budget.", 429, { code: "budget-exhausted", requestId: "r1" }), "r1")).toBe(false);
+  expect(isPreAdmissionDenial(new ApiError("Unknown.", 409, { code: "ownership-unknown", requestId: "r1" }), "r1")).toBe(false);
+  expect(isPreAdmissionDenial(new ApiError("Expired.", 410, { code: "expired-confirmation" }), "r1")).toBe(true);
 });

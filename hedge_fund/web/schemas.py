@@ -106,6 +106,7 @@ _RETRY_POLICIES = RETRY_POLICIES
 _SAFE_SUBJECT_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,180}")
 _SAFE_REQUEST_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
 _SAFE_HEAD = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
+MAX_RETRY_AFTER_SECONDS = 300
 
 
 class ErrorResponse(BaseModel):
@@ -121,6 +122,12 @@ class ErrorResponse(BaseModel):
     subject_id: str | None = None
     request_id: str | None = None
     current_head: str | None = None
+    # Advisory delay mirrored in the Retry-After header; never a promise that capacity will be free.
+    retry_after_seconds: int | None = Field(default=None, ge=1, le=MAX_RETRY_AFTER_SECONDS)
+
+
+def valid_retry_after(status_code: int, code: str, value: object) -> bool:
+    return type(value) is int and 1 <= value <= MAX_RETRY_AFTER_SECONDS and status_code in {429, 503} and code in {"capacity-denied", "budget-exhausted", "observation-conflict", "assets-unavailable"}
 
 
 def error_code_for(status_code: int, code: str | None = None) -> str:
@@ -168,12 +175,15 @@ def error_payload(
     current_head: object = None,
     refresh_required: bool | None = None,
     retry_policy: str | None = None,
+    retry_after_seconds: int | None = None,
 ) -> dict[str, Any]:
     resolved = error_code_for(status_code, code)
     if retry_policy is not None and retry_policy not in _RETRY_POLICIES:
         raise ValueError(f"unknown retry policy: {retry_policy}")
+    if retry_after_seconds is not None and not valid_retry_after(status_code, resolved, retry_after_seconds):
+        raise ValueError("retry-after is only a bounded hint on 429/503 responses")
     message = detail if isinstance(detail, str) else "Invalid request."
-    return ErrorResponse(
+    payload = ErrorResponse(
         detail=detail,
         code=resolved,
         message=message,
@@ -182,7 +192,12 @@ def error_payload(
         subject_id=safe_subject_id(subject_id),
         request_id=safe_request_id(request_id),
         current_head=safe_head(current_head),
-    ).model_dump()
+        retry_after_seconds=retry_after_seconds,
+    ).model_dump(exclude_none=False)
+    # The hint is optional: envelopes without it keep their established shape.
+    if retry_after_seconds is None:
+        payload.pop("retry_after_seconds")
+    return payload
 
 
 class RequestModel(BaseModel):

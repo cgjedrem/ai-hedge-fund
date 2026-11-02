@@ -15,6 +15,7 @@ from hedge_fund.runtime.operations import (
     ConfirmationExpired,
     ConfirmationRejected,
     INDEX_PATH,
+    OperationCapacityExceeded,
     OperationConflict,
     OperationError,
     OPERATIONS_ROOT,
@@ -96,6 +97,7 @@ def _accept(
     now=_NOW,
     start_worker=None,
     current_state_resolver=None,
+    capacity=None,
 ):
     return store.accept_request(
         request_id=request_id,
@@ -111,6 +113,7 @@ def _accept(
         now=now,
         start_worker=start_worker,
         current_state_resolver=current_state_resolver,
+        capacity=capacity,
     )
 
 
@@ -1182,3 +1185,122 @@ def test_corrupt_capture_sidecar_denies_confirmation(operation_store, frozen_cap
 
 def operation_store_for(root_context, admission):
     return OperationStore(root_context, admission=admission)
+
+
+_CAPACITY = (frozenset({"paper-run"}), 1)
+
+
+def _runtime_bytes(root_context):
+    runtime = root_context.path / "runtime"
+    return {path.relative_to(root_context.path).as_posix(): path.read_bytes() for path in runtime.rglob("*") if path.is_file() and path.suffix != ".lock"}
+
+
+def test_full_capacity_denies_before_any_durable_change_and_keeps_preview_issued(operation_store, frozen_capture, root_context):
+    first = _accept(operation_store, _preview(operation_store, frozen_capture), capacity=_CAPACITY)
+    waiting = _preview(operation_store, frozen_capture)
+    before = _runtime_bytes(root_context)
+    started = []
+
+    with pytest.raises(OperationCapacityExceeded):
+        _accept(operation_store, waiting, request_id="request-2", capacity=_CAPACITY, start_worker=started.append)
+
+    assert started == []
+    assert _runtime_bytes(root_context) == before
+    assert operation_store.get_by_request("request-2") is None
+    assert operation_store._read_index()["previews"][waiting.preview_id]["state"] == "issued"
+
+    fence = operation_store.claim_worker(first.operation_id, worker_id="synthetic", now=_NOW)
+    operation_store.mark_running(first.operation_id, fence, now=_NOW)
+    operation_store.complete(first.operation_id, fence, result={"sessions": 1}, now=_NOW + timedelta(seconds=1))
+
+    second = _accept(operation_store, waiting, request_id="request-2", capacity=_CAPACITY, start_worker=started.append)
+
+    assert second.status is OperationStatus.ACCEPTED
+    assert [item.operation_id for item in started] == [second.operation_id]
+
+
+def test_capacity_counts_only_unfinished_operations_of_the_bounded_actions(operation_store, frozen_capture):
+    _accept(operation_store, _preview(operation_store, frozen_capture), capacity=_CAPACITY)
+
+    other_pool = _accept(
+        operation_store,
+        _preview(operation_store, frozen_capture),
+        request_id="request-2",
+        capacity=(frozenset({"backtest"}), 1),
+    )
+
+    assert other_pool.status is OperationStatus.ACCEPTED
+
+
+def test_replay_of_admitted_request_is_answered_even_when_no_capacity_is_offered(operation_store, frozen_capture):
+    preview = _preview(operation_store, frozen_capture)
+    first = _accept(operation_store, preview, capacity=_CAPACITY)
+
+    replay = _accept(operation_store, preview, capacity=(_CAPACITY[0], 0))
+
+    assert replay.operation_id == first.operation_id
+    with pytest.raises(OperationCapacityExceeded):
+        _accept(operation_store, _preview(operation_store, frozen_capture), request_id="request-2", capacity=(_CAPACITY[0], 0))
+
+
+@pytest.mark.parametrize(
+    "capacity",
+    [(frozenset(), 1), (frozenset({"paper-run"}), -1), (frozenset({"paper-run"}), 17), ({"paper-run"}, 1), (frozenset({"paper-run"}), True), (frozenset({"paper-run"}),)],
+)
+def test_invalid_capacity_is_rejected_before_storage(operation_store, frozen_capture, root_context, capacity):
+    preview = _preview(operation_store, frozen_capture)
+    before = _runtime_bytes(root_context)
+
+    with pytest.raises(OperationError, match="capacity is invalid"):
+        _accept(operation_store, preview, capacity=capacity)
+
+    assert _runtime_bytes(root_context) == before
+
+
+_CHILD_ACCEPT = """
+import json, sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from hedge_fund.runtime.admission import AdmissionCoordinator, RootOwnerLease
+from hedge_fund.runtime.capture import freeze_capture
+from hedge_fund.runtime.configuration import resolve_settings
+from hedge_fund.runtime.operations import OperationCapacityExceeded, OperationStore
+from hedge_fund.runtime.root import RootContext
+
+now = datetime(2026, 10, 31, 12, 0, tzinfo=timezone.utc)
+with RootContext.open(Path(sys.argv[1])) as context, RootOwnerLease.acquire(context) as lease:
+    store = OperationStore(context, admission=AdmissionCoordinator(context, owner_lease=lease))
+    capture = freeze_capture(root=context, subject_id="alpha", mandate_digest="a" * 64, universe=("AAA",), broker="paper", settings=resolve_settings(context), credential_versions={}, code_version="synthetic-code-stamp")
+    preview = store.create_preview(action="paper-run", subject_id="alpha", expected_head="head-1", due_set=(), capture=capture, operator_session="operator-2", payload={"mode": "manual"}, now=now, expires_at=now + timedelta(minutes=1))
+    try:
+        store.accept_request(request_id="child-request", action="paper-run", subject_id="alpha", preview_id=preview.preview_id, preview_digest=preview.digest, confirmation_token=preview.confirmation_token, operator_session="operator-2", expected_head="head-1", due_set=(), payload={"mode": "manual"}, now=now, capacity=(frozenset({"paper-run"}), 1))
+    except OperationCapacityExceeded:
+        print(json.dumps({"outcome": "capacity-denied", "preview_state": store._read_index()["previews"][preview.preview_id]["state"]}))
+    else:
+        print(json.dumps({"outcome": "accepted"}))
+"""
+
+
+def test_durable_capacity_bounds_a_second_process_sharing_the_root(operation_store, frozen_capture, root_context, tmp_path):
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    _accept(operation_store, _preview(operation_store, frozen_capture), capacity=_CAPACITY)
+    env = {key: value for key, value in os.environ.items() if not any(marker in key.upper() for marker in ("API_KEY", "TOKEN", "SECRET", "PASSWORD", "PROXY", "AIHF_"))}
+    env.update({"PYTHON_DOTENV_DISABLED": "1", "PYTHONPATH": str(Path(__file__).resolve().parents[2])})
+
+    child = subprocess.run(
+        [sys.executable, "-c", _CHILD_ACCEPT, str(root_context.path)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env=env,
+        cwd=tmp_path,
+        check=False,
+    )
+
+    assert child.returncode == 0, child.stderr[-2000:]
+    assert json.loads(child.stdout.strip().splitlines()[-1]) == {"outcome": "capacity-denied", "preview_state": "issued"}
+    assert operation_store.get_by_request("child-request") is None

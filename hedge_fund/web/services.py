@@ -122,6 +122,7 @@ from hedge_fund.runtime.operations import (
     ConfirmationExpired,
     ConfirmationRejected,
     OperationBusy,
+    OperationCapacityExceeded,
     OperationConflict,
     OperationError,
     OperationRecord,
@@ -164,11 +165,20 @@ from hedge_fund.web.schemas import (
     RunnerPreviewRequest,
     RunnerStartAcceptRequest,
     RuntimeSettingsRequest,
+    valid_retry_after,
     ValuationRefreshRequest,
 )
 from hedge_fund.web.valuation import estimate_valuation, MAX_VALUATION_POSITIONS
 
 PROTECTED_NAMES = ("watchtower", "watchtower-weekly", "umbrella")
+# Worker pools: per-process slots (OperationJobRegistry.max_active) and the same durable
+# root-wide bound on unfinished operations of the pool's actions (OperationStore.accept_request).
+_BACKTEST_POOL_ACTIONS = frozenset({"backtest"})
+_PAPER_POOL_ACTIONS = frozenset({"paper-tick", "paper-runner-start"})
+_BACKTEST_POOL_CAPACITY = 1
+_PAPER_POOL_CAPACITY = 2
+# Advisory only: the bound holds until a running operation finishes, which has no fixed duration.
+OPERATION_CAPACITY_RETRY_AFTER_SECONDS = 30
 _REPORT_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,180}\.json$")
 _SESSION_CURSOR = re.compile(r"\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}:\d{2})?$")
 _SECRET_FIELD = re.compile(r"(?:api.?key|secret|token|password|credential|authorization)", re.IGNORECASE)
@@ -185,6 +195,7 @@ class ServiceError(RuntimeError):
         request_id: str | None = None,
         current_head: str | None = None,
         retry_policy: str | None = None,
+        retry_after_seconds: int | None = None,
     ) -> None:
         super().__init__(detail)
         self.status_code = status_code
@@ -196,6 +207,9 @@ class ServiceError(RuntimeError):
         if retry_policy is not None and retry_policy not in RETRY_POLICIES:
             raise ValueError(f"unknown retry policy: {retry_policy}")
         self.retry_policy = retry_policy
+        if retry_after_seconds is not None and not valid_retry_after(status_code, self.code, retry_after_seconds):
+            raise ValueError("retry-after is only a bounded hint on 429/503 responses")
+        self.retry_after_seconds = retry_after_seconds
 
     def attach(self, *, subject_id: str | None = None, request_id: str | None = None) -> "ServiceError":
         """Add request identity known to the caller without overwriting a site's own identity."""
@@ -204,6 +218,19 @@ class ServiceError(RuntimeError):
         if self.request_id is None:
             self.request_id = request_id
         return self
+
+
+def _capacity_denied(subject_id: str, request_id: str) -> ServiceError:
+    # Raised only before durable acceptance: the preview stays issued and nothing was started.
+    return ServiceError(
+        429,
+        "Operation capacity is full; this request was not accepted and nothing was started. Wait for the running operation to finish, then submit again.",
+        code="capacity-denied",
+        retry_policy="retry-later",
+        retry_after_seconds=OPERATION_CAPACITY_RETRY_AFTER_SECONDS,
+        subject_id=subject_id,
+        request_id=request_id,
+    )
 
 
 class _DispatchGuardedInjectedDataClient:
@@ -357,11 +384,11 @@ class DeskService:
                 if self.allow_writes:
                     operation_jobs = OperationJobRegistry(
                         self._operation_store,
-                        max_active=1,
+                        max_active=_BACKTEST_POOL_CAPACITY,
                     )
                     paper_operation_jobs = OperationJobRegistry(
                         self._operation_store,
-                        max_active=2,
+                        max_active=_PAPER_POOL_CAPACITY,
                     )
                     try:
                         operation_jobs.recover_unfinished()
@@ -1049,44 +1076,72 @@ class DeskService:
                     cancelled,
                 )
 
-            worker.submit(operation, work)
+            worker.submit(operation, work, reservation=reservation)
 
-        with self._settings_lock:
-            self._ensure_settings_available()
-            if self._runtime_settings.version != capture.settings_version or self._runtime_settings.model != capture.model or self._runtime_settings.data_provider != capture.data_provider or self._runtime_settings.llm_provider != capture.llm_provider:
-                raise ServiceError(409, "Runtime settings changed; review the paper operation again.", code="stale-preview")
-            self._require_local_paper_policy(self._runtime_settings)
-            try:
-                operation = store.accept_request(
-                    request_id=request.request_id,
-                    action=action,
-                    subject_id=normalized,
-                    preview_id=request.preview_id,
-                    preview_digest=request.preview_digest,
-                    confirmation_token=request.confirmation_token,
-                    operator_session=operator_session,
-                    expected_head=request.expected_head,
-                    due_set=tuple(request.due_set),
-                    payload=payload,
-                    now=_utcnow(),
-                    start_worker=start_worker,
-                    current_state_resolver=current_state,
-                )
-            except ConfirmationExpired:
-                raise ServiceError(410, "Confirmation expired; review the paper operation again.") from None
-            except (ConfirmationRejected, StalePreview):
-                raise ServiceError(409, "Reviewed paper operation is stale or no longer valid.", code="stale-preview") from None
-            except OperationStartUncertain:
-                raise ServiceError(409, "Paper operation start is uncertain; inspect its durable status.", code="ownership-unknown") from None
-            except OperationConflict:
-                raise ServiceError(409, "Paper operation request conflicts with durable state.", code="request-conflict") from None
-            except (AdmissionError, JobConflict):
-                raise ServiceError(409, "Paper operation conflicts with current runner or execution state.", code="writer-conflict") from None
-            except OperationBusy:
-                raise ServiceError(409, "Operation storage is busy; this request was not processed now. Retry later; if this request was submitted before, inspect its operation status first.", code="writer-conflict", retry_policy="retry-later") from None
-            except OperationError:
-                raise ServiceError(409, "Paper operation could not be accepted.") from None
+        reservation = self._reserve_operation_slot(worker, subject_id=normalized, request_id=request.request_id)
+        try:
+            with self._settings_lock:
+                self._ensure_settings_available()
+                if self._runtime_settings.version != capture.settings_version or self._runtime_settings.model != capture.model or self._runtime_settings.data_provider != capture.data_provider or self._runtime_settings.llm_provider != capture.llm_provider:
+                    raise ServiceError(409, "Runtime settings changed; review the paper operation again.", code="stale-preview")
+                self._require_local_paper_policy(self._runtime_settings)
+                try:
+                    operation = store.accept_request(
+                        request_id=request.request_id,
+                        action=action,
+                        subject_id=normalized,
+                        preview_id=request.preview_id,
+                        preview_digest=request.preview_digest,
+                        confirmation_token=request.confirmation_token,
+                        operator_session=operator_session,
+                        expected_head=request.expected_head,
+                        due_set=tuple(request.due_set),
+                        payload=payload,
+                        now=_utcnow(),
+                        start_worker=start_worker,
+                        current_state_resolver=current_state,
+                        capacity=(_PAPER_POOL_ACTIONS, _PAPER_POOL_CAPACITY if reservation is not None else 0),
+                    )
+                except ConfirmationExpired:
+                    raise ServiceError(410, "Confirmation expired; review the paper operation again.") from None
+                except (ConfirmationRejected, StalePreview):
+                    raise ServiceError(409, "Reviewed paper operation is stale or no longer valid.", code="stale-preview") from None
+                except OperationCapacityExceeded:
+                    raise _capacity_denied(normalized, request.request_id) from None
+                except OperationStartUncertain:
+                    raise ServiceError(409, "Paper operation start is uncertain; inspect its durable status.", code="ownership-unknown") from None
+                except OperationConflict:
+                    raise ServiceError(409, "Paper operation request conflicts with durable state.", code="request-conflict") from None
+                except (AdmissionError, JobConflict):
+                    raise ServiceError(409, "Paper operation conflicts with current runner or execution state.", code="writer-conflict") from None
+                except OperationBusy:
+                    raise ServiceError(409, "Operation storage is busy; this request was not processed now. Retry later; if this request was submitted before, inspect its operation status first.", code="writer-conflict", retry_policy="retry-later") from None
+                except OperationError:
+                    raise ServiceError(409, "Paper operation could not be accepted.") from None
+        finally:
+            worker.release(reservation)
         return self._operation_view(operation)
+
+    def _reserve_operation_slot(
+        self,
+        worker: OperationJobRegistry,
+        *,
+        subject_id: str,
+        request_id: str,
+    ):
+        """Reserve a local worker slot before acceptance.
+
+        ``None`` means this process is at capacity: acceptance then runs with a
+        zero durable bound so a replay of an admitted request still answers with
+        its record while any new acceptance is denied with 429 before effects.
+        """
+        try:
+            reservation = worker.try_reserve()
+        except JobConflict:
+            raise ServiceError(409, "The operation worker is shutting down; nothing was accepted.", code="writer-conflict", retry_policy="retry-later", subject_id=subject_id, request_id=request_id) from None
+        if reservation is not None:
+            worker.reclaim_stranded()
+        return reservation
 
     def _execute_manual_tick(
         self,
@@ -2644,8 +2699,16 @@ class DeskService:
                     apply_if_current,
                 )
 
-            worker.submit(operation, work)
+            worker.submit(operation, work, reservation=reservation)
 
+        reservation = self._reserve_operation_slot(worker, subject_id=subject, request_id=request.request_id)
+        try:
+            operation = self._accept_backtest_locked(request, operator_session, store, subject, capture, payload, current_state, start_worker, reservation)
+        finally:
+            worker.release(reservation)
+        return self._operation_view(operation)
+
+    def _accept_backtest_locked(self, request, operator_session, store, subject, capture, payload, current_state, start_worker, reservation) -> OperationRecord:
         with self._settings_lock:
             self._ensure_settings_available()
             if self._runtime_settings.version != capture.settings_version or self._runtime_settings.model != capture.model or self._runtime_settings.data_provider != capture.data_provider:
@@ -2674,11 +2737,14 @@ class DeskService:
                     now=_utcnow(),
                     start_worker=start_worker,
                     current_state_resolver=current_state,
+                    capacity=(_BACKTEST_POOL_ACTIONS, _BACKTEST_POOL_CAPACITY if reservation is not None else 0),
                 )
             except ConfirmationExpired:
                 raise ServiceError(410, "Confirmation expired; review the operation again.") from None
             except (ConfirmationRejected, StalePreview):
                 raise ServiceError(409, "Reviewed operation is stale or no longer valid.", code="stale-preview") from None
+            except OperationCapacityExceeded:
+                raise _capacity_denied(subject, request.request_id) from None
             except OperationStartUncertain:
                 raise ServiceError(409, "Operation start is uncertain; inspect its durable status.", code="ownership-unknown") from None
             except (OperationConflict, JobConflict):
@@ -2689,7 +2755,7 @@ class DeskService:
                 raise ServiceError(409, "Operation storage is busy; this request was not processed now. Retry later; if this request was submitted before, inspect its operation status first.", code="writer-conflict", retry_policy="retry-later") from None
             except OperationError:
                 raise ServiceError(409, "Operation could not be accepted.") from None
-        return self._operation_view(operation)
+        return operation
 
     def get_operation(self, operation_id: str) -> dict:
         store = self._operation_store

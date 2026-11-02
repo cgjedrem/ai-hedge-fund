@@ -203,7 +203,7 @@ def create_app(
 
     @app.exception_handler(ServiceError)
     async def service_error_handler(request: Request, exc: ServiceError):
-        return _error_response(
+        response = _error_response(
             exc.status_code,
             exc.detail,
             code=exc.code,
@@ -211,7 +211,11 @@ def create_app(
             request_id=exc.request_id,
             current_head=exc.current_head,
             retry_policy=exc.retry_policy,
+            retry_after_seconds=exc.retry_after_seconds,
         )
+        if exc.retry_after_seconds is not None:
+            response.headers["Retry-After"] = str(exc.retry_after_seconds)
+        return response
 
     @app.exception_handler(StarletteHTTPException)
     async def http_error_handler(_request: Request, exc: StarletteHTTPException):

@@ -26,7 +26,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { acceptOperation, cancelOperation, isExpiredConfirmation, previewOperation } from "@/lib/api";
+import { acceptOperation, cancelOperation, isPreAdmissionDenial, previewOperation } from "@/lib/api";
 import { toActionableError, type ActionableError } from "@/lib/errors";
 import { useDesk, useOperation, useResource } from "@/lib/hooks";
 import { usePendingOperations } from "@/lib/use-pending-operations";
@@ -314,7 +314,7 @@ export function BacktestsPage() {
       setConfirmation(null);
       operations.refresh();
     } catch (cause) {
-      if (isExpiredConfirmation(cause)) pending.forget(pendingRequest);
+      if (isPreAdmissionDenial(cause, pendingRequest.requestId)) pending.forget(pendingRequest);
       setError(toActionableError(cause, "Backtest could not be submitted."));
       setConfirmation(null);
     } finally {

@@ -33,6 +33,7 @@ const CODE_GUIDANCE: Partial<Record<ApiErrorCode, string>> = {
   "protected-root": "This storage location is protected and cannot be changed from the web desk.",
   "broker-not-web-supported": "Only local paper operations are supported from the web desk.",
   "budget-exhausted": "The configured budget is exhausted. Nothing was submitted.",
+  "capacity-denied": "Operation capacity is full. Nothing was accepted or started. Wait for running operations to finish, then review and submit again.",
 };
 
 const ACTIONS: Record<ApiRetryPolicy, RecoveryAction> = {
@@ -58,14 +59,17 @@ export function toActionableError(cause: unknown, fallback = "Request failed."):
   }
   const offline = cause.offline;
   const reference = [cause.subjectId, cause.requestId && `request ${cause.requestId}`].filter(Boolean).join(" · ") || null;
+  const guidance = offline
+    ? cause.retryPolicy === "inspect-status"
+      ? "Reconnect, then inspect durable status before resubmitting."
+      : "Reconnect to the local desk server, then retry."
+    : (cause.code && CODE_GUIDANCE[cause.code])
+      || (cause.retryPolicy === "reload" && cause.status !== 403 ? CONFLICT_GUIDANCE : GUIDANCE[cause.retryPolicy]);
   return {
     message: cause.message || fallback,
-    guidance: offline
-      ? cause.retryPolicy === "inspect-status"
-        ? "Reconnect, then inspect durable status before resubmitting."
-        : "Reconnect to the local desk server, then retry."
-      : (cause.code && CODE_GUIDANCE[cause.code])
-        || (cause.retryPolicy === "reload" && cause.status !== 403 ? CONFLICT_GUIDANCE : GUIDANCE[cause.retryPolicy]),
+    guidance: !offline && cause.retryAfterSeconds !== null
+      ? `${guidance} Suggested wait: about ${cause.retryAfterSeconds} s.`
+      : guidance,
     action: offline ? "reconnect" : ACTIONS[cause.retryPolicy],
     retryPolicy: cause.retryPolicy,
     code: cause.code,

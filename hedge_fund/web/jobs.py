@@ -33,8 +33,24 @@ class JobCancelled(Exception):
     """A research job reached a cooperative cancellation boundary."""
 
 
+class SlotReservation:
+    """Opaque in-process worker slot held from before durable acceptance until submit or release."""
+
+    __slots__ = ("_owner", "_settled")
+
+    def __init__(self, owner: "OperationJobRegistry") -> None:
+        self._owner = owner
+        self._settled = False
+
+
 class OperationJobRegistry:
-    """Run accepted operations with durable progress and safe-boundary cancellation."""
+    """Run accepted operations with durable progress and safe-boundary cancellation.
+
+    Capacity is reserved with :meth:`try_reserve` before a request is durably
+    accepted, so a full worker denies admission instead of failing an accepted
+    operation. Slots bound this process only; callers pair them with a durable
+    root-wide bound in ``OperationStore.accept_request``.
+    """
 
     MAX_TRACKED = 1000
 
@@ -57,9 +73,38 @@ class OperationJobRegistry:
         self._executor = ThreadPoolExecutor(max_workers=max_active, thread_name_prefix="aihf-operation")
         self._submitted: dict[str, Future | None] = {}
         self._active: set[str] = set()
+        self._reserved = 0
+        self._stranded: set[str] = set()
         self._max_active = max_active
         self._closed = False
         self._shutdown_requested = threading.Event()
+
+    @property
+    def max_active(self) -> int:
+        return self._max_active
+
+    def try_reserve(self) -> SlotReservation | None:
+        """Reserve one worker slot before acceptance; ``None`` means capacity is full now."""
+        with self._lock:
+            if self._closed:
+                raise JobConflict("The operation worker is shutting down.")
+            if len(self._active) + self._reserved >= self._max_active:
+                return None
+            if len(self._submitted) + self._reserved >= self.MAX_TRACKED:
+                self._prune()
+                if len(self._submitted) + self._reserved >= self.MAX_TRACKED:
+                    return None
+            self._reserved += 1
+            return SlotReservation(self)
+
+    def release(self, reservation: SlotReservation | None) -> None:
+        """Return an unused reservation; a consumed or foreign reservation is ignored."""
+        if reservation is None:
+            return
+        with self._lock:
+            if reservation._owner is self and not reservation._settled:
+                reservation._settled = True
+                self._reserved -= 1
 
     def submit(
         self,
@@ -72,22 +117,39 @@ class OperationJobRegistry:
             ],
             Mapping[str, object],
         ],
+        *,
+        reservation: SlotReservation | None = None,
     ) -> OperationRecord:
         if not isinstance(operation, OperationRecord) or not callable(work):
             raise JobConflict("Accepted operation and worker are required.")
+        if reservation is not None and not isinstance(reservation, SlotReservation):
+            raise JobConflict("Worker reservation is invalid.")
         with self._lock:
+            if reservation is not None and (reservation._owner is not self or reservation._settled):
+                raise JobConflict("Worker reservation is invalid.")
             if self._closed:
                 raise JobConflict("The operation worker is shutting down.")
-            current = self._store.get_operation(operation.operation_id)
+            try:
+                current = self._store.get_operation(operation.operation_id)
+            except Exception:
+                # The accepted record may stay unfinished; reclaim it at the next admission.
+                self._stranded.add(operation.operation_id)
+                raise
             if current.request_id != operation.request_id or current.request_digest != operation.request_digest:
                 raise JobConflict("Operation identity changed.")
             if current.status is not OperationStatus.ACCEPTED or current.operation_id in self._submitted:
                 return current
-            if len(self._active) >= self._max_active:
+            held = 1 if reservation is not None else 0
+            if len(self._active) + self._reserved - held >= self._max_active:
+                self._stranded.add(current.operation_id)
                 raise JobConflict("Operation worker capacity is full.")
             self._prune()
-            if len(self._submitted) >= self.MAX_TRACKED:
+            if len(self._submitted) + self._reserved - held >= self.MAX_TRACKED:
+                self._stranded.add(current.operation_id)
                 raise JobConflict("Operation history capacity is full.")
+            if reservation is not None:
+                reservation._settled = True
+                self._reserved -= 1
             self._submitted[current.operation_id] = None
             self._active.add(current.operation_id)
             try:
@@ -97,6 +159,7 @@ class OperationJobRegistry:
                 try:
                     self._store.interrupt(current.operation_id, now=self._now())
                 except Exception as interrupt_exc:
+                    self._stranded.add(current.operation_id)
                     _log_failure("interrupt", interrupt_exc)
                 _log_failure("submit", exc)
                 raise JobConflict("Operation start is uncertain.") from None
@@ -181,7 +244,7 @@ class OperationJobRegistry:
 
     def recover_unfinished(self) -> tuple[OperationRecord, ...]:
         with self._lock:
-            if self._active:
+            if self._active or self._reserved:
                 raise JobConflict("Operation recovery requires an idle worker.")
         return self._store.recover_unfinished(now=self._now())
 
@@ -215,6 +278,7 @@ class OperationJobRegistry:
             try:
                 self._retry_busy(lambda: self._store.interrupt(operation_id, now=self._now()))
             except Exception as interrupt_exc:
+                self._mark_stranded(operation_id)
                 _log_failure("interrupt", interrupt_exc, operation_id=operation_id)
             self._finish_local(operation_id)
             _log_failure("claim", exc, operation_id=operation_id)
@@ -276,6 +340,7 @@ class OperationJobRegistry:
             except WorkerFenced:
                 pass
             except Exception as failure_exc:
+                self._mark_stranded(operation_id)
                 _log_failure("fail", failure_exc, operation_id=operation_id)
             _log_failure(phase, exc, operation_id=operation_id)
         finally:
@@ -316,7 +381,41 @@ class OperationJobRegistry:
         except WorkerFenced:
             pass
         except Exception as exc:
+            self._mark_stranded(operation_id)
             _log_failure("acknowledge-cancel", exc, operation_id=operation_id)
+
+    def _mark_stranded(self, operation_id: str) -> None:
+        # The durable record may stay unfinished after this process stops running it.
+        with self._lock:
+            self._stranded.add(operation_id)
+
+    def reclaim_stranded(self) -> int:
+        """Interrupt this process's own records whose finalization failed; return how many settled.
+
+        Such records no longer run here but still count toward the durable
+        root-wide capacity bound, so admission reclaims them before counting.
+        """
+        with self._lock:
+            if self._closed:
+                return 0
+            candidates = tuple(operation_id for operation_id in self._stranded if operation_id not in self._active)
+        settled = 0
+        for operation_id in candidates:
+            try:
+                operation = self._store.get_operation(operation_id)
+                if operation.status in {
+                    OperationStatus.ACCEPTED,
+                    OperationStatus.RUNNING,
+                    OperationStatus.CANCEL_REQUESTED,
+                }:
+                    self._store.interrupt(operation_id, now=self._now())
+            except Exception as exc:
+                _log_failure("reclaim", exc, operation_id=operation_id)
+                continue
+            with self._lock:
+                self._stranded.discard(operation_id)
+            settled += 1
+        return settled
 
     def _finish_local(self, operation_id: str) -> None:
         with self._lock:
@@ -335,6 +434,7 @@ class OperationJobRegistry:
                         )
                     )
         except Exception as exc:
+            self._mark_stranded(operation_id)
             _log_failure("future-cancel", exc, operation_id=operation_id)
         finally:
             self._finish_local(operation_id)

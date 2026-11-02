@@ -36,7 +36,7 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { apiPost, isExpiredConfirmation, requireMutationOperationReceipt } from "@/lib/api";
+import { apiPost, isPreAdmissionDenial, requireMutationOperationReceipt } from "@/lib/api";
 import { toActionableError, type ActionableError } from "@/lib/errors";
 import { useDesk, useOperation, useResource } from "@/lib/hooks";
 import type { PendingOperation } from "@/lib/pending-operations";
@@ -474,7 +474,7 @@ export function PaperDetailPage() {
       });
       runnerResource.refresh();
     } catch (cause) {
-      if (isExpiredConfirmation(cause)) pendingOperations.forget(pendingRequest);
+      if (isPreAdmissionDenial(cause, pendingRequest.requestId)) pendingOperations.forget(pendingRequest);
       if (activeFundName.current === name) {
         fail(cause, "Paper operation outcome could not be confirmed.");
         setPaperPreview(null);

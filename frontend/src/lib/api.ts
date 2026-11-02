@@ -54,6 +54,20 @@ export interface ApiErrorOptions {
   subjectId?: string | null;
   requestId?: string | null;
   currentHead?: string | null;
+  retryAfterSeconds?: number | string | null;
+}
+
+// Mirrors the server bound; a hint outside it is ignored rather than trusted.
+const MAX_RETRY_AFTER_SECONDS = 300;
+
+function boundedRetryAfter(status: number, value: unknown): number | null {
+  if (status !== 429 && status !== 503) return null;
+  const seconds = typeof value === "string" && /^\d{1,3}$/.test(value.trim()) ? Number(value.trim()) : value;
+  return typeof seconds === "number" && Number.isInteger(seconds) && seconds >= 1 && seconds <= MAX_RETRY_AFTER_SECONDS ? seconds : null;
+}
+
+function retryAfterHeader(response: Response): string | null {
+  return typeof response.headers?.get === "function" ? response.headers.get("Retry-After") : null;
 }
 
 export class ApiError extends Error {
@@ -64,6 +78,8 @@ export class ApiError extends Error {
   readonly subjectId: string | null;
   readonly requestId: string | null;
   readonly currentHead: string | null;
+  /** Advisory wait from a 429/503 denial; never a promise that a retry will succeed. */
+  readonly retryAfterSeconds: number | null;
 
   constructor(message: string, status: number, options: ApiErrorOptions = {}) {
     super(message);
@@ -75,6 +91,7 @@ export class ApiError extends Error {
     this.subjectId = safeIdentity(options.subjectId);
     this.requestId = safeIdentity(options.requestId);
     this.currentHead = safeIdentity(options.currentHead);
+    this.retryAfterSeconds = boundedRetryAfter(status, options.retryAfterSeconds);
   }
 
   /** Status 0 means the server was never reached or the response was lost. */
@@ -186,6 +203,15 @@ export function isExpiredConfirmation(cause: unknown): boolean {
   return cause instanceof ApiError && cause.status === 410 && cause.code === "expired-confirmation";
 }
 
+/**
+ * True only when the server proved the request was refused before durable acceptance,
+ * so its pending identity can be released. Capacity denials must echo the same request.
+ */
+export function isPreAdmissionDenial(cause: unknown, requestId: string): boolean {
+  if (isExpiredConfirmation(cause)) return true;
+  return cause instanceof ApiError && cause.status === 429 && cause.code === "capacity-denied" && cause.requestId === requestId;
+}
+
 export async function apiPut<T>(path: string, body: unknown): Promise<T> {
   const headers = new Headers({ "Content-Type": "application/json" });
   if (mutationToken) headers.set("X-CSRF-Token", mutationToken);
@@ -284,7 +310,10 @@ async function request<T>(path: string, init: RequestInit, cancelledBy?: AbortSi
   }
   if (!response.ok) {
     const shape = payload as ApiErrorShape | null;
-    const error = new ApiError(errorMessage(shape), response.status, errorEnvelope(shape));
+    const error = new ApiError(errorMessage(shape), response.status, {
+      ...errorEnvelope(shape),
+      retryAfterSeconds: shape?.retry_after_seconds ?? retryAfterHeader(response),
+    });
     if (mutation && response.status === 403 && error.retryPolicy === "reload") emit("session-expired");
     throw error;
   }

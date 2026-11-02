@@ -47,7 +47,8 @@ Never include credentials, unsafe paths or raw provider errors.
 | 429 capacity-denied / budget-exhausted | Bounded capacity or authorization limits reached; stop before next call/session. |
 | 503 observation-conflict / assets-unavailable | Retry read only, or actionable installation failure; no fallback/TUI/mutation. |
 
-Implementation notes (2026-11-02 error-recovery slice, source-tested; 429 row still unproven):
+Implementation notes (2026-11-02 error-recovery slice and 2026-11-03 capacity slice, source-tested;
+429 `budget-exhausted` still unproven):
 
 - Optional `subject_id`, `request_id` and `current_head` are echoed only when they match bounded
   opaque-token patterns; anything else is dropped, never repaired or echoed.
@@ -74,8 +75,24 @@ Implementation notes (2026-11-02 error-recovery slice, source-tested; 429 row st
 - Observation is polling only (no stream/channel). The client tracks a connection epoch: a
   response to a request sent before a connection loss does not report recovery; Reconnect issues a
   fresh capabilities read bounded to 10 s.
-- Gap: no production site emits 429 yet; worker-capacity rejection occurs after durable acceptance
-  and surfaces as 409 `ownership-unknown`.
+- Operation capacity (2026-11-03 slice, source-tested): backtest acceptance (pool capacity 1) and
+  paper tick / runner start (shared pool capacity 2) reserve an in-process worker slot before
+  acceptance, then `OperationStore.accept_request` counts the root's unfinished records for the
+  pool's actions under the registry lock, after the replay/preview/expiry/stale checks and before
+  any record is created. Either bound failing returns 429 `capacity-denied` / `retry-later`
+  with `Retry-After: 30` and `retry_after_seconds: 30`, plus an echo of the subject and request.
+  It writes nothing durable: the preview stays issued, the confirmation token is not consumed, and
+  no worker starts. A replay of an already accepted request returns its record even at capacity.
+  Scope: slots are per process; the durable count bounds every process sharing the root. An
+  unfinished record orphaned by a crashed process holds capacity until a server start runs
+  recovery (fail-closed). A record this process failed to settle is re-interrupted at the next
+  admission. `Retry-After` is advisory, never a promise of success. The schema accepts it only on
+  429/503 for `capacity-denied`, `budget-exhausted`, `observation-conflict` or
+  `assets-unavailable`, as an integer from 1 to 300 seconds. The client ignores out-of-bound hints
+  and releases a pending identity only for an echoed same-request `capacity-denied` (or 410
+  `expired-confirmation`).
+- Gap: no production site emits 429 `budget-exhausted` yet. Lifecycle, halt and verdict writes
+  have no capacity pool.
 
 ## Resource and action matrix
 

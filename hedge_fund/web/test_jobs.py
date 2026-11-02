@@ -30,6 +30,7 @@ from hedge_fund.runtime.configuration import resolve_settings
 from hedge_fund.runtime.handover import enroll_fresh
 from hedge_fund.runtime.operations import (
     OperationBusy,
+    OperationCapacityExceeded,
     OperationError,
     OPERATIONS_ROOT,
     OperationStatus,
@@ -40,7 +41,7 @@ from hedge_fund.runtime.root import RootContext
 from hedge_fund.test_support.handover import enroll_synthetic_root
 from hedge_fund.web import jobs as jobs_module
 from hedge_fund.web.app import create_app
-from hedge_fund.web.jobs import JobCancelled, OperationJobRegistry
+from hedge_fund.web.jobs import JobCancelled, JobConflict, OperationJobRegistry
 from hedge_fund.web.schemas import (
     BacktestRequest,
     CredentialRequest,
@@ -1022,7 +1023,7 @@ def test_reviewed_backtest_executes_captured_mandate_after_template_edit(demo_ro
     monkeypatch.setattr(
         worker,
         "submit",
-        lambda operation, work: pending_work.append((operation, work)) or operation,
+        lambda operation, work, reservation=None: pending_work.append((operation, work)) or operation,
     )
 
     try:
@@ -1709,3 +1710,244 @@ def test_close_waits_for_worker_boundary_before_interruption(durable_job_context
     assert acknowledgements == ["cancelled"]
     assert interruptions == []
     assert restarts == []
+
+
+def test_slot_reservation_bounds_admission_before_durable_acceptance(durable_job_context, monkeypatch):
+    _root_context, store, capture = durable_job_context
+    registry = OperationJobRegistry(store, max_active=1, clock=lambda: _JOB_NOW)
+    futures = []
+    monkeypatch.setattr(registry._executor, "submit", lambda *_args, **_kwargs: futures.append(Future()) or futures[-1])
+    work = lambda _progress, _cancelled, _effect: {"unexpected": True}  # noqa: E731
+
+    try:
+        reservation = registry.try_reserve()
+        assert reservation is not None
+        assert registry.try_reserve() is None
+        unreserved = _accepted_operation(store, capture, request_id="unreserved")
+        with pytest.raises(JobConflict, match="capacity is full"):
+            registry.submit(unreserved, work)
+        with pytest.raises(JobConflict, match="idle worker"):
+            registry.recover_unfinished()
+
+        registry.release(reservation)
+        registry.release(reservation)
+        second = registry.try_reserve()
+        assert second is not None
+        reserved = _accepted_operation(store, capture, request_id="reserved")
+        assert registry.submit(reserved, work, reservation=second).operation_id == reserved.operation_id
+        registry.release(second)
+        assert registry._reserved == 0
+        assert registry._active == {reserved.operation_id}
+        assert registry.try_reserve() is None
+        with pytest.raises(JobConflict, match="reservation is invalid"):
+            registry.submit(unreserved, work, reservation=second)
+    finally:
+        registry.close()
+
+
+def test_reservation_from_another_registry_or_closed_registry_is_refused(durable_job_context):
+    _root_context, store, capture = durable_job_context
+    first = OperationJobRegistry(store, max_active=1, clock=lambda: _JOB_NOW)
+    second = OperationJobRegistry(store, max_active=1, clock=lambda: _JOB_NOW)
+    try:
+        foreign = second.try_reserve()
+        with pytest.raises(JobConflict, match="reservation is invalid"):
+            first.submit(_accepted_operation(store, capture), lambda *_args: {}, reservation=foreign)
+        with pytest.raises(JobConflict, match="reservation is invalid"):
+            first.submit(_accepted_operation(store, capture, request_id="other"), lambda *_args: {}, reservation=object())
+        first.release(foreign)
+        assert second._reserved == 1
+        second.release(foreign)
+        assert second._reserved == 0
+    finally:
+        first.close()
+        second.close()
+    with pytest.raises(JobConflict, match="shutting down"):
+        first.try_reserve()
+
+
+def test_full_backtest_capacity_returns_429_before_acceptance_and_preview_stays_usable(demo_root):
+    import threading
+
+    release = threading.Event()
+    entered = threading.Event()
+    data_client = ManagedFakeDataClient(SERIES)
+
+    def blocking_fund(spec):
+        entered.set()
+        assert release.wait(_WAIT_SECONDS)
+        return Fund(spec, models={"earnings-drift": [FakeAnalyst("pead", {"AAPL": 1.0})]})
+
+    app = create_app(
+        root=demo_root,
+        allow_writes=True,
+        network_enabled=True,
+        demo=True,
+        data_client_factory=lambda: data_client,
+        fund_factory=blocking_fund,
+    )
+    store = app.state.service._operation_store
+    try:
+        with TestClient(app, client=("127.0.0.1", 50000)) as client:
+            headers = _write_headers(client)
+            settings = client.get("/api/settings", headers={"host": "127.0.0.1"}).json()
+            local_model = next(model_id for _, model_id, provider in load_api_models() if provider == "Ollama" and not model_id.endswith(":cloud"))
+            assert client.post("/api/settings/model", headers=headers, json={"model": local_model, "expected_version": settings["version"]}).status_code == 200
+            payload = {
+                "fund": "demo-quality",
+                "universe": ["AAPL"],
+                "start": "2024-06-03",
+                "end": "2024-06-07",
+                "provider": "yfinance",
+                "model": local_model,
+                "mandate_hash": _mandate_fingerprint(demo_root),
+            }
+
+            def review():
+                response = client.post(
+                    "/api/operations/preview",
+                    headers=headers,
+                    json={"action": "backtest", "subject_id": "demo-quality", "expected_head": payload["mandate_hash"], "payload": payload},
+                )
+                assert response.status_code == 201, response.text
+                return response.json()
+
+            def accept(preview, request_id):
+                return client.post(
+                    "/api/operations",
+                    headers=headers,
+                    json={
+                        "request_id": request_id,
+                        "action": "backtest",
+                        "subject_id": "demo-quality",
+                        "preview_id": preview["preview_id"],
+                        "preview_digest": preview["preview_digest"],
+                        "confirmation_token": preview["confirmation_token"],
+                        "expected_head": payload["mandate_hash"],
+                        "due_set": [],
+                        "payload": payload,
+                    },
+                )
+
+            first_preview = review()
+            first = accept(first_preview, "capacity-first")
+            assert first.status_code == 202, first.text
+            assert entered.wait(_WAIT_SECONDS)
+            waiting_preview = review()
+            operations_before = [item.operation_id for item in store.list_operations()]
+
+            denied = accept(waiting_preview, "capacity-second")
+            replay = accept(first_preview, "capacity-first")
+            operations_during = [item.operation_id for item in store.list_operations()]
+
+            release.set()
+            _wait_for_operation(store, first.json()["operation_id"], OperationStatus.COMPLETED)
+            retried = accept(waiting_preview, "capacity-second")
+            assert retried.status_code == 202, retried.text
+            _wait_for_operation(store, retried.json()["operation_id"], OperationStatus.COMPLETED)
+            second_record = store.get_by_request("capacity-second")
+    finally:
+        release.set()
+        app.state.service.close()
+
+    assert denied.status_code == 429
+    assert denied.headers["retry-after"] == "30"
+    assert denied.json() == {
+        "detail": denied.json()["detail"],
+        "code": "capacity-denied",
+        "message": denied.json()["detail"],
+        "refresh_required": False,
+        "retry_policy": "retry-later",
+        "subject_id": "demo-quality",
+        "request_id": "capacity-second",
+        "current_head": None,
+        "retry_after_seconds": 30,
+    }
+    assert "not accepted" in denied.json()["detail"]
+    assert replay.status_code == 202
+    assert replay.json()["operation_id"] == first.json()["operation_id"]
+    assert operations_during == operations_before
+    assert second_record.operation_id == retried.json()["operation_id"]
+
+
+def test_stranded_own_record_is_reclaimed_so_it_cannot_hold_durable_capacity(durable_job_context, monkeypatch):
+    _root_context, store, capture = durable_job_context
+    registry = OperationJobRegistry(store, max_active=1, clock=lambda: _JOB_NOW)
+    stranded = _accepted_operation(store, capture, request_id="stranded")
+
+    def failing_work(_progress, _cancelled, _effect):
+        raise RuntimeError("synthetic worker failure")
+
+    def failing_fail(*_args, **_kwargs):
+        raise OSError(5, "synthetic final-write fault")
+
+    monkeypatch.setattr(store, "fail", failing_fail)
+    try:
+        registry.submit(stranded, failing_work)
+        deadline = time.monotonic() + _WAIT_SECONDS
+        while registry._active and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not registry._active
+        assert store.get_operation(stranded.operation_id).status is OperationStatus.RUNNING
+        assert registry._stranded == {stranded.operation_id}
+
+        preview = store.create_preview(
+            action="backtest",
+            subject_id="alpha",
+            expected_head="head-1",
+            due_set=(),
+            capture=capture,
+            operator_session="operator-1",
+            payload={"mode": "synthetic"},
+            now=_JOB_NOW,
+            expires_at=_JOB_NOW + timedelta(minutes=1),
+        )
+        accept = dict(
+            request_id="after-reclaim",
+            action="backtest",
+            subject_id="alpha",
+            preview_id=preview.preview_id,
+            preview_digest=preview.digest,
+            confirmation_token=preview.confirmation_token,
+            operator_session="operator-1",
+            expected_head="head-1",
+            due_set=(),
+            payload={"mode": "synthetic"},
+            now=_JOB_NOW,
+            capacity=(frozenset({"backtest"}), 1),
+        )
+        with pytest.raises(OperationCapacityExceeded):
+            store.accept_request(**accept)
+
+        assert registry.reclaim_stranded() == 1
+        assert registry._stranded == set()
+        assert store.get_operation(stranded.operation_id).status is OperationStatus.INTERRUPTED
+        assert store.accept_request(**accept).status is OperationStatus.ACCEPTED
+        assert registry.reclaim_stranded() == 0
+    finally:
+        registry.close()
+
+
+def test_submit_that_cannot_read_its_accepted_record_strands_it_for_reclaim(durable_job_context, monkeypatch):
+    _root_context, store, capture = durable_job_context
+    registry = OperationJobRegistry(store, max_active=1, clock=lambda: _JOB_NOW)
+    accepted = _accepted_operation(store, capture, request_id="unstarted")
+    original_get = store.get_operation
+
+    def busy_get(*_args, **_kwargs):
+        raise OperationBusy("synthetic registry contention")
+
+    try:
+        monkeypatch.setattr(store, "get_operation", busy_get)
+        with pytest.raises(OperationBusy):
+            registry.submit(accepted, lambda *_args: {})
+        monkeypatch.setattr(store, "get_operation", original_get)
+        assert not registry._active
+        assert registry._stranded == {accepted.operation_id}
+        assert store.get_operation(accepted.operation_id).status is OperationStatus.ACCEPTED
+
+        assert registry.reclaim_stranded() == 1
+        assert store.get_operation(accepted.operation_id).status is OperationStatus.INTERRUPTED
+        assert registry._stranded == set()
+    finally:
+        registry.close()

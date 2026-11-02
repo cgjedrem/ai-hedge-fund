@@ -75,6 +75,10 @@ class OperationBusy(OperationError):
     """Operation storage lock was not acquired within its bound; durable state is unchanged."""
 
 
+class OperationCapacityExceeded(OperationError):
+    """Bounded operation capacity is full; nothing was accepted and the preview stays issued."""
+
+
 class StalePreview(OperationError):
     """Reviewed head, due-set or payload changed."""
 
@@ -91,6 +95,15 @@ class OperationStatus(str, Enum):
     INTERRUPTED = "interrupted"
     CANCEL_REQUESTED = "cancel-requested"
     CANCELLED = "cancelled"
+
+
+_UNFINISHED_STATUSES = frozenset(
+    {
+        OperationStatus.ACCEPTED.value,
+        OperationStatus.RUNNING.value,
+        OperationStatus.CANCEL_REQUESTED.value,
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -372,7 +385,16 @@ class OperationStore:
         start_worker: Callable[[OperationRecord], object] | None = None,
         current_state_resolver: Callable[[], tuple[str | None, tuple[str, ...]]] | None = None,
         admission_held: bool = False,
+        capacity: tuple[frozenset[str], int] | None = None,
     ) -> OperationRecord:
+        """Admit one reviewed request.
+
+        ``capacity`` is ``(actions, limit)``: a new acceptance is denied with
+        :class:`OperationCapacityExceeded` when the root already holds ``limit``
+        unfinished operations whose action is in ``actions``. The count is read
+        under the registry lock, so it bounds every process sharing the root;
+        replays of an admitted request are answered before the bound applies.
+        """
         self._require_private_storage()
         request_id = _validate_request_id(request_id)
         action = _validate_action(action)
@@ -389,6 +411,9 @@ class OperationStore:
             raise OperationError("current state resolver is invalid")
         if type(admission_held) is not bool:
             raise OperationError("admission state is invalid")
+        if capacity is not None:
+            if not isinstance(capacity, tuple) or len(capacity) != 2 or not isinstance(capacity[0], frozenset) or not capacity[0] or any(not isinstance(item, str) for item in capacity[0]) or type(capacity[1]) is not int or not 0 <= capacity[1] <= 16:
+                raise OperationError("operation capacity is invalid")
         due_set = _validate_due_set(due_set)
         _validate_datetime(now)
         if expected_head is not None and not _safe_text(expected_head, maximum=512):
@@ -484,6 +509,11 @@ class OperationStore:
                     raise StalePreview("reviewed payload changed")
                 if resolved_state is not None and resolved_state != (expected_head, due_set):
                     raise StalePreview("current head or due-set changed")
+                if capacity is not None:
+                    capacity_actions, capacity_limit = capacity
+                    unfinished = sum(1 for item in index["operations"].values() if item.get("action") in capacity_actions and item.get("status") in _UNFINISHED_STATUSES)
+                    if unfinished >= capacity_limit:
+                        raise OperationCapacityExceeded("operation capacity is full")
 
                 operation_id = uuid4().hex
                 timestamp = _datetime_text(now)

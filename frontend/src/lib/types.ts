@@ -56,6 +56,7 @@ export interface ApiErrorShape {
   subject_id?: string | null;
   request_id?: string | null;
   current_head?: string | null;
+  retry_after_seconds?: number | null;
 }
 
 export interface ModelOption {

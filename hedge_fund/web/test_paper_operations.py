@@ -996,3 +996,54 @@ def test_paper_accept_retries_only_busy_storage_and_records_no_effects(demo_root
     assert (denied.value.status_code, body["code"], body["retry_policy"]) == (409, code, policy)
     assert "synthetic" not in denied.value.detail
     assert after == before
+
+
+def test_full_paper_capacity_denies_429_before_acceptance_and_preview_stays_usable(demo_root, monkeypatch):
+    data_client = _OfflineDataClient()
+    service = DeskService(
+        demo_root,
+        allow_writes=True,
+        network_enabled=True,
+        data_client_factory=lambda: data_client,
+        fund_factory=_OfflineFund,
+    )
+    service._runtime_settings = _local_settings()
+    try:
+        spec = load_spec(demo_root / "mandates" / "demo-quality.yaml").model_copy(update={"name": "capacity-test"})
+        service.create_mandate(spec.model_dump(mode="python"))
+        service.deploy_mandate("capacity-test", DeployRequest(universe=["AAPL", "MSFT"]))
+        ledger = Ledger(demo_root / "paper" / "capacity-test")
+        before = ledger.sessions()
+        preview = service.create_manual_tick_preview(
+            "capacity-test",
+            PaperTickPreviewRequest(expected_head=None),
+            operator_session="offline-test-session",
+        )
+        request = PaperTickAcceptRequest(
+            request_id="offline-capacity",
+            preview_id=preview["preview_id"],
+            preview_digest=preview["preview_digest"],
+            confirmation_token=preview["confirmation_token"],
+            expected_head=None,
+            due_set=preview["due_set"],
+        )
+        worker = service._paper_operation_jobs
+        with monkeypatch.context() as patched:
+            patched.setattr(worker, "try_reserve", lambda: None)
+            with pytest.raises(ServiceError) as denied:
+                service.accept_manual_tick("capacity-test", request, operator_session="offline-test-session")
+        denied_record = service._operation_store.get_by_request("offline-capacity")
+        preview_state = service._operation_store._read_index()["previews"][preview["preview_id"]]["state"]
+        after_denial = ledger.sessions()
+
+        accepted = service.accept_manual_tick("capacity-test", request, operator_session="offline-test-session")
+        completed = _wait_for_operation(service, accepted["operation_id"])
+    finally:
+        service.close()
+
+    assert (denied.value.status_code, denied.value.code, denied.value.retry_policy, denied.value.retry_after_seconds) == (429, "capacity-denied", "retry-later", 30)
+    assert (denied.value.subject_id, denied.value.request_id) == ("capacity-test", "offline-capacity")
+    assert denied_record is None
+    assert preview_state == "issued"
+    assert after_denial == before
+    assert completed["status"] == "completed", completed

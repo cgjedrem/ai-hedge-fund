@@ -231,7 +231,7 @@ _ENVELOPE_KEYS = {"detail", "code", "message", "refresh_required", "retry_policy
 def _assert_envelope(response, status, code, *, root=None):
     body = response.json()
     assert response.status_code == status
-    assert set(body) == _ENVELOPE_KEYS
+    assert set(body) - {"retry_after_seconds"} == _ENVELOPE_KEYS
     assert body["code"] == code
     assert isinstance(body["message"], str) and body["message"]
     assert isinstance(body["refresh_required"], bool)
@@ -368,6 +368,56 @@ def test_service_error_rejects_codes_outside_the_contract():
 
     with pytest.raises(ValueError, match="unknown error code"):
         ServiceError(409, "Denied.", code="made-up")
+
+
+def test_capacity_denial_carries_bounded_retry_after_header_and_envelope(tmp_path):
+    from hedge_fund.web.services import (
+        _capacity_denied,
+        OPERATION_CAPACITY_RETRY_AFTER_SECONDS,
+    )
+
+    app = create_app(root=tmp_path)
+
+    def fail():
+        raise _capacity_denied("demo-quality", "request-1")
+
+    app.state.service.catalog = fail
+    with TestClient(app) as client:
+        response = client.get("/api/catalog", headers=LOOPBACK)
+
+    body = _assert_envelope(response, 429, "capacity-denied")
+    assert response.headers["retry-after"] == str(OPERATION_CAPACITY_RETRY_AFTER_SECONDS)
+    assert body["retry_after_seconds"] == OPERATION_CAPACITY_RETRY_AFTER_SECONDS
+    assert body["retry_policy"] == "retry-later"
+    assert body["refresh_required"] is False
+    assert (body["subject_id"], body["request_id"]) == ("demo-quality", "request-1")
+
+
+@pytest.mark.parametrize(
+    ("status", "code", "seconds"),
+    [(409, "writer-conflict", 30), (429, "capacity-denied", 0), (429, "capacity-denied", 301), (429, "capacity-denied", True), (423, "halted", 5)],
+)
+def test_retry_after_hint_is_only_valid_bounded_on_retryable_denials(status, code, seconds):
+    from hedge_fund.web.services import ServiceError
+
+    with pytest.raises(ValueError):
+        ServiceError(status, "Denied.", code=code, retry_after_seconds=seconds)
+
+
+def test_errors_without_retry_hint_omit_the_field_and_header(tmp_path):
+    from hedge_fund.web.services import ServiceError
+
+    app = create_app(root=tmp_path)
+
+    def fail():
+        raise ServiceError(429, "Denied.", code="budget-exhausted")
+
+    app.state.service.catalog = fail
+    with TestClient(app) as client:
+        response = client.get("/api/catalog", headers=LOOPBACK)
+
+    assert "retry-after" not in response.headers
+    assert "retry_after_seconds" not in response.json()
 
 
 def test_tagged_service_conflicts_reach_clients_with_contract_codes():
