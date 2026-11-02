@@ -18,6 +18,7 @@ from hedge_fund.test_support.network_guard import (
     child_test_environment,
     cleanup_test_root,
     CREDENTIAL_ENV_VARS,
+    guarded_test_python_command,
     PROXY_ENV_VARS,
 )
 from hedge_fund.web.services import DeskService, ServiceError
@@ -80,7 +81,7 @@ def test_dotenv_is_disabled_for_test_owned_child(tmp_path: Path) -> None:
     env = child_test_environment()
 
     result = subprocess.run(
-        [sys.executable, "-c", probe],
+        guarded_test_python_command("-c", probe),
         cwd=child,
         env=env,
         capture_output=True,
@@ -91,6 +92,219 @@ def test_dotenv_is_disabled_for_test_owned_child(tmp_path: Path) -> None:
 
     assert result.returncode == 0, result.stderr
     assert "must-not-load" not in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("failure", ["missing-hook", "hook-exception", "hook-syntax", "missing-mode"])
+def test_owned_python_child_refuses_an_unavailable_site_hook(tmp_path: Path, failure: str) -> None:
+    env = child_test_environment()
+    env["OPENAI_API_KEY"] = "synthetic-should-never-be-printed"
+    if failure == "missing-mode":
+        env.pop("HEDGE_FUND_TEST_MODE")
+    else:
+        support = tmp_path / "fake-support"
+        support.mkdir()
+        if failure == "hook-exception":
+            (support / "sitecustomize.py").write_text(
+                "raise RuntimeError('synthetic site hook import failure')\n",
+                encoding="utf-8",
+            )
+        elif failure == "hook-syntax":
+            (support / "sitecustomize.py").write_text("def invalid syntax\n", encoding="utf-8")
+        repository = Path(__file__).resolve().parents[1]
+        env["PYTHONPATH"] = os.pathsep.join((str(support), str(repository)))
+    result = subprocess.run(
+        guarded_test_python_command("-c", "print('CHILD_SCRIPT_RAN')"),
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=10,
+    )
+
+    assert result.returncode != 0
+    assert "CHILD_SCRIPT_RAN" not in result.stdout + result.stderr
+    assert "synthetic-should-never-be-printed" not in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("failure", ["missing-hook", "hook-exception", "missing-mode"])
+def test_owned_runner_child_checks_guard_before_importing_its_module(tmp_path: Path, failure: str) -> None:
+    from hedge_fund.runtime.owned_runner import _runner_command
+    from hedge_fund.runtime.root import RootContext
+
+    support = tmp_path / "fake-support"
+    package = support / "hedge_fund" / "runtime"
+    package.mkdir(parents=True)
+    (package.parent / "__init__.py").write_text("", encoding="utf-8")
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "owned_runner_child.py").write_text("print('CHILD_SCRIPT_RAN')\n", encoding="utf-8")
+    if failure == "hook-exception":
+        (support / "sitecustomize.py").write_text("raise RuntimeError('synthetic hook failure')\n", encoding="utf-8")
+    env = child_test_environment()
+    if failure == "missing-mode":
+        env.pop("HEDGE_FUND_TEST_MODE")
+    else:
+        repository = Path(__file__).resolve().parents[1]
+        env["PYTHONPATH"] = os.pathsep.join((str(support), str(repository)))
+    with RootContext.open(tmp_path) as root:
+        command = _runner_command(root, "synthetic")
+
+    result = subprocess.run(
+        command,
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=10,
+    )
+
+    assert result.returncode != 0
+    assert "test isolation initialization failed" in result.stderr
+    assert "CHILD_SCRIPT_RAN" not in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("launcher", ["python", "owned-runner"])
+def test_owned_child_rejects_partially_configured_guard(tmp_path: Path, launcher: str) -> None:
+    from hedge_fund.runtime.owned_runner import _runner_command
+    from hedge_fund.runtime.root import RootContext
+
+    support = tmp_path / "partial-support"
+    package = support / "hedge_fund" / "runtime"
+    package.mkdir(parents=True)
+    (package.parent / "__init__.py").write_text("", encoding="utf-8")
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "owned_runner_child.py").write_text("print('CHILD_SCRIPT_RAN')\n", encoding="utf-8")
+    (support / "network_guard.py").write_text(
+        "import socket\n"
+        "def configure_test_child():\n"
+        "    def denied(*args, **kwargs):\n"
+        "        raise AssertionError('synthetic socket guard')\n"
+        "    setattr(denied, '__hedge_fund_test_network_guard__', True)\n"
+        "    for name in ('connect', 'connect_ex', 'sendto'):\n"
+        "        setattr(socket.socket, name, denied)\n"
+        "    for name in ('create_connection', 'getaddrinfo', 'gethostbyname', "
+        "'gethostbyname_ex', 'gethostbyaddr'):\n"
+        "        setattr(socket, name, denied)\n",
+        encoding="utf-8",
+    )
+    (support / "sitecustomize.py").write_text(
+        "from network_guard import configure_test_child\nconfigure_test_child()\n",
+        encoding="utf-8",
+    )
+    env = child_test_environment()
+    env["HOME"] = str(tmp_path / "wrong-home")
+    env["PYTHONPATH"] = os.pathsep.join((str(support), str(Path(__file__).resolve().parents[1])))
+    env["OPENAI_API_KEY"] = "synthetic-should-never-be-printed"
+    if launcher == "python":
+        command = guarded_test_python_command("-c", "print('CHILD_SCRIPT_RAN')")
+    else:
+        with RootContext.open(tmp_path) as root:
+            command = _runner_command(root, "synthetic")
+
+    result = subprocess.run(
+        command,
+        cwd=support,
+        env=env,
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=15,
+    )
+
+    assert result.returncode != 0
+    assert "test isolation initialization failed" in result.stderr
+    assert "CHILD_SCRIPT_RAN" not in result.stdout + result.stderr
+    assert "synthetic-should-never-be-printed" not in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("launcher", ["python", "owned-runner"])
+@pytest.mark.parametrize(
+    "failure",
+    ["missing-root", "invalid-root", "mismatched-home", "hook-import", "guard-import", "guard-setup"],
+)
+def test_owned_child_stops_on_canonical_hook_failures(
+    tmp_path: Path,
+    launcher: str,
+    failure: str,
+) -> None:
+    from hedge_fund.runtime.owned_runner import _runner_command
+    from hedge_fund.runtime.root import RootContext
+
+    package = tmp_path / "hedge_fund" / "runtime"
+    package.mkdir(parents=True)
+    (package.parent / "__init__.py").write_text("", encoding="utf-8")
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "owned_runner_child.py").write_text("print('CHILD_SCRIPT_RAN')\n", encoding="utf-8")
+    env = child_test_environment({"OPENAI_API_KEY": "synthetic-should-never-be-printed"})
+    if failure == "missing-root":
+        env.pop("HEDGE_FUND_TEST_ROOT")
+    elif failure == "invalid-root":
+        env["HEDGE_FUND_TEST_ROOT"] = str(tmp_path / "invalid")
+    elif failure == "mismatched-home":
+        env["HOME"] = str(tmp_path / "wrong-home")
+    if launcher == "python":
+        command = guarded_test_python_command("-c", "print('CHILD_SCRIPT_RAN')")
+    else:
+        with RootContext.open(tmp_path) as root:
+            command = _runner_command(root, "synthetic")
+
+    prefix = ""
+    if failure in {"hook-import", "guard-import"}:
+        denied = "sitecustomize" if failure == "hook-import" else "network_guard"
+        prefix = (
+            "import builtins\n"
+            "_original_import = builtins.__import__\n"
+            "def _deny_import(name, *args, **kwargs):\n"
+            f"    if name == {denied!r}: raise ImportError('synthetic import failure')\n"
+            "    return _original_import(name, *args, **kwargs)\n"
+            "builtins.__import__ = _deny_import\n"
+        )
+    elif failure == "guard-setup":
+        prefix = (
+            "import network_guard\n"
+            "def _deny_setup(): raise RuntimeError('synthetic setup failure')\n"
+            "network_guard.configure_test_child = _deny_setup\n"
+        )
+    bootstrap_index = command.index("-c") + 1
+    command[bootstrap_index] = prefix + command[bootstrap_index]
+
+    result = subprocess.run(
+        command,
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=15,
+    )
+
+    assert result.returncode != 0
+    assert "test isolation initialization failed" in result.stderr
+    assert "CHILD_SCRIPT_RAN" not in result.stdout + result.stderr
+    assert "synthetic-should-never-be-printed" not in result.stdout + result.stderr
+
+
+def test_owned_python_child_runs_module_only_after_guard(tmp_path: Path) -> None:
+    (tmp_path / "synthetic_child.py").write_text(
+        "import socket, sys\n"
+        "assert getattr(socket.socket.connect, '__hedge_fund_test_network_guard__', False)\n"
+        "assert sys.argv[1:] == ['expected']\n"
+        "print('isolated-module')\n",
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        guarded_test_python_command("-m", "synthetic_child", "expected"),
+        cwd=tmp_path,
+        env=child_test_environment(),
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "isolated-module"
 
 
 def test_dotenv_values_reject_paths_outside_test_root() -> None:
@@ -131,6 +345,31 @@ def test_dotenv_values_allow_explicit_test_root_file(tmp_path: Path) -> None:
     env_file.write_text("AIHF_TEST_KEY=synthetic-value\n", encoding="utf-8")
 
     assert dotenv_values(env_file) == {"AIHF_TEST_KEY": "synthetic-value"}
+
+
+def test_reconfiguring_dotenv_guard_uses_only_the_current_test_root(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    import dotenv
+    import dotenv.main
+
+    for module in (dotenv, dotenv.main):
+        for name in ("load_dotenv", "find_dotenv", "dotenv_values"):
+            monkeypatch.setattr(module, name, getattr(module, name))
+    old_root = tmp_path / "old"
+    new_root = tmp_path / "new"
+    old_root.mkdir()
+    new_root.mkdir()
+    (old_root / ".env").write_text("AIHF_TEST_KEY=old\n", encoding="utf-8")
+    (new_root / ".env").write_text("AIHF_TEST_KEY=new\n", encoding="utf-8")
+
+    network_guard._disable_dotenv(old_root)
+    network_guard._disable_dotenv(new_root)
+
+    assert dotenv.dotenv_values(new_root / ".env") == {"AIHF_TEST_KEY": "new"}
+    with pytest.raises(AssertionError, match="test dotenv path denied"):
+        dotenv.dotenv_values(old_root / ".env")
 
 
 def test_child_environment_rejects_boundary_overrides() -> None:
@@ -201,7 +440,7 @@ print("isolated")
     )
 
     result = subprocess.run(
-        [sys.executable, "-c", probe],
+        guarded_test_python_command("-c", probe),
         cwd=tmp_path,
         env=env,
         capture_output=True,
@@ -213,6 +452,69 @@ print("isolated")
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "isolated"
     assert "synthetic-test-sentinel" not in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "missing-root",
+        "invalid-root",
+        "mismatched-home",
+        "dotenv-enabled",
+        "bytecode-enabled",
+        "invalid-pythonpath",
+        "guard-import-failure",
+        "guard-setup-failure",
+    ],
+)
+def test_python_child_stops_before_script_when_isolation_bootstrap_fails(
+    tmp_path: Path,
+    failure: str,
+) -> None:
+    env = child_test_environment(
+        {
+            "OPENAI_API_KEY": "synthetic-test-sentinel",
+            "HTTP_PROXY": "http://127.0.0.1:8123",
+        }
+    )
+    if failure == "missing-root":
+        env.pop("HEDGE_FUND_TEST_ROOT")
+    elif failure == "invalid-root":
+        env["HEDGE_FUND_TEST_ROOT"] = str(tmp_path / "invalid")
+    elif failure == "mismatched-home":
+        env["HOME"] = str(tmp_path)
+    elif failure == "dotenv-enabled":
+        env["PYTHON_DOTENV_DISABLED"] = "0"
+    elif failure == "bytecode-enabled":
+        env["PYTHONDONTWRITEBYTECODE"] = "0"
+    elif failure == "invalid-pythonpath":
+        env["PYTHONPATH"] = str(Path(network_guard.__file__).parent)
+    else:
+        support = tmp_path / "broken-support"
+        support.mkdir()
+        sitecustomize = Path(network_guard.__file__).with_name("sitecustomize.py")
+        (support / "sitecustomize.py").write_bytes(sitecustomize.read_bytes())
+        if failure == "guard-import-failure":
+            source = "raise ImportError('synthetic guard import failure')\n"
+        else:
+            source = "def configure_test_child():\n    raise RuntimeError('synthetic guard setup failure')\n"
+        (support / "network_guard.py").write_text(source, encoding="utf-8")
+        env["PYTHONPATH"] = str(support)
+
+    result = subprocess.run(
+        [sys.executable, "-c", "print('CHILD_SCRIPT_RAN')"],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=10,
+    )
+
+    assert result.returncode != 0
+    assert "CHILD_SCRIPT_RAN" not in result.stdout + result.stderr
+    assert "synthetic-test-sentinel" not in result.stdout + result.stderr
+    assert "test isolation initialization failed" in result.stderr
 
 
 @pytest.mark.parametrize(

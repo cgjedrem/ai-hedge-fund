@@ -13,7 +13,7 @@ import time
 from collections import deque
 from contextlib import contextmanager, ExitStack
 from pathlib import Path
-from typing import Iterator
+from typing import Callable, Iterator, TypeVar
 
 from hedge_fund.runtime.root import (
     ensure_unique_resource_name,
@@ -33,6 +33,9 @@ _LOCK_POLL_SECONDS = 0.01
 _LOCK_STATE = threading.local()
 _LOCAL_LANES_GUARD = threading.Lock()
 _LOCAL_LANES: dict[tuple[tuple[int, ...], str], deque[threading.Event]] = {}
+_APPROVAL_SEAL = object()
+_ADMISSION_PROCESS_ID = os.getpid()
+_T = TypeVar("_T")
 
 
 class AdmissionError(RuntimeError):
@@ -45,6 +48,23 @@ class OwnershipUnknown(AdmissionError):
 
 class WriterConflict(AdmissionError):
     """Another writer owns the requested lane."""
+
+
+class PaperControlBusy(WriterConflict):
+    """The paper control lane was occupied before admission."""
+
+
+class PaperPreflightBusy(PaperControlBusy):
+    """Paper work was not started because control admission was occupied."""
+
+
+class PaperAuditObservationBusy(WriterConflict):
+    """A stable audit observation could not acquire its lane."""
+
+
+def _require_current_process() -> None:
+    if os.getpid() != _ADMISSION_PROCESS_ID:
+        raise OwnershipUnknown("Admission requires a fresh interpreter after fork.")
 
 
 class _Overlapped(ctypes.Structure):
@@ -83,6 +103,7 @@ class RootOwnerLease:
         *,
         timeout: float = 0.0,
     ) -> RootOwnerLease:
+        _require_current_process()
         if not isinstance(root, RootContext):
             raise TypeError("an explicit RootContext is required")
         wait = _validate_timeout(timeout, MAX_LOCK_WAIT_SECONDS)
@@ -110,6 +131,7 @@ class RootOwnerLease:
             raise
 
     def matches(self, root: RootContext) -> bool:
+        _require_current_process()
         with self._guard:
             if self._closed or self._exclusive or self._root is not root or root._root_identity != self._root_identity:
                 return False
@@ -124,6 +146,14 @@ class RootOwnerLease:
         return True
 
     def close(self) -> None:
+        if os.getpid() != _ADMISSION_PROCESS_ID:
+            handle = self._handle
+            self._handle = None
+            self._token = None
+            self._closed = True
+            if handle is not None:
+                handle.close()
+            return
         with self._guard:
             if self._closed:
                 return
@@ -138,6 +168,7 @@ class RootOwnerLease:
             handle.close()
 
     def __enter__(self) -> RootOwnerLease:
+        _require_current_process()
         with self._guard:
             if self._closed:
                 raise OwnershipUnknown("Root owner lease is closed.")
@@ -159,6 +190,7 @@ class RootMigrationLease(RootOwnerLease):
         *,
         timeout: float = 0.0,
     ) -> RootMigrationLease:
+        _require_current_process()
         if not isinstance(root, RootContext):
             raise TypeError("an explicit RootContext is required")
         wait = _validate_timeout(timeout, MAX_LOCK_WAIT_SECONDS)
@@ -194,6 +226,7 @@ class AdmissionCoordinator:
         *,
         owner_lease: RootOwnerLease | None = None,
     ) -> None:
+        _require_current_process()
         if not isinstance(root, RootContext):
             raise TypeError("an explicit RootContext is required")
         if owner_lease is not None and not isinstance(owner_lease, RootOwnerLease):
@@ -222,7 +255,7 @@ class AdmissionCoordinator:
     def lane_is_held(self, lane: str, identity: str | None = None) -> bool:
         if lane == "registry":
             key = "registry"
-        elif lane in {"deployment", "runner", "execution", "control", "research"} and identity is not None:
+        elif lane in {"deployment", "runner", "execution", "control", "halt", "audit", "research"} and identity is not None:
             key = f"{lane}:{_resource_identity(identity)}"
         else:
             raise AdmissionError("admission lane is invalid")
@@ -232,40 +265,9 @@ class AdmissionCoordinator:
     @contextmanager
     def registry_read_lock(self, *, timeout: float = 0.0) -> Iterator[None]:
         """Serialize snapshots without writer-ownership authority."""
-        wait = _validate_timeout(timeout, MAX_LOCK_WAIT_SECONDS)
         relative = f"{LOCK_DIRECTORY}/{_lock_filename('registry')}"
-        self._root.revalidate()
-        lock_key = _thread_lock_key(self._root, relative)
-        held = _held_locks()
-        if lock_key in held:
-            held[lock_key] += 1
-            try:
-                yield
-            finally:
-                held[lock_key] -= 1
-            return
-        with _local_lane(lock_key, wait) as deadline:
-            try:
-                self._root.file_info(relative)
-                handle = self._root.open_lock_file(relative, mode=0o600)
-            except Exception as exc:
-                raise AdmissionError("existing registry lock is unavailable") from exc
-            acquired = False
-            token = None
-            try:
-                self._root.revalidate()
-                token = _acquire_os_lock(handle, _remaining(deadline))
-                acquired = True
-                self._root.revalidate()
-                held[lock_key] = 1
-                yield
-            finally:
-                held.pop(lock_key, None)
-                try:
-                    if acquired:
-                        _release_os_lock(handle, token)
-                finally:
-                    handle.close()
+        with _existing_read_lock(self._root, relative, "registry", timeout=timeout):
+            yield
 
     @contextmanager
     def deployment_lock(
@@ -310,6 +312,30 @@ class AdmissionCoordinator:
         resource = _resource_identity(identity)
         wait = _validate_timeout(timeout, MAX_CONTROL_WAIT_SECONDS)
         with self._lock(f"control:{resource}", timeout=wait):
+            yield
+
+    @contextmanager
+    def halt_lane(
+        self,
+        identity: str,
+        *,
+        timeout: float = 0.1,
+    ) -> Iterator[None]:
+        resource = _resource_identity(identity)
+        wait = _validate_timeout(timeout, MAX_CONTROL_WAIT_SECONDS)
+        with self._lock(f"halt:{resource}", timeout=wait):
+            yield
+
+    @contextmanager
+    def audit_lane(
+        self,
+        identity: str,
+        *,
+        timeout: float = MAX_CONTROL_WAIT_SECONDS,
+    ) -> Iterator[None]:
+        resource = _resource_identity(identity)
+        wait = _validate_timeout(timeout, MAX_CONTROL_WAIT_SECONDS)
+        with self._lock(f"audit:{resource}", timeout=wait):
             yield
 
     @contextmanager
@@ -401,7 +427,7 @@ class AdmissionCoordinator:
             finally:
                 held.pop(lock_key, None)
                 try:
-                    if acquired:
+                    if acquired and os.getpid() == _ADMISSION_PROCESS_ID:
                         _release_os_lock(handle, token)
                 finally:
                     handle.close()
@@ -413,34 +439,376 @@ class AdmissionCoordinator:
 
 
 @contextmanager
+def _existing_read_lock(
+    root: RootContext,
+    relative: str,
+    label: str,
+    *,
+    timeout: float,
+) -> Iterator[None]:
+    _require_current_process()
+    wait = _validate_timeout(timeout, MAX_LOCK_WAIT_SECONDS)
+    root.revalidate()
+    lock_key = _thread_lock_key(root, relative)
+    held = _held_locks()
+    if lock_key in held:
+        held[lock_key] += 1
+        try:
+            yield
+        finally:
+            held[lock_key] -= 1
+        return
+    with _local_lane(lock_key, wait) as deadline:
+        try:
+            root.file_info(relative)
+            handle = root.open_lock_file(relative, mode=0o600)
+        except (OSError, RootPathError) as exc:
+            raise AdmissionError(f"existing {label} lock is unavailable") from exc
+        acquired = False
+        token = None
+        try:
+            root.revalidate()
+            token = _acquire_os_lock(handle, _remaining(deadline))
+            acquired = True
+            root.revalidate()
+            held[lock_key] = 1
+            yield
+        finally:
+            held.pop(lock_key, None)
+            try:
+                if acquired and os.getpid() == _ADMISSION_PROCESS_ID:
+                    _release_os_lock(handle, token)
+            finally:
+                handle.close()
+
+
+def paper_audit_snapshot(
+    path: str | os.PathLike[str],
+    identity: str,
+    read: Callable[[], _T],
+) -> _T:
+    directory = Path(os.path.abspath(os.fspath(path)))
+    if not directory.is_dir():
+        try:
+            result = read()
+        except (OSError, UnicodeError, ValueError):
+            if not directory.is_dir():
+                raise
+        else:
+            if not directory.is_dir():
+                return result
+
+    def snapshot(root: RootContext, relative: str) -> _T:
+        def lock_exists() -> bool:
+            try:
+                root.file_info(relative)
+            except FileNotFoundError:
+                return False
+            return True
+
+        if _thread_lock_key(root, relative) in _held_locks():
+            return read()
+        if not lock_exists():
+            try:
+                result = read()
+            except (OSError, UnicodeError, ValueError):
+                if not lock_exists():
+                    raise
+            else:
+                if not lock_exists():
+                    return result
+        with ExitStack() as stack:
+            try:
+                stack.enter_context(_existing_read_lock(root, relative, "paper audit", timeout=MAX_CONTROL_WAIT_SECONDS))
+            except WriterConflict as exc:
+                raise PaperAuditObservationBusy("Paper audit observation is occupied.") from exc
+            return read()
+
+    if _is_paper_component(directory.parent.name):
+        from hedge_fund.runtime.handover import root_is_enrolled
+
+        resource = _resource_identity(identity)
+        if _resource_identity(directory.name) != resource:
+            raise AdmissionError("paper path identity does not match the fund")
+        with RootContext.open(directory.parent.parent) as root:
+            if root_is_enrolled(root):
+                relative = f"{LOCK_DIRECTORY}/{_lock_filename(f'audit:{resource}')}"
+                return snapshot(root, relative)
+    with RootContext.open(directory) as root:
+        return snapshot(root, ".paper-audit.lock")
+
+
+@contextmanager
 def root_registry_writer(
     root: RootContext,
     admission: AdmissionCoordinator | None = None,
+    *,
+    timeout: float = 0.0,
+    allow_prepared_lifecycle: bool = False,
 ) -> Iterator[AdmissionCoordinator]:
     if not isinstance(root, RootContext):
         raise TypeError("an explicit RootContext is required")
     if admission is not None and (not isinstance(admission, AdmissionCoordinator) or admission.root is not root):
         raise TypeError("admission must match the RootContext")
+    if type(allow_prepared_lifecycle) is not bool:
+        raise TypeError("lifecycle inventory option must be a boolean")
     owner = None
     coordinator = admission
     if coordinator is None:
         owner = RootOwnerLease.acquire(root, timeout=0)
         coordinator = AdmissionCoordinator(root, owner_lease=owner)
-    try:
-        if coordinator.lane_is_held("registry"):
+
+    def verify_inventory() -> None:
+        if allow_prepared_lifecycle:
+            from hedge_fund.runtime.handover import verify_cache_write_inventory
+
+            verify_cache_write_inventory(root, coordinator)
+        else:
             from hedge_fund.runtime.handover import verify_root_inventory
 
             verify_root_inventory(root)
+
+    try:
+        if coordinator.lane_is_held("registry"):
+            verify_inventory()
             yield coordinator
         else:
-            with coordinator.registry_lock(timeout=0):
-                from hedge_fund.runtime.handover import verify_root_inventory
-
-                verify_root_inventory(root)
+            with coordinator.registry_lock(timeout=timeout):
+                verify_inventory()
                 yield coordinator
     finally:
         if owner is not None:
             owner.close()
+
+
+@contextmanager
+def paper_execution_transition(
+    path: str | os.PathLike[str],
+    identity: str,
+) -> Iterator[None]:
+    """Keep standalone paper executions distinct from control updates."""
+    admitted = require_paper_write_lanes(
+        path,
+        identity,
+        lane_sets=(("runner", "execution"),),
+        verify_inventory=True,
+    )
+    if admitted:
+        yield
+    else:
+        with _standalone_paper_lane(path, ".paper-execution.lock", timeout=0.0, reentrant=False):
+            yield
+
+
+@contextmanager
+def paper_control_transition(
+    path: str | os.PathLike[str],
+    identity: str,
+) -> Iterator[None]:
+    """Serialize cooperating control updates for a paper fund."""
+    admitted = require_paper_write_lanes(
+        path,
+        identity,
+        lane_sets=(("control",), ("runner", "execution")),
+    )
+    if not admitted:
+        entered = False
+        try:
+            with _standalone_paper_control(path):
+                entered = True
+                yield
+        except WriterConflict as exc:
+            if entered:
+                raise
+            raise PaperControlBusy("Paper control admission is occupied.") from exc
+        return
+    directory = Path(os.path.abspath(os.fspath(path)))
+    with RootContext.open(directory.parent.parent) as root:
+        with RootOwnerLease.acquire(root) as owner:
+            admission = AdmissionCoordinator(root, owner_lease=owner)
+            if admission.lane_is_held("control", identity):
+                yield
+            else:
+                entered = False
+                try:
+                    with admission.control_lane(identity, timeout=MAX_CONTROL_WAIT_SECONDS):
+                        entered = True
+                        yield
+                except WriterConflict as exc:
+                    if entered:
+                        raise
+                    raise PaperControlBusy("Paper control admission is occupied.") from exc
+
+
+@contextmanager
+def paper_halt_transition(
+    path: str | os.PathLike[str],
+    identity: str,
+) -> Iterator[None]:
+    with _paper_auxiliary_lane(
+        path,
+        identity,
+        lane="halt",
+        lane_sets=(("halt",), ("control",), ("deployment",), ("runner", "execution")),
+        standalone_lock=".paper-halt.lock",
+    ):
+        yield
+
+
+@contextmanager
+def paper_audit_transition(
+    path: str | os.PathLike[str],
+    identity: str,
+    *,
+    halt_event: bool = False,
+) -> Iterator[None]:
+    lane_sets = (("control",), ("runner", "execution"))
+    if halt_event:
+        lane_sets = (("halt",),) + lane_sets
+    with _paper_auxiliary_lane(
+        path,
+        identity,
+        lane="audit",
+        lane_sets=lane_sets,
+        standalone_lock=".paper-audit.lock",
+    ):
+        yield
+
+
+@contextmanager
+def _paper_auxiliary_lane(
+    path: str | os.PathLike[str],
+    identity: str,
+    *,
+    lane: str,
+    lane_sets: tuple[tuple[str, ...], ...],
+    standalone_lock: str,
+) -> Iterator[None]:
+    admitted = require_paper_write_lanes(path, identity, lane_sets=lane_sets)
+    if not admitted:
+        with _standalone_paper_lane(path, standalone_lock, timeout=MAX_CONTROL_WAIT_SECONDS, reentrant=True):
+            yield
+        return
+    directory = Path(os.path.abspath(os.fspath(path)))
+    with RootContext.open(directory.parent.parent) as root:
+        with RootOwnerLease.acquire(root) as owner:
+            admission = AdmissionCoordinator(root, owner_lease=owner)
+            if admission.lane_is_held(lane, identity):
+                yield
+            elif lane == "halt":
+                with admission.halt_lane(identity, timeout=MAX_CONTROL_WAIT_SECONDS):
+                    yield
+            else:
+                with admission.audit_lane(identity, timeout=MAX_CONTROL_WAIT_SECONDS):
+                    yield
+
+
+@contextmanager
+def _standalone_paper_control(path: str | os.PathLike[str]) -> Iterator[None]:
+    with _standalone_paper_lane(path, ".paper-control.lock", timeout=MAX_CONTROL_WAIT_SECONDS, reentrant=True):
+        yield
+
+
+@contextmanager
+def _standalone_paper_lane(
+    path: str | os.PathLike[str],
+    relative: str,
+    *,
+    timeout: float,
+    reentrant: bool,
+) -> Iterator[None]:
+    from hedge_fund import paths
+
+    _require_current_process()
+    directory = Path(os.path.abspath(os.fspath(path)))
+    configured = paths.root_context(required=False)
+    if configured is not None:
+        try:
+            directory.relative_to(configured.path)
+        except ValueError:
+            pass
+        else:
+            raise AdmissionError("Standalone paper admission cannot bypass a configured root.")
+    with RootContext.open(directory) as root:
+        lock_key = _thread_lock_key(root, relative)
+        held = _held_locks()
+        if lock_key in held:
+            if not reentrant:
+                raise WriterConflict("Admission lane is occupied.")
+            held[lock_key] += 1
+            try:
+                yield
+            finally:
+                held[lock_key] -= 1
+            return
+        with _local_lane(lock_key, timeout) as deadline:
+            handle = root.open_lock_file(relative, mode=0o600)
+            acquired = False
+            token = None
+            try:
+                root.revalidate()
+                token = _acquire_os_lock(handle, _remaining(deadline))
+                acquired = True
+                root.revalidate()
+                held[lock_key] = 1
+                yield
+            finally:
+                held.pop(lock_key, None)
+                try:
+                    if acquired and os.getpid() == _ADMISSION_PROCESS_ID:
+                        _release_os_lock(handle, token)
+                finally:
+                    handle.close()
+
+
+class PaperApprovalAdmission:
+    """A scoped inventory proof tied to the held registry and control lanes."""
+
+    def __init__(self, admission: AdmissionCoordinator, identity: str, *, _seal: object) -> None:
+        if _seal is not _APPROVAL_SEAL:
+            raise TypeError("paper verdict proofs require verified admission")
+        self._admission = admission
+        self._identity = _resource_identity(identity)
+        self._active = True
+
+    def matches(self, path: str | os.PathLike[str], identity: str) -> bool:
+        try:
+            self._admission.require_root_owner()
+        except AdmissionError:
+            return False
+        candidate = os.path.normcase(os.path.abspath(os.fspath(path)))
+        expected = os.path.normcase(
+            os.path.abspath(os.fspath(self._admission.root.path / "paper" / identity))
+        )
+        return (
+            self._active
+            and _resource_identity(identity) == self._identity
+            and candidate == expected
+            and self._admission.lane_is_held("registry")
+            and self._admission.lane_is_held("control", identity)
+        )
+
+
+@contextmanager
+def paper_approval_transition(
+    admission: AdmissionCoordinator,
+    identity: str,
+) -> Iterator[PaperApprovalAdmission]:
+    """Verify inventory before taking the short-lived human verdict lane."""
+    if not isinstance(admission, AdmissionCoordinator):
+        raise TypeError("paper verdict admission requires a root coordinator")
+    if admission.lane_is_held("control", identity):
+        raise WriterConflict("paper verdict admission must precede the control lane")
+    from hedge_fund.runtime.handover import verify_root_inventory
+
+    with admission.registry_lock(timeout=MAX_LOCK_WAIT_SECONDS):
+        verify_root_inventory(admission.root)
+        with admission.control_lane(identity, timeout=MAX_CONTROL_WAIT_SECONDS):
+            proof = PaperApprovalAdmission(admission, identity, _seal=_APPROVAL_SEAL)
+            try:
+                yield proof
+            finally:
+                proof._active = False
 
 
 def require_paper_write_lanes(
@@ -458,7 +826,7 @@ def require_paper_write_lanes(
         raise AdmissionError("paper admission flags must be booleans")
     if not isinstance(lane_sets, tuple) or not lane_sets:
         raise AdmissionError("paper admission lane sets are invalid")
-    allowed_lanes = {"deployment", "runner", "execution", "control"}
+    allowed_lanes = {"deployment", "runner", "execution", "control", "halt"}
     for lane_set in lane_sets:
         if not isinstance(lane_set, tuple) or not lane_set or any(not isinstance(lane, str) for lane in lane_set) or len(set(lane_set)) != len(lane_set) or any(lane not in allowed_lanes for lane in lane_set):
             raise AdmissionError("paper admission lane sets are invalid")
@@ -559,6 +927,7 @@ def _remaining(deadline: float) -> float:
 
 @contextmanager
 def _local_lane(key: tuple[tuple[int, ...], str], timeout: float) -> Iterator[float]:
+    _require_current_process()
     # FIFO prevents local pollers from barging; OS lock still grants authority.
     deadline = time.monotonic() + timeout
     ticket = threading.Event()
@@ -572,12 +941,13 @@ def _local_lane(key: tuple[tuple[int, ...], str], timeout: float) -> Iterator[fl
             raise WriterConflict("Admission lane is occupied.")
         yield deadline
     finally:
-        with _LOCAL_LANES_GUARD:
-            queue.remove(ticket)
-            if queue:
-                queue[0].set()
-            else:
-                del _LOCAL_LANES[key]
+        if os.getpid() == _ADMISSION_PROCESS_ID:
+            with _LOCAL_LANES_GUARD:
+                queue.remove(ticket)
+                if queue:
+                    queue[0].set()
+                else:
+                    del _LOCAL_LANES[key]
 
 
 def _lock_filename(key: str) -> str:
@@ -586,7 +956,7 @@ def _lock_filename(key: str) -> str:
     if not isinstance(key, str) or ":" not in key:
         raise AdmissionError("admission lane is invalid")
     namespace, identity = key.split(":", 1)
-    if namespace not in {"deployment", "runner", "execution", "control", "research"} or not identity:
+    if namespace not in {"deployment", "runner", "execution", "control", "halt", "audit", "research"} or not identity:
         raise AdmissionError("admission lane is invalid")
     digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
     return f"{namespace}-{digest}.lock"
@@ -685,6 +1055,7 @@ def _windows_lock_api():
 
 
 def _held_locks() -> dict[tuple[tuple[int, ...], str], int]:
+    _require_current_process()
     held = getattr(_LOCK_STATE, "held", None)
     if held is None:
         held = {}

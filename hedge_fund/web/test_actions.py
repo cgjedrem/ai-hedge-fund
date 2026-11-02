@@ -103,6 +103,139 @@ def test_stale_and_expired_approvals_fail_without_rebinding(write_client, demo_r
     assert not ledger.approval()
 
 
+@pytest.mark.parametrize("stale_reason", ["replacement", "expiry", "wrong_hash"])
+def test_paper_detail_does_not_present_stale_mailbox_as_current(
+    write_client, demo_root, monkeypatch, stale_reason
+):
+    from hedge_fund.paper import ledger as ledger_module
+
+    client, headers = write_client
+    detail = client.get("/api/paper/demo-quality", headers={"host": "127.0.0.1"}).json()
+    pending = detail["pending"]
+    request = {
+        "verdict": "approve",
+        "decision_as_of": pending["decision_as_of"],
+        "source_record_hash": pending["source_record_hash"],
+    }
+    response = client.post("/api/paper/demo-quality/approval", headers=headers, json=request)
+    assert response.status_code == 200
+    assert client.get("/api/paper/demo-quality", headers={"host": "127.0.0.1"}).json()["approval"]["verdict"] == "approve"
+    ledger = Ledger(demo_root / "paper" / "demo-quality")
+
+    if stale_reason == "replacement":
+        write_atomic = ledger_module.write_atomic
+
+        def fail_mailbox(path, text, **kwargs):
+            if path == ledger.approval_path:
+                raise OSError("synthetic staged mailbox failure")
+            return write_atomic(path, text, **kwargs)
+
+        monkeypatch.setattr(ledger_module, "write_atomic", fail_mailbox)
+        response = client.post(
+            "/api/paper/demo-quality/approval",
+            headers=headers,
+            json={**request, "verdict": "reject"},
+        )
+        assert response.status_code == 409
+    elif stale_reason == "expiry":
+        with _demo_control_lane(demo_root, "demo-quality"):
+            ledger.log_event(
+                "expire",
+                decision_as_of=pending["decision_as_of"],
+                decision_hash=pending["source_record_hash"],
+                reason="synthetic expiry",
+                durable=True,
+            )
+    else:
+        mailbox = ledger.approval()
+        mailbox["decision_hash"] = "0" * 64 if pending["source_record_hash"] != "0" * 64 else "1" * 64
+        with _demo_control_lane(demo_root, "demo-quality"):
+            ledger.approval_path.write_text(json.dumps(mailbox), encoding="utf-8")
+
+    assert ledger.approval() is not None
+    after = client.get("/api/paper/demo-quality", headers={"host": "127.0.0.1"}).json()
+    assert after["approval"] is None
+    assert after["pending"] == pending
+
+
+def test_paper_detail_exposes_unfinished_approval_reconciliation(write_client, demo_root):
+    client, headers = write_client
+    detail = client.get("/api/paper/demo-quality", headers={"host": "127.0.0.1"}).json()
+    pending = detail["pending"]
+    response = client.post(
+        "/api/paper/demo-quality/approval",
+        headers=headers,
+        json={
+            "verdict": "approve",
+            "decision_as_of": pending["decision_as_of"],
+            "source_record_hash": pending["source_record_hash"],
+        },
+    )
+    assert response.status_code == 200
+    ledger = Ledger(demo_root / "paper" / "demo-quality")
+    approval = ledger.approval()
+    with _demo_control_lane(demo_root, "demo-quality"):
+        ledger.log_event(
+            "consume",
+            decision_as_of=approval["decision_as_of"],
+            decision_hash=approval["decision_hash"],
+            approval_verdict=approval["verdict"],
+            approval_by=approval["by"],
+            approval_id=approval["approval_id"],
+            session="2025-01-07",
+            durable=True,
+        )
+
+    after = client.get("/api/paper/demo-quality", headers={"host": "127.0.0.1"}).json()
+    assert not after["ledger"]["ok"]
+    assert "reconciliation" in after["ledger"]["error"].lower()
+    assert after["approval"] is None
+
+
+def test_paper_detail_detects_consumption_during_verdict_read(write_client, demo_root, monkeypatch):
+    client, headers = write_client
+    before = client.get("/api/paper/demo-quality", headers={"host": "127.0.0.1"}).json()
+    pending = before["pending"]
+    response = client.post(
+        "/api/paper/demo-quality/approval",
+        headers=headers,
+        json={
+            "verdict": "approve",
+            "decision_as_of": pending["decision_as_of"],
+            "source_record_hash": pending["source_record_hash"],
+        },
+    )
+    assert response.status_code == 200
+    ledger = Ledger(demo_root / "paper" / "demo-quality")
+    approval = ledger.approval()
+    resolve = Ledger.resolve_approval
+    consumed = False
+
+    def consume_before_resolution(self, *args, **kwargs):
+        nonlocal consumed
+        if self.directory == ledger.directory and not consumed:
+            consumed = True
+            with _demo_control_lane(demo_root, "demo-quality"):
+                ledger.log_event(
+                    "consume",
+                    decision_as_of=approval["decision_as_of"],
+                    decision_hash=approval["decision_hash"],
+                    approval_verdict=approval["verdict"],
+                    approval_by=approval["by"],
+                    approval_id=approval["approval_id"],
+                    session="2025-01-07",
+                    durable=True,
+                )
+        return resolve(self, *args, **kwargs)
+
+    monkeypatch.setattr(Ledger, "resolve_approval", consume_before_resolution)
+    after = client.get("/api/paper/demo-quality", headers={"host": "127.0.0.1"}).json()
+    assert consumed
+    assert not after["ledger"]["ok"]
+    assert "in progress or requires reconciliation" in after["ledger"]["error"].lower()
+    assert after["approval"] is None
+
+
 def test_approval_is_rejected_when_gate_is_disabled(write_client, demo_root):
     client, headers = write_client
     from hedge_fund.fund import load_spec
@@ -171,6 +304,7 @@ def test_approval_is_rejected_when_control_is_unreadable(write_client, demo_root
 
     assert response.status_code == 423
     assert response.json()["detail"] == "Paper state is invalid (LedgerError)."
+    assert response.json()["code"] == "replay-corrupt"
     assert not (demo_root / "paper" / "demo-quality" / "pending-approval.json").exists()
 
 
@@ -635,13 +769,13 @@ def test_saxo_accept_routes_reject_previews_before_worker_or_ledger_effects(
     assert accepted_operations == ()
 
 
-def test_web_halt_enters_shared_control_lane(tmp_path, monkeypatch):
+def test_web_halt_enters_halt_only_lane(tmp_path, monkeypatch):
     from hedge_fund.web.demo import seed_demo
 
     root = seed_demo(tmp_path / "writes")
     service = DeskService(root, allow_writes=True)
     acquired = []
-    original = service._admission.control_lane
+    original = service._admission.halt_lane
 
     @contextmanager
     def observe(identity, *, timeout):
@@ -649,7 +783,7 @@ def test_web_halt_enters_shared_control_lane(tmp_path, monkeypatch):
         with original(identity, timeout=timeout):
             yield
 
-    monkeypatch.setattr(service._admission, "control_lane", observe)
+    monkeypatch.setattr(service._admission, "halt_lane", observe)
     try:
         result = service.halt_fund("demo-quality", "operator pause")
     finally:
@@ -657,6 +791,247 @@ def test_web_halt_enters_shared_control_lane(tmp_path, monkeypatch):
 
     assert result == {"name": "demo-quality", "halted": True}
     assert acquired == [("demo-quality", 0.1)]
+
+
+def test_web_halt_succeeds_while_a_control_scan_is_in_flight(tmp_path):
+    from threading import Event, Thread
+
+    from hedge_fund.web.demo import seed_demo
+
+    root = seed_demo(tmp_path / "writes")
+    service = DeskService(root, allow_writes=True)
+    entered = Event()
+    release = Event()
+    failures = []
+
+    def long_control_scan():
+        try:
+            with service._admission.control_lane("demo-quality"):
+                entered.set()
+                if not release.wait(timeout=10):
+                    raise TimeoutError("test did not release control scan")
+        except BaseException as exc:
+            failures.append(exc)
+
+    holder = Thread(target=long_control_scan, name="slow-control-scan")
+    holder.start()
+    try:
+        assert entered.wait(timeout=10), failures
+        result = service.halt_fund("demo-quality", "synthetic emergency")
+        assert result == {"name": "demo-quality", "halted": True}
+        assert Ledger(root / "paper" / "demo-quality").halted() == "synthetic emergency"
+    finally:
+        release.set()
+        holder.join(timeout=10)
+        service.close()
+    assert not holder.is_alive()
+    assert failures == []
+
+
+def test_web_halt_reports_applied_switch_when_audit_is_unavailable(tmp_path):
+    from threading import Event, Thread
+
+    from hedge_fund.web.demo import seed_demo
+    from hedge_fund.web.services import ServiceError
+
+    root = seed_demo(tmp_path / "writes")
+    service = DeskService(root, allow_writes=True)
+    held = Event()
+    release = Event()
+    failures = []
+
+    def hold_audit():
+        try:
+            with service._admission.audit_lane("demo-quality"):
+                held.set()
+                if not release.wait(timeout=10):
+                    raise TimeoutError("test did not release audit lane")
+        except BaseException as exc:
+            failures.append(exc)
+
+    holder = Thread(target=hold_audit, name="slow-audit-writer")
+    holder.start()
+    try:
+        assert held.wait(timeout=10), failures
+        with pytest.raises(ServiceError) as error:
+            service.halt_fund("demo-quality", "synthetic emergency")
+        assert error.value.status_code == 423
+        assert "Halt was applied" in error.value.detail
+        assert "audit" in error.value.detail
+        assert Ledger(root / "paper" / "demo-quality").halted() == "synthetic emergency"
+    finally:
+        release.set()
+        holder.join(timeout=10)
+        service.close()
+    assert not holder.is_alive()
+    assert failures == []
+
+
+def test_archive_cannot_move_a_fund_during_an_inflight_halt(tmp_path, monkeypatch):
+    from threading import Event, Thread
+
+    from hedge_fund.runtime.admission import WriterConflict
+    from hedge_fund.runtime.lifecycle import LifecycleArchiveStore
+    from hedge_fund.web.demo import seed_demo
+
+    root = seed_demo(tmp_path / "writes")
+    service = DeskService(root, allow_writes=True)
+    store = LifecycleArchiveStore(service.root_context, service._admission)
+    preview = store.preview("deployment", "demo-quality")
+    validated = Event()
+    release = Event()
+    results = []
+    failures = []
+    control_state = service._paper_control_state
+
+    def pause_after_validation(name):
+        state = control_state(name)
+        validated.set()
+        if not release.wait(timeout=10):
+            raise TimeoutError("test did not release Halt")
+        return state
+
+    def halt():
+        try:
+            results.append(service.halt_fund("demo-quality", "synthetic emergency"))
+        except BaseException as exc:
+            failures.append(exc)
+
+    monkeypatch.setattr(service, "_paper_control_state", pause_after_validation)
+    worker = Thread(target=halt, name="lifecycle-halt")
+    worker.start()
+    archive_error = None
+    archive_result = None
+    try:
+        assert validated.wait(timeout=10), failures
+        try:
+            archive_result = store.archive(
+                "deployment",
+                "demo-quality",
+                expected_digest=preview["digest"],
+                archive_id="e" * 32,
+            )
+        except WriterConflict as exc:
+            archive_error = exc
+    finally:
+        release.set()
+        worker.join(timeout=10)
+        service.close()
+    assert not worker.is_alive()
+    assert archive_error is not None, f"archive={archive_result!r}, halt={results!r}, failures={failures!r}"
+    assert failures == []
+    assert results == [{"name": "demo-quality", "halted": True}]
+    assert Ledger(root / "paper" / "demo-quality").halted() == "synthetic emergency"
+
+
+def test_web_halt_fences_an_inflight_verdict_before_it_commits(tmp_path, monkeypatch):
+    from pathlib import Path
+    from threading import Event, Thread
+
+    from hedge_fund.paper import ledger as ledger_module
+    from hedge_fund.paper.ledger import ApprovalHalted
+    from hedge_fund.runtime.admission import paper_approval_transition
+    from hedge_fund.web.demo import seed_demo
+
+    root = seed_demo(tmp_path / "writes")
+    service = DeskService(root, allow_writes=True)
+    ledger = Ledger(root / "paper" / "demo-quality")
+    latest = ledger.latest()
+    assert latest is not None and latest.decision is not None
+    before_commit = Event()
+    release = Event()
+    outcomes = []
+    write_atomic = ledger_module.write_atomic
+
+    def pause_pending_mailbox(path, text, **kwargs):
+        if Path(path) == ledger.approval_path and json.loads(text).get("pending"):
+            result = write_atomic(path, text, **kwargs)
+            before_commit.set()
+            if not release.wait(timeout=10):
+                raise TimeoutError("test did not release verdict publisher")
+            return result
+        return write_atomic(path, text, **kwargs)
+
+    def publish():
+        try:
+            with paper_approval_transition(service._admission, "demo-quality") as proof:
+                ledger.set_approval("approve", latest.decision.as_of, latest.hash, "web", admission=proof)
+            outcomes.append("approved")
+        except BaseException as exc:
+            outcomes.append(exc)
+
+    monkeypatch.setattr(ledger_module, "write_atomic", pause_pending_mailbox)
+    publisher = Thread(target=publish, name="inflight-verdict")
+    publisher.start()
+    try:
+        assert before_commit.wait(timeout=10), outcomes
+        assert service.halt_fund("demo-quality", "synthetic emergency")["halted"]
+    finally:
+        release.set()
+        publisher.join(timeout=10)
+        service.close()
+
+    assert not publisher.is_alive()
+    assert len(outcomes) == 1 and isinstance(outcomes[0], ApprovalHalted)
+    assert ledger.halted() == "synthetic emergency"
+    assert ledger.resolve_approval(latest.decision.as_of, latest.hash)[0] is None
+
+
+def test_halt_cannot_acknowledge_during_verdict_commit_before_a_publisher_crash(tmp_path, monkeypatch):
+    from threading import Event, Thread
+
+    from hedge_fund.runtime.admission import paper_approval_transition
+    from hedge_fund.web.demo import seed_demo
+    from hedge_fund.web.services import ServiceError
+
+    class PublisherCrash(BaseException):
+        pass
+
+    root = seed_demo(tmp_path / "writes")
+    service = DeskService(root, allow_writes=True)
+    ledger = Ledger(root / "paper" / "demo-quality")
+    latest = ledger.latest()
+    assert latest is not None and latest.decision is not None
+    committed = Event()
+    release = Event()
+    failures = []
+    write_state = ledger._write_approval_publication
+
+    def crash_after_marker(approval_id, state):
+        write_state(approval_id, state)
+        if state == "committed":
+            committed.set()
+            if not release.wait(timeout=10):
+                raise TimeoutError("test did not release verdict publisher")
+            raise PublisherCrash()
+
+    def publish():
+        try:
+            with paper_approval_transition(service._admission, "demo-quality") as proof:
+                ledger.set_approval("approve", latest.decision.as_of, latest.hash, "web", admission=proof)
+        except PublisherCrash:
+            pass
+        except BaseException as exc:
+            failures.append(exc)
+
+    monkeypatch.setattr(ledger, "_write_approval_publication", crash_after_marker)
+    worker = Thread(target=publish, name="crashing-verdict")
+    worker.start()
+    try:
+        try:
+            assert committed.wait(timeout=10), failures
+            with pytest.raises(ServiceError) as blocked:
+                service.halt_fund("demo-quality", "synthetic emergency")
+            assert blocked.value.status_code == 409
+        finally:
+            release.set()
+            worker.join(timeout=10)
+        assert not worker.is_alive()
+        assert failures == []
+        assert service.halt_fund("demo-quality", "synthetic emergency")["halted"]
+        assert ledger.halted() == "synthetic emergency"
+    finally:
+        service.close()
 
 
 def test_web_halt_does_not_wait_for_fund_work_lock(tmp_path):

@@ -57,12 +57,26 @@ from hedge_fund.paper.deployed import (
     load_deployed,
     validate_fund_name,
 )
-from hedge_fund.paper.ledger import Ledger, LedgerError
+from hedge_fund.paper.ledger import (
+    ApprovalExpired,
+    ApprovalHalted,
+    ApprovalStale,
+    HaltAuditUnavailable,
+    Ledger,
+    LedgerError,
+    PaperReconciliationRequired,
+)
 from hedge_fund.paper.tick import following_session, next_session, tick
-from hedge_fund.pipeline.session import code_version, mandate_hash, SessionRecord
+from hedge_fund.pipeline.session import (
+    code_version,
+    FundState,
+    mandate_hash,
+    SessionRecord,
+)
 from hedge_fund.runtime.admission import (
     AdmissionCoordinator,
     AdmissionError,
+    paper_approval_transition,
     RootOwnerLease,
 )
 from hedge_fund.runtime.capture import freeze_capture, FrozenCapture
@@ -90,7 +104,8 @@ from hedge_fund.runtime.dispatch import make_one_shot_dispatch, ProviderDispatch
 from hedge_fund.runtime.handover import (
     enrollment_status,
     HandoverError,
-    record_ledger_head,
+    LedgerHeadPublicationError,
+    LedgerInventoryCorrupt,
     require_enrollment,
     verify_root_inventory,
 )
@@ -576,18 +591,14 @@ class DeskService:
                     directory = deploy(normalized, spec, universe, root=paper_root)
                 except FileExistsError:
                     raise ServiceError(409, "A paper fund with this name already exists.") from None
+                except LedgerHeadPublicationError:
+                    raise ServiceError(423, "Deployment was written; root head inventory requires offline review.", code="reconciliation-required") from None
+                except HandoverError:
+                    raise ServiceError(423, "Offline paper ledger inventory changed; writes are denied.", code="reconciliation-required") from None
                 except ValueError as exc:
                     raise ServiceError(400, f"Deployment validation failed ({type(exc).__name__}).") from None
                 except OSError as exc:
                     raise ServiceError(409, f"Deployment could not be written ({type(exc).__name__}).") from None
-                try:
-                    record_ledger_head(
-                        self.root_context,
-                        normalized,
-                        admission=self._admission,
-                    )
-                except HandoverError:
-                    raise ServiceError(423, "Deployment was written; root head inventory requires offline review.", code="reconciliation-required") from None
         return {"name": normalized, "universe": universe, "path": directory.name, "status": "deployed"}
 
     def list_paper(self) -> dict:
@@ -809,7 +820,7 @@ class DeskService:
         with self._fund_lock(normalized):
             with self._paper_manual_lane(normalized):
                 self._verify_root_inventory()
-                directory, deployed, _ledger, state, latest = self._paper_state(
+                directory, deployed, ledger, state, latest = self._paper_state(
                     normalized,
                     local_paper_only=True,
                 )
@@ -820,6 +831,7 @@ class DeskService:
                     raise ServiceError(409, "Paper ledger changed; reload before previewing.", code="stale-preview", subject_id=normalized, current_head=current_head)
                 if state.halted is not None:
                     raise ServiceError(423, "Halted funds cannot accept a paper operation.", code="halted", subject_id=normalized, current_head=current_head)
+                self._require_paper_work_ready(deployed, ledger, state)
                 with self._settings_lock:
                     self._ensure_settings_available()
                     settings = self._runtime_settings
@@ -1112,15 +1124,14 @@ class DeskService:
                     deployed = load_deployed(directory)
                     if deployed.broker != "paper" or mandate_hash(deployed.spec) != capture.mandate_digest or tuple(deployed.universe) != tuple(capture.universe):
                         raise ServiceError(409, "Paper deployment changed after review.", code="stale-preview")
-                    state, latest = self._replay_paper_state(
-                        deployed,
-                        Ledger(directory),
-                    )
+                    ledger = Ledger(directory)
+                    state, latest = self._replay_paper_state(deployed, ledger)
                     head = latest.hash if latest is not None else None
                     if head != payload["expected_head"]:
                         raise ServiceError(409, "Paper ledger head changed after review.", code="stale-preview")
                     if state.halted is not None:
                         raise ServiceError(423, "Halted funds cannot run a paper tick.", code="halted")
+                    self._require_paper_work_ready(deployed, ledger, state)
                     with self._make_data_client(
                         capture.data_provider,
                         dispatch=dispatch,
@@ -1146,16 +1157,10 @@ class DeskService:
                         )
         except ServiceError:
             raise
+        except LedgerHeadPublicationError:
+            raise ServiceError(423, "Paper tick recorded; root head inventory requires offline review.", code="reconciliation-required") from None
         except (AdmissionError, HandoverError, LedgerError, OSError, ValueError):
             raise ServiceError(409, "Paper tick could not be executed safely.") from None
-        try:
-            record_ledger_head(
-                self.root_context,
-                operation.subject_id,
-                admission=self._admission,
-            )
-        except HandoverError:
-            raise ServiceError(423, "Paper tick recorded; root head inventory requires offline review.", code="reconciliation-required") from None
         progress(95)
         return {
             "session": record.session,
@@ -1248,7 +1253,7 @@ class DeskService:
         capture: FrozenCapture,
     ) -> tuple[str | None, tuple[str, ...]]:
         self._verify_root_inventory()
-        directory, deployed, _ledger, state, latest = self._paper_state(
+        directory, deployed, ledger, state, latest = self._paper_state(
             name,
             local_paper_only=True,
         )
@@ -1256,6 +1261,7 @@ class DeskService:
             raise ServiceError(409, "Paper deployment changed after review.", code="stale-preview")
         if state.halted is not None:
             raise ServiceError(423, "Halted funds cannot accept a paper operation.", code="halted")
+        self._require_paper_work_ready(deployed, ledger, state)
         head = latest.hash if latest is not None else None
         preview_dispatch = self._authorize_manual_capture(
             capture,
@@ -1519,7 +1525,7 @@ class DeskService:
     def _verify_root_inventory(self) -> None:
         try:
             verify_root_inventory(self.root_context)
-        except LedgerError:
+        except (LedgerError, LedgerInventoryCorrupt):
             raise ServiceError(423, "Paper state is invalid (LedgerError).", code="replay-corrupt") from None
         except HandoverError:
             raise ServiceError(423, "Offline paper ledger inventory changed; writes are denied.", code="reconciliation-required") from None
@@ -2983,33 +2989,37 @@ class DeskService:
         normalized = self._validated_name(name)
         self._guard_protected(normalized)
         with self._fund_lock(normalized):
-            with self._paper_control_lane(normalized):
-                _directory, deployed, ledger = self._paper_control_state(normalized)
-                state, latest = self._replay_paper_state(deployed, ledger)
-                if not deployed.spec.approval_required:
-                    raise ServiceError(409, "This fund does not require approval.")
-                if state.halted is not None:
-                    raise ServiceError(423, "Halted funds cannot accept a verdict.", code="halted")
-                pending = state.pending
-                if pending is None or latest is None:
-                    raise ServiceError(409, "No pending decision is available.")
-                if request.decision_as_of != pending.as_of or request.source_record_hash != latest.hash:
-                    raise ServiceError(409, "Pending decision changed; reload before submitting a verdict.", code="stale-preview")
-                resolved, mailbox = ledger.resolve_approval(pending.as_of, latest.hash)
-                if resolved is not None and mailbox is None:
-                    raise ServiceError(409, "This decision is already consumed or expired.")
-                latest_event = self._latest_approval_event(ledger, pending.as_of, latest.hash)
-                if latest_event is not None and latest_event.get("kind") == "expire":
-                    raise ServiceError(409, "This decision has expired.")
-                try:
-                    vote = ledger.set_approval(
-                        request.verdict,
-                        pending.as_of,
-                        latest.hash,
-                        "web",
-                    )
-                except (OSError, ValueError) as exc:
-                    raise ServiceError(409, f"Verdict could not be saved ({type(exc).__name__}).") from None
+            self._verify_root_inventory()
+            _directory, deployed, ledger = self._paper_control_state(normalized)
+            state, latest = self._replay_paper_state(deployed, ledger)
+            if not deployed.spec.approval_required:
+                raise ServiceError(409, "This fund does not require approval.")
+            if state.halted is not None:
+                raise ServiceError(423, "Halted funds cannot accept a verdict.", code="halted")
+            pending = state.pending
+            if pending is None or latest is None:
+                raise ServiceError(409, "No pending decision is available.")
+            if request.decision_as_of != pending.as_of or request.source_record_hash != latest.hash:
+                raise ServiceError(409, "Pending decision changed; reload before submitting a verdict.", code="stale-preview")
+            try:
+                with paper_approval_transition(self._admission, normalized) as proof:
+                    vote = ledger.set_approval(request.verdict, pending.as_of, latest.hash, "web", admission=proof)
+            except ApprovalHalted:
+                raise ServiceError(423, "Halted funds cannot accept a verdict.", code="halted") from None
+            except ApprovalStale:
+                raise ServiceError(409, "Pending decision changed; reload before submitting a verdict.", code="stale-preview") from None
+            except ApprovalExpired:
+                raise ServiceError(409, "This decision is already consumed or expired.") from None
+            except LedgerInventoryCorrupt:
+                raise ServiceError(423, "Paper state is invalid (LedgerError).", code="replay-corrupt") from None
+            except LedgerError:
+                raise ServiceError(423, "Approval history or root inventory is unavailable.", code="reconciliation-required") from None
+            except AdmissionError:
+                raise ServiceError(409, "Paper control admission is unavailable.") from None
+            except HandoverError:
+                raise ServiceError(423, "Offline paper ledger inventory changed; writes are denied.", code="reconciliation-required") from None
+            except (OSError, ValueError) as exc:
+                raise ServiceError(409, f"Verdict could not be saved ({type(exc).__name__}).") from None
         return {"verdict": vote["verdict"], "decision_as_of": vote["decision_as_of"], "saved": True}
 
     def halt_fund(self, name: str, reason: str) -> dict:
@@ -3019,10 +3029,16 @@ class DeskService:
         self._guard_protected(normalized)
         if not isinstance(reason, str) or not reason.strip() or len(reason) > 240 or any(ord(char) < 32 or ord(char) == 127 for char in reason):
             raise ServiceError(400, "Halt reason is invalid.")
-        with self._paper_control_lane(normalized, verify_inventory=False):
+        with self._paper_halt_lane(normalized):
             _, _, ledger = self._paper_control_state(normalized)
             try:
                 ledger.halt(reason)
+            except HaltAuditUnavailable:
+                raise ServiceError(
+                    423,
+                    "Halt was applied, but its audit record is unavailable; reconciliation is required.",
+                    code="reconciliation-required",
+                ) from None
             except OSError as exc:
                 raise ServiceError(409, f"Fund could not be halted ({type(exc).__name__}).") from None
         return {"name": normalized, "halted": True}
@@ -3038,16 +3054,24 @@ class DeskService:
                 raise ServiceError(423, "Resume is disabled until a reconciliation receipt is available.", code="reconciliation-required")
 
     @contextmanager
+    def _paper_halt_lane(self, name: str) -> Iterator[None]:
+        try:
+            with self._admission.halt_lane(name, timeout=0.1):
+                yield
+        except AdmissionError:
+            raise ServiceError(409, "Paper Halt admission is unavailable.") from None
+
+    @contextmanager
     def _paper_control_lane(
         self,
         name: str,
         *,
         verify_inventory: bool = True,
     ) -> Iterator[None]:
+        if verify_inventory:
+            self._verify_root_inventory()
         try:
             with self._admission.control_lane(name, timeout=0.1):
-                if verify_inventory:
-                    self._verify_root_inventory()
                 yield
         except AdmissionError:
             raise ServiceError(409, "Paper control admission is unavailable.") from None
@@ -3126,12 +3150,15 @@ class DeskService:
                 )
         pending = state.pending if state is not None else None
         approval = None
-        if pending is not None and latest is not None:
+        if state is not None:
             try:
-                current, mailbox = ledger.resolve_approval(pending.as_of, latest.hash)
-                approval = current or (mailbox if mailbox and mailbox["decision_as_of"] == pending.as_of else None)
-            except (OSError, ValueError):
-                approval = None
+                approval = ledger.observe_approval_for_display(
+                    state, approval_required=deployed.spec.approval_required
+                )
+            except PaperReconciliationRequired:
+                ledger_status = {"ok": False, "error": "Paper work is in progress or requires reconciliation."}
+            except (LedgerError, OSError, ValueError):
+                ledger_status = {"ok": False, "error": "Approval history is unavailable."}
         try:
             next_run = following_session(deployed.spec, state.last_session if state is not None else None, _utcnow())
         except (OverflowError, ValueError):
@@ -3208,6 +3235,20 @@ class DeskService:
         except (LedgerError, OSError, ValueError) as exc:
             raise ServiceError(423, f"Paper state is invalid ({type(exc).__name__}).", code="replay-corrupt") from None
         return state, latest
+
+    def _require_paper_work_ready(self, deployed: DeployedFund, ledger: Ledger, state: FundState) -> None:
+        try:
+            with self._paper_control_lane(deployed.name, verify_inventory=False):
+                if ledger.halted() is not None:
+                    raise ServiceError(423, "Halted funds cannot accept a paper operation.", code="halted")
+                try:
+                    ledger.require_ready_for_work(state, approval_required=deployed.spec.approval_required)
+                except PaperReconciliationRequired:
+                    if self._admission.lane_is_held("runner", deployed.name) and self._admission.lane_is_held("execution", deployed.name):
+                        ledger.halt("approval journal requires reconciliation")
+                    raise
+        except LedgerError:
+            raise ServiceError(423, "Paper work requires reconciliation before it can continue.", code="reconciliation-required") from None
 
     def _paper_control_state(self, name: str) -> tuple[Path, DeployedFund, Ledger]:
         directory = self._safe_child("paper", name)
@@ -3655,20 +3696,6 @@ class DeskService:
         key = _windows_name_key(name)
         with self._locks_guard:
             return self._locks.setdefault(key, threading.RLock())
-
-    def _latest_approval_event(self, ledger: Ledger, decision_as_of: str, decision_hash: str) -> dict | None:
-        try:
-            events = ledger.events()
-        except (OSError, UnicodeError, ValueError):
-            return None
-        for event in reversed(events):
-            if not isinstance(event, dict):
-                continue
-            if event.get("decision_as_of") == decision_as_of and event.get("decision_hash") == decision_hash:
-                if event.get("kind") in {"approve", "reject", "expire"} or (event.get("kind") == "tick" and event.get("approval_verdict") in {"approve", "reject"}):
-                    return event
-        return None
-
 
 def _is_reparse_point(path: Path) -> bool:
     try:

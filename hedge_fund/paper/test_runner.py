@@ -503,6 +503,10 @@ def test_is_running_never_sends_console_control_events(tmp_path, monkeypatch):
     import sys
 
     from hedge_fund.paper import runner as runner_module
+    from hedge_fund.test_support.network_guard import (
+        child_test_environment,
+        guarded_test_python_command,
+    )
 
     def forbidden(*_args):
         raise AssertionError("os.kill(pid, 0) is CTRL_C_EVENT on Windows and interrupts the whole console")
@@ -512,8 +516,8 @@ def test_is_running_never_sends_console_control_events(tmp_path, monkeypatch):
     pid_file = tmp_path / PID_FILE
     pid_file.write_text(str(os.getpid()), encoding="utf-8")
     assert runner_module.is_running(tmp_path)
-    child = subprocess.Popen([sys.executable, "-c", "pass"])
-    child.wait(timeout=30)
+    child = subprocess.Popen(guarded_test_python_command("-c", "pass"), env=child_test_environment())
+    assert child.wait(timeout=30) == 0
     pid_file.write_text(str(child.pid), encoding="utf-8")
     assert not runner_module.is_running(tmp_path)
     for invalid in ("0", "-1", "999999999", "not-a-pid"):

@@ -126,6 +126,8 @@ def execute_decision(
     clock: Clock | None = None,
     *,
     on_fill: Callable[[Order, Fill], None] | None = None,
+    before_effect: Callable[[], None] | None = None,
+    before_order: Callable[[], None] | None = None,
 ) -> CycleRecord:
     """Refresh views before sizing a complete rebalance at exact session prices."""
     clock = clock or clock_for(fund.spec, data_client)
@@ -134,17 +136,18 @@ def execute_decision(
     if fund.spec != original.spec:
         raise ValueError("fund mandate changed after assessment; create a new assessment")
     cutoff = clock.previous(session)
-    effective = (
-        original
-        if cutoff == original.as_of
-        else assess_fund(
+    if cutoff == original.as_of:
+        effective = original
+    else:
+        if before_effect is not None:
+            before_effect()
+        effective = assess_fund(
             fund,
             cutoff,
             data_client,
             original.universe,
             clock,
         )
-    )
     spec = effective.spec
     validate_targets(spec, effective.strategies, effective.final_weights)
     held = broker.positions()
@@ -214,6 +217,10 @@ def execute_decision(
     deferred: list[Order] = []
     deferral_reason = None
     for index, order in enumerate(orders):
+        if before_order is not None:
+            before_order()
+        if before_effect is not None:
+            before_effect()
         try:
             fill = broker.place_order(order)
         except OrderSubmissionDeferred as exc:

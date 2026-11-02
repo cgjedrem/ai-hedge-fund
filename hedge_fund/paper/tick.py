@@ -18,10 +18,12 @@ book is the failure mode this exists to prevent; a human clears the halt.
 
 from __future__ import annotations
 
+from contextlib import contextmanager, ExitStack
 from datetime import date as _date
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable
+from uuid import uuid4
 
 from hedge_fund.brokers.factory import build_broker
 from hedge_fund.brokers.models import Fill, Order
@@ -43,7 +45,12 @@ from hedge_fund.data.sessions import (
 )
 from hedge_fund.fund import Fund, FundSpec, TradingWindow
 from hedge_fund.paper.deployed import BROKER_FILE, load_deployed
-from hedge_fund.paper.ledger import Ledger
+from hedge_fund.paper.ledger import (
+    AuditObservationUnavailable,
+    Ledger,
+    LedgerError,
+    PaperReconciliationRequired,
+)
 from hedge_fund.pipeline.clock import Clock, LiveClock, Marked
 from hedge_fund.pipeline.session import (
     advance,
@@ -185,22 +192,63 @@ def tick(
     set. *now* is the clock; tests inject it.
     """
     directory = Path(directory)
-    from hedge_fund.runtime.admission import require_paper_write_lanes
+    from hedge_fund.runtime.admission import paper_execution_transition
 
-    require_paper_write_lanes(
-        directory,
-        directory.name,
-        lane_sets=(("runner", "execution"),),
-        verify_inventory=True,
+    with paper_execution_transition(directory, directory.name):
+        return _tick(directory, data_client, session=session, build_fund=build_fund, now=now)
+
+
+@contextmanager
+def _preflight_control(directory: Path, name: str):
+    from hedge_fund.runtime.admission import (
+        paper_control_transition,
+        PaperControlBusy,
+        PaperPreflightBusy,
     )
+
+    with ExitStack() as stack:
+        try:
+            stack.enter_context(paper_control_transition(directory, name))
+        except PaperControlBusy as exc:
+            raise PaperPreflightBusy("Paper preflight control admission is occupied.") from exc
+        try:
+            yield
+        except AuditObservationUnavailable as exc:
+            raise PaperPreflightBusy("Paper preflight audit observation is occupied.") from exc
+
+
+def _tick(
+    directory: Path,
+    data_client: DataClient,
+    *,
+    session: str | None,
+    build_fund: Callable[[FundSpec], Fund] | None,
+    now: Callable[[], datetime] | None,
+) -> SessionRecord:
     deployed = load_deployed(directory)
     spec = deployed.spec
     ledger = Ledger(directory)
     if session is not None and session in ledger.sessions():
-        return ledger.read(session)
+        try:
+            with _preflight_control(directory, deployed.name):
+                ledger._require_completed_redo()
+                ledger._require_completed_approval_publication()
+                ledger._require_completed_approval_consumptions()
+                return ledger.read(session)
+        except PaperReconciliationRequired:
+            ledger.halt("approval journal requires reconciliation")
+            raise
+    ledger._require_completed_redo()
     state = ledger.replay(spec.capital)
     if state.halted is not None:
         raise FundHalted(f"{deployed.name} is halted: {state.halted}")
+
+    try:
+        with _preflight_control(directory, deployed.name):
+            ledger.require_ready_for_work(state, approval_required=spec.approval_required)
+    except PaperReconciliationRequired:
+        ledger.halt("approval journal requires reconciliation")
+        raise
 
     due = next_session(data_client, spec, state.last_session, now=now)
     now = now or (lambda: datetime.now(NEW_YORK))
@@ -232,6 +280,7 @@ def redo(
     data_client: DataClient,
     *,
     build_fund: Callable[[FundSpec], Fund] | None = None,
+    on_rewind: Callable[[SessionRecord], None] | None = None,
 ) -> SessionRecord:
     """Run the latest recorded session again and replace its record.
 
@@ -244,18 +293,24 @@ def redo(
     FundHalted when the kill switch is set.
     """
     directory = Path(directory)
-    from hedge_fund.runtime.admission import require_paper_write_lanes
+    from hedge_fund.runtime.admission import paper_execution_transition
 
-    require_paper_write_lanes(
-        directory,
-        directory.name,
-        lane_sets=(("runner", "execution"),),
-        verify_inventory=True,
-    )
+    with paper_execution_transition(directory, directory.name):
+        return _redo(directory, data_client, build_fund=build_fund, on_rewind=on_rewind)
+
+
+def _redo(
+    directory: Path,
+    data_client: DataClient,
+    *,
+    build_fund: Callable[[FundSpec], Fund] | None,
+    on_rewind: Callable[[SessionRecord], None] | None,
+) -> SessionRecord:
     deployed = load_deployed(directory)
     if deployed.broker != "paper":
         raise ValueError(f"redo is only supported for paper broker funds, not {deployed.broker}")
     ledger = Ledger(directory)
+    ledger._require_completed_redo()
     state = ledger.replay(deployed.spec.capital)  # verifies the whole chain first
     if state.halted is not None:
         raise FundHalted(f"{deployed.name} is halted: {state.halted}")
@@ -263,22 +318,108 @@ def redo(
         raise NothingDue(f"{deployed.name}: no session recorded yet, nothing to run again")
 
     before = ledger.replay(deployed.spec.capital, before=state.last_session)
-    mailbox = ledger.approval() if deployed.spec.approval_required else None
-    superseded = ledger.rewind()
-    PaperBroker.restore(directory / BROKER_FILE, before.cash, before.positions, deployed.spec.costs)
-    ledger.log_event("redo", session=superseded.session, superseded=superseded.hash)
-    if mailbox is not None and (mailbox["decision_as_of"] == superseded.session or mailbox["decision_hash"] == superseded.hash):
-        ledger.clear_approval(expected=mailbox)
-        ledger.log_event(
-            "expire",
-            decision_as_of=mailbox["decision_as_of"],
-            decision_hash=mailbox["decision_hash"],
-            reason="decision redone",
+    superseded = ledger.latest()
+    if superseded is None or superseded.session != state.last_session or superseded.hash != state.prev_hash:
+        raise LedgerError("paper ledger changed before redo")
+    from hedge_fund.runtime.admission import AdmissionError, paper_control_transition
+
+    with paper_control_transition(directory, deployed.name):
+        try:
+            if ledger.halted() is not None:
+                raise FundHalted(f"{deployed.name} is halted")
+            if deployed.spec.approval_required:
+                _verified_redo_approval(ledger, before, superseded)
+            ledger.require_ready_for_work(state, approval_required=deployed.spec.approval_required)
+            redo_id = ledger.begin_redo(superseded)
+            if deployed.spec.approval_required:
+                if superseded.decision is not None:
+                    ledger.log_event(
+                        "expire",
+                        decision_as_of=superseded.decision.as_of,
+                        decision_hash=superseded.hash,
+                        reason="decision redone",
+                        durable=True,
+                    )
+                mailbox = ledger.approval()
+                if mailbox is not None and (mailbox["decision_as_of"] == superseded.session or mailbox["decision_hash"] == superseded.hash):
+                    ledger.clear_approval(expected=mailbox)
+        except AuditObservationUnavailable:
+            raise
+        except (AdmissionError, LedgerError, OSError):
+            ledger.halt("redo approval expiry unavailable")
+            raise
+    from hedge_fund.runtime.policy import AuthorizationDenied
+
+    try:
+        superseded = ledger.rewind()
+        if on_rewind is not None:
+            try:
+                on_rewind(superseded)
+            except AuthorizationDenied:
+                ledger.halt("redo authorization denied after rewind")
+                raise
+        PaperBroker.restore(directory / BROKER_FILE, before.cash, before.positions, deployed.spec.costs)
+        ledger.log_event("redo", session=superseded.session, superseded=superseded.hash)
+        clock = None
+        if deployed.spec.is_intraday:  # a bar's prints are gone; run it at the ones it kept
+            clock = RecordedClock(superseded, deployed.spec.interval_seconds, deployed.spec.window)
+        redo_nonce = uuid4().hex if deployed.spec.approval_required and superseded.decision is not None else None
+        record = _run(
+            directory,
+            deployed,
+            ledger,
+            before,
+            superseded.session,
+            data_client,
+            build_fund,
+            clock=clock,
+            redo_nonce=redo_nonce,
+            replay_record=superseded,
+            active_redo_id=redo_id,
         )
-    clock = None
-    if deployed.spec.is_intraday:  # a bar's prints are gone; run it at the ones it kept
-        clock = RecordedClock(superseded, deployed.spec.interval_seconds, deployed.spec.window)
-    return _run(directory, deployed, ledger, before, superseded.session, data_client, build_fund, clock=clock)
+        ledger.finish_redo(redo_id, record)
+        return record
+    except Exception:
+        if ledger.halted() is None:
+            ledger.halt("redo failed after rewind")
+        raise
+
+
+def _verified_redo_approval(
+    ledger: Ledger,
+    state: FundState,
+    record: SessionRecord,
+) -> dict[str, str] | None:
+    if record.prev_hash != state.prev_hash:
+        raise LedgerError("redo approval does not match the previous ledger head")
+    if state.pending is None:
+        if record.executed is not None:
+            raise LedgerError("redo execution has no pending decision")
+        return None
+    if not isinstance(state.prev_hash, str):
+        raise LedgerError("redo pending decision has no source hash")
+    approval, _ = ledger.resolve_approval(
+        state.pending.as_of,
+        state.prev_hash,
+        replay_session=record.session,
+    )
+    if record.executed is not None:
+        if (
+            approval is None
+            or approval["verdict"] != "approve"
+            or record.executed.as_of != state.pending.as_of
+            or record.executed.execution_as_of not in {None, record.session}
+        ):
+            raise LedgerError("redo consumed approval is unavailable")
+    elif approval is not None and approval["verdict"] == "approve":
+        raise LedgerError("redo approval does not match the recorded execution")
+    elif approval is None:
+        event = ledger._latest_approval_event(state.pending.as_of, state.prev_hash, strict=True)
+        if event is not None and (
+            event.get("kind") in {"consume", "tick"} or event.get("consumed") is True
+        ):
+            raise LedgerError("redo consumed approval is unavailable")
+    return approval
 
 
 def _run(
@@ -293,20 +434,82 @@ def _run(
     clock: Clock | None = None,
     fund: Fund | None = None,
     broker=None,
+    redo_nonce: str | None = None,
+    replay_record: SessionRecord | None = None,
+    active_redo_id: str | None = None,
 ) -> SessionRecord:
     """Advance one session from *state* and record it, halting on failure.
     *fund* lets a long-running caller keep one Fund (and its analysts'
     caches) across sessions instead of staffing a new one each time. A
     minute fund's closing bar also checkpoints the day, so tomorrow's
     replay starts from tonight."""
-    broker = broker or build_broker(deployed, directory=directory)
-    fund = fund or (build_fund or Fund)(deployed.spec)
+    from hedge_fund.runtime.admission import (
+        paper_audit_transition,
+        paper_control_transition,
+        PaperPreflightBusy,
+        WriterConflict,
+    )
+
+    with paper_control_transition(directory, deployed.name):
+        ledger._require_completed_redo(active_redo_id=active_redo_id)
+        ledger._require_completed_approval_publication()
     run_state = state
     clear_verdict = None
     consumed_verdict = None
     audit = None
     if deployed.spec.approval_required and state.pending is not None:
-        approval, clear_verdict = ledger.resolve_approval(state.pending.as_of, state.prev_hash)
+        if not isinstance(state.prev_hash, str):
+            raise LedgerError("pending decision has no source hash")
+        journal_attempted = False
+        try:
+            with paper_control_transition(directory, deployed.name):
+                halted = ledger.halted()
+                if halted is not None:
+                    raise FundHalted(f"{deployed.name} is halted: {halted}")
+                if replay_record is None:
+                    approval, clear_verdict = ledger.resolve_approval(state.pending.as_of, state.prev_hash)
+                    if approval is None:
+                        event = ledger._latest_approval_event(state.pending.as_of, state.prev_hash, strict=True)
+                        if event is not None and (
+                            event.get("kind") in {"consume", "tick"} or event.get("consumed") is True
+                        ):
+                            journal_attempted = True
+                            raise LedgerError("approval consumption is incomplete; reconciliation is required")
+                else:
+                    approval = _verified_redo_approval(ledger, state, replay_record)
+                    clear_verdict = ledger.approval()
+                if approval is not None and replay_record is None:
+                    fields = {
+                        "decision_as_of": approval["decision_as_of"],
+                        "decision_hash": approval["decision_hash"],
+                        "approval_verdict": approval["verdict"],
+                        "approval_by": approval["by"],
+                        "session": session,
+                    }
+                    if "approval_id" in approval:
+                        fields["approval_id"] = approval["approval_id"]
+                    with paper_audit_transition(directory, deployed.name):
+                        journal_attempted = True
+                        ledger.log_event("consume", durable=True, **fields)
+                if approval is None:
+                    with paper_audit_transition(directory, deployed.name):
+                        journal_attempted = True
+                        ledger.log_event(
+                            "expire",
+                            decision_as_of=state.pending.as_of,
+                            decision_hash=state.prev_hash,
+                            reason="stale verdict" if clear_verdict is not None else "no verdict",
+                            durable=True,
+                        )
+        except (AuditObservationUnavailable, WriterConflict) as exc:
+            if journal_attempted:
+                ledger.halt("approval journal requires reconciliation")
+                raise
+            raise PaperPreflightBusy("Paper preflight audit admission is occupied.") from exc
+        except Exception:
+            if journal_attempted:
+                ledger.halt("approval journal requires reconciliation")
+            raise
         if approval is not None:
             consumed_verdict = approval
             if approval["verdict"] == "reject":
@@ -323,21 +526,83 @@ def _run(
                 )
         else:
             run_state = state.model_copy(update={"pending": None})
-            audit = (
-                "expire",
-                {
-                    "decision_as_of": state.pending.as_of,
-                    "decision_hash": state.prev_hash,
-                    "reason": "stale verdict" if clear_verdict is not None else "no verdict",
-                },
-            )
 
     def record_fill(order: Order, fill: Fill) -> None:
         ledger.log_event("broker_fill", session=session, order=order.model_dump(mode="json"), fill=fill.model_dump(mode="json"))
 
+    def check_effect_admission() -> None:
+        from hedge_fund.runtime.admission import paper_control_transition
+
+        with paper_control_transition(directory, deployed.name):
+            halted = ledger.halted()
+            if halted is not None:
+                raise FundHalted(f"{deployed.name} is halted: {halted}")
+            ledger._require_completed_redo(active_redo_id=active_redo_id)
+            ledger._require_completed_approval_publication()
+
     try:
-        record = advance(fund, run_state, session, broker, data_client, deployed.universe, clock, on_fill=record_fill if deployed.broker == "saxo" else None)
-        ledger.append(record)
+        with ExitStack() as publication:
+            registry_reserved = False
+            registry_observation = None
+
+            def reserve_publication() -> None:
+                nonlocal registry_reserved, registry_observation
+                if not registry_reserved and deployed.broker == "paper":
+                    from hedge_fund.runtime.handover import paper_effect_registry
+
+                    registry_observation = publication.enter_context(paper_effect_registry(directory, deployed.name))
+                    registry_reserved = True
+
+            broker = broker or build_broker(deployed, directory=directory)
+            fund = fund or (build_fund or Fund)(deployed.spec)
+            halted = ledger.halted()
+            if halted is not None:
+                raise FundHalted(f"{deployed.name} is halted: {halted}")
+            record = advance(
+                fund,
+                run_state,
+                session,
+                broker,
+                data_client,
+                deployed.universe,
+                clock,
+                on_fill=record_fill if deployed.broker == "saxo" else None,
+                before_effect=check_effect_admission,
+                before_order=reserve_publication,
+            )
+            if registry_observation is not None:
+                registry_observation.close_observations()
+            if redo_nonce is not None:
+                record.redo_nonce = redo_nonce
+                record.hash = record.compute_hash()
+            ledger.append(record)
+            if audit is not None:
+                kind, fields = audit
+                ledger.log_event(kind, **fields)
+            tick_fields = {
+                "session": session,
+                "nav": record.nav,
+                "executed": record.executed is not None,
+                "decided": record.decision is not None,
+            }
+            if consumed_verdict is not None:
+                tick_fields.update(
+                    {
+                        "decision_as_of": consumed_verdict["decision_as_of"],
+                        "decision_hash": consumed_verdict["decision_hash"],
+                        "approval_verdict": consumed_verdict["verdict"],
+                        "approval_by": consumed_verdict["by"],
+                    }
+                )
+                if "approval_id" in consumed_verdict:
+                    tick_fields["approval_id"] = consumed_verdict["approval_id"]
+            ledger.log_event("tick", **tick_fields)
+            if clear_verdict is not None:
+                with paper_control_transition(directory, deployed.name):
+                    ledger.clear_approval(expected=clear_verdict)
+            if is_intraday(session) and is_last_bar(session, deployed.spec.window):
+                ledger.checkpoint(next_state(state, record))
+            return record
     except FundHalted:
         raise
     except Exception as exc:
@@ -347,27 +612,3 @@ def _run(
         finally:
             ledger.halt(reason)
         raise
-    if audit is not None:
-        kind, fields = audit
-        ledger.log_event(kind, **fields)
-    tick_fields = {
-        "session": session,
-        "nav": record.nav,
-        "executed": record.executed is not None,
-        "decided": record.decision is not None,
-    }
-    if consumed_verdict is not None:
-        tick_fields.update(
-            {
-                "decision_as_of": consumed_verdict["decision_as_of"],
-                "decision_hash": consumed_verdict["decision_hash"],
-                "approval_verdict": consumed_verdict["verdict"],
-                "approval_by": consumed_verdict["by"],
-            }
-        )
-    ledger.log_event("tick", **tick_fields)
-    if clear_verdict is not None:
-        ledger.clear_approval(expected=clear_verdict)
-    if is_intraday(session) and is_last_bar(session, deployed.spec.window):
-        ledger.checkpoint(next_state(state, record))
-    return record

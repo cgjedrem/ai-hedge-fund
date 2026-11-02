@@ -734,17 +734,25 @@ class OperationStore:
     ) -> bool:
         self._require_private_storage()
         _validate_operation_id(operation_id)
+        from hedge_fund.runtime.handover import _paper_observation_authorized
+
+        if _paper_observation_authorized(self._root):
+            self._root.revalidate()
+            return self._cancellation_requested_from_index(operation_id, fence)
         with self._locked_for_operation(operation_id):
-            index = self._read_index()
-            operation = self._operation_entry(index, operation_id)
-            self._verify_operation_sidecars(operation)
-            self._verify_operation_capture(index, operation)
-            self._require_current_fence(operation, operation_id, fence)
-            if operation["status"] == OperationStatus.CANCEL_REQUESTED.value:
-                return True
-            if operation["status"] == OperationStatus.RUNNING.value:
-                return False
-            raise WorkerFenced("operation is no longer active")
+            return self._cancellation_requested_from_index(operation_id, fence)
+
+    def _cancellation_requested_from_index(self, operation_id: str, fence: WorkerFence) -> bool:
+        index = self._read_index()
+        operation = self._operation_entry(index, operation_id)
+        self._verify_operation_sidecars(operation)
+        self._verify_operation_capture(index, operation)
+        self._require_current_fence(operation, operation_id, fence)
+        if operation["status"] == OperationStatus.CANCEL_REQUESTED.value:
+            return True
+        if operation["status"] == OperationStatus.RUNNING.value:
+            return False
+        raise WorkerFenced("operation is no longer active")
 
     def request_cancel(
         self,

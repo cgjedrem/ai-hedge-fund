@@ -27,7 +27,13 @@ from datetime import datetime
 from math import isfinite
 from typing import Callable, Protocol
 
-from hedge_fund.data.bars import bar_time, current_bar, is_intraday, previous_bar, session_date
+from hedge_fund.data.bars import (
+    bar_time,
+    current_bar,
+    is_intraday,
+    previous_bar,
+    session_date,
+)
 from hedge_fund.data.models import Price, PriceSnapshot
 from hedge_fund.data.protocol import DataClient
 from hedge_fund.data.sessions import completed_through, NEW_YORK, previous_day
@@ -189,8 +195,19 @@ class LiveClock:
             self._session, self._prints = session, {}
         missing = sorted(set(tickers) - set(self._prints))
         if missing:
+            from hedge_fund.runtime.handover import (
+                _current_paper_observation,
+                _run_with_paper_observation,
+            )
+
+            observation = _current_paper_observation()
             with ThreadPoolExecutor(max_workers=min(8, len(missing))) as pool:
-                for ticker, snapshot in zip(missing, pool.map(self._data.get_snapshot, missing)):
+                snapshots = [
+                    pool.submit(_run_with_paper_observation, observation, self._data.get_snapshot, ticker)
+                    for ticker in missing
+                ]
+                for ticker, future in zip(missing, snapshots):
+                    snapshot = future.result()
                     if snapshot is None:
                         raise ValueError(f"{ticker}: no quote; cannot value the book or execute")
                     self._prints[ticker] = snapshot

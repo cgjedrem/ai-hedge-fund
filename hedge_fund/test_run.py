@@ -785,7 +785,8 @@ def test_paper_create_overrides_day_grid_to_minute_with_standard_defaults(tmp_pa
     deployed_spec = deployed["spec"]
 
     assert output.out == ""
-    assert "every 1m" in output.err and "09:30–16:00 ET" in output.err
+    rendered = " ".join(output.err.split())
+    assert "every 1m" in rendered and "09:30–16:00 ET" in rendered
     assert deployed_spec["rebalance"] == "minute"
     assert deployed_spec["interval"] == 1.0
     assert deployed_spec["window"] == {"start": "09:30", "end": "16:00"}
@@ -878,6 +879,428 @@ def test_paper_flow_resume_requires_reconciliation_receipt(tmp_path, monkeypatch
     with pytest.raises(SystemExit) as exc:
         _main(monkeypatch, "paper", "status", "nobody")
     assert exc.value.code == 2 and "no paper fund named 'nobody'" in capsys.readouterr().err
+
+
+def test_cli_interrupted_redo_denies_before_provider_and_allows_halt(tmp_path, monkeypatch, capsys, offline):
+    from hedge_fund.paper.ledger import Ledger
+    from hedge_fund.runtime.admission import AdmissionCoordinator, RootOwnerLease
+    from hedge_fund.runtime.root import RootContext
+
+    path = _mandate(tmp_path)
+    _enroll_test_root(tmp_path)
+    offline("2025-01-07")
+    _main(monkeypatch, "paper", "create", "alpha", "--mandate", str(path), "--universe", "AAPL")
+    _main(monkeypatch, "paper", "tick", "alpha")
+    capsys.readouterr()
+    ledger = Ledger(tmp_path / "paper" / "alpha")
+    with RootContext.open(tmp_path) as root:
+        owner = RootOwnerLease.acquire(root)
+        try:
+            admission = AdmissionCoordinator(root, owner_lease=owner)
+            with paths.bound_root(root), admission.manual_session("alpha", timeout=0):
+                ledger.begin_redo(ledger.latest())
+        finally:
+            owner.close()
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("interrupted redo reached a data provider")
+
+    monkeypatch.setattr(run, "make_data_client", forbidden)
+    with pytest.raises(SystemExit) as exc:
+        _main(monkeypatch, "paper", "tick", "alpha")
+    assert exc.value.code == 1
+    assert "interrupted redo" in capsys.readouterr().err
+    _main(monkeypatch, "paper", "halt", "alpha", "--reason", "emergency")
+    assert ledger.halted() == "emergency"
+
+
+def test_cli_halt_does_not_wait_for_a_busy_control_lane(tmp_path, monkeypatch, capsys, offline):
+    from threading import Event, Thread
+
+    from hedge_fund.paper.ledger import Ledger
+    from hedge_fund.runtime.admission import AdmissionCoordinator, RootOwnerLease
+    from hedge_fund.runtime.root import RootContext
+
+    path = _mandate(tmp_path)
+    _enroll_test_root(tmp_path)
+    offline("2025-01-07")
+    _main(monkeypatch, "paper", "create", "alpha", "--mandate", str(path), "--universe", "AAPL")
+    capsys.readouterr()
+    entered = Event()
+    release = Event()
+    failures = []
+    with RootContext.open(tmp_path) as root:
+        owner = RootOwnerLease.acquire(root)
+        admission = AdmissionCoordinator(root, owner_lease=owner)
+
+        def hold_control():
+            try:
+                with admission.control_lane("alpha"):
+                    entered.set()
+                    if not release.wait(timeout=10):
+                        raise TimeoutError("test did not release control")
+            except BaseException as exc:
+                failures.append(exc)
+
+        worker = Thread(target=hold_control, name="cli-busy-control")
+        worker.start()
+        try:
+            assert entered.wait(timeout=10), failures
+            _main(monkeypatch, "paper", "halt", "alpha", "--reason", "emergency")
+        finally:
+            release.set()
+            worker.join(timeout=10)
+            owner.close()
+        assert not worker.is_alive()
+        assert failures == []
+    assert Ledger(tmp_path / "paper" / "alpha").halted() == "emergency"
+
+
+def test_cli_halt_does_not_recreate_a_fund_archived_after_lookup(tmp_path, monkeypatch, capsys, offline):
+    from hedge_fund.paper.ledger import Ledger
+    from hedge_fund.runtime.admission import AdmissionCoordinator, RootOwnerLease
+    from hedge_fund.runtime.lifecycle import LifecycleArchiveStore
+    from hedge_fund.runtime.root import RootContext
+
+    path = _mandate(tmp_path)
+    _enroll_test_root(tmp_path)
+    offline("2025-01-07")
+    _main(monkeypatch, "paper", "create", "alpha", "--mandate", str(path), "--universe", "AAPL")
+    capsys.readouterr()
+    lookup = run._fund_dir
+    archived = []
+
+    def archive_after_lookup(name, parser):
+        directory = lookup(name, parser)
+        with RootContext.open(tmp_path) as root:
+            with RootOwnerLease.acquire(root) as owner:
+                store = LifecycleArchiveStore(root, AdmissionCoordinator(root, owner_lease=owner))
+                preview = store.preview("deployment", name)
+                archived.append(
+                    store.archive("deployment", name, expected_digest=preview["digest"], archive_id="d" * 32)
+                )
+        return directory
+
+    monkeypatch.setattr(run, "_fund_dir", archive_after_lookup)
+    error = None
+    try:
+        _main(monkeypatch, "paper", "halt", "alpha", "--reason", "emergency")
+    except SystemExit as exc:
+        error = exc
+
+    assert archived and archived[0]["state"] == "archived"
+    assert not (tmp_path / "paper" / "alpha").exists()
+    assert Ledger(tmp_path / archived[0]["archive_path"]).halted() is None
+    assert error is not None and error.code != 0
+    assert "halted:" not in capsys.readouterr().out
+
+
+def test_cli_halt_rejects_a_replacement_deployment_after_lookup(tmp_path, monkeypatch, capsys, offline):
+    from contextlib import contextmanager
+    from threading import Event, Thread
+
+    from hedge_fund import paths
+    from hedge_fund.paper.deployed import deploy, load_deployed
+    from hedge_fund.paper.ledger import Ledger
+    from hedge_fund.runtime.admission import AdmissionCoordinator, RootOwnerLease
+    from hedge_fund.runtime.lifecycle import LifecycleArchiveStore
+    from hedge_fund.runtime.root import RootContext
+
+    path = _mandate(tmp_path)
+    _enroll_test_root(tmp_path)
+    offline("2025-01-07")
+    _main(monkeypatch, "paper", "create", "alpha", "--mandate", str(path), "--universe", "AAPL")
+    capsys.readouterr()
+    directory = tmp_path / "paper" / "alpha"
+    deployed = load_deployed(directory)
+    before_lane = Event()
+    resume = Event()
+    errors = []
+    original_lane = run._paper_lane
+
+    @contextmanager
+    def pause_before_lane(participant, name, lane):
+        if lane == "halt_lane":
+            before_lane.set()
+            if not resume.wait(timeout=10):
+                raise TimeoutError("test did not replace the deployment")
+        with original_lane(participant, name, lane):
+            yield
+
+    def halt():
+        try:
+            _main(monkeypatch, "paper", "halt", "alpha", "--reason", "emergency")
+        except BaseException as exc:
+            errors.append(exc)
+
+    monkeypatch.setattr(run, "_paper_lane", pause_before_lane)
+    worker = Thread(target=halt)
+    worker.start()
+    try:
+        assert before_lane.wait(timeout=10), errors
+        with RootContext.open(tmp_path) as root:
+            with RootOwnerLease.acquire(root) as owner:
+                admission = AdmissionCoordinator(root, owner_lease=owner)
+                store = LifecycleArchiveStore(root, admission)
+                preview = store.preview("deployment", "alpha")
+                archive = store.archive("deployment", "alpha", expected_digest=preview["digest"], archive_id="e" * 32)
+                with paths.bound_root(root):
+                    with admission.deployment_lock("alpha"):
+                        deploy("alpha", deployed.spec, deployed.universe, root=tmp_path / "paper")
+        resume.set()
+        worker.join(timeout=10)
+    finally:
+        resume.set()
+        worker.join(timeout=10)
+
+    assert not worker.is_alive()
+    assert len(errors) == 1 and isinstance(errors[0], SystemExit) and errors[0].code != 0
+    assert Ledger(directory).halted() is None
+    assert Ledger(tmp_path / archive["archive_path"]).halted() is None
+    assert "halted:" not in capsys.readouterr().out
+
+
+def _consume_cli_approval(root_path, ledger):
+    from hedge_fund.runtime.admission import AdmissionCoordinator, RootOwnerLease
+    from hedge_fund.runtime.root import RootContext
+
+    approval = ledger.approval()
+    with RootContext.open(root_path) as root:
+        owner = RootOwnerLease.acquire(root)
+        try:
+            admission = AdmissionCoordinator(root, owner_lease=owner)
+            with admission.control_lane("alpha", timeout=0):
+                ledger.log_event(
+                    "consume",
+                    decision_as_of=approval["decision_as_of"],
+                    decision_hash=approval["decision_hash"],
+                    approval_verdict=approval["verdict"],
+                    approval_by=approval["by"],
+                    approval_id=approval["approval_id"],
+                    session="2025-01-07",
+                    durable=True,
+                )
+        finally:
+            owner.close()
+
+
+@pytest.mark.parametrize("journal_state", ["unfinished", "malformed"])
+def test_cli_unfinished_consumption_halts_before_provider(tmp_path, monkeypatch, capsys, offline, journal_state):
+    from hedge_fund.paper.ledger import Ledger
+
+    path = _mandate(tmp_path)
+    _enroll_test_root(tmp_path)
+    offline("2025-01-07")
+    _main(monkeypatch, "paper", "create", "alpha", "--mandate", str(path), "--universe", "AAPL", "--approval")
+    directory = tmp_path / "paper" / "alpha"
+    _offline_tick(directory)
+    _main(monkeypatch, "paper", "approve", "alpha")
+    capsys.readouterr()
+    ledger = Ledger(directory)
+    if journal_state == "malformed":
+        with ledger.events_path.open("a", encoding="utf-8") as history:
+            history.write("{invalid\n")
+    else:
+        _consume_cli_approval(tmp_path, ledger)
+
+    monkeypatch.setattr(run, "make_data_client", lambda *_args, **_kwargs: pytest.fail("provider was constructed"))
+    with pytest.raises(SystemExit) as exc:
+        _main(monkeypatch, "paper", "tick", "alpha")
+    assert exc.value.code == 1
+    expected_error = "approval history is unavailable" if journal_state == "malformed" else "consumption is incomplete"
+    assert expected_error in capsys.readouterr().err
+    assert ledger.halted() == "approval journal requires reconciliation"
+
+
+@pytest.mark.parametrize("action", ["list", "status"])
+@pytest.mark.parametrize("interleaving", ["before_read", "during_verdict_read"])
+def test_cli_status_does_not_claim_unfinished_consumption_is_awaiting(
+    tmp_path, monkeypatch, capsys, offline, action, interleaving
+):
+    from hedge_fund.paper.ledger import Ledger
+
+    path = _mandate(tmp_path)
+    _enroll_test_root(tmp_path)
+    offline("2025-01-07")
+    _main(monkeypatch, "paper", "create", "alpha", "--mandate", str(path), "--universe", "AAPL", "--approval")
+    directory = tmp_path / "paper" / "alpha"
+    _offline_tick(directory)
+    _main(monkeypatch, "paper", "approve", "alpha")
+    capsys.readouterr()
+    ledger = Ledger(directory)
+    if interleaving == "before_read":
+        _consume_cli_approval(tmp_path, ledger)
+    else:
+        resolve = Ledger.resolve_approval
+        consumed = False
+
+        def consume_before_resolution(self, *args, **kwargs):
+            nonlocal consumed
+            if self.directory == directory and not consumed:
+                consumed = True
+                _consume_cli_approval(tmp_path, ledger)
+            return resolve(self, *args, **kwargs)
+
+        monkeypatch.setattr(Ledger, "resolve_approval", consume_before_resolution)
+    args = ("paper", "list") if action == "list" else ("paper", "status", "alpha")
+    _main(monkeypatch, *args)
+    output = capsys.readouterr().out.lower()
+    assert "in progress or requires reconciliation" in output
+    assert "awaiting approval" not in output
+
+
+@pytest.mark.parametrize("action", ["list", "status"])
+@pytest.mark.parametrize(
+    "scenario",
+    ["weekly_no_decision", "first_redo_approval", "first_redo_no_approval", "redo_no_approval_with_decision"],
+)
+def test_cli_status_reports_reconciliation_across_ledger_states(
+    tmp_path, monkeypatch, capsys, offline, action, scenario
+):
+    from hedge_fund.paper.ledger import Ledger
+    from hedge_fund.runtime.admission import AdmissionCoordinator, RootOwnerLease
+    from hedge_fund.runtime.root import RootContext
+
+    path = _mandate(tmp_path)
+    _enroll_test_root(tmp_path)
+    offline("2025-01-07")
+    args = ["paper", "create", "alpha", "--mandate", str(path), "--universe", "AAPL"]
+    if scenario not in {"first_redo_no_approval", "redo_no_approval_with_decision"}:
+        args.append("--approval")
+    _main(monkeypatch, *args)
+    directory = tmp_path / "paper" / "alpha"
+    _offline_tick(directory)
+    ledger = Ledger(directory)
+    if scenario == "weekly_no_decision":
+        _main(monkeypatch, "paper", "approve", "alpha")
+        offline("2025-01-08")
+        _offline_tick(directory)
+        latest = ledger.latest()
+        assert latest.decision is None
+        events = [
+            event for event in ledger.events()
+            if not (event["kind"] == "tick" and event["session"] == latest.session)
+        ]
+        ledger.events_path.write_text("".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
+    else:
+        with RootContext.open(tmp_path) as root:
+            owner = RootOwnerLease.acquire(root)
+            try:
+                admission = AdmissionCoordinator(root, owner_lease=owner)
+                with paths.bound_root(root), admission.manual_session("alpha", timeout=0):
+                    ledger.begin_redo(ledger.latest())
+                    if scenario != "redo_no_approval_with_decision":
+                        ledger.rewind()
+            finally:
+                owner.close()
+        if scenario != "redo_no_approval_with_decision":
+            assert ledger.latest() is None
+    capsys.readouterr()
+
+    args = ("paper", "list") if action == "list" else ("paper", "status", "alpha")
+    _main(monkeypatch, *args)
+    output = capsys.readouterr().out.lower()
+    assert "in progress or requires reconciliation" in output
+    assert "awaiting approval" not in output
+    assert "to execute at the next" not in output
+
+
+@pytest.mark.parametrize("tamper", [False, True])
+def test_enrolled_cli_redo_preserves_guarded_dispatch_and_expires_approval(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    offline,
+    tamper,
+):
+    from hedge_fund.backtesting.test_fund import FakeDataClient
+    from hedge_fund.paper.ledger import Ledger
+    from hedge_fund.runtime import endpoints
+    from hedge_fund.runtime.handover import verify_root_inventory
+    from hedge_fund.runtime.policy import ProviderTarget
+    from hedge_fund.runtime.root import RootContext
+
+    calls = []
+    monkeypatch.setattr(endpoints, "_resolve_system", lambda _host, _port: ["93.184.216.34"])
+
+    class GuardedOfflineClient(FakeDataClient):
+        def __init__(self, dispatch):
+            super().__init__(
+                {
+                    ticker: {"2025-01-06": 100, "2025-01-07": 100, "2025-01-08": 110}
+                    for ticker in ("AAPL", "SPY")
+                }
+            )
+            self.dispatch = dispatch
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def get_prices(self, ticker, start_date, end_date, **kwargs):
+            target = ProviderTarget(kind="data", provider="yfinance")
+            self.dispatch.authorize_transport(
+                target,
+                url="https://query1.finance.yahoo.com/synthetic",
+                method="GET",
+            )
+            self.dispatch.recheck_transport_fence(target)
+            calls.append(ticker)
+            return super().get_prices(ticker, start_date, end_date, **kwargs)
+
+    monkeypatch.setattr(
+        run,
+        "make_data_client",
+        lambda *, provider, dispatch, api_key: GuardedOfflineClient(dispatch),
+    )
+    path = _mandate(tmp_path)
+    _enroll_test_root(tmp_path)
+    offline("2025-01-07")
+
+    _main(monkeypatch, "paper", "create", "alpha", "--mandate", str(path), "--universe", "AAPL", "--approval")
+    capsys.readouterr()
+    _main(monkeypatch, "paper", "tick", "alpha")
+    original = json.loads(capsys.readouterr().out)
+    _main(monkeypatch, "paper", "approve", "alpha")
+    capsys.readouterr()
+    assert Ledger(tmp_path / "paper" / "alpha").approval()["decision_hash"] == original["hash"]
+    before_redo = len(calls)
+
+    if tamper:
+        rewind = Ledger.rewind
+
+        def altered_rewind(ledger):
+            return rewind(ledger).model_copy(update={"hash": "0" * 64})
+
+        monkeypatch.setattr(Ledger, "rewind", altered_rewind)
+        with pytest.raises(SystemExit) as denied:
+            _main(monkeypatch, "paper", "tick", "alpha", "--again")
+        assert denied.value.code == 1
+        assert "denied" in capsys.readouterr().err
+        ledger = Ledger(tmp_path / "paper" / "alpha")
+        assert len(calls) == before_redo
+        assert ledger.halted() == "redo authorization denied after rewind"
+        assert ledger.approval() is None
+        assert ledger._latest_approval_event(
+            original["decision"]["as_of"], original["hash"], strict=True
+        )["kind"] == "expire"
+        with RootContext.open(tmp_path) as root:
+            verify_root_inventory(root)
+        return
+
+    _main(monkeypatch, "paper", "tick", "alpha", "--again")
+
+    redone = json.loads(capsys.readouterr().out)
+    ledger = Ledger(tmp_path / "paper" / "alpha")
+    assert len(calls) > before_redo
+    assert redone["session"] == original["session"]
+    assert redone["prev_hash"] == original["prev_hash"]
+    assert ledger.approval() is None
+    assert any(event.get("reason") == "decision redone" for event in ledger.events())
+    with RootContext.open(tmp_path) as root:
+        verify_root_inventory(root)
 
 
 def test_enrolled_cli_tick_lane_conflict_leaves_ledger_unchanged(

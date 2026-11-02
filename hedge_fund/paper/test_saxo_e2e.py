@@ -309,6 +309,8 @@ def test_confirmed_fills_are_journaled_if_later_assessment_fails(tmp_path):
 
 
 def test_fill_journal_failure_still_halts_after_an_external_fill(tmp_path, monkeypatch):
+    from hedge_fund.paper.ledger import HaltAuditUnavailable
+
     directory, deployed, ledger, fund, data, clock = _cutoff_setup(tmp_path)
     broker = SimBroker(100_000)
     _run(directory, deployed, ledger, ledger.replay(100_000), "2026-10-29T15:58:00", data, None, clock=clock, fund=fund, broker=broker)
@@ -317,9 +319,11 @@ def test_fill_journal_failure_still_halts_after_an_external_fill(tmp_path, monke
         raise OSError("event journal unavailable")
 
     monkeypatch.setattr(ledger, "log_event", fail_log)
-    with pytest.raises(OSError, match="event journal unavailable"):
+    with pytest.raises(HaltAuditUnavailable, match="Halt was applied but its audit record is unavailable") as caught:
         _run(directory, deployed, ledger, ledger.replay(100_000), "2026-10-29T15:59:00", data, None, clock=clock, fund=fund, broker=broker)
 
+    assert isinstance(caught.value.__cause__, OSError)
+    assert "event journal unavailable" in str(caught.value.__cause__)
     assert ledger.halted() is not None
     assert set(broker.positions()) == {"AAPL"}
     assert ledger.latest().session == "2026-10-29T15:58:00"

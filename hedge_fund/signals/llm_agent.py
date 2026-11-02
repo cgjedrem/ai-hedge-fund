@@ -16,6 +16,7 @@ Failure contract (locked decisions):
 - Data-layer errors PROPAGATE (fail loud — a broken snapshot must never
   silently become a neutral view).
 - LLM call/parse failures ABSTAIN: Signal(value=0.0, metadata.abstained=True).
+- A caller may opt into stopping on LLM transport failures instead.
 - Every LLM decision persists its exact prompt + response (via PromptCache),
   and an unchanged snapshot never pays for a second LLM call.
 
@@ -89,11 +90,14 @@ class LLMAgent(AlphaModel):
         news: bool = False,
         samples: int = 1,
         temperature: float | None = None,
+        fail_on_llm_error: bool = False,
     ) -> None:
         if samples < 1:
             raise ValueError(f"samples must be >= 1, got {samples}")
         if temperature is not None and not 0 <= temperature <= 2:
             raise ValueError(f"temperature must be within [0, 2], got {temperature}")
+        if type(fail_on_llm_error) is not bool:
+            raise ValueError("LLM failure policy must be a boolean")
         self._llm = llm if llm is not None else make_llm(temperature=temperature)
         self._cache = cache if cache is not None else PromptCache()
         # Blind prompts withhold the ticker, industry, calendar dates and
@@ -125,6 +129,7 @@ class LLMAgent(AlphaModel):
         # agent trusts the param for keying.
         self._samples = int(samples)
         self._temperature = temperature
+        self._fail_on_llm_error = fail_on_llm_error
 
     # ------------------------------------------------------------------
     # AlphaModel interface
@@ -188,6 +193,10 @@ class LLMAgent(AlphaModel):
                     self._cache.put(key, {**record, "call_error": str(exc),
                                           "diagnostics": exc.diagnostic_record})
                     last_failed_key = key
+                if self._fail_on_llm_error:
+                    if isinstance(exc, LLMCallError):
+                        raise
+                    raise LLMCallError("LLM provider request failed") from None
                 last_failure = f"LLM call failed: {exc}"
                 logger.warning("%s LLM call failed for %s@%s (sample %d): %s",
                                self.name, ticker, date, index, exc)

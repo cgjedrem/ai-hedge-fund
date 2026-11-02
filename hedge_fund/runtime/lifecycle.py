@@ -373,7 +373,10 @@ class LifecycleArchiveStore:
 
     @contextmanager
     def _object_lane(self, kind: str, identity: str):
-        lanes = ("deployment", "runner", "execution", "control", "research")
+        lanes = ("deployment", "runner", "execution", "control")
+        if kind == "deployment":
+            lanes += ("halt",)
+        lanes += ("research",)
         with ExitStack() as stack:
             for lane in lanes:
                 if not self._admission.lane_is_held(lane, identity):
@@ -382,6 +385,7 @@ class LifecycleArchiveStore:
                         "runner": self._admission.runner_reservation,
                         "execution": self._admission.execution_lease,
                         "control": self._admission.control_lane,
+                        "halt": self._admission.halt_lane,
                         "research": self._admission.research_lane,
                     }[lane]
                     stack.enter_context(acquire(identity, timeout=0))

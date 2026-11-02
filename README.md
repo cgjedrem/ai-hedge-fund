@@ -94,6 +94,30 @@ With no arguments, this launches the interactive terminal app. It has two modes:
 Provider dispatch is disabled in the TUI; use the guarded CLI or web desk for
 provider-backed actions.
 
+### Check one stock
+
+From a source checkout, use an existing enrolled root and explicitly enable
+provider access for the invocation:
+
+```bash
+poetry run python check_stock.py AAPL --root "$AIHF_ROOT" --enable-network
+```
+
+Yahoo data and the local Ollama model are the defaults; the analyst panel needs
+Ollama to be available. `--agents burry,damodaran` selects analysts and
+`--date YYYY-MM-DD` sets the as-of date. Data and prompt caches stay under the
+selected root. Quant-only selections such as `--agents pead` do not authorize
+an unused LLM provider. Individual analyst errors are reported before the
+remaining analysts run; authorization and infrastructure failures stop the
+operation.
+
+Paid providers require a credential saved under that root, the matching
+`--authorize-paid-provider`, and finite `--paid-max-calls`,
+`--paid-max-cost-usd`, and `--paid-max-attempt-cost-usd` limits. Financial
+Datasets also requires `--confirm-fd-self-service-pricing`. Shell credentials
+do not grant consent. `--deadline-minutes` bounds the authorization lifetime
+and defaults to 60 minutes.
+
 ### Local React desk
 
 The React desk is additive; the Textual TUI and its entry points remain available.
@@ -246,17 +270,66 @@ aihf --root "$AIHF_ROOT" --enable-network paper approve alpha --now  # execute n
 aihf --root "$AIHF_ROOT" paper reject alpha
 ```
 
-In the TUI fund screen, `y` approves and `n` rejects a pending decision. A
-matching approval executes at the next session; `--now` executes immediately
-when one is due. If no session is due, `--now` keeps the verdict and reports
-that it will execute at the next close.
+On enrolled roots, use the CLI or web desk to record a verdict; TUI paper
+writes are disabled. A matching approval executes at the next session;
+`--now` executes immediately when one is due. If no session is due, `--now`
+keeps the verdict and reports that it will execute at the next close.
 
 The verdict lives in `pending-approval.json` in the fund directory, keyed to
-the decision. A rejected, missing, or stale verdict skips execution at the
-next session, records an audit event, marks the book, and lets the decision
-lapse. The fund keeps running; weekly/monthly funds remain mark-only until
-their next decision period. The gate is separate from the kill switch:
-`halt`/`resume` behavior is unchanged.
+the decision and its audit entry. A matching verdict is recorded as consumed
+and the event file is synced before execution, so cooperating writers cannot
+change it while that session is starting. An interrupted or uncertain
+consumption requires a Halt and reconciliation rather than an automatic retry.
+Unfinished consumption remains visible even if a later ledger record changed
+the pending decision, and an explicit-session retry cannot bypass it. CLI
+status and paper detail can report unavailable while work is in progress; if
+that state persists, reconciliation is required.
+A rejected, missing, or stale verdict skips execution at the next session,
+records an audit event, marks the book, and lets the decision lapse. Unreadable
+or inconsistent approval history blocks the session and requests a controlled
+Halt instead. The fund keeps
+running after an ordinary lapse; weekly/monthly funds remain mark-only until
+their next decision period. The gate is separate from the kill switch.
+Emergency Halt remains available; Resume is disabled pending a reconciliation
+receipt. Paper execution checks Halt before `advance`, before a refreshed or
+new assessment, and before each order. An effect admitted before Halt may
+still be in flight when Halt is acknowledged and requires reconciliation.
+Halt uses its own per-fund lane, including during long approval scans. A
+concurrent deployment move, initialization, or final verdict commit can make
+that lane temporarily unavailable; retry the Halt rather than assuming it was
+applied. If the switch was written but its audit record could not be saved,
+the response explicitly reports that Halt was applied and reconciliation is
+required.
+
+A redo expires the superseded decision before rewinding. A redone gated
+decision gets a new source-record hash, even when its contents otherwise match,
+so an old verdict cannot be reused and the new decision can be reviewed and
+approved. Existing non-redone ledger records keep their original hashes.
+Redo reuses a consumed verdict only when the audit identifies the session
+being redone; missing evidence blocks the rewind. An interrupted redo leaves a
+recovery marker that blocks subsequent paper work until offline reconciliation.
+An incomplete verdict publication likewise blocks approval resolution. These
+markers guard process interruptions; they do not prove host power-loss or
+directory-entry durability. If a final marker replacement takes effect but
+reports failure, and both compensation and Halt also fail, its outcome remains
+uncertain and must be reconciled before retry.
+
+Standalone direct paper APIs use separate per-fund execution and control
+locks. A competing execution is denied as busy without halting the active
+one, while emergency Halt remains independently available. These locks do not
+enroll a root or exclude older or out-of-band writers; configured roots still
+require their normal admission. After a POSIX fork, a child must start a fresh
+interpreter before using an inherited root context or admission lanes; it may
+close its duplicate handles without unlocking the parent.
+
+On enrolled roots, a paper session reserves the registry before its first local
+paper order and holds it through ledger-head publication. Other registry
+writers can therefore be delayed while the session completes; this avoids
+leaving a simulated fill unrecorded solely because a sibling publication won
+the registry. Read-only intraday quote checks remain coordinated with that
+reservation. A scheduled runner retries a busy control preflight only before
+paper effects, within its existing stop and expiry bounds and without spending
+another session authorization.
 
 ### Docker
 

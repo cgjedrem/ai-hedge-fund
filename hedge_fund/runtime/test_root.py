@@ -1,11 +1,12 @@
 import ctypes
 import os
+import signal
 import stat
 import subprocess
-import sys
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from threading import Event
+from threading import Event, Thread
 
 import pytest
 
@@ -47,6 +48,144 @@ def test_root_requires_explicit_absolute_existing_directory(tmp_path):
         RootContext.open(root)
 
     assert not root.exists()
+
+
+def test_inherited_root_close_does_not_acquire_parent_thread_lock(tmp_path, monkeypatch):
+    context = RootContext.open(tmp_path)
+    original_lock = context._identity_lock
+    original_getpid = os.getpid
+
+    class ForbiddenLock:
+        def __enter__(self):
+            pytest.fail("child attempted to acquire an inherited root lock")
+
+        def __exit__(self, *_args):
+            pass
+
+    try:
+        with monkeypatch.context() as child:
+            child.setattr(root_module.os, "getpid", lambda: original_getpid() + 1)
+            child.setattr(context, "_identity_lock", ForbiddenLock())
+            context.close()
+    finally:
+        context._identity_lock = original_lock
+        context.close()
+
+
+@pytest.mark.parametrize(
+    "operation", ["revalidate", "prepare_private_storage", "verify_private_storage", "read_bytes", "enter"]
+)
+def test_inherited_root_use_is_rejected_before_parent_mutex(tmp_path, monkeypatch, operation):
+    context = RootContext.open(tmp_path)
+    original_getpid = os.getpid
+
+    class ForbiddenLock:
+        def __enter__(self):
+            pytest.fail("child attempted to acquire the inherited root mutex")
+
+        def __exit__(self, *_args):
+            pass
+
+    try:
+        with monkeypatch.context() as child:
+            child.setattr(root_module.os, "getpid", lambda: original_getpid() + 1)
+            child.setattr(context, "_identity_lock", ForbiddenLock())
+            with pytest.raises(RootPathError, match="fresh interpreter after fork"):
+                if operation == "read_bytes":
+                    context.read_bytes("missing")
+                elif operation == "enter":
+                    context.__enter__()
+                else:
+                    getattr(context, operation)()
+    finally:
+        context.close()
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="POSIX fork is unavailable")
+def test_forked_child_can_close_root_while_parent_thread_holds_lock(tmp_path):
+    context = RootContext.open(tmp_path)
+    held = Event()
+    release = Event()
+
+    def hold_root_lock():
+        with context._identity_lock:
+            held.set()
+            release.wait(timeout=10)
+
+    thread = Thread(target=hold_root_lock)
+    thread.start()
+    pid = None
+    try:
+        assert held.wait(timeout=5)
+        pid = os.fork()
+        if pid == 0:
+            try:
+                context.close()
+            except BaseException:
+                os._exit(2)
+            os._exit(0)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            waited, status = os.waitpid(pid, os.WNOHANG)
+            if waited:
+                pid = None
+                assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+                break
+            time.sleep(0.01)
+        else:
+            pytest.fail("child blocked on the parent's root lock")
+    finally:
+        if pid:
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+        release.set()
+        thread.join(timeout=5)
+        context.close()
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="POSIX fork is unavailable")
+def test_forked_child_rejects_root_use_while_parent_thread_holds_lock(tmp_path):
+    context = RootContext.open(tmp_path)
+    held = Event()
+    release = Event()
+
+    def hold_root_lock():
+        with context._identity_lock:
+            held.set()
+            release.wait(timeout=10)
+
+    thread = Thread(target=hold_root_lock)
+    thread.start()
+    pid = None
+    try:
+        assert held.wait(timeout=5)
+        pid = os.fork()
+        if pid == 0:
+            try:
+                context.revalidate()
+            except RootPathError:
+                context.close()
+                os._exit(0)
+            except BaseException:
+                os._exit(2)
+            os._exit(1)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            waited, status = os.waitpid(pid, os.WNOHANG)
+            if waited:
+                pid = None
+                assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+                break
+            time.sleep(0.01)
+        else:
+            pytest.fail("child blocked on the parent's root lock")
+    finally:
+        if pid:
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+        release.set()
+        thread.join(timeout=5)
+        context.close()
 
 
 def test_explicit_root_ignores_home_cwd_and_environment(monkeypatch, tmp_path, root_context):
@@ -344,6 +483,11 @@ def test_atomic_replace_failure_preserves_record_and_original_error(
 
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="POSIX FIFO is unavailable")
 def test_posix_fifo_read_fails_without_blocking(tmp_path):
+    from hedge_fund.test_support.network_guard import (
+        child_test_environment,
+        guarded_test_python_command,
+    )
+
     root = tmp_path / "root"
     root.mkdir()
     os.mkfifo(root / "pipe")
@@ -360,7 +504,8 @@ raise SystemExit(1)
 """
 
     completed = subprocess.run(
-        [sys.executable, "-c", script, str(root)],
+        guarded_test_python_command("-c", script, str(root)),
+        env=child_test_environment(),
         capture_output=True,
         text=True,
         timeout=3,

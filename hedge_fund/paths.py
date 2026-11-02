@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import stat
@@ -198,7 +199,7 @@ def write_bytes(
     selected = _relative_user_path(candidate)
     if selected is not None:
         context, relative = selected
-        with _root_write_admission(context, relative):
+        with _root_write_admission(context, relative, data=data):
             parent = Path(relative).parent
             if parent.parts:
                 context.mkdir(parent.as_posix(), parents=True)
@@ -275,24 +276,39 @@ def ensure_mandates_dir() -> Path:
 
 
 @contextmanager
-def _root_write_admission(context: RootContext, relative: str) -> Iterator[None]:
+def _root_write_admission(
+    context: RootContext,
+    relative: str,
+    *,
+    data: bytes | None = None,
+) -> Iterator[None]:
     parts = Path(relative).parts
     if parts and parts[0].casefold() == "paper":
         from hedge_fund.runtime.admission import (
             AdmissionError,
             require_paper_write_lanes,
+            WriterConflict,
         )
 
         if len(parts) < 2:
             raise RootConfigurationError("paper-root writes require a deployment identity")
         filename = parts[-1].casefold()
-        lane_sets = (("control",), ("deployment",), ("runner", "execution")) if filename in {"control.json", "pending-approval.json"} else (("deployment",), ("runner", "execution"))
+        lane_sets = (("control",), ("deployment",), ("runner", "execution")) if filename in {"control.json", "pending-approval.json", "approval-publication.json"} else (("deployment",), ("runner", "execution"))
         try:
-            admitted = require_paper_write_lanes(
-                context.path.joinpath(*parts[:2]),
-                parts[1],
-                lane_sets=lane_sets,
-            )
+            try:
+                admitted = require_paper_write_lanes(
+                    context.path.joinpath(*parts[:2]),
+                    parts[1],
+                    lane_sets=lane_sets,
+                )
+            except WriterConflict:
+                if len(parts) != 3 or filename != "control.json" or not _is_halt_control_write(data):
+                    raise
+                admitted = require_paper_write_lanes(
+                    context.path.joinpath(*parts[:2]),
+                    parts[1],
+                    lane_sets=(("halt",),),
+                )
             if not admitted:
                 raise RootConfigurationError("paper write admission is unavailable")
         except AdmissionError as exc:
@@ -301,19 +317,47 @@ def _root_write_admission(context: RootContext, relative: str) -> Iterator[None]
         return
 
     try:
-        from hedge_fund.runtime.admission import root_registry_writer
+        from hedge_fund.runtime.admission import (
+            MAX_LOCK_WAIT_SECONDS,
+            root_registry_writer,
+        )
 
-        with root_registry_writer(context):
+        with root_registry_writer(
+            context,
+            timeout=MAX_LOCK_WAIT_SECONDS,
+            allow_prepared_lifecycle=bool(
+                parts
+                and (parts[0] == "cache" or (os.name == "nt" and parts[0].casefold() == "cache"))
+            ),
+        ):
             yield
     except (OSError, RuntimeError, ValueError) as exc:
         raise RootConfigurationError("root write admission is unavailable") from exc
 
 
-def write_atomic(path: Path, text: str, *, mode: int | None = None) -> None:
-    """Atomically replace a file; root files use handle-relative writes."""
+def _is_halt_control_write(data: bytes | None) -> bool:
+    if data is None:
+        return False
+    try:
+        value = json.loads(data)
+    except (UnicodeError, ValueError):
+        return False
+    return (
+        isinstance(value, dict)
+        and set(value) == {"halted", "reason", "since"}
+        and value["halted"] is True
+        and isinstance(value["reason"], str)
+        and isinstance(value["since"], str)
+    )
+
+
+def write_atomic(path: Path, text: str, *, mode: int | None = None, durable: bool = False) -> None:
+    """Atomically replace a file; optionally sync standalone bytes before rename."""
     path = Path(path)
     if mode is not None and (type(mode) is not int or not 0 <= mode <= 0o777):
         raise ValueError("mode must contain permission bits")
+    if type(durable) is not bool:
+        raise TypeError("durable must be a boolean")
     selected = _relative_user_path(path)
     if selected is not None:
         write_bytes(
@@ -335,6 +379,9 @@ def write_atomic(path: Path, text: str, *, mode: int | None = None) -> None:
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
             descriptor = None
             handle.write(text)
+            if durable:
+                handle.flush()
+                os.fsync(handle.fileno())
         os.replace(tmp, path)
     except BaseException:
         if descriptor is not None:

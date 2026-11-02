@@ -8,6 +8,7 @@ import json
 import os
 import threading
 import time
+from contextlib import ExitStack
 from datetime import datetime, timezone
 from typing import Callable
 
@@ -16,20 +17,26 @@ from hedge_fund.data.sessions import NEW_YORK
 from hedge_fund.fund import Fund, FundSpec
 from hedge_fund.llm import make_llm, PromptCache
 from hedge_fund.paper.deployed import load_deployed
-from hedge_fund.paper.ledger import Ledger
+from hedge_fund.paper.ledger import (
+    AuditObservationUnavailable,
+    Ledger,
+    PaperReconciliationRequired,
+)
 from hedge_fund.paper.tick import next_session, tick
 from hedge_fund.pipeline.session import code_version, mandate_hash
 from hedge_fund.runtime.admission import (
     AdmissionCoordinator,
+    PaperPreflightBusy,
     PROTOCOL_VERSION,
     RootOwnerLease,
+    WriterConflict,
 )
 from hedge_fund.runtime.capture import FrozenCapture
 from hedge_fund.runtime.configuration import ConfigurationError
 from hedge_fund.runtime.dispatch import ProviderDispatch
 from hedge_fund.runtime.handover import (
     HandoverError,
-    record_ledger_head,
+    InventoryObservationUnavailable,
     require_enrollment,
     root_binding,
     verify_ledger_head,
@@ -139,11 +146,29 @@ def run_owned_runner(
     max_sessions = authorization_raw["max_sessions"]
     owner = RootOwnerLease.acquire(root, timeout=5.0)
     admission = AdmissionCoordinator(root, owner_lease=owner)
+    clock = now or (lambda: datetime.now(timezone.utc))
+    pause = sleep or time.sleep
     try:
         status = dict(state)
         try:
-            require_enrollment(root)
-            verify_root_inventory(root)
+            while True:
+                control = read_runner_record(root, fund, "control")
+                if not validate_runner_control(root, fund, nonce_hash, control):
+                    raise OwnedRunnerError("runner control state is unavailable")
+                if control["stop_requested"]:
+                    status.update({"status": "stopped", "reason": "stop-requested"})
+                    _write_status(root, fund, nonce_hash, status)
+                    return
+                if _validated_now(clock()) >= expires_at:
+                    status.update({"status": "completed", "reason": "expiry-reached"})
+                    _write_status(root, fund, nonce_hash, status)
+                    return
+                try:
+                    require_enrollment(root)
+                    verify_root_inventory(root)
+                    break
+                except InventoryObservationUnavailable:
+                    pause(0.25)
             _reject_legacy_pid(root, fund)
             with admission.runner_reservation(fund, timeout=5.0):
                 process_record = current_process_identity()
@@ -172,8 +197,8 @@ def run_owned_runner(
                     max_sessions=max_sessions,
                     data_client_factory=data_client_factory,
                     build_fund=build_fund,
-                    now=now or (lambda: datetime.now(timezone.utc)),
-                    sleep=sleep or time.sleep,
+                    now=clock,
+                    sleep=pause,
                     resolver=resolver,
                 )
         except Exception as exc:
@@ -323,14 +348,40 @@ def _runner_loop(
                 status["status"] = "completed"
                 status["reason"] = "session-bound-reached"
                 break
-            require_enrollment(root)
-            verify_ledger_head(root, fund)
+            try:
+                require_enrollment(root)
+                verify_ledger_head(root, fund)
+            except InventoryObservationUnavailable:
+                if stop_event.wait(0.25):
+                    break
+                continue
             ledger = Ledger(root.path / "paper" / fund)
             state = ledger.replay(spec.capital, full=True)
             if state.halted is not None:
                 status["status"] = "failed"
                 status["reason"] = "fund-halted"
                 break
+            try:
+                with ExitStack() as preflight:
+                    try:
+                        preflight.enter_context(admission.control_lane(fund))
+                    except WriterConflict:
+                        if stop_event.wait(0.25):
+                            break
+                        continue
+                    if ledger.halted() is not None:
+                        status["status"] = "failed"
+                        status["reason"] = "fund-halted"
+                        break
+                    try:
+                        ledger.require_ready_for_work(state, approval_required=spec.approval_required)
+                    except PaperReconciliationRequired:
+                        ledger.halt("approval journal requires reconciliation")
+                        raise
+            except AuditObservationUnavailable:
+                if stop_event.wait(0.25):
+                    break
+                continue
             if spec.is_intraday:
                 due = next_session(
                     None,
@@ -365,6 +416,9 @@ def _runner_loop(
                         build_fund,
                         dispatch,
                         moment,
+                        retry_clock=now,
+                        stop_event=stop_event,
+                        expires_at=expires_at,
                     )
             else:
                 with _client_context(
@@ -400,6 +454,9 @@ def _runner_loop(
                         build_fund,
                         dispatch,
                         moment,
+                        retry_clock=now,
+                        stop_event=stop_event,
+                        expires_at=expires_at,
                     )
             latest = Ledger(root.path / "paper" / fund).latest()
             last_session = latest.session if latest is not None else None
@@ -456,6 +513,10 @@ def _execute_session(
     build_fund,
     dispatch: ProviderDispatch,
     now: datetime,
+    *,
+    retry_clock: Callable[[], datetime],
+    stop_event: threading.Event,
+    expires_at: datetime,
 ) -> None:
     due_set = (due,)
     authorize_session(
@@ -469,20 +530,37 @@ def _execute_session(
         now=now,
     )
     with admission.execution_lease(fund, timeout=0):
-        require_enrollment(root)
-        verify_ledger_head(root, fund)
-        current = Ledger(root.path / "paper" / fund).replay(spec.capital, full=True)
-        current_head = current.prev_hash
-        if current_head != state.prev_hash or current.last_session != state.last_session:
-            raise HandoverError("ledger head changed before runner admission")
-        record = tick(
-            root.path / "paper" / fund,
-            data_client,
-            session=due,
-            build_fund=((lambda selected: build_fund(selected, capture, root, dispatch)) if build_fund is not None else (lambda selected: _build_fund(selected, capture, root, dispatch))),
-            now=lambda: now.astimezone(NEW_YORK),
-        )
-    record_ledger_head(root, fund, admission=admission)
+        def require_retry_authority() -> None:
+            if stop_event.is_set():
+                raise AuthorizationDenied("runner stop was requested")
+            if _validated_now(retry_clock()) >= expires_at:
+                raise AuthorizationDenied("runner deadline expired")
+
+        while True:
+            require_retry_authority()
+            try:
+                require_enrollment(root)
+                verify_ledger_head(root, fund)
+                current = Ledger(root.path / "paper" / fund).replay(spec.capital, full=True)
+            except InventoryObservationUnavailable:
+                stop_event.wait(0.25)
+                continue
+            if current.prev_hash != state.prev_hash or current.last_session != state.last_session:
+                raise HandoverError("ledger head changed before runner admission")
+            break
+        while True:
+            require_retry_authority()
+            try:
+                record = tick(
+                    root.path / "paper" / fund,
+                    data_client,
+                    session=due,
+                    build_fund=((lambda selected: build_fund(selected, capture, root, dispatch)) if build_fund is not None else (lambda selected: _build_fund(selected, capture, root, dispatch))),
+                    now=lambda: _validated_now(retry_clock()).astimezone(NEW_YORK),
+                )
+                break
+            except PaperPreflightBusy:
+                stop_event.wait(0.25)
     status["sessions_completed"] = status.get("sessions_completed", 0) + 1
     status["last_session"] = record.session
     _write_status(root, fund, nonce_hash, status)

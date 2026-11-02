@@ -21,6 +21,8 @@
 - `hedge_fund/runtime/test_credentials.py` — credential boundary and no-TUI import-closure tests.
 - `hedge_fund/runtime/admission.py` — versioned root/deployment OS locks, manual admission and bounded control lane.
 - `hedge_fund/runtime/test_admission.py` — T009 cross-process lock, ownership-fail-closed and bounded-control tests.
+- `hedge_fund/runtime/test_inventory_cache_race.py` — cross-fund publication/cache interleavings and exact-head drift regressions.
+- `hedge_fund/test_check_stock.py` — synthetic-root stock-check consent, guarded-client and cache regressions.
 - `hedge_fund/runtime/configuration.py` — non-secret settings resolution, persistence, provider/model validation and isolated child environment.
 - `hedge_fund/runtime/capture.py` — immutable digest-checked captures and root-scoped credential-version handles.
 - `hedge_fund/runtime/policy.py` — provider classification, one-shot paid authorization and finite scheduled dispatch budgets.
@@ -39,6 +41,7 @@
 - `specs/005-web-engine-migration/change-manifest.md` — implementation file inventory.
 - `specs/005-web-engine-migration/spec005-final-evidence.md` — consolidated final bounded-QA evidence and artifact identities.
 - `specs/005-web-engine-migration/qa-final-disposition.md` — partial readiness, remaining blockers and safe preview boundary.
+- `specs/005-web-engine-migration/pr8-review-triage.md` — focused review dispositions, synthetic evidence and remaining limits.
 - `specs/005-web-engine-migration/screenshots/desktop-backtests.png` — synthetic browser screenshot.
 - `specs/005-web-engine-migration/screenshots/desktop-builder.png` — synthetic browser screenshot.
 - `specs/005-web-engine-migration/screenshots/desktop-mandate-detail.png` — synthetic browser screenshot.
@@ -74,7 +77,7 @@
 - `hedge_fund/paths.py` — explicit root binding, exact-root opted-in dotenv and root-relative I/O helpers.
 - `hedge_fund/run.py` — pre-import explicit-root CLI bootstrap, root-relative paths and neutral report helpers after root binding.
 - `hedge_fund/test_run.py` — CLI relative-mandate root regression and removal of the obsolete credential-loader patch.
-- `check_stock.py` — remove TUI credential-loader dependency; require provider credentials in the process environment.
+- `check_stock.py` — remove TUI credential-loader dependency; require an enrolled explicit root and bounded one-shot consent, using root-private provider credentials when needed.
 - `hedge_fund/tui/palette.py` — compatibility exports from neutral report palette.
 - `hedge_fund/tui/shared.py` — compatibility exports from neutral names/default helpers.
 - `hedge_fund/tui/scorecard_view.py` — compatibility exports from neutral scorecard renderers.
@@ -104,6 +107,19 @@
 - `specs/005-web-engine-migration/implementation-progress.md` — T001–T018 checkpoints, final verification and blockers.
 - `specs/005-web-engine-migration/change-manifest.md` — cumulative source/test/document inventory.
 - `specs/004-react-web-ui/parity-checklist.md` — retained-TUI and final migration blockers.
+
+## PR8 review repair
+
+- `hedge_fund/runtime/handover.py`, `admission.py`, `root.py`, `lifecycle.py`, `paper/deployed.py`, `paper/ledger.py`, and `paper/tick.py` — coordinated inventory publication, scoped paper-order reservation and observation, separate execution/control/Halt/audit locks, lifecycle and verdict/Halt fencing, exact consumption matching, inherited-process cleanup, interrupted-redo/publication guards and effect-boundary Halt checks.
+- `hedge_fund/runtime/operations.py` and `test_operations.py` — read-only snapshot-worker cancellation observations under the owning publication window, with capture, sidecar and worker-fence checks retained.
+- `hedge_fund/pipeline/clock.py`, `session.py`, and `stages.py` — reserve publication before a local paper order and allow scoped, read-only intraday snapshot observations without blocking on the owning reservation.
+- `hedge_fund/pipeline/session.py` and `stages.py` — hash-bound identity for approval-gated redos and optional paper effect-admission callbacks without changing legacy record shape.
+- `hedge_fund/runtime/owned_runner.py`, `owned_runner_child.py` and `hedge_fund/test_support/` — canonical fail-closed test-child bootstrap, isolation, pre-provider interrupted-work checks and stop/expiry-bounded pre-effect observation retries.
+- `hedge_fund/run.py` and `hedge_fund/web/services.py` — identity-safe CLI Halt, pre-provider reconciliation checks and consistent read-only CLI/web approval observations across ledger states.
+- `frontend/src/pages/paper.tsx` and `frontend/src/App.test.tsx` — the paper decision is unavailable rather than awaiting a verdict when the paper state is in progress or requires reconciliation.
+- `check_stock.py`, `hedge_fund/fund/spec.py`, and `hedge_fund/signals/llm_agent.py` — root-bound, bounded stock-check dispatch with opt-in transport-failure propagation.
+- Adjacent runtime, paper, CLI, analyst, fund and isolation tests — synthetic interleavings, actual child negative cases, compatibility and bounded fake-transport regressions.
+- `README.md`, `tasks.md`, and `pr8-review-triage.md` — operator behavior, evidence and explicit partial-migration limits.
 
 ## Deleted
 

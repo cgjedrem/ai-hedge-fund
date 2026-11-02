@@ -16,7 +16,7 @@ from hedge_fund.paper.ledger import Ledger
 from hedge_fund.pipeline.models import CycleRecord, DecisionRecord, StrategyRecord
 from hedge_fund.pipeline.session import mandate_hash, SessionRecord
 from hedge_fund.runtime.admission import AdmissionCoordinator, RootOwnerLease
-from hedge_fund.runtime.handover import enroll_fresh, record_ledger_head
+from hedge_fund.runtime.handover import enroll_fresh
 from hedge_fund.runtime.root import RootContext
 
 
@@ -61,7 +61,6 @@ def _seed_demo_data(data_root: Path, admission: AdmissionCoordinator, context: R
     save_spec(spec, data_root / "mandates", admission=admission)
     with admission.deployment_lock(spec.name, timeout=0):
         paper_dir = deploy("demo-quality", spec, ["AAPL", "MSFT"], root=data_root / "paper")
-    record_ledger_head(context, spec.name, admission=admission)
     ledger = Ledger(paper_dir)
 
     first = _decision(spec, "2024-06-03", 100.0, 0.8)
@@ -76,7 +75,6 @@ def _seed_demo_data(data_root: Path, admission: AdmissionCoordinator, context: R
     with admission.manual_session(spec.name, timeout=0):
         for record in records:
             ledger.append(record)
-    record_ledger_head(context, spec.name, admission=admission)
 
     dates = [record.session for record in records]
     nav = [record.nav for record in records]

@@ -32,6 +32,17 @@ artifact or full-migration acceptance is claimed. Only one verified paid provide
 authorized per operation; combined paid Financial Datasets plus TypeSafe is unsupported.
 T139, T141 and T146 have bounded partial evidence but remain unchecked; convergence tasks
 T138–T148 remain open.
+PR8's focused review repairs also cover synced approval consumption and
+cooperating-control races. Incomplete consumption is checked across ledger
+head changes, and inherited enrolled or standalone admission is denied after
+fork. Interrupted redo and incomplete verdict publication block subsequent
+work, but final-write lost acknowledgements and in-flight effects still require
+reconciliation. The focused Halt lane also fences lifecycle moves and the
+verdict commit point; paper-order publication reservation and pre-effect runner
+retries have synthetic coverage. These repairs do not complete T067/T068/T140,
+prove arbitrary filesystem responsiveness, or establish power-loss recovery.
+Evidence and observed Windows replace failures are recorded in
+`pr8-review-triage.md`.
 T022/T059 record native ext4 and NTFS ACL evidence on the tested source snapshot;
 Linux execution was a Docker Desktop VM on a WSL2 kernel, not bare metal. T006/T007/T012/
 T014/T016/T017 do not themselves establish those native rows or broader live-runtime
@@ -126,6 +137,27 @@ story mutations. Tests below are mandatory red-green implementation tasks.
 **Checkpoint:** all foundational seams exist and safety regressions pass; platform mutation
 is enabled only where primitives are actually verified. Blocked native evidence never
 permits a retirement claim or a fallback process/ACL implementation.
+
+**PR8 review-finding repair:** T001/T002 test-owned child launchers now require
+the isolation hook before running child code, including hook import or setup
+failure. T021 gains coordinated paper head publication and cache admission,
+with a synthetic two-fund interleaving across processes. Approval expiry is
+recorded before redo rewind, fresh gated redos receive a new hash-bound
+identity, and queued approvals do not hold the Halt control lane. A verdict
+is consumed under control before effects, and redo requires matching
+historical consumption evidence. A pending redo/publication guard and a prior
+unfinished consumption deny provider preflight, while emergency Halt remains
+available. Consumption matching covers the previous decision even after a new
+ledger head is appended; mismatched committed publication and mailbox IDs
+block replacement. Checks before assessments and each order do not cancel
+effects already admitted before Halt. Web paper detail does not present an
+expired, wrong-hash or otherwise unmatched mailbox as an active verdict and
+shows unavailable rather than an awaiting-verdict label while the paper state
+is in progress or requires reconciliation.
+`check_stock.py` uses an enrolled explicit root and the existing bounded one-shot
+provider policy; it stops after the first transport failure, covered with fakes.
+These checks do not complete T015, T021, T027, or the migration.
+See `pr8-review-triage.md` for source identity, results, and remaining limits.
 
 ## Phase 3: User Story 1 — Operate the paper engine from the desk (P1, MVP)
 

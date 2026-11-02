@@ -479,7 +479,7 @@ export function PaperDetailPage() {
       {resource.error ? <ErrorState message={resource.error} error={resource.apiError} onRetry={resource.refresh} /> : null}
       {data ? (
         <>
-          {!data.ledger.ok ? <Alert tone="danger" className="mb-5"><strong>Ledger verification failed.</strong> <span>{data.ledger.error}</span></Alert> : null}
+          {!data.ledger.ok ? <Alert tone="danger" className="mb-5"><strong>Paper state unavailable.</strong> <span>{data.ledger.error}</span></Alert> : null}
           {writeUnavailable ? (
             <Alert tone="warning" className="mb-5">
               Root enrollment: <span className="mono">{enrollmentState}</span>. Writes unavailable: <span className="mono">{capabilities?.write_unavailable_reason}</span>.
@@ -797,6 +797,7 @@ export function PaperDetailPage() {
                 approval={data.approval}
                 approvalRequired={approvalRequired}
                 haltState={data.halt_state}
+                ledgerOk={data.ledger.ok}
                 enabled={canApprove}
                 onVerdict={(verdict) => setConfirmAction(verdict)}
               />
@@ -978,6 +979,7 @@ function PendingDecisionCard({
   approval,
   approvalRequired,
   haltState,
+  ledgerOk,
   enabled,
   onVerdict,
 }: {
@@ -985,6 +987,7 @@ function PendingDecisionCard({
   approval: Approval | null;
   approvalRequired: boolean;
   haltState: HaltState;
+  ledgerOk: boolean;
   enabled: boolean;
   onVerdict: (verdict: "approve" | "reject") => void;
 }) {
@@ -994,8 +997,10 @@ function PendingDecisionCard({
         <CardHeader><CardTitle>Pending decision</CardTitle></CardHeader>
         <CardContent>
           <EmptyState
-            title={approvalRequired ? "No decision awaiting approval" : "No approval gate"}
-            description={approvalRequired
+            title={!ledgerOk ? "Decision unavailable" : approvalRequired ? "No decision awaiting approval" : "No approval gate"}
+            description={!ledgerOk
+              ? "Paper state must be verified before a decision can be reviewed."
+              : approvalRequired
               ? "A decision appears here only when it is recorded in the local ledger."
               : "This mandate does not require approval; execution can proceed without a verdict."}
           />
@@ -1006,8 +1011,8 @@ function PendingDecisionCard({
   const weights = Object.entries(pending.final_weights).sort(([left], [right]) => left.localeCompare(right));
   const halted = haltState === "halted";
   const haltUnreadable = haltState === "unreadable";
-  const status = !approvalRequired ? "Approval not required" : haltUnreadable ? "Halt state unknown" : halted ? "Halted" : approval ? approval.verdict : "Awaiting verdict";
-  const statusVariant = !approvalRequired || halted || haltUnreadable ? "muted" : approval ? (approval.verdict === "approve" ? "positive" : "negative") : "warning";
+  const status = !ledgerOk ? "Decision unavailable" : !approvalRequired ? "Approval not required" : haltUnreadable ? "Halt state unknown" : halted ? "Halted" : approval ? approval.verdict : "Awaiting verdict";
+  const statusVariant = !ledgerOk || !approvalRequired || halted || haltUnreadable ? "muted" : approval ? (approval.verdict === "approve" ? "positive" : "negative") : "warning";
   return (
     <Card>
       <CardHeader>
@@ -1041,7 +1046,7 @@ function PendingDecisionCard({
           <Button onClick={() => onVerdict("approve")} disabled={!enabled}>Approve</Button>
           <Button variant="danger" onClick={() => onVerdict("reject")} disabled={!enabled}>Reject</Button>
         </div>
-        {!enabled && approvalRequired && haltState === "clear" ? <p className="text-[10px] leading-relaxed text-muted-foreground">Verdict writes require startup write capability and a non-protected fund name.</p> : null}
+        {!enabled && approvalRequired && haltState === "clear" ? <p className="text-[10px] leading-relaxed text-muted-foreground">{ledgerOk ? "Verdict writes require startup write capability and a non-protected fund name." : "Paper state must be verified before verdicts can be saved."}</p> : null}
       </CardContent>
     </Card>
   );

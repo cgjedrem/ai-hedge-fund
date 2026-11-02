@@ -21,6 +21,7 @@ from hedge_fund.pipeline.session import code_version
 from hedge_fund.runtime.admission import (
     AdmissionCoordinator,
     AdmissionError,
+    MAX_LOCK_WAIT_SECONDS,
     PROTOCOL_VERSION,
 )
 from hedge_fund.runtime.capture import FrozenCapture
@@ -165,8 +166,9 @@ class OwnedRunnerManager:
         if not self._root.verify_private_storage():
             raise OwnedRunnerError("private runner storage is unverified")
         try:
-            record = require_enrollment(self._root)
-            verify_root_inventory(self._root, record=record)
+            with self._admission.registry_lock(timeout=MAX_LOCK_WAIT_SECONDS):
+                record = require_enrollment(self._root)
+                verify_root_inventory(self._root, record=record)
         except Exception:
             raise OwnedRunnerError("offline root enrollment or inventory is unavailable") from None
         head_entry = record["heads"].get(name)
@@ -689,7 +691,14 @@ def _runner_command(root: RootContext, fund: str) -> list[str]:
         fund,
     ]
     module = "hedge_fund.runtime.owned_runner_child"
+    test_mode = os.environ.get("HEDGE_FUND_TEST_MODE") == "1"
     if os.name != "nt":
+        if test_mode:
+            from hedge_fund.test_support.network_guard import (
+                guarded_test_python_command,
+            )
+
+            return guarded_test_python_command("-m", module, *arguments)
         return [sys.executable, "-m", module, *arguments]
 
     base_executable = getattr(sys, "_base_executable", None)
@@ -697,6 +706,12 @@ def _runner_command(root: RootContext, fund: str) -> list[str]:
         raise OwnedRunnerError("direct runner interpreter is unavailable")
     base_executable = os.path.abspath(base_executable)
     if os.path.normcase(base_executable) == os.path.normcase(os.path.abspath(sys.executable)):
+        if test_mode:
+            from hedge_fund.test_support.network_guard import (
+                guarded_test_python_command,
+            )
+
+            return guarded_test_python_command("-m", module, *arguments)
         return [base_executable, "-m", module, *arguments]
 
     try:
@@ -710,7 +725,17 @@ def _runner_command(root: RootContext, fund: str) -> list[str]:
             raise OwnedRunnerError("runner package paths are invalid")
         if os.path.normcase(os.path.abspath(directory)) not in {os.path.normcase(os.path.abspath(value)) for value in site_directories}:
             site_directories.append(directory)
-    bootstrap = "import importlib.util,runpy,site,sys\n" f"_site_count={len(site_directories)}\n" "_args=sys.argv[1:]\n" "for _path in _args[:_site_count]:\n" " site.addsitedir(_path)\n" "sys.argv=['aihf-owned-paper-runner',*_args[_site_count:]]\n" "if importlib.util.find_spec('sitecustomize') is not None:\n" " import sitecustomize\n" f"runpy.run_module({module!r},run_name='__main__')\n"
+    bootstrap = "import importlib.util,runpy,site,sys\n"
+    if test_mode:
+        from hedge_fund.test_support.network_guard import _CHILD_GUARD_PREFLIGHT
+
+        bootstrap += _CHILD_GUARD_PREFLIGHT
+    bootstrap += f"_site_count={len(site_directories)}\n" "_args=sys.argv[1:]\n" "for _path in _args[:_site_count]:\n" " site.addsitedir(_path)\n" "sys.argv=['aihf-owned-paper-runner',*_args[_site_count:]]\n"
+    if test_mode:
+        bootstrap += _CHILD_GUARD_PREFLIGHT
+    else:
+        bootstrap += "if importlib.util.find_spec('sitecustomize') is not None:\n import sitecustomize\n"
+    bootstrap += f"runpy.run_module({module!r},run_name='__main__')\n"
     return [
         base_executable,
         "-S",

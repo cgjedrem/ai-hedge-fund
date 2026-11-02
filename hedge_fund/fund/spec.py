@@ -41,7 +41,7 @@ EARLIEST_WINDOW = "04:00"
 LATEST_WINDOW = "20:00"
 SAXO_REGULAR_OPEN = "09:30"
 SAXO_LAST_BAR = "15:59"
-_RUNTIME_MODEL_PARAMS = frozenset({"breakpoints", "breakpoints_dispatch", "cache", "llm"})
+_RUNTIME_MODEL_PARAMS = frozenset({"breakpoints", "breakpoints_dispatch", "cache", "fail_on_llm_error", "llm"})
 
 
 def _json_value(value: Any) -> bool:
@@ -474,6 +474,7 @@ class Fund:
         cache: PromptCache | None = None,
         llm_factory: Callable[[ModelSpec], object] | None = None,
         breakpoints_dispatch: ProviderDispatch | None = None,
+        fail_on_llm_error: bool = False,
     ) -> None:
         if llm_factory is not None and not callable(llm_factory):
             raise ValueError("LLM factory must be callable")
@@ -482,6 +483,8 @@ class Fund:
             ProviderDispatch,
         ):
             raise ValueError("breakpoints provider authorization is invalid")
+        if type(fail_on_llm_error) is not bool:
+            raise ValueError("LLM failure policy must be a boolean")
         self.spec = spec
         self.strategies: list[tuple[StrategySpec, list[AlphaModel]]] = []
         for strategy in spec.strategies:
@@ -504,5 +507,7 @@ class Fund:
                         **params,
                         "breakpoints_dispatch": breakpoints_dispatch,
                     }
+                if fail_on_llm_error and is_llm:
+                    params = {**params, "fail_on_llm_error": True}
                 staff.append(cls(**params))
             self.strategies.append((strategy, staff))

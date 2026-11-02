@@ -125,6 +125,21 @@ def test_migration_refuses_any_runner_pid_and_releases_exclusive_lease(tmp_path)
     assert not (root / HANDOVER_PATH).exists()
 
 
+def test_inventory_does_not_ignore_directory_walk_errors(tmp_path, monkeypatch):
+    root = tmp_path / "synthetic"
+    (root / "paper" / "alpha").mkdir(parents=True)
+
+    def failed_walk(_path, *, followlinks, onerror):
+        assert followlinks is False
+        onerror(PermissionError("synthetic walk failure"))
+        yield from ()
+
+    monkeypatch.setattr(handover.os, "walk", failed_walk)
+    with RootContext.open(root) as context:
+        with pytest.raises(HandoverError, match="paper inventory is unavailable"):
+            build_head_inventory(context)
+
+
 def test_migration_exclusive_lock_conflicts_with_shared_participant(tmp_path):
     root = tmp_path / "fresh"
     root.mkdir()

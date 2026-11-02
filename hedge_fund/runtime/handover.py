@@ -7,18 +7,23 @@ import json
 import os
 import re
 import stat
+import threading
+from contextlib import contextmanager, ExitStack
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, TypedDict
+from typing import Any, Callable, Iterator, TypedDict, TypeVar
 
 from hedge_fund.pipeline.session import code_version
 from hedge_fund.runtime.admission import (
     AdmissionCoordinator,
     AdmissionError,
     LOCK_DIRECTORY,
+    MAX_LOCK_WAIT_SECONDS,
     OWNER_LOCK_PATH,
     PROTOCOL_VERSION,
+    require_paper_write_lanes,
     RootMigrationLease,
+    RootOwnerLease,
     WriterConflict,
 )
 from hedge_fund.runtime.root import (
@@ -52,6 +57,92 @@ class EnrollmentInvalid(HandoverError):
 
 class LedgerDrift(HandoverError):
     """Current ledger state differs from its enrolled head."""
+
+
+class LedgerInventoryCorrupt(LedgerDrift):
+    """Paper replay cannot establish the ledger inventory."""
+
+
+class LedgerHeadPublicationError(HandoverError):
+    """A committed paper mutation could not publish its enrolled head."""
+
+
+class InventoryObservationUnavailable(HandoverError):
+    """A coordinated inventory observation could not obtain admission."""
+
+
+_OBSERVATION_CONTEXT = threading.local()
+_T = TypeVar("_T")
+
+
+class _PaperObservationWindow:
+    def __init__(self, root: RootContext) -> None:
+        self._root_identity = root._root_identity
+        self._owner_thread = threading.get_ident()
+        self._condition = threading.Condition()
+        self._accepting = True
+        self._active = True
+        self._borrowers: dict[int, int] = {}
+
+    @contextmanager
+    def borrow(self) -> Iterator[None]:
+        thread = threading.get_ident()
+        with self._condition:
+            if not self._active or not self._accepting:
+                raise InventoryObservationUnavailable("paper inventory observation window has closed")
+            self._borrowers[thread] = self._borrowers.get(thread, 0) + 1
+        try:
+            yield
+        finally:
+            with self._condition:
+                remaining = self._borrowers[thread] - 1
+                if remaining:
+                    self._borrowers[thread] = remaining
+                else:
+                    del self._borrowers[thread]
+                self._condition.notify_all()
+
+    def permits(self, root: RootContext) -> bool:
+        with self._condition:
+            return (
+                self._active
+                and root._root_identity == self._root_identity
+                and threading.get_ident() in self._borrowers
+            )
+
+    def close_observations(self) -> None:
+        if threading.get_ident() != self._owner_thread:
+            raise InventoryObservationUnavailable("paper inventory observation owner changed")
+        with self._condition:
+            self._accepting = False
+            while self._borrowers:
+                self._condition.wait()
+            self._active = False
+
+
+def _current_paper_observation() -> _PaperObservationWindow | None:
+    return getattr(_OBSERVATION_CONTEXT, "window", None)
+
+
+def _paper_observation_authorized(root: RootContext) -> bool:
+    window = _current_paper_observation()
+    return window is not None and window.permits(root)
+
+
+def _run_with_paper_observation(
+    window: _PaperObservationWindow | None,
+    callback: Callable[..., _T],
+    *args: Any,
+) -> _T:
+    if window is None:
+        return callback(*args)
+    with window.borrow():
+        previous = _current_paper_observation()
+        _OBSERVATION_CONTEXT.window = window
+        try:
+            return callback(*args)
+        finally:
+            _OBSERVATION_CONTEXT.window = previous
 
 
 class StaleReservationRecoveryRecord(TypedDict):
@@ -105,9 +196,9 @@ def enrollment_status(root: RootContext, *, verify_inventory: bool = False) -> d
     except Exception:
         return {"state": "invalid", "reason": "handover-unavailable"}
     try:
-        record = require_enrollment(root)
+        require_enrollment(root)
         if verify_inventory:
-            verify_root_inventory(root, record=record)
+            verify_root_inventory(root)
     except LedgerDrift:
         return {"state": "drift", "reason": "ledger-drift"}
     except LedgerError:
@@ -255,33 +346,47 @@ def migrate_existing(
 
 def build_head_inventory(root: RootContext) -> dict[str, dict[str, Any]]:
     """Replay every deployed paper ledger and return canonical head identities."""
+    try:
+        return _build_head_inventory(root)
+    except OSError as exc:
+        raise HandoverError(f"paper inventory is unavailable ({type(exc).__name__})") from None
+
+
+def _build_head_inventory(root: RootContext) -> dict[str, dict[str, Any]]:
     if not isinstance(root, RootContext):
         raise TypeError("an explicit RootContext is required")
     root.revalidate()
     paper = root.path / "paper"
-    if _is_reparse_point(paper):
-        raise HandoverError("paper inventory contains a reparse point")
-    if not paper.exists():
+    try:
+        paper_info = paper.lstat()
+    except FileNotFoundError:
         root.revalidate()
         return {}
-    if not paper.is_dir():
+    if _is_reparse_point(paper):
+        raise HandoverError("paper inventory contains a reparse point")
+    if not stat.S_ISDIR(paper_info.st_mode):
         raise HandoverError("paper inventory is not a directory")
     from hedge_fund.paper.deployed import DeployedFund, FUND_FILE, load_deployed
-    from hedge_fund.paper.ledger import Ledger
+    from hedge_fund.paper.ledger import Ledger, LedgerError
 
     inventory: dict[str, dict[str, Any]] = {}
     for directory in sorted(paper.iterdir(), key=lambda item: item.name.casefold()):
+        directory_info = directory.lstat()
         if _is_reparse_point(directory):
             raise HandoverError("paper inventory contains a reparse point")
-        if not directory.is_dir():
+        if not stat.S_ISDIR(directory_info.st_mode):
             raise HandoverError("paper inventory contains an unknown entry")
         if _has_legacy_runner_pid(directory):
             raise HandoverError("runner.pid is present; unknown owners block handover")
         fund_file = directory / FUND_FILE
-        if not fund_file.is_file():
+        try:
+            fund_info = fund_file.stat()
+        except FileNotFoundError:
             if any(directory.iterdir()):
                 raise HandoverError("paper inventory contains an incomplete deployment")
             continue
+        if not stat.S_ISREG(fund_info.st_mode):
+            raise HandoverError("paper inventory contains an incomplete deployment")
         try:
             deployed: DeployedFund = load_deployed(directory)
             key = ensure_unique_resource_name(deployed.name, [])
@@ -304,6 +409,8 @@ def build_head_inventory(root: RootContext) -> dict[str, dict[str, Any]]:
             }
         except HandoverError:
             raise
+        except LedgerError:
+            raise LedgerInventoryCorrupt("paper ledger inventory is invalid") from None
         except (OSError, ValueError, RootPathError) as exc:
             raise HandoverError(f"paper inventory is invalid ({type(exc).__name__})") from None
         if key in inventory:
@@ -318,23 +425,258 @@ def verify_root_inventory(
     *,
     record: dict[str, Any] | None = None,
 ) -> None:
-    expected = (record or require_enrollment(root))["heads"]
-    actual = build_head_inventory(root)
+    current, actual = _inventory_snapshot(root, record=record)
+    expected = current["heads"]
     if actual != expected:
         raise LedgerDrift("paper ledger inventory differs from offline handover")
 
 
 def verify_ledger_head(root: RootContext, name: str) -> dict[str, Any] | None:
-    record = require_enrollment(root)
     key = _resource_key(name)
-    expected = record["heads"].get(key)
     try:
-        actual = build_head_inventory(root).get(key)
+        record, inventory = _inventory_snapshot(root)
+    except InventoryObservationUnavailable:
+        raise
     except HandoverError as exc:
         raise LedgerDrift("paper ledger inventory cannot be verified") from exc
+    expected = record["heads"].get(key)
+    actual = inventory.get(key)
     if actual != expected:
         raise LedgerDrift("paper ledger head differs from offline handover")
     return actual
+
+
+def _inventory_snapshot(
+    root: RootContext,
+    *,
+    record: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+    from hedge_fund.paper.ledger import LedgerError
+
+    coordinator = AdmissionCoordinator(root)
+
+    def read() -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+        return (record or require_enrollment(root)), build_head_inventory(root)
+
+    def registry_exists() -> bool:
+        try:
+            root.file_info(f"{LOCK_DIRECTORY}/registry.lock")
+        except FileNotFoundError:
+            return False
+        return True
+
+    if coordinator.lane_is_held("registry"):
+        return read()
+    if _paper_observation_authorized(root):
+        return read()
+    if not registry_exists():
+        try:
+            snapshot = read()
+        except (HandoverError, LedgerError, OSError, RootPathError, ValueError):
+            if not registry_exists():
+                raise
+        else:
+            if not registry_exists():
+                return snapshot
+    with ExitStack() as stack:
+        try:
+            stack.enter_context(coordinator.registry_read_lock(timeout=MAX_LOCK_WAIT_SECONDS))
+        except WriterConflict as exc:
+            raise InventoryObservationUnavailable("paper inventory observation is unavailable") from exc
+        except AdmissionError as exc:
+            raise HandoverError("paper inventory admission failed") from exc
+        return read()
+
+
+def _verify_paper_transition_inventory(
+    root: RootContext,
+    admission: AdmissionCoordinator,
+    name: str | None,
+    *,
+    transition: PaperInventoryTransition | None = None,
+) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+    record, actual = _inventory_snapshot(root)
+    expected = record["heads"]
+    mismatches = {key for key in expected.keys() | actual.keys() if expected.get(key) != actual.get(key)}
+    if transition is not None:
+        if name is None:
+            raise HandoverError("paper transition identity is required")
+        key = _resource_key(name)
+        if expected.get(key) != transition.previous_entry or actual.get(key) != transition.expected_entry:
+            raise LedgerDrift("paper mutation differs from its expected head")
+        mismatches.discard(key)
+    if not mismatches:
+        return record, actual
+    if name is not None and _resource_key(name) in mismatches:
+        raise LedgerDrift("paper ledger inventory differs from offline handover")
+
+    from hedge_fund.runtime.lifecycle import ArchiveError, LifecycleArchiveStore
+
+    verified: set[str] = set()
+    try:
+        store = LifecycleArchiveStore(root, admission)
+        for item in store.list_archives():
+            if item["kind"] != "deployment" or item["state"] not in {"archive-prepared", "restore-prepared"}:
+                continue
+            key = _resource_key(item["identity"])
+            if key not in mismatches:
+                continue
+            if key in verified:
+                raise LedgerDrift("multiple lifecycle journals claim one ledger head")
+            entry = item["ledger_entry"]
+            before = item["inventory_before"]
+            if not isinstance(entry, dict) or not isinstance(before, dict) or not _valid_inventory_entry(key, entry):
+                raise LedgerDrift("prepared lifecycle inventory is invalid")
+            reviewed = store.inspect(item["archive_id"])
+            if item["state"] == "archive-prepared":
+                valid = reviewed["recovery_action"] == "finalize-archive" and before.get(key) == entry and expected.get(key) == entry and actual.get(key) is None
+            else:
+                valid = reviewed["recovery_action"] == "finalize-restore" and before.get(key) is None and expected.get(key) is None and actual.get(key) == entry
+            if not valid:
+                raise LedgerDrift("prepared lifecycle inventory does not match its journal")
+            verified.add(key)
+    except (ArchiveError, OSError, RootPathError, ValueError) as exc:
+        raise LedgerDrift("prepared lifecycle inventory cannot be verified") from exc
+    if verified != mismatches:
+        raise LedgerDrift("paper ledger inventory differs from offline handover")
+    return record, actual
+
+
+def verify_cache_write_inventory(root: RootContext, admission: AdmissionCoordinator) -> None:
+    """Allow cache writes only across exactly inspected lifecycle transitions."""
+    if admission.root is not root or not admission.lane_is_held("registry"):
+        raise HandoverError("root registry admission is required")
+    _verify_paper_transition_inventory(root, admission, None)
+
+
+class PaperInventoryTransition:
+    """Exact enrolled head before and after one admitted paper mutation."""
+
+    def __init__(self, key: str, previous_entry: dict[str, Any] | None) -> None:
+        self._key = key
+        self._previous_entry = dict(previous_entry) if previous_entry is not None else None
+        self._expected_entry: dict[str, Any] | None = None
+
+    @property
+    def previous_entry(self) -> dict[str, Any] | None:
+        return dict(self._previous_entry) if self._previous_entry is not None else None
+
+    def expect_entry(self, entry: dict[str, Any]) -> None:
+        if self._expected_entry is not None or not _valid_inventory_entry(self._key, entry):
+            raise HandoverError("expected paper inventory transition is invalid")
+        self._expected_entry = dict(entry)
+
+    @property
+    def expected_entry(self) -> dict[str, Any]:
+        if self._expected_entry is None:
+            raise HandoverError("expected paper inventory transition is missing")
+        return dict(self._expected_entry)
+
+
+@contextmanager
+def paper_effect_registry(
+    path: str | os.PathLike[str],
+    name: str,
+) -> Iterator[_PaperObservationWindow | None]:
+    """Reserve publication before a local paper order changes its book."""
+    admitted = require_paper_write_lanes(
+        path,
+        name,
+        lane_sets=(("runner", "execution"),),
+    )
+    if not admitted:
+        yield None
+        return
+    directory = Path(os.path.abspath(os.fspath(path)))
+    with RootContext.open(directory.parent.parent) as root:
+        with RootOwnerLease.acquire(root) as owner:
+            admission = AdmissionCoordinator(root, owner_lease=owner)
+            with admission.registry_lock(timeout=MAX_LOCK_WAIT_SECONDS):
+                _verify_paper_transition_inventory(root, admission, name)
+                window = _PaperObservationWindow(root)
+                previous = _current_paper_observation()
+                _OBSERVATION_CONTEXT.window = window
+                try:
+                    yield window
+                finally:
+                    window.close_observations()
+                    _OBSERVATION_CONTEXT.window = previous
+
+
+@contextmanager
+def paper_inventory_transition(
+    path: str | os.PathLike[str],
+    name: str,
+    *,
+    lane_sets: tuple[tuple[str, ...], ...],
+    paper_root: bool = False,
+) -> Iterator[PaperInventoryTransition | None]:
+    from hedge_fund.paper.ledger import LedgerError
+
+    admitted = require_paper_write_lanes(
+        path,
+        name,
+        lane_sets=lane_sets,
+        paper_root=paper_root,
+    )
+    if not admitted:
+        yield None
+        return
+    candidate = Path(os.path.abspath(os.fspath(path)))
+    root_path = candidate.parent if paper_root else candidate.parent.parent
+    with RootContext.open(root_path) as root:
+        with RootOwnerLease.acquire(root) as owner:
+            admission = AdmissionCoordinator(root, owner_lease=owner)
+            with admission.registry_lock(timeout=MAX_LOCK_WAIT_SECONDS):
+                record, actual_before = _verify_paper_transition_inventory(root, admission, name)
+                key = _resource_key(name)
+                transition = PaperInventoryTransition(key, record["heads"].get(key))
+                yield transition
+                try:
+                    _publish_expected_ledger_head(
+                        root,
+                        name,
+                        transition=transition,
+                        actual_before=actual_before,
+                        admission=admission,
+                    )
+                    _verify_paper_transition_inventory(root, admission, name)
+                except (HandoverError, LedgerError, OSError, RootPathError, ValueError) as exc:
+                    raise LedgerHeadPublicationError(
+                        "paper head publication failed; offline reconciliation is required"
+                    ) from exc
+
+
+def _publish_expected_ledger_head(
+    root: RootContext,
+    name: str,
+    *,
+    transition: PaperInventoryTransition,
+    actual_before: dict[str, dict[str, Any]],
+    admission: AdmissionCoordinator,
+) -> None:
+    if admission.root is not root or not admission.lane_is_held("registry"):
+        raise HandoverError("root registry admission is required")
+    key = _resource_key(name)
+    record, actual = _verify_paper_transition_inventory(root, admission, name, transition=transition)
+    if record["heads"].get(key) != transition.previous_entry:
+        raise LedgerDrift("paper ledger head changed before publication")
+    expected = transition.expected_entry
+    if actual.get(key) != expected:
+        raise LedgerDrift("paper mutation differs from its expected head")
+    other_keys = (actual_before.keys() | actual.keys()) - {key}
+    if any(actual_before.get(other) != actual.get(other) for other in other_keys):
+        raise LedgerDrift("another paper ledger changed during publication")
+    heads = dict(record["heads"])
+    heads[key] = expected
+    updated = _new_record(
+        root,
+        mode=record["mode"],
+        heads=dict(sorted(heads.items())),
+        attestation=record["attestation"],
+        created_at=record["created_at"],
+    )
+    _write_record(root, updated)
 
 
 def record_ledger_head(
@@ -727,7 +1069,10 @@ def _fresh_bootstrap_only(root: RootContext) -> bool:
 
 
 def _has_legacy_runner_pid(root: Path) -> bool:
-    for directory, subdirs, files in os.walk(root, followlinks=False):
+    def fail_walk(exc: OSError) -> None:
+        raise exc
+
+    for directory, subdirs, files in os.walk(root, followlinks=False, onerror=fail_walk):
         current = Path(directory)
         for name in list(subdirs):
             if _is_reparse_point(current / name):

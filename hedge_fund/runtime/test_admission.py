@@ -1,3 +1,5 @@
+import os
+import signal
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -16,6 +18,294 @@ from hedge_fund.runtime.admission import (
 )
 from hedge_fund.runtime.handover import enroll_fresh
 from hedge_fund.runtime.root import PRIVATE_ROOT, RootContext
+
+
+def test_standalone_control_rejects_an_inherited_process_identity(tmp_path, monkeypatch):
+    from hedge_fund.runtime import admission
+
+    directory = tmp_path / "standalone"
+    directory.mkdir()
+    original_getpid = os.getpid
+    with admission.paper_control_transition(directory, directory.name):
+        with monkeypatch.context() as child:
+            child.setattr(admission.os, "getpid", lambda: original_getpid() + 1)
+            with pytest.raises(AdmissionError, match="fresh interpreter after fork"):
+                with admission.paper_control_transition(directory, directory.name):
+                    pass
+    with admission.paper_control_transition(directory, directory.name):
+        pass
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="POSIX fork is unavailable")
+def test_forked_standalone_child_cannot_reenter_parent_control(tmp_path):
+    from hedge_fund.runtime import admission
+
+    directory = tmp_path / "standalone"
+    directory.mkdir()
+    with admission.paper_control_transition(directory, directory.name):
+        pid = os.fork()
+        if pid == 0:
+            try:
+                with admission.paper_control_transition(directory, directory.name):
+                    os._exit(1)
+            except AdmissionError:
+                os._exit(0)
+            except BaseException:
+                os._exit(2)
+        _, status = os.waitpid(pid, 0)
+    assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+
+
+def test_enrolled_admission_rejects_an_inherited_process_identity(admission_root, monkeypatch):
+    from hedge_fund.runtime import admission
+
+    _root, context, owner, coordinator = admission_root
+    original_getpid = os.getpid
+    with coordinator.manual_session("alpha", timeout=0):
+        with monkeypatch.context() as child:
+            child.setattr(admission.os, "getpid", lambda: original_getpid() + 1)
+            with pytest.raises(AdmissionError, match="fresh interpreter after fork"):
+                coordinator.lane_is_held("runner", "alpha")
+            with pytest.raises(AdmissionError, match="fresh interpreter after fork"):
+                owner.matches(context)
+            with pytest.raises(AdmissionError, match="fresh interpreter after fork"):
+                with owner:
+                    pass
+        assert owner.matches(context)
+
+
+def test_inherited_owner_cleanup_closes_only_the_child_handle(admission_root, monkeypatch):
+    from hedge_fund.runtime import admission
+
+    _root, context, _owner, _coordinator = admission_root
+
+    class ChildHandle:
+        closed = 0
+
+        def close(self):
+            self.closed += 1
+
+    class InheritedGuard:
+        def __enter__(self):
+            pytest.fail("child attempted to acquire the inherited owner mutex")
+
+    handle = ChildHandle()
+    owner = RootOwnerLease(context, handle, object())
+    owner._guard = InheritedGuard()
+    original_getpid = os.getpid
+    with monkeypatch.context() as child:
+        child.setattr(admission.os, "getpid", lambda: original_getpid() + 1)
+        child.setattr(admission, "_release_os_lock", lambda *_args: pytest.fail("child unlocked parent"))
+        owner.close()
+        owner.close()
+    assert handle.closed == 1
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="POSIX fork is unavailable")
+def test_forked_owner_close_preserves_parent_lock_and_releases_child_copy(
+    tmp_path, admission_root, owned_test_process
+):
+    root_path, _context, owner, _coordinator = admission_root
+    ready = tmp_path / "child-owner-closed"
+    release = tmp_path / "release-owner-child"
+    pid = os.fork()
+    if pid == 0:
+        try:
+            owner.close()
+            ready.write_text("closed", encoding="utf-8")
+            deadline = time.monotonic() + 30
+            while not release.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            os._exit(0 if release.exists() else 3)
+        except BaseException:
+            os._exit(2)
+    try:
+        deadline = time.monotonic() + 10
+        while not ready.exists() and time.monotonic() < deadline:
+            waited, _status = os.waitpid(pid, os.WNOHANG)
+            if waited:
+                pid = None
+                pytest.fail("child could not close its inherited owner handle")
+            time.sleep(0.01)
+        assert ready.exists(), "child blocked while closing its inherited owner handle"
+
+        script = f"""
+from pathlib import Path
+from hedge_fund.runtime.admission import RootMigrationLease, WriterConflict
+from hedge_fund.runtime.root import RootContext
+with RootContext.open(Path({str(root_path)!r})) as root:
+    try:
+        with RootMigrationLease.acquire(root, timeout=0):
+            acquired = True
+    except WriterConflict:
+        acquired = False
+assert acquired is EXPECTED
+"""
+        contender = owned_test_process(script.replace("EXPECTED", "False"))
+        assert contender.wait(timeout=30) == 0
+        owner.close()
+        contender = owned_test_process(script.replace("EXPECTED", "True"))
+        assert contender.wait(timeout=30) == 0
+    finally:
+        release.write_text("release", encoding="utf-8")
+        if pid is not None:
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                waited, _status = os.waitpid(pid, os.WNOHANG)
+                if waited:
+                    pid = None
+                    break
+                time.sleep(0.01)
+            if pid is not None:
+                os.kill(pid, signal.SIGKILL)
+                os.waitpid(pid, 0)
+
+
+@pytest.mark.parametrize("operation", ["construct", "registry_read"])
+def test_inherited_coordinator_rejects_before_root_mutex(admission_root, monkeypatch, operation):
+    from hedge_fund.runtime import admission
+
+    _root, context, owner, coordinator = admission_root
+    original_getpid = os.getpid
+    with monkeypatch.context() as child:
+        child.setattr(admission.os, "getpid", lambda: original_getpid() + 1)
+        child.setattr(context, "revalidate", lambda: pytest.fail("inherited root mutex was reached"))
+        with pytest.raises(OwnershipUnknown, match="fresh interpreter after fork"):
+            if operation == "construct":
+                AdmissionCoordinator(context, owner_lease=owner)
+            else:
+                with coordinator.registry_read_lock(timeout=0):
+                    pass
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="POSIX fork is unavailable")
+def test_forked_child_cannot_reuse_enrolled_parent_lanes(admission_root):
+    _root, _context, _owner, coordinator = admission_root
+    with coordinator.manual_session("alpha", timeout=0):
+        pid = os.fork()
+        if pid == 0:
+            try:
+                coordinator.lane_is_held("runner", "alpha")
+                os._exit(1)
+            except AdmissionError:
+                os._exit(0)
+            except BaseException:
+                os._exit(2)
+        _, status = os.waitpid(pid, 0)
+    assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+
+
+@pytest.mark.parametrize("lane", ["standalone", "registry", "registry_read", "manual"])
+@pytest.mark.parametrize("exceptional", [False, True])
+def test_inherited_context_cleanup_does_not_unlock_parent(
+    tmp_path, admission_root, monkeypatch, lane, exceptional
+):
+    from hedge_fund.runtime import admission
+
+    _root, _context, _owner, coordinator = admission_root
+    directory = tmp_path / "standalone"
+    directory.mkdir()
+    if lane == "registry_read":
+        with coordinator.registry_lock(timeout=0):
+            pass
+    managers = {
+        "standalone": lambda: admission.paper_control_transition(directory, directory.name),
+        "registry": lambda: coordinator.registry_lock(timeout=0),
+        "registry_read": lambda: coordinator.registry_read_lock(timeout=0),
+        "manual": lambda: coordinator.manual_session("alpha", timeout=0),
+    }
+    initial_keys = set(admission._LOCAL_LANES)
+    manager = managers[lane]()
+    manager.__enter__()
+    created_keys = set(admission._LOCAL_LANES) - initial_keys
+    releases = []
+    original_getpid = os.getpid
+    try:
+        with monkeypatch.context() as child:
+            child.setattr(admission.os, "getpid", lambda: original_getpid() + 1)
+            child.setattr(admission, "_release_os_lock", lambda *_args: releases.append("unlock"))
+            if exceptional:
+                error = RuntimeError("child failure")
+                assert manager.__exit__(RuntimeError, error, None) is False
+            else:
+                assert manager.__exit__(None, None, None) is False
+    finally:
+        with admission._LOCAL_LANES_GUARD:
+            for key in created_keys:
+                admission._LOCAL_LANES.pop(key, None)
+        held = admission._held_locks()
+        for key in created_keys:
+            held.pop(key, None)
+    assert releases == []
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="POSIX fork is unavailable")
+@pytest.mark.parametrize("lane", ["standalone", "registry", "registry_read", "manual"])
+def test_forked_child_unwind_keeps_parent_lock(
+    tmp_path, admission_root, owned_test_process, lane
+):
+    from hedge_fund.runtime import admission
+
+    root_path, _context, _owner, coordinator = admission_root
+    directory = tmp_path / "standalone"
+    directory.mkdir()
+    if lane == "registry_read":
+        with coordinator.registry_lock(timeout=0):
+            pass
+    managers = {
+        "standalone": lambda: admission.paper_control_transition(directory, directory.name),
+        "registry": lambda: coordinator.registry_lock(timeout=0),
+        "registry_read": lambda: coordinator.registry_read_lock(timeout=0),
+        "manual": lambda: coordinator.manual_session("alpha", timeout=0),
+    }
+    manager = managers[lane]()
+    manager.__enter__()
+    pid = None
+    try:
+        pid = os.fork()
+        if pid == 0:
+            try:
+                manager.__exit__(None, None, None)
+            except BaseException:
+                os._exit(2)
+            os._exit(0)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            waited, status = os.waitpid(pid, os.WNOHANG)
+            if waited:
+                pid = None
+                assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+                break
+            time.sleep(0.01)
+        else:
+            pytest.fail("child blocked while unwinding inherited admission")
+        script = f"""
+from pathlib import Path
+from hedge_fund.runtime.admission import AdmissionCoordinator, RootOwnerLease, WriterConflict, paper_control_transition
+from hedge_fund.runtime.root import RootContext
+
+kind = {lane!r}
+try:
+    if kind == "standalone":
+        with paper_control_transition(Path({str(directory)!r}), "standalone"):
+            raise AssertionError("parent's control lane was released")
+    else:
+        with RootContext.open(Path({str(root_path)!r})) as root:
+            with RootOwnerLease.acquire(root) as owner:
+                coordinator = AdmissionCoordinator(root, owner_lease=owner)
+                target = coordinator.manual_session("alpha", timeout=0) if kind == "manual" else coordinator.registry_lock(timeout=0)
+                with target:
+                    raise AssertionError("parent's admission lane was released")
+except WriterConflict:
+    pass
+"""
+        contender = owned_test_process(script)
+        assert contender.wait(timeout=15) == 0
+    finally:
+        if pid:
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+        manager.__exit__(None, None, None)
 
 
 @pytest.fixture

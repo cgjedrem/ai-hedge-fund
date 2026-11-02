@@ -2,7 +2,6 @@
 
 import os
 import subprocess
-import sys
 import uuid
 from pathlib import Path
 
@@ -13,6 +12,7 @@ from hedge_fund.test_support.network_guard import (
     cleanup_test_root,
     configure_test_environment,
     CREDENTIAL_ENV_VARS,
+    guarded_test_python_command,
     prepare_test_output_root,
     PROXY_ENV_VARS,
 )
@@ -49,7 +49,7 @@ def owned_test_process():
 
     def spawn(script: str) -> subprocess.Popen:
         process = subprocess.Popen(
-            [sys.executable, "-c", script],
+            guarded_test_python_command("-c", script),
             cwd=_TEST_ROOT / "home",
             env=child_test_environment(),
             stdin=subprocess.DEVNULL,

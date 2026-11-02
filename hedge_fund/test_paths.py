@@ -31,6 +31,27 @@ def test_write_atomic_replaces_atomically(tmp_path: Path) -> None:
     assert path.read_text(encoding="utf-8") == "new"
 
 
+def test_durable_standalone_write_syncs_before_replace(tmp_path: Path, monkeypatch) -> None:
+    path = tmp_path / "state.json"
+    events = []
+    sync = paths.os.fsync
+    replace = paths.os.replace
+
+    def record_sync(descriptor):
+        events.append("sync")
+        return sync(descriptor)
+
+    def record_replace(source, target):
+        events.append("replace")
+        return replace(source, target)
+
+    monkeypatch.setattr(paths.os, "fsync", record_sync)
+    monkeypatch.setattr(paths.os, "replace", record_replace)
+    write_atomic(path, "durable", durable=True)
+    assert events == ["sync", "replace"]
+    assert path.read_text(encoding="utf-8") == "durable"
+
+
 def test_write_atomic_uses_a_unique_temp_path_per_write(tmp_path: Path, monkeypatch) -> None:
     path = tmp_path / "state.json"
     temporary_names = []
@@ -102,6 +123,38 @@ def test_paper_root_writer_accepts_enrolled_deployment_lane(tmp_path: Path) -> N
                     target = tmp_path / "paper" / "alpha" / "state.json"
                     paths.write_bytes(target, b"admitted")
             assert target.read_bytes() == b"admitted"
+        finally:
+            owner.close()
+
+
+def test_halt_only_lane_cannot_write_resume_or_approval_state(tmp_path: Path) -> None:
+    from hedge_fund.paper.ledger import Ledger, LedgerError
+
+    with RootContext.open(tmp_path) as root:
+        enroll_fresh(root)
+        owner = RootOwnerLease.acquire(root, timeout=0)
+        admission = AdmissionCoordinator(root, owner_lease=owner)
+        try:
+            with paths.bound_root(root):
+                control = tmp_path / "paper" / "alpha" / "control.json"
+                approval = control.with_name("pending-approval.json")
+                with admission.deployment_lock("alpha"):
+                    paths.write_bytes(control, b'{"halted": false}')
+                with admission.halt_lane("alpha"):
+                    for data in (
+                        b'{"halted":false,"reason":"resume","since":"now"}',
+                        b'{"halted":true,"reason":null,"since":"now"}',
+                        b'{"halted":true}',
+                        b"not-json",
+                    ):
+                        with pytest.raises(RootConfigurationError):
+                            paths.write_bytes(control, data)
+                    with pytest.raises(RootConfigurationError):
+                        paths.write_bytes(approval, b'{"verdict":"approve"}')
+                    with pytest.raises(LedgerError):
+                        Ledger(control.parent)._write_control(False, "resume")
+                    paths.write_bytes(control, b'{"halted":true,"reason":"halt","since":"now"}')
+            assert control.read_bytes() == b'{"halted":true,"reason":"halt","since":"now"}'
         finally:
             owner.close()
 

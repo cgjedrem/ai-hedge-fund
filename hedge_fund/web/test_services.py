@@ -337,9 +337,10 @@ def test_paper_snapshot_uses_records_captured_by_the_verified_replay(demo_root, 
     on_disk = original_read(ledger, original.session)
     assert swapped
     assert on_disk.hash == replacement.hash
-    assert snapshot["ledger"]["ok"] is True
+    assert snapshot["ledger"]["ok"] is False
+    assert snapshot["ledger"]["error"] == "Paper work is in progress or requires reconciliation."
     assert snapshot["nav"] == original.nav
-    assert snapshot["cash"] == original.cash
+    assert snapshot["cash"] is None
     assert snapshot["last_record_hash"] == original.hash
     assert snapshot["sessions"][-1]["nav"] == original.nav
     assert snapshot["pending"]["source_record_hash"] == original.hash

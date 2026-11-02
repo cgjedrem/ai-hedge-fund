@@ -24,6 +24,11 @@ _SHA256 = re.compile(r"[a-fA-F0-9]{64}")
 _MAX_MANDATE_SNAPSHOT_BYTES = 1024 * 1024
 
 
+def is_capture_ticker(value: object) -> bool:
+    """Return whether a ticker is valid in a frozen operation capture."""
+    return isinstance(value, str) and _TICKER.fullmatch(value) is not None
+
+
 @dataclass(frozen=True, slots=True)
 class CredentialHandle:
     """Root/provider/version reference; contains no credential material."""
@@ -84,7 +89,7 @@ class FrozenCapture:
             raise ConfigurationError("mandate digest is invalid")
         if not isinstance(self.universe, tuple):
             raise ConfigurationError("capture universe is invalid")
-        if not self.universe or any(not isinstance(ticker, str) or not _TICKER.fullmatch(ticker) for ticker in self.universe) or len(set(self.universe)) != len(self.universe):
+        if not self.universe or any(not is_capture_ticker(ticker) for ticker in self.universe) or len(set(self.universe)) != len(self.universe):
             raise ConfigurationError("capture universe is invalid")
         if not isinstance(self.broker, str) or self.broker != "paper":
             raise ConfigurationError("only local-paper captures are supported")
@@ -353,7 +358,7 @@ def freeze_capture(
     if isinstance(universe, (str, bytes)) or not isinstance(universe, Sequence) or not universe:
         raise ConfigurationError("capture universe is invalid")
     universe_values = tuple(universe)
-    if any(not isinstance(ticker, str) or not _TICKER.fullmatch(ticker) for ticker in universe_values):
+    if any(not is_capture_ticker(ticker) for ticker in universe_values):
         raise ConfigurationError("capture universe is invalid")
     if len(set(universe_values)) != len(universe_values):
         raise ConfigurationError("capture universe is invalid")

@@ -35,7 +35,7 @@ from math import isclose
 from pathlib import Path
 from typing import Callable, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_serializer, SerializerFunctionWrapHandler
 
 from hedge_fund.brokers.models import Fill, format_shares, Order, Shares
 from hedge_fund.brokers.protocol import Broker
@@ -105,11 +105,21 @@ class SessionRecord(BaseModel):
     # When the marks are live prints (a minute fund), the moment of each
     # ticker's print — so a name that last traded an hour ago is visible.
     snapshot_times: dict[str, str] | None = None
+    redo_nonce: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler: SerializerFunctionWrapHandler) -> dict:
+        value = handler(self)
+        if self.redo_nonce is None:
+            value.pop("redo_nonce", None)
+        return value
 
     def compute_hash(self) -> str:
         # A record without print times hashes exactly as it did before the
         # field existed: every ledger written until then must still verify.
         exclude = {"hash"} | ({"snapshot_times"} if self.snapshot_times is None else set())
+        if self.redo_nonce is None:
+            exclude.add("redo_nonce")
         payload = self.model_dump_json(exclude=exclude)
         return hashlib.sha256(payload.encode()).hexdigest()
 
@@ -138,6 +148,8 @@ def advance(
     clock: Clock | None = None,
     *,
     on_fill: Callable[[Order, Fill], None] | None = None,
+    before_effect: Callable[[], None] | None = None,
+    before_order: Callable[[], None] | None = None,
 ) -> SessionRecord:
     """Advance *fund* through one completed *session*: a date (YYYY-MM-DD)
     for a daily/weekly/monthly fund, a bar (YYYY-MM-DDTHH:MM:SS, New York)
@@ -154,6 +166,8 @@ def advance(
     clock = clock or clock_for(spec, data_client)
     if state.halted is not None:
         raise FundHalted(f"{spec.name} is halted: {state.halted}")
+    if before_effect is not None:
+        before_effect()
     if state.last_session is not None and session <= state.last_session:
         raise ValueError(f"{spec.name}: session {session} is not after the last recorded " f"session {state.last_session}")
     if not clock.is_complete(session):
@@ -163,7 +177,17 @@ def advance(
 
     executed: CycleRecord | None = None
     if state.pending is not None:
-        executed = execute_decision(fund, state.pending, session, broker, data_client, clock, on_fill=on_fill)
+        executed = execute_decision(
+            fund,
+            state.pending,
+            session,
+            broker,
+            data_client,
+            clock,
+            on_fill=on_fill,
+            before_effect=before_effect,
+            before_order=before_order,
+        )
 
     held = broker.positions()
     marked = clock.marks([*held, spec.benchmark], session)
@@ -173,7 +197,11 @@ def advance(
     nav = cash + sum(shares * marks[t] for t, shares in positions.items())
 
     rebalance = is_rebalance_session(session, state.last_session, spec.rebalance)
-    decision = assess_fund(fund, session, data_client, universe, clock) if rebalance else None
+    decision = None
+    if rebalance:
+        if before_effect is not None:
+            before_effect()
+        decision = assess_fund(fund, session, data_client, universe, clock)
 
     record = SessionRecord(
         fund=spec.name,

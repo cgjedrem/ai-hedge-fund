@@ -56,6 +56,7 @@ import argparse
 import hashlib
 import json
 import os
+import stat
 import sys
 from contextlib import contextmanager
 from datetime import date as _date
@@ -140,10 +141,11 @@ def main(argv: list[str] | None = None) -> None:
             _load_runtime()
             from hedge_fund.runtime.policy import AuthorizationDenied
 
-            try:
-                ensure_mandates_dir()
-            except RootPathError as exc:
-                parser.error(str(exc))
+            if not (args.command == "paper" and args.action == "halt"):
+                try:
+                    ensure_mandates_dir()
+                except RootPathError as exc:
+                    parser.error(str(exc))
 
             if args.command is None:
                 if args.enable_network:
@@ -601,7 +603,7 @@ def _handover(args, parser: argparse.ArgumentParser, root: RootContext) -> None:
 
 
 @contextmanager
-def _paper_writer_admission() -> Iterator[tuple[RootContext, object] | None]:
+def _paper_writer_admission(*, verify_inventory: bool = True) -> Iterator[tuple[RootContext, object] | None]:
     from hedge_fund.runtime.admission import (
         AdmissionCoordinator,
         AdmissionError,
@@ -614,7 +616,7 @@ def _paper_writer_admission() -> Iterator[tuple[RootContext, object] | None]:
     )
 
     root = paths.root_context()
-    status = enrollment_status(root, verify_inventory=True)
+    status = enrollment_status(root, verify_inventory=verify_inventory)
     if status["state"] == "unenrolled":
         raise PaperWriterDenied("Paper writes are blocked until explicit offline enrollment.")
     if status["state"] != "enrolled":
@@ -624,7 +626,8 @@ def _paper_writer_admission() -> Iterator[tuple[RootContext, object] | None]:
     try:
         owner = RootOwnerLease.acquire(root, timeout=0)
         admission = AdmissionCoordinator(root, owner_lease=owner)
-        verify_root_inventory(root)
+        if verify_inventory:
+            verify_root_inventory(root)
     except (AdmissionError, HandoverError, OSError, RootPathError, ValueError) as exc:
         if owner is not None:
             owner.close()
@@ -640,18 +643,21 @@ def _paper_lane(participant, name: str, lane: str) -> Iterator[None]:
     if participant is None:
         yield
         return
-    if lane not in {"deployment_lock", "manual_session", "control_lane"}:
+    if lane not in {"deployment_lock", "manual_session", "control_lane", "halt_lane"}:
         raise ValueError("paper admission lane is invalid")
+    from hedge_fund.runtime.admission import AdmissionError
+    from hedge_fund.runtime.handover import HandoverError, LedgerHeadPublicationError
+
     _root, admission = participant
     try:
         with getattr(admission, lane)(name, timeout=0):
             yield
-    except Exception as exc:
-        from hedge_fund.runtime.admission import AdmissionError
-
-        if isinstance(exc, AdmissionError):
-            raise PaperWriterDenied(f"Paper {lane.replace('_', ' ')} is busy or unavailable.") from exc
-        raise
+    except LedgerHeadPublicationError as exc:
+        raise PaperWriterDenied("Paper mutation was recorded; root head inventory requires offline review.") from exc
+    except HandoverError as exc:
+        raise PaperWriterDenied("Paper writes are blocked by root enrollment or ledger drift.") from exc
+    except AdmissionError as exc:
+        raise PaperWriterDenied(f"Paper {lane.replace('_', ' ')} is busy or unavailable.") from exc
 
 
 def _verify_enrolled_inventory(participant) -> None:
@@ -676,18 +682,6 @@ def _verify_enrolled_head(participant, name: str) -> None:
         verify_ledger_head(root, name)
     except HandoverError as exc:
         raise PaperWriterDenied("Paper writes are blocked by ledger head drift.") from exc
-
-
-def _record_enrolled_head(participant, name: str) -> None:
-    if participant is None:
-        return
-    from hedge_fund.runtime.handover import HandoverError, record_ledger_head
-
-    root, admission = participant
-    try:
-        record_ledger_head(root, name, admission=admission)
-    except HandoverError as exc:
-        raise PaperWriterDenied("Paper ledger head could not be recorded safely.") from exc
 
 
 def _cli_settings(root: RootContext, args, parser: argparse.ArgumentParser):
@@ -728,6 +722,7 @@ def _authorize_cli_operation(
 ):
     from hedge_fund.llm.client import validate_llm_transport
     from hedge_fund.pipeline.session import code_version, mandate_hash
+    from hedge_fund.pipeline.session import SessionRecord as CapturedSessionRecord
     from hedge_fund.runtime.capture import freeze_capture
     from hedge_fund.runtime.configuration import ConfigurationError, resolve_settings
     from hedge_fund.runtime.costs import (
@@ -739,7 +734,11 @@ def _authorize_cli_operation(
     )
     from hedge_fund.runtime.credentials import CredentialStore, CredentialStoreError
     from hedge_fund.runtime.dispatch import make_one_shot_dispatch
-    from hedge_fund.runtime.handover import HandoverError, verify_ledger_head
+    from hedge_fund.runtime.handover import (
+        HandoverError,
+        verify_ledger_head,
+        verify_root_inventory,
+    )
     from hedge_fund.runtime.policy import (
         AuthorizationDenied,
         classify_provider,
@@ -764,6 +763,22 @@ def _authorize_cli_operation(
         parser.error("operation inputs are invalid")
     if len(operation_inputs_json.encode("utf-8")) > 4096:
         parser.error("operation inputs exceed their bound")
+    redo_source = None
+    if operation == "paper-redo":
+        if directory is None:
+            parser.error("paper redo source is unavailable")
+        try:
+            redo_source = Ledger(directory).latest()
+        except (LedgerError, OSError, ValueError):
+            parser.error("paper redo source is unavailable")
+        if (
+            redo_source is None
+            or redo_source.hash != expected_head
+            or redo_source.hash != redo_source.compute_hash()
+            or operation_inputs.get("redo_source_session") != redo_source.session
+            or operation_inputs.get("redo_previous_head") != redo_source.prev_hash
+        ):
+            parser.error("paper redo head changed before authorization")
     if type(model_call_bound) is not int or not 1 <= model_call_bound <= 1000 or type(llm_call_bound) is not int or not 0 <= llm_call_bound <= model_call_bound:
         parser.error("model-call estimate is invalid")
     deadline_minutes = getattr(args, "deadline_minutes", 60)
@@ -780,13 +795,17 @@ def _authorize_cli_operation(
         model=settings.model,
         endpoint=settings.endpoint,
     )
+    targets = [data_target, breakpoints_target]
     try:
-        validate_llm_transport(llm_target)
         data_class = classify_provider(data_target)
-        llm_class = classify_provider(
-            llm_target,
-            approved_local_models={settings.model},
-        )
+        llm_class = None
+        if llm_call_bound:
+            validate_llm_transport(llm_target)
+            llm_class = classify_provider(
+                llm_target,
+                approved_local_models={settings.model},
+            )
+            targets.append(llm_target)
         if classify_provider(breakpoints_target) is not ProviderClass.FREE_DATA:
             parser.error("breakpoints provider is not approved free data")
     except AuthorizationDenied:
@@ -816,7 +835,7 @@ def _authorize_cli_operation(
     paid_total_text = getattr(args, "paid_max_cost_usd", None)
     paid_attempt_text = getattr(args, "paid_max_attempt_cost_usd", None)
     paid_budget = None
-    if operation in {"backtest", "paper-tick", "paper-redo"} and paid_targets:
+    if operation in {"backtest", "paper-tick", "paper-redo", "stock-check"} and paid_targets:
         paid_provider = paid_targets[0][0].provider
         if not isinstance(authorized_provider, str) or authorized_provider.casefold() != paid_provider:
             parser.error(f"paid dispatch requires --authorize-paid-provider {paid_provider}")
@@ -848,15 +867,15 @@ def _authorize_cli_operation(
         transport_model_call_bound += llm_call_bound
         transport_llm_call_bound *= 2
     data_calls = min(10000, max(100, model_call_bound * 10))
-    llm_calls = max(1, transport_llm_call_bound)
     provider_call_bounds = {
         data_target.identity: data_calls,
-        llm_target.identity: llm_calls,
         breakpoints_target.identity: 1,
     }
+    if llm_call_bound:
+        provider_call_bounds[llm_target.identity] = transport_llm_call_bound
     if paid_targets:
         paid_target = paid_targets[0][0]
-        call_limit = data_calls if paid_target.kind == "data" else llm_calls
+        call_limit = provider_call_bounds[paid_target.identity]
         if paid_budget[0] > call_limit:
             parser.error("paid call bound exceeds the operation estimate")
         provider_call_bounds[paid_target.identity] = paid_budget[0]
@@ -913,13 +932,7 @@ def _authorize_cli_operation(
         "paid_cost_model": paid_cost_model,
         "capture_digest": capture.digest,
         "expected_head": expected_head,
-        "provider_ids": sorted(
-            (
-                data_target.identity,
-                llm_target.identity,
-                breakpoints_target.identity,
-            )
-        ),
+        "provider_ids": sorted(target.identity for target in targets),
         "transport_call_bounds": {identity: calls for identity, calls in sorted(provider_call_bounds.items())},
         "universe": universe,
         "deadline": expires_at.isoformat(),
@@ -938,6 +951,9 @@ def _authorize_cli_operation(
             separators=(",", ":"),
         ).encode("utf-8")
     ).hexdigest()
+
+    active_head = expected_head
+    redo_advanced = False
 
     def boundary_check() -> None:
         try:
@@ -960,6 +976,11 @@ def _authorize_cli_operation(
                     raise AuthorizationDenied("captured provider credential is unavailable") from None
                 if current_version != version or not configured:
                     raise AuthorizationDenied("captured provider credential changed")
+        if operation == "stock-check":
+            try:
+                verify_root_inventory(root)
+            except HandoverError:
+                raise AuthorizationDenied("paper ledger inventory is unavailable") from None
         if spec_path is not None:
             try:
                 current_spec = _override_rebalance(
@@ -985,14 +1006,45 @@ def _authorize_cli_operation(
             except (LedgerError, OSError, ValueError):
                 raise AuthorizationDenied("paper ledger is unavailable") from None
             current_head = current_state.prev_hash
-            if current_head != expected_head or current_state.halted is not None or mandate_hash(current_deployed.spec) != capture.mandate_digest or tuple(current_deployed.universe) != capture.universe:
+            if current_head != active_head or current_state.halted is not None or mandate_hash(current_deployed.spec) != capture.mandate_digest or tuple(current_deployed.universe) != capture.universe:
                 raise AuthorizationDenied("paper operation fence changed")
+
+    def advance_redo_fence(superseded: CapturedSessionRecord) -> None:
+        nonlocal active_head, redo_advanced
+        if (
+            operation != "paper-redo"
+            or directory is None
+            or redo_source is None
+            or redo_advanced
+            or not isinstance(superseded, CapturedSessionRecord)
+            or superseded.hash != redo_source.hash
+            or superseded.hash != superseded.compute_hash()
+            or superseded.session != redo_source.session
+            or superseded.prev_hash != redo_source.prev_hash
+        ):
+            raise AuthorizationDenied("paper redo transition does not match its capture")
+        try:
+            if participant is not None:
+                verify_ledger_head(root, directory.name)
+            current_deployed = load_deployed(directory)
+            current_state = Ledger(directory).replay(current_deployed.spec.capital, full=True)
+        except (HandoverError, LedgerError, OSError, ValueError):
+            raise AuthorizationDenied("paper redo transition is unavailable") from None
+        if (
+            current_state.prev_hash != redo_source.prev_hash
+            or current_state.halted is not None
+            or mandate_hash(current_deployed.spec) != capture.mandate_digest
+            or tuple(current_deployed.universe) != capture.universe
+        ):
+            raise AuthorizationDenied("paper redo transition does not match its capture")
+        active_head = redo_source.prev_hash
+        redo_advanced = True
 
     total_paid_cost = paid_budget[1] if paid_budget is not None else Decimal("0")
     attempt_cost = paid_budget[2] if paid_budget is not None else Decimal("0")
     bounds = {}
     costs = {}
-    for target in (data_target, llm_target, breakpoints_target):
+    for target in targets:
         calls = provider_call_bounds[target.identity]
         cost_cap = total_paid_cost if paid_targets and target.identity == paid_targets[0][0].identity else Decimal("0")
         bounds[target.identity] = (calls, cost_cap, calls)
@@ -1008,7 +1060,7 @@ def _authorize_cli_operation(
             operation_id=operation_id,
             operation_digest=operation_digest,
             expires_at=expires_at,
-            targets=(data_target, llm_target, breakpoints_target),
+            targets=tuple(targets),
             max_calls=max_calls,
             max_cost=total_paid_cost,
             max_resources=sum(item[2] for item in bounds.values()),
@@ -1033,10 +1085,11 @@ def _authorize_cli_operation(
         "paid_cost_model": (cost_model_description(paid_targets[0][0]) if paid_targets else None),
         "paid_budget": paid_budget,
         "fd_self_service_pricing_confirmed": fd_pricing_confirmation,
+        "advance_redo_fence": advance_redo_fence if operation == "paper-redo" else None,
     }
 
 
-def _cli_fund(spec, settings, dispatch, api_key):
+def _cli_llm_factory(settings, dispatch, api_key):
     from hedge_fund.llm import make_llm
 
     def llm_factory(_model_spec):
@@ -1053,10 +1106,14 @@ def _cli_fund(spec, settings, dispatch, api_key):
             dispatch=dispatch,
         )
 
+    return llm_factory
+
+
+def _cli_fund(spec, settings, dispatch, api_key):
     return Fund(
         spec,
         blind=True,
-        llm_factory=llm_factory,
+        llm_factory=_cli_llm_factory(settings, dispatch, api_key),
         breakpoints_dispatch=dispatch,
     )
 
@@ -1076,13 +1133,29 @@ def _run_cli_tick(
     authorization=None,
 ):
     def execute():
+        from hedge_fund.paper.ledger import PaperReconciliationRequired
+        from hedge_fund.runtime.admission import paper_control_transition
+
         _verify_enrolled_head(participant, name)
-        state = Ledger(directory).replay(
+        ledger = Ledger(directory)
+        state = ledger.replay(
             deployed.spec.capital,
             full=True,
         )
         if state.halted is not None:
             raise FundHalted(f"{name} is halted: {state.halted}")
+        try:
+            with paper_control_transition(directory, name):
+                halted = ledger.halted()
+                if halted is not None:
+                    raise FundHalted(f"{name} is halted: {halted}")
+                ledger.require_ready_for_work(state, approval_required=deployed.spec.approval_required)
+        except PaperReconciliationRequired:
+            ledger.halt("approval journal requires reconciliation")
+            raise
+        redo_source = ledger.latest() if again else None
+        if again and redo_source is None:
+            raise NothingDue(f"{name}: no session recorded yet, nothing to run again")
         provider_authority = authorization
         if provider_authority is None:
             settings, admission = _cli_settings(root, args, parser)
@@ -1104,7 +1177,18 @@ def _run_cli_tick(
                 spec=deployed.spec,
                 universe=list(deployed.universe),
                 operation="paper-redo" if again else "paper-tick",
-                operation_inputs={"session": session, "redo": again},
+                operation_inputs={
+                    "session": session,
+                    "redo": again,
+                    **(
+                        {
+                            "redo_source_session": redo_source.session,
+                            "redo_previous_head": redo_source.prev_hash,
+                        }
+                        if redo_source is not None
+                        else {}
+                    ),
+                },
                 expected_head=state.prev_hash,
                 model_call_bound=model_calls,
                 llm_call_bound=llm_calls,
@@ -1132,23 +1216,24 @@ def _run_cli_tick(
                 f"[cyan]{deployed.name}: {verb} over {', '.join(deployed.universe)}…",
                 spinner="dots",
             ):
-                return (
-                    redo(directory, data, build_fund=build_fund)
-                    if again
-                    else tick(
-                        directory,
-                        data,
-                        session=session,
-                        build_fund=build_fund,
-                    )
+                if again:
+                    from hedge_fund.runtime.policy import AuthorizationDenied
+
+                    on_rewind = provider_authority.get("advance_redo_fence")
+                    if not callable(on_rewind):
+                        raise AuthorizationDenied("paper redo transition was not captured")
+                    return redo(directory, data, build_fund=build_fund, on_rewind=on_rewind)
+                return tick(
+                    directory,
+                    data,
+                    session=session,
+                    build_fund=build_fund,
                 )
 
     if participant is None:
         return execute()
     with _paper_lane(participant, name, "manual_session"):
-        record = execute()
-    _record_enrolled_head(participant, name)
-    return record
+        return execute()
 
 
 # ---------------------------------------------------------------------------
@@ -1285,7 +1370,6 @@ def _paper(
                     with _paper_lane(participant, args.name, "deployment_lock"):
                         _verify_enrolled_inventory(participant)
                         directory = deploy(args.name, spec, universe, root=PAPER_DIR)
-                    _record_enrolled_head(participant, args.name)
         except FileExistsError as exc:
             parser.error(str(exc))
         cadence = f"{spec.cadence_label}, {spec.window.label}" if spec.is_intraday else spec.cadence_label
@@ -1327,14 +1411,13 @@ def _paper(
         return
 
     if args.action == "status":
-        print(_status_line(directory))
-        ledger = Ledger(directory)
-        latest = ledger.latest()
-        if latest is not None and latest.decision is not None:
-            deployed = load_deployed(directory)
+        line, deployed, latest, approval, approval_error = _status_view(directory)
+        print(line)
+        if deployed is not None and latest is not None and latest.decision is not None:
             when = "bar" if deployed.spec.is_intraday else "close"
-            if deployed.spec.approval_required:
-                approval, _ = ledger.resolve_approval(latest.decision.as_of, latest.hash)
+            if approval_error is not None:
+                print(f"  pending decision, {approval_error}:")
+            elif deployed.spec.approval_required:
                 if approval is not None:
                     state = "approved for execution" if approval["verdict"] == "approve" else "rejected; execution will be skipped"
                     print(f"  pending decision, {state} at the next {when}:")
@@ -1368,48 +1451,58 @@ def _paper(
         ledger = Ledger(directory)
         with _paper_writer_admission() as participant:
             provider_authority = None
-            with _paper_lane(participant, args.name, "control_lane"):
-                _verify_enrolled_head(participant, args.name)
-                state = ledger.replay(deployed.spec.capital)
-                if state.halted is not None:
-                    raise FundHalted(f"{args.name} is halted: {state.halted}")
-                if not deployed.spec.approval_required:
-                    parser.error(f"approval gate is not enabled for '{args.name}'")
-                if state.pending is None:
-                    parser.error(f"nothing is awaiting approval for '{args.name}'")
-                if state.prev_hash is None:
-                    parser.error(f"pending decision for '{args.name}' has no source record hash")
-                if args.action == "approve" and args.now:
-                    settings, admission = _cli_settings(root, args, parser)
-                    from hedge_fund.fund import model_call_bounds
+            _verify_enrolled_head(participant, args.name)
+            state = ledger.replay(deployed.spec.capital)
+            if state.halted is not None:
+                raise FundHalted(f"{args.name} is halted: {state.halted}")
+            if not deployed.spec.approval_required:
+                parser.error(f"approval gate is not enabled for '{args.name}'")
+            if state.pending is None:
+                parser.error(f"nothing is awaiting approval for '{args.name}'")
+            if state.prev_hash is None:
+                parser.error(f"pending decision for '{args.name}' has no source record hash")
+            if args.action == "approve" and args.now:
+                settings, admission = _cli_settings(root, args, parser)
+                from hedge_fund.fund import model_call_bounds
 
-                    model_calls_per_tick, llm_calls_per_tick = model_call_bounds(
-                        deployed.spec,
-                    )
-                    model_calls = len(deployed.universe) * model_calls_per_tick * 2
-                    llm_calls = len(deployed.universe) * llm_calls_per_tick * 2
-                    if not 1 <= model_calls <= 1000:
-                        parser.error("paper model-call estimate exceeds the 1000-call bound")
-                    provider_authority = _authorize_cli_operation(
-                        root,
-                        args,
-                        parser,
-                        settings=settings,
-                        admission=admission,
-                        spec=deployed.spec,
-                        universe=list(deployed.universe),
-                        operation="paper-tick",
-                        operation_inputs={
-                            "pending_session": state.pending.as_of,
-                            "run_now": True,
-                        },
-                        expected_head=state.prev_hash,
-                        model_call_bound=model_calls,
-                        llm_call_bound=llm_calls,
-                        directory=directory,
-                        participant=participant,
-                    )
+                model_calls_per_tick, llm_calls_per_tick = model_call_bounds(deployed.spec)
+                model_calls = len(deployed.universe) * model_calls_per_tick * 2
+                llm_calls = len(deployed.universe) * llm_calls_per_tick * 2
+                if not 1 <= model_calls <= 1000:
+                    parser.error("paper model-call estimate exceeds the 1000-call bound")
+                provider_authority = _authorize_cli_operation(
+                    root,
+                    args,
+                    parser,
+                    settings=settings,
+                    admission=admission,
+                    spec=deployed.spec,
+                    universe=list(deployed.universe),
+                    operation="paper-tick",
+                    operation_inputs={
+                        "pending_session": state.pending.as_of,
+                        "run_now": True,
+                    },
+                    expected_head=state.prev_hash,
+                    model_call_bound=model_calls,
+                    llm_call_bound=llm_calls,
+                    directory=directory,
+                    participant=participant,
+                )
+            if participant is None:
                 ledger.set_approval(args.action, state.pending.as_of, state.prev_hash, "cli")
+            else:
+                from hedge_fund.runtime.admission import (
+                    AdmissionError,
+                    paper_approval_transition,
+                )
+                from hedge_fund.runtime.handover import HandoverError
+
+                try:
+                    with paper_approval_transition(participant[1], args.name) as proof:
+                        ledger.set_approval(args.action, state.pending.as_of, state.prev_hash, "cli", admission=proof)
+                except (AdmissionError, HandoverError) as exc:
+                    raise PaperWriterDenied("Paper verdict admission is unavailable.") from exc
             if args.action == "approve":
                 console.print(f"[green]{args.name}[/] approved decision from {state.pending.as_of}")
             else:
@@ -1437,21 +1530,40 @@ def _paper(
         return
 
     ledger = Ledger(directory)
-    with _paper_writer_admission() as participant:
-        with _paper_lane(participant, args.name, "control_lane"):
-            _verify_enrolled_head(participant, args.name)
-            if args.action == "halt":
+    if args.action == "halt":
+        def directory_identity():
+            try:
+                info = directory.stat(follow_symlinks=False)
+            except OSError:
+                parser.error(f"paper fund {args.name!r} is no longer available")
+            if not stat.S_ISDIR(info.st_mode):
+                parser.error(f"paper fund {args.name!r} is no longer available")
+            return info.st_dev, info.st_ino
+
+        expected_identity = directory_identity()
+    with _paper_writer_admission(verify_inventory=args.action != "halt") as participant:
+        if args.action == "halt":
+            with _paper_lane(participant, args.name, "halt_lane"):
+                if directory_identity() != expected_identity:
+                    parser.error(f"paper fund {args.name!r} changed before halt admission")
                 ledger.halt(args.reason)
                 console.print(f"[red]{args.name} halted:[/] {args.reason}")
-            elif args.action == "resume":
+        elif args.action == "resume":
+            with _paper_lane(participant, args.name, "control_lane"):
                 raise PaperWriterDenied("Resume requires a verified reconciliation receipt; automatic resume is disabled.")
 
 
 def _status_line(directory: Path) -> str:
+    return _status_view(directory)[0]
+
+
+def _status_view(directory: Path):
+    from hedge_fund.paper.ledger import PaperReconciliationRequired
+
     try:
         deployed = load_deployed(directory)
     except ValueError as exc:
-        return f"{directory.name:<18} unavailable: {exc}"
+        return f"{directory.name:<18} unavailable: {exc}", None, None, None, None
     ledger = Ledger(directory)
     latest = ledger.latest()
     halted = ledger.halted()
@@ -1463,13 +1575,28 @@ def _status_line(directory: Path) -> str:
     flag = f"  ·  HALTED: {halted}" if halted else ""
     running = "  ·  running" if is_running(directory) else ""
     approval_state = ""
-    if deployed.spec.approval_required and latest is not None and latest.decision is not None:
-        approval, _ = ledger.resolve_approval(latest.decision.as_of, latest.hash)
+    approval = None
+    approval_error = None
+    try:
+        replayed = ledger.replay(deployed.spec.capital)
+        if replayed.prev_hash != (latest.hash if latest is not None else None):
+            raise PaperReconciliationRequired("ledger head changed during observation")
+        approval = ledger.observe_approval_for_display(
+            replayed, approval_required=deployed.spec.approval_required
+        )
+    except PaperReconciliationRequired:
+        approval_error = "in progress or requires reconciliation"
+    except (LedgerError, OSError, ValueError):
+        approval_error = "approval history unavailable"
+    if approval_error is not None:
+        approval_state = f"  ·  {approval_error}"
+    elif deployed.spec.approval_required and latest is not None and latest.decision is not None:
         if approval is not None:
             approval_state = f"  ·  {approval['verdict']} recorded"
         else:
             approval_state = "  ·  awaiting approval"
-    return f"{deployed.name:<18} {deployed.spec.name}  ·  {' '.join(deployed.universe)}  ·  " f"broker {deployed.broker}  ·  {deployed.spec.cadence_label}{running}  ·  {state}{flag}{approval_state}"
+    line = f"{deployed.name:<18} {deployed.spec.name}  ·  {' '.join(deployed.universe)}  ·  " f"broker {deployed.broker}  ·  {deployed.spec.cadence_label}{running}  ·  {state}{flag}{approval_state}"
+    return line, deployed, latest, approval, approval_error
 
 
 def _tick_summary(name: str, record: SessionRecord) -> str:

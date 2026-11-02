@@ -351,11 +351,12 @@ def test_fund_passes_operation_dispatch_to_blind_llm_agents():
     assert fund.strategies[0][1][0]._breakpoints_dispatch is dispatch
 
 
-def test_breakpoint_dispatch_is_not_a_mandate_parameter():
+@pytest.mark.parametrize("parameter", ["breakpoints_dispatch", "fail_on_llm_error"])
+def test_runtime_only_agent_options_are_not_mandate_parameters(parameter):
     payload = deepcopy(MINIMAL)
     payload["strategies"][0]["models"][0] = {
         "name": "buffett",
-        "params": {"breakpoints_dispatch": "untrusted"},
+        "params": {parameter: "untrusted"},
     }
 
     with pytest.raises(ValueError, match="constructor parameters"):

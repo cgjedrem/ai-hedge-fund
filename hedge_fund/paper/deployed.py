@@ -9,6 +9,8 @@ to execute a decision made under a different spec.
 
 from __future__ import annotations
 
+import hashlib
+import io
 import re
 from datetime import date as _date
 from pathlib import Path
@@ -62,31 +64,49 @@ def deploy(
     validate_fund_name(name)
     universe = normalize_universe(universe)
     paper_root = Path(root)
-    from hedge_fund.runtime.admission import require_paper_write_lanes
+    from hedge_fund.runtime.handover import paper_inventory_transition
 
-    require_paper_write_lanes(
+    with paper_inventory_transition(
         paper_root,
         name,
         lane_sets=(("deployment",),),
         paper_root=True,
-        verify_inventory=True,
-    )
-    directory = paper_root / name
-    if directory.exists():
-        raise FileExistsError(f"paper fund {name!r} already exists at {directory}")
-    deployed = DeployedFund(
-        name=name,
-        spec=spec,
-        universe=universe,
-        broker=spec.broker,
-        created=_date.today().isoformat(),
-    )
-    directory.mkdir(parents=True)
-    (directory / FUND_FILE).write_text(yaml.safe_dump(deployed.model_dump(), sort_keys=False))
-    if spec.broker == "paper":
-        PaperBroker.create(directory / BROKER_FILE, spec.capital, spec.costs)
-    Ledger(directory).init()
-    return directory
+    ) as transition:
+        directory = paper_root / name
+        if directory.exists():
+            raise FileExistsError(f"paper fund {name!r} already exists at {directory}")
+        deployed = DeployedFund(
+            name=name,
+            spec=spec,
+            universe=universe,
+            broker=spec.broker,
+            created=_date.today().isoformat(),
+        )
+        fund_text = yaml.safe_dump(deployed.model_dump(), sort_keys=False)
+        # Match the native text encoding and newlines before binding the digest.
+        with io.BytesIO() as buffer:
+            with io.TextIOWrapper(buffer) as text:
+                text.write(fund_text)
+                text.flush()
+                fund_bytes = buffer.getvalue()
+        if transition is not None:
+            if transition.previous_entry is not None:
+                raise ValueError("paper deployment identity already has an enrolled head")
+            transition.expect_entry(
+                {
+                    "name": deployed.name,
+                    "deployment_digest": hashlib.sha256(fund_bytes).hexdigest(),
+                    "last_session": None,
+                    "head_hash": None,
+                    "session_count": 0,
+                }
+            )
+        directory.mkdir(parents=True)
+        (directory / FUND_FILE).write_bytes(fund_bytes)
+        if spec.broker == "paper":
+            PaperBroker.create(directory / BROKER_FILE, spec.capital, spec.costs)
+        Ledger(directory).init()
+        return directory
 
 
 def load_deployed(directory: str | Path) -> DeployedFund:

@@ -213,3 +213,66 @@ def test_recovery_keeps_legitimate_other_fund_inventory_changes(archive_store, m
     assert recovered["state"] == "archived"
     assert enrollment_status(root, verify_inventory=True)["state"] == "enrolled"
     assert (root.path / "paper" / "independent" / "fund.yaml").exists()
+
+
+def test_changed_prepared_archive_does_not_authorize_another_funds_append(
+    archive_store,
+    monkeypatch,
+):
+    from hedge_fund.paper.deployed import deploy, load_deployed
+    from hedge_fund.paper.ledger import Ledger
+    from hedge_fund.pipeline.session import code_version, mandate_hash, SessionRecord
+    from hedge_fund.runtime.handover import LedgerDrift
+
+    root, admission, store = archive_store
+    preview = store.preview("deployment", "demo-quality")
+    spec = load_deployed(root.path / "paper" / "demo-quality").spec.model_copy(update={"name": "independent"})
+    with admission.deployment_lock("independent"):
+        directory = deploy("independent", spec, ["AAPL"], root=root.path / "paper")
+    finalize = store._finalize_archive
+    monkeypatch.setattr(store, "_finalize_archive", lambda *args: (_ for _ in ()).throw(RuntimeError("synthetic crash")))
+    with pytest.raises(RuntimeError, match="crash"):
+        store.archive("deployment", "demo-quality", expected_digest=preview["digest"], archive_id="9" * 32)
+    monkeypatch.setattr(store, "_finalize_archive", finalize)
+    archived_fund = root.path / "runtime" / "private" / "v1" / "archives" / "v1" / "objects" / ("9" * 32) / "fund.yaml"
+    archived_fund.write_bytes(archived_fund.read_bytes() + b"\n")
+    record = SessionRecord(fund="independent", session="2024-06-03", universe=["AAPL"], nav=spec.capital, cash=spec.capital, positions={}, marks={}, benchmark="SPY", benchmark_close=100, rebalance=False, code_version=code_version(), mandate_hash=mandate_hash(spec))
+    record.hash = record.compute_hash()
+    ledger = Ledger(directory)
+
+    with admission.manual_session("independent"):
+        with pytest.raises(LedgerDrift, match="lifecycle"):
+            ledger.append(record)
+
+    assert ledger.sessions() == []
+
+
+def test_restore_recovery_keeps_another_funds_published_head(archive_store, monkeypatch):
+    from hedge_fund.paper.deployed import deploy, load_deployed
+    from hedge_fund.paper.ledger import Ledger
+    from hedge_fund.pipeline.session import code_version, mandate_hash, SessionRecord
+
+    root, admission, store = archive_store
+    preview = store.preview("deployment", "demo-quality")
+    spec = load_deployed(root.path / "paper" / "demo-quality").spec.model_copy(update={"name": "independent"})
+    archive_id = "a" * 32
+    operation_id = "b" * 32
+    store.archive("deployment", "demo-quality", expected_digest=preview["digest"], archive_id=archive_id)
+    with admission.deployment_lock("independent"):
+        directory = deploy("independent", spec, ["AAPL"], root=root.path / "paper")
+    finalize = store._finalize_restore
+    monkeypatch.setattr(store, "_finalize_restore", lambda *args: (_ for _ in ()).throw(RuntimeError("synthetic crash")))
+    with pytest.raises(RuntimeError, match="crash"):
+        store.restore(archive_id, expected_digest=preview["digest"], operation_id=operation_id)
+    monkeypatch.setattr(store, "_finalize_restore", finalize)
+
+    record = SessionRecord(fund="independent", session="2024-06-03", universe=["AAPL"], nav=spec.capital, cash=spec.capital, positions={}, marks={}, benchmark="SPY", benchmark_close=100, rebalance=False, code_version=code_version(), mandate_hash=mandate_hash(spec))
+    record.hash = record.compute_hash()
+    with admission.manual_session("independent"):
+        Ledger(directory).append(record)
+    recovered = store.recover(archive_id, expected_digest=preview["digest"])
+
+    assert recovered["state"] == "restored"
+    assert operation_id in recovered["reconciled_operations"]
+    assert enrollment_status(root, verify_inventory=True)["state"] == "enrolled"
+    assert Ledger(directory).latest().hash == record.hash

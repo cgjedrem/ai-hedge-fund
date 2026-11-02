@@ -343,6 +343,7 @@ class RootContext:
     _fd: int | None = field(default=None, repr=False)
     _handles: tuple[int, ...] = field(default=(), repr=False)
     _closed: bool = field(default=False, repr=False)
+    _owner_pid: int = field(default_factory=os.getpid, repr=False)
     _identity_lock: threading.RLock = field(
         default_factory=threading.RLock,
         repr=False,
@@ -408,6 +409,7 @@ class RootContext:
         return self.verify_private_storage()
 
     def prepare_private_storage(self) -> None:
+        self._require_owner_process()
         with self._identity_lock:
             self.mkdir(PRIVATE_ROOT, parents=True, mode=0o700)
             parts = _relative_parts(PRIVATE_ROOT)
@@ -419,6 +421,7 @@ class RootContext:
                 raise UnsupportedFilesystemError("private storage protection is unverified")
 
     def verify_private_storage(self) -> bool:
+        self._require_owner_process()
         with self._identity_lock:
             try:
                 self.revalidate()
@@ -439,18 +442,25 @@ class RootContext:
         self.close()
 
     def close(self) -> None:
-        with self._identity_lock:
-            if self._closed:
-                return
-            self._closed = True
-            if self._fd is not None:
-                os.close(self._fd)
-                self._fd = None
-            if self._handles:
-                _close_windows_handles(self._handles)
-                self._handles = ()
+        if os.getpid() != self._owner_pid:
+            self._close_handles()
+        else:
+            with self._identity_lock:
+                self._close_handles()
+
+    def _close_handles(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self._fd is not None:
+            os.close(self._fd)
+            self._fd = None
+        if self._handles:
+            _close_windows_handles(self._handles)
+            self._handles = ()
 
     def revalidate(self) -> None:
+        self._require_owner_process()
         with self._identity_lock:
             self._require_open()
             if os.name == "nt":
@@ -627,8 +637,13 @@ class RootContext:
         raise UnsupportedFilesystemError("platform lock handles are unsupported")
 
     def _require_open(self) -> None:
+        self._require_owner_process()
         if self._closed:
             raise RootPathError("root context is closed")
+
+    def _require_owner_process(self) -> None:
+        if os.getpid() != self._owner_pid:
+            raise RootPathError("Root context requires a fresh interpreter after fork.")
 
 
 def _open_posix_chain(parts: tuple[str, ...]) -> int:

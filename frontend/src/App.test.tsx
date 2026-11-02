@@ -447,6 +447,38 @@ describe("local desk screens", () => {
     expect(screen.getByRole("button", { name: "Resume" })).toBeDisabled();
   });
 
+  it.each([true, false])("does not describe unavailable paper state as awaiting a verdict (pending=%s)", async (hasPending) => {
+    const unavailableDetail = {
+      ...paperDetail,
+      pending: hasPending ? paperDetail.pending : null,
+      ledger: { ok: false, error: "Paper work is in progress or requires reconciliation." },
+    };
+    installApi({
+      caps: {
+        ...capabilities,
+        mode: "live",
+        writes: true,
+        read_only: false,
+        network: true,
+        enrollment_state: "enrolled",
+        mutation_token: "paper-only-token",
+      },
+      override: (path, method) =>
+        path === "/api/paper/demo-quality" && method === "GET" ? { payload: unavailableDetail } : null,
+    });
+    window.history.replaceState({}, "", "/paper/demo-quality");
+    render(<App />);
+
+    expect(await screen.findByText("Paper state unavailable.")).toBeInTheDocument();
+    expect(screen.getByText("Paper work is in progress or requires reconciliation.")).toBeInTheDocument();
+    expect(screen.getByText("Decision unavailable")).toBeInTheDocument();
+    expect(screen.queryByText("Awaiting verdict")).not.toBeInTheDocument();
+    if (hasPending) {
+      expect(screen.getByRole("button", { name: "Approve" })).toBeDisabled();
+      expect(screen.getByRole("button", { name: "Reject" })).toBeDisabled();
+    }
+  });
+
   it("keeps every web mutation disabled for a SIM deployment", async () => {
     const writeCaps: Capabilities = {
       ...capabilities,

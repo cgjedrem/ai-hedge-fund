@@ -6,10 +6,65 @@ import ipaddress
 import os
 import socket
 import stat
+import sys
+import sysconfig
 from pathlib import Path
 from typing import Any
 
 _GUARD = "__hedge_fund_test_network_guard__"
+_CHILD_GUARD_PREFLIGHT = """\
+try:
+    import importlib.util
+    import os
+    import socket
+    if os.environ.get("HEDGE_FUND_TEST_MODE") != "1":
+        raise RuntimeError("test mode is unavailable")
+    support = %r
+    repository = %r
+    if os.environ.get("PYTHONPATH") != os.pathsep.join((support, repository)):
+        raise RuntimeError("test child import path mismatch")
+    for module, filename in (("sitecustomize", "sitecustomize.py"),
+                             ("network_guard", "network_guard.py")):
+        spec = importlib.util.find_spec(module)
+        expected = os.path.normcase(os.path.abspath(os.path.join(support, filename)))
+        if spec is None or spec.origin is None or os.path.normcase(os.path.abspath(spec.origin)) != expected:
+            raise RuntimeError("test isolation module is unavailable")
+    import sitecustomize
+    from network_guard import configure_test_child
+    configure_test_child()
+    for owner, names in (
+        (socket.socket, ("connect", "connect_ex", "sendto")),
+        (socket, ("create_connection", "getaddrinfo", "gethostbyname",
+                  "gethostbyname_ex", "gethostbyaddr")),
+    ):
+        for name in names:
+            if not getattr(getattr(owner, name), "__hedge_fund_test_network_guard__", False):
+                raise RuntimeError("test network guard is unavailable")
+    if os.environ.get("PYTHON_DOTENV_DISABLED") != "1":
+        raise RuntimeError("test dotenv guard is unavailable")
+except BaseException:
+    sys.stderr.write("test isolation initialization failed\\n")
+    raise SystemExit(70)
+""" % (str(Path(__file__).resolve().parent), str(Path(__file__).resolve().parents[2]))
+_CHILD_COMMAND_BODY = """\
+arguments = sys.argv[1:]
+if not arguments:
+    raise SystemExit("test child command is missing")
+mode, *arguments = arguments
+if mode == "-c":
+    source, *arguments = arguments
+    sys.argv = ["-c", *arguments]
+    exec(compile(source, "<string>", "exec"), {"__name__": "__main__", "__package__": None})
+elif mode == "-m":
+    import runpy
+    module, *arguments = arguments
+    sys.argv = [module, *arguments]
+    runpy.run_module(module, run_name="__main__", alter_sys=True)
+else:
+    import runpy
+    sys.argv = [mode, *arguments]
+    runpy.run_path(mode, run_name="__main__")
+"""
 CREDENTIAL_ENV_VARS = (
     "ANTHROPIC_API_KEY",
     "OPENAI_API_KEY",
@@ -106,8 +161,8 @@ def configure_test_environment(test_root: Path) -> None:
 
     tempfile.tempdir = str(temporary)
     _clear_environment()
-    _disable_dotenv(root)
     install_network_guard()
+    _disable_dotenv(root)
 
 
 def configure_test_child() -> None:
@@ -166,8 +221,8 @@ def configure_test_child() -> None:
     if os.environ.get("PYTHONPATH", "") != _child_pythonpath():
         raise RuntimeError("test child import path mismatch")
     _clear_environment()
-    _disable_dotenv(root)
     install_network_guard()
+    _disable_dotenv(root)
 
 
 def child_test_environment(
@@ -209,6 +264,33 @@ def child_test_environment(
             raise ValueError("child environment override denied")
         env.update(extra)
     return env
+
+
+def guarded_test_python_command(*arguments: str) -> list[str]:
+    """Run a test-owned child only after explicitly checking its startup guard."""
+    if not arguments or any(not isinstance(argument, str) for argument in arguments):
+        raise ValueError("test child command is invalid")
+    paths = sysconfig.get_paths()
+    site_directories = []
+    for key in ("purelib", "platlib"):
+        directory = paths.get(key)
+        if not isinstance(directory, str) or not os.path.isabs(directory) or not os.path.isdir(directory):
+            raise RuntimeError("test child package paths are unavailable")
+        if os.path.normcase(os.path.abspath(directory)) not in {
+            os.path.normcase(os.path.abspath(value)) for value in site_directories
+        }:
+            site_directories.append(directory)
+    command = (
+        "import sys\n"
+        + _CHILD_GUARD_PREFLIGHT
+        + f"_site_count={len(site_directories)}\n"
+        + "import site\n"
+        + "for _path in sys.argv[1:1 + _site_count]:\n site.addsitedir(_path)\n"
+        + "del sys.argv[1:1 + _site_count]\n"
+        + _CHILD_GUARD_PREFLIGHT
+        + _CHILD_COMMAND_BODY
+    )
+    return [sys.executable, "-S", "-c", command, *site_directories, *arguments]
 
 
 def cleanup_test_root(test_root: Path, marker: Path) -> bool:
@@ -386,7 +468,11 @@ def _disable_dotenv(test_root: Path) -> None:
         return
 
     root = Path(test_root).resolve(strict=True)
-    original_values = dotenv.main.dotenv_values
+    original_values = getattr(
+        dotenv.main.dotenv_values,
+        "__hedge_fund_original_values__",
+        dotenv.main.dotenv_values,
+    )
 
     def disabled(*_args: Any, **_kwargs: Any) -> bool:
         return False
@@ -413,6 +499,7 @@ def _disable_dotenv(test_root: Path) -> None:
             raise AssertionError("test dotenv path denied") from None
         return original_values(candidate, *args, **kwargs)
 
+    setattr(isolated_values, "__hedge_fund_original_values__", original_values)
     dotenv.load_dotenv = disabled
     dotenv.find_dotenv = empty_path
     dotenv.dotenv_values = isolated_values

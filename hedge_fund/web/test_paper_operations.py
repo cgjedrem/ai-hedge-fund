@@ -196,6 +196,114 @@ def test_reviewed_manual_tick_executes_one_session_with_local_fakes(
     assert len(data_client.calls) > 0
 
 
+def test_interrupted_redo_denies_web_preview_before_provider_and_allows_halt(demo_root):
+    calls = []
+
+    def forbidden_factory():
+        calls.append("provider")
+        pytest.fail("interrupted redo reached a data provider")
+
+    service = DeskService(
+        demo_root,
+        allow_writes=True,
+        network_enabled=True,
+        data_client_factory=forbidden_factory,
+        fund_factory=_OfflineFund,
+    )
+    service._runtime_settings = _local_settings()
+    try:
+        name = "reconciliation-test"
+        spec = load_spec(demo_root / "mandates" / "demo-quality.yaml").model_copy(update={"name": name})
+        service.create_mandate(spec.model_dump(mode="python"))
+        service.deploy_mandate(name, DeployRequest(universe=["AAPL"]))
+        ledger = Ledger(demo_root / "paper" / name)
+        record = SessionRecord(
+            fund=name,
+            session="2024-06-07",
+            universe=["AAPL"],
+            nav=spec.capital,
+            cash=spec.capital,
+            positions={},
+            marks={},
+            benchmark=spec.benchmark,
+            benchmark_close=100.0,
+            rebalance=True,
+            code_version=code_version(),
+            mandate_hash=mandate_hash(spec),
+        )
+        record.hash = record.compute_hash()
+        with service._admission.manual_session(name, timeout=0):
+            ledger.append(record)
+            ledger.begin_redo(record)
+        with pytest.raises(ServiceError) as exc:
+            service.create_manual_tick_preview(
+                name,
+                PaperTickPreviewRequest(expected_head=record.hash),
+                operator_session="offline-test-session",
+            )
+        assert exc.value.code == "reconciliation-required"
+        assert calls == []
+        service.halt_fund(name, "emergency")
+        assert ledger.halted() == "emergency"
+    finally:
+        service.close()
+
+
+@pytest.mark.parametrize("journal_state", ["unfinished", "malformed"])
+def test_unfinished_consumption_denies_web_preview_before_provider_and_halts(demo_root, journal_state):
+    from hedge_fund.runtime.admission import paper_approval_transition
+
+    calls = []
+
+    def forbidden_factory():
+        calls.append("provider")
+        pytest.fail("unfinished consumption reached a data provider")
+
+    service = DeskService(
+        demo_root,
+        allow_writes=True,
+        network_enabled=True,
+        data_client_factory=forbidden_factory,
+        fund_factory=_OfflineFund,
+    )
+    service._runtime_settings = _local_settings()
+    try:
+        name = "demo-quality"
+        ledger = Ledger(demo_root / "paper" / name)
+        latest = ledger.latest()
+        assert latest.decision is not None
+        with paper_approval_transition(service._admission, name) as proof:
+            approval = ledger.set_approval("approve", latest.decision.as_of, latest.hash, "web", admission=proof)
+        with service._admission.control_lane(name):
+            if journal_state == "malformed":
+                with ledger.events_path.open("a", encoding="utf-8") as history:
+                    history.write("{invalid\n")
+            else:
+                ledger.log_event(
+                    "consume",
+                    decision_as_of=approval["decision_as_of"],
+                    decision_hash=approval["decision_hash"],
+                    approval_verdict=approval["verdict"],
+                    approval_by=approval["by"],
+                    approval_id=approval["approval_id"],
+                    session="2025-01-07",
+                    durable=True,
+                )
+        with pytest.raises(ServiceError) as exc:
+            service.create_manual_tick_preview(
+                name,
+                PaperTickPreviewRequest(expected_head=latest.hash),
+                operator_session="offline-test-session",
+            )
+        assert exc.value.code == "reconciliation-required"
+        assert calls == []
+        assert ledger.halted() == "approval journal requires reconciliation"
+        service.halt_fund(name, "emergency")
+        assert ledger.halted() == "emergency"
+    finally:
+        service.close()
+
+
 def test_injected_data_client_reserves_each_call_before_fake(demo_root):
     data_client = _OfflineDataClient()
     factory_calls = []

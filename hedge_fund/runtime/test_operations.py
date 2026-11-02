@@ -452,6 +452,187 @@ def test_cancel_before_worker_claim_can_finish_without_starting_a_worker(operati
         )
 
 
+@pytest.mark.parametrize("state", ["running", "cancelled", "fenced", "state-corrupt", "capture-corrupt", "write-denied"])
+def test_snapshot_workers_observe_the_operation_fence_during_paper_publication(
+        root_context, operation_store, frozen_capture, monkeypatch, state
+):
+        from hedge_fund import paths
+        from hedge_fund.data.models import PriceSnapshot
+        from hedge_fund.paper.deployed import deploy
+        from hedge_fund.pipeline.clock import LiveClock
+        from hedge_fund.runtime import operations
+        from hedge_fund.runtime.handover import paper_effect_registry
+        from hedge_fund.runtime.test_inventory_cache_race import _spec
+
+        admission = operation_store._admission
+        with paths.bound_root(root_context):
+            with admission.deployment_lock("alpha"):
+                directory = deploy("alpha", _spec("alpha"), ["AAPL"], root=root_context.path / "paper")
+            preview = _preview(operation_store, frozen_capture)
+            operation = _accept(operation_store, preview)
+            fence = operation_store.claim_worker(operation.operation_id, worker_id="synthetic", now=_NOW)
+            operation_store.mark_running(operation.operation_id, fence, now=_NOW)
+            if state == "cancelled":
+                operation_store.request_cancel(operation.operation_id, request_id="cancel-1", now=_NOW)
+            elif state == "fenced":
+                operation_store.recover_unfinished(now=_NOW + timedelta(seconds=1))
+            elif state == "state-corrupt":
+                root_context.write_bytes(f"{operations.OPERATIONS_ROOT}/state/{operation.operation_id}.json", b"{}")
+            elif state == "capture-corrupt":
+                root_context.write_bytes(f"{operations.CAPTURE_ROOT}/{preview.capture_id}.json", b"{}")
+            monkeypatch.setattr(operations, "_MAX_LOCK_WAIT_SECONDS", 0.1)
+            observed = []
+
+            class GuardedSnapshots:
+                def get_snapshot(self, ticker):
+                    if state == "write-denied":
+                        with pytest.raises(operations.OperationBusy):
+                            operation_store.request_cancel(operation.operation_id, request_id="borrower-cancel", now=_NOW)
+                    try:
+                        observed.append(operation_store.cancellation_requested(operation.operation_id, fence))
+                    except WorkerFenced:
+                        observed.append("fenced")
+                    except OperationError:
+                        observed.append("corrupt")
+                    return PriceSnapshot(ticker=ticker, price=100, time="2024-06-04T15:00:00Z")
+
+            clock = LiveClock(GuardedSnapshots(), 60, _spec("alpha").window)
+            with admission.manual_session("alpha"):
+                with paper_effect_registry(directory, "alpha"):
+                    quotes = clock.observe(["AAPL"], "2024-06-04T11:00:00")
+
+        assert "AAPL" in quotes
+        assert observed == [
+            {
+                "running": False,
+                "cancelled": True,
+                "fenced": "fenced",
+                "state-corrupt": "corrupt",
+                "capture-corrupt": "corrupt",
+                "write-denied": False,
+            }[state]
+        ]
+
+
+@pytest.mark.parametrize("cancelled", [False, True])
+def test_web_dispatch_fence_runs_in_snapshot_worker_during_publication(
+        root_context, operation_store, monkeypatch, cancelled
+):
+        from hedge_fund import paths
+        from hedge_fund.data.models import PriceSnapshot
+        from hedge_fund.paper.deployed import deploy
+        from hedge_fund.pipeline.clock import LiveClock
+        from hedge_fund.pipeline.session import code_version, mandate_hash
+        from hedge_fund.runtime import operations
+        from hedge_fund.runtime.handover import paper_effect_registry
+        from hedge_fund.runtime.test_inventory_cache_race import _spec
+        from hedge_fund.web.jobs import JobCancelled
+        from hedge_fund.web.services import DeskService
+
+        admission = operation_store._admission
+        spec = _spec("alpha")
+        with paths.bound_root(root_context):
+            with admission.deployment_lock("alpha"):
+                directory = deploy("alpha", spec, ["AAPL"], root=root_context.path / "paper")
+            service = DeskService(root_context.path, allow_writes=True, network_enabled=True, root_context=root_context)
+            try:
+                capture = freeze_capture(
+                    root=root_context,
+                    subject_id="alpha",
+                    mandate_digest=mandate_hash(spec),
+                    universe=("AAPL",),
+                    broker="paper",
+                    settings=service._runtime_settings,
+                    credential_versions={},
+                    code_version=code_version(),
+                    mandate_snapshot=spec.model_dump(mode="json"),
+                )
+                preview = operation_store.create_preview(
+                    action="paper-tick",
+                    subject_id="alpha",
+                    expected_head=None,
+                    due_set=("2024-06-04",),
+                    capture=capture,
+                    operator_session="operator-1",
+                    payload={"expected_head": None},
+                    now=_NOW,
+                    expires_at=_NOW + timedelta(minutes=1),
+                )
+                operation = _accept(operation_store, preview)
+                fence = operation_store.claim_worker(operation.operation_id, worker_id="synthetic", now=_NOW)
+                operation_store.mark_running(operation.operation_id, fence, now=_NOW)
+                if cancelled:
+                    operation_store.request_cancel(operation.operation_id, request_id="cancel-1", now=_NOW)
+                monkeypatch.setattr(operations, "_MAX_LOCK_WAIT_SECONDS", 0.1)
+
+                class GuardedSnapshots:
+                    def get_snapshot(self, ticker):
+                        service._check_dispatch_fence(
+                            operation,
+                            capture,
+                            lambda: operation_store.cancellation_requested(operation.operation_id, fence),
+                            paper=True,
+                        )
+                        return PriceSnapshot(ticker=ticker, price=100, time="2024-06-04T15:00:00Z")
+
+                clock = LiveClock(GuardedSnapshots(), 60, spec.window)
+                with admission.manual_session("alpha"):
+                    with paper_effect_registry(directory, "alpha"):
+                        if cancelled:
+                            with pytest.raises(JobCancelled):
+                                clock.observe(["AAPL"], "2024-06-04T11:00:00")
+                        else:
+                            assert "AAPL" in clock.observe(["AAPL"], "2024-06-04T11:00:00")
+            finally:
+                service.close()
+
+
+def test_snapshot_worker_cannot_borrow_operation_observation_from_another_root(root_context, operation_store, tmp_path, monkeypatch):
+    from hedge_fund import paths
+    from hedge_fund.paper.deployed import deploy
+    from hedge_fund.pipeline.clock import LiveClock
+    from hedge_fund.runtime import operations
+    from hedge_fund.runtime.handover import paper_effect_registry
+    from hedge_fund.runtime.test_inventory_cache_race import _spec
+
+    other_path = tmp_path / "other-root"
+    other_path.mkdir()
+    admission = operation_store._admission
+    with RootContext.open(other_path) as other_root:
+        enroll_fresh(other_root)
+        with RootOwnerLease.acquire(other_root) as other_owner:
+                other_admission = AdmissionCoordinator(other_root, owner_lease=other_owner)
+                other_store = OperationStore(other_root, admission=other_admission)
+                capture = freeze_capture(
+                    root=other_root,
+                    subject_id="alpha",
+                    mandate_digest="a" * 64,
+                    universe=("AAPL",),
+                    broker="paper",
+                    settings=resolve_settings(other_root),
+                    credential_versions={},
+                    code_version="synthetic-code-stamp",
+                )
+                operation = _accept(other_store, _preview(other_store, capture))
+                fence = other_store.claim_worker(operation.operation_id, worker_id="synthetic", now=_NOW)
+                other_store.mark_running(operation.operation_id, fence, now=_NOW)
+                monkeypatch.setattr(operations, "_MAX_LOCK_WAIT_SECONDS", 0.1)
+
+                class OtherRootSnapshot:
+                    def get_snapshot(self, _ticker):
+                        return other_store.cancellation_requested(operation.operation_id, fence)
+
+                with paths.bound_root(root_context):
+                    with admission.deployment_lock("alpha"):
+                        directory = deploy("alpha", _spec("alpha"), ["AAPL"], root=root_context.path / "paper")
+                    clock = LiveClock(OtherRootSnapshot(), 60, _spec("alpha").window)
+                    with admission.manual_session("alpha"):
+                        with paper_effect_registry(directory, "alpha"):
+                            with other_admission.registry_lock():
+                                with pytest.raises(operations.OperationBusy):
+                                    clock.observe(["AAPL"], "2024-06-04T11:00:00")
+
+
 def test_cancel_request_identity_cannot_alias_an_admission_or_other_operation(operation_store, frozen_capture):
     first = _accept(operation_store, _preview(operation_store, frozen_capture), request_id="request-first")
     second_preview = _preview(operation_store, frozen_capture)
