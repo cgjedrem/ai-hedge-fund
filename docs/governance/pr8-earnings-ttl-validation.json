@@ -1,0 +1,113 @@
+{
+  "scope": "Only the independently identified stock-check earnings-cache TTL omission; not a whole-migration verification.",
+  "published_pr": "https://github.com/cgjedrem/ai-hedge-fund/pull/8",
+  "published_branch": "cgjedrem-vigilant-robot",
+  "verified_remote_head": "e9c2baac69db76c131d35d6cf5209fedb614e758",
+  "remote_verification": "gh pr view 8 --repo cgjedrem/ai-hedge-fund and git ls-remote origin refs/heads/cgjedrem-vigilant-robot; verified before worktree creation and again before commit.",
+  "local_branch": "pr8-earnings-ttl-e9c2baa-20261102",
+  "worktree": "scratch-pr8-earnings-ttl",
+  "source_change": "check_stock.py:186: add live=True to the existing root-private CachedDataClient, preserving the authorized raw-client context manager.",
+  "test_change": "hedge_fund/test_check_stock.py::test_earnings_cache_refreshes_across_stock_checks_on_reused_root calls the published main entrypoint four times against one enrolled synthetic root. It verifies fresh reuse, refresh after SAME_DAY_TTL expires, reuse of refreshed content, one root-private disk entry, authorized client construction, and raw-client closure.",
+  "not_changed": [
+    "Enrollment snapshot handling, API implementation, locks, provider authorization and transport.",
+    "Preserved scratch-pr8-reviewed-fixes at e12471a5650b908f3b5ff4fe616629bf786bad38.",
+    "No merge or cherry-pick from ec7009d/e12471a lineage; no push, publication, or agents."
+  ],
+  "isolation": {
+    "interpreter": "..\\scratch-pr8-d5858e4-20261101\\.venv\\Scripts\\python.exe",
+    "launch": "-I -B outputs\\run_earnings_ttl_checks.py <mode> <label> <arguments>",
+    "environment": "Cleared inherited environment except SYSTEMROOT, WINDIR, PATH, PATHEXT, COMSPEC; synthetic USERNAME; test helper installs synthetic HOME, USERPROFILE, APPDATA and TEMP under this worktree's outputs.",
+    "guards": "Credentials/provider/proxy environment cleared, dotenv disabled, pytest plugin autoload disabled, all TCP including loopback denied. Explicit transport-denial probes confirm no connection to nonloopback or ports 8765/49292.",
+    "clients": "Fake provider clients only; synthetic resolver; no real providers, paid operations, LLMs, brokers or watchtowers.",
+    "cleanup": "Synthetic test roots and interrupted own harness roots removed; local evidence and runner retained under ignored outputs."
+  },
+  "source_sha256": {
+    "published_check_stock.py": "44c937b8a4f31452e566e23037e1075aed94a4503d8f9163610f1844e8899940",
+    "fixed_check_stock.py": "c2fd99837394191d894fefc1c5b160d9732996d2ce49fe0c5fb7baebc0c8da13",
+    "hedge_fund/test_check_stock.py": "00233517ffbdb47d491e6e92b12b8c208055a78bc0fbcb306d422c7886e0f7ad"
+  },
+  "runs": [
+    {
+      "label": "earnings-ttl-red",
+      "started_utc": "2026-11-02T19:07:32.528986+00:00",
+      "finished_utc": "2026-11-02T19:07:36.986730+00:00",
+      "arguments": "pytest -q -p no:cacheprovider hedge_fund\\test_check_stock.py::test_earnings_cache_refreshes_across_stock_checks_on_reused_root",
+      "source": "Unmodified published check_stock.py plus new regression test",
+      "exit_code": 1,
+      "outcome": "1 failed in 2.12s; deterministic stale cache: actual provider-call counts [1,0,0,0], expected [1,0,1,0]."
+    },
+    {
+      "label": "earnings-ttl-green",
+      "started_utc": "2026-11-02T19:07:46.273138+00:00",
+      "finished_utc": "2026-11-02T19:07:49.634582+00:00",
+      "arguments": "pytest -q -p no:cacheprovider hedge_fund\\test_check_stock.py::test_earnings_cache_refreshes_across_stock_checks_on_reused_root",
+      "source": "Published check_stock.py with only live=True added; identical regression test",
+      "exit_code": 0,
+      "outcome": "1 passed in 1.19s."
+    },
+    {
+      "label": "earnings-ttl-suites",
+      "started_utc": "2026-11-02T19:07:56.279013+00:00",
+      "finished_utc": "2026-11-02T19:08:46.903432+00:00",
+      "arguments": "pytest -q -p no:cacheprovider hedge_fund\\test_check_stock.py hedge_fund\\data\\test_cached.py",
+      "exit_code": 0,
+      "outcome": "51 passed in 44.86s."
+    },
+    {
+      "label": "earnings-ttl-isort",
+      "started_utc": "2026-11-02T19:07:56.293443+00:00",
+      "finished_utc": "2026-11-02T19:07:56.559878+00:00",
+      "arguments": "isort --check-only check_stock.py hedge_fund\\test_check_stock.py",
+      "exit_code": 0
+    },
+    {
+      "label": "earnings-ttl-flake8-serial",
+      "started_utc": "2026-11-02T19:10:10.988961+00:00",
+      "finished_utc": "2026-11-02T19:10:12.264786+00:00",
+      "arguments": "flake8 --isolated --jobs 1 --select E9,F63,F7,F82 check_stock.py hedge_fund\\test_check_stock.py",
+      "exit_code": 0,
+      "scope": "Critical syntax/error lint, not a full style-clean claim."
+    },
+    {
+      "label": "earnings-ttl-black-test",
+      "started_utc": "2026-11-02T19:10:24.774136+00:00",
+      "finished_utc": "2026-11-02T19:10:25.065360+00:00",
+      "arguments": "black --check hedge_fund\\test_check_stock.py",
+      "exit_code": 0
+    },
+    {
+      "label": "earnings-ttl-black-source",
+      "started_utc": "2026-11-02T19:10:24.841403+00:00",
+      "finished_utc": "2026-11-02T19:10:25.117531+00:00",
+      "arguments": "black --check check_stock.py",
+      "exit_code": 1,
+      "outcome": "Existing source formatting would be changed by Black. Left untouched to avoid unrelated formatting."
+    },
+    {
+      "label": "earnings-ttl-black-baseline",
+      "started_utc": "2026-11-02T19:10:40.088452+00:00",
+      "finished_utc": "2026-11-02T19:10:40.404461+00:00",
+      "arguments": "black --check outputs\\published_check_stock.py",
+      "exit_code": 1,
+      "outcome": "The check_stock.py source exported from published e9c2baa also requires Black formatting, confirming the pre-existing failure. Export was removed after comparison."
+    }
+  ],
+  "harness_retries": [
+    "Initial pytest setup errored because the allowlisted Windows environment lacked USERNAME; rerun with synthetic USERNAME produced the genuine RED above.",
+    "Initial parallel flake8 spawned Windows worker errors; its own process tree was stopped, and single-process --jobs 1 passed.",
+    "Initial multi-file Black hit the all-loopback-deny guard in asyncio socketpair; single-file checks avoided that requirement. Its first runner metadata erroneously recorded zero on an uncaught exception; actual shell exit was 1 and this run is not claimed as a pass.",
+    "Interrupted worker left one empty directory without marker; cleanup retried using empty-directory-only removal plus marker-validated cleanup, and completed."
+  ],
+  "additional_check": "git diff --check passed.",
+  "local_evidence_sha256": {
+    "outputs/run_earnings_ttl_checks.py": "c21430678fa9d8f013e70e79f89eb2a7aaf85f17ee5d0bc6b8073590d7226537",
+    "outputs/earnings-ttl-red.log": "b613df9a50f895ec8f4b151dbd6db6ec9a74ac606d3ecf00258aa78a8c889deb",
+    "outputs/earnings-ttl-green.log": "36c4d7888d0c99fa0663f8bf34da7c2b7c7aefb2196c208f74f29e8cb18ba93f",
+    "outputs/earnings-ttl-suites.log": "bfac35d44837265452f03b48a3d0bd54526364a5e6916e1d73d139886db786f0",
+    "outputs/earnings-ttl-isort.log": "2e1c102758c9c6fc227f33e7fcef4b1b3dfc1c2ee179d79f0a5d94113c260505",
+    "outputs/earnings-ttl-flake8-serial.log": "1fd4068751658f1a2c596f8374e8c5a03125e70dce62b7d39c6dab23a8ef1473",
+    "outputs/earnings-ttl-black-test.log": "ab939f8a6f6d9d23ee8215f0245495a9bafb7026b59739277b41c6926755c246",
+    "outputs/earnings-ttl-black-source.log": "4fe400e770d8ebaffce5eb6cba0d6a740e4a06ebd05bad40e127bcec02d22668",
+    "outputs/earnings-ttl-black-baseline.log": "aa326e2c691db9fe82094f9aae82a09de832d197d209cdfe9a5bd4542a4bfc75"
+  }
+}

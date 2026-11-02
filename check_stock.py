@@ -183,7 +183,7 @@ def main(argv: list[str] | None = None) -> None:
                     dispatch=authority["dispatch"],
                     api_key=authority["data_key"],
                 ) as raw:
-                    data_client = CachedDataClient(raw, cache_dir=root.path / "cache" / "data")
+                    data_client = CachedDataClient(raw, cache_dir=root.path / "cache" / "data", live=True)
                     try:
                         show_snapshot(ticker, as_of, data_client)
                     except InsufficientData as exc:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -202,6 +203,92 @@ def test_stock_check_free_default_panel_uses_root_bound_guarded_clients(
     assert events.count("llm") == 4
     assert len(dispatches) == 2
     assert all(dispatch.root_id and dispatch.operation_id for dispatch in dispatches)
+
+
+def test_earnings_cache_refreshes_across_stock_checks_on_reused_root(enrolled_root, monkeypatch):
+    import check_stock
+    import hedge_fund.data
+    import hedge_fund.data.cached as cached
+    import hedge_fund.llm
+    import hedge_fund.runtime.endpoints
+    from hedge_fund.data.models import EarningsRecord
+
+    now = datetime(2026, 10, 30, 12, tzinfo=cached.NEW_YORK)
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now.astimezone(tz)
+
+    monkeypatch.setattr(cached, "datetime", Clock)
+    monkeypatch.setattr(
+        hedge_fund.runtime.endpoints,
+        "_resolve_system",
+        lambda _host, _port: ["93.184.216.34"],
+    )
+    clients = []
+    results = []
+
+    class FakeRawClient:
+        def __init__(self):
+            self.closed = False
+            self.calls = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc_info):
+            self.closed = True
+
+        def get_earnings_history(self, ticker, limit=12):
+            self.calls += 1
+            return [
+                EarningsRecord(
+                    ticker=ticker,
+                    report_period="2026-09-30",
+                    source_type="8-K",
+                    filing_date=now.date().isoformat(),
+                )
+            ]
+
+    def fake_data_client(*, provider, dispatch, api_key):
+        assert provider == "yfinance"
+        assert api_key is None
+        assert isinstance(dispatch, ProviderDispatch)
+        assert dispatch.root_id and dispatch.operation_id
+        client = FakeRawClient()
+        clients.append(client)
+        return client
+
+    def read_earnings(ticker, as_of, data_client, agents):
+        assert [agent.name for agent in agents] == ["pead"]
+        assert data_client._dir == enrolled_root / "cache" / "data"
+        results.append(data_client.get_earnings_history(ticker))
+
+    monkeypatch.setattr(hedge_fund.data, "make_data_client", fake_data_client)
+    monkeypatch.setattr(
+        hedge_fund.llm,
+        "make_llm",
+        Mock(side_effect=AssertionError("earnings cache check must not construct an LLM")),
+    )
+    monkeypatch.setattr(check_stock, "show_snapshot", lambda *_args: None)
+    monkeypatch.setattr(check_stock, "ask_agents", read_earnings)
+    arguments = _arguments(enrolled_root) + ["--agents", "pead"]
+
+    check_stock.main(arguments)
+    check_stock.main(arguments)
+    assert results[1] == results[0]
+    assert [client.calls for client in clients] == [1, 0]
+    assert all(client.closed for client in clients)
+
+    now += timedelta(days=1, seconds=cached.SAME_DAY_TTL + 1)
+    check_stock.main(arguments)
+    check_stock.main(arguments)
+    assert [client.calls for client in clients] == [1, 0, 1, 0]
+    assert results[2][0].filing_date != results[0][0].filing_date
+    assert results[3] == results[2]
+    assert all(client.closed for client in clients)
+    assert len(list((enrolled_root / "cache" / "data").glob("*.json"))) == 1
 
 
 @pytest.mark.parametrize(
