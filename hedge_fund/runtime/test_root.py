@@ -168,6 +168,36 @@ def test_handle_relative_atomic_write_replaces_and_reads_inside_root(tmp_path):
     assert list(root.glob(".*.tmp")) == []
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows ctypes ABI retention")
+@pytest.mark.parametrize("operation", ["revalidate", "private-storage", "atomic-write"])
+def test_windows_root_guards_do_not_retain_new_pointer_types_per_call(tmp_path, operation):
+    pointer_type_cache = getattr(ctypes, "_pointer_type_cache", None)
+    if not isinstance(pointer_type_cache, dict):
+        pytest.skip("Windows CPython pointer-type cache is unavailable")
+    root = tmp_path / "abi-root"
+    root.mkdir()
+    with RootContext.open(root) as context:
+        context.prepare_private_storage()
+
+        def exercise():
+            if operation == "revalidate":
+                context.revalidate()
+            elif operation == "private-storage":
+                assert context.verify_private_storage()
+            else:
+                context.write_bytes("record.json", b"synthetic")
+                assert context.read_bytes("record.json") == b"synthetic"
+
+        def retained_types():
+            return {key for key in pointer_type_cache if getattr(key, "__module__", None) == root_module.__name__}
+
+        exercise()
+        before = retained_types()
+        for _ in range(3):
+            exercise()
+        assert retained_types() == before
+
+
 def test_handle_relative_rename_moves_regular_file_without_replacing(tmp_path):
     root = tmp_path / "root"
     root.mkdir()

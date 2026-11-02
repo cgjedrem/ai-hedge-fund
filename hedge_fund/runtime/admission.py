@@ -10,6 +10,7 @@ import os
 import sys
 import threading
 import time
+from collections import deque
 from contextlib import contextmanager, ExitStack
 from pathlib import Path
 from typing import Iterator
@@ -30,6 +31,8 @@ MAX_LOCK_WAIT_SECONDS = 5.0
 MAX_CONTROL_WAIT_SECONDS = 0.5
 _LOCK_POLL_SECONDS = 0.01
 _LOCK_STATE = threading.local()
+_LOCAL_LANES_GUARD = threading.Lock()
+_LOCAL_LANES: dict[tuple[tuple[int, ...], str], deque[threading.Event]] = {}
 
 
 class AdmissionError(RuntimeError):
@@ -236,27 +239,28 @@ class AdmissionCoordinator:
             finally:
                 held[lock_key] -= 1
             return
-        try:
-            self._root.file_info(relative)
-            handle = self._root.open_lock_file(relative, mode=0o600)
-        except Exception as exc:
-            raise AdmissionError("existing registry lock is unavailable") from exc
-        acquired = False
-        token = None
-        try:
-            self._root.revalidate()
-            token = _acquire_os_lock(handle, wait)
-            acquired = True
-            self._root.revalidate()
-            held[lock_key] = 1
-            yield
-        finally:
-            held.pop(lock_key, None)
+        with _local_lane(lock_key, wait) as deadline:
             try:
-                if acquired:
-                    _release_os_lock(handle, token)
+                self._root.file_info(relative)
+                handle = self._root.open_lock_file(relative, mode=0o600)
+            except Exception as exc:
+                raise AdmissionError("existing registry lock is unavailable") from exc
+            acquired = False
+            token = None
+            try:
+                self._root.revalidate()
+                token = _acquire_os_lock(handle, _remaining(deadline))
+                acquired = True
+                self._root.revalidate()
+                held[lock_key] = 1
+                yield
             finally:
-                handle.close()
+                held.pop(lock_key, None)
+                try:
+                    if acquired:
+                        _release_os_lock(handle, token)
+                finally:
+                    handle.close()
 
     @contextmanager
     def deployment_lock(
@@ -368,33 +372,34 @@ class AdmissionCoordinator:
 
     @contextmanager
     def _lock(self, key: str, *, timeout: float) -> Iterator[None]:
-        self._require_verified_owner()
         wait = _validate_timeout(timeout, MAX_LOCK_WAIT_SECONDS)
         filename = _lock_filename(key)
         relative = f"{LOCK_DIRECTORY}/{filename}"
         lock_key = _thread_lock_key(self._root, relative)
         held = _held_locks()
-        self._root.mkdir(LOCK_DIRECTORY, parents=True, mode=0o700)
-        handle = self._root.open_lock_file(
-            relative,
-            mode=0o600,
-        )
-        acquired = False
-        token = None
-        try:
-            self._root.revalidate()
-            token = _acquire_os_lock(handle, wait)
-            acquired = True
-            self._root.revalidate()
-            held[lock_key] = 1
-            yield
-        finally:
-            held.pop(lock_key, None)
+        with _local_lane(lock_key, wait) as deadline:
+            self._require_verified_owner()
+            self._root.mkdir(LOCK_DIRECTORY, parents=True, mode=0o700)
+            handle = self._root.open_lock_file(
+                relative,
+                mode=0o600,
+            )
+            acquired = False
+            token = None
             try:
-                if acquired:
-                    _release_os_lock(handle, token)
+                self._root.revalidate()
+                token = _acquire_os_lock(handle, _remaining(deadline))
+                acquired = True
+                self._root.revalidate()
+                held[lock_key] = 1
+                yield
             finally:
-                handle.close()
+                held.pop(lock_key, None)
+                try:
+                    if acquired:
+                        _release_os_lock(handle, token)
+                finally:
+                    handle.close()
 
     def _require_verified_owner(self) -> None:
         if self._owner_lease is None or not self._owner_lease.matches(self._root):
@@ -545,6 +550,29 @@ def _validate_timeout(value: float, maximum: float) -> float:
 
 def _remaining(deadline: float) -> float:
     return max(0.0, deadline - time.monotonic())
+
+
+@contextmanager
+def _local_lane(key: tuple[tuple[int, ...], str], timeout: float) -> Iterator[float]:
+    # FIFO prevents local pollers from barging; OS lock still grants authority.
+    deadline = time.monotonic() + timeout
+    ticket = threading.Event()
+    with _LOCAL_LANES_GUARD:
+        queue = _LOCAL_LANES.setdefault(key, deque())
+        queue.append(ticket)
+        if len(queue) == 1:
+            ticket.set()
+    try:
+        if not ticket.wait(_remaining(deadline)):
+            raise WriterConflict("Admission lane is occupied.")
+        yield deadline
+    finally:
+        with _LOCAL_LANES_GUARD:
+            queue.remove(ticket)
+            if queue:
+                queue[0].set()
+            else:
+                del _LOCAL_LANES[key]
 
 
 def _lock_filename(key: str) -> str:

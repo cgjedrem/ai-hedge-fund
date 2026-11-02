@@ -29,6 +29,7 @@ from hedge_fund.runtime.operations import (
 from hedge_fund.runtime.policy import ProviderTarget
 from hedge_fund.runtime.root import RootContext
 from hedge_fund.test_support.handover import enroll_synthetic_root
+from hedge_fund.web import jobs as jobs_module
 from hedge_fund.web.app import create_app
 from hedge_fund.web.jobs import JobCancelled, OperationJobRegistry
 from hedge_fund.web.schemas import (
@@ -908,7 +909,7 @@ def test_reviewed_backtest_cancellation_closes_fake_client_and_freezes_model(dem
     def paused_backtest(_fund, _start, _end, _client, _universe, *, on_valuation):
         on_valuation(0, 2, None)
         entered.set()
-        release.wait(timeout=2)
+        release.wait()
         on_valuation(1, 2, None)
 
     monkeypatch.setattr(services, "backtest_fund", paused_backtest)
@@ -994,6 +995,46 @@ def test_reviewed_backtest_cancellation_closes_fake_client_and_freezes_model(dem
     assert not (demo_root / "research" / "cancelled.json").exists()
 
 
+def test_reviewed_backtest_pause_requires_explicit_release(demo_root, monkeypatch):
+    event_type = threading.Event
+    wait_called = event_type()
+    wait_timeouts = []
+    event_count = 0
+    set_model = DeskService.set_model
+
+    def make_event():
+        nonlocal event_count
+        event_count += 1
+        event = event_type()
+        if event_count == 2:
+            wait = event.wait
+
+            def expire_timed_wait(timeout=None):
+                wait_timeouts.append(timeout)
+                wait_called.set()
+                if timeout is not None:
+                    return False
+                return wait()
+
+            event.wait = expire_timed_wait
+        return event
+
+    def save_after_pause(self, request):
+        worker = self._operation_jobs
+        if worker is not None and worker._active:
+            assert wait_called.wait(timeout=5)
+            if wait_timeouts[-1] is not None:
+                future = next(iter(worker._submitted.values()))
+                assert future is not None
+                future.result(timeout=5)
+        return set_model(self, request)
+
+    monkeypatch.setattr(threading, "Event", make_event)
+    monkeypatch.setattr(DeskService, "set_model", save_after_pause)
+    test_reviewed_backtest_cancellation_closes_fake_client_and_freezes_model(demo_root, monkeypatch)
+    assert wait_timeouts == [None]
+
+
 def test_legacy_backtest_and_job_routes_cannot_start_work(demo_root):
     called = False
 
@@ -1054,7 +1095,7 @@ def test_operation_job_registry_persists_progress_and_result(durable_job_context
         assert not cancelled()
         progress(20)
         entered.set()
-        release.wait(timeout=2)
+        release.wait()
         assert not cancelled()
         progress(75)
         return {"sessions": 1}
@@ -1075,6 +1116,86 @@ def test_operation_job_registry_persists_progress_and_result(durable_job_context
         registry.close()
 
 
+@pytest.mark.parametrize("phase", ["claim", "work", "complete"])
+def test_operation_worker_failures_log_safe_cause_without_payload(durable_job_context, monkeypatch, caplog, phase):
+    _root_context, store, capture = durable_job_context
+    registry = OperationJobRegistry(store, clock=lambda: _JOB_NOW)
+    operation = _accepted_operation(store, capture)
+    secret = "synthetic-private-config-prompt-credential"
+
+    def fail(*_args, **_kwargs):
+        try:
+            raise OSError(5, secret)
+        except OSError as cause:
+            raise RuntimeError(secret) from cause
+
+    def work(_progress, _cancelled, _apply):
+        if phase == "work":
+            fail()
+        return {"sessions": 1}
+
+    if phase == "claim":
+        monkeypatch.setattr(store, "claim_worker", fail)
+    elif phase == "complete":
+        monkeypatch.setattr(store, "complete", fail)
+    caplog.set_level("ERROR", logger="hedge_fund.web.jobs")
+    try:
+        registry.submit(operation, work)
+        future = registry._submitted[operation.operation_id]
+        assert future is not None
+        future.result(timeout=5)
+        current = store.get_operation(operation.operation_id)
+        expected = OperationStatus.INTERRUPTED if phase == "claim" else OperationStatus.FAILED
+        assert current.status is expected
+        assert "type=RuntimeError" in caplog.text
+        assert "cause_type=OSError errno=5 winerror=None" in caplog.text
+        assert f"phase={phase}" in caplog.text
+        assert secret not in caplog.text
+        assert str(_root_context.path) not in caplog.text
+        assert all(record.exc_info is None and record.stack_info is None for record in caplog.records)
+        assert secret not in str(current.public_view())
+    finally:
+        registry.close()
+
+
+@pytest.mark.parametrize(("phase", "expected"), [("claim", OperationStatus.INTERRUPTED), ("work", OperationStatus.FAILED), ("complete", OperationStatus.FAILED)])
+def test_diagnostic_failure_does_not_skip_durable_worker_failure(
+    durable_job_context,
+    monkeypatch,
+    phase,
+    expected,
+):
+    _root_context, store, capture = durable_job_context
+    registry = OperationJobRegistry(store, clock=lambda: _JOB_NOW)
+    operation = _accepted_operation(store, capture)
+
+    def fail(*_args, **_kwargs):
+        raise RuntimeError("synthetic worker failure")
+
+    def fail_diagnostic(*_args, **_kwargs):
+        raise RuntimeError("synthetic diagnostic failure")
+
+    def work(_progress, _cancelled, _apply):
+        if phase == "work":
+            fail()
+        return {"sessions": 1}
+
+    if phase == "claim":
+        monkeypatch.setattr(store, "claim_worker", fail)
+    elif phase == "complete":
+        monkeypatch.setattr(store, "complete", fail)
+    monkeypatch.setattr(jobs_module, "_log_failure", fail_diagnostic)
+    try:
+        registry.submit(operation, work)
+        future = registry._submitted[operation.operation_id]
+        assert future is not None
+        with pytest.raises(RuntimeError, match="synthetic diagnostic failure"):
+            future.result(timeout=5)
+        assert store.get_operation(operation.operation_id).status is expected
+    finally:
+        registry.close()
+
+
 def test_operation_job_cancellation_stops_at_boundary_without_result(durable_job_context):
     _root_context, store, capture = durable_job_context
     registry = OperationJobRegistry(store, clock=lambda: _JOB_NOW)
@@ -1087,7 +1208,7 @@ def test_operation_job_cancellation_stops_at_boundary_without_result(durable_job
         calls.append("started")
         progress(25)
         entered.set()
-        release.wait(timeout=2)
+        release.wait()
         if cancelled():
             raise JobCancelled()
         return {"must_not_persist": True}

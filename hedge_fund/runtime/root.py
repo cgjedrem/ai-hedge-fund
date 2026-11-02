@@ -94,6 +94,75 @@ class _ByHandleInfo(ctypes.Structure):
     ]
 
 
+# Stable ABI types; ctypes.POINTER retains class identities for process lifetime.
+class _UnicodeString(ctypes.Structure):
+    _fields_ = [
+        ("length", ctypes.c_ushort),
+        ("maximum_length", ctypes.c_ushort),
+        ("buffer", ctypes.c_wchar_p),
+    ]
+
+
+class _ObjectAttributes(ctypes.Structure):
+    _fields_ = [
+        ("length", ctypes.c_ulong),
+        ("root_directory", ctypes.c_void_p),
+        ("object_name", ctypes.POINTER(_UnicodeString)),
+        ("attributes", ctypes.c_ulong),
+        ("security_descriptor", ctypes.c_void_p),
+        ("security_quality_of_service", ctypes.c_void_p),
+    ]
+
+
+class _IoStatusBlock(ctypes.Structure):
+    _fields_ = [("status", ctypes.c_void_p), ("information", ctypes.c_size_t)]
+
+
+class _SidAndAttributes(ctypes.Structure):
+    _fields_ = [("sid", ctypes.c_void_p), ("attributes", ctypes.c_ulong)]
+
+
+class _TokenUser(ctypes.Structure):
+    _fields_ = [("user", _SidAndAttributes)]
+
+
+class _AclSizeInformation(ctypes.Structure):
+    _fields_ = [
+        ("ace_count", ctypes.c_ulong),
+        ("acl_bytes_in_use", ctypes.c_ulong),
+        ("acl_bytes_free", ctypes.c_ulong),
+    ]
+
+
+class _AceHeader(ctypes.Structure):
+    _fields_ = [
+        ("ace_type", ctypes.c_ubyte),
+        ("ace_flags", ctypes.c_ubyte),
+        ("ace_size", ctypes.c_ushort),
+    ]
+
+
+class _AccessAllowedAce(ctypes.Structure):
+    _fields_ = [
+        ("header", _AceHeader),
+        ("mask", ctypes.c_ulong),
+        ("sid_start", ctypes.c_ulong),
+    ]
+
+
+class _RenameInformationEx(ctypes.Structure):
+    _fields_ = [
+        ("flags", ctypes.c_ulong),
+        ("root_directory", ctypes.c_void_p),
+        ("name_length", ctypes.c_ulong),
+        ("name", ctypes.c_wchar * 1),
+    ]
+
+
+class _DispositionInfo(ctypes.Structure):
+    _fields_ = [("delete_file", ctypes.c_ubyte)]
+
+
 def _kernel32():
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     handle = ctypes.c_void_p
@@ -821,13 +890,7 @@ def _windows_current_user_sid() -> str:
         ):
             raise ctypes.WinError(ctypes.get_last_error())
 
-        class SidAndAttributes(ctypes.Structure):
-            _fields_ = [("sid", ctypes.c_void_p), ("attributes", ctypes.c_ulong)]
-
-        class TokenUser(ctypes.Structure):
-            _fields_ = [("user", SidAndAttributes)]
-
-        sid = ctypes.cast(buffer, ctypes.POINTER(TokenUser)).contents.user.sid
+        sid = ctypes.cast(buffer, ctypes.POINTER(_TokenUser)).contents.user.sid
         return _windows_sid_text(sid)
     finally:
         kernel32.CloseHandle(token)
@@ -1017,28 +1080,7 @@ def _windows_verify_private_dacl(
     ):
         raise UnsupportedFilesystemError("private directory ACL is inherited")
 
-    class AclSizeInformation(ctypes.Structure):
-        _fields_ = [
-            ("ace_count", ctypes.c_ulong),
-            ("acl_bytes_in_use", ctypes.c_ulong),
-            ("acl_bytes_free", ctypes.c_ulong),
-        ]
-
-    class AceHeader(ctypes.Structure):
-        _fields_ = [
-            ("ace_type", ctypes.c_ubyte),
-            ("ace_flags", ctypes.c_ubyte),
-            ("ace_size", ctypes.c_ushort),
-        ]
-
-    class AccessAllowedAce(ctypes.Structure):
-        _fields_ = [
-            ("header", AceHeader),
-            ("mask", ctypes.c_ulong),
-            ("sid_start", ctypes.c_ulong),
-        ]
-
-    info = AclSizeInformation()
+    info = _AclSizeInformation()
     advapi32.GetAclInformation.argtypes = [
         ctypes.c_void_p,
         ctypes.c_void_p,
@@ -1069,7 +1111,7 @@ def _windows_verify_private_dacl(
             raise ctypes.WinError(ctypes.get_last_error())
         ace = ctypes.cast(
             ace_pointer,
-            ctypes.POINTER(AccessAllowedAce),
+            ctypes.POINTER(_AccessAllowedAce),
         ).contents
         if ace.header.ace_type != 0 or ace.header.ace_flags != 0x03 or ace.mask & 0x001F01FF != 0x001F01FF:
             raise UnsupportedFilesystemError("private directory ACL entries are invalid")
@@ -1300,32 +1342,12 @@ def _nt_open_child(
     access: int | None = None,
     share_delete: bool = False,
 ) -> int:
-    class UnicodeString(ctypes.Structure):
-        _fields_ = [
-            ("length", ctypes.c_ushort),
-            ("maximum_length", ctypes.c_ushort),
-            ("buffer", ctypes.c_wchar_p),
-        ]
-
-    class ObjectAttributes(ctypes.Structure):
-        _fields_ = [
-            ("length", ctypes.c_ulong),
-            ("root_directory", ctypes.c_void_p),
-            ("object_name", ctypes.POINTER(UnicodeString)),
-            ("attributes", ctypes.c_ulong),
-            ("security_descriptor", ctypes.c_void_p),
-            ("security_quality_of_service", ctypes.c_void_p),
-        ]
-
-    class IoStatusBlock(ctypes.Structure):
-        _fields_ = [("status", ctypes.c_void_p), ("information", ctypes.c_size_t)]
-
     ntdll = ctypes.WinDLL("ntdll")
     ntdll.NtCreateFile.argtypes = [
         ctypes.POINTER(ctypes.c_void_p),
         ctypes.c_ulong,
-        ctypes.POINTER(ObjectAttributes),
-        ctypes.POINTER(IoStatusBlock),
+        ctypes.POINTER(_ObjectAttributes),
+        ctypes.POINTER(_IoStatusBlock),
         ctypes.c_void_p,
         ctypes.c_ulong,
         ctypes.c_ulong,
@@ -1340,20 +1362,20 @@ def _nt_open_child(
     handle = ctypes.c_void_p()
     name_buffer = ctypes.create_unicode_buffer(name)
     encoded_length = len(name.encode("utf-16-le"))
-    unicode_name = UnicodeString(
+    unicode_name = _UnicodeString(
         encoded_length,
         encoded_length + 2,
         ctypes.cast(name_buffer, ctypes.c_wchar_p),
     )
-    attributes = ObjectAttributes(
-        ctypes.sizeof(ObjectAttributes),
+    attributes = _ObjectAttributes(
+        ctypes.sizeof(_ObjectAttributes),
         parent,
         ctypes.pointer(unicode_name),
         0x40 | 0x1000,
         None,
         None,
     )
-    status_block = IoStatusBlock()
+    status_block = _IoStatusBlock()
     if access is None:
         access = 0x0001 | 0x0080 | 0x00100000
     options = 0x00200000 | 0x00000020 | (0x00000001 if directory else 0x00000040)
@@ -1766,30 +1788,19 @@ def _windows_rename_handle(
     *,
     replace: bool = True,
 ) -> None:
-    class IoStatusBlock(ctypes.Structure):
-        _fields_ = [("status", ctypes.c_void_p), ("information", ctypes.c_size_t)]
-
-    class RenameInformationEx(ctypes.Structure):
-        _fields_ = [
-            ("flags", ctypes.c_ulong),
-            ("root_directory", ctypes.c_void_p),
-            ("name_length", ctypes.c_ulong),
-            ("name", ctypes.c_wchar * 1),
-        ]
-
     encoded = name.encode("utf-16-le")
-    offset = RenameInformationEx.name.offset
+    offset = _RenameInformationEx.name.offset
     buffer = ctypes.create_string_buffer(offset + len(encoded))
-    info = ctypes.cast(buffer, ctypes.POINTER(RenameInformationEx)).contents
+    info = ctypes.cast(buffer, ctypes.POINTER(_RenameInformationEx)).contents
     info.flags = 0x0002 | (0x0001 if replace else 0)
     info.root_directory = parent
     info.name_length = len(encoded)
     ctypes.memmove(ctypes.addressof(buffer) + offset, encoded, len(encoded))
-    status_block = IoStatusBlock()
+    status_block = _IoStatusBlock()
     ntdll = ctypes.WinDLL("ntdll")
     ntdll.NtSetInformationFile.argtypes = [
         ctypes.c_void_p,
-        ctypes.POINTER(IoStatusBlock),
+        ctypes.POINTER(_IoStatusBlock),
         ctypes.c_void_p,
         ctypes.c_ulong,
         ctypes.c_int,
@@ -1810,10 +1821,7 @@ def _windows_rename_handle(
 
 
 def _windows_delete_handle(handle: int) -> None:
-    class DispositionInfo(ctypes.Structure):
-        _fields_ = [("delete_file", ctypes.c_ubyte)]
-
-    info = DispositionInfo(1)
+    info = _DispositionInfo(1)
     kernel32 = _kernel32()
     if not kernel32.SetFileInformationByHandle(
         handle,

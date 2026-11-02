@@ -9,6 +9,10 @@ from pathlib import Path
 from typing import Any
 
 
+class _FileTime(ctypes.Structure):
+    _fields_ = [("low", ctypes.c_ulong), ("high", ctypes.c_ulong)]
+
+
 class ProcessIdentityError(RuntimeError):
     """Process identity could not be verified."""
 
@@ -37,9 +41,6 @@ def identity_matches(pid: int, expected: object) -> bool:
 
 
 def _windows_process_identity(pid: int) -> dict[str, Any]:
-    class _FileTime(ctypes.Structure):
-        _fields_ = [("low", ctypes.c_ulong), ("high", ctypes.c_ulong)]
-
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel32.OpenProcess.argtypes = [ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]
     kernel32.OpenProcess.restype = ctypes.c_void_p

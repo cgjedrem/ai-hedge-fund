@@ -1,6 +1,7 @@
 import time
 from contextlib import contextmanager
 from pathlib import Path
+from threading import current_thread, Event, Thread
 
 import pytest
 
@@ -59,6 +60,82 @@ def test_multi_deployment_acquires_registry_then_sorted_identities(admission_roo
         pass
 
     assert acquired == ["registry", "deployment:alpha", "deployment:beta"]
+
+
+def test_registry_waiting_writer_cannot_be_overtaken_by_status_reader(admission_root, monkeypatch):
+    import hedge_fund.runtime.admission as admission
+
+    _root, context, owner, coordinator = admission_root
+    observer = AdmissionCoordinator(context, owner_lease=owner)
+    with coordinator.registry_lock():
+        pass
+    writer_at_native_lock = Event()
+    release_writer = Event()
+    reader_started = Event()
+    reader_entered = Event()
+    order = []
+    errors = []
+    try_lock = admission._try_acquire_os_lock
+
+    def pause_writer(handle, *, exclusive=True):
+        if current_thread().name == "queued-writer":
+            writer_at_native_lock.set()
+            assert release_writer.wait(timeout=5)
+        return try_lock(handle, exclusive=exclusive)
+
+    monkeypatch.setattr(admission, "_try_acquire_os_lock", pause_writer)
+
+    def writer():
+        try:
+            with coordinator.registry_lock(timeout=5):
+                order.append("writer")
+        except BaseException as exc:
+            errors.append(exc)
+
+    def reader():
+        reader_started.set()
+        try:
+            with observer.registry_read_lock(timeout=5):
+                order.append("reader")
+                reader_entered.set()
+        except BaseException as exc:
+            errors.append(exc)
+
+    first = Thread(target=writer, name="queued-writer")
+    second = Thread(target=reader, name="later-status-reader")
+    first.start()
+    try:
+        assert writer_at_native_lock.wait(timeout=5)
+        second.start()
+        assert reader_started.wait(timeout=5)
+        assert not reader_entered.wait(timeout=1), "status reader bypassed a pending writer"
+    finally:
+        release_writer.set()
+        first.join(timeout=5)
+        if second.ident is not None:
+            second.join(timeout=5)
+    assert not first.is_alive() and not second.is_alive()
+    assert errors == []
+    assert order == ["writer", "reader"]
+
+
+def test_timed_out_local_waiter_preserves_holder_and_releases_queue(admission_root):
+    import hedge_fund.runtime.admission as admission
+
+    _root, context, _owner, coordinator = admission_root
+    key = admission._thread_lock_key(context, f"{LOCK_DIRECTORY}/registry.lock")
+    with coordinator.registry_lock():
+        with pytest.raises(WriterConflict):
+            with coordinator.registry_lock(timeout=0):
+                pytest.fail("a conflicting writer was admitted")
+        assert coordinator.lane_is_held("registry")
+        assert len(admission._LOCAL_LANES[key]) == 1
+        with coordinator.registry_read_lock():
+            assert coordinator.lane_is_held("registry")
+    assert key not in admission._LOCAL_LANES
+    with coordinator.registry_lock():
+        assert coordinator.lane_is_held("registry")
+    assert key not in admission._LOCAL_LANES
 
 
 def test_multi_deployment_rejects_canonical_aliases_before_lane_creation(admission_root):

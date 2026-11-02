@@ -2,13 +2,22 @@
 
 from __future__ import annotations
 
+import logging
+import re
 import threading
 import uuid
 from collections.abc import Callable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timezone
 
-from hedge_fund.runtime.operations import OperationRecord, OperationStatus, OperationStore, WorkerFenced
+from hedge_fund.runtime.operations import (
+    OperationRecord,
+    OperationStatus,
+    OperationStore,
+    WorkerFenced,
+)
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class JobConflict(RuntimeError):
@@ -78,12 +87,13 @@ class OperationJobRegistry:
             self._active.add(current.operation_id)
             try:
                 future = self._executor.submit(self._run, current.operation_id, work)
-            except Exception:
+            except Exception as exc:
                 self._active.discard(current.operation_id)
                 try:
                     self._store.interrupt(current.operation_id, now=self._now())
-                except Exception:
-                    pass
+                except Exception as interrupt_exc:
+                    _log_failure("interrupt", interrupt_exc)
+                _log_failure("submit", exc)
                 raise JobConflict("Operation start is uncertain.") from None
             self._submitted[current.operation_id] = future
             future.add_done_callback(
@@ -146,8 +156,8 @@ class OperationJobRegistry:
                         request_id=f"shutdown-{uuid.uuid4().hex}",
                         now=self._now(),
                     )
-            except Exception:
-                pass
+            except Exception as exc:
+                _log_failure("shutdown-cancel", exc)
         self._shutdown_requested.set()
         for future in futures:
             future.cancel()
@@ -161,8 +171,8 @@ class OperationJobRegistry:
                     OperationStatus.CANCEL_REQUESTED,
                 }:
                     self._store.interrupt(operation_id, now=self._now())
-            except Exception:
-                pass
+            except Exception as exc:
+                _log_failure("shutdown-interrupt", exc)
 
     def recover_unfinished(self) -> tuple[OperationRecord, ...]:
         with self._lock:
@@ -194,12 +204,13 @@ class OperationJobRegistry:
             self._acknowledge_cancellation(operation_id, fence)
             self._finish_local(operation_id)
             return
-        except Exception:
+        except Exception as exc:
             try:
                 self._store.interrupt(operation_id, now=self._now())
-            except Exception:
-                pass
+            except Exception as interrupt_exc:
+                _log_failure("interrupt", interrupt_exc)
             self._finish_local(operation_id)
+            _log_failure("claim", exc)
             return
 
         def report_progress(value: int) -> None:
@@ -224,14 +235,16 @@ class OperationJobRegistry:
         def apply_if_current(effect: Callable[[], object]) -> object:
             return self._store.apply_if_current(operation_id, fence, effect)
 
+        phase = "work"
         try:
             result = work(report_progress, cancellation_requested, apply_if_current)
+            phase = "complete"
             self._store.complete(operation_id, fence, result=result, now=self._now())
         except JobCancelled:
             self._acknowledge_cancellation(operation_id, fence)
         except WorkerFenced:
             self._acknowledge_cancellation(operation_id, fence)
-        except Exception:
+        except Exception as exc:
             try:
                 self._store.fail(
                     operation_id,
@@ -241,8 +254,9 @@ class OperationJobRegistry:
                 )
             except WorkerFenced:
                 pass
-            except Exception:
-                pass
+            except Exception as failure_exc:
+                _log_failure("fail", failure_exc)
+            _log_failure(phase, exc)
         finally:
             self._finish_local(operation_id)
 
@@ -257,8 +271,8 @@ class OperationJobRegistry:
                 self._store.acknowledge_cancel(operation_id, fence, now=self._now())
         except WorkerFenced:
             pass
-        except Exception:
-            pass
+        except Exception as exc:
+            _log_failure("acknowledge-cancel", exc)
 
     def _finish_local(self, operation_id: str) -> None:
         with self._lock:
@@ -274,8 +288,8 @@ class OperationJobRegistry:
                         None,
                         now=self._now(),
                     )
-        except Exception:
-            pass
+        except Exception as exc:
+            _log_failure("future-cancel", exc)
         finally:
             self._finish_local(operation_id)
 
@@ -305,3 +319,45 @@ class OperationJobRegistry:
 
 def _now_datetime() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _log_failure(phase: str, error: Exception) -> None:
+    """Emit bounded types/codes/source locations; never exception text or frames."""
+    cause = error
+    seen = {id(cause)}
+    for _ in range(3):
+        candidate = cause.__cause__ or cause.__context__
+        if candidate is None or id(candidate) in seen:
+            break
+        seen.add(id(candidate))
+        cause = candidate
+    locations = []
+    trace = cause.__traceback__
+    while trace is not None and len(locations) < 8:
+        module = trace.tb_frame.f_globals.get("__name__", "")
+        function = trace.tb_frame.f_code.co_name
+        if isinstance(module, str) and re.fullmatch(r"hedge_fund\.[A-Za-z0-9_.]{1,120}", module):
+            if re.fullmatch(r"[A-Za-z0-9_]{1,64}", function):
+                locations.append(f"{module}.{function}:{trace.tb_lineno}")
+        trace = trace.tb_next
+
+    def error_type(value: BaseException) -> str:
+        cls = type(value)
+        if cls.__module__ == "builtins" or cls.__module__.startswith("hedge_fund."):
+            if re.fullmatch(r"[A-Za-z0-9_]{1,64}", cls.__name__):
+                return cls.__name__
+        return "ExternalError"
+
+    def error_number(name: str) -> int | None:
+        value = getattr(cause, name, None)
+        return value if type(value) is int else None
+
+    _LOGGER.error(
+        "operation worker failure: phase=%s type=%s cause_type=%s errno=%s winerror=%s locations=%s",
+        phase,
+        error_type(error),
+        error_type(cause),
+        error_number("errno"),
+        error_number("winerror"),
+        ",".join(locations) or "unavailable",
+    )
