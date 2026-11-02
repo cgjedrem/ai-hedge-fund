@@ -23,6 +23,7 @@ const frontendRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const repositoryRoot = resolve(frontendRoot, "..");
 const outputRoot = resolve(repositoryRoot, "outputs");
 const port = 8876;
+const lifecycleAcceptance = process.argv.includes("--lifecycle");
 const rootName = `spec005-test-e2e-${process.pid}-${randomUUID().slice(0, 8)}`;
 const testRoot = resolve(outputRoot, rootName);
 const marker = join(testRoot, ".test-owned");
@@ -109,6 +110,7 @@ const unsafeOverrides = [
   "HEDGE_FUND_TEST_MODE",
   "HEDGE_FUND_TEST_ROOT",
   "PLAYWRIGHT_BROWSERS_PATH",
+  "AIHF_WEB_LIFECYCLE_ACCEPTANCE",
 ];
 
 let activeChild;
@@ -174,11 +176,13 @@ export function isolatedEnvironment(source, python) {
   env.AIHF_PLAYWRIGHT_OUTPUT_DIR = join(testRoot, "playwright-results");
   env.AIHF_PLAYWRIGHT_SCREENSHOT_DIR = screenshotDir;
   env.AIHF_E2E_PYTHON = python;
+  env.AIHF_WEB_LIFECYCLE_ACCEPTANCE = lifecycleAcceptance ? "1" : "0";
   env.AIHF_WEB_SERVER_COMMAND = [
     shellQuote(python),
     "-m hedge_fund.web --demo",
     `--port ${port}`,
     `--root ${shellQuote(demoRoot)}`,
+    ...(lifecycleAcceptance ? ["--allow-writes"] : []),
   ].join(" ");
   env.AIHF_VITE_ENV_DIR = join(testRoot, "vite-env");
   env.PLAYWRIGHT_BROWSERS_PATH = join(testRoot, "playwright-browsers");
@@ -536,7 +540,7 @@ async function main() {
       failure = true;
     } else {
       serverStarted = true;
-      runnerResult = await runPlaywright(env, process.argv.slice(2));
+      runnerResult = await runPlaywright(env, process.argv.slice(2).filter((arg) => arg !== "--lifecycle"));
       if (runnerResult.code !== 0) failure = true;
       if (interrupted) failure = true;
       if (!(await waitForPortRelease())) {

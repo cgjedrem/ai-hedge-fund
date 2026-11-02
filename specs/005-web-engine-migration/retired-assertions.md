@@ -234,9 +234,13 @@ New regression tests: `hedge_fund/tui/test_admission_regressions.py`. They cover
 - `_save_admitted` writing under `research/` with an owner lease and research lane;
 - `_save_admitted` failing closed on an unenrolled root.
 
-**Parity gap:** mandate and fund deletion is denied in the TUI and does not exist on the web desk
-(`hedge_fund/web/services.py` has no delete). TUI retirement must not proceed until an
-admitted web deletion/replacement path exists or the gap is explicitly accepted.
+**Scoped lifecycle update:** TUI deletion remains denied. The web desk and headless CLI
+now expose separately reviewed reversible template/deployment/research archive, stopped
+restore and explicit journal recovery (`runtime/test_lifecycle.py`, `web/test_lifecycle.py`,
+`frontend/src/components/lifecycle-actions.test.tsx`, real-API `frontend/e2e/lifecycle.spec.ts`).
+These replace no original assertion yet. Replacement with a distinct linked deployment,
+the exhaustive writer/race matrix and verifiable legacy-writer exclusion remain incomplete;
+TUI retirement must not proceed.
 
 ### External TUI-importing test changed by the same repair
 

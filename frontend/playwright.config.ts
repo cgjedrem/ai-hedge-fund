@@ -38,6 +38,7 @@ const expectedServerCommand = [
   "-m hedge_fund.web --demo",
   `--port ${port}`,
   `--root ${shellQuote(demoRoot)}`,
+  ...(process.env.AIHF_WEB_LIFECYCLE_ACCEPTANCE === "1" ? ["--allow-writes"] : []),
 ].join(" ");
 
 if (dirname(testRoot) !== resolve(repositoryRoot, "outputs")) {

@@ -208,6 +208,11 @@ class AdmissionCoordinator:
 
     @contextmanager
     def registry_lock(self, *, timeout: float = 0.0) -> Iterator[None]:
+        self._require_verified_owner()
+        _validate_timeout(timeout, MAX_LOCK_WAIT_SECONDS)
+        if self.lane_is_held("registry"):
+            yield
+            return
         with self._lock("registry", timeout=timeout):
             yield
 

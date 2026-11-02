@@ -1,8 +1,10 @@
 import { useState, type FormEvent } from "react";
 import { ArrowLeft, FileBarChart2, FlaskConical } from "lucide-react";
-import { Link, useParams } from "react-router-dom";
+import { Link, useNavigate, useParams } from "react-router-dom";
 
 import { DataTable, type TableColumn } from "@/components/data-table";
+import { ArchivePanel } from "@/components/archive-panel";
+import { LifecycleActions } from "@/components/lifecycle-actions";
 import { EquityChart } from "@/components/equity-chart";
 import { MetricCard } from "@/components/metric-card";
 import { ErrorState, PageHeader, SectionTitle } from "@/components/page";
@@ -68,7 +70,7 @@ export function ResearchPage() {
         <Button type="submit" variant="secondary" disabled={resource.loading}>Search</Button>
       </form>
       {resource.loading ? <div className="h-52 animate-pulse rounded-xl border border-border bg-white/[0.025]" /> : null}
-      {resource.error ? <ErrorState message={resource.error} /> : null}
+      {resource.error ? <ErrorState message={resource.error} error={resource.apiError} onRetry={resource.refresh} /> : null}
       {resource.data ? (
         <>
           {resource.data.errors.length > 0 ? (
@@ -123,12 +125,14 @@ export function ResearchPage() {
           </Card>
         </>
       ) : null}
+      <ArchivePanel kind="research" onChange={resource.refresh} />
     </>
   );
 }
 
 export function ResearchReportPage() {
   const { reportId = "" } = useParams();
+  const navigate = useNavigate();
   const resource = useResource<ResearchReport>(reportId ? `/api/research/${encodeURIComponent(reportId)}` : null);
   const report = resource.data;
   const curve = report
@@ -152,10 +156,13 @@ export function ResearchReportPage() {
         eyebrow="Research / report detail"
         title={report ? `${report.fund} backtest` : "Backtest report"}
         description={report ? `${report.start} → ${report.end} · ${report.rebalance} · ${report.benchmark} benchmark` : "Canonical persisted research report."}
-        actions={<Button asChild variant="secondary"><Link to="/research"><ArrowLeft className="h-3.5 w-3.5" /> All reports</Link></Button>}
+        actions={<>
+          <Button asChild variant="secondary"><Link to="/research"><ArrowLeft className="h-3.5 w-3.5" /> All reports</Link></Button>
+          <LifecycleActions kind="research" identity={reportId} onComplete={() => navigate("/research")} />
+        </>}
       />
       {resource.loading ? <div className="h-48 animate-pulse rounded-xl border border-border bg-white/[0.025]" /> : null}
-      {resource.error ? <ErrorState message={resource.error} /> : null}
+      {resource.error ? <ErrorState message={resource.error} error={resource.apiError} onRetry={resource.refresh} /> : null}
       {report ? (
         <>
           <div className="mb-5 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
@@ -189,6 +196,7 @@ export function ResearchReportPage() {
           <p className="mt-4 text-[10px] text-muted-foreground">Fund universe: <span className="mono">{report.universe.join(" · ")}</span></p>
         </>
       ) : null}
+      {resource.error ? <ArchivePanel kind="research" onChange={resource.refresh} /> : null}
     </>
   );
 }

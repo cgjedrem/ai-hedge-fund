@@ -47,6 +47,26 @@ Never include credentials, unsafe paths or raw provider errors.
 | 429 capacity-denied / budget-exhausted | Bounded capacity or authorization limits reached; stop before next call/session. |
 | 503 observation-conflict / assets-unavailable | Retry read only, or actionable installation failure; no fallback/TUI/mutation. |
 
+Implementation notes (2026-11-02 error-recovery slice, source-tested; 429 row still unproven):
+
+- Optional `subject_id`, `request_id` and `current_head` are echoed only when they match bounded
+  opaque-token patterns; anything else is dropped, never repaired or echoed.
+- `retry_policy` defaults per code. `writer-conflict` defaults to `inspect-status`; only a
+  registry-lock `OperationBusy` before acceptance opts into `retry-later`. A busy status read after
+  a durable transition returns the accepted record; a busy replay of a known request requires
+  status inspection. Permanent faults (`none`, `inspect-status`, `review-again`) are never retried
+  automatically, and mutations are never auto-resubmitted by the client.
+- A mutation rejected because the operator session is absent or expired (for example after a
+  server restart) returns 403 with `retry_policy=reload`; the client renews via a read-only
+  capabilities reload and asks the operator to submit again.
+- An unavailable operation store is 503 `observation-conflict` / `retry-read-only`, not 404, so a
+  remembered operation is not offered for forgetting.
+- Observation is polling only (no stream/channel). The client tracks a connection epoch: a
+  response to a request sent before a connection loss does not report recovery; Reconnect issues a
+  fresh capabilities read bounded to 10 s.
+- Gap: no production site emits 429 yet; worker-capacity rejection occurs after durable acceptance
+  and surfaces as 409 `ownership-unknown`.
+
 ## Resource and action matrix
 
 | Resource / observation | Reviewed action / payload | Required guards and result |

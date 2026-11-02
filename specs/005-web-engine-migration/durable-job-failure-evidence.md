@@ -2,16 +2,21 @@
 
 ## Disposition and scope
 
-**Interim disposition:** the original bounded repair passed its combined, native
-NTFS and full suites, but independent review found a second call site with the same
-Windows ABI retention defect. That follow-up now has a failing-before/passing-after
-regression; validation on the merged PR head remains pending. Deliberate
-four-reader saturation remains a failed test-observation scenario, not a
-supported-load claim. This is a single Python runtime/test slice on Spec005/PR8,
-not migration or merge acceptance.
-Execution owner: repository `python-dev` persona; independent `qa-reviewer` static
-review completed. No dependency changes or real fund/provider/broker operations.
-Publication is deferred until merged-head review and validation.
+**Current disposition:** the repair is merged locally with PR8 head `1fb15be` and
+the final full Python suite passed **1657 tests, 42 skipped** on the merged
+artifact. The combined runtime/web suite passed **482 tests, 4 skipped**. A
+missed durable `apply_if_current` lock-acquisition retry was found by independent
+QA, reproduced red with a deterministic regression, and fixed with a paired
+non-retry test for `OperationBusy` raised by the effect itself. This single
+Python runtime/test slice is not migration or merge acceptance. Deliberate
+four-reader saturation evidence below predates the merge/retry change and is not
+a supported-load claim.
+Execution owner: repository `python-dev` persona. Initial independent QA blocked
+publication on the missed retry and stale evidence; the code and provenance
+updates are complete. Final independent static QA returned **PASS** with no
+blocking findings; the reviewer attributed, but did not rerun, the reported
+tests. No manifest changes or real fund/provider/broker operations. Publication
+to the existing PR remains pending.
 
 Starting revision: `d5858e4ae425a22c810e2315a16e4552fc1e0e2c`.
 The inherited `1551 passed, 42 skipped, 2 failed in 526.58 s` report is an input,
@@ -64,8 +69,10 @@ Repair: a process-local FIFO ticket queue keyed by native root identity and lane
 filename orders contenders **before** opening/acquiring their native lock.
 The native OS lock still grants authority; private-storage, root-identity,
 enrollment, owner and sidecar checks remain intact. Waiting consumes the existing
-budget; no timeout or admission bound increased. Different lanes/roots stay
-independent. Tickets are removed on success, timeout and exceptions.
+budget; this FIFO change did not increase its timeout or admission bound.
+Tickets are keyed by root identity and lane, so independent lanes/roots do not
+share a queue; no FIFO-specific independence regression was added. Tickets are
+removed on success, timeout and exceptions.
 
 The FIFO regression passed in the first focused **4 passed in 10.57 s** run.
 An adjacent regression verifies that an expired local waiter does not release
@@ -92,14 +99,17 @@ or included in the implementation. A separate synthetic unfair-lock replay
 completed after **80.7512891 s**; this negative result is retained rather than
 represented as a deterministic reproduction.
 
-The cancellation fake had a separate, exact failure path:
+The cancellation fake had a separate, exact fixture failure path:
 `release.wait(timeout=2)` ignored its false return, advanced to the second
 valuation and returned `None`. Under delayed parent settings work, the worker
 therefore tried to save `None` as a validated backtest report. The production
 type guard correctly raised `TypeError`; the registry converted it into the
 previously opaque `worker-failed`.
 
-Discrimination on the first repair artifact, before changing the fixture:
+Discrimination on the first repair artifact, before changing the fixture. The
+inherited full-suite report did not preserve the original exception, so this
+reproduction does **not** prove that the historical cancellation failure was
+this exact `TypeError`:
 
 - An owned, runtime-only three-second delay in active-job model-setting work
   reproduced the requested cancellation symbol: **1 failed in 9.82 s**.
@@ -121,8 +131,11 @@ Discrimination on the first repair artifact, before changing the fixture:
 Second repair: paused fake workers now wait for the explicit release event rather
 than a wall-clock expiry. This is a handshake correction, not a longer timeout.
 The existing parent observation bounds and unconditional `finally: release.set()`
-cleanup remain. The same correction applies to the two adjacent durable-registry
-progress/cancellation fake workers with identical premature-advance behavior.
+cleanup remain; the accept call also releases/closes if submission raises before
+the main `try/finally`. The release-wait regression injects an instrumented event
+only into that fake instead of replacing `threading.Event` process-wide. The same
+correction applies to the two adjacent durable-registry progress/cancellation fake
+workers with identical premature-advance behavior.
 No production report type guard, cancellation fence or provider guard was relaxed.
 
 The deterministic fixture regression, original cancellation, safe diagnostics and
@@ -251,14 +264,18 @@ no real market-data, LLM, paid-provider or broker calls.
 
 Only synthetic fixture-owned child processes/locks are used by native tests.
 No creator server on 8765, existing preview on 60639/PID45300, real funds/runners
-or unrelated process/worktree was controlled. The existing dependency environment
-is reused read-only; application source comes from this checkout, not its owning
-worktree. Bytecode/user-site/cache writes are disabled or isolated.
+or unrelated process/worktree was controlled. Application source comes from this
+checkout. Bytecode/user-site/cache writes are disabled or isolated.
 
-Environment: Windows, Python **3.13.7**, existing pytest **7.4.4** environment:
-`C:\Users\ChristianGjedrem\source\repos\copilot-worktrees\ai-hedge-fund\cgjedrem-vigilant-robot\outputs\spec005-poetry-envs\aihf-Tbl0PwyA-py3.13\Scripts\python.exe`.
-The system Python import probe lacked Textual; no installation was attempted,
-and the existing complete project environment was located instead.
+Merged-head tests use Windows Python **3.13.7**, pytest **7.4.4** from the
+existing LocalAppData Poetry environment
+`%LOCALAPPDATA%\pypoetry\Cache\virtualenvs\aihf-Tbl0PwyA-py3.13\Scripts\python.exe`.
+The first full run exposed that this environment lacked locked `curl_cffi==0.16.3`.
+The interpreter was repaired without network access or manifest changes: the
+cached Windows wheel's SHA-256 matched the exact `poetry.lock` hash
+`fe87b66e324ed7318166698e02169f3208dbda32b872a27d2bc61a9c19b335eb`, then it
+was installed with `pip --no-deps --no-index`. `cffi`, `certifi` and `pycparser`
+were already present. The initial missing-dependency run is not test evidence.
 
 The six-path pre-follow-up tracked code/test diff was measured with
 `git diff --binary -- hedge_fund/runtime/admission.py hedge_fund/runtime/test_admission.py hedge_fund/runtime/root.py hedge_fund/runtime/test_root.py hedge_fund/web/jobs.py hedge_fund/web/test_jobs.py`:
@@ -267,7 +284,7 @@ The six-path pre-follow-up tracked code/test diff was measured with
 This identity excludes the later ownership regression, this evidence document
 and ignored local experiment files.
 
-| Final source/test path | SHA-256 of exact working bytes |
+| Pre-merge source/test path (historical, superseded) | SHA-256 of exact working bytes |
 | --- | --- |
 | `hedge_fund\runtime\admission.py` | `1693ffdceed6a097ffa3b158fd3e0cef3b09f96529d9abdd3d8251930f06b1c6` |
 | `hedge_fund\runtime\test_admission.py` | `013aa83f4914828138deef244fd540efb248f9e0958c3ff0ad64433829bb3d22` |
@@ -278,15 +295,21 @@ and ignored local experiment files.
 
 Existing NTFS ACL/ext4 evidence documents are not edited. Root native ABI
 definitions are now reused, but native guard conditions are unchanged.
-Windows `OpenProcess` observation code is not edited. Verified unchanged Git blobs:
-`runtime\ownership.py` (working SHA-256
-`25636b43652f2129dc29c7c5b60b33fd275cf4da7211e9b5918e84fd93775196`),
+Windows `OpenProcess` observation code is not edited. `runtime\ownership.py` is
+changed only to reuse its existing `_FileTime` layout; its pre-fix SHA-256 was
+`25636b43652f2129dc29c7c5b60b33fd275cf4da7211e9b5918e84fd93775196`.
+The following are **pre-merge working-file SHA-256 values**, not Git blob IDs,
+and are not claims about the merged artifact:
 `paper\runner.py` (`b771877fa955b9ef0151ca8b86996ea5df37d603ae297cbf13b68e71da2326c3`),
-`runtime\operations.py` (`283cd6af28a1e5f2370eaefb06e09fa1e5ccfe12254a21721a4ded204c89c317`),
-and the two native test modules. Historical native evidence remains historical;
-it is not rebound to a new artifact by this document.
+`runtime\operations.py` (`283cd6af28a1e5f2370eaefb06e09fa1e5ccfe12254a21721a4ded204c89c317`).
+Historical native evidence remains historical; it is not rebound to a new
+artifact by this document.
 
-## Commands, windows and results
+## Pre-merge commands, windows and results (historical)
+
+The measurements in this section were made before integrating PR8 head
+`1fb15be`. They describe the earlier repair artifact only; they are not final
+merged-head confirmation.
 
 `H(label, options, paths)` below means the **exact command form**:
 
@@ -327,7 +350,12 @@ All owned poller/watchdog threads are joined; marked synthetic homes are cleaned
 | `combined-fixed` / final artifact combined | 20:52:08.209628–20:55:43.126703 | 272 passed, 4 skipped / 213.82 s; 214.9167386 s |
 | `poll-final` / deliberate four-reader saturation | 20:54:06.102597–20:54:42.335065 | 1 failed, 1 passed, 22 deselected / 35.41 s; 36.2323544 s |
 | `native-final` / actual NTFS locks, ACL, owned processes | 20:57:43.794150–20:58:00.918505 | 10 passed, 3 skipped / 16.38 s; 17.1242694 s |
-| `full-final` / final source artifact | 20:56:36.093505–21:02:11.972004 | 1562 passed, 42 skipped / 335.34 s; 335.8780349 s |
+| `full-final` / pre-merge final candidate | 20:56:36.093505–21:02:11.972004 | 1562 passed, 42 skipped / 335.34 s; 335.8780349 s |
+
+These are historical concurrent probes, not independent samples:
+`combined-fixed` overlaps the deliberately loading `poll-final`, and `full-final`
+overlaps `native-final`. The later merged-head final runtime/web and full-suite
+confirmations were run sequentially and are recorded separately below.
 
 Exact selectors:
 
@@ -364,14 +392,21 @@ Harness wall is the timed pytest/cleanup portion; Python launch and pre-test
 import/isolation setup are outside that measurement. It is not whole-command
 PowerShell elapsed time.
 
-Final full suite exit **0**: **1562 passed, 42 skipped in 335.34 s**. The original
-1553 non-skipped tests plus nine new parameterized regression cases account for
-the final count. Both originally requested symbols pass on this final artifact.
+Pre-merge full suite exit **0**: **1562 passed, 42 skipped in 335.34 s**. The
+original 1553 non-skipped tests plus nine new parameterized regression cases
+account for that historical count. Both originally requested symbols pass on
+that pre-merge artifact. This result is superseded for publication by merged-head
+confirmation.
 One `PytestAssertRewriteWarning` for pre-imported AnyIO accompanies the safe
 pre-import harness; it is not a test failure. No root guard, timeout, consent or
 full-suite selector was weakened to obtain green. Pytest's cache plugin was
 disabled and real provider network calls were blocked consistently in this safe
 isolated harness, not selectively removed after a failing run.
+
+The preceding statements describe the **pre-merge repair artifact only**. PR8's
+merged source already contains the bounded 30-second, busy-only operation retry;
+this follow-up did not raise that bound and uses it for the previously omitted
+`apply_if_current` acquisition.
 
 `native-final` observes actual NTFS file identity, cross-process lock exclusion,
 atomic replacement/reader bytes, non-delete-sharing denial, root-handle binding,
@@ -432,29 +467,128 @@ dotenv, real provider endpoints, paid consent or real-root arguments.
 - This evidence file. Ignored `outputs` contain owned harnesses/raw synthetic
   evidence only, not shipped application or installed-package changes.
 
-Static style: **PASS** on all six changed Python paths, without modifying source:
+Pre-merge static style (historical): **PASS** on the then-changed six Python paths, without modifying source:
 Black `--check` exit 0 (**1.609876 s**), isort `--check-only` exit 0
 (**0.460119 s**), flake8 `--max-line-length=420 --extend-ignore=E203,W503` exit 0
 (**2.703872 s**), `git diff --check` exit 0. The three tool processes used
 `child_test_environment()` inside the single marked checkout-owned isolation root.
 UTC window **20:55:26.910925–20:55:31.693347**, 2026-11-01;
 raw output `outputs\job-static-final.log`. Static checks are not runtime evidence.
-Self-review is direct, not independent QA approval; native ABI fields and guard
-conditions are preserved, queue cleanup is explicitly tested, and diagnostic
-records have no exception/frame attachments. Final full-suite confirmation is
-**PASS**, source/fake/native tiers as identified above.
+Native ABI fields and guard conditions are preserved, queue cleanup is explicitly
+tested, and diagnostic records have no exception/frame attachments. The merged-head
+static verification recorded in the current validation section applies to the
+final repair files.
 
 No installed-wheel, browser, production provider, real runner, bare-metal Linux
 or current ext4 FIFO observation is claimed. Native fixture tests are distinguished
 from actual production use. FIFO cannot make unbounded reader saturation cheap:
 the deliberately excessive four-reader scenario exceeded the unchanged
 twenty-second test observation window on the **intermediate** FIFO-only artifact.
-Final saturation still exceeds that **test observation window**: the preview
-remains running and is cooperatively cancelled by test cleanup. The final safe
-probe records **no acquisition failure or hidden worker exception**, only expected
-`JobCancelled`; longest individual exclusive hold is **0.2193930 s**.
+The last recorded pre-merge saturation run also exceeded that observation window:
+the preview remained running and was cooperatively cancelled by test cleanup.
+That probe recorded **no acquisition failure or hidden worker exception**, only
+expected `JobCancelled`; longest individual exclusive hold was **0.2193930 s**.
+It has not been rerun with the merged 30-second busy retry, so it must not be
+described as a current-head result.
 This negative load scenario is not promoted to PASS or represented as evidence
 that arbitrary monitoring pressure is supported. It is distinct from the now-green
 representative combined suite and the eliminated retained-type growth.
 Cross-process OS-lock fairness is still
 the OS's responsibility; native locks/denials remain authoritative.
+
+## Merged-head confirmation (current repair)
+
+PR8's verified head before this integration was
+`1fb15be7c3f6368e333e5fdb62cb26fc2ec6f269`. The worktree merge uses this commit
+as `MERGE_HEAD`; no PR8 head advance was observed at the merge point. The
+pre-merge rows above do not establish results for this combined artifact.
+
+The original two inherited web-job failures did not retain their underlying
+worker exceptions, so their exact historical trigger remains unattributed. The
+current code-level defect was discriminated separately: the worker passed
+`OperationStore.apply_if_current` directly to work callbacks, unlike other
+durable store transitions. A bounded registry-lock timeout raised `OperationBusy`,
+which escaped the work phase and was recorded as `worker-failed`. A regression
+that raises `OperationBusy` before the callback first failed (`FAILED` rather
+than `COMPLETED`); after the fix it passed by retrying before the effect. Its
+paired test raises the same exception from inside the effect and verifies there
+is no second effect attempt. The wrapper marks the effect as started before
+invoking it, and `_retry_busy` retries this call only while that marker remains
+false. The established bounded retry duration remains 30 seconds; no admission,
+approval, cancellation or public error behavior was weakened.
+
+Validation on Windows, Python 3.13.7 / pytest 7.4.4, with synthetic roots and
+fake transports only. `PYTHON_DOTENV_DISABLED=1`; provider, credential, broker
+and proxy environment variables were removed for pytest. No live provider,
+paid, broker or runner operation was made.
+
+| Validation | Result |
+| --- | --- |
+| New regression before fix | **1 failed, 1 passed, 34 deselected in 3.76 s**, exit 1; the pre-effect busy case persisted `FAILED`. |
+| Final focused job regressions | **4 passed, 32 deselected in 21.11 s**, exit 0; UTC `2026-11-02T09:52:41.5786857Z`–`2026-11-02T09:53:05.0157623Z`. Selector: `hedge_fund/web/test_jobs.py -k 'busy_apply_if_current_retries_before_effect or busy_from_apply_if_current_effect_is_not_retried or reviewed_operation_preview_accept or reviewed_backtest_cancellation'`. |
+| YFinance mocked client tests after environment repair | **79 passed in 0.19 s**, exit 0; UTC `2026-11-02T09:53:05.0285965Z`–`2026-11-02T09:53:07.1069339Z`. |
+| Combined `hedge_fund/runtime hedge_fund/web` | **482 passed, 4 skipped in 474.59 s**, exit 0; UTC `2026-11-02T09:53:07.1069339Z`–`2026-11-02T10:01:04.0439346Z`. |
+| Final full suite, first attempt | **1 failed, 1656 passed, 42 skipped in 543.51 s**, exit 1; UTC `2026-11-02T09:26:18.8376407Z`–`2026-11-02T09:35:24.6598171Z`. `test_archive_interruption_is_explicitly_recoverable` encountered Windows `PermissionError [WinError 5]` during the unrelated native directory rename; the exact test passed alone in 1.98 s. This single failure is not attributed to the repair and the isolated pass is not considered resolution. |
+| Final full suite, confirmation | **1657 passed, 42 skipped in 593.22 s**, exit 0; UTC `2026-11-02T10:01:16.8652921Z`–`2026-11-02T10:11:12.2579461Z`. Command: `python -m pytest -q --disable-warnings --tb=short`. |
+
+The initial merged-artifact full-suite attempt before dependency repair was not
+valid test evidence: **64 failed, 1590 passed, 43 skipped**; all 64
+`test_yfinance_client.py` cases failed because the existing test interpreter
+lacked required, lockfile-pinned yfinance packages
+(`yfinance`, `curl_cffi`, Beautiful Soup, lxml, multitasking, peewee and
+SoupSieve). Their cached wheel hashes were checked against `poetry.lock` and
+installed offline without dependency or manifest changes. `pip check` then
+reported no broken requirements; the 79-test mocked YFinance module passed
+without network access.
+
+The final repair's eight focused Python source/test files have these exact
+working-byte SHA-256 values:
+
+| Path | SHA-256 |
+| --- | --- |
+| `hedge_fund/runtime/admission.py` | `7d4085166f17272d7207eab974177fd73764cc04d502cfa7ccbced14150cd00e` |
+| `hedge_fund/runtime/test_admission.py` | `8fcc54404b72cb29de9fc3b32ffcdc837c80a11c3fd3314f202b36908857da7e` |
+| `hedge_fund/runtime/root.py` | `4ca9239d86c8908c705b23023d0691c75f3b53df6f3679263b6412f305861f6c` |
+| `hedge_fund/runtime/test_root.py` | `ea774aef573945dbce2429b85c2ad3c49079a06f5d0d95b4eff2a6c95d045b69` |
+| `hedge_fund/runtime/ownership.py` | `bb0b60f760c81bbc58ecb3bf1bf7f7634a0dbcacf36bfe75cb783b7d66cee9b4` |
+| `hedge_fund/runtime/test_ownership.py` | `9917d5145204d6618844aa9670aac4944c2ef8d5d1767d93460727a9c5b68bb8` |
+| `hedge_fund/web/jobs.py` | `d387f7c78d53ee857d8a9c2b7c086c0b52230bd04733a9de3b806bd2abf21903` |
+| `hedge_fund/web/test_jobs.py` | `d16df82d6e56024a675121afc9a5cf6e3cbacf599fa865b0b3b50ccf35de8acb` |
+
+Complete merged source/test identity: **284 tracked paths**, covering all files
+under `hedge_fund/` and `frontend/`, plus `pyproject.toml` and `poetry.lock`;
+paths are Git-sorted and the SHA-256 digest incorporates each UTF-8 path, NUL,
+exact working bytes and NUL. Digest:
+`492e8c39edae09777ced371a8e0c7ee9895db94856de18e9491828f3748ccdce`. This binds
+the final full-suite source, including merged PR8 files such as `web/services.py`;
+only this evidence markdown changed after that run.
+
+Final scoped static verification on those same eight paths: Black
+`--check`, isort `--check-only`, and flake8
+`--max-line-length=420 --extend-ignore=E203,W503` all exited 0; whole staged
+plus unstaged `git diff --check HEAD --` exited 0. No source was modified by
+these checks.
+
+Merged-head pytest used the existing Poetry interpreter
+`C:\Users\ChristianGjedrem\AppData\Local\pypoetry\Cache\virtualenvs\aihf-Tbl0PwyA-py3.13\Scripts\python.exe`.
+Before pytest, a PowerShell loop removed inherited environment variables whose
+names matched `(?i)(API[_-]?KEY|TOKEN|SECRET|PROVIDER|BROKER|PROXY)`, then set
+`PYTHON_DOTENV_DISABLED=1` and `PYTHONDONTWRITEBYTECODE=1`. The focus selector,
+mocked Yahoo tests and combined runtime/web suite above used this same isolation.
+The full suite also passed once earlier at `09:36:43Z`–`09:46:24Z`
+(1657 passed, 42 skipped); the later final run confirms the test-helper-only
+change and is the current evidence.
+
+Final independent QA: **PASS, no blocking findings**. The reviewer verified the
+pre-effect-only retry, the no-retry-from-effect regression, FIFO/native safety
+and redacted diagnostics by source inspection. The reviewer did not execute
+tests or verify hashes; test and hash rows above are execution-owner evidence.
+The exact historical worker exceptions from the two inherited failures remain
+unavailable, so the defect fixed here is the reproduced code-level failure
+class, not a proven attribution of both old failures.
+
+These results complete only the durable-job failure repair slice. Spec005
+remains **20/148 tasks complete**; no migration-wide, production, browser,
+installed-artifact or bare-metal Linux acceptance is implied. Deliberate
+four-reader saturation has not been rerun with the merged 30-second busy retry
+and remains an unaccepted load scenario.

@@ -39,8 +39,18 @@ def test_process_identity_rejects_pid_only_and_invalid_inputs():
     reason="Windows CPython pointer-type cache is unavailable",
 )
 def test_windows_process_identity_does_not_retain_pointer_types_per_call():
+    pointer_type_cache = ctypes._pointer_type_cache
+
+    class PointerCacheProbe(ctypes.Structure):
+        _fields_ = [("value", ctypes.c_int)]
+
+    cache_size = len(pointer_type_cache)
+    ctypes.POINTER(PointerCacheProbe)
+    if len(pointer_type_cache) == cache_size:
+        pytest.skip("this CPython version does not expose pointer-type cache growth")
+
     def retained_types():
-        return {entry for entry in ctypes._pointer_type_cache if getattr(entry, "__module__", None) == ownership.__name__}
+        return {entry for entry in pointer_type_cache if getattr(entry, "__module__", None) == ownership.__name__}
 
     current_process_identity()
     before = retained_types()

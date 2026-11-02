@@ -12,6 +12,7 @@ from urllib.parse import urlsplit
 from fastapi import FastAPI, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, Response
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from hedge_fund.runtime.root import RootContext
 from hedge_fund.web.schemas import (
@@ -19,7 +20,10 @@ from hedge_fund.web.schemas import (
     CapabilitiesResponse,
     CredentialRequest,
     DeployRequest,
+    error_payload,
     HaltRequest,
+    LifecycleAcceptRequest,
+    LifecyclePreviewRequest,
     MandateCreateRequest,
     MandateRevisionRequest,
     ModelRequest,
@@ -92,7 +96,7 @@ class RequestBodyLimitMiddleware:
         await self.app(scope, replay_receive, send)
 
     async def _reject(self, scope, send) -> None:
-        response = JSONResponse({"detail": "Request body exceeds the 1 MB limit."}, status_code=413)
+        response = _error_response(413, "Request body exceeds the 1 MB limit.")
         _security_headers(response, scope.get("path", ""))
         await response(scope, _empty_receive, send)
 
@@ -159,27 +163,22 @@ def create_app(
         emergency_control = not service.allow_writes and service.emergency_halt_available and method == "POST" and _is_emergency_control_path(request.url.path)
         mutation_allowed = service.allow_writes or emergency_control
         if parsed_host is None:
-            response = JSONResponse({"detail": "Host must be a loopback address."}, status_code=403)
+            response = _error_response(403, "Host must be a loopback address.")
         else:
             origin = request.headers.get("origin")
             if origin is not None and not _same_origin(origin, host, request.url.scheme):
-                response = JSONResponse({"detail": "Origin must match the loopback host."}, status_code=403)
+                response = _error_response(403, "Origin must match the loopback host.")
             elif method not in _SAFE_METHODS and not mutation_allowed:
-                response = JSONResponse({"detail": "Write capability is disabled for this server."}, status_code=403)
+                response = _error_response(403, "Write capability is disabled for this server.", code="read-only")
             elif method not in _SAFE_METHODS and mutation_allowed and not _is_loopback_peer(request.client.host if request.client else None):
-                response = JSONResponse(
-                    {"detail": "Writable server requires a loopback client connection."},
-                    status_code=403,
-                )
+                response = _error_response(403, "Writable server requires a loopback client connection.")
             elif method not in _SAFE_METHODS and mutation_allowed and operator_session is None:
-                response = JSONResponse(
-                    {"detail": "A valid server-owned operator session is required."},
-                    status_code=403,
-                )
+                # A server restart rotates the signing key; the browser can renew read-only and resubmit only by review.
+                response = _renewable_denial("A valid server-owned operator session is required.")
             elif method not in _SAFE_METHODS and origin is None:
-                response = JSONResponse({"detail": "Mutation requires a same-origin request."}, status_code=403)
+                response = _error_response(403, "Mutation requires a same-origin request.")
             elif method not in _SAFE_METHODS and not _valid_token(request.headers.get("x-csrf-token"), token):
-                response = JSONResponse({"detail": "Mutation token is missing or invalid."}, status_code=403)
+                response = _renewable_denial("Mutation token is missing or invalid.")
             else:
                 response = await call_next(request)
         if operator_session is None and (service.allow_writes or service.emergency_halt_available) and _is_loopback_peer(request.client.host if request.client else None) and parsed_host is not None:
@@ -201,17 +200,36 @@ def create_app(
         return response
 
     @app.exception_handler(ServiceError)
-    async def service_error_handler(_request: Request, exc: ServiceError):
-        return JSONResponse({"detail": exc.detail}, status_code=exc.status_code)
+    async def service_error_handler(request: Request, exc: ServiceError):
+        return _error_response(
+            exc.status_code,
+            exc.detail,
+            code=exc.code,
+            subject_id=exc.subject_id if exc.subject_id is not None else _path_subject(request),
+            request_id=exc.request_id,
+            current_head=exc.current_head,
+            retry_policy=exc.retry_policy,
+        )
+
+    @app.exception_handler(StarletteHTTPException)
+    async def http_error_handler(_request: Request, exc: StarletteHTTPException):
+        detail = exc.detail if isinstance(exc.detail, str) else "Request failed."
+        response = _error_response(exc.status_code, detail)
+        for name, value in (exc.headers or {}).items():
+            response.headers[name] = value
+        return response
 
     @app.exception_handler(RequestValidationError)
-    async def request_validation_handler(_request: Request, exc: RequestValidationError):
-        details = [{"loc": list(error.get("loc", ())), "type": error.get("type", "value_error"), "message": "Invalid request."} for error in exc.errors()]
-        return JSONResponse({"detail": details}, status_code=422)
+    async def request_validation_handler(request: Request, exc: RequestValidationError):
+        details = [{"loc": [_safe_loc_part(part) for part in error.get("loc", ())], "type": _safe_loc_part(error.get("type", "value_error")), "message": "Invalid request."} for error in exc.errors()]
+        return _error_response(400, details, code="invalid-request", subject_id=_path_subject(request))
 
     @app.exception_handler(Exception)
-    async def safe_unhandled_handler(_request: Request, _exc: Exception):
-        return JSONResponse({"detail": "Internal server error."}, status_code=500)
+    async def safe_unhandled_handler(request: Request, _exc: Exception):
+        # Runs in ServerErrorMiddleware, outside local_boundary, so headers are applied here.
+        response = _error_response(500, "Internal server error.")
+        _security_headers(response, request.url.path)
+        return response
 
     @app.get("/api/capabilities", response_model=CapabilitiesResponse)
     def capabilities():
@@ -224,6 +242,29 @@ def create_app(
     @app.get("/api/home")
     def home():
         return service.home()
+
+    @app.get("/api/lifecycle/archives")
+    def lifecycle_archives():
+        return service.list_lifecycle_archives()
+
+    @app.get("/api/lifecycle/archives/{archive_id}")
+    def lifecycle_archive(archive_id: str):
+        return service.get_lifecycle_archive(archive_id)
+
+    @app.post("/api/lifecycle/preview")
+    def lifecycle_preview(body: LifecyclePreviewRequest, request: Request):
+        return service.create_lifecycle_preview(
+            body,
+            operator_session=request.state.operator_session,
+        )
+
+    @app.post("/api/lifecycle/accept", status_code=202)
+    def lifecycle_accept(body: LifecycleAcceptRequest, request: Request):
+        return _with_request_identity(
+            lambda: service.accept_lifecycle(body, operator_session=request.state.operator_session),
+            request_id=body.request_id,
+            subject_id=body.archive_id or body.identity,
+        )
 
     @app.get("/api/mandates")
     def mandates():
@@ -275,10 +316,10 @@ def create_app(
 
     @app.post("/api/paper/{name}/tick", status_code=202)
     def paper_tick(name: str, request: PaperTickAcceptRequest, http_request: Request):
-        return service.accept_manual_tick(
-            name,
-            request,
-            operator_session=http_request.state.operator_session,
+        return _with_request_identity(
+            lambda: service.accept_manual_tick(name, request, operator_session=http_request.state.operator_session),
+            request_id=request.request_id,
+            subject_id=name,
         )
 
     @app.post("/api/paper/{name}/runner/preview", status_code=201)
@@ -291,10 +332,10 @@ def create_app(
 
     @app.post("/api/paper/{name}/runner", status_code=202)
     def runner_start(name: str, request: RunnerStartAcceptRequest, http_request: Request):
-        return service.accept_runner_start(
-            name,
-            request,
-            operator_session=http_request.state.operator_session,
+        return _with_request_identity(
+            lambda: service.accept_runner_start(name, request, operator_session=http_request.state.operator_session),
+            request_id=request.request_id,
+            subject_id=name,
         )
 
     @app.get("/api/paper/{name}/runner")
@@ -363,9 +404,10 @@ def create_app(
 
     @app.post("/api/operations", status_code=202)
     def accept_operation(request: OperationAcceptRequest, http_request: Request):
-        return service.accept_operation(
-            request,
-            operator_session=http_request.state.operator_session,
+        return _with_request_identity(
+            lambda: service.accept_operation(request, operator_session=http_request.state.operator_session),
+            request_id=request.request_id,
+            subject_id=request.subject_id,
         )
 
     @app.get("/api/operations")
@@ -378,7 +420,11 @@ def create_app(
 
     @app.post("/api/operations/{operation_id}/cancel")
     def cancel_operation(operation_id: str, request: OperationCancelRequest):
-        return service.cancel_operation(operation_id, request)
+        return _with_request_identity(
+            lambda: service.cancel_operation(operation_id, request),
+            request_id=request.request_id,
+            subject_id=operation_id,
+        )
 
     @app.get("/api/settings")
     def settings():
@@ -414,7 +460,7 @@ def create_app(
     @app.get("/{path:path}")
     def spa(path: str):
         if path == "api" or path.startswith("api/"):
-            return JSONResponse({"detail": "Not found."}, status_code=404)
+            return _error_response(404, "Not found.")
         return _spa_response(app.state.static_root, path)
 
     return app
@@ -495,6 +541,46 @@ def _is_emergency_control_path(value: str) -> bool:
     return len(parts) == 5 and parts[0] == "" and parts[1] == "api" and parts[2] == "paper" and bool(parts[3]) and parts[4] in {"halt", "resume"}
 
 
+_SAFE_LOC_PART = re.compile(r"[A-Za-z_][A-Za-z0-9_.-]{0,63}")
+
+
+def _safe_loc_part(part):
+    """Echo only bounded identifiers or indexes; request-supplied keys stay inert."""
+    if type(part) is int:
+        return part
+    if isinstance(part, str) and _SAFE_LOC_PART.fullmatch(part):
+        return part
+    return "<redacted>"
+
+
+def _error_response(status_code: int, detail, *, code: str | None = None, **identity) -> JSONResponse:
+    return JSONResponse(error_payload(status_code, detail, code=code, **identity), status_code=status_code)
+
+
+def _renewable_denial(detail: str) -> JSONResponse:
+    """Session/token denial after restart or expiry: renew via read-only capabilities, never auto-resubmit."""
+    return _error_response(403, detail, refresh_required=True, retry_policy="reload")
+
+
+_SUBJECT_PATH_PARAMS = ("operation_id", "archive_id", "report_id", "name")
+
+
+def _path_subject(request: Request) -> str | None:
+    params = request.path_params or {}
+    for key in _SUBJECT_PATH_PARAMS:
+        value = params.get(key)
+        if value is not None:
+            return value
+    return None
+
+
+def _with_request_identity(call, *, request_id: str, subject_id: str | None = None):
+    try:
+        return call()
+    except ServiceError as exc:
+        raise exc.attach(subject_id=subject_id, request_id=request_id)
+
+
 def _security_headers(response: Response, path: str) -> None:
     response.headers["Content-Security-Policy"] = _CSP
     response.headers["X-Content-Type-Options"] = "nosniff"
@@ -507,10 +593,7 @@ def _security_headers(response: Response, path: str) -> None:
 
 def _spa_response(static_root: Path | None, relative: str) -> Response:
     if static_root is None:
-        return JSONResponse(
-            {"detail": "Frontend build is missing; run npm --prefix frontend ci and npm --prefix frontend run build."},
-            status_code=503,
-        )
+        return _error_response(503, "Frontend build is missing; run npm --prefix frontend ci and npm --prefix frontend run build.")
     if relative:
         candidate = static_root.joinpath(*Path(relative).parts)
         try:
@@ -520,8 +603,8 @@ def _spa_response(static_root: Path | None, relative: str) -> Response:
         if resolved is not None and resolved != static_root and static_root in resolved.parents and resolved.is_file():
             return FileResponse(resolved)
         if relative.startswith("assets/"):
-            return JSONResponse({"detail": "Asset not found."}, status_code=404)
+            return _error_response(404, "Asset not found.")
     index = static_root / "index.html"
     if not index.is_file() or index.is_symlink():
-        return JSONResponse({"detail": "Frontend build is missing its index."}, status_code=503)
+        return _error_response(503, "Frontend build is missing its index.")
     return FileResponse(index)

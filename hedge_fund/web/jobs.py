@@ -5,12 +5,15 @@ from __future__ import annotations
 import logging
 import re
 import threading
+import time
 import uuid
 from collections.abc import Callable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timezone
+from typing import TypeVar
 
 from hedge_fund.runtime.operations import (
+    OperationBusy,
     OperationRecord,
     OperationStatus,
     OperationStore,
@@ -18,6 +21,8 @@ from hedge_fund.runtime.operations import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+_BUSY_RETRY_SECONDS = 30.0
+_T = TypeVar("_T")
 
 
 class JobConflict(RuntimeError):
@@ -124,7 +129,7 @@ class OperationJobRegistry:
             future = self._submitted.get(operation_id)
             if future is None:
                 try:
-                    return self._store.acknowledge_cancel(operation_id, None, now=self._now())
+                    return self._retry_busy(lambda: self._store.acknowledge_cancel(operation_id, None, now=self._now()))
                 except WorkerFenced:
                     return self._store.get_operation(operation_id)
             if future.cancel():
@@ -194,85 +199,124 @@ class OperationJobRegistry:
     ) -> None:
         fence = None
         try:
-            fence = self._store.claim_worker(
-                operation_id,
-                worker_id=uuid.uuid4().hex,
-                now=self._now(),
+            fence = self._retry_busy(
+                lambda: self._store.claim_worker(
+                    operation_id,
+                    worker_id=uuid.uuid4().hex,
+                    now=self._now(),
+                )
             )
-            self._store.mark_running(operation_id, fence, now=self._now())
+            self._retry_busy(lambda: self._store.mark_running(operation_id, fence, now=self._now()))
         except WorkerFenced:
             self._acknowledge_cancellation(operation_id, fence)
             self._finish_local(operation_id)
             return
         except Exception as exc:
             try:
-                self._store.interrupt(operation_id, now=self._now())
+                self._retry_busy(lambda: self._store.interrupt(operation_id, now=self._now()))
             except Exception as interrupt_exc:
-                _log_failure("interrupt", interrupt_exc)
+                _log_failure("interrupt", interrupt_exc, operation_id=operation_id)
             self._finish_local(operation_id)
-            _log_failure("claim", exc)
+            _log_failure("claim", exc, operation_id=operation_id)
             return
 
         def report_progress(value: int) -> None:
             if type(value) is not int:
                 raise ValueError("progress is invalid")
             bounded = min(99, max(0, value))
-            self._store.update_progress(
-                operation_id,
-                fence,
-                progress=bounded,
-                now=self._now(),
+            self._retry_busy(
+                lambda: self._store.update_progress(
+                    operation_id,
+                    fence,
+                    progress=bounded,
+                    now=self._now(),
+                )
             )
 
         def cancellation_requested() -> bool:
             if self._shutdown_requested.is_set():
                 return True
             try:
-                return self._store.cancellation_requested(operation_id, fence)
+                return self._retry_busy(lambda: self._store.cancellation_requested(operation_id, fence))
             except WorkerFenced:
                 return True
 
         def apply_if_current(effect: Callable[[], object]) -> object:
-            return self._store.apply_if_current(operation_id, fence, effect)
+            effect_started = False
+
+            def guarded_effect() -> object:
+                nonlocal effect_started
+                effect_started = True
+                return effect()
+
+            return self._retry_busy(
+                lambda: self._store.apply_if_current(operation_id, fence, guarded_effect),
+                retry_if=lambda: not effect_started,
+            )
 
         phase = "work"
         try:
             result = work(report_progress, cancellation_requested, apply_if_current)
             phase = "complete"
-            self._store.complete(operation_id, fence, result=result, now=self._now())
+            self._retry_busy(lambda: self._store.complete(operation_id, fence, result=result, now=self._now()))
         except JobCancelled:
             self._acknowledge_cancellation(operation_id, fence)
         except WorkerFenced:
             self._acknowledge_cancellation(operation_id, fence)
         except Exception as exc:
             try:
-                self._store.fail(
-                    operation_id,
-                    fence,
-                    error_code="worker-failed",
-                    now=self._now(),
+                self._retry_busy(
+                    lambda: self._store.fail(
+                        operation_id,
+                        fence,
+                        error_code="worker-failed",
+                        now=self._now(),
+                    )
                 )
             except WorkerFenced:
                 pass
             except Exception as failure_exc:
-                _log_failure("fail", failure_exc)
-            _log_failure(phase, exc)
+                _log_failure("fail", failure_exc, operation_id=operation_id)
+            _log_failure(phase, exc, operation_id=operation_id)
         finally:
             self._finish_local(operation_id)
+
+    def _retry_busy(
+        self,
+        step: Callable[[], _T],
+        *,
+        retry_if: Callable[[], bool] | None = None,
+    ) -> _T:
+        # OperationBusy is raised only when the bounded lock wait expired before any durable change.
+        deadline = time.monotonic() + _BUSY_RETRY_SECONDS
+        delay = 0.05
+        while True:
+            try:
+                return step()
+            except OperationBusy:
+                if retry_if is not None and not retry_if():
+                    raise
+                if self._shutdown_requested.is_set() or time.monotonic() >= deadline:
+                    raise
+                time.sleep(delay)
+                delay = min(delay * 2, 0.5)
 
     def _acknowledge_cancellation(
         self,
         operation_id: str,
         fence,
     ) -> None:
-        try:
+        def acknowledge_if_requested() -> None:
             operation = self._store.get_operation(operation_id)
             if operation.status is OperationStatus.CANCEL_REQUESTED:
                 self._store.acknowledge_cancel(operation_id, fence, now=self._now())
+
+        try:
+            self._retry_busy(acknowledge_if_requested)
         except WorkerFenced:
             pass
         except Exception as exc:
-            _log_failure("acknowledge-cancel", exc)
+            _log_failure("acknowledge-cancel", exc, operation_id=operation_id)
 
     def _finish_local(self, operation_id: str) -> None:
         with self._lock:
@@ -283,13 +327,15 @@ class OperationJobRegistry:
             if future.cancelled():
                 operation = self._store.get_operation(operation_id)
                 if operation.status is OperationStatus.CANCEL_REQUESTED:
-                    self._store.acknowledge_cancel(
-                        operation_id,
-                        None,
-                        now=self._now(),
+                    self._retry_busy(
+                        lambda: self._store.acknowledge_cancel(
+                            operation_id,
+                            None,
+                            now=self._now(),
+                        )
                     )
         except Exception as exc:
-            _log_failure("future-cancel", exc)
+            _log_failure("future-cancel", exc, operation_id=operation_id)
         finally:
             self._finish_local(operation_id)
 
@@ -321,7 +367,7 @@ def _now_datetime() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _log_failure(phase: str, error: Exception) -> None:
+def _log_failure(phase: str, error: Exception, *, operation_id: str | None = None) -> None:
     """Emit bounded types/codes/source locations; never exception text or frames."""
     cause = error
     seen = {id(cause)}
@@ -343,7 +389,8 @@ def _log_failure(phase: str, error: Exception) -> None:
 
     def error_type(value: BaseException) -> str:
         cls = type(value)
-        if cls.__module__ == "builtins" or cls.__module__.startswith("hedge_fund."):
+        module = cls.__module__
+        if isinstance(module, str) and (module == "builtins" or module.startswith("hedge_fund.")):
             if re.fullmatch(r"[A-Za-z0-9_]{1,64}", cls.__name__):
                 return cls.__name__
         return "ExternalError"
@@ -352,8 +399,10 @@ def _log_failure(phase: str, error: Exception) -> None:
         value = getattr(cause, name, None)
         return value if type(value) is int else None
 
+    safe_operation_id = operation_id if isinstance(operation_id, str) and re.fullmatch(r"[a-f0-9]{32}", operation_id) else "unavailable"
     _LOGGER.error(
-        "operation worker failure: phase=%s type=%s cause_type=%s errno=%s winerror=%s locations=%s",
+        "operation worker failure: operation_id=%s phase=%s type=%s cause_type=%s errno=%s winerror=%s locations=%s",
+        safe_operation_id,
         phase,
         error_type(error),
         error_type(cause),

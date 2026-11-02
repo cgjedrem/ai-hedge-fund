@@ -125,9 +125,27 @@ def test_timed_out_local_waiter_preserves_holder_and_releases_queue(admission_ro
     _root, context, _owner, coordinator = admission_root
     key = admission._thread_lock_key(context, f"{LOCK_DIRECTORY}/registry.lock")
     with coordinator.registry_lock():
-        with pytest.raises(WriterConflict):
-            with coordinator.registry_lock(timeout=0):
-                pytest.fail("a conflicting writer was admitted")
+        attempted = Event()
+        completed = Event()
+        result = []
+
+        def wait_for_held_lane():
+            attempted.set()
+            try:
+                with coordinator.registry_lock(timeout=0):
+                    result.append("admitted")
+            except WriterConflict as exc:
+                result.append(exc)
+            finally:
+                completed.set()
+
+        waiter = Thread(target=wait_for_held_lane, name="timed-out-local-waiter")
+        waiter.start()
+        assert attempted.wait(timeout=5)
+        assert completed.wait(timeout=5)
+        waiter.join(timeout=5)
+        assert not waiter.is_alive()
+        assert len(result) == 1 and isinstance(result[0], WriterConflict)
         assert coordinator.lane_is_held("registry")
         assert len(admission._LOCAL_LANES[key]) == 1
         with coordinator.registry_read_lock():

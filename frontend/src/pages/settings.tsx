@@ -2,7 +2,7 @@ import { AlertCircle, CheckCircle2, KeyRound, LockKeyhole, RadioTower, Settings2
 import { useEffect, useState } from "react";
 
 import { MetricCard } from "@/components/metric-card";
-import { ErrorState, PageHeader, SectionTitle } from "@/components/page";
+import { ErrorNotice, ErrorState, PageHeader, SectionTitle } from "@/components/page";
 import { Alert } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -17,11 +17,12 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { apiDelete, apiPost, apiPut } from "@/lib/api";
+import { toActionableError, type ActionableError } from "@/lib/errors";
 import { useDesk, useResource } from "@/lib/hooks";
 import type { Settings } from "@/lib/types";
 
 export function SettingsPage() {
-  const { capabilities } = useDesk();
+  const { capabilities, reconnect } = useDesk();
   const resource = useResource<Settings>("/api/settings");
   const settings = resource.data;
   const [selectedModel, setSelectedModel] = useState("");
@@ -36,7 +37,11 @@ export function SettingsPage() {
   const [credential, setCredential] = useState("");
   const [savingSettings, setSavingSettings] = useState(false);
   const [savingCredential, setSavingCredential] = useState(false);
-  const [feedback, setFeedback] = useState<{ tone: "danger" | "neutral"; message: string } | null>(null);
+  const [feedback, setFeedback] = useState<{ tone: "danger" | "neutral"; message: string; error?: ActionableError } | null>(null);
+  const fail = (cause: unknown, fallback: string) => {
+    const error = toActionableError(cause, fallback);
+    setFeedback({ tone: "danger", message: error.message, error });
+  };
   const canWrite = capabilities?.writes === true;
   const credentialProviders = settings?.providers.filter((item) => item.requires_key) ?? [];
   const selectedCredentialProvider = credentialProviders.find((item) => item.provider === provider);
@@ -111,7 +116,7 @@ export function SettingsPage() {
       setFeedback({ tone: "neutral", message: "Runtime settings are saved in this root. New operations capture this version; active captures and the shared .env file are unchanged." });
       resource.refresh();
     } catch (cause) {
-      setFeedback({ tone: "danger", message: cause instanceof Error ? cause.message : "Runtime settings could not be saved." });
+      fail(cause, "Runtime settings could not be saved.");
     } finally {
       setSavingSettings(false);
     }
@@ -132,7 +137,7 @@ export function SettingsPage() {
       setFeedback({ tone: "neutral", message: `Credential saved for ${provider}. The value is not returned or displayed.` });
       resource.refresh();
     } catch (cause) {
-      setFeedback({ tone: "danger", message: cause instanceof Error ? cause.message : "Credential could not be saved." });
+      fail(cause, "Credential could not be saved.");
     } finally {
       setSavingCredential(false);
     }
@@ -149,7 +154,7 @@ export function SettingsPage() {
       setFeedback({ tone: "neutral", message: `Credential removed for ${provider}. Existing captures retain their prior version.` });
       resource.refresh();
     } catch (cause) {
-      setFeedback({ tone: "danger", message: cause instanceof Error ? cause.message : "Credential could not be deleted." });
+      fail(cause, "Credential could not be deleted.");
     } finally {
       setSavingCredential(false);
     }
@@ -163,11 +168,23 @@ export function SettingsPage() {
         description="Inspect model and provider readiness without revealing key values. Network and write permissions are immutable for this server process."
       />
       {resource.loading ? <div className="mb-5 h-24 animate-pulse rounded-xl border border-border bg-white/[0.025]" /> : null}
-      {resource.error ? <div className="mb-5"><ErrorState message={resource.error} /></div> : null}
+      {resource.error ? <div className="mb-5"><ErrorState message={resource.error} error={resource.apiError} onRetry={resource.refresh} /></div> : null}
       {!canWrite && capabilities ? <Alert tone="warning" className="mb-5">Settings are read only. Start a separate server with explicit write consent to save a model or credential.</Alert> : null}
       {capabilities?.local_operator_only ? <Alert tone="warning" className="mb-5">Local operator only. The CSRF token blocks cross-site requests; it is not authentication against local processes.</Alert> : null}
       {settings?.settings_error ? <Alert tone="danger" className="mb-5">Private settings or credential status is unavailable. Writes that depend on this state are blocked.</Alert> : null}
-      {feedback ? <Alert tone={feedback.tone} className="mb-5">{feedback.message}</Alert> : null}
+      {feedback?.error ? (
+        <ErrorNotice
+          className="mb-5"
+          error={feedback.error}
+          onAction={
+            feedback.error.action === "reconnect"
+              ? () => void reconnect()
+              : feedback.error.action
+                ? () => { setFeedback(null); resource.refresh(); }
+                : undefined
+          }
+        />
+      ) : feedback ? <Alert tone={feedback.tone} className="mb-5">{feedback.message}</Alert> : null}
       {settings ? (
         <>
           <div className="grid gap-3 sm:grid-cols-3">

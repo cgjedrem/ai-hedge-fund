@@ -133,6 +133,52 @@ services/writable containers cannot reach the root. Unverified handover is owner
 read-only. Never auto-adopt/start to test ownership. Locks do not defend against arbitrary
 out-of-band file writers; inability to exclude those writers denies mutation.
 
+**Current implementation boundary (not an A3 waiver).** Root enrollment, root/build
+binding, inventory drift checks and OS lanes fence cooperating participants only.
+`migrate-existing` records an exact operator attestation; it does not independently
+prove that an old executable, writable container or arbitrary filesystem writer has
+lost access. A successful attestation or lock probe is therefore not production
+handover acceptance. If exclusion cannot be established outside this protocol, keep
+the desk read-only. T015/T021/T138 remain incomplete on that criterion.
+
+Scoped archive/restore uses registry-before-object admission and a retained
+`archive-prepared`/`restore-prepared` journal outside the active stores. After a
+move, inventory changes compare-and-set the reviewed deployment entry, retain the
+live enrolled entries of independent funds, and verify the full resulting inventory.
+Explicit recovery reconciles only a matching journal/content transition; it never
+rebases arbitrary drift or repeats unknown financial effects. Completed or abandoned
+journals retain the exact reconciled operation IDs, so later legitimate ledger progress
+does not invalidate a previously proven result.
+These checks detect unsupported states, not hostile writes that ignore OS lanes.
+
+The desk separates template, local-paper deployment and research-report archive scopes;
+it offers no permanent deletion or implicit linked replacement. Review binds source
+bytes, references, runner observations and enrollment heads to an expiring single-use
+confirmation. Restores preserve the original identity, reject exact/canonical collisions
+and leave the fund stopped. List/detail pages expose retained archives and explicit
+recovery; an unsupported record shows a manual-review error without hiding independent
+archives or granting permission.
+
+Headless `aihf --root ROOT lifecycle list|inspect`, `lifecycle preview --action
+archive --kind template|deployment|research --identity ID`, `lifecycle archive KIND ID
+--expected-head HASH --request-id ID`, and `lifecycle restore|recover ARCHIVE_ID
+--expected-head HASH --request-id ID` use the same reviewed protocol without TUI or
+provider loading. Restore/recover previews use `--action restore|recover --archive-id ID`.
+No network/model/dotenv option is accepted by these offline commands. A drifted root
+stays web-read-only; bounded explicit headless journal recovery does not enable other
+mutations. An explicit-root paper CLI command never falls back to an unenrolled writer.
+
+An accepted archive interrupted before journal creation is not automatically retried.
+Recovery requires the durable operation, absent exact archive destination, verified
+enrollment and the original source bytes. Only a deployment may have advanced: its
+fund-file digest must be unchanged, session count nondecreasing and prior session hash
+retained; the operator reviews the full current source digest/head again before a
+no-effect reconciliation. A restore interrupted before its write-ahead move may likewise
+be explicitly reconciled against the intact archived bytes and archived journal state,
+even if a new destination now collides; that never authorizes overwrite or a real restore.
+Changed templates/reports, changed deployment snapshots/history and unknown destinations
+remain manual-review states. Missing records alone never establish safe recovery.
+
 **A4 — LM1/LM2/HM4.** Ownership binds root/deployment, protocol/build, namespace/host boot,
 PID/process incarnation, private handshake nonce, authorization and capture digest. PID
 liveness is insufficient. POSIX session/process group and Windows owned process group/

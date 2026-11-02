@@ -684,3 +684,243 @@ Environment: Windows 11 / NTFS, Python 3.13.7 `.venv` (uv, `-e ".[web]"`, pytest
 - Lint: isort and flake8 clean on changed files; Black findings on `tui/funds.py`, `tui/backtest.py` pre-exist at HEAD. Windows `OpenProcess` PID probe and native NTFS/ext4 evidence from 3042c85 preserved unchanged.
 
 T021/T138 remain unchecked: deletion primitive parity, unaware legacy/out-of-band writers and the exhaustive writer-race matrix remain open. No TUI module or assertion was deleted.
+
+## T019 / T020 ? common error envelope and intermittent web-failure root causes (2026-11-01T22:33:09+01:00)
+
+**Status: PARTIAL.** Source-run evidence on Windows 11 / NTFS, Python 3.13.7 `.venv`, `PYTHON_DOTENV_DISABLED=1`, synthetic roots and fake providers only. Base `d5858e4`. Command form: `.venv\Scripts\python.exe -m pytest <paths> -q -p no:cacheprovider`.
+
+### Error envelope (T019/T020 partial)
+
+- `web/schemas.py` adds `ErrorCode`, `RetryPolicy`, default/retry/refresh maps, `ErrorResponse`, `error_code_for` and `error_payload`. Every HTTP error (middleware denials, Starlette 404/405, 413, 422 validation, `ServiceError`, unhandled 500) returns the additive envelope `{detail, code, message, refresh_required, retry_policy}`; `detail` is preserved for compatibility. About 47 `ServiceError` sites carry contract codes. 422 `loc` echoes of unknown field names are redacted; 500 responses carry security headers. Frontend `api.ts`/`types.ts` parse the envelope with a code whitelist; new `api.test.ts`.
+- Red/green: `web/test_app.py` **16 failed / 8 passed** before, **24 passed** after. Vitest **3 files / 29 tests passed**; `npx tsc --noEmit` exit 0.
+- Documented contract deviations (kept): halted, replay-corrupt and reconciliation-required stay 409 (not 423); validation stays 422 `invalid-request`; subject/request identity and current head are not yet in error bodies.
+
+### Intermittent web failures ? discriminating evidence and repairs
+
+1. **Swallowed worker exception.** `web/jobs.py::_log_worker_failure` logs only exception type and innermost frame basename:line (no message, path or secret) for start and worker failures; `test_operation_job_failure_logs_only_type_and_frame` proves message/secret/path are absent. First diagnostic capture: worker `AssertionError at test_jobs.py:1081` (second `cancelled()` check) ? the main thread's 5 s event wait expired under load and `close()` requested cancellation. Repair: test wait budgets `_WAIT_SECONDS = 60`.
+2. **Owned-runner readiness budget.** Production readiness was 8.0 s; idle cold import of the child alone measured **5.52 s / 2.12 s / 2.11 s**. Repair: `owned_runner._READINESS_TIMEOUT_SECONDS = 30.0`. New `test_owned_runner_readiness_timeout_fails_closed_and_stops_child` (constant patched to 0): operation and runner `failed` with `runner-readiness-timeout`, stop requested, child exits, ledger unchanged. Red on baseline: `AttributeError` (no constant). Paper-ops + jobs + owned-runner: **32 passed in 144 s**.
+3. **Lock-timeout misclassification and fatal transient busy.** Full suite after (1)?(2): **1 failed, 1569 passed, 42 skipped in 532.12 s** (`KeyError: 'status'` on a status poll). Added `operations.OperationBusy` and 503 `observation-conflict` / `retry-read-only` mapping for operation status/list reads; red (mapping removed) **409 request-conflict**, green **503**. Independent review found the conversion too broad (lock-file stat/open, ACL, reparse and `OwnershipUnknown` failures would be reported as retryable). Repair: `OperationStore._acquire_registry` raises `OperationBusy` **only** for `WriterConflict` during acquisition; other acquisition failures and `AdmissionError` from the locked body stay plain `OperationError` (409).
+4. Confirmatory full suite: **3 failed, 1568 passed, 42 skipped in 502.02 s**. Captured logs: `start failed: OperationBusy at operations.py:609` ? reviewed preview ended `interrupted`; test helper `_wait_for_operation` raised `WriterConflict`?`OperationBusy` after the 5 s bound; paper `start_entered.wait(timeout=10)` expired (worker later failed closed with `ServiceError at services.py:1188`).
+5. **Lock-contention experiment** (scratch roots under the session folder, one 60-write progress writer plus one status poller, deleted afterwards): idle durable write ~0.35 s each. Poll 10 ms: max writer lock wait **0.785 s** idle, **3.441 s** with 28 CPU burners. Poll 100 ms: **0.096 s** idle, **6.362 s** with burners (1 `OperationBusy`). Conclusion: the 5 s bound is exceeded under CPU saturation regardless of poll rate; slow durable writes are an open performance item.
+6. Repairs: `OperationJobRegistry._retry_busy` retries only `OperationBusy` (bounded 30 s, backoff 0.05?0.5 s, stops on shutdown) for `claim_worker`, `mark_running`, `update_progress`, `cancellation_requested`, `complete` and `fail`; each takes the registry lock once and writes only while held, so a busy result means no durable change. Test pollers retry only `OperationBusy` / 503 `observation-conflict`; paper start barrier widened to 60 s.
+7. New tests: `test_operation_lock_failure_other_than_timeout_is_not_retryable` (409 `request-conflict`, not retryable), `test_operation_body_admission_error_is_not_reported_busy`, `test_operation_job_retries_transient_busy_without_interrupting`. Red with blanket busy conversion and no job retry: **3 failed** (the retry test reproduced the full-suite `interrupted` symptom); sources restored byte-exact (SHA-256 verified). Green: **5 passed in 13.33 s**.
+
+### Results
+
+| Result | Command / scope | Observation |
+|---|---|---|
+| **PASS** | `hedge_fund\web` + runtime `test_*operations*`/`*owned_runner*`/`*admission*` + `backtesting\test_research.py` | **225 passed in 360.85 s** |
+| **PASS** | `pytest hedge_fund` (full suite) | **1574 passed, 42 skipped, 0 failed in 567.23 s** (wall 664 s) ? first fully green full suite in this migration |
+| **PASS** | `frontend`: `npx vitest run src`; `npx tsc --noEmit` | **29 passed**; tsc exit 0 |
+| **PASS** | flake8 (`--max-line-length 420 --extend-ignore E203,W503`), Black, isort on changed files; `git diff --check` | clean; pre-existing Black findings in `test_actions.py` unchanged |
+
+Independent reviews (code-review agents; no custom python-dev/qa-reviewer persona available): envelope diff **no significant issues**; OperationBusy delta **one medium finding** (non-timeout lock failures classified retryable) ? fixed; follow-up delta **no significant issues**.
+
+T019/T020 remain unchecked: identity/head fields in error bodies, 423 realignment, remaining 503 sites, expired-CSRF and SIM-denial envelope coverage, and observation reconnect are open. One green full suite is not a statistical flake-free claim.
+
+## T015 / T021 / T138 bounded lifecycle slice (2026-11-02)
+
+**Status: implemented bounded slice; migration remains PARTIAL / NOT READY TO MERGE.**
+T015/T021/T138 remain unchecked. This section supersedes earlier statements that no
+web/headless scoped archive implementation exists; it does not supersede the A3
+external-writer exclusion, complete writer-matrix, linked-replacement or retirement gates.
+
+### Candidate, isolation and manifest
+
+- Verified base and remote PR8 head before work: `d2e4f313ca27fd7e6f733c6760beb1bff32c2d0a`.
+  Publication targets existing `cgjedrem-vigilant-robot`; no force push, duplicate PR or merge.
+- Final code/test identity captured `2026-11-02T00:26:45.001715+01:00`:
+  **`3a8b9e654043f76be905415e6998cb0aca6790cb14f71176060c0b3c64f4eb1e`**,
+  **23 paths / 776,647 bytes**. Algorithm: sorted repository-relative UTF-8 paths, NUL,
+  complete file bytes, NUL. Documentation and screenshots are excluded from this code
+  identity; later documentation-only changes do not change loaded code.
+  Canonical staged Git blobs: **`958fa00ff343a07df1e6777fbbbcbd8f8b99d770bef548f7afd0c93dba4f6e7e`**,
+  **23 paths / 759,003 bytes**. At `2026-11-02T00:44:01.965031+01:00`, all 23 staged
+  blobs were compared to the tested files: **only CRLF-to-LF normalization, zero
+  non-newline differences**. The first attempted byte-exact assertion detected this
+  normal Windows/Git conversion; neither hash is silently substituted for the other.
+- Windows 11 / NTFS; Python 3.13.7 from the existing dependency-cache environment
+  `aihf-jeXvH3Gy-py3.13`; Node 22.13.1. No other session checkout was accessed.
+  Existing `hedge_fund/conftest.py` isolation scrubs HOME/provider/proxy/credential
+  variables, disables dotenv, uses marked checkout-owned roots and denies non-loopback
+  Python sockets. Browser harness owns port 8876, refuses reuse, strips inherited
+  interpreter/Node overrides, uses fake demo data and denies non-loopback requests.
+- No live root, paid/data/LLM/broker provider, credential, protected runner, port 8765,
+  synthetic preview 49292 or PID 54644 was accessed, stopped or restarted.
+- Runtime manifest: `runtime/lifecycle.py`, `test_lifecycle.py`, `admission.py`,
+  `handover.py`, `operations.py`, `test_operations.py`, `root.py`.
+- Adapter manifest: `run.py`, `test_run.py`, `web/app.py`, `schemas.py`, `services.py`,
+  `test_lifecycle.py`.
+- React/harness manifest: `frontend/src/components/{archive-panel.tsx,archive-panel.test.tsx,
+  lifecycle-actions.tsx,lifecycle-actions.test.tsx}`, `pages/{mandates,paper,research}.tsx`,
+  `frontend/e2e/lifecycle.spec.ts`, `e2e/run-owned.mjs`, `playwright.config.ts`.
+- Documentation: governance contract, this evidence, tasks and retired-assertion inventory.
+  The existing 17 synthetic desktop/narrow screenshots were regenerated by the final
+  owned route workflow. No TUI source, dependency, module or assertion was removed.
+  Screenshot identity at `2026-11-02T00:38:19.859133+01:00`: **17 PNGs / 2,857,154 bytes /
+  SHA-256 `f0e5cb3b583139e07d63a04501da9792dff7a87ff04fe8d35c6de4cac6551e9a`**,
+  using the same full repository-relative path/content NUL-separated algorithm.
+
+### Implemented criteria and deliberate limits
+
+- Three distinct, reversible scopes: template YAML/YML, local-paper deployment directory,
+  persisted research JSON. Root-relative no-replace file/directory rename retains history
+  under the private archive store, never broad-deletes or changes a deployment snapshot.
+- Registry-before-object lanes cover deployment, runner, execution, control and research;
+  verified same-thread registry reuse avoids self-deadlock without trusting an unverified
+  owner. Real child-process tests prove conflicting execution exclusion and independent
+  object progress. Starting/unknown runner records block even when the OS lane is free.
+- Enrollment and exact bytes/references/runner observations are rechecked under admission.
+  Deployment inventory transition compares the target entry while retaining live enrolled
+  siblings and verifying the full resulting inventory. Legitimate independent fund
+  progress does not permanently strand an interrupted target archive.
+- Single-use expiring operator-session-bound review, durable accepted-before-effects,
+  idempotent request replay and stale-state rejection remain in the common operation
+  protocol. Host/Origin/CSRF/path/budget/paid-operation protections are unchanged.
+- Restores reject exact/canonical collisions, preserve history and remain stopped, with
+  no automatic tick, pending-decision replay, provider dispatch or linked replacement.
+- Prepared, accepted-before-journal and final-journal/completion gaps have deliberate
+  recovery. Retained journals atomically record exact reconciled operation IDs, including
+  recovery itself. An unprepared restore can be closed against intact archived bytes
+  without overwriting a newly occupied destination.
+- Unprepared deployment recovery permits only forward canonical history with the same
+  fund-file digest, nondecreasing session count and exact retained prior-session hash.
+  It binds current source bytes/head to a new explicit review; newer sessions survive.
+  Changed templates/reports, changed deployment snapshots/history and unknown archive
+  destinations remain manual-review. Missing records alone never establish safe recovery.
+- GET list/inspect do not reconcile or mutate. Per-record unsupported recovery is visible
+  as `manual-review` plus an error, leaving independent records usable. Root/ownership/
+  storage errors still fail closed globally. React hides unsafe actions but the backend
+  independently denies them.
+- Retained offline CLI list/inspect/preview/archive/restore/recover use the same service,
+  source hash and request protocol without importing TUI/providers. Explicit-root paper
+  commands no longer fall back to an unenrolled legacy writer.
+- Enrollment/attestation and OS lanes still fence cooperating writers only. They do
+  **not** establish verifiable exclusion of old executables, writable containers or
+  arbitrary filesystem writers. The governance note explicitly preserves A3.
+
+### Fresh measurements
+
+| Timestamp / scope | Command and observed result |
+|---|---|
+| Final candidate, `2026-11-02T00:26:45.001715+01:00` to `00:45:00.948896+01:00` | Cached Python `-m pytest hedge_fund -q --tb=short`: **1617 passed, 42 skipped, 0 failed in 938.29 s**, process exit 0 after fixture cleanup. Exact 23-path code/test identity printed immediately before invocation and rechecked unchanged after the final browser runs. Includes all co-located runtime/web/CLI, guards, adjacent writer and TUI regressions. |
+| `2026-11-02T00:04:15.716589+01:00` to `00:06:02.841631+01:00` | New crash-boundary selection initially **1 failed, 9 passed**; durable deployment payload is deeply frozen, so a nested mapping was not a dict. Fallback now uses the operation's thawed public payload. |
+| Subsequent discriminating selection, before final panel closure | `pytest web/test_lifecycle.py runtime/test_operations.py -k 'before_or_after or missing_journal or prepared_move or legitimate_new_sessions or accept_persists'`: **10 passed, 53 deselected in 100.58 s**. |
+| `2026-11-02T00:22:41.972043+01:00` to `00:24:26.174306+01:00` | `npm --prefix frontend test -- --run`: **5 files / 34 passed in 45.36 s**; `npm --prefix frontend run build`: TypeScript passed; Vite 2,309 modules, 21.37 s. Non-fatal large-chunk advisory remains. Final React code/test identity matches the candidate above. |
+| Final per-record/collision selection, ended `2026-11-02T00:26:23.909047+01:00` | `pytest hedge_fund/web/test_lifecycle.py -k 'missing_journal or prepared_move'`: **5 passed, 19 deselected in 68.50 s**. |
+| `2026-11-02T00:26:39.809031+01:00` to `00:28:07.148199+01:00` | `node e2e/run-owned.mjs --lifecycle lifecycle.spec.ts`: **1 passed in 36.6 s**, real workflow 30.5 s. Six real API archive/restore mutations across all three scopes; stale template confirmation denied; deployment snapshot/head preserved and restore stopped. No `page.route` response fakes. Followed by owned `desk.spec.ts --grep 'production routes render'`: **1 passed in 12.7 s**, desktop/narrow routes and no external requests. Both include fresh TypeScript/build. |
+| Same final two browser builds | **3 files / 984,294 bytes / SHA-256 `f5448fd39c8ff2057e4505d0e41f04cfc036f72556586d288be2cc7ebfa95014`**. JS `index-CSg9ctmY.js`. The earlier `c4049a95...` bundle is superseded, not final evidence. |
+| `2026-11-01T23:58:59.933605+01:00` to `23:59:27.339732+01:00` | Node harness safety **6 passed**; prior frontend 33 passed/build also green, superseded by final 34-test/build rows above. Harness source unchanged afterward. |
+| `2026-11-02T00:36:46.494849+01:00` to `00:36:49.211129+01:00` | Black check, isort check, configured flake8 (`--max-line-length=420 --extend-ignore=E203,W503`) over all **13 changed/new Python files**, plus `git diff --check`: exit 0. |
+
+### Review-driven repairs and failed attempts
+
+- Initial independent `qa-reviewer` identified missing lifecycle implementation,
+  lock order/reuse, unsafe directory rename, runner-starting gap and writer-enrollment
+  limitations. Execution specialist left partial runtime work before a provider-policy
+  failure; the parent completed it directly. Separate adapter specialist completed
+  web/CLI wiring and adjacent tests. There was no repeated implementation delegation.
+- Final independent `qa-reviewer` inspected the current runtime/adapters/React diffs across
+  at most three bounded repair cycles. Final closure response: **PASS for the listed
+  closures**, static only, no test execution or source-hash attestation by that reviewer.
+  Parent-recorded candidate identity and measurements above supply that separate evidence.
+- Reproduced red before repairs: abandoning a prepared archive lost its only journal and
+  permanently blocked later archive/restore; recovering one deployment rejected a
+  legitimately advanced independent fund; completion-gap and unprepared interruptions
+  could strand operations; canonical restore collisions were not denied during review.
+- Discriminating timestamp regression: after a synchronous worker moved to RUNNING at a
+  later timestamp and raised, launch fallback reused the earlier accept timestamp.
+  `_set_interrupted` failed journal validation and its caller left RUNNING. New operation
+  test was **1 failed / 1 passed** before fixing the timestamp to
+  `max(now, operation.updated_at)`. It now fences and interrupts rather than replaying.
+- A misplaced multi-hunk edit temporarily broke service syntax and backtest-call
+  parentheses. Exact surrounding code was restored; subsequent import, lifecycle, full
+  suite and real browser checks exercise the corrected code. No claim uses that attempt.
+- Per-record recovery test first used a research decoy with the **same fund identity**.
+  The expected independent restore was correctly blocked by its subject lane. Fixture
+  was corrected to a genuinely independent report/fund identity; final five-case run
+  above passed. Same-subject exclusion was not relaxed.
+- An earlier full-suite attempt reported **1 failed / 1603 passed / 42 skipped in
+  732.40 s**: a synthetic paper-redo `os.replace` raised Windows WinError 5. The complete
+  adjacent tick module immediately passed **40 tests in 5.14 s** without source changes.
+  No speculative production retry was added. A later pre-panel-closure full suite passed
+  **1616 / 42 skipped in 876.85 s**, but is not substituted for final-candidate evidence.
+
+### Remaining migration gates
+
+Cleanup: owned browser processes exited and port 8876 was verified released at
+`2026-11-02T00:43:28.088774+01:00`; no marked test roots remained. One older failed-run
+residue was removed only after verifying its exact exited pytest PID 49652 and
+`.test-owned` marker, using `cleanup_test_root` on that single resolved fixture.
+No other session process, checkout, preview or the worktree itself was removed.
+
+- T015: verified exclusion of unaware/out-of-band writers, not merely operator attestation.
+- T021/T138 and T027: exhaustive direct-writer/CLI/web/runner/manual/redo/lifecycle race
+  matrix; all cooperating writers under sustained contention. Long lifecycle digest
+  holding the registry versus an independent runner's bounded head-recording wait remains
+  **INCONCLUSIVE**, not a proven independent-fund throughput guarantee.
+- Production-root enumeration with protected deployments currently fails closed. This
+  synthetic slice is not authorization to enable mutation on any existing live root.
+- FR-043 linked new-identity replacement/redeployment, complete US4 and remaining
+  Spec005 story parity. No task count increase or TUI retirement follows from this slice.
+- Current-source bare-metal Linux/native lifecycle acceptance and wheel/container/
+  installed-artifact gates; historical native/smoke rows are not current artifact proof.
+- T019/T020 envelope gaps, full browser/visual parity, final packaging and TUI removal
+  remain open. No merge or complete-migration claim.
+
+## T019 / T020 error-envelope and reconnect recovery slice (2026-11-02)
+
+**Status: implemented bounded slice; T019/T020 remain unchecked (PARTIAL). Migration remains 20/148, NOT READY TO MERGE.**
+
+### Candidate and isolation
+
+- Verified base and remote PR8 head before work and before publication: `89e0b49bb9cee2d7aaeb44a125e128acfbcce296`
+  (`origin/cgjedrem-vigilant-robot`); publication is a non-force push to that branch, no duplicate PR or merge.
+- Code/test identity captured `2026-11-02T02:34:28+01:00`: **`492ce48e005eab554c625e838a5ddb55d990b62dbc30e3ef546ce4c4c73281f0`**,
+  **30 paths / 779,905 bytes** (sorted repo-relative paths, NUL, staged blob bytes, NUL; docs/screenshots excluded).
+  Every staged blob was compared with the working tree (CRLF->LF normalization only) and matched.
+- Windows 11 / NTFS, Python 3.13.7 Poetry venv, Node/Vitest/Playwright Chromium; `PYTHON_DOTENV_DISABLED=1`, isolated synthetic roots,
+  HOME/TEMP/provider/proxy/credential env cleared by the existing harnesses; loopback only. No live root, runner, credential,
+  provider, LLM, paid or broker call; no other checkout/process (8765, 49292, PID 54644) touched.
+
+### Behavior implemented (source)
+
+- `schemas.error_payload`/`ErrorResponse`: optional `subject_id`, `request_id`, `current_head` echoed only when they fully match bounded
+  opaque-token patterns (hostile values dropped); explicit `refresh_required`/`retry_policy` overrides validated against `RETRY_POLICIES`.
+- Contract code->status table with `error_code_status_matches`; `halted`/`replay-corrupt`/`reconciliation-required` moved 409->423,
+  request validation 422->400 `invalid-request`, stored-artifact readiness 422 `readiness-denied`; new codes `protected-root`,
+  `unsupported-filesystem`, `private-storage-unverified`, `budget-exhausted`.
+- Retry semantics: `writer-conflict` defaults to `inspect-status`; only pre-acceptance registry-lock `OperationBusy` (paper/lifecycle/operation
+  accept) opts into `retry-later` with neutral wording ("this request was not processed now ... inspect its operation status first").
+  A busy status read after a durable lifecycle transition returns the accepted record; busy replay of a known request is `inspect-status`.
+  An unavailable operation store reads as 503 `observation-conflict`/`retry-read-only` (not 404).
+- A mutation rejected for an absent/expired operator session (e.g. after server restart) returns 403 `reload`; Host/Origin/CSRF checks unchanged.
+- Frontend: `ApiError` + `errors.ts` actionable guidance (Review again, Refresh status, Reload session, Reconnect; no retry for permanent faults;
+  mutations never auto-resubmitted); `ConnectionBanner`; per-page recovery; connection epoch so a pre-loss response cannot report recovery;
+  Reconnect issues a fresh capabilities read bounded to 10 s.
+
+### Results (source-bound unless stated)
+
+- Full Python suite (post all repairs): **1640 passed, 42 skipped, 0 failed in 1233.76 s** (skips: live-key smoke, Linux-only, FIFO).
+  Only trailing blank-line removal in three test files followed this run.
+- Targeted: `test_lifecycle.py` **25 passed** (254 s); `test_app.py` **43 passed**; paper accept fault matrix **3 passed**.
+- Frontend Vitest (`npm test`): **5 files, 49 passed**; `npm run build` (tsc + vite) OK; e2e safety **6/6**.
+- Owned real-API Playwright (runtime against the source-built static bundle, synthetic root, port 8876, no `page.route` fakes):
+  `recovery.spec.ts` **3 passed in 4 consecutive runs**; `lifecycle.spec.ts` **1 passed**; desk suite **12 passed, 4 skipped**.
+- Lint: changed-file flake8 and isort clean; Black failures only in `test_actions.py`/`test_settings.py`, identical at HEAD; `git diff --check` clean.
+
+### QA cycles and failed attempts
+
+- Initial independent QA: 3 findings (writer-conflict always `retry-later`; misleading reload guidance; missing store as 404 offering Forget). Repaired.
+- First discriminating test for lifecycle busy-only retry vacuously skipped; rewritten to patch `OperationStore.get_by_request` so it exercises the path.
+- Final QA 1: busy status read after durable transition misreported as nothing accepted -> fixed, new regression. Final QA 2: busy replay
+  wording -> fixed. Final QA 3 (fresh reviewer): **no blocking findings**.
+- Recovery e2e offline test failed 2 of 3 runs: a background read sent before the loss completed afterwards and flipped the banner online,
+  and Reconnect could reuse a hung in-flight request. Fixed via connection epoch and fresh bounded reconnect; then 4/4 runs green.
+
+### Open (keeps T019/T020 unchecked)
+
+- No production site emits 429 `capacity-denied`/`budget-exhausted`; worker-capacity rejection occurs after durable acceptance and surfaces as
+  409 `ownership-unknown`. Next: a pre-acceptance capacity check that preserves idempotent replay, plus its envelope regression.
+- No observation stream/channel exists (polling only); T023 identity-aware polling and late-response rejection remain open.
+- No current-source wheel/container/installed-artifact, bare-metal Linux or cross-browser evidence for this slice.

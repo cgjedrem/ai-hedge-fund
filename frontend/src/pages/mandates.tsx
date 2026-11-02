@@ -3,7 +3,9 @@ import { useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 
 import { DataTable, type TableColumn } from "@/components/data-table";
-import { ErrorState, PageHeader, SectionTitle } from "@/components/page";
+import { ArchivePanel } from "@/components/archive-panel";
+import { LifecycleActions } from "@/components/lifecycle-actions";
+import { ErrorNotice, ErrorState, PageHeader, SectionTitle } from "@/components/page";
 import { Alert } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -19,6 +21,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { apiPost } from "@/lib/api";
+import { toActionableError, type ActionableError } from "@/lib/errors";
 import { useDesk, useResource } from "@/lib/hooks";
 import type { MandateCollection, MandateSummary } from "@/lib/types";
 import { money } from "@/lib/utils";
@@ -64,7 +67,7 @@ export function MandatesPage() {
         }
       />
       {resource.loading ? <div className="h-52 animate-pulse rounded-xl border border-border bg-white/[0.025]" /> : null}
-      {resource.error ? <ErrorState message={resource.error} /> : null}
+      {resource.error ? <ErrorState message={resource.error} error={resource.apiError} onRetry={resource.refresh} /> : null}
       {resource.data ? (
         <div className="space-y-5">
           {resource.data.errors.length > 0 ? (
@@ -93,6 +96,7 @@ export function MandatesPage() {
           </Card>
         </div>
       ) : null}
+      <ArchivePanel kind="template" onChange={resource.refresh} />
     </>
   );
 }
@@ -104,12 +108,12 @@ interface MandateDetail extends MandateSummary {
 export function MandateDetailPage() {
   const { name = "" } = useParams();
   const navigate = useNavigate();
-  const { capabilities } = useDesk();
+  const { capabilities, reconnect } = useDesk();
   const resource = useResource<MandateDetail>(name ? `/api/mandates/${encodeURIComponent(name)}` : null);
   const [dialogOpen, setDialogOpen] = useState(false);
   const [universeText, setUniverseText] = useState("");
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<string | ActionableError | null>(null);
   const protectedName = capabilities?.protected_names.some((entry) => entry.toLowerCase() === name.toLowerCase()) ?? false;
   const canWrite = capabilities?.writes === true && !protectedName;
 
@@ -137,7 +141,7 @@ export function MandateDetailPage() {
       setDialogOpen(false);
       navigate(`/paper/${encodeURIComponent(result.name)}`);
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "Deployment failed.");
+      setError(toActionableError(cause, "Deployment failed."));
     } finally {
       setBusy(false);
     }
@@ -163,6 +167,7 @@ export function MandateDetailPage() {
             <Button onClick={() => { setError(null); setDialogOpen(true); }} disabled={!canWrite}>
               Deploy to paper
             </Button>
+            <LifecycleActions kind="template" identity={name} onComplete={() => navigate("/mandates")} />
           </>
         }
       />
@@ -174,7 +179,7 @@ export function MandateDetailPage() {
         </Alert>
       ) : null}
       {resource.loading ? <div className="h-52 animate-pulse rounded-xl border border-border bg-white/[0.025]" /> : null}
-      {resource.error ? <ErrorState message={resource.error} /> : null}
+      {resource.error ? <ErrorState message={resource.error} error={resource.apiError} onRetry={resource.refresh} /> : null}
       {resource.data ? (
         <div className="grid gap-5 xl:grid-cols-[minmax(0,1.3fr)_minmax(320px,0.7fr)]">
           <div className="space-y-5">
@@ -258,7 +263,19 @@ export function MandateDetailPage() {
             />
             <p className="text-[10px] text-muted-foreground">Comma or space separated · up to 25 unique tickers.</p>
           </div>
-          {error ? <Alert tone="danger">{error}</Alert> : null}
+          {typeof error === "string" ? <Alert tone="danger">{error}</Alert> : null}
+            {error && typeof error !== "string" ? (
+              <ErrorNotice
+                error={error}
+                onAction={
+                  error.action === "reconnect"
+                    ? () => void reconnect()
+                    : error.action === "review-again" || error.action === "inspect-status"
+                      ? () => { setError(null); resource.refresh(); }
+                      : undefined
+                }
+              />
+            ) : null}
           <DialogFooter>
             <Button variant="ghost" onClick={() => setDialogOpen(false)} disabled={busy}>Cancel</Button>
             <Button onClick={() => void deploy()} disabled={busy || !canWrite}>{busy ? "Deploying…" : "Create paper book"}</Button>

@@ -145,8 +145,10 @@ def test_approval_is_rejected_for_halted_fund(write_client, demo_root):
         },
     )
 
-    assert response.status_code == 409
+    assert response.status_code == 423
     assert response.json()["detail"] == "Halted funds cannot accept a verdict."
+    assert response.json()["code"] == "halted"
+    assert response.json()["subject_id"] == "demo-quality"
     assert not ledger.approval()
 
 
@@ -167,7 +169,7 @@ def test_approval_is_rejected_when_control_is_unreadable(write_client, demo_root
         },
     )
 
-    assert response.status_code == 409
+    assert response.status_code == 423
     assert response.json()["detail"] == "Paper state is invalid (LedgerError)."
     assert not (demo_root / "paper" / "demo-quality" / "pending-approval.json").exists()
 
@@ -193,7 +195,9 @@ def test_halt_reuses_ledger_control_and_resume_requires_reconciliation(tmp_path)
     ledger = Ledger(root / "paper" / "demo-quality")
     assert halted.status_code == 200
     assert current["halted"] == "operator pause"
-    assert resumed.status_code == 409
+    assert resumed.status_code == 423
+    assert resumed.json()["code"] == "reconciliation-required"
+    assert resumed.json()["retry_policy"] == "inspect-status"
     assert "reconciliation receipt" in resumed.json()["detail"]
     assert ledger.halted() == "operator pause"
     assert [event["kind"] for event in ledger.events()][-1:] == ["halt"]
@@ -220,7 +224,7 @@ def test_halt_works_for_corrupt_ledger_but_resume_still_requires_valid_replay(de
     ledger = Ledger(demo_root / "paper" / "demo-quality")
     assert halted.status_code == 200
     assert ledger.halted() == "ledger review"
-    assert resumed.status_code == 409
+    assert resumed.status_code == 423
     assert ledger.halted() == "ledger review"
 
 
@@ -327,8 +331,8 @@ def test_protected_windows_aliases_are_rejected_before_control_writes(tmp_path, 
         trailing_space = client.post("/api/paper/watchtower%20/halt", headers=headers, json={"reason": "blocked"})
 
     assert canonical.status_code == 403
-    assert trailing_dot.status_code == 422
-    assert trailing_space.status_code == 422
+    assert trailing_dot.status_code == 400
+    assert trailing_space.status_code == 400
     assert not called
     assert control.read_bytes() == before_control
     assert events.read_bytes() == before_events
@@ -471,6 +475,7 @@ def test_saxo_web_routes_deny_before_provider_or_writer_effects(
         service.close()
 
     assert [response.status_code for response in results] == [403] * len(paths)
+    assert {(response.json()["code"], response.json()["retry_policy"]) for response in results} == {("broker-not-web-supported", "none")}
     assert called == []
     after_events = events_path.read_bytes() if events_path.exists() else None
     assert after_events == before_events
@@ -798,4 +803,13 @@ def test_unknown_local_policy_classification_returns_service_error(
     )
 
     assert response.status_code == 422
-    assert response.json() == {"detail": "Provider configuration is not supported for local-paper operations."}
+    assert response.json() == {
+        "detail": "Provider configuration is not supported for local-paper operations.",
+        "code": "readiness-denied",
+        "message": "Provider configuration is not supported for local-paper operations.",
+        "refresh_required": False,
+        "retry_policy": "none",
+        "subject_id": "demo-quality",
+        "request_id": None,
+        "current_head": None,
+    }

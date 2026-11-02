@@ -115,8 +115,8 @@ def test_credential_write_is_allowlisted_write_only_and_control_safe(tmp_path, c
                     expected_version=1,
                 )
             )
-        assert invalid.value.status_code == 422
-        assert control.value.status_code == 422
+        assert invalid.value.status_code == 400
+        assert control.value.status_code == 400
         assert "line1" not in control.value.detail
     finally:
         service.close()
@@ -142,7 +142,7 @@ def test_model_setting_is_catalog_allowlisted_and_persisted_by_root(tmp_path, mo
         assert (tmp_path / ".env").read_text(encoding="utf-8") == original
         with pytest.raises(ServiceError) as unknown:
             service.set_model(ModelRequest(model="unregistered-model", expected_version=1))
-        assert unknown.value.status_code == 422
+        assert unknown.value.status_code == 400
         assert "unregistered-model" not in unknown.value.detail
     finally:
         service.close()
@@ -310,7 +310,7 @@ def test_runtime_settings_api_rejects_invalid_values_before_persistence(tmp_path
             json=payload,
         )
 
-    assert response.status_code == 422
+    assert response.status_code == 400
     assert not (tmp_path / "runtime" / "private" / "v1" / "settings.json").exists()
 
 
@@ -344,8 +344,8 @@ def test_credential_validation_errors_do_not_echo_request_values(tmp_path):
             },
         )
 
-    assert control.status_code == 422
-    assert malformed.status_code == 422
+    assert control.status_code == 400
+    assert malformed.status_code == 400
     assert sentinel not in control.text
     assert sentinel not in malformed.text
     assert not (tmp_path / ".env").exists()

@@ -69,6 +69,7 @@ def offline(tmp_path, monkeypatch):
             @staticmethod
             def now(tz):
                 return datetime(y, m, d, 12, tzinfo=tz)
+
         monkeypatch.setattr(sessions, "datetime", Clock)
 
     set_today("2025-01-14")
@@ -76,8 +77,7 @@ def offline(tmp_path, monkeypatch):
 
 
 def _mandate(tmp_path, mode="long_short", name="mixed"):
-    spec = FundSpec(schema_version=2, name=name, strategies=[custom_strategy(["buffett", "druckenmiller"])],
-                    risk={"max_position_pct": .25, "max_gross_exposure": 1})
+    spec = FundSpec(schema_version=2, name=name, strategies=[custom_strategy(["buffett", "druckenmiller"])], risk={"max_position_pct": 0.25, "max_gross_exposure": 1})
     spec.strategies[0].blend.mode = mode
     path = tmp_path / f"{name}.yaml"
     path.write_text(yaml.safe_dump(spec.model_dump()))
@@ -179,6 +179,20 @@ def test_cli_writer_admission_rejects_missing_handover_with_admission_artifacts(
                 pytest.fail("orphaned admission state entered legacy writer mode")
 
 
+def test_unenrolled_explicit_root_paper_writer_denies_before_deploy(tmp_path, monkeypatch, capsys, offline):
+    path = _mandate(tmp_path)
+    forbidden = Mock(side_effect=AssertionError("unenrolled root reached deployment effects"))
+    monkeypatch.setattr(run, "deploy", forbidden)
+
+    with pytest.raises(SystemExit) as denied:
+        _main(monkeypatch, "paper", "create", "alpha", "--mandate", str(path), "--universe", "AAPL")
+
+    assert denied.value.code == 1
+    assert "offline enrollment" in capsys.readouterr().err
+    assert forbidden.call_count == 0
+    assert not (tmp_path / "paper").exists()
+
+
 def test_handover_cli_inspects_then_migrates_with_exact_attestation(
     tmp_path,
     monkeypatch,
@@ -273,11 +287,7 @@ def test_handover_cli_refuses_any_legacy_runner_pid_without_signaling(
 
 
 def test_documented_cli_examples_include_explicit_root():
-    commands = [
-        line.strip()
-        for line in (run.__doc__ or "").splitlines()
-        if line.strip().startswith("aihf ")
-    ]
+    commands = [line.strip() for line in (run.__doc__ or "").splitlines() if line.strip().startswith("aihf ")]
 
     assert commands
     assert all(command.startswith("aihf --root ") for command in commands)
@@ -286,9 +296,7 @@ def test_documented_cli_examples_include_explicit_root():
 def test_supported_container_launchers_pass_explicit_root():
     repository = Path(__file__).resolve().parents[1]
     compose = yaml.safe_load((repository / "docker-compose.yml").read_text(encoding="utf-8"))
-    linux_compose = yaml.safe_load(
-        (repository / "docker-compose.linux.yml").read_text(encoding="utf-8")
-    )
+    linux_compose = yaml.safe_load((repository / "docker-compose.linux.yml").read_text(encoding="utf-8"))
 
     dockerfile = (repository / "Dockerfile").read_text(encoding="utf-8")
     web_dockerfile = (repository / "Dockerfile.web").read_text(encoding="utf-8")
@@ -323,8 +331,7 @@ def test_makefile_write_targets_require_caller_selected_absolute_root():
 @pytest.mark.parametrize("command", ["backtest", "create"])
 @pytest.mark.parametrize("unversioned", [False, True])
 def test_cli_rejects_invalid_configuration_before_clients(tmp_path, monkeypatch, capsys, command, unversioned):
-    spec = FundSpec(schema_version=2, name="mixed", strategies=[custom_strategy(["buffett", "druckenmiller"])],
-                    risk={"max_position_pct": .25, "max_gross_exposure": 1})
+    spec = FundSpec(schema_version=2, name="mixed", strategies=[custom_strategy(["buffett", "druckenmiller"])], risk={"max_position_pct": 0.25, "max_gross_exposure": 1})
     data = spec.model_dump()
     if unversioned:
         data.pop("schema_version")
@@ -339,8 +346,7 @@ def test_cli_rejects_invalid_configuration_before_clients(tmp_path, monkeypatch,
     monkeypatch.setattr(run, "make_data_client", forbidden)
     monkeypatch.setattr(run, "deploy", forbidden)
     monkeypatch.setattr(run, "PAPER_DIR", tmp_path / "paper")
-    argv = (["backtest", str(path), "--universe", "AAPL"] if command == "backtest"
-            else ["paper", "create", "alpha", "--mandate", str(path), "--universe", "AAPL"])
+    argv = ["backtest", str(path), "--universe", "AAPL"] if command == "backtest" else ["paper", "create", "alpha", "--mandate", str(path), "--universe", "AAPL"]
     with pytest.raises(SystemExit) as exc:
         _main(monkeypatch, *argv)
     assert exc.value.code == 2
@@ -730,11 +736,7 @@ def test_invalid_rebalance_override_is_usage_error_before_engine_work(tmp_path, 
     monkeypatch.setattr(run, "Fund", forbidden)
     monkeypatch.setattr(run, "make_data_client", forbidden)
     monkeypatch.setattr(run, "deploy", forbidden)
-    argv = (
-        ["backtest", "unused.yaml", "--universe", "AAPL", "--rebalance", "hourly"]
-        if command == "backtest"
-        else ["paper", "create", "alpha", "--mandate", "unused.yaml", "--universe", "AAPL", "--rebalance", "hourly"]
-    )
+    argv = ["backtest", "unused.yaml", "--universe", "AAPL", "--rebalance", "hourly"] if command == "backtest" else ["paper", "create", "alpha", "--mandate", "unused.yaml", "--universe", "AAPL", "--rebalance", "hourly"]
 
     with pytest.raises(SystemExit) as exc:
         _main(monkeypatch, *argv)
@@ -974,9 +976,8 @@ def test_paper_minute_fund_ticks_and_denies_legacy_runner(tmp_path, monkeypatch,
     """Manual ticks use captured authority; legacy headless loops fail closed."""
     from hedge_fund.data.sessions import NEW_YORK
     from hedge_fund.pipeline.test_clock import Tape
-    spec = FundSpec(schema_version=2, name="bars", strategies=[custom_strategy(["buffett"])],
-                    risk={"max_position_pct": .25, "max_gross_exposure": 1},
-                    rebalance="minute", interval=0.5, window={"start": "09:30", "end": "12:00"})
+
+    spec = FundSpec(schema_version=2, name="bars", strategies=[custom_strategy(["buffett"])], risk={"max_position_pct": 0.25, "max_gross_exposure": 1}, rebalance="minute", interval=0.5, window={"start": "09:30", "end": "12:00"})
     path = tmp_path / "bars.yaml"
     path.write_text(yaml.safe_dump(spec.model_dump()))
     _enroll_test_root(tmp_path)

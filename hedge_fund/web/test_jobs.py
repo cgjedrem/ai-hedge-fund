@@ -1,6 +1,8 @@
+import logging
 import threading
 import time
 from concurrent.futures import Future
+from contextlib import contextmanager
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -11,17 +13,24 @@ import yaml
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
 
+import hedge_fund.runtime.operations as operations_module
 from hedge_fund.backtesting.test_fund import FakeAnalyst, FakeDataClient, SERIES
 from hedge_fund.data import make_data_client
 from hedge_fund.fund import custom_strategy, Fund, FundSpec, load_spec
 from hedge_fund.llm import load_api_models
 from hedge_fund.paper.deployed import load_deployed
 from hedge_fund.pipeline.session import mandate_hash
-from hedge_fund.runtime.admission import AdmissionCoordinator, RootOwnerLease
+from hedge_fund.runtime.admission import (
+    AdmissionCoordinator,
+    AdmissionError,
+    RootOwnerLease,
+)
 from hedge_fund.runtime.capture import freeze_capture
 from hedge_fund.runtime.configuration import resolve_settings
 from hedge_fund.runtime.handover import enroll_fresh
 from hedge_fund.runtime.operations import (
+    OperationBusy,
+    OperationError,
     OPERATIONS_ROOT,
     OperationStatus,
     OperationStore,
@@ -99,14 +108,23 @@ def _accepted_operation(store, capture, request_id="job-request"):
     )
 
 
-def _wait_for_operation(store, operation_id, status, timeout=5):
+# Generous so loaded full-suite runs do not misreport slow durable writes as failures.
+_WAIT_SECONDS = 60
+
+
+def _wait_for_operation(store, operation_id, status, timeout=_WAIT_SECONDS):
     deadline = time.monotonic() + timeout
     latest = None
     while time.monotonic() < deadline:
-        latest = store.get_operation(operation_id)
+        try:
+            latest = store.get_operation(operation_id)
+        except OperationBusy:
+            # Contract: a bounded lock-wait timeout is retry-read-only, not a terminal observation.
+            time.sleep(0.05)
+            continue
         if latest.status is status:
             return latest
-        time.sleep(0.01)
+        time.sleep(0.05)
     view = latest.public_view() if latest is not None else None
     raise AssertionError(f"operation did not reach {status.value}: {view}")
 
@@ -196,7 +214,7 @@ def test_builder_canonical_validation_conflicts_and_deployment(tmp_path):
     invalid["interval"] = 1.0
     with pytest.raises(ServiceError) as cadence:
         service.create_mandate(invalid)
-    assert cadence.value.status_code == 422
+    assert cadence.value.status_code == 400
     service.close()
 
 
@@ -240,7 +258,7 @@ def test_mandate_api_preserves_advanced_model_roster_and_weights_and_rejects_unk
     assert partial_response.json()["spec"]["strategies"][0]["models"] == partial["strategies"][0]["models"]
     assert weight_response.status_code == 201
     assert weight_response.json()["spec"]["strategies"][0]["models"][0]["weight"] == changed_weight["strategies"][0]["models"][0]["weight"]
-    assert params_response.status_code == 422
+    assert params_response.status_code == 400
     assert (tmp_path / "mandates" / "partial-library.yaml").is_file()
     assert (tmp_path / "mandates" / "changed-library-weight.yaml").is_file()
     assert not (tmp_path / "mandates" / "changed-library-params.yaml").exists()
@@ -282,6 +300,122 @@ def test_custom_mandate_api_preserves_dollar_neutral_override(tmp_path):
     assert response.json()["spec"]["strategies"][0]["blend"]["mode"] == "dollar_neutral"
     assert (tmp_path / "mandates" / "custom-neutral.yaml").is_file()
     app.state.service.close()
+
+
+def test_operation_status_read_under_writer_contention_is_retryable_503(demo_root, monkeypatch):
+    app = create_app(root=demo_root, allow_writes=True, network_enabled=False, demo=True)
+    service = app.state.service
+    assert service._operation_store is not None
+    monkeypatch.setattr(operations_module, "_MAX_LOCK_WAIT_SECONDS", 0.1)
+    held = threading.Event()
+    release = threading.Event()
+
+    def hold_registry_lock():
+        with service._admission.registry_lock(timeout=5):
+            held.set()
+            release.wait(timeout=_WAIT_SECONDS)
+
+    holder = threading.Thread(target=hold_registry_lock, daemon=True)
+    try:
+        with TestClient(app) as client:
+            holder.start()
+            assert held.wait(timeout=_WAIT_SECONDS)
+            busy_list = client.get("/api/operations", headers={"host": "127.0.0.1"})
+            busy_item = client.get(f"/api/operations/{'a' * 32}", headers={"host": "127.0.0.1"})
+            release.set()
+            holder.join(timeout=_WAIT_SECONDS)
+            recovered = client.get("/api/operations", headers={"host": "127.0.0.1"})
+    finally:
+        release.set()
+        service.close()
+
+    for response in (busy_list, busy_item):
+        body = response.json()
+        assert response.status_code == 503, body
+        assert body["code"] == "observation-conflict"
+        assert body["retry_policy"] == "retry-read-only"
+        assert body["refresh_required"] is False
+        assert str(demo_root) not in response.text
+        assert "lock" not in response.text.lower()
+    assert recovered.status_code == 200
+    assert recovered.json() == {"items": []}
+
+
+def test_operation_lock_failure_other_than_timeout_is_not_retryable(demo_root, monkeypatch):
+    app = create_app(root=demo_root, allow_writes=True, network_enabled=False, demo=True)
+    service = app.state.service
+    store = service._operation_store
+    assert store is not None
+
+    @contextmanager
+    def unavailable_lock(*_args, **_kwargs):
+        raise AdmissionError("existing registry lock is unavailable")
+        yield
+
+    monkeypatch.setattr(service._admission, "registry_read_lock", unavailable_lock)
+    try:
+        with pytest.raises(OperationError) as direct:
+            store.list_operations()
+        with TestClient(app) as client:
+            response = client.get("/api/operations", headers={"host": "127.0.0.1"})
+    finally:
+        service.close()
+
+    assert not isinstance(direct.value, OperationBusy)
+    body = response.json()
+    assert response.status_code == 409, body
+    assert body["code"] == "request-conflict"
+    assert body["retry_policy"] != "retry-read-only"
+    assert str(demo_root) not in response.text
+
+
+def test_operation_body_admission_error_is_not_reported_busy(durable_job_context):
+    _root_context, store, capture = durable_job_context
+    operation = _accepted_operation(store, capture)
+
+    with pytest.raises(OperationError) as raised:
+        with store._locked_for_operation(operation.operation_id):
+            raise AdmissionError("nested lane failure")
+
+    assert not isinstance(raised.value, OperationBusy)
+    assert store.get_operation(operation.operation_id).status is OperationStatus.ACCEPTED
+
+
+def test_operation_job_retries_transient_busy_without_interrupting(durable_job_context, monkeypatch):
+    _root_context, store, capture = durable_job_context
+    registry = OperationJobRegistry(store, clock=lambda: _JOB_NOW)
+    operation = _accepted_operation(store, capture)
+    busy = {"claim_worker": 2, "mark_running": 1, "update_progress": 1, "complete": 1}
+    attempts = {name: 0 for name in busy}
+
+    def flaky(name):
+        original = getattr(store, name)
+
+        def wrapper(*args, **kwargs):
+            attempts[name] += 1
+            if busy[name] > 0:
+                busy[name] -= 1
+                raise OperationBusy("operation admission lock is unavailable")
+            return original(*args, **kwargs)
+
+        return wrapper
+
+    for name in busy:
+        monkeypatch.setattr(store, name, flaky(name))
+
+    def work(progress, cancelled, _apply_if_current):
+        assert not cancelled()
+        progress(40)
+        return {"sessions": 1}
+
+    try:
+        registry.submit(operation, work)
+        completed = _wait_for_operation(store, operation.operation_id, OperationStatus.COMPLETED)
+    finally:
+        registry.close()
+
+    assert completed.result == {"sessions": 1}
+    assert attempts == {"claim_worker": 3, "mark_running": 2, "update_progress": 2, "complete": 2}
 
 
 def test_reviewed_operation_preview_accept_persists_capture_and_report(demo_root, monkeypatch):
@@ -360,12 +494,17 @@ def test_reviewed_operation_preview_accept_persists_capture_and_report(demo_root
             )
             assert accepted.status_code == 202, accepted.text
             operation_id = accepted.json()["operation_id"]
-            deadline = time.monotonic() + 20
+            deadline = time.monotonic() + _WAIT_SECONDS
             while time.monotonic() < deadline:
-                current = client.get(
+                response = client.get(
                     f"/api/operations/{operation_id}",
                     headers={"host": "127.0.0.1"},
-                ).json()
+                )
+                current = response.json()
+                if response.status_code == 503 and current.get("code") == "observation-conflict":
+                    time.sleep(0.2)
+                    continue
+                assert response.status_code == 200, current
                 if current["status"] in {"completed", "failed", "interrupted"}:
                     break
                 time.sleep(0.2)
@@ -547,12 +686,12 @@ def test_cancel_after_effect_returns_preserves_completed_result(durable_job_cont
     def work(_progress, _cancelled, apply_if_current):
         result = apply_if_current(lambda: effects.append("report-committed") or {"report_id": "report.json"})
         effect_finished.set()
-        assert release_worker.wait(timeout=5)
+        assert release_worker.wait(timeout=_WAIT_SECONDS)
         return result
 
     try:
         registry.submit(operation, work)
-        assert effect_finished.wait(timeout=5)
+        assert effect_finished.wait(timeout=_WAIT_SECONDS)
         cancellation = registry.cancel(
             operation.operation_id,
             request_id="cancel-after-commit",
@@ -881,12 +1020,18 @@ def test_reviewed_backtest_executes_captured_mandate_after_template_edit(demo_ro
         service.close()
 
 
-def test_reviewed_backtest_cancellation_closes_fake_client_and_freezes_model(demo_root, monkeypatch):
+def _run_reviewed_backtest_cancellation(
+    demo_root,
+    monkeypatch,
+    *,
+    release_factory=threading.Event,
+    release_wait_started=None,
+):
     import hedge_fund.web.services as services
 
     data_client = ManagedFakeDataClient(SERIES)
     entered = threading.Event()
-    release = threading.Event()
+    release = release_factory()
     selected_model = next(model_id for _, model_id, provider in load_api_models() if provider == "Ollama" and not model_id.endswith(":cloud"))
     service = DeskService(
         demo_root,
@@ -931,23 +1076,30 @@ def test_reviewed_backtest_cancellation_closes_fake_client_and_freezes_model(dem
         ),
         operator_session="synthetic-server-session",
     )
-    operation = service.accept_operation(
-        OperationAcceptRequest(
-            request_id="cancel-reviewed-backtest",
-            action="backtest",
-            subject_id="demo-quality",
-            preview_id=preview["preview_id"],
-            preview_digest=preview["preview_digest"],
-            confirmation_token=preview["confirmation_token"],
-            expected_head=preview["expected_head"],
-            due_set=preview["due_set"],
-            payload=payload,
-        ),
-        operator_session="synthetic-server-session",
-    )
+    try:
+        operation = service.accept_operation(
+            OperationAcceptRequest(
+                request_id="cancel-reviewed-backtest",
+                action="backtest",
+                subject_id="demo-quality",
+                preview_id=preview["preview_id"],
+                preview_digest=preview["preview_digest"],
+                confirmation_token=preview["confirmation_token"],
+                expected_head=preview["expected_head"],
+                due_set=preview["due_set"],
+                payload=payload,
+            ),
+            operator_session="synthetic-server-session",
+        )
+    except BaseException:
+        release.set()
+        service.close()
+        raise
     try:
         assert operation["model"] == selected_model
-        assert entered.wait(timeout=5)
+        assert entered.wait(timeout=_WAIT_SECONDS)
+        if release_wait_started is not None:
+            assert release_wait_started.wait(timeout=_WAIT_SECONDS)
         changed_model = next(item["id"] for item in service.settings()["models"] if item["id"] != selected_model)
         service.set_model(
             ModelRequest(
@@ -979,7 +1131,7 @@ def test_reviewed_backtest_cancellation_closes_fake_client_and_freezes_model(dem
             OperationCancelRequest(request_id="cancel-reviewed-backtest-1"),
         )
         release.set()
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + _WAIT_SECONDS
         current = service.get_operation(operation["operation_id"])
         while current["status"] in {"accepted", "running", "cancel-requested"} and time.monotonic() < deadline:
             time.sleep(0.02)
@@ -995,43 +1147,34 @@ def test_reviewed_backtest_cancellation_closes_fake_client_and_freezes_model(dem
     assert not (demo_root / "research" / "cancelled.json").exists()
 
 
+def test_reviewed_backtest_cancellation_closes_fake_client_and_freezes_model(demo_root, monkeypatch):
+    _run_reviewed_backtest_cancellation(demo_root, monkeypatch)
+
+
 def test_reviewed_backtest_pause_requires_explicit_release(demo_root, monkeypatch):
-    event_type = threading.Event
-    wait_called = event_type()
+    release_wait_started = threading.Event()
     wait_timeouts = []
-    event_count = 0
-    set_model = DeskService.set_model
 
-    def make_event():
-        nonlocal event_count
-        event_count += 1
-        event = event_type()
-        if event_count == 2:
-            wait = event.wait
+    def make_release():
+        event = threading.Event()
+        wait = event.wait
 
-            def expire_timed_wait(timeout=None):
-                wait_timeouts.append(timeout)
-                wait_called.set()
-                if timeout is not None:
-                    return False
-                return wait()
+        def observe_wait(timeout=None):
+            wait_timeouts.append(timeout)
+            release_wait_started.set()
+            if timeout is not None:
+                return False
+            return wait()
 
-            event.wait = expire_timed_wait
+        event.wait = observe_wait
         return event
 
-    def save_after_pause(self, request):
-        worker = self._operation_jobs
-        if worker is not None and worker._active:
-            assert wait_called.wait(timeout=5)
-            if wait_timeouts[-1] is not None:
-                future = next(iter(worker._submitted.values()))
-                assert future is not None
-                future.result(timeout=5)
-        return set_model(self, request)
-
-    monkeypatch.setattr(threading, "Event", make_event)
-    monkeypatch.setattr(DeskService, "set_model", save_after_pause)
-    test_reviewed_backtest_cancellation_closes_fake_client_and_freezes_model(demo_root, monkeypatch)
+    _run_reviewed_backtest_cancellation(
+        demo_root,
+        monkeypatch,
+        release_factory=make_release,
+        release_wait_started=release_wait_started,
+    )
     assert wait_timeouts == [None]
 
 
@@ -1084,6 +1227,30 @@ def test_legacy_backtest_and_job_routes_cannot_start_work(demo_root):
     assert {path.name for path in (demo_root / "research").iterdir()} == research_before
 
 
+def test_operation_job_failure_logs_only_type_and_frame(durable_job_context, caplog):
+    _root_context, store, capture = durable_job_context
+    registry = OperationJobRegistry(store, clock=lambda: _JOB_NOW)
+    operation = _accepted_operation(store, capture)
+
+    def work(_progress, _cancelled, _apply_if_current):
+        raise RuntimeError("provider said sk-test-secret at C:/private/root")
+
+    try:
+        with caplog.at_level(logging.WARNING, logger="hedge_fund.web.jobs"):
+            registry.submit(operation, work)
+            failed = _wait_for_operation(store, operation.operation_id, OperationStatus.FAILED)
+    finally:
+        registry.close()
+
+    assert failed.result == {"error_code": "worker-failed"}
+    messages = [record.getMessage() for record in caplog.records if record.name == "hedge_fund.web.jobs"]
+    assert len(messages) == 1
+    assert messages[0].startswith(f"operation worker failure: operation_id={operation.operation_id} phase=work " "type=RuntimeError cause_type=RuntimeError errno=None winerror=None locations=")
+    assert f"hedge_fund.web.test_jobs.work:{work.__code__.co_firstlineno + 1}" in messages[0]
+    assert "sk-test-secret" not in caplog.text
+    assert "private" not in caplog.text
+
+
 def test_operation_job_registry_persists_progress_and_result(durable_job_context):
     root_context, store, capture = durable_job_context
     registry = OperationJobRegistry(store, clock=lambda: _JOB_NOW)
@@ -1103,7 +1270,7 @@ def test_operation_job_registry_persists_progress_and_result(durable_job_context
     try:
         submitted = registry.submit(operation, work)
         assert submitted.operation_id == operation.operation_id
-        assert entered.wait(timeout=5)
+        assert entered.wait(timeout=_WAIT_SECONDS)
         running = _wait_for_operation(store, operation.operation_id, OperationStatus.RUNNING)
         assert running.progress == 20
         release.set()
@@ -1154,6 +1321,130 @@ def test_operation_worker_failures_log_safe_cause_without_payload(durable_job_co
         assert str(_root_context.path) not in caplog.text
         assert all(record.exc_info is None and record.stack_info is None for record in caplog.records)
         assert secret not in str(current.public_view())
+    finally:
+        registry.close()
+
+
+def test_busy_interrupt_after_claim_failure_is_retried(durable_job_context, monkeypatch):
+    _root_context, store, capture = durable_job_context
+    registry = OperationJobRegistry(store, clock=lambda: _JOB_NOW)
+    operation = _accepted_operation(store, capture)
+    original_retry = registry._retry_busy
+    original_interrupt = store.interrupt
+    retry_calls = 0
+    interrupt_calls = 0
+
+    def fail_claim(*_args, **_kwargs):
+        raise OperationBusy("synthetic busy")
+
+    def interrupt_busy_once(operation_id, **kwargs):
+        nonlocal interrupt_calls
+        interrupt_calls += 1
+        if interrupt_calls == 1:
+            raise OperationBusy("synthetic busy")
+        return original_interrupt(operation_id, **kwargs)
+
+    def expire_claim_retry(step, **kwargs):
+        nonlocal retry_calls
+        retry_calls += 1
+        if retry_calls == 1:
+            raise OperationBusy("synthetic busy")
+        return original_retry(step, **kwargs)
+
+    monkeypatch.setattr(store, "claim_worker", fail_claim)
+    monkeypatch.setattr(store, "interrupt", interrupt_busy_once)
+    monkeypatch.setattr(registry, "_retry_busy", expire_claim_retry)
+    try:
+        registry.submit(operation, lambda *_args: {"unused": True})
+        future = registry._submitted[operation.operation_id]
+        assert future is not None
+        future.result(timeout=5)
+        assert interrupt_calls == 2
+        assert store.get_operation(operation.operation_id).status is OperationStatus.INTERRUPTED
+    finally:
+        registry.close()
+
+
+def test_busy_cancel_acknowledgement_is_retried(durable_job_context, monkeypatch):
+    _root_context, store, capture = durable_job_context
+    registry = OperationJobRegistry(store, clock=lambda: _JOB_NOW)
+    operation = _accepted_operation(store, capture)
+    store.request_cancel(operation.operation_id, request_id="retry-cancel-ack", now=_JOB_NOW)
+    original_acknowledge = store.acknowledge_cancel
+    acknowledge_calls = 0
+
+    def acknowledge_busy_once(operation_id, fence, *, now):
+        nonlocal acknowledge_calls
+        acknowledge_calls += 1
+        if acknowledge_calls == 1:
+            raise OperationBusy("synthetic busy")
+        return original_acknowledge(operation_id, fence, now=now)
+
+    monkeypatch.setattr(store, "acknowledge_cancel", acknowledge_busy_once)
+    try:
+        registry._acknowledge_cancellation(operation.operation_id, None)
+        assert acknowledge_calls == 2
+        assert store.get_operation(operation.operation_id).status is OperationStatus.CANCELLED
+    finally:
+        registry.close()
+
+
+def test_busy_apply_if_current_retries_before_effect(durable_job_context, monkeypatch):
+    _root_context, store, capture = durable_job_context
+    registry = OperationJobRegistry(store, clock=lambda: _JOB_NOW)
+    operation = _accepted_operation(store, capture)
+    apply_if_current = store.apply_if_current
+    apply_calls = 0
+    effect_calls = []
+
+    def apply_busy_once(operation_id, fence, effect):
+        nonlocal apply_calls
+        apply_calls += 1
+        if apply_calls == 1:
+            raise OperationBusy("synthetic busy before effect")
+        return apply_if_current(operation_id, fence, effect)
+
+    def work(_progress, _cancelled, apply):
+        return {"effect_result": apply(lambda: effect_calls.append("committed") or "result")}
+
+    monkeypatch.setattr(store, "apply_if_current", apply_busy_once)
+    try:
+        registry.submit(operation, work)
+        future = registry._submitted[operation.operation_id]
+        assert future is not None
+        future.result(timeout=5)
+
+        current = store.get_operation(operation.operation_id)
+        assert current.status is OperationStatus.COMPLETED
+        assert current.result == {"effect_result": "result"}
+        assert apply_calls == 2
+        assert effect_calls == ["committed"]
+    finally:
+        registry.close()
+
+
+def test_busy_from_apply_if_current_effect_is_not_retried(durable_job_context):
+    _root_context, store, capture = durable_job_context
+    registry = OperationJobRegistry(store, clock=lambda: _JOB_NOW)
+    operation = _accepted_operation(store, capture)
+    effect_calls = []
+
+    def work(_progress, _cancelled, apply):
+        def effect():
+            effect_calls.append("started")
+            raise OperationBusy("synthetic busy from effect")
+
+        return {"unused": apply(effect)}
+
+    try:
+        registry.submit(operation, work)
+        future = registry._submitted[operation.operation_id]
+        assert future is not None
+        future.result(timeout=5)
+
+        current = store.get_operation(operation.operation_id)
+        assert current.status is OperationStatus.FAILED
+        assert effect_calls == ["started"]
     finally:
         registry.close()
 
@@ -1215,7 +1506,7 @@ def test_operation_job_cancellation_stops_at_boundary_without_result(durable_job
 
     try:
         registry.submit(operation, work)
-        assert entered.wait(timeout=5)
+        assert entered.wait(timeout=_WAIT_SECONDS)
         cancel_requested = registry.cancel(
             operation.operation_id,
             request_id="cancel-job-1",
@@ -1290,7 +1581,7 @@ def test_close_waits_for_worker_boundary_before_interruption(durable_job_context
 
     def delay_request_cancel(*args, **kwargs):
         request_cancel_entered.set()
-        if not release_request_cancel.wait(timeout=5):
+        if not release_request_cancel.wait(timeout=_WAIT_SECONDS):
             raise TimeoutError("shutdown cancellation barrier timed out")
         result = original_request_cancel(*args, **kwargs)
         request_cancel_persisted.set()
@@ -1314,20 +1605,20 @@ def test_close_waits_for_worker_boundary_before_interruption(durable_job_context
 
     def work(_progress, cancelled, _apply_if_current):
         entered.set()
-        if not probe_worker.wait(timeout=5):
+        if not probe_worker.wait(timeout=_WAIT_SECONDS):
             raise TimeoutError("worker probe barrier timed out")
         cancel_results.append(cancelled())
         worker_checked.set()
         if cancel_results[-1]:
             raise JobCancelled()
-        if not release_worker.wait(timeout=5):
+        if not release_worker.wait(timeout=_WAIT_SECONDS):
             raise TimeoutError("worker release barrier timed out")
         if cancelled():
             raise JobCancelled()
         return {"unexpected": True}
 
     registry.submit(operation, work)
-    assert entered.wait(timeout=5)
+    assert entered.wait(timeout=_WAIT_SECONDS)
 
     def close_registry():
         registry.close()
@@ -1336,18 +1627,18 @@ def test_close_waits_for_worker_boundary_before_interruption(durable_job_context
     shutdown = threading.Thread(target=close_registry)
     shutdown.start()
     try:
-        assert request_cancel_entered.wait(timeout=5)
+        assert request_cancel_entered.wait(timeout=_WAIT_SECONDS)
         assert not shutdown_done.wait(timeout=0.05)
         probe_worker.set()
-        assert worker_checked.wait(timeout=5)
+        assert worker_checked.wait(timeout=_WAIT_SECONDS)
         assert cancel_results == [False]
         release_request_cancel.set()
-        assert request_cancel_persisted.wait(timeout=5)
+        assert request_cancel_persisted.wait(timeout=_WAIT_SECONDS)
         release_worker.set()
     finally:
         release_request_cancel.set()
         release_worker.set()
-        shutdown.join(timeout=10)
+        shutdown.join(timeout=_WAIT_SECONDS)
 
     assert shutdown_done.is_set()
     assert not shutdown.is_alive()

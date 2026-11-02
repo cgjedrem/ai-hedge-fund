@@ -203,6 +203,7 @@ def test_mandate_detail_keeps_invalid_exact_file_error(tmp_path):
     service.close()
 
     assert invalid.value.status_code == 422
+    assert invalid.value.code == "readiness-denied"
     assert invalid.value.detail == "Mandate is invalid (ValueError)."
 
 
@@ -267,8 +268,17 @@ def test_session_report_verifies_entire_ledger_before_returning_a_later_record(d
             headers={"host": "127.0.0.1"},
         )
 
-    assert response.status_code == 409
-    assert response.json() == {"detail": "Ledger verification failed (LedgerError)."}
+    assert response.status_code == 423
+    assert response.json() == {
+        "detail": "Ledger verification failed (LedgerError).",
+        "code": "replay-corrupt",
+        "message": "Ledger verification failed (LedgerError).",
+        "refresh_required": False,
+        "retry_policy": "inspect-status",
+        "subject_id": "demo-quality",
+        "request_id": None,
+        "current_head": None,
+    }
     assert not {"session", "hash", "nav", "executed"} & set(response.json())
 
 
@@ -616,7 +626,7 @@ def test_mandate_update_denies_paper_inventory_drift_before_mutation(demo_root, 
     finally:
         service.close()
 
-    assert drift.value.status_code == 409
+    assert drift.value.status_code == 423
     assert drift.value.detail == "Offline paper ledger inventory changed; writes are denied."
     assert source_path.read_bytes() == source_before
     if renamed:
@@ -745,7 +755,7 @@ def test_advanced_mandate_parameters_are_constructor_validated(demo_root):
     finally:
         service.close()
 
-    assert invalid.value.status_code == 422
+    assert invalid.value.status_code == 400
     assert invalid.value.detail == "Mandate validation failed (ValidationError)."
     assert not (demo_root / "mandates" / "invalid-model-parameter.yaml").exists()
 
@@ -834,7 +844,7 @@ def test_research_pages_use_stable_cursor_search_and_bounded_limits(demo_root):
         ):
             with pytest.raises(ServiceError) as rejected:
                 service.list_research(**invalid)
-            assert rejected.value.status_code == 422
+            assert rejected.value.status_code == 400
     finally:
         service.close()
 
@@ -897,7 +907,8 @@ def test_research_pages_use_stable_cursor_search_and_bounded_limits(demo_root):
     assert home.status_code == 200
     assert home.json()["research_count"] == 107
     assert long_cursor_response.status_code == 200
-    assert rejected.status_code == 422
+    assert rejected.status_code == 400
+    assert rejected.json()["code"] == "invalid-request"
 
 
 def test_paper_session_pages_cover_verified_history_and_search(demo_root):
@@ -954,7 +965,7 @@ def test_paper_session_pages_cover_verified_history_and_search(demo_root):
         ):
             with pytest.raises(ServiceError) as rejected_request:
                 service.paper_sessions("demo-quality", **invalid)
-            assert rejected_request.value.status_code == 422
+            assert rejected_request.value.status_code == 400
     finally:
         service.close()
 
@@ -992,4 +1003,5 @@ def test_paper_session_pages_cover_verified_history_and_search(demo_root):
     assert response.status_code == 200
     assert response.json()["total"] == 1
     assert len(response.json()["items"]) == 1
-    assert rejected.status_code == 422
+    assert rejected.status_code == 400
+    assert rejected.json()["code"] == "invalid-request"

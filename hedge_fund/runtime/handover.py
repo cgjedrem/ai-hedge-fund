@@ -367,6 +367,56 @@ def record_ledger_head(
         raise HandoverError("ledger head inventory update is unavailable") from exc
 
 
+def transition_ledger_inventory(
+    root: RootContext,
+    name: str,
+    *,
+    expected_heads: dict[str, dict[str, Any]],
+    expected_entry: dict[str, Any] | None,
+    new_entry: dict[str, Any] | None,
+    admission: AdmissionCoordinator,
+) -> None:
+    """Commit one journaled lifecycle head transition under registry CAS."""
+    if not isinstance(admission, AdmissionCoordinator) or admission.root is not root:
+        raise HandoverError("root admission is required")
+    if not admission.lane_is_held("registry"):
+        raise HandoverError("root registry admission is required")
+    key = _resource_key(name)
+    if not isinstance(expected_heads, dict) or any(not isinstance(head_key, str) or not _valid_inventory_entry(head_key, entry) for head_key, entry in expected_heads.items()):
+        raise HandoverError("expected ledger inventory is invalid")
+    try:
+        record = require_enrollment(root)
+        current_heads = record["heads"]
+        current_entry = current_heads.get(key)
+        if expected_heads.get(key) != expected_entry:
+            raise LedgerDrift("reviewed lifecycle entry does not match its journal")
+        # Other enrolled funds may legitimately advance while this object is interrupted.
+        updated_heads = dict(current_heads)
+        if new_entry is None:
+            updated_heads.pop(key, None)
+        else:
+            if not _valid_inventory_entry(key, new_entry):
+                raise HandoverError("new ledger head is invalid")
+            updated_heads[key] = new_entry
+        actual_heads = build_head_inventory(root)
+        if actual_heads != updated_heads:
+            raise LedgerDrift("paper ledger inventory differs from the reviewed lifecycle transition")
+        if current_heads == updated_heads and current_entry == new_entry:
+            return
+        if current_entry != expected_entry:
+            raise LedgerDrift("paper ledger inventory changed before lifecycle transition")
+        updated = _new_record(
+            root,
+            mode=record["mode"],
+            heads=dict(sorted(updated_heads.items())),
+            attestation=record["attestation"],
+            created_at=record["created_at"],
+        )
+        _write_record(root, updated)
+    except (AdmissionError, OSError, RootPathError) as exc:
+        raise HandoverError("ledger lifecycle transition is unavailable") from exc
+
+
 def recover_stale_reservation(
     root: RootContext,
     fund: str,

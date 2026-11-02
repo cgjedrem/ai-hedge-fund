@@ -9,7 +9,7 @@ import re
 import stat
 import threading
 import unicodedata
-from contextlib import contextmanager
+from contextlib import contextmanager, ExitStack
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from ipaddress import ip_address
@@ -91,11 +91,19 @@ from hedge_fund.runtime.handover import (
     enrollment_status,
     HandoverError,
     record_ledger_head,
+    require_enrollment,
     verify_root_inventory,
+)
+from hedge_fund.runtime.lifecycle import (
+    ArchiveConflict,
+    ArchiveError,
+    ArchiveNotFound,
+    LifecycleArchiveStore,
 )
 from hedge_fund.runtime.operations import (
     ConfirmationExpired,
     ConfirmationRejected,
+    OperationBusy,
     OperationConflict,
     OperationError,
     OperationRecord,
@@ -104,7 +112,12 @@ from hedge_fund.runtime.operations import (
     OperationStore,
     StalePreview,
 )
-from hedge_fund.runtime.owned_runner import OwnedRunnerError, OwnedRunnerManager
+from hedge_fund.runtime.owned_runner import (
+    OwnedRunnerError,
+    OwnedRunnerManager,
+    runner_key,
+    RUNNER_ROOT,
+)
 from hedge_fund.runtime.policy import (
     AuthorizationDenied,
     classify_provider,
@@ -120,12 +133,16 @@ from hedge_fund.web.schemas import (
     BacktestRequest,
     CredentialRequest,
     DeployRequest,
+    error_code_for,
+    LifecycleAcceptRequest,
+    LifecyclePreviewRequest,
     ModelRequest,
     OperationAcceptRequest,
     OperationCancelRequest,
     OperationPreviewRequest,
     PaperTickAcceptRequest,
     PaperTickPreviewRequest,
+    RETRY_POLICIES,
     RunnerPreviewRequest,
     RunnerStartAcceptRequest,
     RuntimeSettingsRequest,
@@ -140,10 +157,35 @@ _SECRET_FIELD = re.compile(r"(?:api.?key|secret|token|password|credential|author
 
 
 class ServiceError(RuntimeError):
-    def __init__(self, status_code: int, detail: str) -> None:
+    def __init__(
+        self,
+        status_code: int,
+        detail: str,
+        *,
+        code: str | None = None,
+        subject_id: str | None = None,
+        request_id: str | None = None,
+        current_head: str | None = None,
+        retry_policy: str | None = None,
+    ) -> None:
         super().__init__(detail)
         self.status_code = status_code
         self.detail = detail
+        self.code = error_code_for(status_code, code)
+        self.subject_id = subject_id
+        self.request_id = request_id
+        self.current_head = current_head
+        if retry_policy is not None and retry_policy not in RETRY_POLICIES:
+            raise ValueError(f"unknown retry policy: {retry_policy}")
+        self.retry_policy = retry_policy
+
+    def attach(self, *, subject_id: str | None = None, request_id: str | None = None) -> "ServiceError":
+        """Add request identity known to the caller without overwriting a site's own identity."""
+        if self.subject_id is None:
+            self.subject_id = subject_id
+        if self.request_id is None:
+            self.request_id = request_id
+        return self
 
 
 class _DispatchGuardedInjectedDataClient:
@@ -269,6 +311,7 @@ class DeskService:
         self._captures: dict[str, FrozenCapture] = {}
         self._preview_captures: dict[str, str] = {}
         self._preview_expiries: dict[str, datetime] = {}
+        self._lifecycle_previews: dict[str, dict[str, object]] = {}
         try:
             self._environment_settings = environment_settings()
             self._runtime_settings = resolve_settings(
@@ -350,7 +393,7 @@ class DeskService:
             "deferred_actions": {
                 "runner": ("Finite local-paper runner start and stop require an explicit reviewed operation." if self.allow_writes else "Runner controls are unavailable because root writes are disabled."),
                 "manual_run": ("One-session local-paper ticks require a reviewed head and due-set confirmation." if self.allow_writes and self.network_enabled else "Manual ticks are unavailable because writes or network capability are disabled."),
-                "delete": "Fund and report deletion is not available.",
+                **({} if self.allow_writes and self._operation_store is not None else {"delete": "Scoped archival is unavailable because root writes or durable operation storage are disabled."}),
                 "redo": "Ledger redo is not available from the web UI.",
                 "live_value": ("Explicit free-Yahoo refresh is available; quote print freshness remains unverified." if self.network_enabled else "Valuation refresh is disabled because network capability is off."),
             },
@@ -437,7 +480,7 @@ class DeskService:
                 except FileExistsError:
                     raise ServiceError(409, "A mandate with this name already exists.") from None
                 except (OSError, ValueError, StorageAdmissionError) as exc:
-                    raise ServiceError(422, f"Mandate could not be saved ({type(exc).__name__}).") from None
+                    raise ServiceError(400, f"Mandate could not be saved ({type(exc).__name__}).") from None
         return self._mandate_summary(spec, include_spec=True)
 
     def update_mandate(self, name: str, payload: dict, *, expected_hash: str) -> dict:
@@ -445,7 +488,7 @@ class DeskService:
         normalized = self._validated_name(name)
         self._guard_protected(normalized)
         if not isinstance(expected_hash, str) or re.fullmatch(r"[0-9a-f]{64}", expected_hash) is None:
-            raise ServiceError(422, "Mandate revision is invalid.")
+            raise ServiceError(400, "Mandate revision is invalid.")
         spec = self._validated_mandate(payload)
         target = self._validated_name(spec.name)
         self._guard_protected(target)
@@ -453,7 +496,7 @@ class DeskService:
             with self._fund_lock(normalized):
                 current, path = self._load_mandate_entry(normalized)
                 if mandate_hash(current) != expected_hash:
-                    raise ServiceError(409, "Mandate changed; reload before editing.")
+                    raise ServiceError(409, "Mandate changed; reload before editing.", code="stale-preview", subject_id=normalized, current_head=mandate_hash(current))
                 relative = path.relative_to(self.root).as_posix()
                 if _windows_name_key(target) != _windows_name_key(normalized):
                     directory = self._safe_child("mandates")
@@ -489,17 +532,17 @@ class DeskService:
         source = self._validated_name(name)
         self._guard_protected(source)
         if not isinstance(expected_hash, str) or re.fullmatch(r"[0-9a-f]{64}", expected_hash) is None:
-            raise ServiceError(422, "Mandate revision is invalid.")
+            raise ServiceError(400, "Mandate revision is invalid.")
         spec = self._validated_mandate(payload)
         target = self._validated_name(spec.name)
         self._guard_protected(target)
         if _windows_name_key(target) == _windows_name_key(source):
-            raise ServiceError(422, "A clone must use a distinct mandate name.")
+            raise ServiceError(400, "A clone must use a distinct mandate name.")
         with self._mandate_writer():
             with self._fund_lock(source):
                 current, _source_path = self._load_mandate_entry(source)
                 if mandate_hash(current) != expected_hash:
-                    raise ServiceError(409, "Mandate changed; reload before cloning.")
+                    raise ServiceError(409, "Mandate changed; reload before cloning.", code="stale-preview", subject_id=source, current_head=mandate_hash(current))
                 directory = self._ensure_dir("mandates")
                 self._assert_mandate_name_available(target, directory)
                 try:
@@ -509,7 +552,7 @@ class DeskService:
                 except StorageAdmissionError:
                     raise ServiceError(409, "Mandate could not be saved safely.") from None
                 except (OSError, ValueError) as exc:
-                    raise ServiceError(422, f"Mandate could not be saved ({type(exc).__name__}).") from None
+                    raise ServiceError(400, f"Mandate could not be saved ({type(exc).__name__}).") from None
         return self._mandate_summary(spec, include_spec=True)
 
     def deploy_mandate(self, name: str, request: DeployRequest) -> dict:
@@ -519,14 +562,14 @@ class DeskService:
         try:
             universe = normalize_universe(request.universe)
         except ValueError:
-            raise ServiceError(422, "Deployment universe is invalid.") from None
+            raise ServiceError(400, "Deployment universe is invalid.") from None
         with self._fund_lock(normalized):
             with self._paper_deployment_lane(normalized):
                 self._verify_root_inventory()
                 spec = self._load_mandate_by_name(normalized)
                 _reject_secret_fields(spec.model_dump(mode="python"))
                 if spec.broker != "paper":
-                    raise ServiceError(403, "Web deployment is restricted to local-paper mandates.")
+                    raise ServiceError(403, "Web deployment is restricted to local-paper mandates.", code="broker-not-web-supported")
                 paper_root = self._ensure_dir("paper")
                 self._assert_unique(paper_root, normalized)
                 try:
@@ -534,7 +577,7 @@ class DeskService:
                 except FileExistsError:
                     raise ServiceError(409, "A paper fund with this name already exists.") from None
                 except ValueError as exc:
-                    raise ServiceError(422, f"Deployment validation failed ({type(exc).__name__}).") from None
+                    raise ServiceError(400, f"Deployment validation failed ({type(exc).__name__}).") from None
                 except OSError as exc:
                     raise ServiceError(409, f"Deployment could not be written ({type(exc).__name__}).") from None
                 try:
@@ -544,10 +587,7 @@ class DeskService:
                         admission=self._admission,
                     )
                 except HandoverError:
-                    raise ServiceError(
-                        409,
-                        "Deployment was written; root head inventory requires offline review.",
-                    ) from None
+                    raise ServiceError(423, "Deployment was written; root head inventory requires offline review.", code="reconciliation-required") from None
         return {"name": normalized, "universe": universe, "path": directory.name, "status": "deployed"}
 
     def list_paper(self) -> dict:
@@ -599,7 +639,7 @@ class DeskService:
         try:
             deployed = load_deployed(directory)
         except ValueError as exc:
-            raise ServiceError(422, f"Paper fund is invalid ({type(exc).__name__}).") from None
+            raise ServiceError(422, f"Paper fund is invalid ({type(exc).__name__}).", code="readiness-denied") from None
         return self._paper_snapshot(deployed, directory, include_records=True)
 
     def paper_sessions(
@@ -611,19 +651,19 @@ class DeskService:
         search: str | None = None,
     ) -> dict:
         if type(limit) is not int or not 1 <= limit <= 100:
-            raise ServiceError(422, "Session page limit must be between 1 and 100.")
+            raise ServiceError(400, "Session page limit must be between 1 and 100.")
         if cursor is not None:
             if not isinstance(cursor, str) or not _SESSION_CURSOR.fullmatch(cursor):
-                raise ServiceError(422, "Session cursor is invalid.")
+                raise ServiceError(400, "Session cursor is invalid.")
             try:
                 if "T" in cursor:
                     datetime.strptime(cursor, "%Y-%m-%dT%H:%M:%S")
                 else:
                     date.fromisoformat(cursor)
             except ValueError:
-                raise ServiceError(422, "Session cursor is invalid.") from None
+                raise ServiceError(400, "Session cursor is invalid.") from None
         if search is not None and (not isinstance(search, str) or len(search) > 128 or any(ord(character) < 32 or ord(character) == 127 for character in search)):
-            raise ServiceError(422, "Session search is invalid.")
+            raise ServiceError(400, "Session search is invalid.")
 
         normalized = self._validated_name(name)
         directory = self._safe_child("paper", normalized)
@@ -632,7 +672,7 @@ class DeskService:
         try:
             deployed = load_deployed(directory)
         except ValueError as exc:
-            raise ServiceError(422, f"Paper fund is invalid ({type(exc).__name__}).") from None
+            raise ServiceError(422, f"Paper fund is invalid ({type(exc).__name__}).", code="readiness-denied") from None
 
         records: list[SessionRecord] = []
         try:
@@ -677,7 +717,7 @@ class DeskService:
         operator_session: str | None,
     ) -> dict:
         if not isinstance(request, PaperTickPreviewRequest):
-            raise ServiceError(422, "Paper tick preview is invalid.")
+            raise ServiceError(400, "Paper tick preview is invalid.")
         return self._create_local_paper_preview(
             name,
             expected_head=request.expected_head,
@@ -699,7 +739,7 @@ class DeskService:
         operator_session: str | None,
     ) -> dict:
         if not isinstance(request, RunnerPreviewRequest):
-            raise ServiceError(422, "Runner preview is invalid.")
+            raise ServiceError(400, "Runner preview is invalid.")
 
         def payload(head, due, spec, model_calls, universe_size):
             max_calls, max_resources = _runner_limits(
@@ -742,7 +782,7 @@ class DeskService:
                 try:
                     return self._runner_manager.request_stop(normalized)
                 except OwnedRunnerError:
-                    raise ServiceError(409, "Owned runner identity is unavailable; no process was signalled.") from None
+                    raise ServiceError(409, "Owned runner identity is unavailable; no process was signalled.", code="ownership-unknown") from None
 
     def _create_local_paper_preview(
         self,
@@ -774,12 +814,12 @@ class DeskService:
                     local_paper_only=True,
                 )
                 if deployed.broker != "paper":
-                    raise ServiceError(403, "Paper operations require a local-paper deployment.")
+                    raise ServiceError(403, "Paper operations require a local-paper deployment.", code="broker-not-web-supported")
                 current_head = latest.hash if latest is not None else None
                 if expected_head != current_head:
-                    raise ServiceError(409, "Paper ledger changed; reload before previewing.")
+                    raise ServiceError(409, "Paper ledger changed; reload before previewing.", code="stale-preview", subject_id=normalized, current_head=current_head)
                 if state.halted is not None:
-                    raise ServiceError(409, "Halted funds cannot accept a paper operation.")
+                    raise ServiceError(423, "Halted funds cannot accept a paper operation.", code="halted", subject_id=normalized, current_head=current_head)
                 with self._settings_lock:
                     self._ensure_settings_available()
                     settings = self._runtime_settings
@@ -789,7 +829,7 @@ class DeskService:
                         len(deployed.universe),
                     )
                     if model_calls > 1000:
-                        raise ServiceError(422, "Estimated local model calls exceed the 1000-call bound.")
+                        raise ServiceError(422, "Estimated local model calls exceed the 1000-call bound.", code="readiness-denied")
                     now = _utcnow()
                     try:
                         capture = freeze_capture(
@@ -874,9 +914,9 @@ class DeskService:
         operator_session: str | None,
     ) -> dict:
         if not isinstance(request, PaperTickAcceptRequest):
-            raise ServiceError(422, "Paper tick acceptance is invalid.")
+            raise ServiceError(400, "Paper tick acceptance is invalid.")
         if len(request.due_set) != 1:
-            raise ServiceError(422, "Manual tick requires exactly one reviewed session.")
+            raise ServiceError(400, "Manual tick requires exactly one reviewed session.")
         payload = {
             "kind": "manual-tick",
             "session": request.due_set[0],
@@ -898,14 +938,14 @@ class DeskService:
         operator_session: str | None,
     ) -> dict:
         if not isinstance(request, RunnerStartAcceptRequest):
-            raise ServiceError(422, "Runner acceptance is invalid.")
+            raise ServiceError(400, "Runner acceptance is invalid.")
         normalized = self._validated_name(name)
         _directory, deployed, _ledger, _state, _latest = self._paper_state(
             normalized,
             local_paper_only=True,
         )
         if deployed.broker != "paper":
-            raise ServiceError(403, "Runner requires a local-paper deployment.")
+            raise ServiceError(403, "Runner requires a local-paper deployment.", code="broker-not-web-supported")
         model_calls = _estimate_paper_model_calls(
             deployed.spec,
             len(deployed.universe),
@@ -957,11 +997,11 @@ class DeskService:
         capture_id = self._preview_captures.get(request.preview_id)
         capture = self._captures.get(capture_id or "")
         if capture is None or capture.subject_id != normalized:
-            raise ServiceError(409, "Paper preview is no longer available; review again.")
+            raise ServiceError(409, "Paper preview is no longer available; review again.", code="stale-preview")
         if request.due_set != payload.get("initial_due_set", request.due_set):
-            raise ServiceError(409, "Reviewed session set changed; review again.")
+            raise ServiceError(409, "Reviewed session set changed; review again.", code="stale-preview")
         if payload.get("expected_head") != request.expected_head:
-            raise ServiceError(409, "Reviewed ledger head changed; review again.")
+            raise ServiceError(409, "Reviewed ledger head changed; review again.", code="stale-preview")
 
         def current_state() -> tuple[str | None, tuple[str, ...]]:
             return self._resolve_paper_schedule(normalized, capture)
@@ -991,7 +1031,7 @@ class DeskService:
         with self._settings_lock:
             self._ensure_settings_available()
             if self._runtime_settings.version != capture.settings_version or self._runtime_settings.model != capture.model or self._runtime_settings.data_provider != capture.data_provider or self._runtime_settings.llm_provider != capture.llm_provider:
-                raise ServiceError(409, "Runtime settings changed; review the paper operation again.")
+                raise ServiceError(409, "Runtime settings changed; review the paper operation again.", code="stale-preview")
             self._require_local_paper_policy(self._runtime_settings)
             try:
                 operation = store.accept_request(
@@ -1012,11 +1052,15 @@ class DeskService:
             except ConfirmationExpired:
                 raise ServiceError(410, "Confirmation expired; review the paper operation again.") from None
             except (ConfirmationRejected, StalePreview):
-                raise ServiceError(409, "Reviewed paper operation is stale or no longer valid.") from None
+                raise ServiceError(409, "Reviewed paper operation is stale or no longer valid.", code="stale-preview") from None
             except OperationStartUncertain:
-                raise ServiceError(409, "Paper operation start is uncertain; inspect its durable status.") from None
-            except (AdmissionError, JobConflict, OperationConflict):
-                raise ServiceError(409, "Paper operation conflicts with current runner or execution state.") from None
+                raise ServiceError(409, "Paper operation start is uncertain; inspect its durable status.", code="ownership-unknown") from None
+            except OperationConflict:
+                raise ServiceError(409, "Paper operation request conflicts with durable state.", code="request-conflict") from None
+            except (AdmissionError, JobConflict):
+                raise ServiceError(409, "Paper operation conflicts with current runner or execution state.", code="writer-conflict") from None
+            except OperationBusy:
+                raise ServiceError(409, "Operation storage is busy; this request was not processed now. Retry later; if this request was submitted before, inspect its operation status first.", code="writer-conflict", retry_policy="retry-later") from None
             except OperationError:
                 raise ServiceError(409, "Paper operation could not be accepted.") from None
         return self._operation_view(operation)
@@ -1067,16 +1111,16 @@ class DeskService:
                     self._verify_root_inventory()
                     deployed = load_deployed(directory)
                     if deployed.broker != "paper" or mandate_hash(deployed.spec) != capture.mandate_digest or tuple(deployed.universe) != tuple(capture.universe):
-                        raise ServiceError(409, "Paper deployment changed after review.")
+                        raise ServiceError(409, "Paper deployment changed after review.", code="stale-preview")
                     state, latest = self._replay_paper_state(
                         deployed,
                         Ledger(directory),
                     )
                     head = latest.hash if latest is not None else None
                     if head != payload["expected_head"]:
-                        raise ServiceError(409, "Paper ledger head changed after review.")
+                        raise ServiceError(409, "Paper ledger head changed after review.", code="stale-preview")
                     if state.halted is not None:
-                        raise ServiceError(409, "Halted funds cannot run a paper tick.")
+                        raise ServiceError(423, "Halted funds cannot run a paper tick.", code="halted")
                     with self._make_data_client(
                         capture.data_provider,
                         dispatch=dispatch,
@@ -1089,7 +1133,7 @@ class DeskService:
                             data_client=client,
                         )
                         if due != session:
-                            raise ServiceError(409, "Paper due-set changed after review.")
+                            raise ServiceError(409, "Paper due-set changed after review.", code="stale-preview")
                         record = tick(
                             directory,
                             client,
@@ -1111,7 +1155,7 @@ class DeskService:
                 admission=self._admission,
             )
         except HandoverError:
-            raise ServiceError(409, "Paper tick recorded; root head inventory requires offline review.") from None
+            raise ServiceError(423, "Paper tick recorded; root head inventory requires offline review.", code="reconciliation-required") from None
         progress(95)
         return {
             "session": record.session,
@@ -1209,9 +1253,9 @@ class DeskService:
             local_paper_only=True,
         )
         if deployed.broker != "paper" or mandate_hash(deployed.spec) != capture.mandate_digest or tuple(deployed.universe) != tuple(capture.universe):
-            raise ServiceError(409, "Paper deployment changed after review.")
+            raise ServiceError(409, "Paper deployment changed after review.", code="stale-preview")
         if state.halted is not None:
-            raise ServiceError(409, "Halted funds cannot accept a paper operation.")
+            raise ServiceError(423, "Halted funds cannot accept a paper operation.", code="halted")
         head = latest.hash if latest is not None else None
         preview_dispatch = self._authorize_manual_capture(
             capture,
@@ -1334,7 +1378,7 @@ class DeskService:
         calls = min(10000, max(100, model_calls + 100 * len(capture.universe)))
         expires_at = self._preview_expiries.get(operation.preview_id)
         if expires_at is None:
-            raise ServiceError(409, "Paper operation deadline is unavailable; review again.")
+            raise ServiceError(409, "Paper operation deadline is unavailable; review again.", code="stale-preview")
         targets = (
             data_target,
             llm_target,
@@ -1406,11 +1450,12 @@ class DeskService:
             raise ServiceError(
                 422,
                 "Provider configuration is not supported for local-paper operations.",
+                code="readiness-denied",
             ) from None
         if data_class is not ProviderClass.FREE_DATA:
-            raise ServiceError(422, "Paper operations require free yfinance market data.")
+            raise ServiceError(422, "Paper operations require free yfinance market data.", code="readiness-denied")
         if llm_class is not ProviderClass.LOCAL:
-            raise ServiceError(422, "Paper operations require a local Ollama model endpoint.")
+            raise ServiceError(422, "Paper operations require a local Ollama model endpoint.", code="readiness-denied")
 
     def _captured_fund_factory(
         self,
@@ -1475,9 +1520,9 @@ class DeskService:
         try:
             verify_root_inventory(self.root_context)
         except LedgerError:
-            raise ServiceError(409, "Paper state is invalid (LedgerError).") from None
+            raise ServiceError(423, "Paper state is invalid (LedgerError).", code="replay-corrupt") from None
         except HandoverError:
-            raise ServiceError(409, "Offline paper ledger inventory changed; writes are denied.") from None
+            raise ServiceError(423, "Offline paper ledger inventory changed; writes are denied.", code="reconciliation-required") from None
 
     def get_valuation(self, name: str) -> dict:
         """Return current-head estimate; never contacts a provider."""
@@ -1488,7 +1533,7 @@ class DeskService:
         if not self.network_enabled:
             raise ServiceError(403, "Network capability is disabled for this server.")
         if not isinstance(request, ValuationRefreshRequest):
-            raise ServiceError(422, "Valuation request is invalid.")
+            raise ServiceError(400, "Valuation request is invalid.")
         normalized = self._validated_name(name)
         self._guard_protected(normalized)
         with self._fund_lock(normalized):
@@ -1498,10 +1543,10 @@ class DeskService:
                     local_paper_only=True,
                 )
                 if deployed.broker != "paper":
-                    raise ServiceError(403, "Valuation requires a local-paper deployment.")
+                    raise ServiceError(403, "Valuation requires a local-paper deployment.", code="broker-not-web-supported")
                 expected_head = latest.hash if latest is not None else None
                 if request.expected_head != expected_head:
-                    raise ServiceError(409, "Paper ledger changed; reload before refreshing valuation.")
+                    raise ServiceError(409, "Paper ledger changed; reload before refreshing valuation.", code="stale-preview")
                 positions = {ticker: shares for ticker, shares in state.positions.items() if shares != 0}
                 if len(positions) > MAX_VALUATION_POSITIONS:
                     raise ServiceError(409, "Paper holdings exceed the quote-call bound.")
@@ -1653,7 +1698,7 @@ class DeskService:
     def session_report(self, name: str, session: str) -> dict:
         normalized = self._validated_name(name)
         if not re.fullmatch(r"\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}:\d{2})?", session):
-            raise ServiceError(422, "Session key is invalid.")
+            raise ServiceError(400, "Session key is invalid.")
         directory = self._safe_child("paper", normalized)
         if not directory.is_dir():
             raise ServiceError(404, "Paper fund not found.")
@@ -1676,7 +1721,7 @@ class DeskService:
         except ServiceError:
             raise
         except (LedgerError, OSError, ValueError) as exc:
-            raise ServiceError(409, f"Ledger verification failed ({type(exc).__name__}).") from None
+            raise ServiceError(423, f"Ledger verification failed ({type(exc).__name__}).", code="replay-corrupt") from None
         return self._session_report(record)
 
     def paper_scorecard(self, name: str) -> dict:
@@ -1694,11 +1739,11 @@ class DeskService:
         search: str | None = None,
     ) -> dict:
         if type(limit) is not int or not 1 <= limit <= 100:
-            raise ServiceError(422, "Research page limit must be between 1 and 100.")
+            raise ServiceError(400, "Research page limit must be between 1 and 100.")
         if cursor is not None and (not isinstance(cursor, str) or not _REPORT_ID.fullmatch(cursor) or ".." in cursor):
-            raise ServiceError(422, "Research cursor is invalid.")
+            raise ServiceError(400, "Research cursor is invalid.")
         if search is not None and (not isinstance(search, str) or len(search) > 128 or any(ord(character) < 32 or ord(character) == 127 for character in search)):
-            raise ServiceError(422, "Research search is invalid.")
+            raise ServiceError(400, "Research search is invalid.")
 
         directory = self._safe_child("research")
         query = search.casefold() if search else ""
@@ -1724,7 +1769,7 @@ class DeskService:
         for path in paths:
             try:
                 if not _REPORT_ID.fullmatch(path.name) or ".." in path.name:
-                    raise ServiceError(422, "Research report identifier is invalid.")
+                    raise ServiceError(400, "Research report identifier is invalid.")
                 safe_path = self._safe_child("research", path.name)
                 result = FundBacktestResult.model_validate_json(safe_path.read_text(encoding="utf-8"))
                 item = self._research_summary(path.name, result)
@@ -1763,7 +1808,7 @@ class DeskService:
         try:
             result = FundBacktestResult.model_validate_json(path.read_text(encoding="utf-8"))
         except (OSError, ValueError) as exc:
-            raise ServiceError(422, f"Research report is invalid ({type(exc).__name__}).") from None
+            raise ServiceError(422, f"Research report is invalid ({type(exc).__name__}).", code="readiness-denied") from None
         return {
             **self._research_summary(report_id, result),
             "dates": result.dates,
@@ -1843,7 +1888,7 @@ class DeskService:
         self._require_writes()
         provider = _supported_model_providers().get(request.model)
         if provider is None:
-            raise ServiceError(422, "Model is not in the supported provider catalog.")
+            raise ServiceError(400, "Model is not in the supported provider catalog.")
         values: dict[str, object] = {
             "model": request.model,
             "llm_provider": provider,
@@ -1860,7 +1905,7 @@ class DeskService:
         self._require_writes()
         provider = _supported_model_providers().get(request.model)
         if provider is None:
-            raise ServiceError(422, "Model is not in the supported provider catalog.")
+            raise ServiceError(400, "Model is not in the supported provider catalog.")
         values = request.model_dump(exclude={"expected_version"})
         values["llm_provider"] = provider
         _persisted, updated = self._persist_runtime_settings(
@@ -1877,7 +1922,7 @@ class DeskService:
         provider = _credential_provider(request.provider)
         value = request.value.get_secret_value()
         if not value or any(unicodedata.category(char) in {"Cc", "Cf"} for char in value):
-            raise ServiceError(422, "Credential value is empty or contains control characters.")
+            raise ServiceError(400, "Credential value is empty or contains control characters.")
         with self._settings_lock:
             if self._credential_store is None:
                 raise ServiceError(409, "Private credential storage is unavailable.")
@@ -1888,7 +1933,7 @@ class DeskService:
                     expected_version=request.expected_version,
                 )
             except CredentialVersionConflict:
-                raise ServiceError(409, "Credential version changed; reload before saving.") from None
+                raise ServiceError(409, "Credential version changed; reload before saving.", code="stale-preview") from None
             except CredentialStoreError:
                 raise ServiceError(409, "Credential could not be saved.") from None
         return {"provider": provider, "configured": True, "version": version}
@@ -1897,7 +1942,7 @@ class DeskService:
         self._require_writes()
         provider_name = _credential_provider(provider)
         if type(expected_version) is not int or expected_version < 0:
-            raise ServiceError(422, "Credential version is invalid.")
+            raise ServiceError(400, "Credential version is invalid.")
         with self._settings_lock:
             if self._credential_store is None:
                 raise ServiceError(409, "Private credential storage is unavailable.")
@@ -1907,10 +1952,459 @@ class DeskService:
                     expected_version=expected_version,
                 )
             except CredentialVersionConflict:
-                raise ServiceError(409, "Credential version changed; reload before saving.") from None
+                raise ServiceError(409, "Credential version changed; reload before saving.", code="stale-preview") from None
             except CredentialStoreError:
                 raise ServiceError(409, "Credential could not be deleted.") from None
         return {"provider": provider_name, "configured": False, "version": version}
+
+    @staticmethod
+    def _archive_view(record: dict) -> dict:
+        fields = (
+            "archive_id",
+            "kind",
+            "identity",
+            "source_path",
+            "digest",
+            "state",
+            "updated_at",
+            "restore_operation_id",
+            "recovery_required",
+            "recovery_action",
+            "recovery_error",
+        )
+        return {key: record[key] for key in fields if key in record}
+
+    def list_lifecycle_archives(self) -> dict:
+        try:
+            store = LifecycleArchiveStore(self.root_context, self._admission)
+            records = {item["archive_id"]: item for item in store.list_archives()}
+            for archive_id, record in records.items():
+                if self._has_unprepared_restore(record):
+                    records[archive_id] = self._inspect_lifecycle_recovery(store, archive_id, record=record)
+            if self._operation_store is not None:
+                for operation in self._operation_store.interrupted_lifecycle_archives():
+                    archive_id = operation.payload.get("archive_id")
+                    if archive_id not in records:
+                        records[archive_id] = self._inspect_lifecycle_recovery(store, archive_id, operation=operation)
+            return {"items": [self._archive_view(item) for item in records.values()]}
+        except OperationBusy:
+            raise ServiceError(503, "Archive history is busy; retry the read.", code="observation-conflict") from None
+        except (ArchiveError, AdmissionError, OperationError, HandoverError, OSError, RootPathError):
+            raise ServiceError(409, "Archive history is unavailable.") from None
+
+    def get_lifecycle_archive(self, archive_id: str) -> dict:
+        try:
+            store = LifecycleArchiveStore(self.root_context, self._admission)
+            try:
+                record = store.inspect(archive_id)
+                if self._has_unprepared_restore(record):
+                    record = self._inspect_lifecycle_recovery(store, archive_id, record=record)
+            except ArchiveNotFound:
+                matches = [] if self._operation_store is None else [operation for operation in self._operation_store.interrupted_lifecycle_archives() if operation.payload.get("archive_id") == archive_id]
+                if len(matches) != 1:
+                    raise
+                record = self._inspect_lifecycle_recovery(store, archive_id, operation=matches[0])
+            return self._archive_view(record)
+        except ArchiveNotFound:
+            raise ServiceError(404, "Archive not found.") from None
+        except OperationBusy:
+            raise ServiceError(503, "Archive inspection is busy; retry the read.", code="observation-conflict") from None
+        except (ArchiveError, AdmissionError, OperationError, HandoverError, OSError, RootPathError):
+            raise ServiceError(409, "Archive inspection is unavailable.") from None
+
+    def _inspect_lifecycle_recovery(self, archives: LifecycleArchiveStore, archive_id: str, *, record: dict | None = None, operation: OperationRecord | None = None) -> dict:
+        try:
+            return self._review_lifecycle_archive(archives, archive_id, action="recover")
+        except (ArchiveConflict, ArchiveNotFound):
+            if record is None:
+                if operation is None:
+                    raise ArchiveNotFound("interrupted archive evidence is unavailable") from None
+                payload = operation.payload
+                record = {
+                    "archive_id": archive_id,
+                    "kind": payload["kind"],
+                    "identity": payload["identity"],
+                    "source_path": payload["source_path"],
+                    "digest": payload["object_digest"],
+                    "state": "archive-unprepared",
+                    "updated_at": operation.updated_at,
+                }
+            return {
+                **record,
+                "recovery_required": True,
+                "recovery_action": "manual-review",
+                "recovery_error": "Safe automatic recovery cannot be verified. Preserve both locations and perform offline manual review.",
+            }
+
+    def _review_lifecycle_archive(self, archives: LifecycleArchiveStore, archive_id: str, *, action: str) -> dict:
+        try:
+            return archives.review_archive(archive_id, action=action)
+        except ArchiveNotFound:
+            if action != "recover" or self._operation_store is None:
+                raise
+            matches = [operation for operation in self._operation_store.interrupted_lifecycle_archives() if operation.payload.get("archive_id") == archive_id]
+            if len(matches) != 1:
+                raise ArchiveNotFound("interrupted archive identity is unavailable") from None
+            payload = matches[0].public_view()["payload"]
+            return archives.review_unprepared(payload["kind"], payload["identity"], archive_id=archive_id, expected_digest=payload["object_digest"], deployment_before=payload.get("deployment_before"))
+        except ArchiveConflict:
+            if action != "recover":
+                raise
+            record = archives.inspect(archive_id)
+            if not self._has_unprepared_restore(record):
+                raise
+            return archives.review_unprepared_restore(archive_id)
+
+    def _has_unprepared_restore(self, record: dict) -> bool:
+        if record["state"] != "archived" or self._operation_store is None:
+            return False
+        return any(operation.status is OperationStatus.INTERRUPTED and operation.action in {"lifecycle-restore", "lifecycle-recover"} and operation.payload.get("archive_id") == record["archive_id"] and operation.payload.get("object_digest") == record["digest"] and operation.operation_id not in record.get("reconciled_operations", []) for operation in self._operation_store.active_for_subject(record["lane_identity"]))
+
+    @contextmanager
+    def _lifecycle_lane(self, subject: str) -> Iterator[None]:
+        with ExitStack() as stack:
+            stack.enter_context(self._admission.registry_lock(timeout=0))
+            for lane, factory in (
+                ("deployment", self._admission.deployment_lock),
+                ("runner", self._admission.runner_reservation),
+                ("execution", self._admission.execution_lease),
+                ("control", self._admission.control_lane),
+                ("research", self._admission.research_lane),
+            ):
+                if not self._admission.lane_is_held(lane, subject):
+                    stack.enter_context(factory(subject, timeout=0))
+            yield
+
+    def _lifecycle_review(
+        self,
+        request: LifecyclePreviewRequest,
+        *,
+        archive_id: str | None = None,
+    ) -> tuple[str, dict]:
+        archives = LifecycleArchiveStore(self.root_context, self._admission)
+        if request.action == "archive":
+            record = archives.preview(request.kind, request.identity)
+            record["archive_id"] = archive_id
+        else:
+            record = self._review_lifecycle_archive(archives, request.archive_id, action=request.action)
+        subject = self._validated_name(record["lane_identity"])
+        self._guard_protected(subject)
+        kind, identity = record["kind"], record["identity"]
+        source = record.get("review_path", record["source_path"])
+        if kind == "deployment":
+            deployed = load_deployed(self.root_context.resolve(source))
+            if deployed.broker != "paper":
+                raise ServiceError(403, "Lifecycle mutations require a local-paper deployment.", code="broker-not-web-supported")
+        elif kind == "template":
+            spec = load_spec(self.root_context.resolve(source))
+            if spec.name != identity:
+                raise ServiceError(409, "Template identity does not match its contents.")
+            if spec.broker != "paper":
+                raise ServiceError(403, "Lifecycle mutations require a local-paper template.", code="broker-not-web-supported")
+        references = {"deployments": [], "research": []}
+        related_subjects = {subject}
+        paper = self._safe_child("paper")
+        entries = sorted(paper.iterdir()) if paper.exists() else []
+        if len(entries) > 10000:
+            raise ServiceError(409, "Deployment reference inventory exceeds its bound.")
+        heads = require_enrollment(self.root_context)["heads"]
+        for entry in entries:
+            directory = self._safe_child("paper", entry.name)
+            if not directory.is_dir() or not self._safe_child("paper", entry.name, "fund.yaml").is_file():
+                continue
+            self._guard_protected(directory.name)
+            deployed = load_deployed(directory)
+            if _windows_name_key(deployed.spec.name) == _windows_name_key(subject) or deployed.name == subject:
+                head = heads.get(_windows_name_key(deployed.name))
+                if not isinstance(head, dict):
+                    raise ServiceError(409, "Deployment reference head is unavailable.")
+                references["deployments"].append(
+                    {
+                        "identity": deployed.name,
+                        "mandate_digest": mandate_hash(deployed.spec),
+                        "broker": deployed.broker,
+                        "ledger_head": head.get("head_hash"),
+                    }
+                )
+                related_subjects.add(deployed.name)
+        research = self._safe_child("research")
+        reports = sorted(research.glob("*.json")) if research.exists() else []
+        if len(reports) > 10000:
+            raise ServiceError(409, "Research reference inventory exceeds its bound.")
+        for path in reports:
+            raw = self.root_context.read_bytes(f"research/{path.name}")
+            report = json.loads(raw.decode("utf-8"))
+            fund = report.get("fund") if isinstance(report, dict) else None
+            if not isinstance(fund, str):
+                raise ServiceError(409, "Research reference identity is unavailable.")
+            if _windows_name_key(fund) == _windows_name_key(subject):
+                references["research"].append(
+                    {
+                        "identity": path.name,
+                        "digest": hashlib.sha256(raw).hexdigest(),
+                    }
+                )
+        runner_states = {}
+        for related in sorted(related_subjects):
+            self._guard_protected(related)
+            runner = self._runner_state(related)
+            if runner.get("status") != "stopped":
+                raise ServiceError(409, "Lifecycle requires a verified stopped runner.", code="ownership-unknown")
+            observed = {"status": "stopped", "available": False}
+            for filename in ("state", "control"):
+                relative = f"{RUNNER_ROOT}/{runner_key(related)}/{filename}.json"
+                try:
+                    raw = self.root_context.read_bytes(relative)
+                except FileNotFoundError:
+                    observed[f"{filename}_digest"] = None
+                else:
+                    observed[f"{filename}_digest"] = hashlib.sha256(raw).hexdigest()
+            runner_states[related] = observed
+            for operation in self._operation_store.active_for_subject(related):
+                reconciled = False
+                if operation.status is OperationStatus.INTERRUPTED and operation.action in {
+                    "lifecycle-archive",
+                    "lifecycle-restore",
+                    "lifecycle-recover",
+                }:
+                    try:
+                        journal = archives.inspect(operation.payload.get("archive_id"))
+                    except ArchiveNotFound:
+                        journal = None
+                    if journal is not None and operation.operation_id in journal.get("reconciled_operations", []) and journal["digest"] == operation.payload.get("object_digest"):
+                        reconciled = True
+                recovering = request.action == "recover" and operation.status is OperationStatus.INTERRUPTED and operation.action in {"lifecycle-archive", "lifecycle-restore", "lifecycle-recover"} and operation.payload.get("archive_id") == record["archive_id"]
+                if not recovering and not reconciled:
+                    raise ServiceError(409, "Lifecycle conflicts with an unfinished operation.", code="writer-conflict")
+        payload = {
+            "action": request.action,
+            "kind": kind,
+            "identity": identity,
+            "archive_id": record["archive_id"],
+            "object_digest": record["digest"],
+            "source_path": record["source_path"],
+            "references": references,
+            "runner_state": runner_states,
+            "journal_state": record.get("state"),
+            "recovery_action": record.get("recovery_action"),
+            "review_digest": record.get("review_digest", record["digest"]),
+            "deployment_before": record.get("deployment_before") if request.action == "recover" else heads.get(_windows_name_key(identity)) if kind == "deployment" else None,
+        }
+        return subject, payload
+
+    @staticmethod
+    def _lifecycle_head(payload: dict) -> str:
+        reviewed = dict(payload)
+        if reviewed["action"] == "archive":
+            # The new journal identifier is not an existing object revision.
+            reviewed.pop("archive_id", None)
+        return hashlib.sha256(json.dumps(reviewed, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+    def _require_lifecycle_authority(self, action: str, offline_recovery: bool) -> None:
+        if type(offline_recovery) is not bool:
+            raise ServiceError(403, "Offline recovery authority is invalid.")
+        if offline_recovery and action == "recover" and self.emergency_halt_available and self._owner_lease is not None:
+            self._admission.require_root_owner()
+            return
+        self._require_writes()
+
+    def create_lifecycle_preview(
+        self,
+        request: LifecyclePreviewRequest,
+        *,
+        operator_session: str | None,
+        offline_recovery: bool = False,
+    ) -> dict:
+        self._require_lifecycle_authority(request.action, offline_recovery)
+        if not operator_session:
+            raise ServiceError(403, "A server-owned operator session is required.")
+        if self._operation_store is None:
+            raise ServiceError(409, "Durable operation storage is unavailable.")
+        try:
+            # Resolve once to select the lane, then review again while all writers are fenced.
+            archives = LifecycleArchiveStore(self.root_context, self._admission)
+            initial = archives.preview(request.kind, request.identity) if request.action == "archive" else self._review_lifecycle_archive(archives, request.archive_id, action=request.action)
+            subject = self._validated_name(initial["lane_identity"])
+            with self._settings_lock, self._lifecycle_lane(subject):
+                self._ensure_settings_available()
+                subject, payload = self._lifecycle_review(
+                    request,
+                    archive_id=uuid4().hex if request.action == "archive" else request.archive_id,
+                )
+                head = self._lifecycle_head(payload)
+                settings = self._runtime_settings
+                capture = freeze_capture(
+                    root=self.root_context,
+                    subject_id=subject,
+                    mandate_digest=head,
+                    universe=["SPY"],
+                    broker="paper",
+                    settings=settings,
+                    credential_versions={},
+                    code_version=code_version(),
+                )
+                now = _utcnow()
+                preview = self._operation_store.create_preview(
+                    action=f"lifecycle-{request.action}",
+                    subject_id=subject,
+                    expected_head=head,
+                    due_set=(),
+                    capture=capture,
+                    operator_session=operator_session,
+                    payload=payload,
+                    now=now,
+                    expires_at=now + timedelta(minutes=10),
+                )
+                self._cache_preview_capture(preview.preview_id, capture, preview.expires_at)
+                while len(self._lifecycle_previews) >= 1000:
+                    self._lifecycle_previews.pop(next(iter(self._lifecycle_previews)))
+                self._lifecycle_previews[preview.preview_id] = payload
+            return {
+                **preview.public_view(),
+                "confirmation_token": preview.confirmation_token,
+                "capture": capture.public_view(current_settings_version=settings.version),
+                "references": payload["references"],
+                "consequences": [
+                    "Only the exact reviewed object is moved; unrelated objects and immutable history are retained.",
+                    "Restore collision-checks the original identity and never starts a runner or replays decisions.",
+                    "No provider dispatch, permanent deletion, or replacement is authorized.",
+                ],
+            }
+        except ArchiveNotFound:
+            raise ServiceError(404, "Lifecycle object not found.") from None
+        except OperationBusy:
+            raise ServiceError(409, "Operation storage is busy; nothing was reviewed. Retry later.", code="writer-conflict", retry_policy="retry-later") from None
+        except HandoverError:
+            raise ServiceError(423, "Root head inventory requires offline reconciliation; lifecycle review is denied.", code="reconciliation-required") from None
+        except (ArchiveError, AdmissionError, OperationError, ConfigurationError, OSError, RootPathError, ValueError):
+            raise ServiceError(409, "Lifecycle review is unavailable.", code="writer-conflict") from None
+
+    def accept_lifecycle(
+        self,
+        request: LifecycleAcceptRequest,
+        *,
+        operator_session: str | None,
+        offline_recovery: bool = False,
+    ) -> dict:
+        self._require_lifecycle_authority(request.action, offline_recovery)
+        if not operator_session:
+            raise ServiceError(403, "A server-owned operator session is required.")
+        store = self._operation_store
+        if store is None:
+            raise ServiceError(409, "Durable operation storage is unavailable.")
+        existing = None
+        try:
+            existing = store.get_by_request(request.request_id)
+            payload = dict(existing.payload) if existing is not None else self._lifecycle_previews.get(request.preview_id)
+            if payload is None:
+                raise StalePreview("lifecycle review is unavailable")
+            if request.action != payload.get("action") or (request.action == "archive" and (request.kind != payload.get("kind") or request.identity != payload.get("identity"))) or (request.action != "archive" and request.archive_id != payload.get("archive_id")):
+                raise StalePreview("lifecycle identity changed")
+            subject = existing.subject_id if existing is not None else self._captures[self._preview_captures[request.preview_id]].subject_id
+            arguments = dict(
+                request_id=request.request_id,
+                action=f"lifecycle-{request.action}",
+                subject_id=subject,
+                preview_id=request.preview_id,
+                preview_digest=request.preview_digest,
+                confirmation_token=request.confirmation_token,
+                operator_session=operator_session,
+                expected_head=request.expected_head,
+                due_set=(),
+                payload=payload,
+                now=_utcnow(),
+            )
+            # Authenticate durable replay before looking up a source that may already have moved.
+            if existing is not None:
+                return self._operation_view(store.accept_request(**arguments))
+            preview_request = LifecyclePreviewRequest(
+                action=request.action,
+                kind=request.kind,
+                identity=request.identity,
+                archive_id=request.archive_id,
+            )
+
+            def current_state():
+                current_subject, current_payload = self._lifecycle_review(
+                    preview_request,
+                    archive_id=payload["archive_id"],
+                )
+                if current_subject != subject:
+                    raise StalePreview("lifecycle subject changed")
+                return self._lifecycle_head(current_payload), ()
+
+            def execute(operation):
+                fence = store.claim_worker(operation.operation_id, worker_id=uuid4().hex, now=_utcnow())
+                store.mark_running(operation.operation_id, fence, now=_utcnow())
+                archives = LifecycleArchiveStore(self.root_context, self._admission)
+                try:
+                    if request.action == "archive":
+                        result = archives.archive(
+                            payload["kind"],
+                            payload["identity"],
+                            expected_digest=payload["object_digest"],
+                            archive_id=payload["archive_id"],
+                            operation_id=operation.operation_id,
+                        )
+                    elif request.action == "restore":
+                        result = archives.restore(
+                            payload["archive_id"],
+                            expected_digest=payload["object_digest"],
+                            operation_id=operation.operation_id,
+                        )
+                    else:
+                        reconciled = (operation.operation_id,) + tuple(prior.operation_id for prior in store.active_for_subject(subject) if prior.status is OperationStatus.INTERRUPTED and prior.action in {"lifecycle-archive", "lifecycle-restore", "lifecycle-recover"} and prior.payload.get("archive_id") == payload["archive_id"] and prior.payload.get("object_digest") == payload["object_digest"])
+                        if payload["recovery_action"] == "abandon-unprepared":
+                            result = archives.abandon_unprepared(
+                                payload["kind"],
+                                payload["identity"],
+                                archive_id=payload["archive_id"],
+                                expected_digest=payload["object_digest"],
+                                reconciled_operations=reconciled,
+                                review_digest=payload["review_digest"],
+                                deployment_before=payload.get("deployment_before"),
+                            )
+                        elif payload["recovery_action"] == "abandon-unprepared-restore":
+                            result = archives.reconcile_unprepared_restore(payload["archive_id"], expected_digest=payload["object_digest"], reconciled_operations=reconciled)
+                        else:
+                            result = archives.recover(payload["archive_id"], expected_digest=payload["object_digest"], reconciled_operations=reconciled)
+                except Exception:
+                    store.interrupt(operation.operation_id, now=_utcnow())
+                    # Only a new explicit recovery may reconcile an uncertain transition.
+                    raise
+                store.complete(
+                    operation.operation_id,
+                    fence,
+                    result=self._archive_view(result),
+                    now=_utcnow(),
+                )
+
+            with self._settings_lock, self._lifecycle_lane(subject):
+                operation = store.accept_request(
+                    **arguments,
+                    current_state_resolver=current_state,
+                    start_worker=execute,
+                    admission_held=True,
+                )
+                try:
+                    return self._operation_view(store.get_operation(operation.operation_id))
+                except OperationBusy:
+                    # The transition is already durable; report the accepted record, never "nothing accepted".
+                    return self._operation_view(operation)
+        except ConfirmationExpired:
+            raise ServiceError(410, "Confirmation expired; review lifecycle again.") from None
+        except (ConfirmationRejected, StalePreview, ArchiveConflict, ArchiveNotFound):
+            raise ServiceError(409, "Lifecycle review is stale or mismatched.", code="stale-preview") from None
+        except OperationStartUncertain:
+            raise ServiceError(409, "Lifecycle transition was interrupted; inspect operation and archive journal.", code="ownership-unknown") from None
+        except OperationBusy:
+            if existing is not None:
+                raise ServiceError(409, "Operation storage is busy; this request was already recorded. Inspect its operation status.", code="writer-conflict") from None
+            raise ServiceError(409, "Operation storage is busy; this request was not processed now. Retry later; if this request was submitted before, inspect its operation status first.", code="writer-conflict", retry_policy="retry-later") from None
+        except HandoverError:
+            raise ServiceError(423, "Root head inventory requires offline reconciliation; inspect lifecycle status before continuing.", code="reconciliation-required") from None
+        except (ArchiveError, AdmissionError, OperationError, OSError, RootPathError, ValueError, KeyError):
+            raise ServiceError(409, "Lifecycle admission is unavailable; inspect operation and archive status.", code="writer-conflict") from None
 
     def create_operation_preview(
         self,
@@ -1930,23 +2424,23 @@ class DeskService:
         self._guard_protected(subject)
         payload = request.payload
         if payload.fund != subject or payload.mandate_hash != request.expected_head:
-            raise ServiceError(422, "Backtest subject and reviewed head do not match.")
+            raise ServiceError(400, "Backtest subject and reviewed head do not match.")
         try:
             universe = normalize_universe(payload.universe)
         except (OSError, ValueError):
-            raise ServiceError(422, "Backtest universe is invalid.") from None
+            raise ServiceError(400, "Backtest universe is invalid.") from None
         if universe != payload.universe:
-            raise ServiceError(422, "Backtest universe must use canonical uppercase tickers.")
+            raise ServiceError(400, "Backtest universe must use canonical uppercase tickers.")
         spec = self._load_mandate_by_name(subject)
         if spec.name != subject or mandate_hash(spec) != request.expected_head:
-            raise ServiceError(409, "Mandate changed; reload before previewing.")
+            raise ServiceError(409, "Mandate changed; reload before previewing.", code="stale-preview", subject_id=subject, current_head=mandate_hash(spec))
         if spec.broker != "paper":
-            raise ServiceError(403, "Only local-paper backtests are supported.")
+            raise ServiceError(403, "Only local-paper backtests are supported.", code="broker-not-web-supported")
         with self._settings_lock:
             self._ensure_settings_available()
             settings = self._runtime_settings
             if payload.provider != settings.data_provider or payload.model != settings.model:
-                raise ServiceError(409, "Provider or model changed; reload before previewing.")
+                raise ServiceError(409, "Provider or model changed; reload before previewing.", code="stale-preview")
             data_target = ProviderTarget(
                 kind="data",
                 provider=settings.data_provider,
@@ -1965,7 +2459,7 @@ class DeskService:
                     approved_local_models={settings.model},
                 )
             except AuthorizationDenied:
-                raise ServiceError(422, "Provider configuration has no guarded production transport.") from None
+                raise ServiceError(422, "Provider configuration has no guarded production transport.", code="readiness-denied") from None
             paid_targets = [
                 (target, provider_class)
                 for target, provider_class in (
@@ -1975,25 +2469,25 @@ class DeskService:
                 if provider_class is ProviderClass.PAID_CLOUD
             ]
             if len(paid_targets) > 1:
-                raise ServiceError(422, "Only one paid provider may be authorized per backtest.")
+                raise ServiceError(400, "Only one paid provider may be authorized per backtest.")
             if paid_targets and not payload.authorize_paid_provider:
                 raise ServiceError(403, "Paid provider use requires explicit bounded authorization.")
             if not paid_targets and payload.authorize_paid_provider:
-                raise ServiceError(422, "Paid authorization does not match the captured providers.")
+                raise ServiceError(400, "Paid authorization does not match the captured providers.")
             fd_pricing_attestation_required = any(target.kind == "data" and target.provider == "fd" for target, _provider_class in paid_targets)
             if fd_pricing_attestation_required and not payload.confirm_fd_self_service_pricing:
                 raise ServiceError(403, "Financial Datasets dispatch requires explicit self-service pricing confirmation.")
             if payload.confirm_fd_self_service_pricing and not fd_pricing_attestation_required:
-                raise ServiceError(422, "Financial Datasets pricing confirmation does not match the captured provider.")
+                raise ServiceError(400, "Financial Datasets pricing confirmation does not match the captured provider.")
             paid_cost_model_id = None
             if paid_targets:
                 paid_target = paid_targets[0][0]
                 paid_cost_model_id = cost_model_identity(paid_target)
                 minimum_cost = minimum_attempt_cost(paid_target)
                 if not has_verified_cost_model(paid_target) or minimum_cost is None:
-                    raise ServiceError(422, "Paid provider has no verified upper-bound cost model.")
+                    raise ServiceError(422, "Paid provider has no verified upper-bound cost model.", code="readiness-denied")
                 if Decimal(payload.paid_max_attempt_cost_usd) < minimum_cost:
-                    raise ServiceError(422, "Per-attempt cost bound is below the provider's verified maximum.")
+                    raise ServiceError(422, "Per-attempt cost bound is below the provider's verified maximum.", code="readiness-denied")
             if payload.authorize_paid_provider and len(paid_targets) == 1 and paid_targets[0][0].kind == "llm" and self._custom_fund_factory:
                 raise ServiceError(403, "Injected model providers cannot authorize paid dispatch.")
             if payload.authorize_paid_provider and len(paid_targets) == 1 and paid_targets[0][0].kind == "data" and self._data_client_factory is not None:
@@ -2006,11 +2500,11 @@ class DeskService:
                 local_llm_fallback=llm_class is ProviderClass.LOCAL,
             )
             if estimated_model_calls > 1000:
-                raise ServiceError(422, "Estimated model calls exceed the 1000-call bound.")
+                raise ServiceError(422, "Estimated model calls exceed the 1000-call bound.", code="readiness-denied")
             paid_call_bound = max(1, estimated_llm_calls) if paid_targets and paid_targets[0][0].kind == "llm" else min(10000, max(100, estimated_model_calls * 10))
             if paid_targets:
                 if payload.paid_max_calls > paid_call_bound:
-                    raise ServiceError(422, "Paid call bound exceeds the captured operation estimate.")
+                    raise ServiceError(422, "Paid call bound exceeds the captured operation estimate.", code="readiness-denied")
             elif settings.llm_provider not in KEYLESS_PROVIDERS:
                 raise ServiceError(403, "Paid model providers require explicit bounded authorization.")
 
@@ -2023,7 +2517,7 @@ class DeskService:
                     None,
                 )
                 if not status or not status["configured"]:
-                    raise ServiceError(422, "Selected provider credential is not configured.")
+                    raise ServiceError(422, "Selected provider credential is not configured.", code="readiness-denied")
                 credential_versions[provider_id] = status["version"]
             now = _utcnow()
             operation_payload = payload.model_dump(mode="json")
@@ -2093,11 +2587,11 @@ class DeskService:
         subject = self._validated_name(request.subject_id)
         self._guard_protected(subject)
         if request.action != "backtest" or request.payload.fund != subject or request.payload.mandate_hash != request.expected_head or request.due_set:
-            raise ServiceError(422, "Backtest acceptance does not match the reviewed operation.")
+            raise ServiceError(400, "Backtest acceptance does not match the reviewed operation.")
         capture_id = self._preview_captures.get(request.preview_id)
         capture = self._captures.get(capture_id or "")
         if capture is None or capture.subject_id != subject:
-            raise ServiceError(409, "Backtest preview is no longer available; review again.")
+            raise ServiceError(409, "Backtest preview is no longer available; review again.", code="stale-preview")
         payload = request.payload.model_dump(mode="json")
 
         def current_state() -> tuple[str | None, tuple[str, ...]]:
@@ -2123,7 +2617,7 @@ class DeskService:
         with self._settings_lock:
             self._ensure_settings_available()
             if self._runtime_settings.version != capture.settings_version or self._runtime_settings.model != capture.model or self._runtime_settings.data_provider != capture.data_provider:
-                raise ServiceError(409, "Runtime settings changed; review the operation again.")
+                raise ServiceError(409, "Runtime settings changed; review the operation again.", code="stale-preview")
             for provider_id, version in capture.credential_versions.items():
                 if self._credential_store is None:
                     raise ServiceError(409, "Captured credential storage is unavailable.")
@@ -2132,7 +2626,7 @@ class DeskService:
                 except CredentialStoreError:
                     raise ServiceError(409, "Captured credential version is unavailable.") from None
                 if current_version != version:
-                    raise ServiceError(409, "Credential version changed; review the operation again.")
+                    raise ServiceError(409, "Credential version changed; review the operation again.", code="stale-preview")
             try:
                 operation = store.accept_request(
                     request_id=request.request_id,
@@ -2152,13 +2646,15 @@ class DeskService:
             except ConfirmationExpired:
                 raise ServiceError(410, "Confirmation expired; review the operation again.") from None
             except (ConfirmationRejected, StalePreview):
-                raise ServiceError(409, "Reviewed operation is stale or no longer valid.") from None
+                raise ServiceError(409, "Reviewed operation is stale or no longer valid.", code="stale-preview") from None
             except OperationStartUncertain:
-                raise ServiceError(409, "Operation start is uncertain; inspect its durable status.") from None
+                raise ServiceError(409, "Operation start is uncertain; inspect its durable status.", code="ownership-unknown") from None
             except (OperationConflict, JobConflict):
                 raise ServiceError(409, "Operation request conflicts with durable state.") from None
             except ServiceError:
                 raise
+            except OperationBusy:
+                raise ServiceError(409, "Operation storage is busy; this request was not processed now. Retry later; if this request was submitted before, inspect its operation status first.", code="writer-conflict", retry_policy="retry-later") from None
             except OperationError:
                 raise ServiceError(409, "Operation could not be accepted.") from None
         return self._operation_view(operation)
@@ -2166,9 +2662,12 @@ class DeskService:
     def get_operation(self, operation_id: str) -> dict:
         store = self._operation_store
         if store is None:
-            raise ServiceError(404, "Operation not found.")
+            # Unavailable storage must not look like an unknown (forgettable) operation ID.
+            raise ServiceError(503, "Operation status storage is unavailable; the operation outcome is unknown. Retry the read.", code="observation-conflict", subject_id=operation_id)
         try:
             operation = store.get_operation(operation_id)
+        except OperationBusy:
+            raise ServiceError(503, "Operation status is busy; retry the read.", code="observation-conflict") from None
         except OperationError as exc:
             status = 404 if "not found" in str(exc) else 409
             raise ServiceError(status, "Operation is unavailable.") from None
@@ -2176,12 +2675,14 @@ class DeskService:
 
     def list_operations(self, *, limit: int = 100) -> dict:
         if type(limit) is not int or not 1 <= limit <= 100:
-            raise ServiceError(422, "Operation page size is invalid.")
+            raise ServiceError(400, "Operation page size is invalid.")
         store = self._operation_store
         if store is None:
             return {"items": []}
         try:
             operations = store.list_operations(limit=limit)
+        except OperationBusy:
+            raise ServiceError(503, "Operation history is busy; retry the read.", code="observation-conflict") from None
         except OperationError:
             raise ServiceError(409, "Operation history is unavailable.") from None
         return {"items": [self._operation_view(item) for item in operations]}
@@ -2488,12 +2989,12 @@ class DeskService:
                 if not deployed.spec.approval_required:
                     raise ServiceError(409, "This fund does not require approval.")
                 if state.halted is not None:
-                    raise ServiceError(409, "Halted funds cannot accept a verdict.")
+                    raise ServiceError(423, "Halted funds cannot accept a verdict.", code="halted")
                 pending = state.pending
                 if pending is None or latest is None:
                     raise ServiceError(409, "No pending decision is available.")
                 if request.decision_as_of != pending.as_of or request.source_record_hash != latest.hash:
-                    raise ServiceError(409, "Pending decision changed; reload before submitting a verdict.")
+                    raise ServiceError(409, "Pending decision changed; reload before submitting a verdict.", code="stale-preview")
                 resolved, mailbox = ledger.resolve_approval(pending.as_of, latest.hash)
                 if resolved is not None and mailbox is None:
                     raise ServiceError(409, "This decision is already consumed or expired.")
@@ -2517,7 +3018,7 @@ class DeskService:
         normalized = self._validated_name(name)
         self._guard_protected(normalized)
         if not isinstance(reason, str) or not reason.strip() or len(reason) > 240 or any(ord(char) < 32 or ord(char) == 127 for char in reason):
-            raise ServiceError(422, "Halt reason is invalid.")
+            raise ServiceError(400, "Halt reason is invalid.")
         with self._paper_control_lane(normalized, verify_inventory=False):
             _, _, ledger = self._paper_control_state(normalized)
             try:
@@ -2534,10 +3035,7 @@ class DeskService:
         with self._fund_lock(normalized):
             with self._paper_control_lane(normalized):
                 self._paper_control_state(normalized)
-                raise ServiceError(
-                    409,
-                    "Resume is disabled until a reconciliation receipt is available.",
-                )
+                raise ServiceError(423, "Resume is disabled until a reconciliation receipt is available.", code="reconciliation-required")
 
     @contextmanager
     def _paper_control_lane(
@@ -2691,11 +3189,11 @@ class DeskService:
         try:
             deployed = load_deployed(directory)
             if local_paper_only and deployed.broker != "paper":
-                raise ServiceError(403, "Web paper mutations require a local-paper deployment.")
+                raise ServiceError(403, "Web paper mutations require a local-paper deployment.", code="broker-not-web-supported")
             ledger = Ledger(directory)
             state, latest = self._replay_paper_state(deployed, ledger)
         except (LedgerError, OSError, ValueError) as exc:
-            raise ServiceError(409, f"Paper state is invalid ({type(exc).__name__}).") from None
+            raise ServiceError(423, f"Paper state is invalid ({type(exc).__name__}).", code="replay-corrupt") from None
         return directory, deployed, ledger, state, latest
 
     def _replay_paper_state(self, deployed: DeployedFund, ledger: Ledger):
@@ -2708,7 +3206,7 @@ class DeskService:
         try:
             state = ledger.replay(deployed.spec.capital, full=True, on_verified=capture)
         except (LedgerError, OSError, ValueError) as exc:
-            raise ServiceError(409, f"Paper state is invalid ({type(exc).__name__}).") from None
+            raise ServiceError(423, f"Paper state is invalid ({type(exc).__name__}).", code="replay-corrupt") from None
         return state, latest
 
     def _paper_control_state(self, name: str) -> tuple[Path, DeployedFund, Ledger]:
@@ -2726,7 +3224,7 @@ class DeskService:
         if _windows_name_key(deployed.name) != _windows_name_key(name):
             raise ServiceError(409, "Paper deployment identity does not match its directory.")
         if deployed.broker != "paper":
-            raise ServiceError(403, "Web paper mutations require a local-paper deployment.")
+            raise ServiceError(403, "Web paper mutations require a local-paper deployment.", code="broker-not-web-supported")
         return directory, deployed, Ledger(directory)
 
     def _session_report(self, record: SessionRecord) -> dict:
@@ -2834,13 +3332,13 @@ class DeskService:
         library_names = set(self._strategy_library())
         for strategy in spec.strategies:
             if strategy.name != "custom" and strategy.name not in library_names:
-                raise ServiceError(422, "Strategy must use a backend library entry or the custom identity.")
+                raise ServiceError(400, "Strategy must use a backend library entry or the custom identity.")
 
     def _validated_mandate(self, payload: dict) -> FundSpec:
         try:
             spec = FundSpec.model_validate(payload)
         except ValueError as exc:
-            raise ServiceError(422, f"Mandate validation failed ({type(exc).__name__}).") from None
+            raise ServiceError(400, f"Mandate validation failed ({type(exc).__name__}).") from None
         _reject_secret_fields(spec.model_dump(mode="python"))
         self._validate_mandate_strategies(spec)
         return spec
@@ -2965,13 +3463,13 @@ class DeskService:
         candidate = self.root
         for part in parts:
             if not isinstance(part, str) or part in {"", ".", ".."} or Path(part).is_absolute():
-                raise ServiceError(422, "Storage path is invalid.")
+                raise ServiceError(400, "Storage path is invalid.")
             candidate = candidate / part
             if _is_reparse_point(candidate):
-                raise ServiceError(403, "Storage path contains a symlink or reparse point.")
+                raise ServiceError(403, "Storage path contains a symlink or reparse point.", code="protected-root")
         resolved = candidate.resolve(strict=False)
         if resolved != self.root and self.root not in resolved.parents:
-            raise ServiceError(403, "Storage path escapes the configured data root.")
+            raise ServiceError(403, "Storage path escapes the configured data root.", code="protected-root")
         return resolved
 
     def _ensure_dir(self, *parts: str) -> Path:
@@ -3002,7 +3500,7 @@ class DeskService:
         try:
             return validate_fund_name(name)
         except ValueError:
-            raise ServiceError(422, "Fund name is invalid.") from None
+            raise ServiceError(400, "Fund name is invalid.") from None
 
     def _load_mandate_by_name(self, name: str) -> FundSpec:
         return self._load_mandate_entry(name)[0]
@@ -3043,12 +3541,12 @@ class DeskService:
         if matches:
             return matches[0]
         if invalid_type is not None:
-            raise ServiceError(422, f"Mandate is invalid ({invalid_type}).")
+            raise ServiceError(422, f"Mandate is invalid ({invalid_type}).", code="readiness-denied")
         raise ServiceError(404, "Mandate not found.")
 
     def _guard_protected(self, name: str) -> None:
         if _windows_name_key(name) in {_windows_name_key(entry) for entry in PROTECTED_NAMES}:
-            raise ServiceError(403, "Protected fund names cannot be modified by the web UI.")
+            raise ServiceError(403, "Protected fund names cannot be modified by the web UI.", code="protected-root")
 
     def _require_writes(self) -> None:
         if not self.allow_writes:
@@ -3126,7 +3624,7 @@ class DeskService:
             try:
                 RuntimeSettings(**{**self._runtime_settings.to_mapping(), **values})
             except ConfigurationError:
-                raise ServiceError(422, "Runtime settings are invalid.") from None
+                raise ServiceError(400, "Runtime settings are invalid.") from None
             try:
                 persisted = save_settings(
                     self.root_context,
@@ -3135,7 +3633,7 @@ class DeskService:
                     admission=self._admission,
                 )
             except SettingsConflict:
-                raise ServiceError(409, "Runtime settings changed; reload before saving.") from None
+                raise ServiceError(409, "Runtime settings changed; reload before saving.", code="stale-preview") from None
             except ConfigurationError:
                 raise ServiceError(409, "Runtime settings could not be saved.") from None
             except (OSError, RootPathError):
@@ -3188,13 +3686,13 @@ def _windows_name_key(name: str) -> str:
 
 def _credential_provider(value: str) -> str:
     if not isinstance(value, str):
-        raise ServiceError(422, "Provider is not an allowlisted credential provider.")
+        raise ServiceError(400, "Provider is not an allowlisted credential provider.")
     provider = next(
         (name for name in (*PROVIDER_ENV_VARS, *DATA_PROVIDER_ENV_VARS) if name.casefold() == value.casefold()),
         None,
     )
     if provider is None:
-        raise ServiceError(422, "Provider is not an allowlisted credential provider.")
+        raise ServiceError(400, "Provider is not an allowlisted credential provider.")
     return provider
 
 
@@ -3226,13 +3724,13 @@ def _estimate_backtest_bounds(
         start = date.fromisoformat(start_text)
         end = date.fromisoformat(end_text)
     except (TypeError, ValueError):
-        raise ServiceError(422, "Backtest dates are invalid.") from None
+        raise ServiceError(400, "Backtest dates are invalid.") from None
     if end < start or (end - start).days > 730:
-        raise ServiceError(422, "Backtest date range exceeds its bound.")
+        raise ServiceError(400, "Backtest date range exceeds its bound.")
     if type(universe_size) is not int or not 1 <= universe_size <= 20:
-        raise ServiceError(422, "Backtest universe exceeds its bound.")
+        raise ServiceError(400, "Backtest universe exceeds its bound.")
     if not isinstance(spec, FundSpec) or type(local_llm_fallback) is not bool:
-        raise ServiceError(422, "Backtest model-call estimate is invalid.")
+        raise ServiceError(400, "Backtest model-call estimate is invalid.")
     weekdays = sum(1 for offset in range((end - start).days + 1) if (start + timedelta(days=offset)).weekday() < 5)
     try:
         model_calls, llm_calls = model_call_bounds(
@@ -3240,23 +3738,23 @@ def _estimate_backtest_bounds(
             local_llm_fallback=local_llm_fallback,
         )
     except ValueError:
-        raise ServiceError(422, "Backtest model-call estimate is invalid.") from None
+        raise ServiceError(400, "Backtest model-call estimate is invalid.") from None
     return weekdays * universe_size * model_calls, weekdays * universe_size * llm_calls
 
 
 def _estimate_paper_model_calls(spec: FundSpec, universe_size: int) -> int:
     if not isinstance(spec, FundSpec) or type(universe_size) is not int or not 1 <= universe_size <= 25:
-        raise ServiceError(422, "Paper model-call estimate is invalid.")
+        raise ServiceError(400, "Paper model-call estimate is invalid.")
     try:
         model_calls, _llm_calls = model_call_bounds(
             spec,
             local_llm_fallback=True,
         )
     except ValueError:
-        raise ServiceError(422, "Paper model-call estimate is invalid.") from None
+        raise ServiceError(400, "Paper model-call estimate is invalid.") from None
     calls = universe_size * model_calls * 2
     if type(calls) is not int or not 1 <= calls <= 1000:
-        raise ServiceError(422, "Paper model-call estimate exceeds the 1000-call bound.")
+        raise ServiceError(422, "Paper model-call estimate exceeds the 1000-call bound.", code="readiness-denied")
     return calls
 
 
@@ -3268,13 +3766,13 @@ def _runner_limits(
     max_runtime_minutes: int,
 ) -> tuple[int, int]:
     if not isinstance(spec, FundSpec) or type(universe_size) is not int or not 1 <= universe_size <= 25 or type(max_sessions) is not int or not 1 <= max_sessions <= 100 or type(max_runtime_minutes) is not int or not 1 <= max_runtime_minutes <= 1440:
-        raise ServiceError(422, "Finite runner bounds are invalid.")
+        raise ServiceError(400, "Finite runner bounds are invalid.")
     model_calls = _estimate_paper_model_calls(spec, universe_size)
     calls_per_session = model_calls + 40 * universe_size + 20
     max_calls = 2 * max_runtime_minutes + 1 + max_sessions * calls_per_session
     max_resources = max_calls
     if not 1 <= max_calls <= 1_000_000 or not 1 <= max_resources <= 1_000_000:
-        raise ServiceError(422, "Finite runner resource estimate exceeds its bound.")
+        raise ServiceError(422, "Finite runner resource estimate exceeds its bound.", code="readiness-denied")
     return max_calls, max_resources
 
 
@@ -3282,7 +3780,7 @@ def _reject_secret_fields(value) -> None:
     if isinstance(value, dict):
         for key, child in value.items():
             if _SECRET_FIELD.search(str(key)):
-                raise ServiceError(422, "Mandates cannot store credential-like fields.")
+                raise ServiceError(400, "Mandates cannot store credential-like fields.")
             _reject_secret_fields(child)
     elif isinstance(value, list):
         for child in value:

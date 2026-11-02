@@ -174,6 +174,15 @@ def test_windows_root_guards_do_not_retain_new_pointer_types_per_call(tmp_path, 
     pointer_type_cache = getattr(ctypes, "_pointer_type_cache", None)
     if not isinstance(pointer_type_cache, dict):
         pytest.skip("Windows CPython pointer-type cache is unavailable")
+
+    class PointerCacheProbe(ctypes.Structure):
+        _fields_ = [("value", ctypes.c_int)]
+
+    cache_size = len(pointer_type_cache)
+    ctypes.POINTER(PointerCacheProbe)
+    if len(pointer_type_cache) == cache_size:
+        pytest.skip("this CPython version does not expose pointer-type cache growth")
+
     root = tmp_path / "abi-root"
     root.mkdir()
     with RootContext.open(root) as context:
