@@ -1401,6 +1401,14 @@ Cooperative registry and OS locks do **not** prove that unaware or out-of-band w
 
 Earlier full-suite counts belong to superseded SHAs and are not evidence for this one. A previous full run at superseded `20f4df7` hit one intermittent failure: `web/test_paper_operations.py::test_owned_runner_readiness_timeout_fails_closed_and_stops_child`, raising `ProcessIdentityError` "command line unavailable" at launch. It passed 5/5 in isolation and did not recur here. It is recorded as an unexplained flake in the T142 launch path.
 
+**Style follow-up (2026-11-03).** A review flagged an earlier changed-file Black failure (`black=1`) that was not rerun. Black was rerun with the locked `black==23.12.1`, using the repo `line-length = 420`, over every `.py` file changed since `5f3f909`:
+
+- **Files the review cited:** `web/demo.py`, `web/__main__.py`, `web/test_main.py`, `test_support/handover.py` and `runtime/test_writer_race_matrix.py` all pass.
+- **Two hunks introduced by this slice (`33b83cf`) are now fixed:**
+  - the `run.py` paper-writer remedy expression;
+  - the `runtime/handover.py` `WriteAuthorityDenied` message. Its text is unchanged; it was collapsed to one line.
+- **Remaining drift is pre-existing:** Black still reports drift in 19 changed files, but a line-level `git blame` shows none of the lines it would rewrite come from this slice's commits. 18 of those files already fail at `5f3f909`. The other one, `runtime/test_inventory_cache_race.py`, came from upstream commit `b6a8a5b`.
+- **Tests after the fix:** the affected run/handover/write-authority/writer-matrix/inventory/map tests gave **314 passed**.
 ### Reviews
 
 - Independent read-only QA review of the rebased slice. It found no admission bypass and no A3 breach.

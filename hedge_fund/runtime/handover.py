@@ -338,10 +338,7 @@ def require_write_authority(root: RootContext) -> dict[str, Any]:
     if reason is not None:
         raise WriteAuthorityDenied(f"root write authority is ownership-unknown ({reason})")
     if out_of_band_exclusion_basis(root) is None:
-        raise WriteAuthorityDenied(
-            f"root write authority is ownership-unknown ({EXCLUSION_UNPROVEN_REASON}); "
-            "cooperative locks do not exclude out-of-band same-account writers"
-        )
+        raise WriteAuthorityDenied(f"root write authority is ownership-unknown ({EXCLUSION_UNPROVEN_REASON}); cooperative locks do not exclude out-of-band same-account writers")
     return record
 
 
