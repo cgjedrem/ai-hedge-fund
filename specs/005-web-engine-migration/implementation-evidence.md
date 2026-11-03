@@ -1122,3 +1122,18 @@ No other session process, checkout, preview or the worktree itself was removed.
   wheel like the existing test-support modules; packaging exclusion is open.
 - Browser server-restart observation, the pre-existing desk/lifecycle browser failures, full Python suite, Linux, wheel/container
   and cross-browser evidence remain open.
+
+### Remote advance during publication (incorporated by rebase)
+
+- At the pre-push recheck, `cgjedrem-vigilant-robot` had advanced `16369e9` -> `5a41b2d` (`d008101` report evidence docs,
+  `294f9db` T096 fake SIM account binding, `5a41b2d` paper session day grouping). The three slice commits were rebased onto
+  `5a41b2d` (no force, original commits' content preserved). Only conflict: `implementation-progress.md` (both new log lines kept);
+  `frontend/src/pages/paper.tsx` auto-merged.
+- Integrated identity vs `5a41b2d` (same hash method, `specs/` excluded): **`a82dd750fff6f2a3629ad45cdbf36d5c6df4a187613382af24748dfef20d22f5`**, **20 paths / 733,337 bytes**.
+- Fresh reruns on the rebased source: pytest `brokers\test_account_binding.py`, `web\test_paper_operations.py`,
+  `web\test_app.py`, `web\test_main.py`, `web\test_jobs.py` **163 passed in 762.01 s**; Vitest **11 files, 161 passed**;
+  `npm run build` (tsc + vite) passed; harness unit **9 passed**; owned `--capacity` **1 passed (34.0 s)**; owned default
+  **10 passed, 4 failed, 6 skipped** -- the 4 failures (paper session history "No verified sessions", manual tick running, runner
+  stop, backtest running) reproduce identically on an unmodified temporary `5a41b2d` checkout (desk spec **8 passed, 4 failed**),
+  so they are pre-existing at the remote head. `--lifecycle`/`--reports` modes were not rerun after the rebase (unchanged
+  harness paths; prior results above). Recorded 2026-11-03T02:23:02.7079614+01:00.
