@@ -19,6 +19,7 @@ import { LifecycleActions } from "@/components/lifecycle-actions";
 import { DataTable, type TableColumn } from "@/components/data-table";
 import { EquityChart } from "@/components/equity-chart";
 import { MetricCard } from "@/components/metric-card";
+import { nothingDueLabel, PaperOperationStatus, runnerStatusLabel } from "@/components/operation-status";
 import { PaperSessionDays } from "@/components/paper-session-days";
 import { PendingOperationRecovery } from "@/components/pending-operation-recovery";
 import { EmptyState, ErrorNotice, ErrorState, LoadingState, PageHeader, SectionTitle } from "@/components/page";
@@ -90,11 +91,11 @@ export function PaperPage() {
           ) : item.halt_state === "halted" ? (
             <Badge variant="warning">Halted</Badge>
           ) : item.runner.status === "unknown" ? (
-            <Badge variant="warning">Runner unverified</Badge>
+            <Badge variant="warning">{runnerStatusLabel(item.runner)}</Badge>
           ) : item.runner.available ? (
-            <Badge variant="positive">Runner {item.runner.status}</Badge>
+            <Badge variant="positive">{runnerStatusLabel(item.runner)}</Badge>
           ) : (
-            <Badge variant="muted">Runner {item.runner.status}</Badge>
+            <Badge variant="muted">{runnerStatusLabel(item.runner)}</Badge>
           )}
         </div>
       ),
@@ -677,9 +678,7 @@ export function PaperDetailPage() {
                         ? "Halt state unknown"
                         : data.halt_state === "halted"
                           ? "Halted"
-                          : runner?.status === "unknown"
-                            ? "Runner unverified"
-                            : `Runner ${runner?.status ?? "unavailable"}`}
+                          : runnerStatusLabel(runner)}
                     </Badge>
                   </div>
                 </CardHeader>
@@ -786,28 +785,7 @@ export function PaperDetailPage() {
                         {runner.expires_at ? ` · deadline ${dateLabel(runner.expires_at)}` : ""}
                       </p>
                     ) : null}
-                    {operation ? (
-                      <div className="mt-4 rounded-lg border border-border bg-black/10 p-3" aria-live="polite">
-                        <div className="flex items-center justify-between gap-3">
-                          <span className="mono text-[10px] text-foreground">
-                            {operation.action === "paper-tick" ? "Manual tick" : "Runner start"} · {operation.status}
-                          </span>
-                          <span className="mono text-[10px] text-muted-foreground">{Math.min(100, Math.max(0, operation.progress))}%</span>
-                        </div>
-                        <div
-                          className="mt-2 h-1.5 overflow-hidden rounded-full bg-white/10"
-                          role="progressbar"
-                          aria-label="Paper operation progress"
-                          aria-valuenow={Math.min(100, Math.max(0, operation.progress))}
-                          aria-valuemin={0}
-                          aria-valuemax={100}
-                        >
-                          <div className="h-full rounded-full bg-accent transition-[width]" style={{ width: `${Math.min(100, Math.max(0, operation.progress))}%` }} />
-                        </div>
-                        <p className="mono mt-2 break-all text-[9px] text-muted-foreground">{operation.id}</p>
-                        {operation.error ? <p className="mt-2 text-[10px] text-rose-300">{operation.error}</p> : null}
-                      </div>
-                    ) : null}
+                    {operation ? <PaperOperationStatus operation={operation} /> : null}
                     {unexpectedOperation ? (
                       <Alert tone="warning" className="mt-3">
                         <p>The remembered operation is not a paper tick or runner start. Inspect its durable status before forgetting it.</p>
@@ -929,9 +907,7 @@ export function PaperDetailPage() {
               <p className="text-xs">
                 Reviewed due-set:{" "}
                 <span className="mono">
-                  {paperPreview.due_set.length > 0
-                    ? paperPreview.due_set.map(dateLabel).join(" · ")
-                    : "No session due now; runner waits for the next eligible session."}
+                  {nothingDueLabel(paperPreview.due_set) ?? paperPreview.due_set.map(dateLabel).join(" · ")}
                 </span>
               </p>
               <p className="text-xs">
