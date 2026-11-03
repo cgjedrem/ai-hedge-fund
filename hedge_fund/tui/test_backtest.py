@@ -1,9 +1,10 @@
 """The backtest board's running numbers against the engine's final metrics."""
 
 import asyncio
+from unittest.mock import Mock
 
 import pytest
-from textual.widgets import ContentSwitcher, Static
+from textual.widgets import ContentSwitcher, Input, OptionList, Static
 
 from hedge_fund.backtesting import (
     DailyValuation,
@@ -11,9 +12,86 @@ from hedge_fund.backtesting import (
     performance_metrics,
 )
 from hedge_fund.brokers.models import Fill
-from hedge_fund.tui import backtest
+from hedge_fund.tui import backtest, home
 from hedge_fund.tui.app import HedgeFundApp
 from hedge_fund.tui.fixtures import make_cycle, make_session, make_signal, render
+
+
+@pytest.mark.parametrize("start_action", ["submit", "direct"])
+def test_legacy_backtest_refuses_before_key_prompt_worker_provider_or_success(monkeypatch, start_action):
+    keys = Mock(return_value=True)
+    provider = Mock(side_effect=AssertionError("No provider construction is authorized"))
+    save = Mock(side_effect=AssertionError("No result may be saved"))
+    monkeypatch.setattr(home, "demand_run_keys", keys)
+    monkeypatch.setattr(backtest, "make_data_client", provider)
+    monkeypatch.setattr(backtest, "_save_admitted", save)
+    spec = make_cycle(make_signal()).spec
+
+    async def scenario():
+        app = HedgeFundApp()
+        async with app.run_test(size=(120, 45)) as pilot:
+            await app.push_screen(backtest.BacktestScreen(spec))
+            screen = app.screen
+            worker = Mock()
+            monkeypatch.setattr(screen, "_run", worker)
+            notifications = Mock(wraps=screen.notify)
+            monkeypatch.setattr(screen, "notify", notifications)
+            screen.query_one("#bt-tickers", Input).value = "TEST"
+            screen.query_one("#start-input", Input).value = "2025-01-01"
+            screen.query_one("#end-input", Input).value = "2025-02-01"
+            screen.query_one("#end-input", Input).focus()
+
+            if start_action == "submit":
+                await pilot.press("enter")
+            else:
+                screen._begin("2025-01-01", "2025-02-01", ["TEST"])
+            await pilot.pause()
+
+            keys.assert_not_called()
+            worker.assert_not_called()
+            provider.assert_not_called()
+            save.assert_not_called()
+            message = notifications.call_args.args[0]
+            assert "disabled" in message.lower()
+            assert "aihf backtest" in message
+            assert "web desk" in message
+            assert render(screen.query_one("#bt-disabled", Static).content).strip() == message
+            assert notifications.call_args.kwargs["severity"] == "warning"
+            assert screen.query_one("#bt-panes", ContentSwitcher).current == "bt-dates"
+            assert screen.query_one("#bt-done-menu", OptionList).has_class("hidden")
+            assert screen.check_action("back", ())
+            await pilot.press("escape")
+            await pilot.pause()
+            assert not isinstance(app.screen, backtest.BacktestScreen)
+
+    asyncio.run(scenario())
+
+
+def test_legacy_worker_entry_refuses_synchronously_before_starting_work(monkeypatch):
+    provider = Mock(side_effect=AssertionError("No provider construction is authorized"))
+    monkeypatch.setattr(backtest, "make_data_client", provider)
+    spec = make_cycle(make_signal()).spec
+
+    async def scenario():
+        app = HedgeFundApp()
+        async with app.run_test(size=(120, 45)) as pilot:
+            await app.push_screen(backtest.BacktestScreen(spec))
+            screen = app.screen
+            notifications = Mock(wraps=screen.notify)
+            monkeypatch.setattr(screen, "notify", notifications)
+
+            started = screen._run(spec, "2025-01-01", "2025-02-01", ["TEST"])
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+            assert started is None
+            provider.assert_not_called()
+            assert "disabled" in notifications.call_args.args[0].lower()
+            assert notifications.call_args.kwargs["severity"] == "warning"
+            assert screen.query_one("#bt-panes", ContentSwitcher).current == "bt-dates"
+            assert screen.query_one("#bt-done-menu", OptionList).has_class("hidden")
+
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize("size", [(120, 45), (80, 24)])

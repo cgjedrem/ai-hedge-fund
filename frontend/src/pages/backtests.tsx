@@ -87,12 +87,15 @@ export function BacktestsPage() {
   const [paidMaxCost, setPaidMaxCost] = useState("5.00");
   const [paidMaxAttemptCost, setPaidMaxAttemptCost] = useState("0.25");
   const [busy, setBusy] = useState(false);
+  const [admissionWaiting, setAdmissionWaiting] = useState(false);
   const [cancelling, setCancelling] = useState(false);
   const [confirmation, setConfirmation] = useState<OperationPreview | null>(null);
   const [error, setError] = useState<string | ActionableError | null>(null);
   const previewInFlight = useRef(false);
   const admissionInFlight = useRef(false);
+  const admissionController = useRef<AbortController | null>(null);
   const cancellationInFlight = useRef(false);
+  useEffect(() => () => admissionController.current?.abort(), []);
   const selectOperation = useCallback((selectedId: string | null) => {
     setOperationId(selectedId);
     const saved = persistSelectedOperationId(selectedId);
@@ -274,21 +277,28 @@ export function BacktestsPage() {
       return;
     }
     admissionInFlight.current = true;
+    const controller = new AbortController();
+    admissionController.current = controller;
     setBusy(true);
+    setAdmissionWaiting(true);
     setError(null);
     const pendingRequest = {
       requestId: newRequestId(),
       action: confirmation.action,
       subjectId: confirmation.subject_id,
     };
-    if (!pending.remember(pendingRequest)) {
-      setError("The request identity could not be preserved or another request is unresolved. No operation was submitted.");
-      setConfirmation(null);
-      admissionInFlight.current = false;
-      setBusy(false);
-      return;
-    }
     try {
+      const remembered = await pending.remember(pendingRequest, controller.signal);
+      setAdmissionWaiting(false);
+      if (controller.signal.aborted) {
+        if (remembered) pending.forget(pendingRequest);
+        return;
+      }
+      if (!remembered) {
+        setError("The request identity could not be preserved or another request is unresolved. No operation was submitted.");
+        setConfirmation(null);
+        return;
+      }
       const operation = await acceptOperation({
         request_id: pendingRequest.requestId,
         action: confirmation.action,
@@ -308,9 +318,17 @@ export function BacktestsPage() {
       setError(toActionableError(cause, "Backtest could not be submitted."));
       setConfirmation(null);
     } finally {
+      if (admissionController.current === controller) admissionController.current = null;
       admissionInFlight.current = false;
+      setAdmissionWaiting(false);
       setBusy(false);
     }
+  }
+
+  function dismissConfirmation(): void {
+    if (busy && !admissionWaiting) return;
+    admissionController.current?.abort();
+    setConfirmation(null);
   }
 
   async function cancelActiveOperation(): Promise<void> {
@@ -567,7 +585,7 @@ export function BacktestsPage() {
           ) : null}
         </CardContent>
       </Card>
-      <Dialog open={confirmation !== null} onOpenChange={(open) => { if (!open && !busy) setConfirmation(null); }}>
+      <Dialog open={confirmation !== null} onOpenChange={(open) => { if (!open) dismissConfirmation(); }}>
         <DialogContent>
           <DialogHeader>
             <DialogTitle>Confirm reviewed backtest</DialogTitle>
@@ -609,7 +627,7 @@ export function BacktestsPage() {
             </div>
           ) : null}
           <DialogFooter>
-            <Button variant="ghost" onClick={() => setConfirmation(null)} disabled={busy}>Review later</Button>
+            <Button variant="ghost" onClick={dismissConfirmation} disabled={busy && !admissionWaiting}>Review later</Button>
             <Button onClick={() => void submitConfirmed()} disabled={busy || !canRun}>
               {busy ? "Accepting…" : "Accept reviewed operation"}
             </Button>

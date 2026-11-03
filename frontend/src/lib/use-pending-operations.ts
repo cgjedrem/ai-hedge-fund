@@ -18,6 +18,8 @@ interface PendingSnapshot {
   error: string | null;
 }
 
+const COORDINATION_UNAVAILABLE = "Cross-tab operation coordination is unavailable. Use a browser supporting Web Locks on the local desk; no operation was submitted.";
+
 function snapshot(): PendingSnapshot {
   try {
     return { items: readPendingOperations(), saved: readSavedOperationIdentities(), error: null };
@@ -28,6 +30,8 @@ function snapshot(): PendingSnapshot {
 
 export function usePendingOperations(kind: "backtest" | "paper", subjectId?: string) {
   const [state, setState] = useState<PendingSnapshot>(snapshot);
+  const mounted = useRef(false);
+  const waiters = useRef(new Set<AbortController>());
   const [observed, setObserved] = useState<Record<string, {
     operationId: string;
     action: string;
@@ -41,6 +45,16 @@ export function usePendingOperations(kind: "backtest" | "paper", subjectId?: str
     scopeRef.current = { key: scope, version: scopeRef.current.version + 1 };
   }
   const scopeVersion = scopeRef.current.version;
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      for (const waiter of waiters.current) waiter.abort();
+    };
+  }, []);
+  useEffect(() => () => {
+    for (const waiter of waiters.current) waiter.abort();
+  }, [scopeVersion]);
   const refresh = useCallback(() => {
     const next = snapshot();
     setState(next);
@@ -57,36 +71,68 @@ export function usePendingOperations(kind: "backtest" | "paper", subjectId?: str
     return () => window.removeEventListener("storage", changed);
   }, [refresh]);
 
-  const remember = useCallback((item: PendingOperation): boolean => {
+  const remember = useCallback(async (item: PendingOperation, signal?: AbortSignal): Promise<boolean> => {
+    const controller = new AbortController();
+    const abort = () => controller.abort();
+    signal?.addEventListener("abort", abort, { once: true });
+    if (signal?.aborted) controller.abort();
+    waiters.current.add(controller);
+    let timedOut = false;
+    const timeout = window.setTimeout(() => { timedOut = true; controller.abort(); }, 10_000);
     try {
-      const current = readPendingOperations();
-      const saved = readSavedOperationIdentities();
-      const unresolved = current.some((existing) =>
-        item.action === "backtest"
-          ? existing.action === "backtest"
-          : existing.action !== "backtest" && existing.subjectId === item.subjectId,
-      );
-      const savedUnverified = saved.some((existing) => {
-        const sameSurface = item.action === "backtest"
-          ? existing.action === "backtest"
-          : existing.action !== "backtest" && existing.subjectId === item.subjectId;
-        if (!sameSurface) return false;
-        const result = observed[existing.requestId];
-        return !result || result.scope !== scopeVersion || result.operationId !== existing.operationId
-          || result.action !== existing.action || result.subjectId !== existing.subjectId || result.status !== "terminal";
+      if (!mounted.current || controller.signal.aborted || scopeRef.current.version !== scopeVersion) return false;
+      if (kind === "backtest" ? item.action !== "backtest" : item.action === "backtest" || item.subjectId !== subjectId) {
+        throw new Error("The operation identity does not match this page; no operation was submitted.");
+      }
+      if (typeof navigator.locks?.request !== "function") throw new Error(COORDINATION_UNAVAILABLE);
+      const surface = item.action === "backtest" ? ["backtest"] : ["paper", item.subjectId];
+      const accepted = await navigator.locks.request(`aihf.operation-admission.${JSON.stringify(surface)}`, {
+        mode: "exclusive", signal: controller.signal,
+      }, () => {
+        if (!mounted.current || controller.signal.aborted || scopeRef.current.version !== scopeVersion) return false;
+        const current = readPendingOperations();
+        const saved = readSavedOperationIdentities();
+        const unresolved = current.some((existing) =>
+          item.action === "backtest"
+            ? existing.action === "backtest"
+            : existing.action !== "backtest" && existing.subjectId === item.subjectId,
+        );
+        const savedUnverified = saved.some((existing) => {
+          const sameSurface = item.action === "backtest"
+            ? existing.action === "backtest"
+            : existing.action !== "backtest" && existing.subjectId === item.subjectId;
+          if (!sameSurface) return false;
+          const result = observed[existing.requestId];
+          return !result || result.scope !== scopeVersion || result.operationId !== existing.operationId
+            || result.action !== existing.action || result.subjectId !== existing.subjectId || result.status !== "terminal";
+        });
+        if (unresolved || savedUnverified) {
+          setState({ items: current, saved, error: null });
+          return false;
+        }
+        rememberPendingOperation(item);
+        refresh();
+        return true;
       });
-      if (unresolved || savedUnverified) {
-        setState({ items: current, saved, error: null });
+      if (accepted && (!mounted.current || controller.signal.aborted || scopeRef.current.version !== scopeVersion)) {
+        forgetPendingOperation(item);
+        refresh();
         return false;
       }
-      rememberPendingOperation(item);
-      refresh();
-      return true;
+      return accepted;
     } catch (cause) {
-      setState((current) => ({ ...current, error: cause instanceof Error ? cause.message : "Pending operation storage is unavailable." }));
+      if (timedOut || !controller.signal.aborted || cause !== controller.signal.reason) {
+        setState((current) => ({ ...current, error: timedOut
+          ? "Cross-tab operation coordination timed out; no operation was submitted."
+          : cause instanceof Error || cause instanceof DOMException ? cause.message : "Cross-tab operation coordination failed; no operation was submitted." }));
+      }
       return false;
+    } finally {
+      window.clearTimeout(timeout);
+      signal?.removeEventListener("abort", abort);
+      waiters.current.delete(controller);
     }
-  }, [observed, refresh, scopeVersion]);
+  }, [kind, subjectId, observed, refresh, scopeVersion]);
 
   const save = useCallback((item: PendingOperation, operationId: string): boolean => {
     try {
@@ -150,8 +196,9 @@ export function usePendingOperations(kind: "backtest" | "paper", subjectId?: str
     return !result || result.scope !== scopeVersion || result.operationId !== item.operationId
       || result.action !== item.action || result.subjectId !== item.subjectId || result.status !== "terminal";
   });
+  const error = state.error ?? (typeof navigator.locks?.request !== "function" ? COORDINATION_UNAVAILABLE : null);
   return {
-    items, saved, error: state.error, blocked: Boolean(state.error || items.length || savedBlocked),
+    items, saved, error, blocked: Boolean(error || items.length || savedBlocked),
     remember, forget, save, forgetSaved, observe, refresh,
   };
 }

@@ -55,7 +55,7 @@ class _FakeTransport(httpx.BaseTransport):
 
 
 @pytest.fixture
-def client():
+def client(request):
     target = ProviderTarget(kind="data", provider="fd")
     now = datetime(2026, 10, 31, 12, 0, tzinfo=timezone.utc)
     dispatch = make_one_shot_dispatch(
@@ -75,7 +75,7 @@ def client():
     )
     transport = _FakeTransport()
     c = FDClient(
-        api_key="test-key",
+        api_key=getattr(request, "param", "test-key"),
         dispatch=dispatch,
         inner_transport=transport,
     )
@@ -138,6 +138,37 @@ def test_http_401_raises(client):
     with pytest.raises(FDClientError) as exc_info:
         client.get_financial_metrics("AAPL", "2024-12-31")
     assert exc_info.value.status_code == 401
+
+
+@pytest.mark.parametrize("client", ["test-key", "fd-captured-credential-with-a-tail", "opaque-captured-credential-with-a-tail"], indirect=True)
+@pytest.mark.parametrize("status", [401, 429, 500])
+def test_http_error_redacts_every_captured_credential_prefix_across_truncation(client, status):
+    key = client._session.headers["X-API-Key"]
+    for prefix_length in range(1, len(key)):
+        response = "~" * (200 - prefix_length) + key + "tail-only-after-the-boundary"
+        _stub(client, [_FakeResponse(status, text=response)])
+
+        with pytest.raises(FDClientError) as caught:
+            client.get_prices("AAPL", "2024-01-01", "2024-12-31")
+
+        message = str(caught.value)
+        assert caught.value.status_code == status
+        assert key not in message
+        assert "~" + key[:prefix_length] not in message
+        assert len(message.split(": ", 1)[1]) <= 200
+
+
+@pytest.mark.parametrize("client", ["fd-captured-credential-with-a-tail"], indirect=True)
+def test_http_error_redacts_full_response_before_later_credentials_move_inside_excerpt(client):
+    key = client._session.headers["X-API-Key"]
+    response = key + "|" + "~" * 170 + key + "tail"
+    assert response.index(key, len(key)) > 200
+    _stub(client, [_FakeResponse(500, text=response)])
+
+    with pytest.raises(FDClientError) as caught:
+        client.get_prices("AAPL", "2024-01-01", "2024-12-31")
+
+    assert str(caught.value) == "GET /prices/ returned 500: [REDACTED]|" + "~" * 170 + "[REDACTED]tail"
 
 
 def test_network_error_raises(client):

@@ -72,6 +72,12 @@ pricing is unsupported. The web desk permits paid providers only for reviewed
 backtests; manual paper actions and scheduled runners are free-data, local-model
 only. The TUI does not dispatch provider calls.
 
+Reviewed web backtests and paper tick/runner starts require browser Web Locks.
+The desk serializes admission across tabs, checks pending requests and saved
+monitors again while holding the surface lock, and refuses submission if
+cross-tab coordination is unavailable. Cancelling while waiting does not save
+a request identity; reloading only inspects saved status and never resubmits.
+
 Verified paid dispatch currently covers Financial Datasets self-service data
 and TypeSafe Jev 1.13.0 model calls. Other cloud-model providers lack verified
 cost bounds and are denied before transport, even when a key is saved.
@@ -89,7 +95,7 @@ aihf --root "$AIHF_ROOT"
 With no arguments, this launches the interactive terminal app. It has two modes:
 
 - **Paper trading** — your funds, each with a ledger of market days and paper money. Highlight a fund to review its next run; use `y`/`n` for gated decisions, `s` for history, and `h`/`r` for halt/resume. Sessions live in the selected root's `paper/<name>/`.
-- **Backtesting** — replay a fund over history and compare its equity curve with a benchmark. Results live in the selected root's `research/`; mandates live in `mandates/` and carry no tickers.
+- **Backtesting** — the legacy picker remains visible, but starting a backtest is temporarily disabled before credential prompting or worker startup. Use the authorized `aihf backtest` CLI or reviewed web desk instead. Results live in the selected root's `research/`; mandates live in `mandates/` and carry no tickers.
 
 Provider dispatch is disabled in the TUI; use the guarded CLI or web desk for
 provider-backed actions.

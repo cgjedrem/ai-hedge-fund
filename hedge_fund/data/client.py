@@ -315,7 +315,7 @@ class FDClient:
 
         if resp.status_code >= 400:
             safe_path = _safe_path(path)
-            body = resp.text[:200].replace(self._api_key, "[REDACTED]") if self._api_key else resp.text[:200]
+            body = (resp.text.replace(self._api_key, "[REDACTED]") if self._api_key else resp.text)[:200]
             raise FDClientError(
                 f"{method} {safe_path} returned {resp.status_code}: {body}",
                 status_code=resp.status_code,

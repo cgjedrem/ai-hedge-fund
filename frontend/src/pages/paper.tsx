@@ -170,6 +170,7 @@ export function PaperDetailPage() {
   const [haltReason, setHaltReason] = useState("");
   const [busy, setBusy] = useState(false);
   const [paperActionBusy, setPaperActionBusy] = useState(false);
+  const [paperAdmissionWaiting, setPaperAdmissionWaiting] = useState(false);
   const [paperPreview, setPaperPreview] = useState<PaperOperationPreview | null>(null);
   const [paperPreviewKind, setPaperPreviewKind] = useState<"tick" | "runner" | null>(null);
   const [stopRunnerDialogOpen, setStopRunnerDialogOpen] = useState(false);
@@ -180,9 +181,11 @@ export function PaperDetailPage() {
   const [feedback, setFeedback] = useState<{ tone: "danger" | "neutral"; message: string; error?: ActionableError } | null>(null);
   const valuationRequest = useRef(0);
   const paperActionInFlight = useRef(false);
+  const paperAdmissionController = useRef<AbortController | null>(null);
   const refreshedOperation = useRef<string | null>(null);
   const activeFundName = useRef(name);
   activeFundName.current = name;
+  useEffect(() => () => paperAdmissionController.current?.abort(), [name]);
   const protectedName = capabilities?.protected_names.some((entry) => entry.toLowerCase() === name.toLowerCase()) ?? false;
   const canWrite = capabilities?.writes === true && !protectedName;
   const data = resource.data;
@@ -432,17 +435,24 @@ export function PaperDetailPage() {
     }
 
     paperActionInFlight.current = true;
+    const controller = new AbortController();
+    paperAdmissionController.current = controller;
     setPaperActionBusy(true);
+    setPaperAdmissionWaiting(true);
     setFeedback(null);
-    if (!pendingOperations.remember(pendingRequest)) {
-      setFeedback({ tone: "danger", message: "The request identity could not be preserved or another request is unresolved. No operation was submitted." });
-      setPaperPreview(null);
-      setPaperPreviewKind(null);
-      paperActionInFlight.current = false;
-      setPaperActionBusy(false);
-      return;
-    }
     try {
+      const remembered = await pendingOperations.remember(pendingRequest, controller.signal);
+      setPaperAdmissionWaiting(false);
+      if (controller.signal.aborted || activeFundName.current !== name) {
+        if (remembered) pendingOperations.forget(pendingRequest);
+        return;
+      }
+      if (!remembered) {
+        setFeedback({ tone: "danger", message: "The request identity could not be preserved or another request is unresolved. No operation was submitted." });
+        setPaperPreview(null);
+        setPaperPreviewKind(null);
+        return;
+      }
       const receipt = await apiPost<unknown>(
         `/api/paper/${encodeURIComponent(name)}/${paperPreviewKind === "tick" ? "tick" : "runner"}`,
         request,
@@ -471,9 +481,18 @@ export function PaperDetailPage() {
         setPaperPreviewKind(null);
       }
     } finally {
+      if (paperAdmissionController.current === controller) paperAdmissionController.current = null;
       paperActionInFlight.current = false;
+      setPaperAdmissionWaiting(false);
       setPaperActionBusy(false);
     }
+  }
+
+  function dismissPaperPreview(): void {
+    if (paperActionBusy && !paperAdmissionWaiting) return;
+    paperAdmissionController.current?.abort();
+    setPaperPreview(null);
+    setPaperPreviewKind(null);
   }
 
   async function stopOwnedRunner(): Promise<void> {
@@ -890,10 +909,7 @@ export function PaperDetailPage() {
       <Dialog
         open={paperPreview !== null}
         onOpenChange={(open) => {
-          if (!open && !paperActionBusy) {
-            setPaperPreview(null);
-            setPaperPreviewKind(null);
-          }
+          if (!open) dismissPaperPreview();
         }}
       >
         <DialogContent>
@@ -940,8 +956,8 @@ export function PaperDetailPage() {
           <DialogFooter>
             <Button
               variant="ghost"
-              onClick={() => { setPaperPreview(null); setPaperPreviewKind(null); }}
-              disabled={paperActionBusy}
+              onClick={dismissPaperPreview}
+              disabled={paperActionBusy && !paperAdmissionWaiting}
             >
               Cancel
             </Button>
