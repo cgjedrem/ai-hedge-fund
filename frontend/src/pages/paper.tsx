@@ -19,8 +19,9 @@ import { LifecycleActions } from "@/components/lifecycle-actions";
 import { DataTable, type TableColumn } from "@/components/data-table";
 import { EquityChart } from "@/components/equity-chart";
 import { MetricCard } from "@/components/metric-card";
+import { PaperSessionDays } from "@/components/paper-session-days";
 import { PendingOperationRecovery } from "@/components/pending-operation-recovery";
-import { EmptyState, ErrorNotice, ErrorState, PageHeader, SectionTitle } from "@/components/page";
+import { EmptyState, ErrorNotice, ErrorState, LoadingState, PageHeader, SectionTitle } from "@/components/page";
 import { Alert } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -56,7 +57,6 @@ import type {
   RiskLimitsDto,
   ScoreMetrics,
   SessionReport,
-  SessionSummary,
 } from "@/lib/types";
 import { dateLabel, money, pct, shortHash } from "@/lib/utils";
 
@@ -606,7 +606,13 @@ export function PaperDetailPage() {
                       ))}
                     </Alert>
                   ) : null}
-                  <SessionsTable name={name} sessions={sessionResource.data?.items ?? []} />
+                  {sessionResource.loading ? <LoadingState label="Loading session history" /> : null}
+                  {sessionResource.data && !sessionResource.data.ledger.ok && sessionResource.data.errors.length === 0 ? (
+                    <ErrorState message={sessionResource.data.ledger.error ?? "Session ledger verification failed."} />
+                  ) : null}
+                  {sessionResource.data?.ledger.ok && !sessionResource.loading && !sessionResource.error ? (
+                    <PaperSessionDays name={name} sessions={sessionResource.data.items} search={sessionResource.data.search} />
+                  ) : null}
                   <div className="mt-4 flex items-center justify-between gap-3 border-t border-border pt-4">
                     <p className="text-xs text-muted-foreground">Page {sessionCursorStack.length}</p>
                     <div className="flex gap-2">
@@ -1135,21 +1141,6 @@ function estimateMoney(value: string | null): string {
   if (value === null) return "—";
   const numeric = Number(value);
   return Number.isFinite(numeric) ? money(numeric) : value;
-}
-
-function SessionsTable({ name, sessions }: { name: string; sessions: SessionSummary[] }) {
-  const columns: TableColumn<SessionSummary>[] = [
-    {
-      key: "session",
-      label: "Session",
-      render: (item) => <Link className="mono text-foreground hover:text-accent hover:underline" to={`/paper/${encodeURIComponent(name)}/sessions/${encodeURIComponent(item.session)}`}>{dateLabel(item.session)}</Link>,
-    },
-    { key: "nav", label: "NAV", align: "right", render: (item) => <span className="mono text-foreground">{money(item.nav)}</span> },
-    { key: "cash", label: "Cash", align: "right", render: (item) => <span className="mono">{money(item.cash)}</span> },
-    { key: "orders", label: "Orders / fills", align: "right", render: (item) => <span className="mono">{item.orders} / {item.fills}</span> },
-    { key: "hash", label: "Record hash", render: (item) => <span className="mono" title={item.hash}>{shortHash(item.hash)}</span> },
-  ];
-  return <DataTable columns={columns} rows={[...sessions].reverse()} rowKey={(item) => item.session} emptyTitle="No verified sessions" emptyDescription="The ledger has no session records to display." />;
 }
 
 export function PaperScorecardPage() {
