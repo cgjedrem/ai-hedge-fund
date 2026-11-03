@@ -56,10 +56,7 @@ ROOT_PRIMITIVE = "root-primitive: RootContext handle-relative implementation use
 DISABLED = "disabled: legacy writer always raises before writing"
 OUTSIDE_ROOT = "outside-root: writes only to a process temp directory, never an engine root"
 TEST_HARNESS = "test-harness: test-owned demo root creation, validated inside HEDGE_FUND_TEST_ROOT"
-USER_REGISTRY = (
-    "per-user-registry: private per-user SIM account registry outside every fund root, under its own "
-    "OS lock; bind/release also require write_authority plus fund-root registry/deployment lanes"
-)
+USER_REGISTRY = "per-user-registry: private per-user SIM account registry outside every fund root, under its own " "OS lock; bind/release also require write_authority plus fund-root registry/deployment lanes"
 
 WRITER_INVENTORY: dict[tuple[str, str, str], tuple[int, str]] = {
     ("backtesting/research.py", "save_result", "mkdir"): (1, PATHS_ROUTED),
@@ -78,14 +75,17 @@ WRITER_INVENTORY: dict[tuple[str, str, str], tuple[int, str]] = {
     ("fund/storage.py", "save_spec", "mkdir"): (1, PATHS_ROUTED),
     ("fund/storage.py", "save_spec", "write_bytes"): (1, PATHS_ROUTED),
     ("llm/cache.py", "PromptCache.put", "write_text"): (1, PATHS_ROUTED),
-    ("paper/deployed.py", "deploy", "mkdir"): (1, PAPER_LANES),
-    ("paper/deployed.py", "deploy", "write_bytes"): (1, PAPER_LANES),
+    ("paper/deployed.py", "deploy", "mkdir"): (2, PAPER_LANES),
+    ("paper/deployed.py", "deploy", "write_bytes"): (2, PAPER_LANES),
+    ("paper/deployed.py", "deploy", "write_text"): (1, PAPER_LANES),
     ("paper/ledger.py", "Ledger._clear_approval", "unlink"): (1, PAPER_LANES),
-    ("paper/ledger.py", "Ledger.append", "mkdir"): (1, PAPER_LANES),
-    ("paper/ledger.py", "Ledger.init", "mkdir"): (1, PAPER_LANES),
+    ("paper/ledger.py", "Ledger.append", "mkdir"): (2, PAPER_LANES),
+    ("paper/ledger.py", "Ledger.append", "write_text"): (1, PAPER_LANES),
+    ("paper/ledger.py", "Ledger.init", "mkdir"): (2, PAPER_LANES),
     ("paper/ledger.py", "Ledger.log_event", "open"): (1, PAPER_LANES),
-    ("paper/ledger.py", "Ledger.rewind", "mkdir"): (1, PAPER_LANES),
+    ("paper/ledger.py", "Ledger.rewind", "mkdir"): (2, PAPER_LANES),
     ("paper/ledger.py", "Ledger.rewind", "rename"): (1, PAPER_LANES),
+    ("paper/ledger.py", "Ledger.rewind", "rename_file"): (1, PAPER_LANES),
     ("paper/ledger.py", "Ledger.rewind", "unlink"): (1, PAPER_LANES),
     ("paper/runner.py", "serve", "unlink"): (1, DISABLED),
     ("paper/runner.py", "serve", "write_text"): (1, DISABLED),
@@ -119,6 +119,10 @@ WRITER_INVENTORY: dict[tuple[str, str, str], tuple[int, str]] = {
     ("runtime/credentials.py", "CredentialStore._write_bytes", "write_bytes"): (1, REGISTRY),
     ("runtime/handover.py", "_write_record", "write_bytes"): (1, BOOTSTRAP),
     ("runtime/handover.py", "_write_stale_recovery_record", "write_bytes"): (1, BOOTSTRAP),
+    ("runtime/handover.py", "PaperInventoryTransition.mkdir", "mkdir"): (2, PAPER_LANES),
+    ("runtime/handover.py", "PaperInventoryTransition.rename_file", "rename_file"): (1, PAPER_LANES),
+    ("runtime/handover.py", "PaperInventoryTransition.write_bytes", "write_bytes"): (1, PAPER_LANES),
+    ("runtime/handover.py", "PaperInventoryTransition.write_text", "write_bytes"): (1, PAPER_LANES),
     ("runtime/handover.py", "enroll_fresh", "prepare_private_storage"): (1, BOOTSTRAP),
     ("runtime/handover.py", "migrate_existing", "prepare_private_storage"): (1, BOOTSTRAP),
     ("runtime/handover.py", "recover_stale_reservation", "mkdir"): (1, BOOTSTRAP),
@@ -141,6 +145,7 @@ WRITER_INVENTORY: dict[tuple[str, str, str], tuple[int, str]] = {
     ("runtime/root.py", "_posix_open_lock_relative", "os.open"): (1, ROOT_PRIMITIVE),
     ("runtime/root.py", "_posix_parent_fd", "os.open"): (1, ROOT_PRIMITIVE),
     ("runtime/root.py", "_posix_read_relative", "os.open"): (1, ROOT_PRIMITIVE),
+    ("runtime/root.py", "_posix_unlink_relative", "os.unlink"): (1, ROOT_PRIMITIVE),
     ("runtime/root.py", "_posix_secure_private_directory", "os.open"): (1, ROOT_PRIMITIVE),
     ("runtime/root.py", "_posix_verify_private_directory", "os.open"): (1, ROOT_PRIMITIVE),
     ("runtime/root.py", "_posix_write_relative", "os.replace"): (1, ROOT_PRIMITIVE),

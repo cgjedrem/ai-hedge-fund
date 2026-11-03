@@ -73,7 +73,7 @@ ROOT_TESTS = (
     "hedge_fund/runtime/test_root_unlink.py::test_unlink_never_follows_link_parent_outside_root",
 )
 LEGACY_NOTE = "raw path is reached only when the paper root is not enrolled; enrolled roots take the transition branch"
-BOUND_NOTE = "admitted through RootContext only while paths.bound_root covers the target; an unbound caller falls back to a raw os.replace"
+BOUND_NOTE = "admitted through RootContext while paths.bound_root covers the target or the target lies under an enrolled root (unbound callers are routed via paths._write_in_root); the raw os.replace remains only for paths outside every enrolled root"
 LANE_LOCK = ("hedge_fund/runtime/test_admission.py::test_subject_sessions_conflict_while_controls_remain_independent", "hedge_fund/runtime/test_admission.py::test_control_lane_conflict_has_a_bounded_wait")
 
 WRITER_MAP: dict[tuple[str, str, str], Writer] = {
@@ -81,7 +81,6 @@ WRITER_MAP: dict[tuple[str, str, str], Writer] = {
     ("hedge_fund.backtesting.research", "save_result", "mkdir"): Writer(ROOT, "race", ("hedge_fund/backtesting/test_research.py::test_research_lanes_for_independent_funds_do_not_contend", "hedge_fund/backtesting/test_research.py::test_save_result_admission_denial_preserves_existing_bytes")),
     ("hedge_fund.backtesting.research", "save_result", "write_bytes"): Writer(ROOT, "race", ("hedge_fund/backtesting/test_research.py::test_research_writer_holds_fund_lane_without_runner_lane", "hedge_fund/backtesting/test_research.py::test_save_result_admission_denial_preserves_existing_bytes")),
     # paper broker book
-    ("hedge_fund.brokers.paper", "PaperBroker.create", "mkdir"): Writer(LEGACY, "denial", (ICR + "test_external_drift_during_deploy_is_not_published",), LEGACY_NOTE),
     ("hedge_fund.brokers.paper", "PaperBroker.create", "write_atomic"): Writer(LEGACY, "denial", (ICR + "test_external_drift_during_deploy_is_not_published",), LEGACY_NOTE),
     ("hedge_fund.brokers.paper", "PaperBroker.restore", "write_atomic"): Writer(BOUND, "none", ("hedge_fund/test_run.py::test_enrolled_cli_redo_preserves_guarded_dispatch_and_expires_approval",), "redo-only writer; functional enrolled redo test, no interleaving at restore"),
     ("hedge_fund.brokers.paper", "PaperBroker._save", "write_atomic"): Writer(BOUND, "race", ("hedge_fund/test_run.py::test_enrolled_cli_tick_lane_conflict_leaves_ledger_unchanged", "hedge_fund/web/test_paper_operations.py::test_manual_tick_denies_runner_lane_conflict_without_ledger_change"), BOUND_NOTE),
@@ -136,8 +135,12 @@ WRITER_MAP: dict[tuple[str, str, str], Writer] = {
     ("hedge_fund.paper.runner", "serve", "unlink"): Writer(DENIED, "denial", ("hedge_fund/paper/test_runner.py::test_legacy_runner_entrypoints_deny_before_pid_or_provider_effects",)),
     ("hedge_fund.paper.runner", "spawn_runner", "open:a"): Writer(DENIED, "denial", ("hedge_fund/paper/test_runner.py::test_enrolled_root_blocks_legacy_runner_start_and_pid_signaling",)),
     # paths helpers
-    ("hedge_fund.paths", "write_bytes", "mkdir"): Writer(HELPER, "denial", ("hedge_fund/runtime/test_bootstrap.py::test_cache_writes_deny_unenrolled_root",), "root branch when bound; raw branch only for unbound targets"),
-    ("hedge_fund.paths", "write_bytes", "write_bytes"): Writer(HELPER, "denial", ("hedge_fund/runtime/test_bootstrap.py::test_cache_writes_deny_unenrolled_root",), "root branch when bound; raw branch only for unbound targets"),
+    ("hedge_fund.paths", "write_bytes", "mkdir"): Writer(HELPER, "denial", ("hedge_fund/runtime/test_bootstrap.py::test_cache_writes_deny_unenrolled_root",), "root branch when bound or under an enrolled root; raw branch only for targets outside every enrolled root"),
+    ("hedge_fund.paths", "write_bytes", "write_bytes"): Writer(HELPER, "denial", ("hedge_fund/runtime/test_bootstrap.py::test_cache_writes_deny_unenrolled_root",), "root branch when bound or under an enrolled root; raw branch only for targets outside every enrolled root"),
+    ("hedge_fund.paths", "_write_in_root", "mkdir"): Writer(ROOT, "race", ("hedge_fund/runtime/test_writer_admission_race_matrix.py::test_unconfigured_writes_into_an_enrolled_root_are_routed_through_admission", "hedge_fund/runtime/test_writer_admission_race_matrix.py::test_alias_into_an_enrolled_root_subdirectory_is_routed_through_admission")),
+    ("hedge_fund.paths", "_write_in_root", "write_bytes"): Writer(
+        ROOT, "race", ("hedge_fund/runtime/test_writer_admission_race_matrix.py::test_unconfigured_writes_into_an_enrolled_root_are_routed_through_admission", "hedge_fund/runtime/test_writer_admission_race_matrix.py::test_unconfigured_paper_write_without_a_held_lane_is_denied", "hedge_fund/runtime/test_writer_admission_race_matrix.py::test_unusual_enrollment_state_never_falls_back_to_a_raw_write")
+    ),
     ("hedge_fund.paths", "write_text", "write_bytes"): Writer(HELPER, "denial", ("hedge_fund/runtime/test_bootstrap.py::test_cache_writes_deny_unenrolled_root",)),
     ("hedge_fund.paths", "ensure_directory", "mkdir"): Writer(HELPER, "denial", ("hedge_fund/runtime/test_bootstrap.py::test_cache_writes_deny_unenrolled_root",)),
     ("hedge_fund.paths", "ensure_mandates_dir", "mkdir"): Writer(HELPER, "denial", ("hedge_fund/fund/test_storage.py::test_save_spec_uses_root_context_and_registry_lane",)),
@@ -158,7 +161,6 @@ WRITER_MAP: dict[tuple[str, str, str], Writer] = {
     ("hedge_fund.runtime.configuration", "build_child_environment", "mkdir"): Writer(ROOT, "denial", ("hedge_fund/web/test_settings_provenance.py::test_settings_update_after_snapshot_requires_restart_of_active_capture_without_hot_swap",), "creates private child HOME/temp directories inside the root"),
     ("hedge_fund.runtime.credentials", "CredentialStore._write_bytes", "mkdir"): Writer(ROOT, "race", ("hedge_fund/runtime/test_credentials.py::test_credential_store_compare_and_swap_rejects_stale_version",)),
     ("hedge_fund.runtime.credentials", "CredentialStore._write_bytes", "write_bytes"): Writer(ROOT, "race", ("hedge_fund/runtime/test_credentials.py::test_credential_store_compare_and_swap_rejects_stale_version",)),
-    ("hedge_fund.runtime.credentials", "save_credential", "mkdir"): Writer(RESIDUAL, "denial", ("hedge_fund/web/test_settings.py::test_credential_write_is_allowlisted_write_only_and_control_safe",), "explicit credential-file writer; raw parent mkdir"),
     ("hedge_fund.runtime.credentials", "save_credential", "write_atomic"): Writer(RESIDUAL, "denial", ("hedge_fund/web/test_settings.py::test_credential_write_is_allowlisted_write_only_and_control_safe",), BOUND_NOTE),
     # handover records and relocation
     ("hedge_fund.runtime.handover", "relocate_existing", "mkdir"): Writer(ROOT, "denial", ("hedge_fund/runtime/test_write_authority.py::test_relocation_refuses_reparse_points_in_source",)),
@@ -183,8 +185,6 @@ WRITER_MAP: dict[tuple[str, str, str], Writer] = {
     # owned runner
     ("hedge_fund.runtime.owned_runner", "OwnedRunnerManager._start_locked", "mkdir"): Writer(ROOT, "race", ("hedge_fund/web/test_paper_operations.py::test_runner_start_rejects_head_changed_after_acceptance_before_spawn",)),
     ("hedge_fund.runtime.owned_runner", "_write_record", "write_bytes"): Writer(ROOT, "race", ("hedge_fund/web/test_paper_operations.py::test_owned_runner_child_starts_and_stops_with_exact_process_identity", "hedge_fund/runtime/test_lifecycle.py::test_unverified_starting_record_blocks_archive_even_with_free_runner_lane")),
-    ("hedge_fund.runtime.owned_runner_child", "_client_context._ClientContext.__enter__", "mkdir"): Writer(ROOT, "race", ("hedge_fund/runtime/test_owned_runner_child.py::test_runner_retries_pre_effect_observation_contention",)),
-    ("hedge_fund.runtime.owned_runner_child", "_build_fund", "mkdir"): Writer(ROOT, "race", ("hedge_fund/runtime/test_owned_runner_child.py::test_runner_retries_pre_effect_control_contention_without_spending_another_session",)),
     # no-follow primitives
     ("hedge_fund.runtime.root", "RootContext.prepare_private_storage", "mkdir"): Writer(PRIMITIVE, "primitive", ("hedge_fund/runtime/test_root.py::test_concurrent_root_validation_and_private_storage_checks",)),
     ("hedge_fund.runtime.root", "_posix_unlink_relative", "unlink"): Writer(PRIMITIVE, "primitive", ROOT_TESTS, "POSIX lstat->unlinkat is not identity-fenced against a same-name swap"),
@@ -327,7 +327,6 @@ def test_writer_map_reports_residuals_explicitly():
         "hedge_fund.paths:write_atomic:replace",
         "hedge_fund.paths:write_atomic:unlink",
         "hedge_fund.paths:write_atomic:write_bytes",
-        "hedge_fund.runtime.credentials:save_credential:mkdir",
         "hedge_fund.runtime.credentials:save_credential:write_atomic",
         "hedge_fund.web.__main__:main:mkdir",
         "hedge_fund.web.demo:seed_demo:mkdir",
