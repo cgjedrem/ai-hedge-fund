@@ -16,6 +16,7 @@ from hedge_fund.runtime.configuration import (
     save_settings,
 )
 from hedge_fund.runtime.operations import OperationStatus
+from hedge_fund.runtime.policy import AuthorizationDenied
 from hedge_fund.test_support.handover import enroll_synthetic_root
 from hedge_fund.web.app import create_app
 from hedge_fund.web.schemas import (
@@ -160,7 +161,7 @@ def test_version_changes_and_external_writer_require_restart_and_reject_stale_sa
         service.close()
 
 
-def test_settings_update_after_snapshot_keeps_active_capture_without_server_restart(tmp_path, monkeypatch):
+def test_settings_update_after_snapshot_requires_restart_of_active_capture_without_hot_swap(tmp_path, monkeypatch):
     enroll_synthetic_root(tmp_path)
     service = DeskService(tmp_path, allow_writes=True)
     try:
@@ -176,11 +177,74 @@ def test_settings_update_after_snapshot_keeps_active_capture_without_server_rest
         assert result["active_captures"][0]["settings_version"] == 0
         configuration = result["configuration"]
         assert configuration["active"] == {"available": True, "count": 1, "stale_count": 1}
-        # The running snapshot is immutable; a server restart would not update it and
-        # new work already uses the saved version, so no restart is requested.
-        assert configuration["restart_reasons"] == []
-        assert configuration["restart_required"] is False
+        assert configuration["effective"]["version"] == 1
+        assert configuration["restart_reasons"] == ["active-capture-stale"]
+        assert configuration["restart_required"] is True
+        assert configuration["policy"]["hot_reload"] is False
+        assert configuration["policy"]["restart_action"] == "manual"
+        # Captured work is fenced, never hot-swapped: its next dispatch is denied.
+        monkeypatch.setattr(service, "network_enabled", True)
+        operation = SimpleNamespace(capture_id=captured.capture_id, subject_id="demo-alpha", payload={})
+        with pytest.raises(AuthorizationDenied, match="captured provider settings changed"):
+            service._check_dispatch_fence(operation, captured, lambda: False, paper=False)
+        # Reading the view never mutates the immutable running snapshot.
         assert captured.model == DEFAULT_MODEL
+        assert captured.settings_version == 0
+    finally:
+        service.close()
+
+
+def test_live_owned_runner_on_older_settings_requires_stop_and_start(tmp_path, monkeypatch):
+    enroll_synthetic_root(tmp_path)
+    service = DeskService(tmp_path, allow_writes=True)
+    try:
+        captured = _capture(service)
+        service._captures[captured.capture_id] = captured
+
+        def runner_start(subject: str, capture_id: str, status=OperationStatus.COMPLETED):
+            return SimpleNamespace(action="paper-runner-start", subject_id=subject, capture_id=capture_id, status=status)
+
+        operations = (
+            runner_start("demo-alpha", captured.capture_id),
+            runner_start("demo-beta", "f" * 32),
+            runner_start("demo-gamma", captured.capture_id),
+            runner_start("demo-delta", captured.capture_id, OperationStatus.FAILED),
+        )
+        states = {"demo-alpha": "running", "demo-beta": "unknown", "demo-gamma": "stopped", "demo-delta": "running"}
+        monkeypatch.setattr(service._operation_store, "list_operations", lambda limit=100: operations)
+        monkeypatch.setattr(service, "_runner_state", lambda name: {"status": states[name]})
+        monkeypatch.setattr(service, "_active_operation_captures", lambda: [])
+
+        configuration = service.settings()["configuration"]
+        assert configuration["runners"] == {
+            "available": True,
+            "count": 1,
+            "stale_count": 0,
+            "stale_unverified_count": 0,
+            "ownership_unknown_count": 1,
+        }
+        assert configuration["restart_reasons"] == ["owned-runner-unverified"]
+
+        service._captures.pop(captured.capture_id)
+        assert service.settings()["configuration"]["restart_reasons"] == ["owned-runner-stale", "owned-runner-unverified"]
+        service._captures[captured.capture_id] = captured
+
+        states["demo-beta"] = "stopped"
+        assert service.settings()["configuration"]["restart_required"] is False
+
+        service.set_model(ModelRequest(model=_other_model(), expected_version=0))
+
+        configuration = service.settings()["configuration"]
+        assert configuration["runners"] == {
+            "available": True,
+            "count": 1,
+            "stale_count": 1,
+            "stale_unverified_count": 0,
+            "ownership_unknown_count": 0,
+        }
+        assert configuration["restart_reasons"] == ["owned-runner-stale"]
+        assert configuration["restart_required"] is True
+        assert captured.settings_version == 0
     finally:
         service.close()
 
@@ -212,6 +276,12 @@ def test_credential_deleted_after_capture_keeps_captured_version_without_echoing
         }
         assert service._credential_store.read_version("openai", 1) == SECRET
         assert SECRET not in json.dumps(result)
+        assert result["configuration"]["restart_required"] is False
+        monkeypatch.setattr(service, "network_enabled", True)
+        operation = SimpleNamespace(capture_id=captured.capture_id, subject_id="demo-alpha", payload={})
+        with pytest.raises(AuthorizationDenied, match="captured credentials changed"):
+            service._check_dispatch_fence(operation, captured, lambda: False, paper=False)
+        assert service._credential_store.read_version("openai", 1) == SECRET
         with pytest.raises(ServiceError) as stale:
             service.delete_credential("OpenAI", expected_version=saved["version"])
         assert stale.value.status_code == 409

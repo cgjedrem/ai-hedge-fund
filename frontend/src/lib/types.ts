@@ -605,7 +605,12 @@ export interface ConfigurationField {
   shadowed: boolean;
 }
 
-export type RestartReason = "stored-version-changed" | "override-shadows-stored";
+export type RestartReason =
+  | "stored-version-changed"
+  | "override-shadows-stored"
+  | "active-capture-stale"
+  | "owned-runner-stale"
+  | "owned-runner-unverified";
 
 export interface ConfigurationProvenance {
   stored: { available: boolean; version: number | null; present: boolean };
@@ -623,6 +628,7 @@ export interface ConfigurationProvenance {
     parameters: Record<string, number>;
   } | null;
   active: { available: boolean; count: number; stale_count: number };
+  runners: { available: boolean; count: number; stale_count: number; stale_unverified_count: number; ownership_unknown_count: number };
   credential_captures: {
     capture_id: string;
     subject_id: string;

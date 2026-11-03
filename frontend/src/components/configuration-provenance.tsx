@@ -25,14 +25,20 @@ const RESTART_REASONS: Record<RestartReason, string> = {
     "Saved settings changed outside this server. This server keeps using its effective version until it is restarted; saves from this page are rejected as stale.",
   "override-shadows-stored":
     "A process environment override shadows a saved value. The saved value applies only after the variable is removed and the server is restarted.",
+  "active-capture-stale":
+    "Settings changed after active work captured its snapshot. That work is never switched to the new settings: its captured version stays recorded, and its next provider call or start is denied (fail-closed). To use the current settings, cancel it or let it end, then review and start it again. A server restart does not change captured work.",
+  "owned-runner-stale":
+    "A paper runner owned by this server was started on an older settings version, or its captured version is no longer known here. Runners do not re-check settings after launch: it keeps its captured version until it stops or expires. Stop it from its paper fund page and start it again to use the current settings. This page does not stop it, and a server restart does not change it.",
+  "owned-runner-unverified":
+    "A paper runner may still be running, but this server process cannot verify that it owns it (for example, after a server restart), so its settings version is unknown. It cannot be stopped or restarted from the paper page; offline recovery is required. Nothing is stopped, restarted or reloaded from here.",
 };
 
 const CREDENTIAL_STATES: Record<ConfigurationProvenance["credential_captures"][number]["state"], string> = {
   current: "Captured version is still the saved version.",
   superseded:
-    "A newer credential was saved. Work not yet dispatched is rechecked and must be reviewed again; running work keeps its captured version.",
+    "A newer credential was saved after capture. The work is never switched to the new key; its next provider call or start is denied, so it must be reviewed again.",
   "deleted-after-capture":
-    "The saved credential was removed after capture. Work not yet dispatched is rechecked and denied; running work keeps its captured version and is not revoked by this page.",
+    "The saved credential was removed after capture. Removal does not erase the captured version or switch the work to another key; its next provider call or start is denied, so it must be reviewed again.",
   "not-captured": "No credential version was captured for this provider.",
   unavailable: "Credential status is unavailable; nothing is inferred.",
 };
@@ -77,19 +83,28 @@ export function ConfigurationProvenancePanel({ configuration }: { configuration:
             <p className="mono mt-1 text-foreground">
               {active.available ? `${active.count} active · ${active.stale_count} on an older version` : "Unavailable"}
             </p>
+            {configuration.runners.available ? (
+              <p className="mono mt-1 text-muted-foreground">
+                {configuration.runners.count} paper runner{configuration.runners.count === 1 ? "" : "s"} live · {configuration.runners.stale_count} on an
+                older version
+                {configuration.runners.stale_unverified_count ? ` · ${configuration.runners.stale_unverified_count} version unknown` : ""}
+                {configuration.runners.ownership_unknown_count ? ` · ${configuration.runners.ownership_unknown_count} owner unverified` : ""}
+              </p>
+            ) : null}
           </div>
         </div>
 
         {configuration.restart_required ? (
           <Alert tone="warning">
-            <p className="font-semibold">Restart required for saved settings to apply everywhere</p>
+            <p className="font-semibold">Restart required</p>
+            <p className="mt-1 text-xs">Saved settings may not apply everywhere yet. Each reason names what must be restarted or recovered and what happens until then.</p>
             <ul className="mt-2 list-disc space-y-1 pl-5 text-xs">
               {configuration.restart_reasons.map((reason) => (
                 <li key={reason}>{RESTART_REASONS[reason] ?? reason}</li>
               ))}
             </ul>
             <p className="mt-2 text-xs">
-              This page never restarts the server, reloads settings into it, or swaps settings in running work. Restart is a manual operator action.
+              This page never restarts the server or running work, reloads settings into it, or swaps settings in running work. Restart is a manual operator action.
             </p>
           </Alert>
         ) : (
@@ -98,8 +113,9 @@ export function ConfigurationProvenancePanel({ configuration }: { configuration:
 
         {active.stale_count > 0 ? (
           <p className="text-xs text-muted-foreground">
-            {active.stale_count} active operation{active.stale_count === 1 ? " keeps" : "s keep"} the settings version captured at review. Captured
-            work is never hot-swapped and restarting would not change it; new operations already use the current effective version.
+            {active.stale_count} active operation{active.stale_count === 1 ? " was" : "s were"} captured on an older settings version. Captured work
+            is never hot-swapped and a server restart would not change it; its next provider call is denied. New operations use the current effective
+            version.
           </p>
         ) : null}
 

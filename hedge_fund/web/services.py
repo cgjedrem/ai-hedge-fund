@@ -3778,17 +3778,34 @@ class DeskService:
                         "state": state,
                     }
                 )
+        reasons = list(view["restart_reasons"])
+        if stale:
+            # Captured work is fenced, never hot-swapped: its next dispatch or
+            # start is denied, so it must be restarted (re-reviewed) to apply.
+            reasons.append("active-capture-stale")
+        runners = self._runner_capture_summary(effective)
+        if runners["stale_count"] or runners["stale_unverified_count"]:
+            # Owned runners do not re-check settings after launch; they keep
+            # their captured version until stopped and started again.
+            reasons.append("owned-runner-stale")
+        if runners["ownership_unknown_count"]:
+            # Runner owner is not verified in this server process, so its
+            # captured version is unknown and it cannot be stopped from here.
+            reasons.append("owned-runner-unverified")
         stored_values = None
         if stored is not None and stored.version == effective.version:
             stored_values = stored.to_mapping()
         return {
             **view,
+            "restart_required": bool(reasons),
+            "restart_reasons": reasons,
             "stored_values": stored_values,
             "active": {
                 "available": items is not None,
                 "count": len(items or []),
                 "stale_count": stale,
             },
+            "runners": runners,
             "credential_captures": credentials,
             "policy": {
                 "hot_reload": False,
@@ -3796,6 +3813,48 @@ class DeskService:
                 "process_environment_credentials_used": False,
                 "restart_action": "manual",
             },
+        }
+
+    def _runner_capture_summary(self, effective: RuntimeSettings) -> dict[str, object]:
+        """Count launched owned runners whose capture predates ``effective``.
+
+        Uses only the latest completed runner start per fund and the public
+        runner status; nothing is started, stopped or reloaded here.
+        """
+        if self._operation_store is None:
+            return {"available": False, "count": 0, "stale_count": 0, "stale_unverified_count": 0, "ownership_unknown_count": 0}
+        try:
+            operations = self._operation_store.list_operations(limit=100)
+        except OperationError:
+            return {"available": False, "count": 0, "stale_count": 0, "stale_unverified_count": 0, "ownership_unknown_count": 0}
+        count = stale_count = unverified = ownership_unknown = 0
+        seen: set[str] = set()
+        for operation in operations:
+            if operation.action != "paper-runner-start" or operation.status != OperationStatus.COMPLETED:
+                continue
+            if operation.subject_id in seen:
+                continue
+            seen.add(operation.subject_id)
+            status = self._runner_state(operation.subject_id).get("status")
+            if status == "unknown":
+                # Not owned by this server process (e.g. after a restart): it
+                # cannot be stopped here and needs offline recovery.
+                ownership_unknown += 1
+                continue
+            if status not in {"running", "stopping"}:
+                continue
+            count += 1
+            capture = self._captures.get(operation.capture_id)
+            if capture is None:
+                unverified += 1
+            elif capture.settings_version != effective.version:
+                stale_count += 1
+        return {
+            "available": True,
+            "count": count,
+            "stale_count": stale_count,
+            "stale_unverified_count": unverified,
+            "ownership_unknown_count": ownership_unknown,
         }
 
     def _ensure_settings_available(self) -> None:

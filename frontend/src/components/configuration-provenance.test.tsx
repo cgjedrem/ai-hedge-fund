@@ -36,6 +36,7 @@ function provenance(extra: Partial<ConfigurationProvenance> = {}): Configuration
     restart_reasons: [],
     stored_values: null,
     active: { available: true, count: 0, stale_count: 0 },
+    runners: { available: true, count: 0, stale_count: 0, stale_unverified_count: 0, ownership_unknown_count: 0 },
     credential_captures: [],
     policy: { hot_reload: false, environment_read_at: "startup", process_environment_credentials_used: false, restart_action: "manual" },
     ...extra,
@@ -74,7 +75,7 @@ describe("ConfigurationProvenancePanel", () => {
     expect(within(endpoint).getByText("remote endpoint · origin hidden")).toBeVisible();
     expect(within(endpoint).getByText("Not set")).toBeVisible();
     expect(container.textContent).not.toMatch(/https?:\/\//);
-    expect(screen.getByText("Restart required for saved settings to apply everywhere")).toBeVisible();
+    expect(screen.getByText("Restart required")).toBeVisible();
     expect(screen.getByText(/process environment override shadows a saved value/)).toBeVisible();
     expect(screen.getByText(/never restarts the server.*Restart is a manual operator action/)).toBeVisible();
   });
@@ -86,7 +87,7 @@ describe("ConfigurationProvenancePanel", () => {
           stored: { available: true, version: 4, present: true },
           effective: { version: 3, startup_version: 2 },
           restart_required: true,
-          restart_reasons: ["stored-version-changed"],
+          restart_reasons: ["stored-version-changed", "active-capture-stale"],
           active: { available: true, count: 2, stale_count: 1 },
         })}
       />,
@@ -95,7 +96,58 @@ describe("ConfigurationProvenancePanel", () => {
     expect(screen.getByText("v3 · started at v2")).toBeVisible();
     expect(screen.getByText("2 active · 1 on an older version")).toBeVisible();
     expect(screen.getByText(/saves from this page are rejected as stale/)).toBeVisible();
-    expect(screen.getByText(/never hot-swapped and restarting would not change it/)).toBeVisible();
+    expect(screen.getByText(/never hot-swapped and a server restart would not change it/)).toBeVisible();
+  });
+
+  it("requires restart of active work captured before a settings update without implying hot-swap", () => {
+    render(
+      <ConfigurationProvenancePanel
+        configuration={provenance({
+          restart_required: true,
+          restart_reasons: ["active-capture-stale"],
+          active: { available: true, count: 1, stale_count: 1 },
+        })}
+      />,
+    );
+    expect(screen.getByText("Restart required")).toBeVisible();
+    expect(screen.getByText(/never switched to the new settings/)).toBeVisible();
+    expect(screen.getByText(/next provider call or start is denied \(fail-closed\)/)).toBeVisible();
+    expect(screen.getByText(/A server restart does not change captured work/)).toBeVisible();
+    expect(screen.getByText(/never restarts the server or running work/)).toBeVisible();
+    expect(screen.queryByText(/No restart is needed/)).toBeNull();
+    expect(screen.queryByText(/older version stays in force/)).toBeNull();
+  });
+
+  it("requires a stop and start of a paper runner launched on an older settings version", () => {
+    render(
+      <ConfigurationProvenancePanel
+        configuration={provenance({
+          restart_required: true,
+          restart_reasons: ["owned-runner-stale"],
+          runners: { available: true, count: 1, stale_count: 1, stale_unverified_count: 1, ownership_unknown_count: 0 },
+        })}
+      />,
+    );
+    expect(screen.getByText("Restart required")).toBeVisible();
+    expect(screen.getByText(/1 paper runner live · 1 on an\s+older version · 1 version unknown/)).toBeVisible();
+    expect(screen.getByText(/Runners do not re-check settings after launch: it keeps its captured version until it stops or expires/)).toBeVisible();
+    expect(screen.getByText(/This page does not stop it, and a server restart does not change it/)).toBeVisible();
+    expect(screen.queryByText(/offline recovery is required/)).toBeNull();
+  });
+
+  it("routes runners whose owner is unverified to offline recovery instead of stop and start", () => {
+    render(
+      <ConfigurationProvenancePanel
+        configuration={provenance({
+          restart_required: true,
+          restart_reasons: ["owned-runner-unverified"],
+          runners: { available: true, count: 0, stale_count: 0, stale_unverified_count: 0, ownership_unknown_count: 2 },
+        })}
+      />,
+    );
+    expect(screen.getByText(/0 paper runners live · 0 on an\s+older version · 2 owner unverified/)).toBeVisible();
+    expect(screen.getByText(/cannot be stopped or restarted from the paper page; offline recovery is required/)).toBeVisible();
+    expect(screen.queryByText(/Stop it from its paper fund page/)).toBeNull();
   });
 
   it("keeps a captured credential version visible after the saved credential is deleted", () => {
@@ -120,7 +172,7 @@ describe("ConfigurationProvenancePanel", () => {
     );
     expect(screen.getByText("deleted-after-capture")).toBeVisible();
     expect(screen.getByText(/captured v1 · saved v2/)).toBeVisible();
-    expect(screen.getByText(/running work keeps its captured version and is not revoked/)).toBeVisible();
+    expect(screen.getByText(/does not erase the captured version or switch the work to another key/)).toBeVisible();
     expect(screen.getByText(/captured version remains in private storage/)).toBeVisible();
   });
 
