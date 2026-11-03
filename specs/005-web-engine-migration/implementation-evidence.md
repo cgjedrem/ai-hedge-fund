@@ -1611,3 +1611,66 @@ does not execute a fill. T024's foundation prerequisites and production
 out-of-band exclusion remain open, so T027 and the other incomplete tasks
 stay unchecked; no full migration, installed-artifact or production
 acceptance is claimed.
+
+## T027 owned-runner fill and completed-lifecycle follow-up (2026-11-03)
+
+**Partial, not foundation or migration acceptance.** This section supersedes
+the preceding statement that the owned-runner race has no due session. No
+task checkbox changed: T024's prerequisites and production out-of-band writer
+exclusion remain open, so T027 stays unchecked.
+
+| Field | Evidence |
+| --- | --- |
+| Source under test | Base `9c4602d35f618ee8c91a3a5baa100162c5cedd88` plus dirty blobs: `hedge_fund\runtime\test_writer_races.py` `1031cd93b507b28ec41c801d5312a5fad46d3dbc`; `hedge_fund\web\services.py` `b41d19c2bbc001bbd24948e4dfa9cbad1e5814ae`; `hedge_fund\web\test_lifecycle.py` `2de3dbaaccb26f27e8f988247fc1a1cd8a13595f`; `frontend\src\components\lifecycle-actions.test.tsx` `5f034f65a941388bb3fd5b4252c07384fe3c98bb`. These are source runs, not an installed wheel or container. |
+| Environment and isolation | Windows 11 Enterprise build 26200, NTFS, Python 3.13.7; Node 22.13.1; marked synthetic roots, owned child processes, isolated HOME/TEMP and Vite environment, cleared provider/credential/proxy overrides and disabled dotenv. The guarded runner child blocks loopback and non-loopback network; provider resolution, market data and analyst outputs are fakes. No protected fund, real runner, external provider/broker or LLM was contacted. |
+| Runner and lifecycle scenario | The real manager launches a guarded test child invoking `run_owned_runner` with fake data and analyst injection, one reviewed due session and a one-session bound. After a hash-bound approval, the child pauses before the fake fill while real CLI tick, web tick preview and a reviewed web archive are denied; no competing operation or paper-file effect appears. The runner then records one 500-share AAPL buy, consumes the approval once and leaves matching ledger and broker state. An additional barrier holds the runner reservation *after* the child publishes `completed`: archive still receives 409 `writer-conflict` and creates no operation. After release and process exit, the old review is stale; a fresh reviewed archive and restore succeed without starting a runner. |
+| Negative and adjacent state | `completed` is accepted for lifecycle only with its matching runner reservation held and `available` false; its actual state and control digests are bound into the review. Starting, running, stopping, failed, unknown, inconsistent available and unreserved completed states deny. A related deployment whose reservation was not acquired remains denied. Production write authority is unchanged and remains fail-closed. |
+
+- **Expected red:** at 2026-11-03 16:39:13–16:39:31 +01:00, the owned-runner
+  scenario failed after completing its fill because archive returned
+  `ownership-unknown` instead of allowing stale-review detection. The
+  lifecycle implementation had required exactly `stopped`, even after a
+  one-session runner exited as `completed`. The repair admits `completed`
+  only under its matching held reservation; it does not treat the terminal
+  record alone as quiescence. The initial corrected scenario passed at
+  16:39:43–16:40:07, **1 passed in 22.14 s**.
+- **Backend regression:** at 16:45:04–16:51:25 +01:00, the complete
+  writer-race and web-lifecycle files plus the selected owned-runner
+  stop/readiness/reattach/crash tests passed **52 tests in 378.98 s**, exit 0.
+  That run used the same production and lifecycle-test blobs above, but the
+  runner-race test blob was `93b82597204cd953199bc08c9cb788581ab2e902`:
+  afterward, its two file handshakes were made atomic to avoid observing
+  partially written sentinels. On final blob `1031cd93...`, the full
+  owned-runner scenario passed three independent repeats in **22.35, 21.72
+  and 20.16 s**, 16:51:45–16:52:55 +01:00, all exit 0.
+- **Frontend unit/fake tests:** an owned empty Vite env and disabled network
+  ran the full Vitest suite at 16:53:34–16:55:34 +01:00: **13 files, 215
+  tests passed in 108.78 s**, exit 0. The added component regression displays
+  the reviewed `completed` runner and requires explicit confirmation.
+- **Build and browser runtime:** the owned lifecycle browser harness ran
+  `tsc --noEmit` and a production Vite build, then exercised the real local API
+  at 16:55:47–16:57:24 +01:00: **1 Playwright test passed in 29.6 s**,
+  exit 0. The isolated three-file frontend artifact was 1,035,167 bytes,
+  SHA-256 `bbfbf686c1b100e976c5c9be0ed6c7592e82de93febc88ef48deb865c28dee14`;
+  Vite build took **31.24 s**. This browser case covers stale review, archive
+  and stopped restore, not the completed-runner race, which is covered by the
+  backend test and frontend fake test separately. The owned browser root was
+  cleaned; no production artifact was installed.
+- **Style:** Black at 420 characters, Flake8 at 420 characters, isort with the
+  Black profile at 420 for the two changed test files, configured isort
+  defaults for `services.py`, and `git diff --check` all passed. Forcing
+  420-character isort on `services.py` flags its pre-existing multiline import
+  layout; unrelated imports were not reformatted.
+- **Development failures:** early runner fixtures failed before readiness
+  because Windows' known-folder lookup rejected the overly long pytest child
+  HOME path (`WinError -2147024690`); using a shorter path within the same
+  marked synthetic test root fixed the fixture. The first Vitest fixture setup
+  had a PowerShell-to-Python quoting syntax error and ran no tests or created
+  a fixture; the here-string invocation above succeeded and cleaned its root.
+  These fixture failures are not production runtime passes.
+
+No current-source Linux/native exclusion, installed-artifact, full-suite or
+live-provider acceptance is claimed. The earlier broader backend attempt
+remains **434 passed / 1 failed**, not a pass; its child exited before a
+barrier for a cause not captured. The existing read-only preview is not this
+source artifact.

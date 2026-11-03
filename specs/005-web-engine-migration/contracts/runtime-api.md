@@ -99,6 +99,12 @@ valuation slices, source-tested):
 - A manual paper preview maps an occupied admission lane to 409 `writer-conflict` and unavailable
   ownership to `ownership-unknown`. A denial during lane acquisition starts no provider; if
   authority is lost later, earlier calls may already have occurred.
+- Lifecycle review accepts an owned runner's `completed` state only when that runner is
+  unavailable and the lifecycle operation holds its matching runner reservation as well as the
+  existing lifecycle lanes. A completed record published before reservation release remains
+  blocked; failed, unknown and unreserved related `completed` runners remain denied. Review binds
+  the actual terminal state and its record digests, so a change after review requires a fresh confirmation.
+  This does not grant production write authority.
 - Lifecycle, halt and verdict writes have no capacity pool.
 
 ## Resource and action matrix

@@ -98,6 +98,69 @@ def test_lifecycle_routes_require_session_origin_and_confirmation(demo_root):
         assert client.get(f"/api/lifecycle/archives/{archive_id}", headers=headers).json()["state"] == "archived"
 
 
+@pytest.mark.parametrize(
+    ("status", "available", "reservation_observed"),
+    [
+        ("starting", True, True),
+        ("running", True, True),
+        ("stopping", True, True),
+        ("failed", False, True),
+        ("unknown", False, True),
+        ("completed", True, True),
+        ("completed", False, False),
+    ],
+)
+def test_lifecycle_rejects_nonquiescent_or_unreserved_completed_runner(demo_root, monkeypatch, status, available, reservation_observed):
+    service = DeskService(demo_root, allow_writes=True, demo=True)
+    source = demo_root / "mandates" / "demo-quality.yaml"
+    before = source.read_bytes()
+    try:
+        monkeypatch.setattr(service, "_runner_state", lambda _name: {"status": status, "available": available})
+        if not reservation_observed:
+            original_held = service._admission.lane_is_held
+            monkeypatch.setattr(
+                service._admission,
+                "lane_is_held",
+                lambda lane, identity=None: False if lane == "runner" and identity == "demo-quality" else original_held(lane, identity),
+            )
+        with pytest.raises(ServiceError) as denied:
+            service.create_lifecycle_preview(
+                LifecyclePreviewRequest(action="archive", kind="template", identity="demo-quality"),
+                operator_session="operator-test",
+            )
+        assert denied.value.status_code == 409 and denied.value.code == "ownership-unknown"
+        assert source.read_bytes() == before
+        assert service.list_lifecycle_archives()["items"] == []
+    finally:
+        service.close()
+
+
+def test_lifecycle_does_not_infer_related_completed_runner_is_reserved(demo_root, monkeypatch):
+    from hedge_fund import paths
+    from hedge_fund.paper.deployed import deploy, load_deployed
+
+    service = DeskService(demo_root, allow_writes=True, demo=True)
+    alias = "related-quality"
+    try:
+        spec = load_deployed(demo_root / "paper" / "demo-quality").spec
+        with paths.bound_root(service.root_context):
+            with service._admission.deployment_lock(alias, timeout=0):
+                deploy(alias, spec, ["AAPL"], root=demo_root / "paper")
+        original_state = service._runner_state
+        monkeypatch.setattr(service, "_runner_state", lambda name: {"status": "completed", "available": False} if name == alias else original_state(name))
+        with pytest.raises(ServiceError) as denied:
+            service.create_lifecycle_preview(
+                LifecyclePreviewRequest(action="archive", kind="template", identity="demo-quality"),
+                operator_session="operator-test",
+            )
+        assert denied.value.status_code == 409 and denied.value.code == "ownership-unknown"
+        assert (demo_root / "mandates" / "demo-quality.yaml").is_file()
+        assert (demo_root / "paper" / alias / "fund.yaml").is_file()
+        assert service.list_lifecycle_archives()["items"] == []
+    finally:
+        service.close()
+
+
 def test_cli_archive_uses_reviewed_head_without_network_or_tui(demo_root, capsys, monkeypatch):
     def forbidden():
         raise AssertionError("lifecycle commands must bypass TUI/runtime dispatch loading")

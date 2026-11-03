@@ -733,6 +733,405 @@ result.write_text(outcome + "\\n" + output.getvalue(), encoding="utf-8")
         service.close()
 
 
+def test_owned_runner_executes_one_fake_fill_while_cli_web_and_archive_compete(tmp_path, owned_test_process, monkeypatch, request):
+    import subprocess
+    from datetime import datetime
+
+    from fastapi.testclient import TestClient
+
+    import hedge_fund.runtime.dispatch as dispatch_module
+    import hedge_fund.runtime.owned_runner as owned_runner
+    from hedge_fund.backtesting.test_fund import FakeAnalyst, FakeDataClient, SERIES
+    from hedge_fund.brokers.paper import PaperBroker
+    from hedge_fund.data.sessions import NEW_YORK
+    from hedge_fund.fund import Fund
+    from hedge_fund.paper import tick
+    from hedge_fund.web.app import create_app
+    from hedge_fund.web.demo import seed_demo
+    from hedge_fund.web.test_paper_operations import _wait_for_operation
+
+    root = seed_demo(Path(os.environ["HEDGE_FUND_TEST_ROOT"]) / "runner-race")
+    fund = "runner-fill"
+    ready = tmp_path / "runner-before-fill"
+    release = tmp_path / "runner-release"
+    terminal_ready = tmp_path / "runner-terminal"
+    terminal_release = tmp_path / "runner-terminal-release"
+    runner_error = tmp_path / "runner-error"
+    bootstrap_error = tmp_path / "runner-bootstrap-error"
+    cli_result = tmp_path / "runner-cli-result"
+    preview_calls = []
+
+    def fake_data_client():
+        preview_calls.append(True)
+        return nullcontext(FakeDataClient(SERIES))
+
+    original_resolve = dispatch_module.resolve_destination
+
+    def fake_public_ip(_host, _port):
+        return ["93.184.216.34"]
+
+    def fake_dns(host, port, *, local, resolver=None):
+        if host == "query1.finance.yahoo.com" and not local:
+            resolver = fake_public_ip
+        return original_resolve(host, port, local=local, resolver=resolver)
+
+    monkeypatch.setattr(dispatch_module, "resolve_destination", fake_dns)
+    runner_script = _render(
+        """
+import argparse, time, traceback
+from pathlib import Path
+from hedge_fund import paths
+from hedge_fund.backtesting.test_fund import FakeAnalyst, FakeDataClient, SERIES
+from hedge_fund.fund import Fund
+import hedge_fund.runtime.owned_runner_child as runner_child
+from hedge_fund.runtime.owned_runner_child import run_owned_runner
+from hedge_fund.runtime.policy import ProviderTarget
+from hedge_fund.runtime.root import RootContext
+
+ready, release, error = Path(READY), Path(RELEASE), Path(ERROR)
+terminal_ready, terminal_release = Path(FINISHED_WAIT), Path(FINISHED_GO)
+parser = argparse.ArgumentParser()
+parser.add_argument("--root", required=True)
+parser.add_argument("--fund", required=True)
+args = parser.parse_args()
+
+def signal(path, value):
+    pending = path.with_name(path.name + ".pending")
+    pending.write_text(value, encoding="utf-8")
+    pending.replace(path)
+
+class FixtureData(FakeDataClient):
+    def __init__(self, dispatch):
+        super().__init__(SERIES)
+        self.dispatch = dispatch
+        self.blocked = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return None
+
+    def get_prices(self, ticker, start, end, interval="day", interval_multiplier=1):
+        assert interval == "day" and interval_multiplier == 1
+        self.dispatch.authorize_transport(
+            ProviderTarget(kind="data", provider="yfinance"),
+            url="https://query1.finance.yahoo.com/mock",
+            method="GET",
+        )
+        if ticker == "AAPL" and not self.blocked:
+            self.blocked = True
+            signal(ready, "before-fill")
+            deadline = time.monotonic() + 90
+            while not release.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            if not release.exists():
+                raise TimeoutError("runner release missing")
+        return super().get_prices(ticker, start, end)
+
+def build_fund(spec, _capture, _root, _dispatch):
+    return Fund(spec, models={"solo": [FakeAnalyst("pead", {"AAPL": 1.0})]})
+
+original_write_status = runner_child._write_status
+def hold_terminal(root, fund, nonce_hash, status):
+    original_write_status(root, fund, nonce_hash, status)
+    if status["status"] == "completed":
+        signal(terminal_ready, "completed-held")
+        deadline = time.monotonic() + 90
+        while not terminal_release.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        if not terminal_release.exists():
+            raise TimeoutError("terminal release missing")
+runner_child._write_status = hold_terminal
+
+try:
+    with RootContext.open(args.root) as root, paths.bound_root(root):
+        run_owned_runner(
+            root,
+            args.fund,
+            data_client_factory=lambda _capture, _root, dispatch: FixtureData(dispatch),
+            build_fund=build_fund,
+            resolver=lambda _host, _port: ["93.184.216.34"],
+        )
+except BaseException:
+    error.write_text(traceback.format_exc(), encoding="utf-8")
+    raise
+""",
+        READY=str(ready),
+        RELEASE=str(release),
+        FINISHED_WAIT=str(terminal_ready),
+        FINISHED_GO=str(terminal_release),
+        ERROR=str(runner_error),
+    )
+    original_command = owned_runner._runner_command
+
+    def fake_runner_command(root_context, name):
+        command = original_command(root_context, name)
+        module = "hedge_fund.runtime.owned_runner_child"
+        if "-m" in command:
+            index = command.index("-m")
+            assert command[index + 1] == module
+            command[index] = "-c"
+            command[index + 1] = runner_script
+        else:
+            index = command.index("-c") + 1
+            marker = f"runpy.run_module({module!r},run_name='__main__')"
+            assert command[index].count(marker) == 1
+            command[index] = command[index].replace(marker, f"exec({runner_script!r})")
+        return command
+
+    monkeypatch.setattr(owned_runner, "_runner_command", fake_runner_command)
+    stderr_file = bootstrap_error.open("wb")
+    request.addfinalizer(stderr_file.close)
+    runner_processes = []
+
+    class CaptureRunnerSubprocess:
+        def __getattr__(self, name):
+            return getattr(subprocess, name)
+
+        def Popen(self, *args, **kwargs):
+            kwargs["stderr"] = stderr_file
+            process = subprocess.Popen(*args, **kwargs)
+            runner_processes.append(process)
+            return process
+
+    monkeypatch.setattr(owned_runner, "subprocess", CaptureRunnerSubprocess())
+    app = create_app(
+        root=root,
+        allow_writes=True,
+        network_enabled=True,
+        demo=True,
+        data_client_factory=fake_data_client,
+    )
+    service = app.state.service
+    request.addfinalizer(service.close)
+    spec = FundSpec(
+        schema_version=2,
+        name=fund,
+        strategies=[{"name": "solo", "models": [{"name": "pead"}], "blend": {"mode": "long_short"}}],
+        risk={"max_position_pct": 1.0, "max_gross_exposure": 1.0},
+        capital=100_000,
+        costs={"spread_bps": 0, "commission_per_share": 0},
+        approval_required=True,
+        rebalance="daily",
+    )
+
+    def build_fund(mandate):
+        return Fund(mandate, models={"solo": [FakeAnalyst("pead", {"AAPL": 1.0})]})
+
+    with paths.bound_root(service.root_context):
+        with service._admission.deployment_lock(fund, timeout=0):
+            directory = deploy(fund, spec, ["AAPL"], root=root / "paper")
+        with service._admission.manual_session(fund, timeout=0):
+            first = tick(
+                directory,
+                FakeDataClient(SERIES),
+                session="2024-06-03",
+                build_fund=build_fund,
+                now=lambda: datetime(2024, 6, 4, 12, tzinfo=NEW_YORK),
+            )
+    assert first.decision is not None
+    ledger = Ledger(directory)
+
+    cli_script = _render(
+        """
+import contextlib, io, traceback
+from pathlib import Path
+from hedge_fund import run
+
+result = Path(RESULT)
+original_load = run._load_runtime
+def deny_provider(*_args, **_kwargs):
+    raise AssertionError("denied CLI reached a provider")
+def load_fakes():
+    original_load()
+    run.make_data_client = deny_provider
+    run._cli_fund = deny_provider
+run._load_runtime = load_fakes
+output = io.StringIO()
+try:
+    with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+        try:
+            run.main(["--root", ROOT, "--enable-network", "paper", "tick", FUND])
+        except SystemExit as exc:
+            outcome = str(exc.code)
+        else:
+            outcome = "returned"
+except BaseException:
+    result.write_text(traceback.format_exc(), encoding="utf-8")
+    raise
+result.write_text(outcome + "\\n" + output.getvalue(), encoding="utf-8")
+""",
+        ROOT=str(root),
+        FUND=fund,
+        RESULT=str(cli_result),
+    )
+    try:
+        with TestClient(app, client=("127.0.0.1", 50000)) as client:
+            capabilities = client.get("/api/capabilities", headers={"host": "127.0.0.1"}).json()
+            headers = {
+                "host": "127.0.0.1",
+                "origin": "http://127.0.0.1",
+                "x-csrf-token": capabilities["mutation_token"],
+            }
+            settings = client.get("/api/settings", headers=headers).json()
+            configured = client.put(
+                "/api/settings",
+                headers=headers,
+                json={
+                    "data_provider": "yfinance",
+                    "model": "gemma3:4b",
+                    "endpoint": "http://127.0.0.1:11434",
+                    "timeout_seconds": 1.0,
+                    "parameters": {"max_tokens": 32},
+                    "expected_version": settings["version"],
+                },
+            )
+            assert configured.status_code == 200, configured.text
+            approved = client.post(
+                f"/api/paper/{fund}/approval",
+                headers=headers,
+                json={"verdict": "approve", "decision_as_of": first.decision.as_of, "source_record_hash": first.hash},
+            )
+            assert approved.status_code == 200, approved.text
+
+            archive = {"action": "archive", "kind": "deployment", "identity": fund}
+            response = client.post("/api/lifecycle/preview", headers=headers, json=archive)
+            assert response.status_code == 200, response.text
+            archive_preview = response.json()
+            archive_request = {
+                **archive,
+                "request_id": "running-fill-archive",
+                "preview_id": archive_preview["preview_id"],
+                "preview_digest": archive_preview["preview_digest"],
+                "confirmation_token": archive_preview["confirmation_token"],
+                "expected_head": archive_preview["expected_head"],
+            }
+            response = client.post(
+                f"/api/paper/{fund}/runner/preview",
+                headers=headers,
+                json={"expected_head": first.hash, "max_sessions": 1, "max_runtime_minutes": 2},
+            )
+            assert response.status_code == 201, response.text
+            preview = response.json()
+            assert preview["due_set"] == ["2024-06-04"]
+            accepted = client.post(
+                f"/api/paper/{fund}/runner",
+                headers=headers,
+                json={
+                    "request_id": "running-fill-start",
+                    "preview_id": preview["preview_id"],
+                    "preview_digest": preview["preview_digest"],
+                    "confirmation_token": preview["confirmation_token"],
+                    "expected_head": first.hash,
+                    "due_set": preview["due_set"],
+                    "max_sessions": 1,
+                    "max_runtime_minutes": 2,
+                },
+            )
+            assert accepted.status_code == 202, accepted.text
+            operation = _wait_for_operation(service, accepted.json()["operation_id"])
+            if operation["status"] != "completed":
+                raise AssertionError(f"{operation}\n{runner_error.read_text() if runner_error.exists() else ''}\n{bootstrap_error.read_text(errors='replace')}")
+            process_ref = service._runner_manager._processes[owned_runner.runner_key(fund)]
+            process = process_ref.process
+            assert _wait_file(ready, process, "runner pre-fill admission", timeout=60) == "before-fill"
+            assert service.runner_status(fund)["status"] == "running"
+            before_files = _paper_files(root, fund)
+            before_preview_calls = len(preview_calls)
+            contender = owned_test_process(cli_script)
+            denied_tick = client.post(f"/api/paper/{fund}/tick/preview", headers=headers, json={"expected_head": first.hash})
+            denied_archive = client.post("/api/lifecycle/accept", headers=headers, json=archive_request)
+            assert contender.wait(timeout=60) == 0, cli_result.read_text() if cli_result.exists() else "CLI contender failed"
+            output = cli_result.read_text(encoding="utf-8")
+            assert output.startswith("1\n") and "busy or unavailable" in output, output
+            assert denied_tick.status_code == 409 and denied_tick.json()["code"] == "writer-conflict", denied_tick.text
+            assert denied_archive.status_code == 409 and denied_archive.json()["code"] == "writer-conflict", denied_archive.text
+            assert client.get("/api/operations/by-request/running-fill-archive", headers=headers).status_code == 404
+            assert len(preview_calls) == before_preview_calls
+            assert _paper_files(root, fund) == before_files
+            assert _recorded_fills(root, fund) == []
+
+            release.write_text("release", encoding="utf-8")
+            assert _wait_file(terminal_ready, process, "completed runner still holding its reservation", timeout=60) == "completed-held"
+            assert service.runner_status(fund)["status"] == "completed"
+            blocked_terminal = client.post("/api/lifecycle/accept", headers=headers, json=archive_request)
+            assert blocked_terminal.status_code == 409 and blocked_terminal.json()["code"] == "writer-conflict", blocked_terminal.text
+            assert client.get("/api/operations/by-request/running-fill-archive", headers=headers).status_code == 404
+            terminal_release.write_text("release", encoding="utf-8")
+            assert process.wait(timeout=90) == 0, runner_error.read_text() if runner_error.exists() else "runner child failed"
+            status = service.runner_status(fund)
+            assert status["status"] == "completed" and status["sessions_completed"] == 1, status
+            assert ledger.sessions() == ["2024-06-03", "2024-06-04"]
+            recorded = ledger.read("2024-06-04")
+            assert recorded.executed is not None and len(recorded.executed.fills) == 1
+            fill = recorded.executed.fills[0]
+            assert (fill.ticker, fill.side, fill.quantity) == ("AAPL", "buy", 500)
+            assert len(_recorded_fills(root, fund)) == 1
+            assert [event["kind"] for event in ledger.events()] == ["tick", "approve", "consume", "tick"]
+            assert ledger.approval() is None
+            book = PaperBroker(directory / "broker.json")
+            assert book.cash() == pytest.approx(recorded.cash)
+            assert {ticker: position.shares for ticker, position in book.positions().items()} == recorded.positions
+            stale = client.post("/api/lifecycle/accept", headers=headers, json=archive_request)
+            assert stale.status_code == 409 and stale.json()["code"] == "stale-preview", stale.text
+            assert client.get("/api/operations/by-request/running-fill-archive", headers=headers).status_code == 404
+            refreshed = client.post("/api/lifecycle/preview", headers=headers, json=archive)
+            assert refreshed.status_code == 200, refreshed.text
+            refreshed = refreshed.json()
+            runner_review = refreshed["payload"]["runner_state"][fund]
+            assert runner_review["status"] == "completed" and runner_review["available"] is False
+            assert len(runner_review["state_digest"]) == len(runner_review["control_digest"]) == 64
+            archived = client.post(
+                "/api/lifecycle/accept",
+                headers=headers,
+                json={
+                    **archive,
+                    "request_id": "completed-fill-archive",
+                    "preview_id": refreshed["preview_id"],
+                    "preview_digest": refreshed["preview_digest"],
+                    "confirmation_token": refreshed["confirmation_token"],
+                    "expected_head": refreshed["expected_head"],
+                },
+            )
+            assert archived.status_code == 202 and archived.json()["status"] == "completed", archived.text
+            assert not directory.exists()
+            archive_id = archived.json()["result"]["archive_id"]
+            restore = {"action": "restore", "archive_id": archive_id}
+            restored_preview = client.post("/api/lifecycle/preview", headers=headers, json=restore)
+            assert restored_preview.status_code == 200, restored_preview.text
+            restored_preview = restored_preview.json()
+            restored = client.post(
+                "/api/lifecycle/accept",
+                headers=headers,
+                json={
+                    **restore,
+                    "request_id": "completed-fill-restore",
+                    "preview_id": restored_preview["preview_id"],
+                    "preview_digest": restored_preview["preview_digest"],
+                    "confirmation_token": restored_preview["confirmation_token"],
+                    "expected_head": restored_preview["expected_head"],
+                },
+            )
+            assert restored.status_code == 202 and restored.json()["status"] == "completed", restored.text
+            assert Ledger(directory).sessions() == ["2024-06-03", "2024-06-04"]
+            assert len(_recorded_fills(root, fund)) == 1
+            assert service.runner_status(fund)["status"] == "completed"
+            assert len(preview_calls) == before_preview_calls
+    finally:
+        release.write_text("release", encoding="utf-8")
+        terminal_release.write_text("release", encoding="utf-8")
+        for process in runner_processes:
+            if process.poll() is not None:
+                continue
+            try:
+                process.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                process.terminate()
+                process.wait(timeout=15)
+        service.close()
+
+
 def test_web_verdict_and_halt_remain_responsive_during_cross_process_research_saturation(tmp_path, owned_test_process):
     from fastapi.testclient import TestClient
 

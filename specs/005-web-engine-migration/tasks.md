@@ -15,8 +15,10 @@ T020, T021, T023, T024, T025, T026, T027 and T028, only T023, T025, T026
 and T028 are checked. T015/T021 still lack proven production out-of-band
 exclusion; T024's foundation prerequisites remain open. T027 now includes an
 actual fake-data paper fill under competing CLI/web admission, an executed redo
-while archive admission competes, and saturated-control races. Its foundation
-prerequisite and a real owned-runner due-session/fill race remain open.
+while archive admission competes, saturated-control races, and an owned runner
+executing one due-session fill while CLI/web/archive competitors are denied.
+The runner's completed status is also reviewed for lifecycle only with its
+reservation held. Its foundation prerequisite and broader acceptance remain open.
 T019 has a synchronous valuation
 `budget-exhausted` emitter with no retry/reset hint; older statements below
 that there is no emitter predate that change. Bounded polling is an allowed

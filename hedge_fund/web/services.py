@@ -2249,9 +2249,11 @@ class DeskService:
         for related in sorted(related_subjects):
             self._guard_protected(related)
             runner = self._runner_state(related)
-            if runner.get("status") != "stopped":
-                raise ServiceError(409, "Lifecycle requires a verified stopped runner.", code="ownership-unknown")
-            observed = {"status": "stopped", "available": False}
+            runner_status = runner.get("status")
+            completed_and_reserved = runner_status == "completed" and runner.get("available") is False and self._admission.lane_is_held("runner", related)
+            if runner_status != "stopped" and not completed_and_reserved:
+                raise ServiceError(409, "Lifecycle requires a verified quiescent runner.", code="ownership-unknown")
+            observed = {"status": runner_status, "available": False}
             for filename in ("state", "control"):
                 relative = f"{RUNNER_ROOT}/{runner_key(related)}/{filename}.json"
                 try:

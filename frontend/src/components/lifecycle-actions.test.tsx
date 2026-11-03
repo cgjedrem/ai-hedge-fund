@@ -42,6 +42,27 @@ it("reviews exact scope and references before single-use archive acceptance", as
   }));
 });
 
+it("shows a completed runner in the review before explicit archive confirmation", async () => {
+  vi.mocked(apiPost).mockResolvedValue({
+    ...preview,
+    payload: {
+      ...preview.payload,
+      kind: "deployment",
+      source_path: "paper/synthetic",
+      runner_state: { synthetic: { status: "completed", available: false, state_digest: "e".repeat(64), control_digest: "f".repeat(64) } },
+    },
+  });
+  render(<LifecycleActions kind="deployment" identity="synthetic" onComplete={refresh} />);
+  fireEvent.click(screen.getByRole("button", { name: "Review archive" }));
+  expect(await screen.findByText(/"status": "completed"/)).toBeVisible();
+  expect(apiPost).toHaveBeenCalledTimes(1);
+  expect(refresh).not.toHaveBeenCalled();
+  vi.mocked(apiPost).mockResolvedValue({ status: "completed" });
+  fireEvent.click(screen.getByRole("button", { name: "Confirm archive" }));
+  await waitFor(() => expect(refresh).toHaveBeenCalledOnce());
+  expect(apiPost).toHaveBeenLastCalledWith("/api/lifecycle/accept", expect.objectContaining({ expected_head: preview.expected_head }));
+});
+
 it("invalidates stale confirmation and never repeats an uncertain effect automatically", async () => {
   render(<LifecycleActions kind="research" identity="synthetic-2026.json" onComplete={refresh} />);
   fireEvent.click(screen.getByRole("button", { name: "Review archive" }));
