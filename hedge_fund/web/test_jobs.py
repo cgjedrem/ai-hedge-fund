@@ -1951,3 +1951,147 @@ def test_submit_that_cannot_read_its_accepted_record_strands_it_for_reclaim(dura
         assert registry._stranded == set()
     finally:
         registry.close()
+
+
+def _orphan_backtest_from_crashed_process(root_path):
+    """Durably accept a backtest that no worker in any live process will run."""
+    with RootContext.open(root_path) as root_context, RootOwnerLease.acquire(root_context, timeout=5.0) as lease:
+        store = OperationStore(root_context, admission=AdmissionCoordinator(root_context, owner_lease=lease))
+        capture = freeze_capture(
+            root=root_context,
+            subject_id="alpha",
+            mandate_digest="a" * 64,
+            universe=("AAA",),
+            broker="paper",
+            settings=resolve_settings(root_context),
+            credential_versions={},
+            code_version="crashed-process",
+        )
+        now = datetime.now(timezone.utc)
+        preview = store.create_preview(
+            action="backtest",
+            subject_id="alpha",
+            expected_head="head-1",
+            due_set=(),
+            capture=capture,
+            operator_session="crashed-operator",
+            payload={"mode": "synthetic"},
+            now=now,
+            expires_at=now + timedelta(minutes=1),
+        )
+        orphan = store.accept_request(
+            request_id="crashed-process-request",
+            action=preview.action,
+            subject_id=preview.subject_id,
+            preview_id=preview.preview_id,
+            preview_digest=preview.digest,
+            confirmation_token=preview.confirmation_token,
+            operator_session="crashed-operator",
+            expected_head=preview.expected_head,
+            due_set=preview.due_set,
+            payload=preview.payload,
+            now=now,
+        )
+        return orphan.operation_id, capture.capture_id, orphan.fence_generation
+
+
+def _capacity_backtest_app(demo_root, data_client):
+    return create_app(
+        root=demo_root,
+        allow_writes=True,
+        network_enabled=True,
+        demo=True,
+        data_client_factory=lambda: data_client,
+        fund_factory=lambda spec: Fund(spec, models={"earnings-drift": [FakeAnalyst("pead", {"AAPL": 1.0})]}),
+    )
+
+
+def _review_and_accept_backtest(client, demo_root, request_id):
+    headers = _write_headers(client)
+    settings = client.get("/api/settings", headers={"host": "127.0.0.1"}).json()
+    local_model = next(model_id for _, model_id, provider in load_api_models() if provider == "Ollama" and not model_id.endswith(":cloud"))
+    if settings["model"] != local_model:
+        assert client.post("/api/settings/model", headers=headers, json={"model": local_model, "expected_version": settings["version"]}).status_code == 200
+    payload = {
+        "fund": "demo-quality",
+        "universe": ["AAPL"],
+        "start": "2024-06-03",
+        "end": "2024-06-07",
+        "provider": "yfinance",
+        "model": local_model,
+        "mandate_hash": _mandate_fingerprint(demo_root),
+    }
+    preview = client.post(
+        "/api/operations/preview",
+        headers=headers,
+        json={"action": "backtest", "subject_id": "demo-quality", "expected_head": payload["mandate_hash"], "payload": payload},
+    )
+    assert preview.status_code == 201, preview.text
+    preview = preview.json()
+    return client.post(
+        "/api/operations",
+        headers=headers,
+        json={
+            "request_id": request_id,
+            "action": "backtest",
+            "subject_id": "demo-quality",
+            "preview_id": preview["preview_id"],
+            "preview_digest": preview["preview_digest"],
+            "confirmation_token": preview["confirmation_token"],
+            "expected_head": payload["mandate_hash"],
+            "due_set": [],
+            "payload": payload,
+        },
+    )
+
+
+def test_orphaned_capacity_is_reconciled_only_by_verified_startup_recovery(demo_root):
+    data_client = ManagedFakeDataClient(SERIES)
+    first_app = _capacity_backtest_app(demo_root, data_client)
+    try:
+        with TestClient(first_app, client=("127.0.0.1", 50000)) as client:
+            orphan_id, _capture_id, orphan_fence = _orphan_backtest_from_crashed_process(demo_root)
+            # A live server never frees capacity just because the owning process is gone.
+            denied = _review_and_accept_backtest(client, demo_root, "before-restart")
+            assert first_app.state.service._operation_store.get_operation(orphan_id).status is OperationStatus.ACCEPTED
+    finally:
+        first_app.state.service.close()
+    assert denied.status_code == 429, denied.text
+    assert denied.json()["code"] == "capacity-denied"
+
+    restarted = _capacity_backtest_app(demo_root, data_client)
+    store = restarted.state.service._operation_store
+    try:
+        recovered = store.get_operation(orphan_id)
+        assert recovered.status is OperationStatus.INTERRUPTED
+        assert recovered.fence_generation == orphan_fence + 1
+        with TestClient(restarted, client=("127.0.0.1", 50000)) as client:
+            assert client.get("/api/capabilities", headers={"host": "127.0.0.1"}).json()["writes"] is True
+            accepted = _review_and_accept_backtest(client, demo_root, "after-restart")
+            assert accepted.status_code == 202, accepted.text
+            _wait_for_operation(store, accepted.json()["operation_id"], OperationStatus.COMPLETED)
+    finally:
+        restarted.state.service.close()
+
+
+def test_startup_recovery_fails_closed_when_an_orphan_capture_cannot_be_verified(demo_root):
+    orphan_id, capture_id, _orphan_fence = _orphan_backtest_from_crashed_process(demo_root)
+    with RootContext.open(demo_root) as root_context:
+        capture_path = root_context.path / Path(f"{operations_module.CAPTURE_ROOT}/{capture_id}.json")
+    original = capture_path.read_bytes()
+    capture_path.write_bytes(original + b" ")
+
+    app = create_app(root=demo_root, allow_writes=True, demo=True)
+    try:
+        service = app.state.service
+        assert service.allow_writes is False
+        assert service.write_unavailable_reason == "operation-recovery-unavailable"
+        assert service._operation_store is None
+    finally:
+        app.state.service.close()
+
+    capture_path.write_bytes(original)
+    with RootContext.open(demo_root) as root_context:
+        reader = OperationStore(root_context, admission=AdmissionCoordinator(root_context))
+        # Recovery refused to rewrite or free anything: the record still holds its slot.
+        assert reader.get_operation(orphan_id).status is OperationStatus.ACCEPTED

@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 import {
   isolatedEnvironment,
   fingerprintDirectory,
+  playwrightArguments,
   preflightEnvironment,
   runOwnedProcess,
 } from "../e2e/run-owned.mjs";
@@ -154,6 +155,24 @@ test("explicit report acceptance uses a preseeded read-only server instead of de
   assert.equal(env.AIHF_REPORT_PARITY_FIXTURE, "clamped");
   assert.doesNotMatch(env.AIHF_WEB_SERVER_COMMAND, /--demo|--allow-writes|--enable-network/);
   assert.match(env.AIHF_WEB_SERVER_COMMAND, /--port 8876/);
+});
+
+test("capacity acceptance alone enables network capability and only runs its own spec", () => {
+  const general = isolatedEnvironment({ AIHF_WEB_CAPACITY_ACCEPTANCE: "1" }, "C:\\Python\\python.exe");
+  assert.equal(general.AIHF_WEB_CAPACITY_ACCEPTANCE, "0");
+  assert.doesNotMatch(general.AIHF_WEB_SERVER_COMMAND, /--enable-network/);
+
+  const env = isolatedEnvironment({}, "C:\\Python\\python.exe", false, true);
+  assert.equal(env.AIHF_WEB_CAPACITY_ACCEPTANCE, "1");
+  assert.equal(env.HEDGE_FUND_TEST_MODE, "1");
+  assert.match(env.AIHF_WEB_SERVER_COMMAND, /--demo .*--allow-writes --enable-network$/);
+  assert.throws(() => isolatedEnvironment({}, "C:\\Python\\python.exe", true, true), /runs alone/);
+
+  assert.deepEqual(playwrightArguments(["--capacity"], true), ["e2e/capacity.spec.ts"]);
+  assert.deepEqual(playwrightArguments(["--capacity", "e2e/capacity.spec.ts"], true), ["e2e/capacity.spec.ts"]);
+  assert.throws(() => playwrightArguments(["--capacity", "e2e/desk.spec.ts"], true), /only runs the capacity spec/);
+  assert.throws(() => playwrightArguments(["--grep", "desk"], true), /only runs the capacity spec/);
+  assert.deepEqual(playwrightArguments(["--lifecycle", "e2e/desk.spec.ts"], false), ["e2e/desk.spec.ts"]);
 });
 
 test("artifact fingerprint binds sorted relative paths and bytes", () => {

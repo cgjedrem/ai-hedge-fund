@@ -34,8 +34,13 @@ const expectedScreenshotDir = resolve(
 const expectedDemoRelative = relative(testRoot, demoRoot);
 const marker = resolve(testRoot, ".test-owned");
 const reportAcceptance = process.env.AIHF_REPORT_PARITY_FIXTURE === "clamped";
-if (reportAcceptance && process.env.AIHF_WEB_LIFECYCLE_ACCEPTANCE === "1") {
+const lifecycleAcceptance = process.env.AIHF_WEB_LIFECYCLE_ACCEPTANCE === "1";
+const capacityAcceptance = process.env.AIHF_WEB_CAPACITY_ACCEPTANCE === "1";
+if (reportAcceptance && lifecycleAcceptance) {
   throw new Error("Report acceptance cannot enable lifecycle writes.");
+}
+if (capacityAcceptance && (reportAcceptance || lifecycleAcceptance)) {
+  throw new Error("Capacity acceptance runs alone in its own owned fixture.");
 }
 const expectedServerCommand = [
   shellQuote(python),
@@ -43,7 +48,8 @@ const expectedServerCommand = [
   ...(reportAcceptance ? [] : ["--demo"]),
   `--port ${port}`,
   `--root ${shellQuote(demoRoot)}`,
-  ...(process.env.AIHF_WEB_LIFECYCLE_ACCEPTANCE === "1" ? ["--allow-writes"] : []),
+  ...(lifecycleAcceptance || capacityAcceptance ? ["--allow-writes"] : []),
+  ...(capacityAcceptance ? ["--enable-network"] : []),
 ].join(" ");
 
 if (dirname(testRoot) !== resolve(repositoryRoot, "outputs")) {
@@ -75,6 +81,7 @@ if (!serverCommand || serverCommand !== expectedServerCommand) {
 
 export default defineConfig({
   testDir: "./e2e",
+  ...(capacityAcceptance ? { testMatch: "capacity.spec.ts" } : {}),
   fullyParallel: false,
   forbidOnly: true,
   retries: 0,

@@ -1059,3 +1059,59 @@ No other session process, checkout, preview or the worktree itself was removed.
 - Records orphaned by a crashed other process hold capacity until server-start recovery (fail-closed). `Retry-After` is advisory.
 - The capacity 429 is proven at the HTTP/app level, not browser-driven: demo work cannot be held deterministically without a production hook.
 - No observation stream/channel (polling only). Full Python suite, wheel/container, Linux and cross-browser evidence not run for this slice.
+
+## T019 / T020 capacity integration onto PR8 head (2026-11-04)
+
+**Status: integrated bounded slice; T019/T020 remain unchecked (PARTIAL). Migration remains incomplete, NOT READY TO MERGE.**
+
+### Integration
+
+- Remote `cgjedrem-vigilant-robot` verified at `16369e9ee93801a2ef7abcd3b02604f1c3b12866` before integration; merge-base with the
+  reviewed local commit `13edce3` was `5f3f909`. `git cherry-pick 13edce3` applied with **no conflicts** (19 files) as `bb9aeb3`;
+  original commits preserved. Report/session/settings features from `16369e9` are untouched; the shared operation identity/table
+  was not changed or duplicated (capacity counts the existing registry records).
+- Budget decision: no production 429 `budget-exhausted` emitter. `DispatchBudget` is a per-operation reservation taken after
+  acceptance with no cumulative cap or reset window, so no truthful per-operation cap or `Retry-After` exists; fail closed by not
+  inventing one.
+- Source/test identity of the integrated change vs `16369e9` (sorted repo-relative paths, NUL, staged blob bytes, NUL; `specs/`
+  excluded): **`6af98a2d2ebe625b60d56e747e9e58f8e7d243362af2670458ff4f5585268141`**, **20 paths / 733,262 bytes**.
+
+### Added in the integration
+
+- `test_jobs.py`: a record durably accepted by a separate (crashed) store holds the backtest pool on a live server (429
+  `capacity-denied`, record stays `accepted`); only a restart's verified recovery interrupts it (fence +1), after which writes are
+  enabled and a new acceptance completes. A corrupted orphan capture sidecar makes startup recovery fail closed (writes disabled,
+  `operation-recovery-unavailable`, operation store absent) and leaves the record `accepted`. Process absence never frees capacity.
+- `hedge_fund\test_support\capacity_holder.py` (test-only): holds/releases one durable backtest slot from a second process; refuses
+  unless `HEDGE_FUND_TEST_MODE=1` and the root is inside the marked owned test root; release only interrupts its own holder record.
+- `frontend/e2e/capacity.spec.ts` + owned `--capacity` mode (`run-owned.mjs`, `playwright.config.ts`): runs alone with
+  `--demo --allow-writes --enable-network` (capability only; the test-child guard still refuses all non-loopback sockets) and only
+  this spec. Real API, no `page.route` fakes. Holds the slot from the holder process, drives one browser Accept to 429 with
+  `Retry-After: 30` and `retry_after_seconds: 30`, verifies "Nothing was accepted or started" guidance, exactly one mutation POST,
+  by-request lookup 404 and released pending identity; then reloads onto the held operation, goes offline, releases the hold,
+  reconnects via "Inspect status" (read-only GET) and observes `interrupted` with no new mutation and no external request.
+  Browser-level server restart is not driven (fixed harness web server); restart recovery is proven at TestClient level.
+
+### Results (Windows/NTFS, Python 3.13 Poetry env under `outputs\`, synthetic roots, dotenv off, credential/proxy env scrubbed)
+
+- Pytest `runtime\test_operations.py`, `web\test_jobs.py`, `web\test_app.py`, `web\test_paper_operations.py`, `web\test_reports.py`,
+  `web\test_settings_provenance.py` (`-x`): **185 passed in 1132.59 s**. `web\test_main.py` + `web\test_actions.py` + the two new
+  orphan tests: **50 passed, 1 failed in 622.42 s**; the failure `test_actions.py::test_web_halt_does_not_wait_for_fund_work_lock`
+  fails identically at unmodified `16369e9` (pre-existing, outside this slice). New orphan tests alone: **2 passed**.
+- Frontend `vitest run src`: **9 files, 122 passed**; `tsc --noEmit` passed; `npm run test:e2e-safety`: **9 passed**; the harness
+  build (vite) passed. ESLint has no repository config (not a gate). Python black/isort/flake8 (line 420): no new findings
+  (`runtime\test_operations.py` black drift pre-exists at `16369e9` and `5f3f909`).
+- Owned Playwright (port 8876, Chromium): `--capacity` **1 passed (1.0 m)**; default **11 passed, 3 failed, 6 skipped**;
+  `--reports` **11 passed, 3 failed, 6 skipped**; `--lifecycle` **10 passed, 7 failed, 1 skipped, 2 did not run**. Comparison on a
+  temporary detached `16369e9` checkout (removed afterwards): default desk spec **9 passed, 3 failed** (same three: manual tick
+  running, runner stop, backtest running); `--lifecycle` **10 passed, 7 failed, 2 did not run** with the identical failing set
+  (lifecycle, stale lifecycle review, operation receipts, report clamps JSON, the same three desk tests). These are pre-existing;
+  lifecycle denials surfaced as `writer-conflict` or `reconciliation-required` depending on run. The earlier unreproduced
+  "9 pass / 6 fail / 2 not-run" claim is superseded by these counts and is not a pass.
+
+### Open (keeps T019/T020 unchecked)
+
+- No production 429 `budget-exhausted` emitter (by decision above). No observation stream/channel (bounded polling only).
+- Crashed-process orphans hold capacity until verified server-start recovery; no live reclamation. `Retry-After` is advisory.
+- Browser server-restart observation, the pre-existing desk/lifecycle browser failures, full Python suite, Linux, wheel/container
+  and cross-browser evidence remain open.

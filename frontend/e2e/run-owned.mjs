@@ -25,8 +25,14 @@ const outputRoot = resolve(repositoryRoot, "outputs");
 const port = 8876;
 const lifecycleAcceptance = process.argv.includes("--lifecycle");
 const reportAcceptance = process.argv.includes("--reports");
+// Capacity acceptance needs the network-gated operation endpoints; the test child guard still denies non-loopback.
+const capacityAcceptance = process.argv.includes("--capacity");
+const capacitySpec = "e2e/capacity.spec.ts";
 if (lifecycleAcceptance && reportAcceptance) {
   throw new Error("Report acceptance is read-only and cannot enable lifecycle writes.");
+}
+if (capacityAcceptance && (lifecycleAcceptance || reportAcceptance)) {
+  throw new Error("Capacity acceptance runs alone in its own owned fixture.");
 }
 const rootName = `spec005-test-e2e-${process.pid}-${randomUUID().slice(0, 8)}`;
 const testRoot = resolve(outputRoot, rootName);
@@ -122,9 +128,12 @@ let activeChild;
 let activeChildUsesGroup = false;
 let interrupted = false;
 
-export function isolatedEnvironment(source, python, reports = reportAcceptance) {
+export function isolatedEnvironment(source, python, reports = reportAcceptance, capacity = capacityAcceptance) {
   if (reports && lifecycleAcceptance) {
     throw new Error("Report acceptance cannot enable lifecycle writes.");
+  }
+  if (capacity && (reports || lifecycleAcceptance)) {
+    throw new Error("Capacity acceptance runs alone in its own owned fixture.");
   }
   const env = { ...source };
   for (const name of Object.keys(env)) {
@@ -185,6 +194,7 @@ export function isolatedEnvironment(source, python, reports = reportAcceptance) 
   env.AIHF_PLAYWRIGHT_SCREENSHOT_DIR = screenshotDir;
   env.AIHF_E2E_PYTHON = python;
   env.AIHF_WEB_LIFECYCLE_ACCEPTANCE = lifecycleAcceptance ? "1" : "0";
+  env.AIHF_WEB_CAPACITY_ACCEPTANCE = capacity ? "1" : "0";
   env.AIHF_REPORT_PARITY_FIXTURE = reports ? "clamped" : "empty";
   env.AIHF_WEB_SERVER_COMMAND = [
     shellQuote(python),
@@ -192,7 +202,8 @@ export function isolatedEnvironment(source, python, reports = reportAcceptance) 
     ...(reports ? [] : ["--demo"]),
     `--port ${port}`,
     `--root ${shellQuote(demoRoot)}`,
-    ...(lifecycleAcceptance ? ["--allow-writes"] : []),
+    ...(lifecycleAcceptance || capacity ? ["--allow-writes"] : []),
+    ...(capacity ? ["--enable-network"] : []),
   ].join(" ");
   env.AIHF_VITE_ENV_DIR = join(testRoot, "vite-env");
   env.PLAYWRIGHT_BROWSERS_PATH = join(testRoot, "playwright-browsers");
@@ -513,6 +524,16 @@ async function runFrontendBuild(env) {
   return 0;
 }
 
+export function playwrightArguments(argv, capacity = capacityAcceptance) {
+  const args = argv.filter((arg) => !["--lifecycle", "--reports", "--capacity"].includes(arg));
+  if (!capacity) return args;
+  // A network-capable server must never run the general specs.
+  if (args.some((arg) => arg !== capacitySpec)) {
+    throw new Error("Capacity acceptance only runs the capacity spec.");
+  }
+  return [capacitySpec];
+}
+
 function runPlaywright(env, args) {
   const cli = resolve(frontendRoot, "node_modules", "@playwright", "test", "cli.js");
   if (!existsSync(cli)) {
@@ -587,7 +608,7 @@ async function main() {
         reportBefore = prepareReportFixture(python, env);
       }
       serverStarted = true;
-      runnerResult = await runPlaywright(env, process.argv.slice(2).filter((arg) => arg !== "--lifecycle" && arg !== "--reports"));
+      runnerResult = await runPlaywright(env, playwrightArguments(process.argv.slice(2)));
       if (runnerResult.code !== 0) failure = true;
       if (interrupted) failure = true;
       if (!(await waitForPortRelease())) {
