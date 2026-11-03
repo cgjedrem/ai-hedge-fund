@@ -1354,3 +1354,72 @@ new and changed test files. Pre-existing non-black files were not reformatted.
 Post-rebase verification (onto `042cfbc`, isolated temp HOME/USERPROFILE/TEMP, dotenv off, provider/proxy/token env removed, no network or ports): a combined suite of 21 files (writer map/matrix/unlink, inventory cache race, write authority, lifecycle, handover, admission, operations, paper tick/ledger/deployed broker/runner, account binding, research, fund storage, web services/actions/jobs/paper operations and `test_run.py`) gave **787 passed, 7 skipped, 0 failed, 1 deselected** (pre-existing `test_second_process_can_join_shared_root_participants`) in 31 min 18 s. Writer map after the rebase: **109 passed**. Full pytest was not rerun after the rebase. T021 stays PARTIAL.
 
 Second rebase onto `9c5f491` (`bf541c5`/`9c5f491` touched only frontend e2e, `test_support\network_guard.py`, `test_acceptance_isolation.py` and this file; no production writer changed): evidence-doc conflict only. Writer map + race matrix + unlink + acceptance isolation: **203 passed** in 2 min 16 s.
+
+## T021 admission slice: A3 exclusion gate, writer inventory and admission race matrix (2026-11-03, PARTIAL)
+
+Status: PARTIAL. T021, T015, T019 and T020 stay unchecked. This slice complements the writer map above. Base: PR #8 head `14e1793`. Environment: synthetic `outputs/spec005-test-*` roots, isolated home, dotenv off, and provider/proxy variables scrubbed. Only fake providers were used, with no network, brokers or runners, and ports 8765/49292 were not touched.
+
+### A3 decision (conservative)
+
+Cooperative registry and OS locks do **not** prove that unaware or out-of-band writers from the same account are excluded.
+
+- `runtime/exclusion.py` defines `out_of_band_exclusion_basis`. The only basis it recognises is `SYNTHETIC_TEST_OWNED`, which requires all of:
+  - `HEDGE_FUND_TEST_MODE=1`;
+  - a root strictly inside `<checkout>/outputs/spec005-test-*`;
+  - a `.test-owned` marker;
+  - no reparse points.
+- `handover.write_authority` requires a basis. Every production root therefore reports `ownership-unknown` / `out-of-band-exclusion-unproven` and is read-only.
+- Production mutation stays disabled until there is explicit proof of OS sandbox, account or ACL isolation.
+
+### Changes
+
+- **Hidden bypass removed.** Unconfigured `paths.write_bytes` and `write_atomic` calls that land under an enrolled root are now routed through that root's admission (`paths._write_in_root`), including through alias/junction parents. They no longer fall back to a raw write.
+- **Raw mkdirs replaced.** The raw mkdirs in `PaperBroker.create`, `save_credential` and the owned-runner child were replaced, so the stale writer-map entries were removed.
+- **Demo disabled outside the harness.** `aihf-web --demo` now fails closed outside the test harness with `DEMO_SEEDING_UNAVAILABLE`.
+- **Synthetic enrollment guarded.** The shipped helper `test_support.enroll_synthetic_root` refuses to run unless the basis is `SYNTHETIC_TEST_OWNED`.
+- **Writer inventory.** `runtime/test_writer_inventory.py` is an AST ratchet that classifies every production write site by admission class (`test_support/` is included). It now also classifies upstream's `PaperInventoryTransition`, ledger/deploy effects and POSIX unlink.
+- **Admission race matrix.** `runtime/test_writer_admission_race_matrix.py` covers:
+  - same-object contention with crash/cooperative release and retry;
+  - independent-object progress;
+  - a registry snapshot taken during an in-flight commit;
+  - an authority flip while a lane is held (legacy alias, runner);
+  - authority lost while waiting for the OS lock;
+  - a production root being read-only;
+  - the synthetic-basis binding;
+  - unconfigured, alias and unusual-state routing;
+  - Saxo lock rejection.
+- **Upstream SIM-custody denial.** After the rebase, upstream's `14e1793` refuses unverified SIM custody before the write-authority check runs. The A3 binding test accepts either denial; its invariant (no custody call, no binding) is unchanged.
+
+### Results (candidate `a5d6706`)
+
+| Run | Result |
+| --- | --- |
+| Writer inventory + writer map | 109 passed |
+| 16 affected files (both matrices, inventory, map, account binding, handover, inventory cache race, lifecycle x2, root unlink, write authority x2, paper tick, web main/app/paper operations), pre-rebase onto `14e1793` | 560 passed |
+| Overlap set after rebase (ratchets, matrices, account binding + guards, write authority, `test_run.py`, deployed broker, tick) | 487 passed, 1 failed (stale message match, fixed), then `test_account_binding.py` 71 passed |
+| **Full pytest `hedge_fund`**, clean detached worktree, nothing concurrent | **2391 passed, 51 skipped, 0 failed** in 2412 s; log SHA-256 `9b2dc30b466d54f7e0883802bda165e3d8be514a597dec151960565d0b720015` |
+
+Earlier full-suite counts belong to superseded SHAs and are not evidence for this one. A previous full run at superseded `20f4df7` hit one intermittent failure: `web/test_paper_operations.py::test_owned_runner_readiness_timeout_fails_closed_and_stops_child`, raising `ProcessIdentityError` "command line unavailable" at launch. It passed 5/5 in isolation and did not recur here. It is recorded as an unexplained flake in the T142 launch path.
+
+### Reviews
+
+- Independent read-only QA review of the rebased slice. It found no admission bypass and no A3 breach.
+- Its findings were:
+  - the demo crash outside test mode (fixed);
+  - the unguarded shipped synthetic-enrollment helper (fixed);
+  - no production-mode entry-point tests (a demo fail-closed test was added);
+  - `write_runner_record` has no per-write authority recheck. This is unreachable in production under A3 and left open.
+
+### Open (keeps T021 unchecked)
+
+- **No production exclusion basis.** All production mutation is disabled, which is fail-closed and intentional.
+- **Matrix scope.** The matrix exercises the shared admission primitives and paper lanes, not a per-domain race for every writer.
+- **Ratchet blind spots.** The inventory does not see `os.fdopen` or an aliased `os.replace` (the writer map does scan `os.fdopen`).
+- **Unchecked locations.** `write_runner_record` has no per-write recheck, and the location of `AccountRegistry.initialize` is not checked.
+- **Upstream residuals from the writer-map section still apply:**
+  - the `events.jsonl` append;
+  - no durable rewind intent;
+  - the unjournaled mandate rename;
+  - the POSIX unlink fence;
+  - the Saxo lock and credential file.
+- **Historical demo smoke.** The 2026-11-01 wheel demo smoke predates A3. The demo now requires the test harness.
