@@ -1154,3 +1154,17 @@ No other session process, checkout, preview or the worktree itself was removed.
   `operation-coordination.spec.ts:137` (paper-tick two-tab lock); it did not reproduce in four subsequent head runs
   (2x isolated 12/12, full suite) nor 2x isolated on base -- recorded as an intermittent, unexplained flake, not a pass.
   Recorded 2026-11-03T02:38:56.7068875+01:00.
+
+  ### Third remote advance (incorporated by rebase)
+
+- The remote advanced again `b36da71` -> `c2d56a4` (`5e7b15e` T145 bounded restart-required, `2abf68f` T142 partial owned-runner
+  reattachment, `c2d56a4` T142 evidence). Rebased; the only conflict was this file (both appended sections kept, upstream first).
+  Semantic check: T142 reattachment and T145 runner summaries read **completed** `paper-runner-start` operations, while capacity
+  counts only **unfinished** records, and server-start operation recovery is unchanged, so neither feature alters capacity accounting.
+- Integrated identity vs `c2d56a4` (same method, `specs/` excluded): **`c096dff3ce1e1c9c88ae0e1c61cae9c9f3103a461fd4b66619090d27b894bd80`**, **20 paths / 762,535 bytes**.
+- Fresh reruns: pytest `runtime\test_operations.py`, `runtime\test_owned_runner.py`, `runtime\test_handover.py`,
+  `web\test_settings_provenance.py`, `web\test_paper_operations.py`, `web\test_app.py`, `web\test_main.py`, `web\test_jobs.py`
+  **229 passed in 716.30 s**; Vitest **12 files, 184 passed**; `npm run build` passed; harness unit **9 passed**; owned `--capacity`
+  **1 passed (21.9 s)**; owned default **22 passed, 4 failed, 6 skipped**, identical failing set on an unmodified temporary
+  `c2d56a4` checkout (**22 passed, 4 failed, 5 skipped**). Black: only the pre-existing `test_operations.py` drift (also fails at
+  `c2d56a4`); isort clean. Recorded 2026-11-03T02:53:59.9072361+01:00.
