@@ -1,6 +1,111 @@
 # Bounded read-only session-report parity evidence
 
-## Scope and provenance
+## Current integration on the reviewed T145 PR8 tip
+
+The independently approved report commit
+`5441dcd314c946d941d791bd1983809fa582cf27` is a direct child of
+`5f3f909c4f9151d531b571dd37bdebe368ee127c`. It was replayed with
+`git cherry-pick --no-commit` on the isolated integration branch
+`cgjedrem-report-slice-integration`, whose starting HEAD was
+`07f6d8bdb2540db38d113eb62c9993a0736e1c19`. GitHub PR8's head and
+`origin/cgjedrem-vigilant-robot` were independently checked against that starting SHA
+before replay; the remote was still equal at the subsequent validation check.
+
+The report replay had **no textual conflicts and no source-resolution edits**. Git auto-merged
+`frontend\src\App.test.tsx`, `frontend\src\lib\types.ts` and
+`hedge_fund\web\services.py`. The report additions remain separate from T145's
+stored/effective/active configuration, endpoint redaction, frozen credential retention
+and stale-save behavior. The settings-only implementation and regression files are
+unchanged from the integration base. Eight non-overlapping report runtime/test files
+were also checked against the exact approved child blobs and are identical.
+
+During the first independent integration review, PR8 advanced to
+`16369e9ee93801a2ef7abcd3b02604f1c3b12866`, a parallel publication of this same report
+slice on `07f6d8b`. Comparing that published tree with this checkout's initial-reviewed
+tree found differences only in `report-parity-evidence.md` and `tasks.md`; all runtime/test
+source and the API contract were identical. To avoid duplicate runtime publication, only
+this checkout's branch was advanced using `git rebase --autostash` onto `16369e9`.
+Reapplying its owned documentation produced an add/add conflict in this evidence file and
+a content conflict in `tasks.md`. Both were resolved with `apply_patch`, retaining the
+parallel publication receipt below and this checkout's fresh results. No runtime/test
+source changed. The resulting follow-up commit is documentation-only.
+
+Only this checkout and its own branch were edited; neither the original report child nor
+the settings worktree/shared local branch was opened, switched, reset or changed.
+This checkout's follow-up publication occurs only after both integration reviews pass and a fresh
+remote ancestry check permits an ordinary fast-forward push. Review outcomes and the
+exact committed/publication SHA are retained in the final handoff; this receipt does not
+itself claim GitHub approval or merge authorization.
+
+### Integrated runtime/test source receipt
+
+The same eleven-path normalization defined in the historical source receipt below now
+produces:
+`b807fef3063cb6960e62c6072d8a75c4370586c10eb7b4f156da586c6b6cb9a0`.
+Unchanged inherited T145 source is bound by the integration base above. The following
+fresh checks all used this combined source, rather than relying on the older child results.
+Timestamps are UTC; execution was Windows with Python 3.13.7 and Node v22.13.1.
+
+| Check | Start | End | Result |
+|---|---|---|---|
+| Combined report/API/service/settings/capture/credentials/console pytest | 2026-11-02T23:57:16.778Z | 2026-11-03T00:02:41.064Z | 151 passed |
+| Full integrated Vitest source suite | 2026-11-03T00:00:34.723Z | 2026-11-03T00:01:39.317Z | 119 passed, 9 files |
+| Owned real synthetic report API/Playwright plus TypeScript/build | 2026-11-03T00:00:34.719Z | 2026-11-03T00:01:39.144Z | 2 browser tests passed; tsc/build passed |
+| Owned-browser Node safety suite | 2026-11-02T23:54:49.326Z | 2026-11-02T23:54:51.866Z | 8 passed |
+| Black check on touched Python files | 2026-11-02T23:54:49.306Z | 2026-11-02T23:54:53.450Z | 3 files unchanged |
+| Isort check on touched Python files | 2026-11-02T23:54:53.969Z | 2026-11-02T23:54:55.420Z | passed |
+| Full configured Flake8 on touched Python files | 2026-11-02T23:54:55.921Z | 2026-11-02T23:54:59.949Z | passed |
+
+The pytest selectors were `hedge_fund\web\test_reports.py`, `test_app.py`,
+`test_services.py`, `test_settings.py`, `test_settings_provenance.py`,
+`hedge_fund\runtime\test_capture.py`, `test_credentials.py` and
+`hedge_fund\reporting\test_console.py`. Frontend and style selectors are unchanged from
+the reproducible commands below. `git diff --check` passed.
+
+The owned browser started server PID 55236 on 127.0.0.1:8876, awaited real API readiness,
+performed GET-only report observations and canonical download assertions, and released the
+port before its fixture was removed. Its complete fixture-tree SHA-256 was
+`bec13dd484db97b4c072e6e10a419ea28711870de52551349eddbd81b5e0842f`
+before and after browser reads. The production artifact SHA-256 was
+`94ed54b9c4df269e99879b2849e73f4bb3c00b1db3f0bc6e2fb7b596647673fc`
+(three files, 1,025,450 bytes). Vite retained its existing nonfatal >500 kB chunk warning.
+
+Fresh screenshot SHA-256 values, with copies retained in the integration session:
+
+| Screenshot | SHA-256 |
+|---|---|
+| `report-clamps-desktop.png` | `e9fe5c90e1883cd909b07adcaa94c0c8cfe12571a316c46fe167a89b08c01c78` |
+| `report-clamps-mobile.png` | `65d467ef2296b63690a2801a8d4adea07df88367e1cd7a9e397194f8719fb922` |
+
+### Integration environment and failure disposition
+
+The existing complete standalone cached virtualenv was used read-only; no other checkout's
+interpreter was used or modified. The initial frontend command identified missing local
+dependencies. `npm ci --offline --ignore-scripts --no-audit --no-fund` restored 311 packages
+from the local cache with separate synthetic user/global config files and unchanged
+manifests/lockfiles. Its first preparation attempt reused one npm config path for both
+scopes and was rejected; separate empty config files resolved that wrapper-only error.
+
+The first combined pytest attempt reported 12 failed, 108 passed and 31 setup errors:
+the session wrapper supplied `--basetemp` under its outer synthetic root, while repository
+`conftest.py` correctly created a different guarded test root. Demo seeding and the child-home
+assertion rejected that mismatch. Removing the wrapper override lets the existing conftest
+own TEMP/pytest fixtures; the identical source then passed all 151 tests. No production
+code, test assertion, root-admission check or isolation guard was weakened to obtain green.
+Both initial attempts are retained as rejected evidence, not acceptance results.
+
+All checks scrubbed provider/credential/proxy and runtime-override environment variables,
+used synthetic HOME/TEMP, disabled dotenv and explicitly proved nonloopback resolver denial
+before execution. No real fund, provider, paid service, LLM, broker, runner, watchtower or
+umbrella process was invoked. Protected 8765/49292 ports and unrelated processes were
+neither contacted nor stopped. Every wrapper/browser fixture was owned and cleaned.
+
+Spec005 remains **20/148** complete. T145 remains partial and unchecked; all
+T111/T112/T113/T119/T122/T146 report tasks remain unchecked. Broader migration and the
+settings slice's remaining CLI/TUI persisted-setting and launch-override wiring acceptance
+are not completed by this integration. PR8 remains partial and not ready to merge.
+
+## Historical child scope and provenance
 
 This slice is based on published PR8 source
 `5f3f909c4f9151d531b571dd37bdebe368ee127c`, verified against GitHub and the remote head
@@ -57,7 +162,7 @@ before and after browser reads. The owned server PID was 10916; the runner relea
 and removed its owned fixture before exiting successfully. No creator 8765 or old 49292
 preview was contacted or stopped.
 
-## Final runtime/test source receipt
+## Historical child runtime/test source receipt
 
 Normalized source SHA-256:
 `903fb19d5f1d03ce04b5f721a573d15475b876d7b4c22d8bcb5d1ce48ac479e7`.
@@ -118,7 +223,7 @@ Final desktop/mobile screenshots are retained in the isolated worktree's
 | `report-clamps-desktop.png` | `e9fe5c90e1883cd909b07adcaa94c0c8cfe12571a316c46fe167a89b08c01c78` |
 | `report-clamps-mobile.png` | `5ab5f8bd59a54bc3ff08aca1a755e660c8ad9089f9a2bb29c11fce73f059ffe9` |
 
-## Independent review and failure disposition
+## Historical child independent review and failure disposition
 
 The initial read-only `code-review` was blocked by two Important findings:
 
@@ -144,9 +249,12 @@ This is static approval, not independently rerun test evidence, GitHub approval,
 authorization, or permission to publish to another child's branch. Initial/final review
 reports and exact final check logs are retained as session evidence.
 
-## Integration onto the T145 settings-provenance head
+## Parallel published integration receipt (`16369e9`)
 
-The sections above are pre-T145 evidence for original commit
+This section preserves the separate integration receipt published in
+`16369e9ee93801a2ef7abcd3b02604f1c3b12866`; its 106-test selection, dependency restoration,
+browser PID and timing-failure observation belong to that parallel checkout, not this one.
+The historical child sections above are pre-T145 evidence for original commit
 `5441dcd314c946d941d791bd1983809fa582cf27` (child of `5f3f909`) and are not inherited as
 integration acceptance. The slice was re-applied as a new child of PR8 head
 `07f6d8bdb2540db38d113eb62c9993a0736e1c19` (settings configuration provenance, T145

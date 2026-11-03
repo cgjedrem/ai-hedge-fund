@@ -39,6 +39,8 @@ API/React/owned-browser/review evidence is in `report-parity-evidence.md`, inclu
 separate rerun evidence after integration onto the T145 settings-provenance head. No report task
 or story checkbox is completed by this slice; research drilldowns/scorecards, full book/tape
 parity, headless export acceptance and the remaining platform criteria are still open.
+Integration preserves T145's independently reviewed settings-provenance contribution as
+partial and unchecked; the report slice does not complete its remaining acceptance.
 PR8's focused review repairs also cover synced approval consumption and
 cooperating-control races. Incomplete consumption is checked across ledger
 head changes, and inherited enrolled or standalone admission is denied after
