@@ -32,7 +32,8 @@ from __future__ import annotations
 import json
 import os
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -122,6 +123,16 @@ class Ledger:
             )
         except AdmissionError as exc:
             raise LedgerError(f"{self.directory}: paper write admission denied: {exc}") from exc
+
+    def _transition_effect(self, effect: Callable[[], object]) -> None:
+        """Run one enrolled root effect, failing closed as a ledger error."""
+        from hedge_fund.runtime.handover import HandoverError
+        from hedge_fund.runtime.root import RootPathError
+
+        try:
+            effect()
+        except (HandoverError, RootPathError) as exc:
+            raise LedgerError(f"{self.directory}: paper write effect denied: {exc}") from exc
 
     def _read_transition_state(self, path: Path, label: str) -> dict | None:
         try:
@@ -272,10 +283,18 @@ class Ledger:
 
     def init(self) -> None:
         """Create an empty ledger with the kill switch off."""
-        self._require_write_lanes(_DEPLOYMENT_LANES)
+        enrolled = self._require_write_lanes(_DEPLOYMENT_LANES)
         from hedge_fund.runtime.admission import paper_halt_transition
+        from hedge_fund.runtime.root import RootPathError
 
-        self.records_dir.mkdir(parents=True, exist_ok=True)
+        if enrolled:
+            try:
+                with self._enrolled_root(_DEPLOYMENT_LANES, self.records_dir) as (root, relative):
+                    root.mkdir(relative, parents=False)
+            except RootPathError as exc:
+                raise LedgerError(f"{self.directory}: ledger directory is unsafe: {exc}") from exc
+        else:
+            self.records_dir.mkdir(parents=True, exist_ok=True)
         with paper_halt_transition(self.directory, self.directory.name):
             if not self.control_path.exists():
                 write_atomic(self.control_path, json.dumps({"halted": False}, indent=2))
@@ -348,6 +367,10 @@ class Ledger:
                         "session_count": previous["session_count"] + 1,
                     }
                 )
+                relative = path.relative_to(self.directory)
+                self._transition_effect(lambda: transition.mkdir(relative.parent))
+                self._transition_effect(lambda: transition.write_text(relative, record.model_dump_json(indent=2)))
+                return path
             path.parent.mkdir(parents=True, exist_ok=True)
             write_atomic(path, record.model_dump_json(indent=2))
             return path
@@ -379,14 +402,25 @@ class Ledger:
                     }
                 )
             keep = self.records_dir / SUPERSEDED_SUBDIR
-            keep.mkdir(exist_ok=True)
             safe = latest.session.replace(":", "")
             name = f"{safe}.{latest.hash[:12]}"
+            if transition is not None:
+                keep_relative = keep.relative_to(self.directory)
+                self._transition_effect(lambda: transition.mkdir(keep_relative, parents=False))
+            else:
+                keep.mkdir(exist_ok=True)
             target = keep / f"{name}.json"
             if target.exists():
                 target = keep / f"{name}.{uuid4().hex}.json"
-            self.path(latest.session).rename(target)
             checkpoint = self.checkpoint_path(session_date(latest.session))
+            if transition is not None:
+                source = self.path(latest.session).relative_to(self.directory)
+                destination = target.relative_to(self.directory)
+                self._transition_effect(lambda: transition.rename_file(source, destination))
+                checkpoint_relative = checkpoint.relative_to(self.directory)
+                self._transition_effect(lambda: transition.unlink_file(checkpoint_relative, missing_ok=True))
+                return latest
+            self.path(latest.session).rename(target)
             if checkpoint.exists():
                 checkpoint.unlink()
             return latest
@@ -947,16 +981,38 @@ class Ledger:
 
             with paper_control_transition(self.directory, self.directory.name):
                 return self._clear_approval(expected)
-        return self._clear_approval(expected)
+        return self._clear_approval(expected, enrolled=True)
 
-    def _clear_approval(self, expected: dict[str, str] | None) -> bool:
+    def _unlink_enrolled(self, path: Path) -> None:
+        """Recheck the control lane, then unlink without following reparse points."""
+        with self._enrolled_root((("control",),), path) as (root, relative):
+            root.unlink_file(relative)
+
+    @contextmanager
+    def _enrolled_root(self, lane_sets: tuple[tuple[str, ...], ...], path: Path) -> Iterator[tuple[object, str]]:
+        """Recheck lanes and authority, then expose one root-relative no-follow target."""
+        from hedge_fund.runtime.root import RootContext
+
+        if not self._require_write_lanes(lane_sets):
+            raise LedgerError(f"{self.directory.name}: enrolled admission changed")
+        directory = Path(os.path.abspath(self.directory))
+        relative = path.relative_to(self.directory).as_posix()
+        with RootContext.open(directory.parent.parent) as root:
+            yield root, f"{directory.parent.name}/{directory.name}/{relative}"
+
+    def _clear_approval(self, expected: dict[str, str] | None, *, enrolled: bool = False) -> bool:
+        from hedge_fund.runtime.root import RootPathError
+
         if expected is not None and self.approval() != expected:
             return False
         try:
-            self.approval_path.unlink()
+            if enrolled:
+                self._unlink_enrolled(self.approval_path)
+            else:
+                self.approval_path.unlink()
         except FileNotFoundError:
             return False
-        except OSError as exc:
+        except (OSError, RootPathError) as exc:
             fields = {}
             if expected is not None:
                 fields = {
@@ -976,6 +1032,7 @@ class Ledger:
 
         with paper_audit_transition(self.directory, self.directory.name, halt_event=halt_event):
             line = json.dumps({"time": _now(), "kind": kind, **fields}, default=str)
+            self._require_write_lanes(_HALT_LANES if halt_event else _CONTROL_LANES)
             with self.events_path.open("a", encoding="utf-8") as handle:
                 handle.write(line + "\n")
                 if durable:

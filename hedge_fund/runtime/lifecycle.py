@@ -518,6 +518,7 @@ class LifecycleArchiveStore:
         return digest.hexdigest()
 
     def _move(self, kind: str, source: str, destination: str) -> None:
+        self._admission.require_root_owner()
         if kind == "deployment":
             self._root.rename_directory(source, destination)
         else:
@@ -580,6 +581,7 @@ class LifecycleArchiveStore:
         return index
 
     def _write_index(self, index: dict[str, Any]) -> None:
+        self._admission.require_root_owner()
         self._root.mkdir(ARCHIVE_ROOT, parents=True, mode=0o700)
         raw = json.dumps(index, sort_keys=True, separators=(",", ":")).encode("utf-8")
         if len(raw) > _MAX_INDEX_BYTES:

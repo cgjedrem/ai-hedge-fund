@@ -174,6 +174,43 @@ calls): enrolled-root writes in `paths.py`, `backtesting/research.py`, `fund/sto
 `require_paper_write_lanes` or `root_registry_writer`; TUI wipe always denies via
 `paper_write_denial`; the legacy paper runner entrypoint is disabled. This is a static audit
 plus the tests above, not the T021 exhaustive interleaving matrix.
+T021 source-based writer map (supersedes the grep audit as the inventory, still partial):
+`hedge_fund\runtime\test_writer_map.py` AST-scans every non-test production module for raw
+write primitives (`write_text`/`write_bytes`/`open` write modes/`mkdir`/`rename`/`replace`/
+`unlink`/`remove`/`rmtree`/`write_atomic` and the root `rename_file`/`rename_directory`/
+`unlink_file` primitives). Each `(module, qualname, primitive)` is mapped to its seam
+(root no-follow, paper inventory transition, bound-root `write_atomic`, paths helper,
+unenrolled legacy branch, denied entrypoint, primitive, bootstrap or residual), an evidence
+level (`race`, `denial`, `primitive`, `none`) and existing test nodes. The test fails on
+unmapped or stale callsites and on missing test nodes, and pins the residual set.
+Deterministic barrier tests in `hedge_fund\runtime\test_writer_race_matrix.py` cover an
+authority flip (legacy home alias or `runner.pid`) inside paper append/rewind/deploy/
+approval-clear/audit transitions, between successive deploy effects, after a completed rewind effect, after a lifecycle
+journal and before a lifecycle head transition, and between web mandate rename and write.
+They also cover a junction/link swap of `ledger/superseded`, the ledger directory or the
+approval parent mid-transaction, same-fund `WriterConflict` while a transaction is paused,
+independent-fund progress, and crash after the rewind rename followed by restart.
+Fixes from these tests: paper ledger/deploy effects on enrolled roots go through
+`PaperInventoryTransition` effect methods or the new no-follow `RootContext.unlink_file`,
+which recheck write authority immediately before each effect. Ledger-head records are
+published only after a final authority recheck. Lifecycle `_move`/`_write_index` recheck
+root ownership. The web mandate update returns 409, naming the partial state when authority
+changes after the rename. A failed emergency Halt after a failed redo raises
+`PaperReconciliationRequired` chained to the original error.
+Cooperative protocol writers are serialized with OS locks; authority and inventory are
+revalidated at defined effect/publication boundaries; supported no-follow primitives
+prevent reparse traversal. Same-account out-of-band writers are not fenced, and mutations
+completed before detected authority loss may require reconciliation.
+Residuals named by the map (open):
+- the raw `events.jsonl` append follows links (detected by drift, not prevented);
+- `paths.write_atomic` falls back to raw `os.replace` when no root is bound, which still
+  applies to enrolled control/redo/checkpoint/approval files reached by an unbound caller;
+- there is no durable rewind intent, so a crash after the rename leaves root-wide drift
+  that blocks every fund until offline reconciliation;
+- the mandate rename+rewrite is not journaled;
+- the POSIX `lstat`→`unlinkat` delete is not identity-fenced;
+- Saxo token refresh locks and explicit credential files live outside root admission;
+- demo/bootstrap directory creation precedes enrollment.
 Residual (open): arbitrary same-account out-of-band writers that target a protocol-native
 root by explicit path are detected by inventory/head drift (→ read-only), not prevented.
 Whether drift detection on a legacy-unaddressable root satisfies A3's "inability to exclude"

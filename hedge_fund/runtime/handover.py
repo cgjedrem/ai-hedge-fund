@@ -928,10 +928,59 @@ def verify_cache_write_inventory(root: RootContext, admission: AdmissionCoordina
 class PaperInventoryTransition:
     """Exact enrolled head before and after one admitted paper mutation."""
 
-    def __init__(self, key: str, previous_entry: dict[str, Any] | None) -> None:
+    def __init__(
+        self,
+        key: str,
+        previous_entry: dict[str, Any] | None,
+        *,
+        root: RootContext | None = None,
+        base: tuple[str, ...] = (),
+    ) -> None:
         self._key = key
         self._previous_entry = dict(previous_entry) if previous_entry is not None else None
         self._expected_entry: dict[str, Any] | None = None
+        self._root = root
+        self._base = tuple(base)
+
+    def _effect_root(self, relative: str | os.PathLike[str]) -> tuple[RootContext, str]:
+        """Recheck authority immediately before one no-follow root effect."""
+        if self._root is None:
+            raise HandoverError("paper transition has no admitted root")
+        require_write_authority(self._root)
+        parts = Path(os.fspath(relative)).parts
+        if not parts or any(part in {"", ".", ".."} for part in parts) or Path(os.fspath(relative)).is_absolute():
+            raise RootPathError("paper transition effect must be fund-relative")
+        return self._root, "/".join(self._base + parts)
+
+    def mkdir(self, relative: str | os.PathLike[str], *, parents: bool = True, ensure_base: bool = False) -> None:
+        root, target = self._effect_root(relative)
+        if ensure_base and self._base:
+            root.mkdir("/".join(self._base), parents=True)
+        root.mkdir(target, parents=parents)
+
+    def write_text(self, relative: str | os.PathLike[str], text: str) -> None:
+        # Preserve the native newline bytes of the legacy text writer.
+        root, target = self._effect_root(relative)
+        root.write_bytes(target, text.replace("\n", os.linesep).encode("utf-8"))
+
+    def write_bytes(self, relative: str | os.PathLike[str], data: bytes) -> None:
+        root, target = self._effect_root(relative)
+        root.write_bytes(target, data)
+
+    def rename_file(self, source: str | os.PathLike[str], destination: str | os.PathLike[str]) -> None:
+        root, target = self._effect_root(destination)
+        _, origin = self._effect_root(source)
+        root.rename_file(origin, target)
+
+    def unlink_file(self, relative: str | os.PathLike[str], *, missing_ok: bool = False) -> bool:
+        root, target = self._effect_root(relative)
+        try:
+            root.unlink_file(target)
+        except FileNotFoundError:
+            if missing_ok:
+                return False
+            raise
+        return True
 
     @property
     def previous_entry(self) -> dict[str, Any] | None:
@@ -1006,7 +1055,12 @@ def paper_inventory_transition(
             with admission.registry_lock(timeout=MAX_LOCK_WAIT_SECONDS):
                 record, actual_before = _verify_paper_transition_inventory(root, admission, name)
                 key = _resource_key(name)
-                transition = PaperInventoryTransition(key, record["heads"].get(key))
+                transition = PaperInventoryTransition(
+                    key,
+                    record["heads"].get(key),
+                    root=root,
+                    base=(candidate.name,) if paper_root else (candidate.parent.name, candidate.name),
+                )
                 yield transition
                 try:
                     _publish_expected_ledger_head(
@@ -1052,6 +1106,7 @@ def _publish_expected_ledger_head(
         attestation=record["attestation"],
         created_at=record["created_at"],
     )
+    require_write_authority(root)
     _write_record(root, updated)
 
 
@@ -1080,6 +1135,7 @@ def record_ledger_head(
                 attestation=record["attestation"],
                 created_at=record["created_at"],
             )
+            require_write_authority(root)
             _write_record(root, updated)
     except AdmissionError as exc:
         raise HandoverError("ledger head inventory update is unavailable") from exc
@@ -1130,6 +1186,7 @@ def transition_ledger_inventory(
             attestation=record["attestation"],
             created_at=record["created_at"],
         )
+        require_write_authority(root)
         _write_record(root, updated)
     except (AdmissionError, OSError, RootPathError) as exc:
         raise HandoverError("ledger lifecycle transition is unavailable") from exc

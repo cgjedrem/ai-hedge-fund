@@ -578,6 +578,16 @@ class RootContext:
         self.revalidate()
         return self.path.joinpath(*destination_parts)
 
+    def unlink_file(self, relative: str | os.PathLike[str]) -> None:
+        """Remove one regular file without following reparse components."""
+        parts = _relative_parts(relative)
+        self.revalidate()
+        if os.name == "nt":
+            _windows_unlink_relative(self._handles[-1], parts)
+        else:
+            _posix_unlink_relative(self._fd, parts)
+        self.revalidate()
+
     def mkdir(
         self,
         relative: str | os.PathLike[str],
@@ -769,6 +779,17 @@ def _posix_rename_relative(
         if destination_parent is not None:
             os.close(destination_parent)
         os.close(source_parent)
+
+
+def _posix_unlink_relative(root_fd: int, parts: tuple[str, ...]) -> None:
+    parent = _posix_parent_fd(root_fd, parts[:-1])
+    try:
+        info = os.stat(parts[-1], dir_fd=parent, follow_symlinks=False)
+        if not stat.S_ISREG(info.st_mode):
+            raise RootPathError("root unlink target is not a regular file")
+        os.unlink(parts[-1], dir_fd=parent)
+    finally:
+        os.close(parent)
 
 
 def _posix_secure_private_directory(
@@ -1517,6 +1538,26 @@ def _windows_rename_relative(
             _close_windows_handles((destination_owned,))
         if source_owned is not None:
             _close_windows_handles((source_owned,))
+
+
+def _windows_unlink_relative(root_handle: int, parts: tuple[str, ...]) -> None:
+    parent, owned = _windows_open_parent(root_handle, parts[:-1])
+    handle = None
+    try:
+        handle = _nt_open_child(
+            parent,
+            parts[-1],
+            directory=False,
+            access=0x00010000 | 0x00000080 | 0x00100000,
+            share_delete=True,
+        )
+        _validate_windows_handle(handle, directory=False)
+        _windows_delete_handle(handle)
+    finally:
+        if handle is not None:
+            _close_windows_handles((handle,))
+        if owned is not None:
+            _close_windows_handles((owned,))
 
 
 def _windows_mkdir_relative(

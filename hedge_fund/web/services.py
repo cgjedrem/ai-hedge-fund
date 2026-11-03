@@ -560,6 +560,7 @@ class DeskService:
                     )
                     target_relative = f"mandates/{target}.yaml"
                     if relative.casefold() != target_relative.casefold():
+                        self._recheck_mandate_authority()
                         try:
                             self.root_context.rename_file(relative, target_relative)
                         except FileExistsError:
@@ -574,6 +575,7 @@ class DeskService:
                             ) from None
                     relative = target_relative
                 serialized = yaml.safe_dump(spec.model_dump(), sort_keys=False).encode("utf-8")
+                self._recheck_mandate_authority(renamed=relative != path.relative_to(self.root).as_posix())
                 try:
                     self.root_context.write_bytes(relative, serialized)
                 except (OSError, RootPathError, ValueError):
@@ -3503,6 +3505,15 @@ class DeskService:
             yield
         finally:
             lane.__exit__(None, None, None)
+
+    def _recheck_mandate_authority(self, *, renamed: bool = False) -> None:
+        """Deny the next mandate effect when root ownership or write authority changed."""
+        try:
+            self._admission.require_root_owner()
+        except (AdmissionError, OSError, RootPathError):
+            if renamed:
+                raise ServiceError(409, "Mandate writer authority changed after rename; the renamed file keeps its previous contents and needs reconciliation.") from None
+            raise ServiceError(409, "Mandate writer authority changed; nothing was written.") from None
 
     def _assert_mandate_name_available(
         self,

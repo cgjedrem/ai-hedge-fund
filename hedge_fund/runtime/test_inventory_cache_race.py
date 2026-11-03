@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from pathlib import Path
 from threading import current_thread, Event, Thread
 
 import pytest
@@ -101,13 +102,25 @@ def _record(spec: FundSpec) -> SessionRecord:
     return record
 
 
+def _after_record_write(monkeypatch, action):
+    """Run ``action(path)`` after an enrolled ledger record effect writes its bytes."""
+    from hedge_fund.runtime.handover import PaperInventoryTransition
+
+    original = PaperInventoryTransition.write_text
+
+    def write_then_act(self, relative, text):
+        original(self, relative, text)
+        action(Path(self._root.path, *self._base, relative))
+
+    monkeypatch.setattr(PaperInventoryTransition, "write_text", write_then_act)
+
+
 @pytest.mark.parametrize("kind", ["data", "prompt", "root-status", "head-check"])
 def test_cache_waits_for_another_funds_append_and_head_publication(
     enrolled_funds,
     monkeypatch,
     kind,
 ):
-    from hedge_fund.paper import ledger as ledger_module
     from hedge_fund.runtime import admission as admission_module
 
     root, admission = enrolled_funds
@@ -120,17 +133,15 @@ def test_cache_waits_for_another_funds_append_and_head_publication(
     cache_finished = Event()
     failures = []
     lock_held = []
-    original_write = ledger_module.write_atomic
 
-    def pause_after_append(path, text, **kwargs):
-        original_write(path, text, **kwargs)
+    def pause_after_append(path):
         if path == ledger.path(record.session):
             lock_held.append(admission.lane_is_held("registry"))
             written.set()
             if not release.wait(timeout=10):
                 raise TimeoutError("test did not release ledger publication")
 
-    monkeypatch.setattr(ledger_module, "write_atomic", pause_after_append)
+    _after_record_write(monkeypatch, pause_after_append)
 
     def append_alpha():
         try:
@@ -749,7 +760,6 @@ def test_tampered_prepared_sibling_is_not_accepted_before_head_publication(
     enrolled_funds,
     monkeypatch,
 ):
-    from hedge_fund.paper import ledger as ledger_module
     from hedge_fund.runtime.lifecycle import LifecycleArchiveStore
 
     root, admission = enrolled_funds
@@ -771,14 +781,12 @@ def test_tampered_prepared_sibling_is_not_accepted_before_head_publication(
     ledger = Ledger(root.path / "paper" / "beta")
     record = _record(_spec("beta"))
     prior = require_enrollment(root)["heads"]["beta"]
-    original_write = ledger_module.write_atomic
 
-    def damage_archive_after_append(path, text, **kwargs):
-        original_write(path, text, **kwargs)
+    def damage_archive_after_append(path):
         if path == ledger.path(record.session):
             archived_fund.write_bytes(archived_fund.read_bytes() + b"\n")
 
-    monkeypatch.setattr(ledger_module, "write_atomic", damage_archive_after_append)
+    _after_record_write(monkeypatch, damage_archive_after_append)
     with admission.manual_session("beta"):
         with pytest.raises(LedgerHeadPublicationError):
             ledger.append(record)
@@ -962,7 +970,6 @@ def test_approval_waiting_for_sibling_publication_does_not_block_halt(
     from hedge_fund.backtesting.test_fund import FakeAnalyst, FakeDataClient, SERIES
     from hedge_fund.data.sessions import NEW_YORK
     from hedge_fund.fund import Fund
-    from hedge_fund.paper import ledger as ledger_module
     from hedge_fund.runtime import admission as admission_module
     from hedge_fund.web.schemas import ApprovalRequest
     from hedge_fund.web.services import DeskService, ServiceError
@@ -987,16 +994,14 @@ def test_approval_waiting_for_sibling_publication_does_not_block_halt(
     release = Event()
     failures = []
     vote_result = []
-    original_write = ledger_module.write_atomic
 
-    def pause_publication(path, text, **kwargs):
-        original_write(path, text, **kwargs)
+    def pause_publication(path):
         if path == ledger.path(record.session):
             written.set()
             if not release.wait(timeout=10):
                 raise TimeoutError("test did not release publication")
 
-    monkeypatch.setattr(ledger_module, "write_atomic", pause_publication)
+    _after_record_write(monkeypatch, pause_publication)
 
     def publish():
         try:
@@ -1325,7 +1330,6 @@ def test_failed_final_halt_check_does_not_commit_a_verdict(enrolled_funds, monke
 def test_cli_halt_succeeds_while_sibling_head_publication_is_inflight(enrolled_funds, monkeypatch):
     import subprocess
 
-    from hedge_fund.paper import ledger as ledger_module
     from hedge_fund.test_support.network_guard import (
         child_test_environment,
         guarded_test_python_command,
@@ -1337,16 +1341,14 @@ def test_cli_halt_succeeds_while_sibling_head_publication_is_inflight(enrolled_f
     written = Event()
     release = Event()
     failures = []
-    original_write = ledger_module.write_atomic
 
-    def pause_publication(path, text, **kwargs):
-        original_write(path, text, **kwargs)
+    def pause_publication(path):
         if path == ledger.path(record.session):
             written.set()
             if not release.wait(timeout=15):
                 raise TimeoutError("test did not release publication")
 
-    monkeypatch.setattr(ledger_module, "write_atomic", pause_publication)
+    _after_record_write(monkeypatch, pause_publication)
 
     def publish():
         try:
@@ -1507,21 +1509,18 @@ def test_external_target_drift_during_append_is_not_published(
     enrolled_funds,
     monkeypatch,
 ):
-    from hedge_fund.paper import ledger as ledger_module
 
     root, admission = enrolled_funds
     ledger = Ledger(root.path / "paper" / "alpha")
     record = _record(_spec("alpha"))
     fund_file = root.path / "paper" / "alpha" / "fund.yaml"
     original_digest = require_enrollment(root)["heads"]["alpha"]["deployment_digest"]
-    write = ledger_module.write_atomic
 
-    def append_then_tamper(path, text, **kwargs):
-        write(path, text, **kwargs)
+    def append_then_tamper(path):
         if path == ledger.path(record.session):
             fund_file.write_bytes(fund_file.read_bytes() + b"\n")
 
-    monkeypatch.setattr(ledger_module, "write_atomic", append_then_tamper)
+    _after_record_write(monkeypatch, append_then_tamper)
     with admission.manual_session("alpha"):
         with pytest.raises(LedgerHeadPublicationError, match="offline reconciliation"):
             ledger.append(record)
@@ -1548,10 +1547,10 @@ def test_cache_waits_for_another_process_to_publish_its_ledger_head(
 import time
 from pathlib import Path
 from hedge_fund import paths
-from hedge_fund.paper import ledger as ledger_module
 from hedge_fund.paper.ledger import Ledger
 from hedge_fund.pipeline.session import SessionRecord
 from hedge_fund.runtime.admission import AdmissionCoordinator, RootOwnerLease
+from hedge_fund.runtime.handover import PaperInventoryTransition
 from hedge_fund.runtime.root import RootContext
 
 root_path = Path({str(root.path)!r})
@@ -1560,11 +1559,11 @@ release = Path({str(release)!r})
 failure = Path({str(failure)!r})
 record = SessionRecord.model_validate_json({record.model_dump_json()!r})
 ledger = Ledger(root_path / "paper" / "alpha")
-original_write = ledger_module.write_atomic
+original_write = PaperInventoryTransition.write_text
 
-def pause_after_write(path, text, **kwargs):
-    original_write(path, text, **kwargs)
-    if path == ledger.path(record.session):
+def pause_after_write(self, relative, text):
+    original_write(self, relative, text)
+    if Path(self._root.path, *self._base, relative) == ledger.path(record.session):
         written.write_text("written", encoding="utf-8")
         deadline = time.monotonic() + 15
         while not release.exists():
@@ -1572,7 +1571,7 @@ def pause_after_write(path, text, **kwargs):
                 raise TimeoutError("parent did not release publication")
             time.sleep(0.01)
 
-ledger_module.write_atomic = pause_after_write
+PaperInventoryTransition.write_text = pause_after_write
 try:
     with RootContext.open(root_path) as root:
         with RootOwnerLease.acquire(root) as owner:

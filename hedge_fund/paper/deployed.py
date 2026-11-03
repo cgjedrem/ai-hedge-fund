@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import re
 from datetime import date as _date
 from pathlib import Path
@@ -101,10 +102,17 @@ def deploy(
                     "session_count": 0,
                 }
             )
-        directory.mkdir(parents=True)
-        (directory / FUND_FILE).write_bytes(fund_bytes)
+        if transition is not None:
+            transition.mkdir(name, parents=False, ensure_base=True)
+            transition.write_bytes(Path(name) / FUND_FILE, fund_bytes)
+        else:
+            directory.mkdir(parents=True)
+            (directory / FUND_FILE).write_bytes(fund_bytes)
         if spec.broker == "paper":
-            PaperBroker.create(directory / BROKER_FILE, spec.capital, spec.costs)
+            if transition is not None:
+                transition.write_text(Path(name) / BROKER_FILE, json.dumps({"cash": spec.capital, "shares": {}}, indent=2))
+            else:
+                PaperBroker.create(directory / BROKER_FILE, spec.capital, spec.costs)
         Ledger(directory).init()
         return directory
 

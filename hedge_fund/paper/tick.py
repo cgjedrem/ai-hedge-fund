@@ -379,9 +379,12 @@ def _redo(
         )
         ledger.finish_redo(redo_id, record)
         return record
-    except Exception:
-        if ledger.halted() is None:
-            ledger.halt("redo failed after rewind")
+    except Exception as exc:
+        try:
+            if ledger.halted() is None:
+                ledger.halt("redo failed after rewind")
+        except Exception as halt_exc:
+            raise PaperReconciliationRequired(f"redo failed after rewind ({type(exc).__name__}) and the emergency halt is unavailable ({type(halt_exc).__name__}); offline reconciliation is required") from exc
         raise
 
 

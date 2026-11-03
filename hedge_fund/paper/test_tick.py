@@ -1246,6 +1246,27 @@ def test_redo_completion_failure_keeps_recovery_guard(tmp_path, clock, SPEC, mon
         _tick(directory)
 
 
+def test_redo_failure_with_unavailable_halt_requires_reconciliation_and_keeps_cause(tmp_path, clock, SPEC, monkeypatch):
+    from hedge_fund.paper.tick import PaperReconciliationRequired
+
+    clock("2024-06-04")
+    directory = deploy("alpha", SPEC, ["AAPL"], root=tmp_path)
+    _tick(directory)
+    original = OSError("synthetic redo failure after rewind")
+
+    def fail_after_rewind(_record):
+        raise original
+
+    def fail_halt(self, reason):
+        raise OSError("synthetic emergency halt failure")
+
+    monkeypatch.setattr(Ledger, "halt", fail_halt)
+    with pytest.raises(PaperReconciliationRequired, match="offline reconciliation is required") as raised:
+        redo(directory, FakeDataClient(SERIES), build_fund=build_fund, on_rewind=fail_after_rewind)
+
+    assert raised.value.__cause__ is original
+
+
 def test_successful_redo_records_completion_and_allows_next_tick(tmp_path, clock, SPEC):
     clock("2024-06-04")
     directory = deploy("alpha", SPEC, ["AAPL"], root=tmp_path)

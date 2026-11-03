@@ -1193,3 +1193,164 @@ No other session process, checkout, preview or the worktree itself was removed.
   `web\test_main.py`, `runtime\test_owned_runner.py`, `web\test_jobs.py` **135 passed in 302.30 s**; harness unit **9 passed**;
   owned `--capacity` **1 passed (19.2 s)**; owned default **22 passed, 4 failed, 6 skipped** (same 4 pre-existing desk failures);
   flake8/isort clean, Black drift unchanged (20/20 lines). Recorded 2026-11-03T03:20:33+01:00.
+
+## T021 writer map and deterministic race matrix slice (2026-11-03)
+
+Status: PARTIAL. T021 and T015 stay unchecked. Base: PR #8 head
+`d0081011b3c6428959d9759dda0aaa8189d16a61`. Environment: synthetic roots only, isolated
+HOME/USERPROFILE/TEMP, `PYTHON_DOTENV_DISABLED=1`, and provider/token/proxy variables
+cleared. No providers, brokers, network, runner processes or ports 8765/49292 were used.
+
+### Writer map (source, not a static claim)
+
+`hedge_fund\runtime\test_writer_map.py` AST-scans all non-test production modules for
+these writes:
+
+- path/os write primitives;
+- `open` in write/append mode;
+- `os.open` with create/write or non-literal flags;
+- `os.fdopen` in write mode;
+- root `rename_file`/`rename_directory`/`unlink_file`.
+
+It fails on any unmapped or stale callsite and on any cited test node that does not exist.
+
+After rebasing onto PR8 head `042cfbc`, the scanner flagged three new raw-write callsites from the per-user SIM account registry (`brokers\account_binding.py`: `AccountRegistry.initialize` mkdir/write_bytes and `AccountRegistry._locked` write_bytes) plus one renamed settings test node. They are now mapped: the locked state replace is race-level (barrier-started concurrent transfers admit exactly one; lock contention is busy without effects), and one-time initialization is denial-level only. The registry lives outside every fund root and is guarded by its own OS lock, not root admission.
+
+The map has 106 entries:
+
+| By level | Count |
+| --- | --- |
+| race | 48 |
+| denial | 36 |
+| none | 9 |
+| primitive | 13 |
+
+| By seam | Count |
+| --- | --- |
+| root no-follow | 36 |
+| paper inventory transition | 13 |
+| residual | 11 |
+| paths helper | 11 |
+| bound-root `write_atomic` | 9 |
+| no-follow primitive | 13 |
+| unenrolled legacy branch | 6 |
+| denied entrypoint | 5 |
+| bootstrap | 2 |
+
+The residual/`none` set is pinned exactly:
+
+- Saxo refresh lock;
+- `Ledger.log_event` raw append;
+- unbound `paths.write_atomic` fallback (`os.open`/`fdopen`/`replace`/`unlink`) and its bound
+  `write_bytes`;
+- `Ledger.init` `write_atomic`;
+- `PaperBroker.restore`;
+- explicit credential file;
+- web demo/bootstrap mkdir.
+
+Denial-level entries are not race evidence. POSIX no-follow primitives are mapped, but this Windows evidence host does not execute them.
+
+### Deterministic race matrix (barriers, no sleeps)
+
+`hedge_fund\runtime\test_writer_race_matrix.py` has 28 tests. Each one uses a monkeypatched
+hook at an exact seam and makes event-ordered thread handoffs, plus a subprocess crash case.
+
+- **Authority flip inside held lanes and transaction.** The flip is a legacy home alias or
+  `runner.pid`, applied inside:
+  - append and rewind;
+  - deploy, both before the first effect and between mkdir, `write_bytes` and `write_text`;
+  - `Ledger.init`, after its entry admission and before its effect recheck;
+  - approval-clear;
+  - audit;
+  - after the rewind effect, before head publication;
+  - after the lifecycle journal, before move;
+  - before the lifecycle head transition;
+  - between the mandate rename and the rewrite (exact 409 partial state).
+- **Junction/link swap.** Swapping `ledger/superseded`, the ledger directory or the approval
+  parent mid-transaction writes and removes nothing outside the root.
+- **Lane conflicts.** A same-fund `WriterConflict` occurs while a transaction is paused, and
+  an independent fund progresses while another fund holds its lanes.
+- **Crash and restart.** A crash after the rewind rename leaves root-wide `LedgerDrift`, and
+  every fund needs offline reconciliation.
+- **No residue.** No legacy alias is left in the synthetic home.
+
+Other new tests:
+
+- `hedge_fund\runtime\test_root_unlink.py`: 9 tests of the no-follow unlink semantics.
+- `paper\test_tick.py::test_redo_failure_with_unavailable_halt_requires_reconciliation_and_keeps_cause`.
+
+### Fixes driven by the matrix
+
+1. Paper ledger and deploy effects on enrolled roots go through `PaperInventoryTransition`
+   effect methods (`mkdir`, `write_text`, `write_bytes`, `rename_file`, `unlink_file`). Each
+   method rechecks write authority immediately before its effect.
+2. Approval unlink uses the new `RootContext.unlink_file`, a no-follow primitive (POSIX
+   `unlinkat` and Windows handle-relative delete).
+3. Ledger-head records are published only after a final authority recheck. This fixes G1,
+   where an authority flip during a rewind still published the head.
+4. The raw rewind rename/unlink on enrolled roots is removed. This fixes G2, where a junction
+   swap moved a record outside the root.
+5. Lifecycle `_move` and `_write_index` recheck root ownership.
+6. The web mandate update rechecks authority and returns 409 naming the partial state.
+7. A redo failure followed by a failed emergency Halt raises `PaperReconciliationRequired`
+   chained to the original error.
+
+`PaperInventoryTransition.mkdir(..., ensure_base=True)` creates `paper/` on fresh roots.
+Without it there was a deploy regression, found by the first matrix run.
+
+Six existing `test_inventory_cache_race.py` tests hooked `ledger.write_atomic` for the record
+write. That hook no longer sees enrolled record writes, so the tests silently stopped
+exercising their interleaving and failed. They now hook the transition write via
+`_after_record_write`, keeping the same assertions.
+
+### Results (this candidate, uncommitted tree before commit)
+
+| Run | Result |
+| --- | --- |
+| Writer map, matrix, unlink (143 after the second review round), `paper/test_tick.py`, `paper/test_ledger.py`, `paper/test_deployed_broker.py` | 305 passed |
+| `runtime/test_inventory_cache_race.py` after hook retarget | 46 passed |
+| Broad isolated run: `runtime`, `paper`, `brokers`, `fund`, `backtesting`, `web`, `test_run.py`, TUI paper/admission, `features`, acceptance isolation | 1378 passed, 13 skipped, 10 failed, 1 deselected |
+
+In the broad run:
+
+- The deselected test is the pre-existing baseline failure
+  `test_admission.py::test_second_process_can_join_shared_root_participants`.
+- 9 of the 10 failures were the stale hooks above; that file now passes.
+- The 10th, `web/test_actions.py::test_web_halt_does_not_wait_for_fund_work_lock`, uses a 1 s
+  wall-clock wait. It failed under heavy host load and passed 3/3 in isolation on both this
+  tree and the d008101 baseline.
+
+A full pytest was not rerun after the hook retarget. Lint is `flake8 --max-line-length 420
+--extend-ignore E203,W503`, `black -l 420 --check` and `isort --check-only`, all clean on the
+new and changed test files. Pre-existing non-black files were not reformatted.
+
+### Reviews
+
+- **Initial independent rubber-duck review.** Its findings were applied before the matrix.
+- **Final independent code review.** It found no product bugs. It flagged map entries whose
+  cited tests did not reach the claimed write, and `os.open`/`fdopen` writers the scanner
+  missed. Both were fixed:
+  - added the staged deploy flip test;
+  - downgraded Ledger.init `write_atomic`, the helper `write_bytes` and
+    `PaperBroker.restore` to `none`;
+  - recited the legacy entries;
+  - extended the scanner.
+- **Second final review round, on the delta.** It confirmed the inventory hook retarget keeps assertion strength. It flagged two gaps, both now fixed:
+  - `Ledger.init` mkdir was still only entry-denied, so a `_enrolled_root` flip test was added;
+  - variable-flag `os.open` calls were missed, so the scanner now maps them (5 POSIX primitives).
+
+### Open (keeps T021/T015 unchecked)
+
+- No exhaustive every-writer race evidence: 34 entries are denial-only and 9 are `none`.
+- `events.jsonl` append follows links; unbound `write_atomic` falls back to raw
+  `os.replace`.
+- There is no durable rewind intent, so crash drift is root-wide. The mandate rename+write is
+  unjournaled.
+- The POSIX `lstat`→`unlinkat` delete is not identity-fenced. The Saxo lock and explicit
+  credential file are outside root admission.
+- Same-account out-of-band writers are not fenced. The A3 decision (drift detection versus OS
+  isolation) is unresolved, so production mutation stays disabled for legacy/attested roots.
+
+Post-rebase verification (onto `042cfbc`, isolated temp HOME/USERPROFILE/TEMP, dotenv off, provider/proxy/token env removed, no network or ports): a combined suite of 21 files (writer map/matrix/unlink, inventory cache race, write authority, lifecycle, handover, admission, operations, paper tick/ledger/deployed broker/runner, account binding, research, fund storage, web services/actions/jobs/paper operations and `test_run.py`) gave **787 passed, 7 skipped, 0 failed, 1 deselected** (pre-existing `test_second_process_can_join_shared_root_participants`) in 31 min 18 s. Writer map after the rebase: **109 passed**. Full pytest was not rerun after the rebase. T021 stays PARTIAL.
+
+Second rebase onto `9c5f491` (`bf541c5`/`9c5f491` touched only frontend e2e, `test_support\network_guard.py`, `test_acceptance_isolation.py` and this file; no production writer changed): evidence-doc conflict only. Writer map + race matrix + unlink + acceptance isolation: **203 passed** in 2 min 16 s.
