@@ -649,7 +649,12 @@ def _paper_writer_admission(*, verify_inventory: bool = True) -> Iterator[tuple[
         raise PaperWriterDenied("Paper writes are blocked by root enrollment or ledger drift.")
     authority = write_authority(root)
     if authority["authority"] != "protocol-native":
-        raise PaperWriterDenied(f"Paper writes are blocked: root write authority is {authority['authority']} ({authority['reason']}); relocate into a protocol-native root.")
+        remedy = (
+            "no out-of-band writer exclusion proof (OS sandbox, account or ACL) is available, so production roots are read-only"
+            if authority["reason"] == "out-of-band-exclusion-unproven"
+            else "relocate into a protocol-native root"
+        )
+        raise PaperWriterDenied(f"Paper writes are blocked: root write authority is {authority['authority']} ({authority['reason']}); {remedy}.")
 
     owner = None
     try:

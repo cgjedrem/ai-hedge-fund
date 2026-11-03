@@ -12,6 +12,7 @@ from contextlib import ExitStack
 from datetime import datetime, timezone
 from typing import Callable
 
+from hedge_fund import paths
 from hedge_fund.data import CachedDataClient, make_data_client
 from hedge_fund.data.sessions import NEW_YORK
 from hedge_fund.fund import Fund, FundSpec
@@ -72,7 +73,7 @@ def main(argv: list[str] | None = None) -> int:
     if not os.path.isabs(args.root):
         return 2
     try:
-        with RootContext.open(args.root) as root:
+        with RootContext.open(args.root) as root, paths.bound_root(root):
             run_owned_runner(root, args.fund)
     except Exception:
         return 1
@@ -575,7 +576,7 @@ def _client_context(root, capture, factory, dispatch):
 
     class _ClientContext:
         def __enter__(self):
-            root.mkdir("cache", parents=True, mode=0o700)
+            paths.ensure_directory(root.path / "cache")
             self._raw_client = make_data_client(
                 provider=capture.data_provider,
                 dispatch=dispatch,
@@ -600,7 +601,7 @@ def _build_fund(
 ) -> Fund:
     cache_id = runner_key(spec.name)
     cache_relative = f"cache/llm/{cache_id}"
-    root.mkdir(cache_relative, parents=True, mode=0o700)
+    paths.ensure_directory(root.path.joinpath(*cache_relative.split("/")))
     cache = PromptCache(root.resolve(cache_relative))
 
     def llm_factory(_model_spec):

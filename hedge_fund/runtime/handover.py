@@ -26,6 +26,7 @@ from hedge_fund.runtime.admission import (
     RootOwnerLease,
     WriterConflict,
 )
+from hedge_fund.runtime.exclusion import out_of_band_exclusion_basis, UNPROVEN_REASON as EXCLUSION_UNPROVEN_REASON
 from hedge_fund.runtime.root import (
     ensure_unique_resource_name,
     PRIVATE_ROOT,
@@ -320,6 +321,8 @@ def write_authority(root: RootContext) -> dict[str, str | None]:
         reason = "legacy-reachability-unverified"
     if reason is not None:
         return {"authority": "ownership-unknown", "reason": reason}
+    if out_of_band_exclusion_basis(root) is None:
+        return {"authority": "ownership-unknown", "reason": EXCLUSION_UNPROVEN_REASON}
     return {"authority": "protocol-native", "reason": None}
 
 
@@ -334,6 +337,11 @@ def require_write_authority(root: RootContext) -> dict[str, Any]:
         raise WriteAuthorityDenied(f"root write authority is unverified ({type(exc).__name__})") from None
     if reason is not None:
         raise WriteAuthorityDenied(f"root write authority is ownership-unknown ({reason})")
+    if out_of_band_exclusion_basis(root) is None:
+        raise WriteAuthorityDenied(
+            f"root write authority is ownership-unknown ({EXCLUSION_UNPROVEN_REASON}); "
+            "cooperative locks do not exclude out-of-band same-account writers"
+        )
     return record
 
 

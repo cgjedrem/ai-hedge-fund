@@ -21,7 +21,7 @@ from pathlib import Path
 from hedge_fund.brokers.costs import TradingCosts
 from hedge_fund.brokers.models import Fill, Order, as_json_shares
 from hedge_fund.brokers.sim import SimBroker
-from hedge_fund.paths import write_atomic
+from hedge_fund.paths import ensure_directory, write_atomic
 
 
 class PaperBroker(SimBroker):
@@ -45,7 +45,7 @@ class PaperBroker(SimBroker):
         path = Path(path)
         if path.exists():
             raise FileExistsError(f"{path}: a paper broker book already exists")
-        path.parent.mkdir(parents=True, exist_ok=True)
+        ensure_directory(path.parent)
         write_atomic(path, json.dumps({"cash": cash, "shares": {}}, indent=2))
         return cls(path, costs)
 

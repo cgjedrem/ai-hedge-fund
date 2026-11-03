@@ -643,6 +643,10 @@ def _refresh_lock(reference: str, lock_dir: str | Path | None = None, *, timeout
     try:
         configured = lock_dir or os.environ.get("SAXO_REFRESH_LOCK_DIR")
         directory = Path(configured) if configured else Path(tempfile.gettempdir()) / "hedge-fund-saxo-locks"
+        from hedge_fund.paths import _enrolled_root_ancestor
+
+        if _enrolled_root_ancestor(directory / "probe") is not None:
+            raise ValueError("Saxo refresh lock directory must be outside an enrolled engine root")
         directory.mkdir(parents=True, exist_ok=True)
         path = directory / f"{key}.lockdir"
         acquired = False

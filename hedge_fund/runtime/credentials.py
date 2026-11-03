@@ -308,7 +308,8 @@ def save_credential(env_var: str, value: str, *, path: str | Path | None = None)
             updated = f"{original}{separator}{line}\n"
     else:
         updated = f"{line}\n"
-    candidate.parent.mkdir(parents=True, exist_ok=True)
+    if not candidate.parent.is_dir():
+        paths.ensure_directory(candidate.parent)
     write_atomic(candidate, updated, mode=stat.S_IRUSR | stat.S_IWUSR)
     os.environ[env_var] = value
     return candidate

@@ -11,7 +11,15 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
-from hedge_fund.runtime.root import RootConfigurationError, RootContext, RootFileInfo
+from hedge_fund.runtime.root import (
+    PRIVATE_ROOT,
+    RootConfigurationError,
+    RootContext,
+    RootFileInfo,
+)
+
+ENROLLMENT_MARKER = f"{PRIVATE_ROOT}/handover.json"
+ADMISSION_STATE = f"{PRIVATE_ROOT}/admission"
 
 USER_DIR: Path | None = None
 MANDATES_DIR: Path | None = None
@@ -199,14 +207,81 @@ def write_bytes(
     selected = _relative_user_path(candidate)
     if selected is not None:
         context, relative = selected
-        with _root_write_admission(context, relative, data=data):
-            parent = Path(relative).parent
-            if parent.parts:
-                context.mkdir(parent.as_posix(), parents=True)
-            context.write_bytes(relative, data, mode=mode)
+        _write_in_root(context, relative, data, mode)
         return
+    with _unconfigured_enrolled_root(candidate) as routed:
+        if routed is not None:
+            _write_in_root(*routed, data, mode)
+            return
     candidate.parent.mkdir(parents=True, exist_ok=True)
     candidate.write_bytes(data)
+
+
+def _write_in_root(context: RootContext, relative: str, data: bytes, mode: int) -> None:
+    with _root_write_admission(context, relative, data=data):
+        parent = Path(relative).parent
+        if parent.parts:
+            context.mkdir(parent.as_posix(), parents=True)
+        context.write_bytes(relative, data, mode=mode)
+
+
+def _enrolled_root_ancestor(candidate: Path) -> tuple[Path, Path] | None:
+    """Return ``(root, path)`` when ``candidate`` lands inside an enrolled root.
+
+    Both the lexical path and the path with its parent aliases resolved are
+    checked, so a junction/symlink into a root subdirectory cannot hide the
+    enclosing root. Unreadable or non-regular markers count as enrolled.
+    """
+    absolute = Path(os.path.abspath(os.fspath(candidate)))
+    chains = [absolute]
+    try:
+        resolved = Path(os.path.realpath(absolute.parent)) / absolute.name
+    except (OSError, ValueError):
+        raise RootConfigurationError("enrolled root write admission is unavailable") from None
+    if resolved != absolute:
+        chains.append(resolved)
+    for chain in chains:
+        for ancestor in chain.parents:
+            try:
+                (ancestor / ENROLLMENT_MARKER).lstat()
+            except (FileNotFoundError, NotADirectoryError):
+                pass
+            except OSError:
+                return ancestor, chain
+            else:
+                return ancestor, chain
+            try:
+                (ancestor / ADMISSION_STATE).lstat()
+            except (FileNotFoundError, NotADirectoryError):
+                continue
+            except OSError:
+                pass
+            raise RootConfigurationError("admission state exists without a handover record")
+    return None
+
+
+@contextmanager
+def _unconfigured_enrolled_root(candidate: Path) -> Iterator[tuple[RootContext, str] | None]:
+    """Route raw writes that land inside an enrolled root through its admission.
+
+    A process that never configured a root (for example an owned runner child,
+    or a helper writing by absolute path) must not bypass registry, inventory and
+    write-authority admission merely because the global root is unset or differs.
+    """
+    found = _enrolled_root_ancestor(candidate)
+    if found is None:
+        yield None
+        return
+    ancestor, target = found
+    relative = target.relative_to(ancestor)
+    if not relative.parts:
+        raise RootConfigurationError("a file path under the root is required")
+    try:
+        context = RootContext.open(ancestor)
+    except (OSError, ValueError, RootConfigurationError) as exc:
+        raise RootConfigurationError("enrolled root write admission is unavailable") from exc
+    with context:
+        yield context, relative.as_posix()
 
 
 def write_text(
@@ -250,6 +325,11 @@ def ensure_directory(
         context, relative = selected
         with _root_write_admission(context, relative):
             return context.mkdir(relative, parents=True, mode=mode)
+    with _unconfigured_enrolled_root(candidate) as routed:
+        if routed is not None:
+            context, relative = routed
+            with _root_write_admission(context, relative):
+                return context.mkdir(relative, parents=True, mode=mode)
     candidate.mkdir(parents=True, exist_ok=True)
     return candidate
 
@@ -359,7 +439,7 @@ def write_atomic(path: Path, text: str, *, mode: int | None = None, durable: boo
     if type(durable) is not bool:
         raise TypeError("durable must be a boolean")
     selected = _relative_user_path(path)
-    if selected is not None:
+    if selected is not None or _enrolled_root_ancestor(path) is not None:
         write_bytes(
             path,
             text.encode("utf-8"),

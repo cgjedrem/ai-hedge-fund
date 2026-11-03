@@ -203,19 +203,61 @@ prevent reparse traversal. Same-account out-of-band writers are not fenced, and 
 completed before detected authority loss may require reconciliation.
 Residuals named by the map (open):
 - the raw `events.jsonl` append follows links (detected by drift, not prevented);
-- `paths.write_atomic` falls back to raw `os.replace` when no root is bound, which still
-  applies to enrolled control/redo/checkpoint/approval files reached by an unbound caller;
+- `paths.write_atomic` falls back to raw `os.replace` when no root is bound; for paths under an
+  enrolled root the admission slice below now routes that fallback through the enclosing root's
+  `RootContext` and admission, so the raw replace remains only for unenrolled paths;
 - there is no durable rewind intent, so a crash after the rename leaves root-wide drift
   that blocks every fund until offline reconciliation;
 - the mandate rename+rewrite is not journaled;
 - the POSIX `lstat`→`unlinkat` delete is not identity-fenced;
 - Saxo token refresh locks and explicit credential files live outside root admission;
 - demo/bootstrap directory creation precedes enrollment.
-Residual (open): arbitrary same-account out-of-band writers that target a protocol-native
-root by explicit path are detected by inventory/head drift (→ read-only), not prevented.
-Whether drift detection on a legacy-unaddressable root satisfies A3's "inability to exclude"
-clause, or whether production writes additionally need OS isolation (dedicated account/ACL),
-is an unresolved contract decision. T015 stays open until it is resolved and evidenced.
+**A3 decision (2026-11-03, conservative default).** Cooperative registry/OS locks,
+enrollment, attestation and inventory/head drift detection do **not** prove exclusion of
+unaware or out-of-band same-account writers, and no surface may claim they do. Write
+authority therefore additionally requires an out-of-band exclusion basis
+(`runtime/exclusion.py::out_of_band_exclusion_basis`). No production basis exists yet: a
+protocol-native root without one is `ownership-unknown` with reason
+`out-of-band-exclusion-unproven`, so every enrolled production root is read-only for the
+owner lease, registry writer, paper lanes, web desk, CLI and owned runner. Enabling
+production mutation requires a new, explicitly evidenced basis (dedicated OS account,
+ACL or sandbox that unaware writers cannot reach); none is implemented. The only basis
+today is `synthetic-test-owned`: test mode plus a root strictly inside the harness-created
+`<checkout>/outputs/spec005-test-*` directory carrying its regular `.test-owned` marker,
+with no reparse points on the chain. It exists so synthetic tests can exercise controlled
+flows; it is not production evidence.
+
+**T021 admission slice: writer inventory and admission race matrix (2026-11-03).** Complements the writer map and barrier matrix above. A hidden bypass was fixed: the owned
+runner child never bound its root, so unbound `paths.write_bytes`/`ensure_directory`/
+`write_atomic` fallbacks wrote into the enrolled root without admission. Unbound writes now
+detect an enrolled ancestor on both the lexical path and the parent-alias-resolved path
+(`runtime/private/v1/handover.json`; any or unreadable marker entry counts as enrolled, and
+admission state without a marker fails closed) and route through that root's `RootContext`
+and admission, and the runner child binds its root. Saxo refresh-lock directories inside an
+enrolled root are rejected. Lane acquisition re-verifies owner/authority after the OS
+lock is granted. `runtime/test_writer_inventory.py` is an AST ratchet over every raw
+write/replace/unlink/mkdir/open-for-write site in `hedge_fund/` production modules
+(including any `os`/`shutil`/`tempfile` writer call, names imported from them, and `open`
+with a non-literal mode), classified as
+paths-routed, registry, paper-lanes, deployment, web-gated, bootstrap, lock-file, root
+primitive, disabled, outside-root or test-harness; an unclassified, stale or recounted
+site fails. `runtime/test_writer_admission_race_matrix.py` drives the central primitives with a real
+second interpreter: same-object contention for every lane, independent-object progress,
+authority flip while a lane is held (legacy `runner.pid`, legacy home alias, loss of the
+exclusion basis) and during OS-lock wait, registry snapshot versus in-flight commit,
+crash/kill then retry, cooperative release then retry, production read-only denial,
+exclusion-basis negatives and enrolled-root path routing.
+
+Uncovered surface (open): (1) production mutation is disabled pending an exclusion basis;
+(2) the matrix exercises the shared admission primitives each writer class uses, not every
+domain writer end-to-end under every interleaving; (3) deeper per-file symlink/hardlink
+aliases inside a root rely on inventory/head drift; (4) legacy unenrolled `~/.hedge-fund`
+use without `--root` keeps legacy behavior outside this protocol; (5) the ratchet is static:
+dynamic dispatch (`getattr`, writer callables passed as values) and scripts outside
+`hedge_fund/` (for example `check_stock.py`) are not scanned; (6) the synthetic basis trusts
+test-mode environment variables a same-account process could set — that grants nothing the
+process could not already write directly, but it is not an isolation proof. T015/T021 stay open
+until a production basis is implemented and evidenced.
 
 Scoped archive/restore uses registry-before-object admission and a retained
 `archive-prepared`/`restore-prepared` journal outside the active stores. After a

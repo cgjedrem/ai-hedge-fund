@@ -128,11 +128,14 @@ class RootOwnerLease:
                 handle.close()
             raise
 
-    def matches(self, root: RootContext) -> bool:
+    def is_open_for(self, root: RootContext) -> bool:
         _require_current_process()
         with self._guard:
-            if self._closed or self._exclusive or self._root is not root or root._root_identity != self._root_identity:
-                return False
+            return not (self._closed or self._exclusive or self._root is not root or root._root_identity != self._root_identity)
+
+    def matches(self, root: RootContext) -> bool:
+        if not self.is_open_for(root):
+            return False
         if not root.verify_private_storage():
             return False
         try:
@@ -419,7 +422,8 @@ class AdmissionCoordinator:
         lock_key = _thread_lock_key(self._root, relative)
         held = _held_locks()
         with _local_lane(lock_key, wait) as deadline:
-            self._require_verified_owner()
+            # Cheap pre-check; full authority is verified once the OS lock is held.
+            self._require_open_owner_lease()
             self._root.mkdir(LOCK_DIRECTORY, parents=True, mode=0o700)
             handle = self._root.open_lock_file(
                 relative,
@@ -431,7 +435,7 @@ class AdmissionCoordinator:
                 self._root.revalidate()
                 token = _acquire_os_lock(handle, _remaining(deadline))
                 acquired = True
-                self._root.revalidate()
+                self._require_verified_owner()
                 held[lock_key] = 1
                 yield
             finally:
@@ -441,6 +445,11 @@ class AdmissionCoordinator:
                         _release_os_lock(handle, token)
                 finally:
                     handle.close()
+
+    def _require_open_owner_lease(self) -> None:
+        lease = self._owner_lease
+        if lease is None or not lease.is_open_for(self._root):
+            raise OwnershipUnknown("Writer ownership is unknown.")
 
     def _require_verified_owner(self) -> None:
         if self._owner_lease is None or not self._owner_lease.matches(self._root):

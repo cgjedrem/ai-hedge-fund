@@ -1058,7 +1058,9 @@ def test_web_halt_does_not_wait_for_fund_work_lock(tmp_path):
     thread = Thread(target=halt)
     try:
         thread.start()
-        responsive = completed.wait(timeout=1)
+        # The work lock stays held until after this wait, so any finite bound proves
+        # halt does not wait for it; admitted control writes need headroom under load.
+        responsive = completed.wait(timeout=5)
     finally:
         work_lock.release()
         thread.join(timeout=2)
