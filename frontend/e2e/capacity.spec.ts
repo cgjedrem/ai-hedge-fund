@@ -109,6 +109,13 @@ test("real capacity denial is unaccepted and observation recovers after a lost c
     expect(requests.filter((request) => request.method() !== "GET")).toHaveLength(mutations);
     expect(external).toEqual([]);
   } finally {
-    if (!released) holder("release", "--operation", held.operation_id);
+    if (!released) {
+      try {
+        holder("release", "--operation", held.operation_id);
+      } catch (error) {
+        // Never mask the original failure; the owned root is discarded with the run.
+        console.error("capacity holder release failed", error);
+      }
+    }
   }
 });

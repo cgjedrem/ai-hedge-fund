@@ -1074,14 +1074,14 @@ No other session process, checkout, preview or the worktree itself was removed.
   acceptance with no cumulative cap or reset window, so no truthful per-operation cap or `Retry-After` exists; fail closed by not
   inventing one.
 - Source/test identity of the integrated change vs `16369e9` (sorted repo-relative paths, NUL, staged blob bytes, NUL; `specs/`
-  excluded): **`6af98a2d2ebe625b60d56e747e9e58f8e7d243362af2670458ff4f5585268141`**, **20 paths / 733,262 bytes**.
+  excluded): **`fc044af5d15fa1fdee82368fde6c10b94340780bebfa589e928074db0a496627`**, **20 paths / 733,887 bytes**.
 
 ### Added in the integration
 
 - `test_jobs.py`: a record durably accepted by a separate (crashed) store holds the backtest pool on a live server (429
   `capacity-denied`, record stays `accepted`); only a restart's verified recovery interrupts it (fence +1), after which writes are
   enabled and a new acceptance completes. A corrupted orphan capture sidecar makes startup recovery fail closed (writes disabled,
-  `operation-recovery-unavailable`, operation store absent) and leaves the record `accepted`. Process absence never frees capacity.
+  `operation-recovery-unavailable`, operation store absent) and leaves the record `accepted`; restoring the exact bytes lets the next start recover it (writes on, `interrupted`). Process absence never frees capacity on a running server.
 - `hedge_fund\test_support\capacity_holder.py` (test-only): holds/releases one durable backtest slot from a second process; refuses
   unless `HEDGE_FUND_TEST_MODE=1` and the root is inside the marked owned test root; release only interrupts its own holder record.
 - `frontend/e2e/capacity.spec.ts` + owned `--capacity` mode (`run-owned.mjs`, `playwright.config.ts`): runs alone with
@@ -1101,7 +1101,7 @@ No other session process, checkout, preview or the worktree itself was removed.
 - Frontend `vitest run src`: **9 files, 122 passed**; `tsc --noEmit` passed; `npm run test:e2e-safety`: **9 passed**; the harness
   build (vite) passed. ESLint has no repository config (not a gate). Python black/isort/flake8 (line 420): no new findings
   (`runtime\test_operations.py` black drift pre-exists at `16369e9` and `5f3f909`).
-- Owned Playwright (port 8876, Chromium): `--capacity` **1 passed (1.0 m)**; default **11 passed, 3 failed, 6 skipped**;
+- Owned Playwright (port 8876, Chromium): `--capacity` **1 passed (1.0 m)**, rerun after review fixes **1 passed (29.3 s)**; orphan pytest pair after fixes **2 passed in 63.30 s**; default **11 passed, 3 failed, 6 skipped**;
   `--reports` **11 passed, 3 failed, 6 skipped**; `--lifecycle` **10 passed, 7 failed, 1 skipped, 2 did not run**. Comparison on a
   temporary detached `16369e9` checkout (removed afterwards): default desk spec **9 passed, 3 failed** (same three: manual tick
   running, runner stop, backtest running); `--lifecycle` **10 passed, 7 failed, 2 did not run** with the identical failing set
@@ -1113,5 +1113,12 @@ No other session process, checkout, preview or the worktree itself was removed.
 
 - No production 429 `budget-exhausted` emitter (by decision above). No observation stream/channel (bounded polling only).
 - Crashed-process orphans hold capacity until verified server-start recovery; no live reclamation. `Retry-After` is advisory.
+- Startup recovery (pre-existing) interrupts every unfinished record on the root after sidecar verification; under the shared owner
+  lease it does not prove owner liveness, so a live peer process sharing the root would also be fenced (in-flight work lost, no
+  durable effect). Exclusive-lease or liveness-proof recovery is open.
+- Residual test risk: `--capacity` runs with writes and network capability; if the asserted 429 ever regressed, the single browser
+  Accept could start a demo backtest whose only reachable model endpoint is the approved local loopback Ollama (non-loopback data
+  fetches stay denied). It did not occur in the recorded run. `hedge_fund\test_support\*` (including the guarded holder) ships in the
+  wheel like the existing test-support modules; packaging exclusion is open.
 - Browser server-restart observation, the pre-existing desk/lifecycle browser failures, full Python suite, Linux, wheel/container
   and cross-browser evidence remain open.

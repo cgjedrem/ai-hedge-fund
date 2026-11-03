@@ -2095,3 +2095,11 @@ def test_startup_recovery_fails_closed_when_an_orphan_capture_cannot_be_verified
         reader = OperationStore(root_context, admission=AdmissionCoordinator(root_context))
         # Recovery refused to rewrite or free anything: the record still holds its slot.
         assert reader.get_operation(orphan_id).status is OperationStatus.ACCEPTED
+
+    # The corrupted sidecar was the only blocker: with verifiable bytes, startup recovery proceeds.
+    restarted = create_app(root=demo_root, allow_writes=True, demo=True)
+    try:
+        assert restarted.state.service.allow_writes is True
+        assert restarted.state.service._operation_store.get_operation(orphan_id).status is OperationStatus.INTERRUPTED
+    finally:
+        restarted.state.service.close()
