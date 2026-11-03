@@ -11,8 +11,9 @@ real fund is touched.
 from __future__ import annotations
 
 import os
+import threading
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
 import pytest
@@ -226,6 +227,16 @@ def _recorded(root: Path, fund: str) -> list[str]:
     return Ledger(root / "paper" / fund).sessions()
 
 
+def _recorded_fills(root: Path, fund: str) -> list[dict]:
+    records = Ledger(root / "paper" / fund).records()
+    return [fill.model_dump(mode="json") for record in records if record.executed is not None for fill in record.executed.fills]
+
+
+def _paper_files(root: Path, fund: str) -> dict[str, bytes]:
+    directory = root / "paper" / fund
+    return {str(path.relative_to(directory)): path.read_bytes() for path in directory.rglob("*") if path.is_file()}
+
+
 def test_concurrent_manual_appends_to_one_fund_admit_exactly_one_writer(race_root, tmp_path, owned_test_process):
     root, admission = race_root
     record = _record("alpha")
@@ -367,3 +378,455 @@ def test_halt_and_verdict_lanes_stay_responsive_under_research_saturation(race_r
             assert ledger.halted() is not None
             release.write_text("release", encoding="utf-8")
             racer.wait_final()
+
+
+def test_web_archive_waits_for_real_cli_redo_admission_without_duplicate_fills(tmp_path, owned_test_process):
+    from fastapi.testclient import TestClient
+
+    from hedge_fund.web.app import create_app
+    from hedge_fund.web.demo import seed_demo
+
+    root = seed_demo(tmp_path / "redo-archive")
+    fund = "demo-quality"
+    before_files = _paper_files(root, fund)
+    before_fills = _recorded_fills(root, fund)
+    assert [(fill["ticker"], fill["side"], fill["quantity"]) for fill in before_fills] == [("AAPL", "buy", 100)]
+    ready = tmp_path / "redo-admitted"
+    release = tmp_path / "redo-release"
+    outcome = tmp_path / "redo-outcome"
+    script = "\n".join(
+        [
+            "import contextlib, time, traceback",
+            "from pathlib import Path",
+            "from hedge_fund import run",
+            f"ready, release, outcome = Path({str(ready)!r}), Path({str(release)!r}), Path({str(outcome)!r})",
+            "class StagedStop(Exception): pass",
+            "original_lane = run._paper_lane",
+            "@contextlib.contextmanager",
+            "def staged_lane(participant, name, lane):",
+            "    with original_lane(participant, name, lane):",
+            "        if lane == 'manual_session':",
+            "            ready.write_text('redo-admitted', encoding='utf-8')",
+            "            deadline = time.monotonic() + 90",
+            "            while not release.exists() and time.monotonic() < deadline: time.sleep(0.01)",
+            "            if not release.exists(): raise TimeoutError('redo release missing')",
+            "            raise StagedStop()",
+            "        yield",
+            "run._paper_lane = staged_lane",
+            "try:",
+            f"    run.main(['--root', {str(root)!r}, '--enable-network', 'paper', 'tick', {fund!r}, '--again'])",
+            "except StagedStop:",
+            "    outcome.write_text('stopped-before-redo-effects', encoding='utf-8')",
+            "except BaseException:",
+            "    outcome.write_text(traceback.format_exc(), encoding='utf-8')",
+            "    raise",
+            "else:",
+            "    outcome.write_text('unexpected-return', encoding='utf-8')",
+        ]
+    )
+    app = create_app(root=root, allow_writes=True, network_enabled=True, demo=True)
+    with TestClient(app, client=("127.0.0.1", 50000)) as client:
+        capabilities = client.get("/api/capabilities", headers={"host": "127.0.0.1"}).json()
+        headers = {
+            "host": "127.0.0.1",
+            "origin": "http://127.0.0.1",
+            "x-csrf-token": capabilities["mutation_token"],
+        }
+        archive = {"action": "archive", "kind": "deployment", "identity": fund}
+        response = client.post("/api/lifecycle/preview", headers=headers, json=archive)
+        assert response.status_code == 200, response.text
+        preview = response.json()
+        request = {
+            **archive,
+            "request_id": "redo-archive-race",
+            "preview_id": preview["preview_id"],
+            "preview_digest": preview["preview_digest"],
+            "confirmation_token": preview["confirmation_token"],
+            "expected_head": preview["expected_head"],
+        }
+        child = owned_test_process(script)
+        try:
+            assert _wait_file(ready, child, "CLI redo admission", timeout=60) == "redo-admitted"
+            denied = client.post("/api/lifecycle/accept", headers=headers, json=request)
+            assert denied.status_code == 409, denied.text
+            assert denied.json()["code"] == "writer-conflict"
+            assert client.get("/api/operations/by-request/redo-archive-race", headers=headers).status_code == 404
+            assert _paper_files(root, fund) == before_files
+            assert _recorded_fills(root, fund) == before_fills
+        finally:
+            release.write_text("release", encoding="utf-8")
+            assert child.wait(timeout=60) == 0, outcome.read_text(encoding="utf-8") if outcome.exists() else "CLI child did not exit"
+
+        assert outcome.read_text(encoding="utf-8") == "stopped-before-redo-effects"
+        accepted = client.post("/api/lifecycle/accept", headers=headers, json=request)
+        assert accepted.status_code == 202, accepted.text
+        assert accepted.json()["status"] == "completed"
+        assert not (root / "paper" / fund).exists()
+
+        archive_id = accepted.json()["result"]["archive_id"]
+        restore = {"action": "restore", "archive_id": archive_id}
+        response = client.post("/api/lifecycle/preview", headers=headers, json=restore)
+        assert response.status_code == 200, response.text
+        preview = response.json()
+        restored = client.post(
+            "/api/lifecycle/accept",
+            headers=headers,
+            json={
+                **restore,
+                "request_id": "redo-archive-restore",
+                "preview_id": preview["preview_id"],
+                "preview_digest": preview["preview_digest"],
+                "confirmation_token": preview["confirmation_token"],
+                "expected_head": preview["expected_head"],
+            },
+        )
+        assert restored.status_code == 202, restored.text
+        assert restored.json()["status"] == "completed"
+        assert _paper_files(root, fund) == before_files
+        assert _recorded_fills(root, fund) == before_fills
+
+
+def test_real_cli_and_web_manual_competition_produces_one_fake_fill(tmp_path, owned_test_process, request):
+    from datetime import datetime
+
+    from fastapi.testclient import TestClient
+
+    from hedge_fund.backtesting.test_fund import FakeAnalyst, FakeDataClient, SERIES
+    from hedge_fund.brokers.paper import PaperBroker
+    from hedge_fund.data.sessions import NEW_YORK
+    from hedge_fund.fund import Fund, FundSpec
+    from hedge_fund.llm import load_api_models
+    from hedge_fund.paper import deploy, tick
+    from hedge_fund.web.app import create_app
+    from hedge_fund.web.demo import seed_demo
+
+    root = seed_demo(tmp_path / "manual-fills")
+    fund = "race-fill"
+    ready = tmp_path / "tick-admitted"
+    release = tmp_path / "tick-release"
+    winner_result = tmp_path / "tick-winner"
+    loser_result = tmp_path / "tick-loser"
+    factory_calls = []
+
+    def forbidden_data_client():
+        factory_calls.append(True)
+        raise AssertionError("a denied web preview constructed a data client")
+
+    app = create_app(
+        root=root,
+        allow_writes=True,
+        network_enabled=True,
+        demo=True,
+        data_client_factory=forbidden_data_client,
+    )
+    service = app.state.service
+    request.addfinalizer(service.close)
+    spec = FundSpec(
+        schema_version=2,
+        name=fund,
+        strategies=[{"name": "solo", "models": [{"name": "pead"}], "blend": {"mode": "long_short"}}],
+        risk={"max_position_pct": 1.0, "max_gross_exposure": 1.0},
+        capital=100_000,
+        costs={"spread_bps": 0, "commission_per_share": 0},
+        approval_required=True,
+        rebalance="daily",
+    )
+
+    def build_fund(mandate):
+        return Fund(mandate, models={"solo": [FakeAnalyst("pead", {"AAPL": 1.0})]})
+
+    with paths.bound_root(service.root_context):
+        with service._admission.deployment_lock(fund, timeout=0):
+            directory = deploy(fund, spec, ["AAPL"], root=root / "paper")
+        with service._admission.manual_session(fund, timeout=0):
+            latest = tick(
+                directory,
+                FakeDataClient(SERIES),
+                session="2024-06-03",
+                build_fund=build_fund,
+                now=lambda: datetime(2024, 6, 4, 12, tzinfo=NEW_YORK),
+            )
+    ledger = Ledger(directory)
+    before_fills = _recorded_fills(root, fund)
+    assert latest.decision is not None
+    assert before_fills == []
+
+    script = """
+import contextlib, io, time, traceback
+from pathlib import Path
+from hedge_fund import run
+from hedge_fund.backtesting.test_fund import FakeAnalyst, FakeDataClient, SERIES, WEEKDAYS
+from hedge_fund.fund import Fund
+
+root, fund, ready, release, result, stage = Path(ROOT), FUND, Path(READY), Path(RELEASE), Path(RESULT), STAGE
+original_load = run._load_runtime
+original_lane = run._paper_lane
+
+class FixtureData(FakeDataClient):
+    def get_prices(self, ticker, start, end, interval="day", interval_multiplier=1):
+        assert interval == "day" and interval_multiplier == 1
+        return super().get_prices(ticker, start, end)
+
+@contextlib.contextmanager
+def fake_data_client(**_kwargs):
+    series = dict(SERIES)
+    series["MSFT"] = {day: 50.0 for day in WEEKDAYS}
+    yield FixtureData(series)
+
+def load_fakes():
+    original_load()
+    run.make_data_client = fake_data_client
+    run._cli_fund = lambda spec, _settings, _dispatch, _key: Fund(spec, models={"solo": [FakeAnalyst("pead", {"AAPL": 1.0})]})
+
+@contextlib.contextmanager
+def staged_lane(participant, name, lane):
+    with original_lane(participant, name, lane):
+        if lane == "manual_session" and stage == "winner":
+            ready.write_text("admitted", encoding="utf-8")
+            deadline = time.monotonic() + 90
+            while not release.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            if not release.exists():
+                raise TimeoutError("tick release missing")
+        yield
+
+run._load_runtime = load_fakes
+run._paper_lane = staged_lane
+output = io.StringIO()
+try:
+    with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+        try:
+            run.main(["--root", str(root), "--enable-network", "paper", "tick", fund, "--session", "2024-06-04"])
+        except SystemExit as exc:
+            outcome = str(exc.code)
+        else:
+            outcome = "returned"
+except BaseException:
+    result.write_text(traceback.format_exc(), encoding="utf-8")
+    raise
+result.write_text(outcome + "\\n" + output.getvalue(), encoding="utf-8")
+"""
+    try:
+        with TestClient(app, client=("127.0.0.1", 50000)) as client:
+            capabilities = client.get("/api/capabilities", headers={"host": "127.0.0.1"}).json()
+            headers = {
+                "host": "127.0.0.1",
+                "origin": "http://127.0.0.1",
+                "x-csrf-token": capabilities["mutation_token"],
+            }
+            settings = client.get("/api/settings", headers=headers).json()
+            model = next(model_id for _, model_id, provider in load_api_models() if provider == "Ollama" and not model_id.endswith(":cloud"))
+            configured = client.post("/api/settings/model", headers=headers, json={"model": model, "expected_version": settings["version"]})
+            assert configured.status_code == 200, configured.text
+            approved = client.post(
+                f"/api/paper/{fund}/approval",
+                headers=headers,
+                json={
+                    "verdict": "approve",
+                    "decision_as_of": latest.decision.as_of,
+                    "source_record_hash": latest.hash,
+                },
+            )
+            assert approved.status_code == 200, approved.text
+            before_files = _paper_files(root, fund)
+
+            def child_script(stage: str, result: Path) -> str:
+                return _render(
+                    script,
+                    ROOT=str(root),
+                    FUND=fund,
+                    READY=str(ready),
+                    RELEASE=str(release),
+                    RESULT=str(result),
+                    STAGE=stage,
+                )
+
+            winner = owned_test_process(child_script("winner", winner_result))
+            try:
+                assert _wait_file(ready, winner, "CLI tick admission", timeout=60) == "admitted"
+                loser = owned_test_process(child_script("contender", loser_result))
+                denied = client.post(f"/api/paper/{fund}/tick/preview", headers=headers, json={"expected_head": latest.hash})
+                assert loser.wait(timeout=60) == 0, loser_result.read_text(encoding="utf-8") if loser_result.exists() else "CLI contender failed"
+                loser_output = loser_result.read_text(encoding="utf-8")
+                assert loser_output.startswith("1\n") and "busy or unavailable" in loser_output, loser_output
+                assert denied.status_code == 409, denied.text
+                assert denied.json()["code"] == "writer-conflict"
+                assert factory_calls == []
+                assert _paper_files(root, fund) == before_files
+                assert _recorded_fills(root, fund) == before_fills
+            finally:
+                release.write_text("release", encoding="utf-8")
+                assert winner.wait(timeout=90) == 0, winner_result.read_text(encoding="utf-8") if winner_result.exists() else "CLI winner failed"
+
+            assert winner_result.read_text(encoding="utf-8").startswith("returned\n"), winner_result.read_text(encoding="utf-8")
+            sessions = ledger.sessions()
+            assert sessions == ["2024-06-03", "2024-06-04"]
+            recorded = ledger.read("2024-06-04")
+            assert recorded.executed is not None
+            assert len(recorded.executed.fills) == 1
+            assert recorded.executed.fills[0].ticker == "AAPL"
+            assert recorded.executed.fills[0].side == "buy"
+            assert recorded.executed.fills[0].quantity == 500
+            assert len(_recorded_fills(root, fund)) == len(before_fills) + 1
+            assert [event["kind"] for event in ledger.events()] == ["tick", "approve", "consume", "tick"]
+            assert ledger.approval() is None
+            book = PaperBroker(root / "paper" / fund / "broker.json")
+            assert book.cash() == pytest.approx(recorded.cash)
+            assert {ticker: position.shares for ticker, position in book.positions().items()} == recorded.positions
+    finally:
+        service.close()
+
+
+def test_web_verdict_and_halt_remain_responsive_during_cross_process_research_saturation(tmp_path, owned_test_process):
+    from fastapi.testclient import TestClient
+
+    from hedge_fund.backtesting.test_fund import FakeAnalyst, FakeDataClient, SERIES
+    from hedge_fund.fund import Fund, load_spec
+    from hedge_fund.llm import load_api_models
+    from hedge_fund.web.app import create_app
+    from hedge_fund.web.demo import seed_demo
+
+    root = seed_demo(tmp_path / "saturated-controls")
+    fund = "demo-quality"
+    ledger = Ledger(root / "paper" / fund)
+    before_records = {session: ledger.path(session).read_bytes() for session in ledger.sessions()}
+    before_fills = _recorded_fills(root, fund)
+    assert [(fill["ticker"], fill["side"], fill["quantity"]) for fill in before_fills] == [("AAPL", "buy", 100)]
+    entered = threading.Event()
+    release = threading.Event()
+    data_calls = []
+    data_fetches = []
+
+    class RecordingDataClient(FakeDataClient):
+        def get_prices(self, *args, **kwargs):
+            data_fetches.append((args, kwargs))
+            return super().get_prices(*args, **kwargs)
+
+    def fake_data_client():
+        data_calls.append(True)
+        return nullcontext(RecordingDataClient(SERIES))
+
+    def blocking_fund(spec):
+        entered.set()
+        if not release.wait(90):
+            raise TimeoutError("test did not release the synthetic backtest")
+        return Fund(spec, models={"earnings-drift": [FakeAnalyst("pead", {"AAPL": 1.0})]})
+
+    app = create_app(
+        root=root,
+        allow_writes=True,
+        network_enabled=True,
+        demo=True,
+        data_client_factory=fake_data_client,
+        fund_factory=blocking_fund,
+    )
+    try:
+        with TestClient(app, client=("127.0.0.1", 50000)) as client:
+            capabilities = client.get("/api/capabilities", headers={"host": "127.0.0.1"}).json()
+            headers = {
+                "host": "127.0.0.1",
+                "origin": "http://127.0.0.1",
+                "x-csrf-token": capabilities["mutation_token"],
+            }
+            pending = client.get(f"/api/paper/{fund}", headers=headers).json()["pending"]
+            settings = client.get("/api/settings", headers=headers).json()
+            model = next(model_id for _, model_id, provider in load_api_models() if provider == "Ollama" and not model_id.endswith(":cloud"))
+            configured = client.post("/api/settings/model", headers=headers, json={"model": model, "expected_version": settings["version"]})
+            assert configured.status_code == 200, configured.text
+            head = mandate_hash(load_spec(root / "mandates" / f"{fund}.yaml"))
+            payload = {
+                "fund": fund,
+                "universe": ["AAPL"],
+                "start": "2024-06-03",
+                "end": "2024-06-07",
+                "provider": "yfinance",
+                "model": model,
+                "mandate_hash": head,
+            }
+
+            def preview():
+                response = client.post(
+                    "/api/operations/preview",
+                    headers=headers,
+                    json={"action": "backtest", "subject_id": fund, "expected_head": head, "payload": payload},
+                )
+                assert response.status_code == 201, response.text
+                return response.json()
+
+            def accept(review, request_id):
+                return client.post(
+                    "/api/operations",
+                    headers=headers,
+                    json={
+                        "request_id": request_id,
+                        "action": "backtest",
+                        "subject_id": fund,
+                        "preview_id": review["preview_id"],
+                        "preview_digest": review["preview_digest"],
+                        "confirmation_token": review["confirmation_token"],
+                        "expected_head": head,
+                        "due_set": [],
+                        "payload": payload,
+                    },
+                )
+
+            started = accept(preview(), "saturation-running")
+            assert started.status_code == 202, started.text
+            assert entered.wait(60), "synthetic backtest did not occupy its worker"
+            waiting = preview()
+            with _research_held_by_child(owned_test_process, tmp_path, root, fund):
+                denied = accept(waiting, "saturation-denied")
+                assert denied.status_code == 429, denied.text
+                assert denied.json()["code"] == "capacity-denied"
+                assert client.get("/api/operations/by-request/saturation-denied", headers=headers).status_code == 404
+                assert not release.is_set()
+                assert data_calls == []
+
+                started_at = time.monotonic()
+                verdict = client.post(
+                    f"/api/paper/{fund}/approval",
+                    headers=headers,
+                    json={
+                        "verdict": "approve",
+                        "decision_as_of": pending["decision_as_of"],
+                        "source_record_hash": pending["source_record_hash"],
+                    },
+                )
+                verdict_seconds = time.monotonic() - started_at
+                assert verdict.status_code == 200, verdict.text
+                assert verdict_seconds < MAX_CONTROL_WAIT_SECONDS + 5
+                assert ledger.approval()["decision_hash"] == pending["source_record_hash"]
+
+                started_at = time.monotonic()
+                halted = client.post(f"/api/paper/{fund}/halt", headers=headers, json={"reason": "synthetic saturation halt"})
+                halt_seconds = time.monotonic() - started_at
+                assert halted.status_code == 200, halted.text
+                assert halt_seconds < MAX_CONTROL_WAIT_SECONDS + 5
+                assert ledger.halted() == "synthetic saturation halt"
+                assert {session: ledger.path(session).read_bytes() for session in ledger.sessions()} == before_records
+                assert _recorded_fills(root, fund) == before_fills
+                print(f"T027 bounded controls: verdict={verdict_seconds:.3f}s halt={halt_seconds:.3f}s")
+
+            cancelled = client.post(
+                f"/api/operations/{started.json()['operation_id']}/cancel",
+                headers=headers,
+                json={"request_id": "saturation-cancel"},
+            )
+            assert cancelled.status_code == 200, cancelled.text
+            assert cancelled.json()["status"] == "cancel-requested"
+            release.set()
+            deadline = time.monotonic() + 60
+            latest = None
+            while time.monotonic() < deadline:
+                status = client.get(f"/api/operations/{started.json()['operation_id']}", headers=headers)
+                assert status.status_code == 200, status.text
+                latest = status.json()
+                if latest["status"] in {"completed", "failed", "cancelled", "interrupted"}:
+                    break
+                time.sleep(0.05)
+            assert latest is not None and latest["status"] == "cancelled", latest
+            assert data_fetches == []
+            assert _recorded_fills(root, fund) == before_fills
+    finally:
+        release.set()
+        app.state.service.close()

@@ -10,7 +10,19 @@ description: "Executable, mandatory-test work plan for complete web-only engine 
 `docs\governance\web-migration-contract.md`.
 **Prerequisite gate:** [exact Git/API receipt](tasks-gate-2026-10-31.md): clean/pushed
 spec and plan at `193d16dc754567710c8dd5703e4f427184c9079f`, open main-targeting PR #8.
-**Current state:** user-directed implementation authorized. **21/148 tasks complete:**
+**Latest scoped state (2026-11-03):** 25/148 tasks are checked. Of T015, T019,
+T020, T021, T023, T024, T025, T026, T027 and T028, only T023, T025, T026
+and T028 are checked. T015/T021 still lack proven production out-of-band
+exclusion; T024's foundation prerequisites remain open. T027 now includes an
+actual fake-data paper fill under competing CLI/web admission, plus redo/archive
+admission and saturated-control races, but its foundation prerequisite and
+full race acceptance remain open. T019 has a synchronous valuation
+`budget-exhausted` emitter with no retry/reset hint; older statements below
+that there is no emitter predate that change. Bounded polling is an allowed
+observation mechanism; no unimplemented push channel is implied.
+See `implementation-evidence.md` for limits and exact results.
+
+**Historical state (before the scoped continuation):** user-directed implementation authorized. **21/148 tasks complete:**
 T001–T014, T016–T018, T022, T059, T096 and T137. T096 is the fake-only account-policy
 test slice, not production/global custody acceptance. T009–T011 include completed test-design/red phases. T018 passes
 its implementation/test criteria on synthetic Windows/NTFS, including reviewed local-paper

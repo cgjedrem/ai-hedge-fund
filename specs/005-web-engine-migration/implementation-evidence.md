@@ -1520,3 +1520,65 @@ were previously checked; this continuation does not change task markers.
   in `owned_runner_child.py` and `test_actions.py`; isort flags a pre-existing
   import layout in `test_writer_races.py`. Each was also verified at the base
   revision and is not attributed to this continuation.
+
+## T027 synthetic admission and fill-race continuation (2026-11-03)
+
+**Partial, not foundation or migration acceptance.** No task checkbox was
+changed. T024's prerequisites remain open. T027 gains actual synthetic fill
+coverage, but the archive/redo case stops after CLI redo admission and before
+redo effects; the owned-runner conflict has no due session. These are not a
+complete real runner/redo/effects matrix.
+
+| Field | Evidence |
+| --- | --- |
+| Source under test | Published base `92b6a42d4e9af576b8ebd23ed000c59d5600cc06` plus the dirty `hedge_fund\runtime\test_writer_races.py` test blob `0bbd8de2d1e0c3bf9257bfaf1fa228539a01786d`; its `git diff --binary` blob is `0073a505800c95b500f51528b246b3f449d74fb9`. No production code or frontend changed in this continuation. |
+| Environment and isolation | Windows 11 Enterprise build 26200, NTFS; Python 3.13.7; test-owned synthetic roots and children, isolated HOME/TEMP, cleared credentials/provider and proxy overrides, dotenv disabled and non-loopback network denied. Fake data and fake analysts only; no real fund, provider, LLM or paid call. |
+| Runtime bound | Existing production roots remain read-only. These tests do not establish OS-account/ACL/sandbox exclusion, an installed artifact, or protection against a non-cooperating writer. |
+
+- A real CLI child held the manual admission for `paper tick --again`. The
+  reviewed HTTP archive was rejected with 409 `writer-conflict`, produced no
+  durable operation, and left the original paper bytes and its recorded
+  100-share AAPL fill unchanged. The child was released and intentionally
+  stopped **before redo effects**; the same reviewed archive then completed,
+  and restore reproduced the original paper bytes and fill.
+- An engine-generated, hash-approved pending decision on a second synthetic
+  fund was advanced by a real CLI child using a fake data-client factory and
+  fake analyst. While it held manual admission, a second CLI tick failed
+  with a busy denial and an HTTP preview returned 409 `writer-conflict`
+  without constructing a web data client or altering paper bytes. The winner
+  recorded exactly one 500-share AAPL buy, one new session and the event
+  sequence `tick, approve, consume, tick`; its broker cash/positions matched
+  the ledger and the approval mailbox was cleared. The fake factory does not
+  exercise live provider transport or dispatch authorization.
+- An accepted fake backtest occupied its bounded worker while another real
+  test-owned process held the fund's research lane. A second backtest
+  admission returned 429 `capacity-denied` with no request record. Hash-bound
+  HTTP approval and Halt succeeded without changing existing session records
+  or fills; the backtest was cancelled before fake price fetch. In the final
+  combined run, verdict took **0.866 s** and Halt **0.588 s** end to end.
+  The test's bound is `MAX_CONTROL_WAIT_SECONDS + 5` seconds; the configured
+  0.5-second control lock wait is not an end-to-end HTTP latency guarantee.
+- The three new cases ran together three times before the final mailbox,
+  event and exact-session assertions: **3 passed in 28.95, 28.64 and 29.07 s**.
+  On the final dirty test blob above, the entire writer-race file plus the
+  adjacent owned-runner conflict, CLI approval/web Halt, capacity,
+  cancellation and stale-archive tests gave **20 passed in 137.23 s**,
+  2026-11-03 16:13:37–16:15:56 local, exit 0. Two preceding combined runs
+  gave **20 passed in 146.26 and 142.12 s** on earlier test revisions. These
+  are synthetic source-run tests, not native deployment or browser acceptance.
+- Development failures are retained: the first saturation fixture hit the
+  non-loopback DNS guard even with a fake transport, so it was changed to
+  cancel before provider dispatch without weakening the guard. The first
+  real-fill fixture used a fake `get_prices` signature incompatible with
+  `CachedDataClient`; the next used a demo decision rejected by canonical
+  eligible-score validation. The fixture was replaced with a canonical
+  engine-generated decision. A missing `schema_version` then failed setup;
+  that failure exposed a Windows locked-file cleanup error because the
+  service was not yet covered by teardown. A finalizer and the required
+  schema version fixed the fixture, and the single abandoned synthetic root
+  was inspected and removed. These were test-fixture failures, not evidence
+  of a production repair.
+- On the final test blob, Black (`--line-length 420`), isort (Black profile,
+  line length 420), Flake8 (`--max-line-length=420`) and `git diff --check`
+  passed. The earlier frontend and browser evidence above remains historical;
+  they were not rerun for this test/documentation-only continuation.
