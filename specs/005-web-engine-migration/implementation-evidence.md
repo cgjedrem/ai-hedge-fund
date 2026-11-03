@@ -1060,7 +1060,7 @@ No other session process, checkout, preview or the worktree itself was removed.
 - The capacity 429 is proven at the HTTP/app level, not browser-driven: demo work cannot be held deterministically without a production hook.
 - No observation stream/channel (polling only). Full Python suite, wheel/container, Linux and cross-browser evidence not run for this slice.
 
-## T019 / T020 capacity integration onto PR8 head (2026-11-04)
+## T019 / T020 capacity integration onto PR8 head (2026-11-03)
 
 **Status: integrated bounded slice; T019/T020 remain unchecked (PARTIAL). Migration remains incomplete, NOT READY TO MERGE.**
 
