@@ -1674,3 +1674,16 @@ live-provider acceptance is claimed. The earlier broader backend attempt
 remains **434 passed / 1 failed**, not a pass; its child exited before a
 barrier for a cause not captured. The existing read-only preview is not this
 source artifact.
+
+## T025/T026 historical date correction (2026-11-03)
+
+The T025 and T026 task notes previously gave the future date 2026-11-04.
+The session records show their validation commands were invoked on
+2026-11-03 at 11:48:37.065 and 11:51:06.321 +01:00, respectively. Those
+commands included file edits or formatting before pytest, so these are not
+exact test-start times. The subsequent task commits were `a08fffd` at
+11:48:47 +01:00 and `fcbff96` at 11:51:16 +01:00. Session checkpoint 003
+reports 31 ownership tests and 115 cadence/runner tests passed. Original
+test-end timestamps and standalone stdout/exit records were not located;
+no tests were rerun for this date correction. These historical observations
+are not current-artifact or final migration acceptance.
