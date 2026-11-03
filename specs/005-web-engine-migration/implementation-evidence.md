@@ -924,3 +924,78 @@ No other session process, checkout, preview or the worktree itself was removed.
   409 `ownership-unknown`. Next: a pre-acceptance capacity check that preserves idempotent replay, plus its envelope regression.
 - No observation stream/channel exists (polling only); T023 identity-aware polling and late-response rejection remain open.
 - No current-source wheel/container/installed-artifact, bare-metal Linux or cross-browser evidence for this slice.
+
+## T142 — verified owned-runner reattachment, fencing and stale-owner review (2026-11-03, PARTIAL)
+
+**Status: implemented bounded slice; T142 remains unchecked (PARTIAL).**
+
+### Candidate and isolation
+
+- Started from PR8 head `07f6d8bdb2540db38d113eb62c9993a0736e1c19`; before publication the remote had advanced to
+  `5e7b15e9bc81f6f4fa53e139b3dd256e316d0954` (6 commits incl. T145 runner restart-required summary, none touching runtime runner code; compatible: reattached runners now count as running instead of ownership-unknown); the slice was rebased onto it
+  and re-verified. Non-force fast-forward push to `cgjedrem-vigilant-robot`; no duplicate PR or merge.
+- Windows 11 10.0.26200 / NTFS, Python 3.13.7 isolated venv (`outputs/t142-venv`, gitignored). HOME/USERPROFILE/TEMP/APPDATA
+  under a synthetic test home, `PYTHON_DOTENV_DISABLED=1`, provider/proxy/credential/`HEDGE_FUND*` env scrubbed, loopback only.
+  Only synthetic enrolled roots and test-owned children (`sleep` stand-in or the real offline `owned_runner_child` in a closed
+  market window). No live root, runner, watchtower/umbrella, credential, provider, LLM, broker or network call; ports 8765/49292
+  and other checkouts untouched.
+
+### Behavior implemented (source)
+
+- `runtime/ownership.py`: `launch_command_digest` and `process_launch_fingerprint` — Windows: native command line via
+  `NtQueryInformationProcess` + token user SID; Linux: `/proc` cmdline, euid and cwd.
+- `runtime/owned_runner.py`: the launching manager writes a root-private `owner.json` (schema/protocol/build, root binding, fund,
+  operation ID/digest, nonce hash, command and executable SHA-256, process incarnation, launch fingerprint, manager identity)
+  only after verifying the launched child. A manager without the in-memory handle presents `running`/`stopping` only when:
+  owner/launch/state/control records validate and agree (nonce, operation, root, command), the PID's incarnation matches,
+  the native fingerprint matches, the image is the same executable (digest), this server holds a verified root-owner lease,
+  and a `timeout=0` probe proves the runner reservation is held. Any mismatch → `unknown` (no attach, no stop);
+  dead incarnation → `unknown` with offline `recover_stale_reservation` guidance. A same-nonce terminal record written while
+  the owner exits during verification is presented instead of `unknown`.
+- Stop is cooperative only (control `stop_requested`), fenced by `deployment_lock(timeout=0)`; busy/unobservable admission
+  raises `RunnerOwnershipUnknown` (HTTP 409 `ownership-unknown`) with no control write. Nothing is signalled or killed by PID;
+  public status payloads carry no PID.
+- `runtime/handover.py` (pre-existing bug): stale-recovery creation compared `process_identity` host/namespace with the
+  root's host-identity scheme, so a real child could never be recovered. Creation now checks against
+  `ownership.process_identity(os.getpid())`; reads validate structure, root binding and digest only.
+
+### Results
+
+- Focused (final source, pre-rebase): `test_owned_runner.py`, `test_handover.py`, `test_ownership.py`,
+  `web/test_paper_operations.py` — **58 passed in 255.32 s** (2026-11-03T02:16:36–02:20:57+01:00).
+- Rebased on `5a41b2d`: `test_owned_runner.py`, `test_owned_runner_child.py`,
+  `test_handover.py`, `test_ownership.py`, `web/test_paper_operations.py`, `web/test_app.py`, `web/test_reports.py` —
+  **137 passed in 502.05 s** (2026-11-03T02:21:26–02:29:54+01:00).
+- Final, rebased on `5e7b15e` (same suites + `web/test_settings_provenance.py`): **145 passed in 503.20 s**
+  (2026-11-03T02:30:37–02:39:12+01:00).
+- New unit coverage (`test_owned_runner.py`, 22 tests): restarted + parallel reattach and cooperative stop; reservation
+  not held; PID reuse, foreign command, foreign fingerprint, replaced executable, nonce, operation, wrong root, missing owner,
+  state identity, server command (10 tamper cases, control unchanged); crashed child → stale review; `starting` never adopted;
+  read-only server unknown; stop fenced by deployment lock; admission `OSError` fail-closed; exact owner validator;
+  fingerprint of exact child; terminal record during exit.
+- Integration (`web/test_paper_operations.py`, real offline owned child, synthetic root): service A starts; parallel service B
+  reattaches; A closes (simulated web restart); a fresh `create_app(...)` FastAPI TestClient reports `running` /
+  reattached with no `pid`, CSRF-checked `POST /runner/stop` → `stopping` → `stopped`; child exits 0; ledger unchanged.
+  Crash case: child killed through the test-owned handle → `unknown`/stale review, stop 409 with control unchanged,
+  offline `recover_stale_reservation` → `failed`/`operator-stale-recovery`, ledger unchanged.
+- Runtime + web suite (pre-review-fix source, under heavy concurrent load): **651 passed, 13 skipped, 4 failed in 3392 s**.
+  Three failures (10 s import timeouts ×2, child preflight thread liveness) passed on isolated rerun.
+  `test_actions.py::test_web_halt_does_not_wait_for_fund_work_lock` (1 s responsiveness bound) fails deterministically
+  (6.3–7.8 s) on this machine **also on unmodified HEAD `07f6d8b`** — pre-existing/environmental, not caused by this slice.
+- Lint: Black/isort applied to changed files; flake8 (repo line length) clean on changed lines; remaining Black drift in
+  `handover.py` and E203 in `ownership.py` pre-date this slice. No UI change, so no TS build.
+
+### Independent review
+
+- Review 1: (Medium) admission `OSError`/`RootPathError` could escape as HTTP 500 → caught, fail-closed, regression test
+  added; (Low) restart-test cleanup could leak a child → test-owned handle kill fallback.
+- Final review: no production findings; one test-harness cleanup issue (stop raising skipped the kill fallback) → repaired;
+  both integration tests re-run green.
+
+### Open (keeps T142 unchecked)
+
+- Integration with the canonical headless runner upgrade path and native owned-child fake-canonical completion not proven.
+- Windows verifies command line, token SID, creation time, image path and executable digest; cwd and parent are recorded
+  for audit but not verified. Linux path (cmdline/euid/cwd) has no native run in this slice.
+- Depends on incomplete T015/T021; existing-root read-only uncertainty remains. No browser (Playwright) restart run — API
+  restart proven through FastAPI TestClient only.
