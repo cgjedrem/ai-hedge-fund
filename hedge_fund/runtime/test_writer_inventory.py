@@ -56,10 +56,19 @@ ROOT_PRIMITIVE = "root-primitive: RootContext handle-relative implementation use
 DISABLED = "disabled: legacy writer always raises before writing"
 OUTSIDE_ROOT = "outside-root: writes only to a process temp directory, never an engine root"
 TEST_HARNESS = "test-harness: test-owned demo root creation, validated inside HEDGE_FUND_TEST_ROOT"
+USER_REGISTRY = (
+    "per-user-registry: private per-user SIM account registry outside every fund root, under its own "
+    "OS lock; bind/release also require write_authority plus fund-root registry/deployment lanes"
+)
 
 WRITER_INVENTORY: dict[tuple[str, str, str], tuple[int, str]] = {
     ("backtesting/research.py", "save_result", "mkdir"): (1, PATHS_ROUTED),
     ("backtesting/research.py", "save_result", "write_bytes"): (1, PATHS_ROUTED),
+    ("brokers/account_binding.py", "AccountRegistry._locked", "open_lock_file"): (1, USER_REGISTRY),
+    ("brokers/account_binding.py", "AccountRegistry._locked", "write_bytes"): (1, USER_REGISTRY),
+    ("brokers/account_binding.py", "AccountRegistry.initialize", "mkdir"): (1, USER_REGISTRY),
+    ("brokers/account_binding.py", "AccountRegistry.initialize", "prepare_private_storage"): (1, USER_REGISTRY),
+    ("brokers/account_binding.py", "AccountRegistry.initialize", "write_bytes"): (2, USER_REGISTRY),
     ("brokers/saxo.py", "_refresh_lock", "mkdir"): (2, OUTSIDE_ROOT),
     ("brokers/saxo.py", "_refresh_lock", "rmdir"): (1, OUTSIDE_ROOT),
     ("brokers/saxo.py", "_refresh_lock", "unlink"): (1, OUTSIDE_ROOT),

@@ -331,6 +331,13 @@ def test_non_protocol_native_root_is_ownership_unknown(registry, tmp_path, accou
     assert custody.calls == 0 and _state(registry)["bindings"] == {}
 
 
+def test_enrolled_root_without_out_of_band_exclusion_proof_cannot_bind(registry, roots, account, custody, monkeypatch):
+    monkeypatch.delenv("HEDGE_FUND_TEST_MODE")
+    with pytest.raises(AccountOwnershipUnknown, match="protocol-native"):
+        registry.bind(roots[0], "demo-alpha", account, custody=custody)
+    assert custody.calls == 0 and _state(registry)["bindings"] == {}
+
+
 def test_owned_stopped_release_and_transfer_records_provenance(registry, roots, account, custody):
     root_a, root_b, root_c = roots
     registry.bind(root_a, "demo-alpha", account, custody=custody)
