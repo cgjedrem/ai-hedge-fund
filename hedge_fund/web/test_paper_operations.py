@@ -389,7 +389,37 @@ def test_manual_tick_denies_runner_lane_conflict_without_ledger_change(demo_root
         service.close()
 
     assert conflict.value.status_code == 409
+    assert conflict.value.code == "writer-conflict"
     assert after == before
+
+
+def test_manual_tick_maps_lost_ownership_without_provider_effects(demo_root, monkeypatch):
+    from hedge_fund.runtime.admission import OwnershipUnknown
+
+    calls = []
+    service = DeskService(demo_root, allow_writes=True, network_enabled=True, data_client_factory=lambda: calls.append("provider"))
+    ledger = Ledger(demo_root / "paper" / "demo-quality")
+    before = ledger.sessions()
+    head = ledger.latest().hash
+
+    def deny(*_args, **_kwargs):
+        raise OwnershipUnknown("synthetic authority loss")
+
+    monkeypatch.setattr(service._admission, "manual_session", deny)
+    try:
+        with pytest.raises(ServiceError) as rejected:
+            service.create_manual_tick_preview(
+                "demo-quality",
+                PaperTickPreviewRequest(expected_head=head),
+                operator_session="offline-test-session",
+            )
+    finally:
+        service.close()
+
+    assert rejected.value.status_code == 409
+    assert rejected.value.code == "ownership-unknown"
+    assert calls == []
+    assert ledger.sessions() == before
 
 
 def test_web_saxo_deployment_denied_before_deploy_adapter(demo_root, monkeypatch):
@@ -509,7 +539,7 @@ def test_manual_tick_rejects_stale_head_before_creating_operation(
     assert accepted is None
 
 
-def _start_owned_runner(demo_root, name: str):
+def _start_owned_runner(demo_root, name: str, *, before_accept=None):
     root_path = Path(os.environ["HEDGE_FUND_TEST_ROOT"]) / f"{name}-root"
     root_path.mkdir()
     enroll_synthetic_root(root_path)
@@ -568,6 +598,8 @@ def _start_owned_runner(demo_root, name: str):
         assert preview["due_set"] == []
         assert preview["capture"]["llm_provider"] == "Ollama"
 
+        if before_accept is not None:
+            before_accept(root_path)
         accepted = service.accept_runner_start(
             name,
             RunnerStartAcceptRequest(
@@ -645,6 +677,108 @@ def test_owned_runner_child_starts_and_stops_with_exact_process_identity(
         assert process.wait(timeout=30) == 0
     finally:
         _stop_owned_runner(service, name)
+
+
+def test_real_cli_and_web_tick_conflict_with_owned_runner(demo_root, tmp_path, owned_test_process):
+    from fastapi.testclient import TestClient
+
+    from hedge_fund.web.app import create_app
+
+    name = "owned-runner-race"
+    service = None
+    children = []
+    factory_calls = []
+    ready = tmp_path / "cli-ready"
+    go = tmp_path / "cli-go"
+    result = tmp_path / "cli-result"
+    startup_error = tmp_path / "cli-startup-error"
+
+    def forbidden_data_client():
+        factory_calls.append(True)
+        raise AssertionError("a denied web preview constructed a data client")
+
+    def stage_cli(root_path):
+        script = "\n".join(
+            [
+                "import contextlib, io, sys, time, traceback",
+                "from pathlib import Path",
+                "from hedge_fund import paths, run",
+                f"ready, go, result, startup_error = Path({str(ready)!r}), Path({str(go)!r}), Path({str(result)!r}), Path({str(startup_error)!r})",
+                "original_ensure = paths.ensure_mandates_dir",
+                "def observed_ensure():",
+                "    try:",
+                "        return original_ensure()",
+                "    except Exception as exc:",
+                "        startup_error.write_text(''.join(traceback.format_exception(exc)), encoding='utf-8')",
+                "        raise",
+                "paths.ensure_mandates_dir = observed_ensure",
+                "original_lane = run._paper_lane",
+                "@contextlib.contextmanager",
+                "def gated_lane(participant, fund, lane):",
+                "    if lane == 'manual_session':",
+                "        ready.write_text('ready', encoding='utf-8')",
+                "        deadline = time.monotonic() + 90",
+                "        while not go.exists() and time.monotonic() < deadline: time.sleep(0.01)",
+                "        if not go.exists(): sys.exit(3)",
+                "    with original_lane(participant, fund, lane):",
+                "        yield",
+                "run._paper_lane = gated_lane",
+                f"sys.argv = ['aihf', '--root', {str(root_path)!r}, '--enable-network', 'paper', 'tick', {name!r}]",
+                "stderr = io.StringIO()",
+                "with contextlib.redirect_stderr(stderr):",
+                "    try:",
+                "        run.main()",
+                "    except SystemExit as exc:",
+                "        outcome = str(exc.code)",
+                "    else:",
+                "        outcome = 'returned'",
+                "result.write_text(outcome + '\\n' + stderr.getvalue(), encoding='utf-8')",
+            ]
+        )
+        child = owned_test_process(script)
+        children.append(child)
+        deadline = time.monotonic() + 30
+        while not ready.exists() and child.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        outcome = result.read_text(encoding="utf-8") if result.exists() else "no CLI result"
+        startup = startup_error.read_text(encoding="utf-8") if startup_error.exists() else "no startup exception"
+        assert ready.exists(), f"CLI child failed before manual admission: {child.poll()}; {outcome}; {startup}"
+
+    try:
+        service, root_path, session_record, head, accepted = _start_owned_runner(demo_root, name, before_accept=stage_cli)
+        completed = _wait_for_operation(service, accepted["operation_id"])
+        assert completed["status"] == "completed", completed.get("error")
+        runner = service.runner_status(name)
+        assert runner["status"] == "running"
+        paper_dir = root_path / "paper" / name
+        before = {path.relative_to(paper_dir).as_posix(): path.read_bytes() for path in paper_dir.rglob("*") if path.is_file()}
+
+        app = create_app(root=root_path, allow_writes=True, network_enabled=True, data_client_factory=forbidden_data_client)
+        with TestClient(app, client=("127.0.0.1", 50000)) as client:
+            capability = client.get("/api/capabilities", headers={"host": "127.0.0.1"}).json()
+            headers = {
+                "host": "127.0.0.1",
+                "origin": "http://127.0.0.1",
+                "x-csrf-token": capability["mutation_token"],
+            }
+            go.write_text("go", encoding="utf-8")
+            response = client.post(f"/api/paper/{name}/tick/preview", headers=headers, json={"expected_head": head})
+            assert children[0].wait(timeout=30) == 0
+
+        assert response.status_code == 409
+        assert response.json()["code"] == "writer-conflict"
+        cli_outcome = result.read_text(encoding="utf-8")
+        assert cli_outcome.startswith("1\n")
+        assert "manual session is busy or unavailable" in cli_outcome
+        assert factory_calls == []
+        assert service.runner_status(name)["status"] == "running"
+        assert Ledger(paper_dir).sessions() == [session_record.session]
+        assert {path.relative_to(paper_dir).as_posix(): path.read_bytes() for path in paper_dir.rglob("*") if path.is_file()} == before
+    finally:
+        if children and not go.exists():
+            go.write_text("go", encoding="utf-8")
+        if service is not None:
+            _stop_owned_runner(service, name)
 
 
 def test_owned_runner_readiness_timeout_fails_closed_and_stops_child(

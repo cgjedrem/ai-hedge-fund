@@ -17,8 +17,9 @@ from hedge_fund.runtime.admission import (
     PROTOCOL_VERSION,
     RootOwnerLease,
 )
-from hedge_fund.runtime.handover import root_binding
+from hedge_fund.runtime.handover import enroll_fresh, root_binding
 from hedge_fund.runtime.owned_runner import (
+    OwnedRunnerError,
     OwnedRunnerManager,
     read_runner_record,
     REATTACHED_REASON,
@@ -116,6 +117,28 @@ def test_runner_record_validators_require_timezone_aware_timestamps(tmp_path):
 
 
 _FUND = "synthetic-runner"
+
+
+@pytest.mark.parametrize("kind", ["launch", "state", "control"])
+@pytest.mark.parametrize("revocation", ["legacy-runner", "exclusion-lost"])
+def test_runner_record_write_denies_revoked_root_authority(tmp_path, monkeypatch, kind, revocation):
+    root_path = tmp_path / "root"
+    root_path.mkdir()
+    with RootContext.open(root_path) as root:
+        enroll_fresh(root)
+        with RootOwnerLease.acquire(root):
+            root.mkdir(f"{RUNNER_ROOT}/{runner_key(_FUND)}", parents=True)
+            write_runner_record(root, _FUND, kind, {"version": "before"})
+            before = read_runner_record(root, _FUND, kind)
+            if revocation == "legacy-runner":
+                root.mkdir(f"paper/{_FUND}", parents=True)
+                (root_path / "paper" / _FUND / "runner.pid").write_text("unverified", encoding="utf-8")
+            else:
+                monkeypatch.delenv("HEDGE_FUND_TEST_MODE")
+
+            with pytest.raises(OwnedRunnerError, match="authority"):
+                write_runner_record(root, _FUND, kind, {"version": "after"})
+            assert read_runner_record(root, _FUND, kind) == before
 
 
 def _synthetic_command(marker: str) -> list[str]:

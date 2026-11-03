@@ -10,6 +10,7 @@ real fund is touched.
 
 from __future__ import annotations
 
+import os
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -320,6 +321,30 @@ def test_legacy_runner_presence_denies_every_racing_writer(race_root, tmp_path, 
             pytest.fail("legacy presence must make the whole root read-only")
     assert _recorded(root, "alpha") == []
     assert _recorded(root, "beta") == []
+
+
+@pytest.mark.parametrize("revocation", ["legacy-runner", "exclusion-proof"])
+def test_authority_revoked_across_processes_blocks_an_admitted_append(race_root, tmp_path, owned_test_process, revocation):
+    root, _admission = race_root
+    marker = Path(os.environ["HEDGE_FUND_TEST_ROOT"]) / ".test-owned"
+    moved_marker = tmp_path / "revoked-test-marker"
+    record = _record("alpha")
+    with _session_held_by_child(owned_test_process, tmp_path, root, "alpha", record, f"revoked-{revocation}") as (racer, release):
+        try:
+            if revocation == "legacy-runner":
+                (root / "paper" / "alpha" / "runner.pid").write_text("unverified", encoding="utf-8")
+                reason = "legacy-runner-present"
+            else:
+                marker.rename(moved_marker)
+                reason = "out-of-band-exclusion-unproven"
+            with RootContext.open(root) as context:
+                assert write_authority(context) == {"authority": "ownership-unknown", "reason": reason}
+            release.write_text("release", encoding="utf-8")
+            assert racer.wait_final() == "ledger-error"
+            assert _recorded(root, "alpha") == []
+        finally:
+            if moved_marker.exists():
+                moved_marker.rename(marker)
 
 
 def test_halt_and_verdict_lanes_stay_responsive_under_research_saturation(race_root, tmp_path, owned_test_process):

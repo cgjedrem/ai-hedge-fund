@@ -47,8 +47,8 @@ Never include credentials, unsafe paths or raw provider errors.
 | 429 capacity-denied / budget-exhausted | Bounded capacity or authorization limits reached; stop before next call/session. |
 | 503 observation-conflict / assets-unavailable | Retry read only, or actionable installation failure; no fallback/TUI/mutation. |
 
-Implementation notes (2026-11-02 error-recovery slice and 2026-11-03 capacity slice, source-tested;
-429 `budget-exhausted` still unproven):
+Implementation notes (2026-11-02 error-recovery slice and 2026-11-03 capacity and bounded
+valuation slices, source-tested):
 
 - Optional `subject_id`, `request_id` and `current_head` are echoed only when they match bounded
   opaque-token patterns; anything else is dropped, never repaired or echoed.
@@ -91,8 +91,15 @@ Implementation notes (2026-11-02 error-recovery slice and 2026-11-03 capacity sl
   `assets-unavailable`, as an integer from 1 to 300 seconds. The client ignores out-of-bound hints
   and releases a pending identity only for an echoed same-request `capacity-denied` (or 410
   `expired-confirmation`).
-- Gap: no production site emits 429 `budget-exhausted` yet. Lifecycle, halt and verdict writes
-  have no capacity pool.
+- A synchronous valuation refresh returns 429 `budget-exhausted` if its operation-local
+  provider budget is exhausted. It stops before the denied transport and publishes no new
+  valuation; earlier provider calls may already have completed. There is no `Retry-After` or
+  assumed reset window, and the client does not retry the mutation automatically. This is not
+  a cumulative spend cap or a claim that background operations emit the same HTTP response.
+- A manual paper preview maps an occupied admission lane to 409 `writer-conflict` and unavailable
+  ownership to `ownership-unknown`. A denial during lane acquisition starts no provider; if
+  authority is lost later, earlier calls may already have occurred.
+- Lifecycle, halt and verdict writes have no capacity pool.
 
 ## Resource and action matrix
 

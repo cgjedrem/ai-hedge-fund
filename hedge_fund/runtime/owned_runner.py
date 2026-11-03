@@ -28,7 +28,9 @@ from hedge_fund.runtime.admission import (
 from hedge_fund.runtime.capture import FrozenCapture
 from hedge_fund.runtime.configuration import build_child_environment
 from hedge_fund.runtime.handover import (
+    HandoverError,
     require_enrollment,
+    require_write_authority,
     root_binding,
     verify_root_inventory,
 )
@@ -885,6 +887,10 @@ def _write_record(root: RootContext, path: str, value: dict[str, Any]) -> None:
     ).encode("utf-8")
     if len(payload) > _MAX_RECORD_BYTES:
         raise OwnedRunnerError("runner record exceeds its bound")
+    try:
+        require_write_authority(root)
+    except (HandoverError, OSError, RootPathError):
+        raise OwnedRunnerError("runner write authority is unavailable") from None
     try:
         root.write_bytes(path, payload, mode=0o600)
     except (OSError, RootPathError):

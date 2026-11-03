@@ -32,7 +32,7 @@ const CODE_GUIDANCE: Partial<Record<ApiErrorCode, string>> = {
   "readiness-denied": "Readiness checks denied this request. Review provider, model or budget settings.",
   "protected-root": "This storage location is protected and cannot be changed from the web desk.",
   "broker-not-web-supported": "Only local paper operations are supported from the web desk.",
-  "budget-exhausted": "The configured budget is exhausted. Nothing was submitted.",
+  "budget-exhausted": "The operation's provider budget is exhausted. Earlier calls may have completed; review the limits before trying again.",
   "capacity-denied": "Operation capacity is full. Nothing was accepted or started. Wait for running operations to finish, then review and submit again.",
 };
 

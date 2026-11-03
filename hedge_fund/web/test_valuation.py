@@ -3,9 +3,11 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from threading import Event, Lock
+from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 
+from hedge_fund.data import yfinance_client
 from hedge_fund.data.models import PriceSnapshot
 from hedge_fund.paper.ledger import Ledger
 from hedge_fund.runtime.admission import AdmissionCoordinator, RootOwnerLease
@@ -214,6 +216,57 @@ def test_refresh_returns_estimate_without_changing_recorded_series(demo_root):
     assert after["scorecard"] == before["scorecard"]
     assert after["live_value"]["value"] == estimate["value"]
     assert observed.json()["request_id"] == estimate["request_id"]
+
+
+def test_refresh_returns_429_when_guarded_provider_budget_is_exhausted(demo_root, monkeypatch):
+    import curl_cffi.requests
+
+    import hedge_fund.web.services as web_services
+
+    attempts = []
+
+    def fake_transport(_session, method, url, **_kwargs):
+        attempts.append((method, url))
+        return SimpleNamespace(status_code=200)
+
+    class MultipleRequestTicker:
+        def __init__(self, _ticker, *, session):
+            self.session = session
+
+        @property
+        def fast_info(self):
+            for _ in range(11):
+                self.session.get("https://query1.finance.yahoo.com/v8/finance/chart/AAPL")
+            return SimpleNamespace(last_price=110.0, previous_close=105.0)
+
+    monkeypatch.setattr(curl_cffi.requests.Session, "_request_once", fake_transport)
+    monkeypatch.setattr(yfinance_client, "_YfData", lambda session: None)
+    monkeypatch.setattr(yfinance_client.yf, "Ticker", MultipleRequestTicker)
+    monkeypatch.setattr(web_services, "MAX_VALUATION_POSITIONS", 1)
+
+    paper = demo_root / "paper" / "demo-quality"
+    before_files = {path.relative_to(paper): path.read_bytes() for path in paper.rglob("*") if path.is_file()}
+    app = create_app(root=demo_root, allow_writes=True, network_enabled=True, demo=True)
+    with TestClient(app, client=("127.0.0.1", 50000)) as client:
+        headers = _mutation_headers(client)
+        detail = client.get("/api/paper/demo-quality", headers={"host": "127.0.0.1"}).json()
+        assert [row["ticker"] for row in detail["positions"]] == ["AAPL"]
+        response = client.post(
+            "/api/paper/demo-quality/valuation",
+            headers=headers,
+            json={"expected_head": detail["last_record_hash"]},
+        )
+        observed = client.get("/api/paper/demo-quality/valuation", headers={"host": "127.0.0.1"})
+
+    assert response.status_code == 429
+    assert response.json()["code"] == "budget-exhausted"
+    assert response.json()["retry_policy"] == "none"
+    assert response.json()["subject_id"] == "demo-quality"
+    assert "retry-after" not in response.headers
+    assert str(demo_root) not in response.text
+    assert len(attempts) == 10
+    assert observed.json()["status"] == "unavailable"
+    assert {path.relative_to(paper): path.read_bytes() for path in paper.rglob("*") if path.is_file()} == before_files
 
 
 def test_refresh_discards_result_when_ledger_head_changes_during_quote(demo_root):

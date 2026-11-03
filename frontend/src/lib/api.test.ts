@@ -345,6 +345,13 @@ it("permanent faults never offer a retry action", () => {
   expect(toActionableError(new ApiError("Corrupt.", 423, { code: "replay-corrupt", retryPolicy: "inspect-status" })).action).toBe("inspect-status");
 });
 
+it("does not claim that budget exhaustion undoes earlier provider calls", () => {
+  const error = toActionableError(new ApiError("Budget exhausted.", 429, { code: "budget-exhausted", retryPolicy: "none" }));
+  expect(error.action).toBeNull();
+  expect(error.guidance).toMatch(/Earlier calls may have completed/);
+  expect(error.guidance).not.toMatch(/nothing was submitted/i);
+});
+
 it("never claims session renewal or nothing-submitted for a non-session reload conflict", () => {
   const conflict = toActionableError(new ApiError("Fund could not be halted.", 409, { code: "request-conflict", retryPolicy: "reload" }));
   expect(conflict.guidance).not.toMatch(/session was renewed|Nothing was submitted/);

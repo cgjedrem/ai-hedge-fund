@@ -261,9 +261,11 @@ test-mode environment variables a same-account process could set — that grants
 process could not already write directly, but it is not an isolation proof; (7) `aihf-web
 --demo` seeding is a mutation, so outside the synthetic harness it exits before enrollment
 with an A3 explanation (the 2026-11-01 wheel demo smoke predates A3 and no longer
-reproduces); (8) owned-runner `write_runner_record` status writes rely on the owner lease
-taken at child start, with no per-write authority re-check (unreachable in production, where
-the lease is denied). T015/T021 stay open
+reproduces); (8) owned-runner record writes now recheck root write authority immediately
+before publication, but that helper does not itself verify a matching held owner lease and the
+check does not exclude an uncooperative writer racing after it. Runner provider dispatch also
+revalidates the held owner before each new transport, and an unpublishable terminal status
+causes the child to fail rather than report success. T015/T021 stay open
 until a production basis is implemented and evidenced.
 
 Scoped archive/restore uses registry-before-object admission and a retained

@@ -76,8 +76,10 @@ from hedge_fund.pipeline.session import (
 from hedge_fund.runtime.admission import (
     AdmissionCoordinator,
     AdmissionError,
+    OwnershipUnknown,
     paper_approval_transition,
     RootOwnerLease,
+    WriterConflict,
 )
 from hedge_fund.runtime.capture import freeze_capture, FrozenCapture
 from hedge_fund.runtime.configuration import (
@@ -139,6 +141,7 @@ from hedge_fund.runtime.owned_runner import (
 )
 from hedge_fund.runtime.policy import (
     AuthorizationDenied,
+    BudgetDenied,
     classify_provider,
     KEN_FRENCH_BREAKPOINTS_TARGET,
     ProviderClass,
@@ -1724,8 +1727,17 @@ class DeskService:
                                 errors[ticker] = "InvalidQuote"
                             else:
                                 quotes[ticker] = quote
+                        except BudgetDenied:
+                            raise
                         except Exception as exc:
                             errors[ticker] = type(exc).__name__
+            except BudgetDenied:
+                raise ServiceError(
+                    429,
+                    "The valuation's authorized provider budget was exhausted; no further quotes were requested.",
+                    code="budget-exhausted",
+                    subject_id=normalized,
+                ) from None
             except Exception as exc:
                 errors.update({ticker: type(exc).__name__ for ticker in positions})
 
@@ -3197,6 +3209,10 @@ class DeskService:
         try:
             with self._admission.manual_session(name, timeout=0.1):
                 yield
+        except WriterConflict:
+            raise ServiceError(409, "Paper session conflicts with another writer.", code="writer-conflict") from None
+        except OwnershipUnknown:
+            raise ServiceError(409, "Paper session ownership is unavailable.", code="ownership-unknown") from None
         except AdmissionError:
             raise ServiceError(409, "Paper session admission is unavailable.") from None
 

@@ -27,6 +27,7 @@ from hedge_fund.paper.tick import next_session, tick
 from hedge_fund.pipeline.session import code_version, mandate_hash
 from hedge_fund.runtime.admission import (
     AdmissionCoordinator,
+    AdmissionError,
     PaperPreflightBusy,
     PROTOCOL_VERSION,
     RootOwnerLease,
@@ -84,8 +85,8 @@ def run_owned_runner(
     root: RootContext,
     fund: str,
     *,
-    data_client_factory: Callable[[FrozenCapture, RootContext], object] | None = None,
-    build_fund: Callable[[FundSpec, FrozenCapture, RootContext], Fund] | None = None,
+    data_client_factory: Callable[[FrozenCapture, RootContext, ProviderDispatch], object] | None = None,
+    build_fund: Callable[[FundSpec, FrozenCapture, RootContext, ProviderDispatch], Fund] | None = None,
     now: Callable[[], datetime] | None = None,
     sleep: Callable[[float], None] | None = None,
     resolver=None,
@@ -301,6 +302,10 @@ def _runner_loop(
             raise AuthorizationDenied("runner deadline expired")
         if stop_event.is_set() and authorization.sessions_started == 0:
             raise AuthorizationDenied("runner stop was requested")
+        try:
+            admission.require_root_owner()
+        except AdmissionError as exc:
+            raise AuthorizationDenied("runner write authority is unavailable") from exc
         root.revalidate()
         require_enrollment(root)
         verify_ledger_head(root, fund)
@@ -493,8 +498,8 @@ def _runner_loop(
         status["last_session"] = last_session
         try:
             _write_status(root, fund, nonce_hash, status)
-        except Exception:
-            pass
+        except Exception as exc:
+            raise OwnedRunnerError("runner terminal status could not be published") from exc
 
 
 def _execute_session(

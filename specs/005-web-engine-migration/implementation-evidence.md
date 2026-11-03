@@ -1431,3 +1431,92 @@ Earlier full-suite counts belong to superseded SHAs and are not evidence for thi
   - the POSIX unlink fence;
   - the Saxo lock and credential file.
 - **Historical demo smoke.** The 2026-11-01 wheel demo smoke predates A3. The demo now requires the test harness.
+
+## T019–T021/T027 scoped continuation (2026-11-03)
+
+**Partial, not migration acceptance.** T015 and T021 remain open because no
+production exclusion basis exists. T019/T020 retain open dependencies and
+coverage gaps; T024 remains blocked; T027 still lacks the complete real
+CLI/web/runner/redo/archive and fill-race matrix. T023, T025, T026 and T028
+were previously checked; this continuation does not change task markers.
+
+| Field | Evidence |
+| --- | --- |
+| Source | Base `3c6553156acb1b0add94b3243c8df81416390963`; final dirty code/test diff Git blob `3dad693f6bc210b0a4e8af23f04ade4e4a0f74fd`, computed with `git diff --binary -- hedge_fund frontend \| git hash-object --stdin`. Documentation is excluded from that identity. |
+| Environment | Windows 11 Enterprise build 26200, NTFS worktree; Python 3.13.7; Node 22.13.1; npm 10.9.2. Python tests use marked synthetic roots, isolated HOME/TEMP, cleared credentials/provider and proxy overrides, disabled dotenv, and the test harness's non-loopback network guard. |
+| Execution | Direct source-run and frontend build by this session; no installed wheel, real fund, real provider/LLM, paid request or production writer was exercised. The cross-process tests start only harness-owned children. |
+| Runtime bounds | Existing production roots remain read-only. Rechecks do not establish OS-account/ACL/sandbox exclusion and cannot undo already-issued effects. |
+
+### Changes and observed targeted scenarios
+
+- Valuation refresh now returns 429 `budget-exhausted` with no automatic retry
+  hint when its operation-local dispatch budget is exhausted. A real guarded
+  Yahoo session with fake underlying transport makes ten allowed attempts and
+  denies the eleventh before fake I/O; no new valuation or paper-file change
+  results. Earlier calls may have completed. This is not a global spend cap.
+- Runner-record publication rechecks root write authority. A running synthetic
+  runner now rechecks its owner before each new provider dispatch and fails
+  instead of returning success if terminal status cannot be published. The
+  three stop/legacy-marker/exclusion-loss variants passed in **22.70 s**;
+  they preserve the pre-existing in-flight call but deny a subsequent dispatch,
+  leave the ledger and last published runner state unchanged on revocation,
+  and surface a runner error. Six record-write cases and two actual-child
+  admitted-append cases cover both legacy markers and lost exclusion proof.
+- A barrier-synchronized synthetic **real CLI plus HTTP web preview plus owned
+  runner child** test denies both competing manual ticks, with no new session
+  or paper-file change and no web provider construction. The final complete
+  paper-operation file passed **19 tests in 243.31 s**, followed by five
+  independent repeats of that race (all passed; **20.80, 21.34, 20.55, 32.25
+  and 25.94 s**). A second real-child test passed in
+  **10.05 s**: web Halt fences a CLI approval paused after pending mailbox
+  publication, leaves no actionable verdict, records expiry against the
+  original decision hash and leaves the ledger records unchanged. Neither
+  test proves the complete domain-writer or duplicate-fill matrix.
+- The manual preview now distinguishes an occupied lane (`writer-conflict`)
+  from unknown ownership (`ownership-unknown`). The API contract documents
+  that a pre-admission denial has no provider effect; a later failure cannot
+  retroactively cancel earlier calls.
+- Expected-red checks exposed the swallowed runner error, the missing
+  dispatch exclusion check, and the generic conflict response. A broader
+  isolated run on code/test diff `95ab0a246343c64fc825013e7f2ceeab9abbf4b5`
+  returned **434 passed, 1 failed in 966.75 s**: the CLI exited before the
+  race barrier, and that run did not capture the precise startup cause.
+  Earlier, a separate attempt showed an admission denial during CLI startup;
+  five diagnostic repeats and a full paper-operation run then passed. The
+  final test stages CLI startup and its real manual-lane barrier before
+  launching the owned runner, captures any startup error, and does not retry
+  the mutation. Only test sequencing changed after the broader run; its
+  failure is not counted as a full-suite pass.
+
+### Frontend and style
+
+- With isolated HOME/TEMP, cleared credentials and proxies, disabled dotenv
+  and offline npm, `npm test`: **13 files, 214 tests passed**, Vitest duration
+  **79.04 s**, start 2026-11-03 15:33:10 local. `npm run build`: TypeScript
+  check passed; Vite transformed **2,317 modules**, built in **33.16 s**, exit 0. The
+  1,008.95 kB minified JavaScript chunk triggered Vite's non-fatal size warning.
+- Source-built static artifacts: `index.html` 468 bytes, SHA-256
+  `47ca1603c73c327d3ad74adc1b666a9b23f34a7038d572e9ec44313e49877375`;
+  `index-B_xGBpOx.css` 25,746 bytes,
+  `83c2733e73c333dc782921d45d87f8b339369492ecfd925dad7e9f76a6b5e604`;
+  `index-B2Az4k56.js` 1,008,953 bytes,
+  `429c17a09721ed4b77bef0c087e8a10cc21b2c8de6f1b9cb3bd3eb3b53259c54`.
+  This build does not constitute installed-artifact acceptance.
+- The owned, network-disabled browser fixture built three files (1,035,167
+  bytes, aggregate SHA-256
+  `bbfbf686c1b100e976c5c9be0ed6c7592e82de93febc88ef48deb865c28dee14`)
+  and used loopback port 8876. Three real-API recovery scenarios passed in
+  **18.4 s**: stale lifecycle review, operator-session renewal without
+  resubmission, and read-only reconnect. The server process and fixture root
+  were absent afterward. An initial broader filename match also ran
+  `operation-recovery.spec.ts` concurrently: one test passed, the stale-review
+  case failed with mandate writer admission unavailable, and two serial
+  cases did not run. The three-case one-worker rerun above passed; the first
+  run is not counted as a pass and the exact cause of its contention is not
+  independently proven.
+- Black changed-line checks and the other changed Python files passed;
+  isort passed on the baseline-clean changed files; flake8 with a 420-character
+  limit and `git diff --check` passed. Full-file Black flags pre-existing formatting
+  in `owned_runner_child.py` and `test_actions.py`; isort flags a pre-existing
+  import layout in `test_writer_races.py`. Each was also verified at the base
+  revision and is not attributed to this continuation.

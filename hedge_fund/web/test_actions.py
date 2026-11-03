@@ -977,6 +977,73 @@ def test_web_halt_fences_an_inflight_verdict_before_it_commits(tmp_path, monkeyp
     assert ledger.resolve_approval(latest.decision.as_of, latest.hash)[0] is None
 
 
+def test_web_halt_fences_cli_approval_publication_across_processes(write_client, demo_root, tmp_path, owned_test_process):
+    import time
+
+    from hedge_fund.runtime.admission import MAX_CONTROL_WAIT_SECONDS
+
+    client, headers = write_client
+    directory = demo_root / "paper" / "demo-quality"
+    ledger = Ledger(directory)
+    latest = ledger.latest()
+    before_sessions = ledger.sessions()
+    before_records = {path.name: path.read_bytes() for path in (directory / "ledger").glob("*.json")}
+    ready = tmp_path / "approval-pending"
+    release = tmp_path / "approval-release"
+    result = tmp_path / "approval-result"
+    script = "\n".join(
+        [
+            "import json, sys, time",
+            "from pathlib import Path",
+            "import hedge_fund.paper.ledger as ledger_module",
+            "from hedge_fund import run",
+            f"ready, release, result = Path({str(ready)!r}), Path({str(release)!r}), Path({str(result)!r})",
+            "original_write = ledger_module.write_atomic",
+            "def paused_write(path, text, **kwargs):",
+            "    written = original_write(path, text, **kwargs)",
+            "    if Path(path).name == 'pending-approval.json' and json.loads(text).get('pending') is True:",
+            "        ready.write_text('pending', encoding='utf-8')",
+            "        deadline = time.monotonic() + 30",
+            "        while not release.exists() and time.monotonic() < deadline: time.sleep(0.01)",
+            "        if not release.exists(): raise TimeoutError('approval release missing')",
+            "    return written",
+            "ledger_module.write_atomic = paused_write",
+            f"sys.argv = ['aihf', '--root', {str(demo_root)!r}, 'paper', 'approve', 'demo-quality']",
+            "try:",
+            "    run.main()",
+            "except SystemExit as exc:",
+            "    outcome = str(exc.code)",
+            "else:",
+            "    outcome = 'returned'",
+            "result.write_text(outcome, encoding='utf-8')",
+        ]
+    )
+    child = owned_test_process(script)
+    try:
+        deadline = time.monotonic() + 30
+        while not ready.exists() and child.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert ready.exists(), f"CLI approval did not reach pending publication: {child.poll()}"
+        started = time.monotonic()
+        response = client.post("/api/paper/demo-quality/halt", headers=headers, json={"reason": "synthetic emergency"})
+        elapsed = time.monotonic() - started
+        assert response.status_code == 200
+        assert elapsed < MAX_CONTROL_WAIT_SECONDS + 5
+    finally:
+        release.write_text("release", encoding="utf-8")
+        assert child.wait(timeout=30) == 0
+
+    assert result.read_text(encoding="utf-8") == "1"
+    assert ledger.halted() == "synthetic emergency"
+    assert ledger.approval() is None
+    assert ledger.resolve_approval(latest.decision.as_of, latest.hash)[0] is None
+    assert ledger.sessions() == before_sessions
+    assert {path.name: path.read_bytes() for path in (directory / "ledger").glob("*.json")} == before_records
+    event = ledger._latest_approval_event(latest.decision.as_of, latest.hash, strict=True)
+    assert event["kind"] == "expire"
+    assert event["decision_hash"] == latest.hash
+
+
 def test_halt_cannot_acknowledge_during_verdict_commit_before_a_publisher_crash(tmp_path, monkeypatch):
     from threading import Event, Thread
 

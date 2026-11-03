@@ -16,6 +16,7 @@ from hedge_fund.runtime.capture import freeze_capture
 from hedge_fund.runtime.configuration import resolve_settings
 from hedge_fund.runtime.handover import enroll_fresh, record_ledger_head, root_binding
 from hedge_fund.runtime.owned_runner import (
+    OwnedRunnerError,
     read_runner_record,
     runner_key,
     RUNNER_ROOT,
@@ -23,7 +24,7 @@ from hedge_fund.runtime.owned_runner import (
 )
 from hedge_fund.runtime.owned_runner_child import run_owned_runner
 from hedge_fund.runtime.ownership import current_process_identity
-from hedge_fund.runtime.policy import ProviderTarget
+from hedge_fund.runtime.policy import AuthorizationDenied, ProviderTarget
 from hedge_fund.runtime.root import RootContext
 
 _INITIAL_SESSION = "2024-06-07"
@@ -36,6 +37,7 @@ class _OfflineDataClient:
         self.started = threading.Event()
         self.release = threading.Event()
         self._blocked = False
+        self.calls = []
 
     def __enter__(self):
         return self
@@ -44,6 +46,7 @@ class _OfflineDataClient:
         return None
 
     def get_prices(self, ticker, start_date, end_date, **_kwargs):
+        self.calls.append(ticker)
         if ticker == "AAPL" and not self._blocked:
             self._blocked = True
             self.started.set()
@@ -203,7 +206,8 @@ def _install_runner_records(root, fund, capture, last_session):
     return nonce_hash
 
 
-def test_stop_during_inflight_session_finishes_once_then_stops(tmp_path):
+@pytest.mark.parametrize("revocation", ["none", "legacy-runner", "exclusion-lost"])
+def test_stop_during_inflight_session_finishes_once_then_stops(tmp_path, monkeypatch, revocation):
     root_path = tmp_path / "root"
     root_path.mkdir()
     data_client = _OfflineDataClient()
@@ -264,16 +268,18 @@ def test_stop_during_inflight_session_finishes_once_then_stops(tmp_path):
                 _INITIAL_SESSION,
             )
             errors = []
+            dispatches = []
+
+            def data_client_factory(_capture, _root, dispatch):
+                dispatches.append(dispatch)
+                return _GuardedOfflineDataClient(data_client, dispatch)
 
             def execute():
                 try:
                     run_owned_runner(
                         root,
                         "alpha",
-                        data_client_factory=lambda _capture, _root, dispatch: _GuardedOfflineDataClient(
-                            data_client,
-                            dispatch,
-                        ),
+                        data_client_factory=data_client_factory,
                         build_fund=_OfflineFund,
                         now=lambda: _RUNNER_NOW,
                         resolver=lambda _host, _port: ["93.184.216.34"],
@@ -285,21 +291,44 @@ def test_stop_during_inflight_session_finishes_once_then_stops(tmp_path):
             worker.start()
             assert data_client.started.wait(timeout=10)
             assert ledger.sessions() == [_INITIAL_SESSION]
-
-            with admission.control_lane("alpha", timeout=0.2):
-                control = read_runner_record(root, "alpha", "control")
-                assert control["nonce_hash"] == nonce_hash
-                control["stop_requested"] = True
-                control["requested_at"] = datetime.now(timezone.utc).isoformat()
-                write_runner_record(root, "alpha", "control", control)
+            before_status = read_runner_record(root, "alpha", "state")
+            before_calls = list(data_client.calls)
+            provider_blocked = False
+            if revocation != "none":
+                if revocation == "legacy-runner":
+                    (directory / "runner.pid").write_text("unverified", encoding="utf-8")
+                else:
+                    monkeypatch.delenv("HEDGE_FUND_TEST_MODE")
+                try:
+                    dispatches[0].authorize_transport(
+                        ProviderTarget(kind="data", provider="yfinance"),
+                        url="https://query1.finance.yahoo.com/mock",
+                        method="GET",
+                    )
+                except AuthorizationDenied:
+                    provider_blocked = True
+            else:
+                with admission.control_lane("alpha", timeout=0.2):
+                    control = read_runner_record(root, "alpha", "control")
+                    assert control["nonce_hash"] == nonce_hash
+                    control["stop_requested"] = True
+                    control["requested_at"] = datetime.now(timezone.utc).isoformat()
+                    write_runner_record(root, "alpha", "control", control)
 
             data_client.release.set()
             worker.join(timeout=10)
             assert not worker.is_alive()
-            assert errors == []
-
             final = read_runner_record(root, "alpha", "state")
             final_ledger = Ledger(directory)
+            if revocation != "none":
+                assert provider_blocked
+                assert data_client.calls == before_calls
+                assert len(errors) == 1 and isinstance(errors[0], OwnedRunnerError)
+                assert final == before_status
+                assert final_ledger.sessions() == [_INITIAL_SESSION]
+                return
+
+            assert errors == []
             assert final["status"] == "stopped"
             assert final["sessions_completed"] == 1
             assert final["last_session"] == _DUE_SESSION

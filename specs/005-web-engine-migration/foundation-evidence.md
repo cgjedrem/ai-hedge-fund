@@ -2,13 +2,16 @@
 
 ## Result and limits
 
-**T024 BLOCKED; this is a partial checkpoint, not migration acceptance.** T015,
-T019–T021 and T023 remain open, so T024's T002–T023 dependency is not met.
+**T024 BLOCKED; this is a partial checkpoint, not migration acceptance.** At the
+2026-11-02 checkpoint, T015, T019–T021 and T023 were open. T023 has since been
+checked, but T015 and T019–T021 remain open, so T024's T002–T023 dependency is
+still not met.
 In particular, an existing-root attestation and cooperative locks do not prove
 that legacy or out-of-band writers have lost access. Such roots must remain
-read-only when exclusion cannot be established. The production 429 capacity
-and budget path and exhaustive writer integration/races also remain unproven.
-No new host-mutation capability is enabled by this checkpoint.
+read-only when exclusion cannot be established. Later scoped evidence covers
+capacity denial and a synchronous valuation budget denial, not an exhaustive
+budget or writer integration/race matrix. No new host-mutation capability is
+enabled by this checkpoint.
 
 The baseline backend and native observations below ran against
 `32537b23c8428365aa5d39b69e649b2aaeb6b2cc`. The same committed
