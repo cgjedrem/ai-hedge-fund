@@ -58,6 +58,11 @@ One caveat: Yahoo serves fundamentals as reported *now*, not point-in-time
 — so backtests on the free provider leak the future into the past. Keep
 `HEDGE_FUND_DATA_PROVIDER=fd` (the default) for final backtest validation.
 
+If Yahoo's ticker-news endpoint reports an outage, the provider logs a
+warning and tries Yahoo search news, with the same date filters. If search
+also fails or returns nothing after that outage, the error is preserved;
+the provider never silently switches to paid data.
+
 ## How to Run
 
 ### Interactive app
