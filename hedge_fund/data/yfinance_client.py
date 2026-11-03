@@ -546,12 +546,21 @@ class YFinanceClient:
     ) -> list[CompanyNews]:
         """Fetch company news, newest first. Yahoo serves ~100 recent items
         with no historical window, so the date filters only narrow what
-        Yahoo returned — old news is simply absent."""
-        items = self._guarded(
-            f"{ticker} news",
-            lambda: self._ticker(ticker).get_news(count=min(limit, 100), tab="all"),
-            empty=[],
-        )
+        Yahoo returned — old news is simply absent. Search news is used
+        when the ticker endpoint is empty or raises a Yahoo data error."""
+        primary_error = None
+        try:
+            items = self._guarded(
+                f"{ticker} news",
+                lambda: self._ticker(ticker).get_news(count=min(limit, 100), tab="all"),
+                empty=[],
+            )
+        except DataClientError as exc:
+            if not isinstance(exc.__cause__, yf.exceptions.YFDataException):
+                raise
+            logger.warning("%s; trying Yahoo search news", exc)
+            primary_error = exc
+            items = []
         if not items:
             # Some yfinance versions serve an empty list from Ticker.get_news
             # even when headlines exist; the search endpoint still works, so
@@ -567,6 +576,8 @@ class YFinanceClient:
                 or [],
                 empty=[],
             )
+            if not items and primary_error is not None:
+                raise primary_error
         news = []
         for item in items or []:
             mapped = _map_news_item(ticker, item)

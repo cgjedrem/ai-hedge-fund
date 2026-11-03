@@ -686,6 +686,32 @@ def test_news_falls_back_to_search_when_ticker_news_is_empty(monkeypatch):
     assert [n.title for n in news] == ["Flat headline"]
 
 
+def test_news_falls_back_to_search_when_ticker_endpoint_is_down(monkeypatch, caplog):
+    fake = _install(monkeypatch, FakeTicker("TEST", news=YFDataException("*** YAHOO! FINANCE IS CURRENTLY DOWN! ***")))
+    fake.Search = lambda query, news_count=10: SimpleNamespace(news=[NESTED_NEWS, FLAT_NEWS])
+    news = YFinanceClient().get_news("TEST", "2025-01-11", start_date="2025-01-10")
+    assert [n.title for n in news] == ["Nested headline"]
+    assert "search" in caplog.text.lower()
+
+
+def test_news_preserves_failure_when_search_is_empty_after_outage(monkeypatch):
+    fake = _install(monkeypatch, FakeTicker("TEST", news=YFDataException("ticker news unavailable")))
+    fake.Search = lambda query, news_count=10: SimpleNamespace(news=[])
+    with pytest.raises(DataClientError, match="ticker news unavailable"):
+        YFinanceClient().get_news("TEST", "2025-01-11")
+
+
+def test_news_raises_when_search_also_fails(monkeypatch):
+    fake = _install(monkeypatch, FakeTicker("TEST", news=YFDataException("ticker news unavailable")))
+
+    def failed_search(query, news_count=10):
+        raise requests.ConnectionError("search unavailable")
+
+    fake.Search = failed_search
+    with pytest.raises(DataClientError, match="search unavailable"):
+        YFinanceClient().get_news("TEST", "2025-01-11")
+
+
 def test_news_filters_to_the_window(monkeypatch):
     old = {"title": "Old", "publisher": "X", "link": "u", "providerPublishTime": 1733504400}
     undated = {"title": "Undated", "publisher": "X", "link": "u"}

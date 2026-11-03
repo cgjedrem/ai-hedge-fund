@@ -84,6 +84,11 @@ cost bounds and are denied before transport, even when a key is saved.
 Only one paid provider can be authorized per operation; combining paid
 Financial Datasets with TypeSafe in one action is unsupported.
 
+If Yahoo's ticker-news endpoint reports an outage, the provider logs a
+warning and tries Yahoo search news, with the same date filters. If search
+also fails or returns nothing after that outage, the error is preserved;
+the provider never silently switches to paid data.
+
 ## How to Run
 
 ### Interactive app
