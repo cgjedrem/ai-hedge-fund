@@ -17,6 +17,7 @@ from pydantic import (
 )
 
 from hedge_fund.brokers.costs import TradingCosts
+from hedge_fund.llm.cache import PromptCache
 from hedge_fund.risk.limits import RiskLimits
 from hedge_fund.signals import ALPHA_MODEL_REGISTRY, get_investment_approach, LLMAgent
 from hedge_fund.signals.base import AlphaModel
@@ -350,6 +351,8 @@ class Fund:
         spec: FundSpec,
         models: dict[str, list[AlphaModel]] | None = None,
         blind: bool = False,
+        *,
+        cache: PromptCache | None = None,
     ) -> None:
         self.spec = spec
         self.strategies: list[tuple[StrategySpec, list[AlphaModel]]] = []
@@ -362,6 +365,9 @@ class Fund:
                 if m.name not in ALPHA_MODEL_REGISTRY:
                     raise ValueError(f"unknown model {m.name!r} in strategy " f"{strategy.name!r}; available: {sorted(ALPHA_MODEL_REGISTRY)}")
                 cls = ALPHA_MODEL_REGISTRY[m.name]
-                params = {**m.params, "blind": True} if blind and issubclass(cls, LLMAgent) else m.params
+                is_llm = issubclass(cls, LLMAgent)
+                params = {**m.params, "blind": True} if blind and is_llm else m.params
+                if cache is not None and is_llm:
+                    params = {**params, "cache": cache}
                 staff.append(cls(**params))
             self.strategies.append((strategy, staff))

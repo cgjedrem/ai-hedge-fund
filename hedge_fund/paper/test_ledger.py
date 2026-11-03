@@ -214,6 +214,16 @@ def test_approval_mailbox_round_trips_and_logs(tmp_path):
     assert ledger.events()[1]["by"] == "tui"
 
 
+def test_web_approval_actor_round_trips_without_changing_cli_or_tui_values(tmp_path):
+    ledger = Ledger(tmp_path)
+    ledger.set_approval("approve", "2026-10-07", "2" * 64, "web")
+
+    approval = ledger.approval()
+
+    assert approval is not None and approval["by"] == "web"
+    assert ledger.events()[0]["by"] == "web"
+
+
 def test_approval_mailbox_missing_corrupt_and_wrong_verdict_are_absent(tmp_path):
     ledger = Ledger(tmp_path)
     path = tmp_path / "pending-approval.json"

@@ -5,9 +5,10 @@
 #
 #   runner:   docker compose -f docker-compose.yml -f docker-compose.linux.yml up -d runner
 #   TUI:      docker compose -f docker-compose.yml -f docker-compose.linux.yml run --rm tui
+#   Web desk: docker compose -f docker-compose.yml -f docker-compose.linux.yml --profile web up -d web
+#             (still published only on 127.0.0.1:8765)
 #   Web TUI:  docker compose -f docker-compose.yml -f docker-compose.linux.yml up -d tui-web
-#             (serves the TUI on 127.0.0.1:7681; publish it to your tailnet
-#             with `tailscale serve --bg 7681`)
+#             (serves the TUI on 127.0.0.1:7681)
 #
 # See the README's "Home server (Linux + Tailscale)" section.
 
@@ -38,3 +39,9 @@ services:
     environment:
       - OLLAMA_BASE_URL=http://127.0.0.1:11434
     entrypoint: ["ttyd", "-W", "-b", "127.0.0.1", "-p", "7681", "aihf"]
+
+  web:
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      - OLLAMA_BASE_URL=http://host.docker.internal:11434

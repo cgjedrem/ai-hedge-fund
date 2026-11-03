@@ -41,10 +41,27 @@ def ensure_mandates_dir() -> Path:
     return MANDATES_DIR
 
 
-def write_atomic(path: Path, text: str) -> None:
-    """Write *text* to *path* via a sibling temp file and rename, so a crash
-    mid-write leaves the old file intact rather than a truncated one."""
+def write_atomic(path: Path, text: str, *, mode: int | None = None) -> None:
+    """Atomically replace *path*; apply optional mode before writing."""
     path = Path(path)
     tmp = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
-    tmp.write_text(text, encoding="utf-8")
-    os.replace(tmp, path)
+    if mode is not None and (type(mode) is not int or not 0 <= mode <= 0o777):
+        raise ValueError("mode must contain permission bits")
+
+    descriptor = None
+    try:
+        descriptor = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, mode if mode is not None else 0o666)
+        if mode is not None:
+            if os.name == "posix":
+                os.fchmod(descriptor, mode)
+            else:
+                os.chmod(tmp, mode)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            descriptor = None
+            handle.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        if descriptor is not None:
+            os.close(descriptor)
+        tmp.unlink(missing_ok=True)
+        raise

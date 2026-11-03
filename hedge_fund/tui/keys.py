@@ -21,12 +21,13 @@ from __future__ import annotations
 import os
 import re
 import stat
+import unicodedata
 from pathlib import Path
 
 from dotenv import load_dotenv
 
-from hedge_fund.llm import PROVIDER_ENV_VARS, env_var_for  # noqa: F401  (re-export)
-from hedge_fund.paths import ENV_PATH
+from hedge_fund.llm import env_var_for, PROVIDER_ENV_VARS  # noqa: F401  (re-export)
+from hedge_fund.paths import ENV_PATH, write_atomic
 
 
 def apply_credentials() -> None:
@@ -37,21 +38,24 @@ def apply_credentials() -> None:
     load_dotenv(ENV_PATH, override=False)
 
 
-def save_credential(env_var: str, value: str) -> Path:
+def save_credential(env_var: str, value: str, *, path: str | Path | None = None) -> Path:
     """Write one key into .env, replacing its line if present and appending
     otherwise, then export it for this process. Returns the file it wrote.
 
     Everything else in the file survives untouched — this is a line edit, not
     a regenerate.
     """
+    if not re.fullmatch(r"[A-Z][A-Z0-9_]*", env_var):
+        raise ValueError("environment variable name is invalid")
+    if any(unicodedata.category(char) in {"Cc", "Cf"} for char in value):
+        raise ValueError("credential value contains control characters")
+    path = Path(ENV_PATH if path is None else path)
     line = f"{env_var}={_quote(value)}"
-    if ENV_PATH.exists():
-        original = ENV_PATH.read_text()
+    if path.exists():
+        original = path.read_text()
         # Match an assignment at the start of a line, optionally exported and
         # optionally commented-out, so re-saving a disabled key revives it.
-        pattern = re.compile(
-            rf"^[ \t]*#?[ \t]*(?:export[ \t]+)?{re.escape(env_var)}[ \t]*=.*$",
-            re.MULTILINE)
+        pattern = re.compile(rf"^[ \t]*#?[ \t]*(?:export[ \t]+)?{re.escape(env_var)}[ \t]*=.*$", re.MULTILINE)
         updated, count = pattern.subn(lambda _: line, original, count=1)
         if count == 0:
             sep = "" if not original or original.endswith("\n") else "\n"
@@ -59,10 +63,10 @@ def save_credential(env_var: str, value: str) -> Path:
     else:
         updated = f"{line}\n"
 
-    ENV_PATH.write_text(updated)
-    ENV_PATH.chmod(stat.S_IRUSR | stat.S_IWUSR)  # 0600 — secrets are not world-readable
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_atomic(path, updated, mode=stat.S_IRUSR | stat.S_IWUSR)
     os.environ[env_var] = value
-    return ENV_PATH
+    return path
 
 
 def missing_key(provider: str) -> str | None:
