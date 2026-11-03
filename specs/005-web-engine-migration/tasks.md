@@ -14,9 +14,10 @@ spec and plan at `193d16dc754567710c8dd5703e4f427184c9079f`, open main-targeting
 T020, T021, T023, T024, T025, T026, T027 and T028, only T023, T025, T026
 and T028 are checked. T015/T021 still lack proven production out-of-band
 exclusion; T024's foundation prerequisites remain open. T027 now includes an
-actual fake-data paper fill under competing CLI/web admission, plus redo/archive
-admission and saturated-control races, but its foundation prerequisite and
-full race acceptance remain open. T019 has a synchronous valuation
+actual fake-data paper fill under competing CLI/web admission, an executed redo
+while archive admission competes, and saturated-control races. Its foundation
+prerequisite and a real owned-runner due-session/fill race remain open.
+T019 has a synchronous valuation
 `budget-exhausted` emitter with no retry/reset hint; older statements below
 that there is no emitter predate that change. Bounded polling is an allowed
 observation mechanism; no unimplemented push channel is implied.

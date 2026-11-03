@@ -1523,11 +1523,12 @@ were previously checked; this continuation does not change task markers.
 
 ## T027 synthetic admission and fill-race continuation (2026-11-03)
 
-**Partial, not foundation or migration acceptance.** No task checkbox was
-changed. T024's prerequisites remain open. T027 gains actual synthetic fill
-coverage, but the archive/redo case stops after CLI redo admission and before
-redo effects; the owned-runner conflict has no due session. These are not a
-complete real runner/redo/effects matrix.
+**Historical partial result, not foundation or migration acceptance.** No task
+checkbox was changed. At this revision, T027 gained actual synthetic fill
+coverage, but the archive/redo case stopped after CLI redo admission and before
+redo effects; the owned-runner conflict had no due session. The executed-redo
+follow-up below supersedes that scope, but T024 and the runner due-session
+race remain open.
 
 | Field | Evidence |
 | --- | --- |
@@ -1582,3 +1583,31 @@ complete real runner/redo/effects matrix.
   line length 420), Flake8 (`--max-line-length=420`) and `git diff --check`
   passed. The earlier frontend and browser evidence above remains historical;
   they were not rerun for this test/documentation-only continuation.
+
+## T027 executed-redo/archive follow-up (2026-11-03)
+
+**Partial, not foundation or migration acceptance.** On the same approved
+synthetic fund from the prior fill race, a real CLI child was released after
+holding redo admission and actually completed `paper tick --again` with a
+fake data factory and fake analyst. While it held the lane, a reviewed HTTP
+archive returned 409 `writer-conflict`, produced no operation record and
+left paper bytes unchanged. The redo restored and re-executed the original
+approved 500-share AAPL buy: the active ledger still has exactly two sessions
+and one fill, the prior record is retained once under `superseded`, the
+broker book matches the redone ledger, and the original approval was consumed
+only once. Its new head makes the old archive preview stale; retrying that
+review returns 409 `stale-preview` with no operation.
+
+| Field | Evidence |
+| --- | --- |
+| Source under test | Published base `688c58768628604936caff287996684fb50171e7` plus dirty test blob `29df203679834006e9bb1418f90b2b53a39f0e55`; `git diff --binary` blob `6474a58782ff72e712c79f715b12c34e754c4cd0`. No production code or frontend changed. |
+| Environment | Windows 11 Enterprise build 26200, NTFS; Python 3.13.7; test-owned roots/children, isolated HOME/TEMP, credentials/provider and proxy overrides cleared, dotenv disabled and non-loopback network denied. No real fund, external provider/broker or paid/LLM call was used. |
+| Focused results | Initial pass **1 in 22.03 s**; three independent repeats **1 in 21.60, 23.52 and 21.51 s**, all exit 0. |
+| Combined result | The writer-race file plus the adjacent owned-runner conflict, CLI approval/web Halt, capacity, cancellation and stale-archive tests: **20 passed in 150.05 s**, 2026-11-03 16:23:10–16:25:42 local, exit 0. Saturated HTTP verdict was **1.462 s**, Halt **0.540 s** end to end; these are not guarantees for arbitrary storage or scheduling. |
+| Style | Full-file Black and isort at 420 characters, Flake8 at 420 characters and `git diff --check` passed on the test blob. |
+
+The separately tested real owned-runner conflict still has no due session and
+does not execute a fill. T024's foundation prerequisites and production
+out-of-band exclusion remain open, so T027 and the other incomplete tasks
+stay unchecked; no full migration, installed-artifact or production
+acceptance is claimed.

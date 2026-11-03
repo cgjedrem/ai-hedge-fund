@@ -558,7 +558,7 @@ from hedge_fund import run
 from hedge_fund.backtesting.test_fund import FakeAnalyst, FakeDataClient, SERIES, WEEKDAYS
 from hedge_fund.fund import Fund
 
-root, fund, ready, release, result, stage = Path(ROOT), FUND, Path(READY), Path(RELEASE), Path(RESULT), STAGE
+root, fund, ready, release, result, stage, mode = Path(ROOT), FUND, Path(READY), Path(RELEASE), Path(RESULT), STAGE, MODE
 original_load = run._load_runtime
 original_lane = run._paper_lane
 
@@ -596,7 +596,8 @@ output = io.StringIO()
 try:
     with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
         try:
-            run.main(["--root", str(root), "--enable-network", "paper", "tick", fund, "--session", "2024-06-04"])
+            options = ["--again"] if mode == "redo" else ["--session", "2024-06-04"]
+            run.main(["--root", str(root), "--enable-network", "paper", "tick", fund, *options])
         except SystemExit as exc:
             outcome = str(exc.code)
         else:
@@ -630,15 +631,16 @@ result.write_text(outcome + "\\n" + output.getvalue(), encoding="utf-8")
             assert approved.status_code == 200, approved.text
             before_files = _paper_files(root, fund)
 
-            def child_script(stage: str, result: Path) -> str:
+            def child_script(stage: str, result: Path, *, ready_path: Path = ready, release_path: Path = release, mode: str = "tick") -> str:
                 return _render(
                     script,
                     ROOT=str(root),
                     FUND=fund,
-                    READY=str(ready),
-                    RELEASE=str(release),
+                    READY=str(ready_path),
+                    RELEASE=str(release_path),
                     RESULT=str(result),
                     STAGE=stage,
+                    MODE=mode,
                 )
 
             winner = owned_test_process(child_script("winner", winner_result))
@@ -673,6 +675,60 @@ result.write_text(outcome + "\\n" + output.getvalue(), encoding="utf-8")
             book = PaperBroker(root / "paper" / fund / "broker.json")
             assert book.cash() == pytest.approx(recorded.cash)
             assert {ticker: position.shares for ticker, position in book.positions().items()} == recorded.positions
+
+            archive = {"action": "archive", "kind": "deployment", "identity": fund}
+            response = client.post("/api/lifecycle/preview", headers=headers, json=archive)
+            assert response.status_code == 200, response.text
+            preview = response.json()
+            archive_request = {
+                **archive,
+                "request_id": "redo-filled-archive-race",
+                "preview_id": preview["preview_id"],
+                "preview_digest": preview["preview_digest"],
+                "confirmation_token": preview["confirmation_token"],
+                "expected_head": preview["expected_head"],
+            }
+            before_redo = _paper_files(root, fund)
+            redo_ready = tmp_path / "filled-redo-admitted"
+            redo_release = tmp_path / "filled-redo-release"
+            redo_result = tmp_path / "filled-redo-result"
+            redo_child = owned_test_process(child_script("winner", redo_result, ready_path=redo_ready, release_path=redo_release, mode="redo"))
+            try:
+                assert _wait_file(redo_ready, redo_child, "filled CLI redo admission", timeout=60) == "admitted"
+                denied = client.post("/api/lifecycle/accept", headers=headers, json=archive_request)
+                assert denied.status_code == 409, denied.text
+                assert denied.json()["code"] == "writer-conflict"
+                assert client.get("/api/operations/by-request/redo-filled-archive-race", headers=headers).status_code == 404
+                assert _paper_files(root, fund) == before_redo
+            finally:
+                redo_release.write_text("release", encoding="utf-8")
+                assert redo_child.wait(timeout=90) == 0, redo_result.read_text(encoding="utf-8") if redo_result.exists() else "CLI redo failed"
+
+            redo_output = redo_result.read_text(encoding="utf-8")
+            assert redo_output.startswith("returned\n"), redo_output
+            redone = ledger.read("2024-06-04")
+            assert ledger.sessions() == ["2024-06-03", "2024-06-04"]
+            assert redone.hash != recorded.hash and redone.prev_hash == recorded.prev_hash
+            assert redone.executed is not None
+            assert len(redone.executed.fills) == 1
+            assert redone.executed.fills[0].ticker == "AAPL"
+            assert redone.executed.fills[0].side == "buy"
+            assert redone.executed.fills[0].quantity == 500
+            assert len(_recorded_fills(root, fund)) == 1
+            assert ledger.approval() is None
+            events = ledger.events()
+            assert sum(event["kind"] == "consume" for event in events) == 1
+            assert sum(event["kind"] == "redo" for event in events) == 1
+            superseded = list((ledger.records_dir / "superseded").glob("*.json"))
+            assert len(superseded) == 1
+            assert SessionRecord.model_validate_json(superseded[0].read_text()).hash == recorded.hash
+            book = PaperBroker(root / "paper" / fund / "broker.json")
+            assert book.cash() == pytest.approx(redone.cash)
+            assert {ticker: position.shares for ticker, position in book.positions().items()} == redone.positions
+            stale = client.post("/api/lifecycle/accept", headers=headers, json=archive_request)
+            assert stale.status_code == 409, stale.text
+            assert stale.json()["code"] == "stale-preview"
+            assert client.get("/api/operations/by-request/redo-filled-archive-race", headers=headers).status_code == 404
     finally:
         service.close()
 
