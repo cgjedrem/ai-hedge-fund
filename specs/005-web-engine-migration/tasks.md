@@ -325,7 +325,7 @@ rewrite, implicit catch-up or duplicate fake SIM account binding across roots.
 ### Mandatory tests
 
 - [ ] T095 [P] [US4] Add immutable-deploy/exact-scope/archive/restore/replace/collision/protected-name/interrupt regressions in `hedge_fund\paper\test_deployed_broker.py`, new `hedge_fund\runtime\test_lifecycle.py` and `hedge_fund\fund\test_storage.py`; use sibling decoys and expected head/revision/references, require stopped restore and no snapshot/history overwrite.
-- [ ] T096 [P] [US4] Add fake SIM account/environment binding tests in `hedge_fund\brokers\test_account_binding.py` for duplicates within/across roots, unverifiable global exclusivity denial, owned stopped/quiescent release/transfer and no real-brokerage configuration; provisioning grants no execution.
+- [x] T096 [P] [US4] Add fake SIM account/environment binding tests in `hedge_fund\brokers\test_account_binding.py` for duplicates within/across roots, unverifiable global exclusivity denial, owned stopped/quiescent release/transfer and no real-brokerage configuration; provisioning grants no execution.
 - [ ] T097 [P] [US4] Add scoped lifecycle React unit tests in `frontend\src\components\lifecycle-controls.test.tsx` for exact consequences/head/revision/reference review, writer/unknown-owner denial, stopped restore and new linked replacement identity; test template/deployment/research scope cannot be confused.
 - [ ] T098 [P] [US4] Add real-browser lifecycle scenarios in `frontend\e2e\lifecycle.spec.ts` with synthetic sibling decoys, immutable snapshot, revision conflicts, archive/restore/replace, active runner/job references and explicit SIM web mutation denial.
 
