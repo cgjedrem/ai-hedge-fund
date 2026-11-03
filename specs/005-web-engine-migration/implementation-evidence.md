@@ -1137,3 +1137,20 @@ No other session process, checkout, preview or the worktree itself was removed.
   stop, backtest running) reproduce identically on an unmodified temporary `5a41b2d` checkout (desk spec **8 passed, 4 failed**),
   so they are pre-existing at the remote head. `--lifecycle`/`--reports` modes were not rerun after the rebase (unchanged
   harness paths; prior results above). Recorded 2026-11-03T02:23:02.7079614+01:00.
+
+### Second remote advance (incorporated by rebase)
+
+- Before push the remote advanced again `5a41b2d` -> `b36da71` ("serialize reviewed operations and disable legacy backtest
+  starts": async Web Locks `pending.remember` with abort/dismiss, `data/client.py` redaction, TUI backtest refusal). The four
+  slice commits rebased onto `b36da71` with **no conflicts**. In `backtests.tsx`/`paper.tsx` the capacity catch path
+  (`isPreAdmissionDenial` forgets the request identity only for 410 expired confirmation or a same-request 429 `capacity-denied`)
+  now sits after the awaited, lock-serialized `remember`; unknown outcomes keep the identity and nothing is resubmitted.
+- Integrated identity vs `b36da71` (same method, `specs/` excluded): **`9d0b51e31cea37b00c5df7e0ee4dc4cdb1c94d6b5d9dd0aba445c287a5689002`**, **20 paths / 752,031 bytes**.
+- Fresh reruns: pytest `data\test_client_contract.py`, `tui\test_backtest.py`, `web\test_paper_operations.py`,
+  `web\test_app.py`, `web\test_main.py`, `web\test_jobs.py` **153 passed in 669.33 s**; Vitest **12 files, 181 passed**;
+  `npm run build` passed; harness unit **9 passed**; owned `--capacity` **1 passed (30.3 s)**; owned default
+  **22 passed, 4 failed, 6 skipped** (same 4 desk failures as an unmodified temporary `b36da71` checkout: **22 passed, 4 failed,
+  5 skipped**; the extra skip is the mode-gated capacity spec). One earlier head default run additionally failed
+  `operation-coordination.spec.ts:137` (paper-tick two-tab lock); it did not reproduce in four subsequent head runs
+  (2x isolated 12/12, full suite) nor 2x isolated on base -- recorded as an intermittent, unexplained flake, not a pass.
+  Recorded 2026-11-03T02:38:56.7068875+01:00.
