@@ -86,12 +86,12 @@ WRITER_MAP: dict[tuple[str, str, str], Writer] = {
     ("hedge_fund.brokers.paper", "PaperBroker.restore", "write_atomic"): Writer(BOUND, "none", ("hedge_fund/test_run.py::test_enrolled_cli_redo_preserves_guarded_dispatch_and_expires_approval",), "redo-only writer; functional enrolled redo test, no interleaving at restore"),
     ("hedge_fund.brokers.paper", "PaperBroker._save", "write_atomic"): Writer(BOUND, "race", ("hedge_fund/test_run.py::test_enrolled_cli_tick_lane_conflict_leaves_ledger_unchanged", "hedge_fund/web/test_paper_operations.py::test_manual_tick_denies_runner_lane_conflict_without_ledger_change"), BOUND_NOTE),
     # Saxo token refresh lock (user credential scope, not the data root)
-    # per-user SIM account registry (outside any fund root; RootContext on the registry directory under its own OS lock)
+    # test-owned SIM policy simulation (outside any fund root; never production custody authority)
     ("hedge_fund.brokers.account_binding", "AccountRegistry._locked", "write_bytes"): Writer(
         ROOT,
         "race",
-        ("hedge_fund/brokers/test_account_binding.py::test_concurrent_transfers_of_one_release_digest_admit_exactly_one", "hedge_fund/brokers/test_account_binding.py::test_registry_lock_contention_is_busy_without_effects", "hedge_fund/brokers/test_account_binding.py::test_unreadable_or_corrupt_registry_denies_and_inspects_unknown"),
-        "generation-checked state replace under the exclusive registry lock; per-user registry, not a fund-root writer",
+        ("hedge_fund/brokers/test_account_binding.py::test_concurrent_transfers_of_one_release_digest_are_bounded_and_admit_at_most_one", "hedge_fund/brokers/test_account_binding.py::test_registry_lock_contention_is_busy_without_effects", "hedge_fund/brokers/test_account_binding.py::test_unreadable_or_corrupt_registry_denies_and_inspects_unknown"),
+        "generation-checked state replace under the exclusive synthetic registry lock; no production custody authority",
     ),
     ("hedge_fund.brokers.account_binding", "AccountRegistry.initialize", "mkdir"): Writer(ROOT, "denial", ("hedge_fund/brokers/test_account_binding.py::test_registry_initialization_requires_empty_directory", "hedge_fund/brokers/test_account_binding.py::test_root_local_registry_is_rejected"), "one-time provisioning of an empty per-user directory; not concurrently raced"),
     ("hedge_fund.brokers.account_binding", "AccountRegistry.initialize", "write_bytes"): Writer(ROOT, "denial", ("hedge_fund/brokers/test_account_binding.py::test_registry_initialization_requires_empty_directory", "hedge_fund/brokers/test_account_binding.py::test_unverified_private_registry_storage_denies"), "one-time provisioning of key/state; not concurrently raced"),

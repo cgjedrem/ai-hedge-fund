@@ -143,7 +143,7 @@ def test_a_day_of_bars_decides_fills_and_checkpoints(tmp_path):
 
 
 def test_legacy_runner_denies_before_broker_construction(tmp_path, monkeypatch):
-    directory = deploy("saxo", _spec(broker="saxo"), ["AAPL"], root=tmp_path)
+    directory = tmp_path / "saxo-not-read"
     monkeypatch.setattr(
         runner_module,
         "build_broker",
@@ -161,7 +161,9 @@ def test_legacy_runner_denies_before_broker_construction(tmp_path, monkeypatch):
 
 def test_saxo_runner_skips_a_late_closing_bar_after_market_close(tmp_path, monkeypatch):
     spec = _spec(broker="saxo", interval=30, window={"start": "09:30", "end": "15:59"})
-    directory = deploy("saxo-late-close", spec, ["AAPL"], root=tmp_path)
+    from hedge_fund.brokers.test_saxo_doubles import write_fake_sim_deployment
+
+    directory = write_fake_sim_deployment("saxo-late-close", spec, ["AAPL"], root=tmp_path)
     deployed = runner_module.load_deployed(directory)
     tape = _tape(_at(DAY, "16:10:00"))
     stop = threading.Event()
@@ -194,7 +196,9 @@ def test_saxo_runner_skips_a_late_closing_bar_after_market_close(tmp_path, monke
 
 def test_saxo_runner_passes_the_bar_date_cutoff_to_order_submission(tmp_path, monkeypatch):
     spec = _spec(broker="saxo", interval=1, window={"start": "09:30", "end": "15:59"})
-    directory = deploy("saxo-cutoff", spec, ["AAPL"], root=tmp_path)
+    from hedge_fund.brokers.test_saxo_doubles import write_fake_sim_deployment
+
+    directory = write_fake_sim_deployment("saxo-cutoff", spec, ["AAPL"], root=tmp_path)
     deployed = runner_module.load_deployed(directory)
     tape = _tape(_at(DAY, "15:59:00"))
     stop = threading.Event()

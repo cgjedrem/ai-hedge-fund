@@ -10,6 +10,7 @@ import webbrowser
 from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urlparse
 
+from hedge_fund.brokers.account_binding import require_sim_account_ownership
 from hedge_fund.brokers.saxo import (
     _refresh_lock,
     AUTH_URL,
@@ -33,6 +34,7 @@ def interactive_login(
     state: str | None = None,
     lock_dir: str | Path | None = None,
 ) -> None:
+    require_sim_account_ownership()
     if not isinstance(app_key, str) or not app_key or not isinstance(app_secret, str) or not app_secret or not isinstance(refresh_token_ref, str) or not refresh_token_ref.startswith("op://"):
         raise ValueError("Saxo SIM app credentials and an op:// refresh-token reference are required")
     if not isinstance(redirect_uri, str):
@@ -97,6 +99,7 @@ def interactive_login(
 
 
 def main() -> None:
+    require_sim_account_ownership()
     env = os.environ
     names = ("SAXO_APP_KEY_REF", "SAXO_APP_SECRET_REF", "SAXO_REFRESH_TOKEN_REF")
     refs = {name: env.get(name, "") for name in names}

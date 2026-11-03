@@ -20,6 +20,7 @@ from typing import Literal
 import yaml
 from pydantic import BaseModel, ConfigDict, ValidationError
 
+from hedge_fund.brokers.account_binding import require_sim_account_ownership
 from hedge_fund.brokers.paper import PaperBroker
 from hedge_fund.fund import FundSpec, normalize_universe
 from hedge_fund.paper.ledger import Ledger
@@ -63,6 +64,8 @@ def deploy(
 ) -> Path:
     """Create paper/<name>/ with an empty ledger and broker book if local."""
     validate_fund_name(name)
+    if spec.broker == "saxo":
+        require_sim_account_ownership()
     universe = normalize_universe(universe)
     paper_root = Path(root)
     from hedge_fund.runtime.handover import paper_inventory_transition

@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Callable
 from uuid import uuid4
 
+from hedge_fund.brokers.account_binding import require_sim_account_ownership
 from hedge_fund.brokers.factory import build_broker
 from hedge_fund.brokers.models import Fill, Order
 from hedge_fund.brokers.paper import PaperBroker
@@ -226,6 +227,8 @@ def _tick(
     now: Callable[[], datetime] | None,
 ) -> SessionRecord:
     deployed = load_deployed(directory)
+    if deployed.broker == "saxo":
+        require_sim_account_ownership()
     spec = deployed.spec
     ledger = Ledger(directory)
     if session is not None and session in ledger.sessions():
@@ -407,20 +410,13 @@ def _verified_redo_approval(
         replay_session=record.session,
     )
     if record.executed is not None:
-        if (
-            approval is None
-            or approval["verdict"] != "approve"
-            or record.executed.as_of != state.pending.as_of
-            or record.executed.execution_as_of not in {None, record.session}
-        ):
+        if approval is None or approval["verdict"] != "approve" or record.executed.as_of != state.pending.as_of or record.executed.execution_as_of not in {None, record.session}:
             raise LedgerError("redo consumed approval is unavailable")
     elif approval is not None and approval["verdict"] == "approve":
         raise LedgerError("redo approval does not match the recorded execution")
     elif approval is None:
         event = ledger._latest_approval_event(state.pending.as_of, state.prev_hash, strict=True)
-        if event is not None and (
-            event.get("kind") in {"consume", "tick"} or event.get("consumed") is True
-        ):
+        if event is not None and (event.get("kind") in {"consume", "tick"} or event.get("consumed") is True):
             raise LedgerError("redo consumed approval is unavailable")
     return approval
 
@@ -473,9 +469,7 @@ def _run(
                     approval, clear_verdict = ledger.resolve_approval(state.pending.as_of, state.prev_hash)
                     if approval is None:
                         event = ledger._latest_approval_event(state.pending.as_of, state.prev_hash, strict=True)
-                        if event is not None and (
-                            event.get("kind") in {"consume", "tick"} or event.get("consumed") is True
-                        ):
+                        if event is not None and (event.get("kind") in {"consume", "tick"} or event.get("consumed") is True):
                             journal_attempted = True
                             raise LedgerError("approval consumption is incomplete; reconciliation is required")
                 else:

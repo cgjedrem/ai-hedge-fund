@@ -181,6 +181,61 @@ def test_unenrolled_explicit_root_paper_writer_denies_before_deploy(tmp_path, mo
     assert not (tmp_path / "paper").exists()
 
 
+def test_cli_sim_create_denies_before_root_admission_with_ownership_reason(tmp_path, monkeypatch, capsys, offline):
+    path = _mandate(tmp_path)
+    mandate = yaml.safe_load(path.read_text())
+    mandate.update(broker="saxo", rebalance="minute")
+    path.write_text(yaml.safe_dump(mandate))
+    _enroll_test_root(tmp_path)
+    before = {str(entry.relative_to(tmp_path)): entry.read_bytes() for entry in tmp_path.rglob("*") if entry.is_file()}
+    forbidden = Mock(side_effect=AssertionError("SIM create reached root admission or deployment"))
+    monkeypatch.setattr(run, "_paper_writer_admission", forbidden)
+    monkeypatch.setattr(run, "deploy", forbidden)
+
+    with pytest.raises(SystemExit) as denied:
+        _main(monkeypatch, "paper", "create", "fake-sim", "--mandate", str(path), "--universe", "AAPL")
+
+    assert denied.value.code == 2
+    error = capsys.readouterr().err
+    assert "ownership-unknown" in error
+    assert "busy" not in error
+    assert forbidden.call_count == 0
+    assert {str(entry.relative_to(tmp_path)): entry.read_bytes() for entry in tmp_path.rglob("*") if entry.is_file()} == before
+    assert not (tmp_path / "paper").exists()
+
+
+@pytest.mark.parametrize("command", [("tick",), ("tick", "--again"), ("approve", "--now")])
+def test_cli_sim_execution_denies_before_admission_ledger_or_provider(tmp_path, monkeypatch, capsys, offline, command):
+    from hedge_fund.brokers.test_saxo_doubles import write_fake_sim_deployment
+    from hedge_fund.runtime.admission import AdmissionCoordinator, RootOwnerLease
+    from hedge_fund.runtime.handover import paper_inventory_transition
+    from hedge_fund.runtime.root import RootContext
+
+    spec = FundSpec.model_validate({**yaml.safe_load(_mandate(tmp_path).read_text()), "broker": "saxo", "rebalance": "minute"})
+    run.PAPER_DIR.mkdir()
+    _enroll_test_root(tmp_path)
+    with RootContext.open(tmp_path) as owned, RootOwnerLease.acquire(owned) as owner:
+        with AdmissionCoordinator(owned, owner_lease=owner).deployment_lock("fake-sim"):
+            with paper_inventory_transition(run.PAPER_DIR, "fake-sim", lane_sets=(("deployment",),), paper_root=True) as transition:
+                directory = write_fake_sim_deployment("fake-sim", spec, ["AAPL"], root=run.PAPER_DIR)
+                assert transition is not None
+                transition.expect_entry({"name": "fake-sim", "deployment_digest": hashlib.sha256((directory / "fund.yaml").read_bytes()).hexdigest(), "last_session": None, "head_hash": None, "session_count": 0})
+    before = {str(entry.relative_to(tmp_path)): entry.read_bytes() for entry in tmp_path.rglob("*") if entry.is_file()}
+    forbidden = Mock(side_effect=AssertionError("unsupported SIM execution reached admission, ledger or provider setup"))
+    for attribute in ("_paper_writer_admission", "Ledger", "_cli_settings", "_authorize_cli_operation", "make_data_client"):
+        monkeypatch.setattr(run, attribute, forbidden)
+
+    with pytest.raises(SystemExit) as denied:
+        _main(monkeypatch, "paper", command[0], "fake-sim", *command[1:])
+
+    assert denied.value.code == 2
+    error = capsys.readouterr().err
+    assert "ownership-unknown" in error
+    assert "busy" not in error
+    assert forbidden.call_count == 0
+    assert {str(entry.relative_to(tmp_path)): entry.read_bytes() for entry in tmp_path.rglob("*") if entry.is_file()} == before
+
+
 def test_handover_cli_inspects_then_migrates_with_exact_attestation(
     tmp_path,
     monkeypatch,
@@ -250,7 +305,12 @@ def test_handover_cli_relocates_legacy_root_without_writing_source(tmp_path, mon
 
 
 def test_cli_paper_writer_denies_attested_migration_as_ownership_unknown(tmp_path, monkeypatch):
-    from hedge_fund.runtime.handover import build_head_inventory, inventory_digest, migrate_existing, OPERATOR_ATTESTATION
+    from hedge_fund.runtime.handover import (
+        build_head_inventory,
+        inventory_digest,
+        migrate_existing,
+        OPERATOR_ATTESTATION,
+    )
     from hedge_fund.runtime.root import RootContext
 
     root = tmp_path / "attested-root"
@@ -1010,9 +1070,7 @@ def test_cli_halt_does_not_recreate_a_fund_archived_after_lookup(tmp_path, monke
             with RootOwnerLease.acquire(root) as owner:
                 store = LifecycleArchiveStore(root, AdmissionCoordinator(root, owner_lease=owner))
                 preview = store.preview("deployment", name)
-                archived.append(
-                    store.archive("deployment", name, expected_digest=preview["digest"], archive_id="d" * 32)
-                )
+                archived.append(store.archive("deployment", name, expected_digest=preview["digest"], archive_id="d" * 32))
         return directory
 
     monkeypatch.setattr(run, "_fund_dir", archive_after_lookup)
@@ -1148,9 +1206,7 @@ def test_cli_unfinished_consumption_halts_before_provider(tmp_path, monkeypatch,
 
 @pytest.mark.parametrize("action", ["list", "status"])
 @pytest.mark.parametrize("interleaving", ["before_read", "during_verdict_read"])
-def test_cli_status_does_not_claim_unfinished_consumption_is_awaiting(
-    tmp_path, monkeypatch, capsys, offline, action, interleaving
-):
+def test_cli_status_does_not_claim_unfinished_consumption_is_awaiting(tmp_path, monkeypatch, capsys, offline, action, interleaving):
     from hedge_fund.paper.ledger import Ledger
 
     path = _mandate(tmp_path)
@@ -1188,9 +1244,7 @@ def test_cli_status_does_not_claim_unfinished_consumption_is_awaiting(
     "scenario",
     ["weekly_no_decision", "first_redo_approval", "first_redo_no_approval", "redo_no_approval_with_decision"],
 )
-def test_cli_status_reports_reconciliation_across_ledger_states(
-    tmp_path, monkeypatch, capsys, offline, action, scenario
-):
+def test_cli_status_reports_reconciliation_across_ledger_states(tmp_path, monkeypatch, capsys, offline, action, scenario):
     from hedge_fund.paper.ledger import Ledger
     from hedge_fund.runtime.admission import AdmissionCoordinator, RootOwnerLease
     from hedge_fund.runtime.root import RootContext
@@ -1211,10 +1265,7 @@ def test_cli_status_reports_reconciliation_across_ledger_states(
         _offline_tick(directory)
         latest = ledger.latest()
         assert latest.decision is None
-        events = [
-            event for event in ledger.events()
-            if not (event["kind"] == "tick" and event["session"] == latest.session)
-        ]
+        events = [event for event in ledger.events() if not (event["kind"] == "tick" and event["session"] == latest.session)]
         ledger.events_path.write_text("".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
     else:
         with RootContext.open(tmp_path) as root:
@@ -1259,12 +1310,7 @@ def test_enrolled_cli_redo_preserves_guarded_dispatch_and_expires_approval(
 
     class GuardedOfflineClient(FakeDataClient):
         def __init__(self, dispatch):
-            super().__init__(
-                {
-                    ticker: {"2025-01-06": 100, "2025-01-07": 100, "2025-01-08": 110}
-                    for ticker in ("AAPL", "SPY")
-                }
-            )
+            super().__init__({ticker: {"2025-01-06": 100, "2025-01-07": 100, "2025-01-08": 110} for ticker in ("AAPL", "SPY")})
             self.dispatch = dispatch
 
         def __enter__(self):
@@ -1317,9 +1363,7 @@ def test_enrolled_cli_redo_preserves_guarded_dispatch_and_expires_approval(
         assert len(calls) == before_redo
         assert ledger.halted() == "redo authorization denied after rewind"
         assert ledger.approval() is None
-        assert ledger._latest_approval_event(
-            original["decision"]["as_of"], original["hash"], strict=True
-        )["kind"] == "expire"
+        assert ledger._latest_approval_event(original["decision"]["as_of"], original["hash"], strict=True)["kind"] == "expire"
         with RootContext.open(tmp_path) as root:
             verify_root_inventory(root)
         return

@@ -11,11 +11,16 @@ Global exclusive custody cannot be verified yet: other OS accounts use other
 registries, a deleted or reinitialized registry forgets bindings, and arbitrary
 same-account out-of-band writers are not excluded (T015/T021). The production
 custody verifier therefore always reports ``ownership-unknown`` and binding or
-transfer fails closed. Custody verifiers other than the default exist only so
-tests can exercise the exclusivity policy with fakes.
+transfer fails closed. The mutable AccountRegistry simulation is confined to
+the checkout-owned synthetic test namespace. Custom custody/quiescence callbacks
+cannot enable ordinary production initialization, reads, binding or release.
+SIMAccountRegistry and the shared production ownership requirement always deny,
+including inside the fake harness; synthetic receipts are never account authority.
 
 Binding never constructs a broker, resolves a secret, contacts a network or
 authorizes execution: ``execution_authorized`` is always ``False``.
+Simulation receipts/views are explicitly ``policy_only`` and report global
+custody as ``ownership-unknown``, even when the fake local policy admits a binding.
 """
 
 from __future__ import annotations
@@ -31,13 +36,14 @@ from contextlib import contextmanager, ExitStack
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Literal, NoReturn, Protocol, TypedDict
 
 from hedge_fund.runtime.admission import (
     _acquire_os_lock,
     _release_os_lock,
     AdmissionError,
     MAX_LOCK_WAIT_SECONDS,
+    OwnershipUnknown,
     root_registry_writer,
     WriterConflict,
 )
@@ -73,6 +79,65 @@ class AccountBindingError(RuntimeError):
 
 class AccountOwnershipUnknown(AccountBindingError):
     reason = "ownership-unknown"
+
+
+class SIMOwnershipUnknown(AccountOwnershipUnknown, OwnershipUnknown):
+    """No verifiable exclusive SIM account-control authority is available."""
+
+    code = "ownership-unknown"
+    authority_reason = "exclusive-account-control-unverifiable"
+
+    def __init__(self) -> None:
+        super().__init__("ownership-unknown: exclusive SIM account control cannot be verified; SIM mutation is unsupported")
+
+
+class SIMOwnershipStatus(TypedDict):
+    state: Literal["ownership-unknown"]
+    reason: Literal["exclusive-account-control-unverifiable"]
+    cross_root_inventory: Literal["unverifiable"]
+    binding_supported: Literal[False]
+    provisioning_supported: Literal[False]
+    execution_authorized: Literal[False]
+
+
+def require_sim_account_ownership() -> NoReturn:
+    """Deny before reading credentials, account identities or registry paths."""
+    raise SIMOwnershipUnknown()
+
+
+class SIMAccountRegistry:
+    """Permanently unavailable production authority, not the fake policy store.
+
+    No identity, digest, key, binding or provenance is persisted. Inputs,
+    including the root, are deliberately not retained as authority. The
+    separate AccountRegistry simulation never grants production execution.
+    """
+
+    def __init__(self, root: RootContext) -> None:
+        if not isinstance(root, RootContext):
+            raise TypeError("an explicit RootContext is required")
+
+    def bind(self, environment: str, account_identity: str, deployment: str) -> NoReturn:
+        require_sim_account_ownership()
+
+    def release(self, deployment: str, *, expected_binding_digest: str, request_id: str) -> NoReturn:
+        """Quiescence alone cannot prove prior ownership or authorize release."""
+        require_sim_account_ownership()
+
+    def transfer(self, deployment: str, *, target_root: RootContext, target_deployment: str, expected_binding_digest: str, request_id: str) -> NoReturn:
+        """Never fabricate released/transfer provenance from unverified claims."""
+        require_sim_account_ownership()
+
+    def inspect(self) -> SIMOwnershipStatus:
+        """Return unavailable authority without probing or creating any files."""
+        return {
+            "state": "ownership-unknown",
+            "reason": "exclusive-account-control-unverifiable",
+            "cross_root_inventory": "unverifiable",
+            "binding_supported": False,
+            "provisioning_supported": False,
+            "execution_authorized": False,
+        }
 
 
 class RealBrokerageDenied(AccountBindingError):
@@ -115,7 +180,7 @@ class SimAccountIdentity:
     account_key: str = field(repr=False)
 
     def __repr__(self) -> str:
-        return f"SimAccountIdentity(environment={self.environment!r}, account_key=<redacted>)"
+        return "SimAccountIdentity(environment=<redacted>, account_key=<redacted>)"
 
 
 @dataclass(frozen=True)
@@ -145,6 +210,24 @@ DEFAULT_CUSTODY = UnverifiableGlobalCustody()
 class RunnerQuiescence:
     quiescent: bool
     status: str
+
+
+def _require_fake_registry_harness(*paths: str | os.PathLike[str]) -> None:
+    """Confine policy simulation, never establish production account custody."""
+    namespace = os.environ.get("HEDGE_FUND_TEST_ROOT", "")
+    if os.environ.get("HEDGE_FUND_TEST_MODE") != "1" or not namespace or not Path(namespace).is_absolute():
+        require_sim_account_ownership()
+    try:
+        from hedge_fund.test_support.network_guard import (
+            _validate_test_child_path,
+            _validate_test_root,
+        )
+
+        test_root = _validate_test_root(Path(namespace))
+        for path in paths:
+            _validate_test_child_path(test_root, Path(path))
+    except (ImportError, OSError, RuntimeError, TypeError, ValueError):
+        raise SIMOwnershipUnknown() from None
 
 
 def default_registry_location(environ: dict[str, str] | None = None) -> Path:
@@ -183,14 +266,16 @@ def runner_quiescence(root: RootContext, deployment: str) -> RunnerQuiescence:
 
 
 class AccountRegistry:
-    """Atomic private registry of SIM account bindings shared by all roots of one OS user."""
+    """Atomic private fake-policy registry; no production custody or execution authority."""
 
     def __init__(self, context: RootContext) -> None:
+        _require_fake_registry_harness(context.path)
         self._context = context
 
     @classmethod
     def initialize(cls, path: str | os.PathLike[str]) -> AccountRegistry:
-        """Create a registry in an existing, empty, absolute directory."""
+        """Create a simulation in an existing, empty, absolute test-owned directory."""
+        _require_fake_registry_harness(path)
         context = RootContext.open(path)
         try:
             if any(context.path.iterdir()):
@@ -210,6 +295,7 @@ class AccountRegistry:
     @classmethod
     def open(cls, path: str | os.PathLike[str]) -> AccountRegistry:
         """Open an initialized registry; missing, unprotected or corrupt state is ownership-unknown."""
+        _require_fake_registry_harness(path)
         try:
             context = RootContext.open(path)
         except (OSError, RootPathError) as exc:
@@ -238,17 +324,20 @@ class AccountRegistry:
     def inspect(self, account: SimAccountIdentity) -> dict[str, Any]:
         """Redacted readiness view. Provisioning never authorizes execution."""
         try:
+            _require_fake_registry_harness(self.path)
             environment = _require_sim(account)
             state = self._load()
         except AccountBindingError as exc:
-            return {"status": exc.reason, "environment": None, "deployment": None, "execution_authorized": False}
+            return {"status": exc.reason, "environment": None, "deployment": None, "policy_only": True, "global_custody": "ownership-unknown", "execution_authorized": False}
         record = state["bindings"].get(self._digest(account, environment))
         if record is None:
-            return {"status": "unbound", "environment": SIM_ENVIRONMENT, "deployment": None, "execution_authorized": False}
+            return {"status": "unbound", "environment": SIM_ENVIRONMENT, "deployment": None, "policy_only": True, "global_custody": "ownership-unknown", "execution_authorized": False}
         return {
             "status": record["status"],
             "environment": SIM_ENVIRONMENT,
             "deployment": record["deployment"] if record["status"] == "active" else None,
+            "policy_only": True,
+            "global_custody": "ownership-unknown",
             "execution_authorized": False,
         }
 
@@ -263,6 +352,7 @@ class AccountRegistry:
         lock_timeout: float = MAX_LOCK_WAIT_SECONDS,
     ) -> dict[str, Any]:
         """Bind a fake SIM account to one deployment; a released account needs its exact release digest."""
+        _require_fake_registry_harness(self.path, root.path)
         environment = _require_sim(account)
         name = _deployment_name(deployment)
         if release_digest is not None and (not isinstance(release_digest, str) or not _SHA256.fullmatch(release_digest)):
@@ -271,8 +361,7 @@ class AccountRegistry:
         with self._root_admission(root, name):
             assessment = custody.assess(self, root)
             if not isinstance(assessment, CustodyAssessment) or assessment.verified is not True:
-                reason = getattr(assessment, "reason", "custody-assessment-invalid")
-                raise AccountOwnershipUnknown(f"global account custody is unverified ({reason})")
+                raise AccountOwnershipUnknown("global account custody is unverified (global-custody-unverifiable)")
             owner = self._owner_digest(root)
             with self._locked(lock_timeout) as state:
                 digest = self._digest(account, environment)
@@ -325,6 +414,7 @@ class AccountRegistry:
         lock_timeout: float = MAX_LOCK_WAIT_SECONDS,
     ) -> dict[str, Any]:
         """Release an owned binding only while its deployment runner is stopped/quiescent."""
+        _require_fake_registry_harness(self.path, root.path)
         environment = _require_sim(account)
         name = _deployment_name(deployment)
         self._require_outside_root(root)
@@ -351,6 +441,8 @@ class AccountRegistry:
             "generation": state["generation"],
             "release_digest": record["release_digest"],
             "transfers": len(record["provenance"]),
+            "policy_only": True,
+            "global_custody": "ownership-unknown",
             "execution_authorized": False,
         }
 
@@ -510,10 +602,27 @@ def _valid_state(state: object) -> bool:
     bindings = state["bindings"]
     if not isinstance(bindings, dict) or len(bindings) > _MAX_BINDINGS:
         return False
-    return all(isinstance(key, str) and _SHA256.fullmatch(key) and _valid_record(record) for key, record in bindings.items())
+    active_owners: set[tuple[str, str]] = set()
+    used_generations: set[int] = set()
+    for key, record in bindings.items():
+        if not isinstance(key, str) or not _SHA256.fullmatch(key) or not _valid_record(record, state["generation"]):
+            return False
+        if record["status"] == "active":
+            owner = (record["owner"], record["deployment_key"])
+            if owner in active_owners:
+                return False
+            active_owners.add(owner)
+        generations = {record["bound_generation"]}
+        generations.update(item["generation"] for item in record["provenance"])
+        if record["status"] == "released":
+            generations.add(record["released_generation"])
+        if used_generations.intersection(generations):
+            return False
+        used_generations.update(generations)
+    return True
 
 
-def _valid_record(record: object) -> bool:
+def _valid_record(record: object, state_generation: int) -> bool:
     base = {"environment", "status", "owner", "deployment", "deployment_key", "bound_generation", "bound_at", "release_digest", "provenance", "execution_authorized"}
     if not isinstance(record, dict) or not base.issubset(record) or set(record) - base - {"released_generation"}:
         return False
@@ -523,22 +632,24 @@ def _valid_record(record: object) -> bool:
         return False
     if not isinstance(record["deployment"], str) or record["deployment_key"] != _name_key(record["deployment"]):
         return False
-    if type(record["bound_generation"]) is not int or not isinstance(record["bound_at"], str):
+    if type(record["bound_generation"]) is not int or not 1 <= record["bound_generation"] <= state_generation or not isinstance(record["bound_at"], str):
         return False
     if record["status"] == "active":
         if record["release_digest"] is not None or "released_generation" in record:
             return False
-    elif not isinstance(record["release_digest"], str) or not _SHA256.fullmatch(record["release_digest"]) or type(record.get("released_generation")) is not int:
+    elif not isinstance(record["release_digest"], str) or not _SHA256.fullmatch(record["release_digest"]) or type(record.get("released_generation")) is not int or not record["bound_generation"] < record["released_generation"] <= state_generation:
         return False
     provenance = record["provenance"]
     if not isinstance(provenance, list) or len(provenance) > _MAX_PROVENANCE:
         return False
+    previous_generation = 0
     for item in provenance:
         if not isinstance(item, dict) or set(item) != {"from_owner", "from_deployment_key", "release_digest", "generation"}:
             return False
-        if any(not isinstance(item[key], str) or not _SHA256.fullmatch(item[key]) for key in ("from_owner", "from_deployment_key", "release_digest")) or type(item["generation"]) is not int:
+        if any(not isinstance(item[key], str) or not _SHA256.fullmatch(item[key]) for key in ("from_owner", "from_deployment_key", "release_digest")) or type(item["generation"]) is not int or not previous_generation < item["generation"] <= record["bound_generation"]:
             return False
-    return True
+        previous_generation = item["generation"]
+    return not provenance or previous_generation == record["bound_generation"]
 
 
 __all__ = [
@@ -555,10 +666,14 @@ __all__ = [
     "RealBrokerageDenied",
     "RegistryBusy",
     "ReleaseRequired",
+    "require_sim_account_ownership",
     "runner_quiescence",
     "RunnerNotQuiescent",
     "RunnerQuiescence",
     "SIM_ENVIRONMENT",
+    "SIMAccountRegistry",
+    "SIMOwnershipStatus",
+    "SIMOwnershipUnknown",
     "SimAccountIdentity",
     "StaleRelease",
     "UnverifiableGlobalCustody",

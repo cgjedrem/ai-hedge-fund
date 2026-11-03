@@ -552,8 +552,8 @@ def _handover(args, parser: argparse.ArgumentParser, root: RootContext) -> None:
         enrollment_status,
         HANDOVER_PATH,
         HandoverError,
-        inventory_digest,
         inspect_relocation_source,
+        inventory_digest,
         migrate_existing,
         OPERATOR_ATTESTATION,
         relocate_existing,
@@ -800,13 +800,7 @@ def _authorize_cli_operation(
             redo_source = Ledger(directory).latest()
         except (LedgerError, OSError, ValueError):
             parser.error("paper redo source is unavailable")
-        if (
-            redo_source is None
-            or redo_source.hash != expected_head
-            or redo_source.hash != redo_source.compute_hash()
-            or operation_inputs.get("redo_source_session") != redo_source.session
-            or operation_inputs.get("redo_previous_head") != redo_source.prev_hash
-        ):
+        if redo_source is None or redo_source.hash != expected_head or redo_source.hash != redo_source.compute_hash() or operation_inputs.get("redo_source_session") != redo_source.session or operation_inputs.get("redo_previous_head") != redo_source.prev_hash:
             parser.error("paper redo head changed before authorization")
     if type(model_call_bound) is not int or not 1 <= model_call_bound <= 1000 or type(llm_call_bound) is not int or not 0 <= llm_call_bound <= model_call_bound:
         parser.error("model-call estimate is invalid")
@@ -1040,17 +1034,7 @@ def _authorize_cli_operation(
 
     def advance_redo_fence(superseded: CapturedSessionRecord) -> None:
         nonlocal active_head, redo_advanced
-        if (
-            operation != "paper-redo"
-            or directory is None
-            or redo_source is None
-            or redo_advanced
-            or not isinstance(superseded, CapturedSessionRecord)
-            or superseded.hash != redo_source.hash
-            or superseded.hash != superseded.compute_hash()
-            or superseded.session != redo_source.session
-            or superseded.prev_hash != redo_source.prev_hash
-        ):
+        if operation != "paper-redo" or directory is None or redo_source is None or redo_advanced or not isinstance(superseded, CapturedSessionRecord) or superseded.hash != redo_source.hash or superseded.hash != superseded.compute_hash() or superseded.session != redo_source.session or superseded.prev_hash != redo_source.prev_hash:
             raise AuthorizationDenied("paper redo transition does not match its capture")
         try:
             if participant is not None:
@@ -1059,12 +1043,7 @@ def _authorize_cli_operation(
             current_state = Ledger(directory).replay(current_deployed.spec.capital, full=True)
         except (HandoverError, LedgerError, OSError, ValueError):
             raise AuthorizationDenied("paper redo transition is unavailable") from None
-        if (
-            current_state.prev_hash != redo_source.prev_hash
-            or current_state.halted is not None
-            or mandate_hash(current_deployed.spec) != capture.mandate_digest
-            or tuple(current_deployed.universe) != capture.universe
-        ):
+        if current_state.prev_hash != redo_source.prev_hash or current_state.halted is not None or mandate_hash(current_deployed.spec) != capture.mandate_digest or tuple(current_deployed.universe) != capture.universe:
             raise AuthorizationDenied("paper redo transition does not match its capture")
         active_head = redo_source.prev_hash
         redo_advanced = True
@@ -1147,6 +1126,19 @@ def _cli_fund(spec, settings, dispatch, api_key):
     )
 
 
+def _require_cli_sim_account_ownership(broker: str, parser: argparse.ArgumentParser) -> None:
+    if broker == "saxo":
+        from hedge_fund.brokers.account_binding import (
+            require_sim_account_ownership,
+            SIMOwnershipUnknown,
+        )
+
+        try:
+            require_sim_account_ownership()
+        except SIMOwnershipUnknown as exc:
+            parser.error(str(exc))
+
+
 def _run_cli_tick(
     directory: Path,
     name: str,
@@ -1161,6 +1153,8 @@ def _run_cli_tick(
     args,
     authorization=None,
 ):
+    _require_cli_sim_account_ownership(deployed.broker, parser)
+
     def execute():
         from hedge_fund.paper.ledger import PaperReconciliationRequired
         from hedge_fund.runtime.admission import paper_control_transition
@@ -1389,6 +1383,7 @@ def _paper(
         except ValueError as exc:
             parser.error(str(exc))
         spec = _override_rebalance(spec, args.rebalance)
+        _require_cli_sim_account_ownership(spec.broker, parser)
         if args.approval:
             spec = spec.model_copy(update={"approval_required": True})
         try:
@@ -1422,6 +1417,7 @@ def _paper(
         if not args.enable_network:
             parser.error("paper tick requires explicit --enable-network")
         deployed = load_deployed(directory)
+        _require_cli_sim_account_ownership(deployed.broker, parser)
         with _paper_writer_admission() as participant:
             record = _run_cli_tick(
                 directory,
@@ -1477,6 +1473,8 @@ def _paper(
         if args.action == "approve" and args.now and not args.enable_network:
             parser.error("approve --now requires explicit --enable-network before the ledger verdict")
         deployed = load_deployed(directory)
+        if args.action == "approve" and args.now:
+            _require_cli_sim_account_ownership(deployed.broker, parser)
         ledger = Ledger(directory)
         with _paper_writer_admission() as participant:
             provider_authority = None
@@ -1560,6 +1558,7 @@ def _paper(
 
     ledger = Ledger(directory)
     if args.action == "halt":
+
         def directory_identity():
             try:
                 info = directory.stat(follow_symlinks=False)
@@ -1610,9 +1609,7 @@ def _status_view(directory: Path):
         replayed = ledger.replay(deployed.spec.capital)
         if replayed.prev_hash != (latest.hash if latest is not None else None):
             raise PaperReconciliationRequired("ledger head changed during observation")
-        approval = ledger.observe_approval_for_display(
-            replayed, approval_required=deployed.spec.approval_required
-        )
+        approval = ledger.observe_approval_for_display(replayed, approval_required=deployed.spec.approval_required)
     except PaperReconciliationRequired:
         approval_error = "in progress or requires reconciliation"
     except (LedgerError, OSError, ValueError):

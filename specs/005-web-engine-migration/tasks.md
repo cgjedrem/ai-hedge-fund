@@ -10,8 +10,9 @@ description: "Executable, mandatory-test work plan for complete web-only engine 
 `docs\governance\web-migration-contract.md`.
 **Prerequisite gate:** [exact Git/API receipt](tasks-gate-2026-10-31.md): clean/pushed
 spec and plan at `193d16dc754567710c8dd5703e4f427184c9079f`, open main-targeting PR #8.
-**Current state:** user-directed implementation authorized. **20/148 tasks complete:**
-T001–T014, T016–T018, T022, T059 and T137. T009–T011 include completed test-design/red phases. T018 passes
+**Current state:** user-directed implementation authorized. **21/148 tasks complete:**
+T001–T014, T016–T018, T022, T059, T096 and T137. T096 is the fake-only account-policy
+test slice, not production/global custody acceptance. T009–T011 include completed test-design/red phases. T018 passes
 its implementation/test criteria on synthetic Windows/NTFS, including reviewed local-paper
 ticks and bounded owned-runner controls. T015 and T021 remain partial: operator attestation
 does not fence unaware writers; stale-reservation recovery records and shared-admission
@@ -24,7 +25,7 @@ explicit no-effect recovery, forward-only enrolled deployment history, manual-re
 isolation and collision-safe stopped restore. Source identity, final independent review
 and fresh synthetic API browser/full-suite results are recorded in `implementation-evidence.md`.
 These bounded additions do not complete T015/T021/T138 or US4 linked replacement.
-T019–T021, T023–T058 and T060–T136 remain open.
+T019–T021, T023–T058, T060–T095 and T097–T136 remain open.
 T137's scoped implementation criteria pass at commit
 `4177741ee06a1daddf4751eb441f0924c4f7407a`; exact source/diff identity and fake-only
 evidence are in `implementation-evidence.md`. No live provider call, installed T137
@@ -59,6 +60,18 @@ acceptance. T003's isolated production build/browser harness passed; T004–T005
 are complete. Credential UI/workflow coverage, complete direct-writer integration, bare-metal Linux
 evidence and legacy TUI dotenv cleanup remain future work. No merge is authorized.
 Runtime work remains subject to the isolation and evidence gates below.
+
+PR8 commit `294f9db` contributes the checked T096 fake-policy registry and tests.
+This integration preserves its HMAC duplicate exclusion and release/transfer
+provenance simulation while confining mutation and inspection to the canonical
+checkout-owned test namespace. `SIMAccountRegistry` and the shared production
+ownership requirement always deny, even with fake custody receipts. SIM deployment,
+factory, OAuth, CLI create/tick/replay/approve-now and library tick deny before their sensitive effects.
+No complete cross-root inventory or exclusively mediated account-control authority
+exists, so production provisioning, release and transfer remain blocked. T099
+stays unchecked; this integration completes no additional task beyond the incoming
+**21/148**. Exact scope, synthetic checks and limitations are in
+`sim-account-ownership-evidence.md`.
 
 **Tests: MANDATORY.** Unit, regression, contract, cross-process, browser, native Windows,
 native Linux, package and full-suite acceptance are required, never optional. Write

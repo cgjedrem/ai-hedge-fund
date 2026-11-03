@@ -7,15 +7,18 @@ from importlib import import_module
 
 import pytest
 
-from hedge_fund.brokers.factory import build_broker
 from hedge_fund.brokers.protocol import OrderSubmissionDeferred
 from hedge_fund.brokers.saxo import SaxoBroker
 from hedge_fund.brokers.sim import SimBroker
+from hedge_fund.brokers.test_saxo_doubles import (
+    fake_saxo_broker,
+    write_fake_sim_deployment,
+)
 from hedge_fund.data.models import Price
 from hedge_fund.data.sessions import NEW_YORK
 from hedge_fund.fund import custom_strategy, Fund, FundSpec, TradingWindow
 from hedge_fund.models import Signal
-from hedge_fund.paper.deployed import deploy, load_deployed
+from hedge_fund.paper.deployed import load_deployed
 from hedge_fund.paper.ledger import Ledger
 from hedge_fund.paper.tick import _run
 from hedge_fund.pipeline.clock import Marked
@@ -171,7 +174,7 @@ def _cutoff_setup(tmp_path, *, approval_required=False):
         risk={"max_position_pct": 1, "max_gross_exposure": 1},
         approval_required=approval_required,
     )
-    directory = deploy("cutoff", spec, ["AAPL", "MSFT"], root=tmp_path)
+    directory = write_fake_sim_deployment("cutoff", spec, ["AAPL", "MSFT"], root=tmp_path)
 
     class TwoTickerData(FakeData):
         def get_prices(self, ticker, start_date, end_date, **kwargs):
@@ -329,7 +332,7 @@ def test_fill_journal_failure_still_halts_after_an_external_fill(tmp_path, monke
     assert ledger.latest().session == "2026-10-29T15:58:00"
 
 
-def test_real_saxo_client_deferral_reaches_the_session_ledger(tmp_path):
+def test_fake_transport_saxo_client_deferral_reaches_the_session_ledger(tmp_path):
     class ClosingClock(FakeClock):
         def previous(self, session):
             return "2026-10-29T15:58:00"
@@ -345,20 +348,14 @@ def test_real_saxo_client_deferral_reaches_the_session_ledger(tmp_path):
         strategies=[{"name": "solo", "models": [{"name": "pead"}], "blend": {"mode": "long_short"}}],
         risk={"max_position_pct": 1, "max_gross_exposure": 1},
     )
-    directory = deploy("cutoff-client", spec, ["AAPL"], root=tmp_path)
+    directory = write_fake_sim_deployment("cutoff-client", spec, ["AAPL"], root=tmp_path)
     deployed = load_deployed(directory)
     transport = SaxoSimTransport()
-    broker = build_broker(
-        deployed,
-        directory=directory,
+    broker = fake_saxo_broker(
+        deployed.universe,
         secrets_provider=SharedSecrets(),
         transport=transport,
-        environ={
-            "SAXO_APP_KEY_REF": "op://vault/item/key",
-            "SAXO_APP_SECRET_REF": "op://vault/item/secret",
-            "SAXO_REFRESH_TOKEN_REF": "op://vault/item/token",
-            "SAXO_REFRESH_LOCK_DIR": str(tmp_path / "locks"),
-        },
+        lock_dir=tmp_path,
     )
     ledger = Ledger(directory)
     clock = ClosingClock()
@@ -379,8 +376,6 @@ def test_real_saxo_client_deferral_reaches_the_session_ledger(tmp_path):
 
 
 def test_saxo_external_adapter_records_order_fill_in_ledger(tmp_path, monkeypatch):
-    # TUI paper builds are denied (see hedge_fund/tui/test_builder_broker.py);
-    # deploy the spec the wizard built — custom pead, minute, 15:59 close, Saxo.
     spec = FundSpec(
         schema_version=2,
         name="external",
@@ -393,7 +388,7 @@ def test_saxo_external_adapter_records_order_fill_in_ledger(tmp_path, monkeypatc
         interval=1.0,
         window=TradingWindow(start=TradingWindow().start, end="15:59"),
     )
-    directory = deploy("external", spec, ["AAPL"], root=tmp_path)
+    directory = write_fake_sim_deployment("external", spec, ["AAPL"], root=tmp_path)
     assert directory == tmp_path / "external"
     deployed = load_deployed(directory)
     spec = deployed.spec
@@ -407,31 +402,24 @@ def test_saxo_external_adapter_records_order_fill_in_ledger(tmp_path, monkeypatc
         return original_filter_orders(broker, orders)
 
     monkeypatch.setattr(SaxoBroker, "filter_orders", capture_filter_inputs)
-    environ = {
-        "SAXO_APP_KEY_REF": "op://vault/item/key",
-        "SAXO_APP_SECRET_REF": "op://vault/item/secret",
-        "SAXO_REFRESH_TOKEN_REF": "op://vault/item/token",
-    }
     monkeypatch.setattr(
         tick_module,
         "build_broker",
-        lambda value, *, directory: build_broker(
-            value,
-            directory=directory,
+        lambda value, *, directory: fake_saxo_broker(
+            value.universe,
             secrets_provider=secrets,
             transport=transport,
-            environ=environ,
+            lock_dir=tmp_path,
         ),
     )
     data = FakeData()
     clock = FakeClock()
     ledger = Ledger(directory)
-    broker = build_broker(
-        deployed,
-        directory=directory,
+    broker = fake_saxo_broker(
+        deployed.universe,
         secrets_provider=secrets,
         transport=transport,
-        environ=environ,
+        lock_dir=tmp_path,
     )
     with pytest.raises(BookMismatch, match="cash"):
         advance(

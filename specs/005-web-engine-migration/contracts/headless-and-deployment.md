@@ -46,6 +46,8 @@ No paid invocation example is supplied for this planning execution.
 - Web execution/lifecycle is local-paper only. SIM readiness is inspectable; retain documented
   non-TUI headless SIM reference/OAuth provisioning and operations under exclusive account
   binding. No ordinary web SIM parity claimed, no live brokerage configuration offered.
+  This is target behavior, not shipped provisioning acceptance; the implemented SIM boundary
+  below deliberately blocks production provisioning and execution.
 - TUI/default terminal entry and Docker ttyd/TUI services retire only after assertion/packaged
   platform acceptance. Noninteractive Rich console reports are not a TUI dependency.
 - Archive replaces broad deletion; replacement is new linked identity; restored work is
@@ -84,3 +86,61 @@ acceptance blocked. PID liveness cannot authorize a signal.
 SIM account/environment binding must exclude active duplicates even across roots. Operator
 account exclusivity/handover evidence is required; root-local bookkeeping alone is insufficient.
 Fakes validate policy without contacting Saxo or creating/rotating real credentials.
+
+### Implemented SIM boundary (T096 fake policy; T099 partial)
+
+The current build cannot establish complete cross-root account inventory or
+exclusively mediated Saxo account control. A protocol-native root, private ACL,
+cooperative lock, operator attestation, secret reference, or stopped runner is
+not that proof. Manually configured and out-of-band account clients cannot be
+excluded by the shipped root protocol.
+
+`SIMAccountRegistry` in `brokers/account_binding.py` implements a permanently
+unsupported, fail-closed production ownership seam. Inspection reports `ownership-unknown`, reason
+`exclusive-account-control-unverifiable`, unverifiable cross-root inventory,
+and no binding/provisioning/execution authority. Bind, release and transfer
+always deny; they do not read or persist account identities, digests, keys,
+registry files, or purported released/transfer provenance. No identity key is
+provisioned by this production seam and no global account/network lookup is attempted.
+
+The separate `AccountRegistry` is a fake-only policy simulation preserved from
+PR8 commit `294f9db`: a private canonical HMAC store, root/deployment admission,
+duplicate denial, owned-quiescent release and exact transfer provenance. Its
+initialization, reads and mutations require the canonical checkout-owned synthetic
+test namespace. An injected custody/quiescence callback cannot enable ordinary
+production registry access. This test-mode confinement is not a global custody
+proof; synthetic receipts always deny execution and cannot enable the production
+ownership seam. Receipts/inspection explicitly report `policy_only: true` and
+`global_custody: ownership-unknown`, even after a positive fake-policy bind.
+No real account identity or provider configuration is used.
+The simulation's namespace validation does not itself install or attest a socket
+network guard; callbacks are trusted fake-policy inputs, not provider/account-control
+proof. The test harness separately installs non-loopback denial. Historical adapter
+fixture helpers additionally require its installed guard marker.
+
+Headless SIM deployment, factory construction and OAuth entrypoints now deny
+before deployment/ledger creation, environment/secret resolution, browser or
+prompt access, refresh-lock creation, token rotation, or broker requests.
+This intentionally rejects previously successful SIM setup even with valid
+references. Local-paper behavior and readable historical SIM records remain.
+CLI SIM create, tick/replay and approve-now deny with the ownership reason
+before acquiring writer leases/lanes or constructing a ledger/provider authority.
+The library tick path denies after confined deployment inspection,
+under its existing admission, but before any ledger or provider access; it must
+not journal approval consumption or Halt as a broker-initialization failure.
+Low-level adapter algorithms are still exercised with network-denied test
+doubles; that is neither provisioning nor global ownership acceptance.
+Plain headless approve/reject still record admitted local verdicts on historical SIM
+records; those verdicts grant no account authority and subsequent execution remains
+denied. TUI verdict writes are denied by `paper_write_denial()` in every root state.
+Complete ownership-gated SIM control parity remains
+T070/T099 work. This slice changes no TUI code.
+
+Any future supported binding needs an independently enforced account-control
+authority, complete canonical cross-root inventory, private atomic registry
+storage, and protocol-native authority for every relevant root. Release and
+transfer additionally need verified prior ownership, stopped/quiescent
+writers, exact replay-safe provenance, and root-registry then sorted deployment
+admission. Until all of that is defensible, successful release/transfer and
+headless SIM provisioning remain blocked in production. The incoming T096
+fake-policy checkbox is retained; T099 and full account-control acceptance remain unchecked.

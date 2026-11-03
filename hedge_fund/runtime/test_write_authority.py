@@ -257,10 +257,10 @@ def test_relocation_refuses_unknown_owners_and_interrupted_writes(tmp_path, muta
 def test_relocation_refuses_broker_backed_deployments(tmp_path):
     source_path = tmp_path / "legacy"
     (source_path / "paper").mkdir(parents=True)
-    saxo = FundSpec.model_validate(
-        {**_spec().model_dump(mode="json"), "broker": "saxo", "rebalance": "minute", "interval": 30, "window": {"start": "09:30", "end": "15:59"}}
-    )
-    deploy("alpha", saxo, ["AAPL"], root=source_path / "paper")
+    saxo = FundSpec.model_validate({**_spec().model_dump(mode="json"), "broker": "saxo", "rebalance": "minute", "interval": 30, "window": {"start": "09:30", "end": "15:59"}})
+    from hedge_fund.brokers.test_saxo_doubles import write_fake_sim_deployment
+
+    write_fake_sim_deployment("alpha", saxo, ["AAPL"], root=source_path / "paper")
     with RootContext.open(source_path) as source:
         with pytest.raises(HandoverError, match="broker-backed"):
             inspect_relocation_source(source)
@@ -398,7 +398,11 @@ def test_protocol_native_root_loses_authority_when_legacy_writers_can_reach_it(t
 
 
 def test_writer_already_holding_lanes_is_denied_at_write_time_after_authority_flips(tmp_path):
-    from hedge_fund.runtime.admission import AdmissionCoordinator, require_paper_write_lanes, root_registry_writer
+    from hedge_fund.runtime.admission import (
+        AdmissionCoordinator,
+        require_paper_write_lanes,
+        root_registry_writer,
+    )
 
     root = tmp_path / "native"
     root.mkdir()

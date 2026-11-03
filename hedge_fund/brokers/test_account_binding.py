@@ -152,9 +152,42 @@ def test_missing_registry_is_ownership_unknown(tmp_path):
         AccountRegistry.open(location)
 
 
-@pytest.mark.parametrize("damage", ["truncate", "garbage", "non-canonical", "bad-record", "missing-state", "missing-key", "short-key"])
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "truncate",
+        "garbage",
+        "non-canonical",
+        "bad-record",
+        "missing-state",
+        "missing-key",
+        "short-key",
+        "zero-bound-generation",
+        "negative-bound-generation",
+        "future-bound-generation",
+        "early-release-generation",
+        "same-release-generation",
+        "future-release-generation",
+        "provenance-zero",
+        "provenance-negative",
+        "provenance-after-bound",
+        "provenance-after-state",
+        "provenance-out-of-order",
+        "provenance-duplicate-generation",
+        "provenance-before-current-bound",
+    ],
+)
 def test_unreadable_or_corrupt_registry_denies_and_inspects_unknown(registry, roots, account, custody, damage):
     registry.bind(roots[0], "demo-alpha", account, custody=custody)
+    if damage.endswith("release-generation"):
+        registry.release(roots[0], "demo-alpha", account, quiescence=stopped)
+    elif damage.startswith("provenance-"):
+        source, deployment = roots[0], "demo-alpha"
+        for target, next_deployment in zip(roots[1:], ("demo-beta", "demo-gamma")):
+            digest = registry.release(source, deployment, account, quiescence=stopped)["release_digest"]
+            registry.bind(target, next_deployment, account, release_digest=digest, custody=custody)
+            source, deployment = target, next_deployment
+        registry.release(source, deployment, account, quiescence=stopped)
     context = registry._context
     state_path = context.resolve(ab.STATE_PATH)
     key_path = context.resolve(ab.KEY_PATH)
@@ -168,6 +201,26 @@ def test_unreadable_or_corrupt_registry_denies_and_inspects_unknown(registry, ro
         state = _state(registry)
         next(iter(state["bindings"].values()))["execution_authorized"] = True
         state_path.write_bytes(ab._canonical(state))
+    elif damage.endswith("generation") or damage.startswith("provenance-"):
+        state = _state(registry)
+        record = next(iter(state["bindings"].values()))
+        if damage.endswith("bound-generation"):
+            record["bound_generation"] = {"zero-bound-generation": 0, "negative-bound-generation": -1, "future-bound-generation": state["generation"] + 1}[damage]
+        elif damage.endswith("release-generation"):
+            record["released_generation"] = {"early-release-generation": record["bound_generation"] - 1, "same-release-generation": record["bound_generation"], "future-release-generation": state["generation"] + 1}[damage]
+        elif damage == "provenance-out-of-order":
+            record["provenance"].reverse()
+        elif damage == "provenance-duplicate-generation":
+            record["provenance"][1]["generation"] = record["provenance"][0]["generation"]
+        else:
+            record["provenance"][1]["generation"] = {
+                "provenance-zero": 0,
+                "provenance-negative": -1,
+                "provenance-after-bound": record["bound_generation"] + 1,
+                "provenance-after-state": state["generation"] + 1,
+                "provenance-before-current-bound": record["bound_generation"] - 1,
+            }[damage]
+        state_path.write_bytes(ab._canonical(state))
     elif damage == "missing-state":
         state_path.unlink()
     elif damage == "missing-key":
@@ -175,13 +228,15 @@ def test_unreadable_or_corrupt_registry_denies_and_inspects_unknown(registry, ro
     else:
         key_path.write_bytes(b"short")
 
+    before = {path.name: path.read_bytes() for path in context.resolve(ab.REGISTRY_DIRECTORY).iterdir() if path.is_file()}
     with pytest.raises(AccountOwnershipUnknown):
         registry.bind(roots[1], "demo-beta", SimAccountIdentity("sim", OTHER_ACCOUNT), custody=custody)
     with pytest.raises(AccountOwnershipUnknown):
         registry.release(roots[0], "demo-alpha", account, quiescence=stopped)
-    assert registry.inspect(account) == {"status": "ownership-unknown", "environment": None, "deployment": None, "execution_authorized": False}
+    assert registry.inspect(account) == {"status": "ownership-unknown", "environment": None, "deployment": None, "policy_only": True, "global_custody": "ownership-unknown", "execution_authorized": False}
     with pytest.raises(AccountOwnershipUnknown):
         AccountRegistry.open(registry.path)
+    assert {path.name: path.read_bytes() for path in context.resolve(ab.REGISTRY_DIRECTORY).iterdir() if path.is_file()} == before
 
 
 def test_unverified_private_registry_storage_denies(registry, roots, account, custody, monkeypatch):
@@ -189,6 +244,65 @@ def test_unverified_private_registry_storage_denies(registry, roots, account, cu
     with pytest.raises(AccountOwnershipUnknown, match="private storage"):
         registry.bind(roots[0], "demo-alpha", account, custody=custody)
     assert registry.inspect(account)["status"] == "ownership-unknown"
+
+
+@pytest.mark.parametrize("damage", ["duplicate-active-owner-deployment", "duplicate-bound-generation", "duplicate-release-and-bind", "duplicate-provenance-and-bind"])
+def test_cross_record_corruption_denies_without_mutation(registry, roots, account, custody, damage):
+    root_a, root_b, root_c = roots
+    registry.bind(root_a, "demo-alpha", account, custody=custody)
+    registry.bind(root_a, "demo-beta", SimAccountIdentity("sim", OTHER_ACCOUNT), custody=custody)
+    if damage in {"duplicate-release-and-bind", "duplicate-provenance-and-bind"}:
+        released = registry.release(root_a, "demo-alpha", account, quiescence=stopped)
+        if damage == "duplicate-provenance-and-bind":
+            registry.bind(root_b, "demo-gamma", account, release_digest=released["release_digest"], custody=custody)
+            released = registry.release(root_b, "demo-gamma", account, quiescence=stopped)
+            registry.bind(root_a, "demo-alpha", account, release_digest=released["release_digest"], custody=custody)
+
+    state = _state(registry)
+    first = next(record for record in state["bindings"].values() if record["deployment"] == "demo-alpha")
+    second = next(record for record in state["bindings"].values() if record["deployment"] == "demo-beta")
+    if damage == "duplicate-active-owner-deployment":
+        second["deployment"], second["deployment_key"] = first["deployment"], first["deployment_key"]
+    elif damage == "duplicate-bound-generation":
+        second["bound_generation"] = first["bound_generation"]
+    elif damage == "duplicate-release-and-bind":
+        second["bound_generation"] = first["released_generation"]
+    else:
+        second["bound_generation"] = first["provenance"][0]["generation"]
+    before = ab._canonical(state)
+    state_path = registry._context.resolve(ab.STATE_PATH)
+    state_path.write_bytes(before)
+
+    with pytest.raises(AccountOwnershipUnknown):
+        registry.bind(root_c, "demo-delta", SimAccountIdentity("sim", "SIM-ACCT-FAKE-THIRD"), custody=custody)
+    with pytest.raises(AccountOwnershipUnknown):
+        registry.release(root_a, "demo-alpha", account, quiescence=stopped)
+    assert registry.inspect(account)["status"] == "ownership-unknown"
+    with pytest.raises(AccountOwnershipUnknown):
+        AccountRegistry.open(registry.path)
+    assert state_path.read_bytes() == before
+
+
+def test_interleaved_accounts_allow_released_owner_reuse_and_generation_gaps(registry, roots, account, custody):
+    root_a, root_b, root_c = roots
+    other = SimAccountIdentity("sim", OTHER_ACCOUNT)
+    registry.bind(root_a, "demo-alpha", account, custody=custody)
+    first_release = registry.release(root_a, "demo-alpha", account, quiescence=stopped)
+    receipt = registry.bind(root_a, "demo-alpha", other, custody=custody)
+    before = registry._context.read_bytes(ab.STATE_PATH)
+    assert registry.bind(root_a, "DEMO-ALPHA", other, custody=custody) == receipt
+    assert registry._context.read_bytes(ab.STATE_PATH) == before
+
+    registry.bind(root_b, "demo-beta", account, release_digest=first_release["release_digest"], custody=custody)
+    other_release = registry.release(root_a, "demo-alpha", other, quiescence=stopped)
+    second_release = registry.release(root_b, "demo-beta", account, quiescence=stopped)
+    registry.bind(root_c, "demo-gamma", other, release_digest=other_release["release_digest"], custody=custody)
+    registry.bind(root_a, "demo-alpha", account, release_digest=second_release["release_digest"], custody=custody)
+    state = _state(registry)
+    assert state["generation"] == 8
+    assert sorted(record["bound_generation"] for record in state["bindings"].values()) == [7, 8]
+    assert sorted(hop["generation"] for record in state["bindings"].values() for hop in record["provenance"]) == [4, 7, 8]
+    assert registry.inspect(account)["status"] == registry.inspect(other)["status"] == "active"
 
 
 def test_registry_initialization_requires_empty_directory(tmp_path):
@@ -227,7 +341,7 @@ def test_owned_stopped_release_and_transfer_records_provenance(registry, roots, 
 
     released = registry.release(root_a, "demo-alpha", account, quiescence=stopped)
     assert released["status"] == "released" and len(released["release_digest"]) == 64
-    assert registry.inspect(account) == {"status": "released", "environment": "sim", "deployment": None, "execution_authorized": False}
+    assert registry.inspect(account) == {"status": "released", "environment": "sim", "deployment": None, "policy_only": True, "global_custody": "ownership-unknown", "execution_authorized": False}
 
     with pytest.raises(ReleaseRequired):
         registry.bind(root_b, "demo-beta", account, custody=custody)
@@ -343,20 +457,30 @@ def test_production_runner_quiescence_reads_owned_runner_records(roots):
         assert runner_quiescence(root, "demo-alpha") == expected
 
 
-def test_concurrent_transfers_of_one_release_digest_admit_exactly_one(registry, roots, account, custody):
+@pytest.mark.parametrize("startup_failure", [False, True])
+def test_concurrent_transfers_of_one_release_digest_are_bounded_and_admit_at_most_one(registry, roots, account, custody, monkeypatch, startup_failure):
     root_a, root_b, root_c = roots
     registry.bind(root_a, "demo-alpha", account, custody=custody)
     digest = registry.release(root_a, "demo-alpha", account, quiescence=stopped)["release_digest"]
     barrier = threading.Barrier(2)
     outcomes: dict[str, object] = {}
+    if startup_failure:
+        original_open = RootContext.open
+
+        def fail_one_root(path):
+            if path == root_b.path:
+                raise OSError("fake competing-root startup failure")
+            return original_open(path)
+
+        monkeypatch.setattr(RootContext, "open", fail_one_root)
 
     def transfer(label, path, deployment):
-        with RootContext.open(path) as root, AccountRegistry.open(registry.path) as handle:
-            barrier.wait()
-            try:
+        try:
+            with RootContext.open(path) as root, AccountRegistry.open(registry.path) as handle:
+                barrier.wait(timeout=10)
                 outcomes[label] = handle.bind(root, deployment, account, release_digest=digest, custody=FakeVerifiedCustody())
-            except Exception as exc:  # noqa: BLE001 - outcome is asserted below
-                outcomes[label] = exc
+        except Exception as exc:  # noqa: BLE001 - every failure outcome is asserted below
+            outcomes[label] = exc
 
     threads = [threading.Thread(target=transfer, args=("b", root_b.path, "demo-beta")), threading.Thread(target=transfer, args=("c", root_c.path, "demo-gamma"))]
     for thread in threads:
@@ -364,6 +488,14 @@ def test_concurrent_transfers_of_one_release_digest_admit_exactly_one(registry, 
     for thread in threads:
         thread.join(timeout=30)
     assert not any(thread.is_alive() for thread in threads)
+    assert len(outcomes) == 2
+    if startup_failure:
+        assert isinstance(outcomes["b"], OSError)
+        assert isinstance(outcomes["c"], threading.BrokenBarrierError)
+        record = next(iter(_state(registry)["bindings"].values()))
+        assert record["status"] == "released" and record["provenance"] == []
+        assert _state(registry)["generation"] == 2
+        return
 
     winners = [value for value in outcomes.values() if isinstance(value, dict)]
     losers = [value for value in outcomes.values() if not isinstance(value, dict)]
@@ -467,9 +599,87 @@ def test_default_registry_location_is_per_user_and_outside_legacy_home(tmp_path)
         ab.default_registry_location({"LOCALAPPDATA": "relative", "XDG_STATE_HOME": "relative", "HOME": ""})
 
 
-def test_provisioning_module_is_not_wired_to_execution_or_web():
-    import pathlib
+def test_simulation_receipt_cannot_enable_production_ownership(registry, roots, account, custody):
+    receipt = registry.bind(roots[0], "demo-alpha", account, custody=custody)
+    assert receipt["execution_authorized"] is False
+    with pytest.raises(AccountOwnershipUnknown, match="ownership-unknown"):
+        ab.require_sim_account_ownership()
 
-    package = pathlib.Path(ab.__file__).resolve().parents[1]
-    for relative in ("brokers/factory.py", "paper/deployed.py", "web/app.py", "web/services.py", "run.py"):
-        assert "account_binding" not in (package / relative).read_text(encoding="utf-8")
+
+def test_simulation_receipts_and_inspection_never_claim_global_custody(registry, roots, account, custody):
+    receipt = registry.bind(roots[0], "demo-alpha", account, custody=custody)
+    for result in (receipt, registry.inspect(account)):
+        assert result["policy_only"] is True
+        assert result["global_custody"] == "ownership-unknown"
+        assert result["execution_authorized"] is False
+
+
+def test_simulation_initialization_denies_outside_test_mode_before_path_access(tmp_path, monkeypatch):
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("unsupported production account custody reached registry path access")
+
+    monkeypatch.delenv("HEDGE_FUND_TEST_MODE")
+    monkeypatch.setattr(RootContext, "open", forbidden)
+    with pytest.raises(AccountOwnershipUnknown, match="ownership-unknown"):
+        AccountRegistry.initialize(tmp_path / "not-created")
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("operation", ["bind", "release"])
+def test_fake_custody_cannot_enable_registry_mutation_outside_test_mode(registry, roots, account, custody, monkeypatch, operation):
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("unsupported account custody reached root admission")
+
+    registry.bind(roots[0], "demo-alpha", account, custody=custody)
+    before = _state(registry)
+    calls = custody.calls
+    monkeypatch.delenv("HEDGE_FUND_TEST_MODE")
+    monkeypatch.setattr(ab, "root_registry_writer", forbidden)
+    with pytest.raises(AccountOwnershipUnknown, match="ownership-unknown"):
+        if operation == "bind":
+            registry.bind(roots[1], "demo-beta", SimAccountIdentity("sim", OTHER_ACCOUNT), custody=custody)
+        else:
+            registry.release(roots[0], "demo-alpha", account, quiescence=stopped)
+    assert _state(registry) == before
+    assert custody.calls == calls
+
+
+def test_simulation_initialization_denies_unverifiable_test_namespace_before_path_access(tmp_path, monkeypatch):
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("unverifiable fake registry namespace reached path access")
+
+    monkeypatch.setenv("HEDGE_FUND_TEST_ROOT", str(tmp_path / "unverifiable-namespace"))
+    monkeypatch.setattr(RootContext, "open", forbidden)
+    with pytest.raises(AccountOwnershipUnknown, match="ownership-unknown"):
+        AccountRegistry.initialize(tmp_path)
+
+
+@pytest.mark.parametrize("operation", ["open", "inspect"])
+def test_simulation_reads_deny_outside_test_mode_before_registry_access(registry, roots, account, custody, monkeypatch, operation):
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("unsupported account custody reached a registry read")
+
+    registry.bind(roots[0], "demo-alpha", account, custody=custody)
+    monkeypatch.delenv("HEDGE_FUND_TEST_MODE")
+    if operation == "open":
+        monkeypatch.setattr(RootContext, "open", forbidden)
+        with pytest.raises(AccountOwnershipUnknown, match="ownership-unknown"):
+            AccountRegistry.open(registry.path)
+    else:
+        monkeypatch.setattr(registry, "_load", forbidden)
+        assert registry.inspect(account) == {"status": "ownership-unknown", "environment": None, "deployment": None, "policy_only": True, "global_custody": "ownership-unknown", "execution_authorized": False}
+
+
+def test_untrusted_custody_reason_never_exposes_account_identity(registry, roots, account, caplog):
+    class Declined:
+        def assess(self, registry, root):
+            return CustodyAssessment(False, SECRET_ACCOUNT)
+
+    with pytest.raises(AccountOwnershipUnknown) as denied:
+        registry.bind(roots[0], "demo-alpha", account, custody=Declined())
+    assert SECRET_ACCOUNT not in str(denied.value) + caplog.text
+    assert _state(registry)["bindings"] == {}
+
+
+def test_identity_repr_redacts_untrusted_environment_input():
+    assert SECRET_ACCOUNT not in repr(SimAccountIdentity(SECRET_ACCOUNT, OTHER_ACCOUNT))
