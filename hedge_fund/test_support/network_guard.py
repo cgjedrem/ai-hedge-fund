@@ -387,6 +387,30 @@ def install_network_guard() -> None:
         setattr(guarded, _GUARD, True)
         setattr(socket.socket, name, guarded)
 
+    if os.name == "nt":
+        # Windows asyncio connects/sends through IOCP (ConnectEx/WSASendTo), bypassing socket.socket methods.
+        from asyncio import windows_events
+
+        proactor = windows_events.IocpProactor
+        for name in ("connect", "sendto"):
+            original = getattr(proactor, name)
+            if getattr(original, _GUARD, False):
+                continue
+
+            def guarded_proactor(self, conn, *args, _original=original, _name=name, **kwargs):
+                if _name == "connect":
+                    address = args[0] if args else kwargs.get("address")
+                else:
+                    address = args[2] if len(args) > 2 else kwargs.get("addr")
+                is_unix = getattr(conn, "family", None) == getattr(socket, "AF_UNIX", object())
+                connected_send = _name == "sendto" and address is None
+                if not is_unix and not connected_send and (block_loopback or not _is_loopback_address(address) or not _loopback_port_allowed(address, loopback_ports)):
+                    raise AssertionError("external network disabled in tests")
+                return _original(self, conn, *args, **kwargs)
+
+            setattr(guarded_proactor, _GUARD, True)
+            setattr(proactor, name, guarded_proactor)
+
     module_names = (
         "create_connection",
         "getaddrinfo",

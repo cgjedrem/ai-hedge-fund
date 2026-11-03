@@ -1185,3 +1185,11 @@ No other session process, checkout, preview or the worktree itself was removed.
   files, 184 passed**; `tsc --noEmit` passed; owned `--capacity` **1 passed (18.0 s)** with the allowlist active; owned default
   **22 passed, 4 failed, 6 skipped** (same 4 pre-existing desk failures). flake8/isort clean; Black drift in the two touched
   Python files is pre-existing and unchanged in size. Recorded 2026-11-03T03:08:08+01:00.
+- Review follow-up (MEDIUM): on Windows the asyncio `ProactorEventLoop` connects/sends via `IocpProactor.connect` (ConnectEx)
+  and `IocpProactor.sendto` (WSASendTo), bypassing the `socket.socket` wrappers. The guard now also wraps those two methods with
+  the same non-loopback denial and loopback-port allowlist (AF_UNIX exempt; `sendto` with no address passes through). The probe
+  now asserts asyncio `open_connection` to the allowed port succeeds while the other loopback port, `localhost`, and
+  `203.0.113.1:443` raise, and `loop.sock_sendto` to another loopback port raises. Rerun: `test_acceptance_isolation.py`,
+  `web\test_main.py`, `runtime\test_owned_runner.py`, `web\test_jobs.py` **135 passed in 302.30 s**; harness unit **9 passed**;
+  owned `--capacity` **1 passed (19.2 s)**; owned default **22 passed, 4 failed, 6 skipped** (same 4 pre-existing desk failures);
+  flake8/isort clean, Black drift unchanged (20/20 lines). Recorded 2026-11-03T03:20:33+01:00.
