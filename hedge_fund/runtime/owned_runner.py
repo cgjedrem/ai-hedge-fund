@@ -23,6 +23,7 @@ from hedge_fund.runtime.admission import (
     AdmissionError,
     MAX_LOCK_WAIT_SECONDS,
     PROTOCOL_VERSION,
+    WriterConflict,
 )
 from hedge_fund.runtime.capture import FrozenCapture
 from hedge_fund.runtime.configuration import build_child_environment
@@ -33,7 +34,9 @@ from hedge_fund.runtime.handover import (
 )
 from hedge_fund.runtime.ownership import (
     identity_matches,
+    launch_command_digest,
     process_identity,
+    process_launch_fingerprint,
     ProcessIdentityError,
 )
 from hedge_fund.runtime.root import (
@@ -53,6 +56,28 @@ _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _SESSION_KEY = re.compile(r"^\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}:\d{2})?$")
 _ACTIVE_STATES = frozenset({"starting", "running", "stopping"})
 _TERMINAL_STATES = frozenset({"completed", "stopped", "failed"})
+_OWNER_FIELDS = frozenset(
+    {
+        "schema",
+        "protocol_version",
+        "build_id",
+        "root",
+        "fund",
+        "nonce_hash",
+        "operation_id",
+        "operation_digest",
+        "process_identity",
+        "launch_fingerprint",
+        "command_sha256",
+        "executable_sha256",
+        "manager_identity",
+        "created_at",
+    }
+)
+_FINGERPRINT_FIELDS = frozenset({"command_sha256", "user", "cwd"}) if sys.platform.startswith("linux") else frozenset({"command_sha256", "user"})
+_IDENTITY_FIELDS = frozenset({"pid", "creation_time", "image", "host", "namespace"})
+REATTACHED_REASON = "Runner owner reattached after verifying its exact process incarnation."
+STALE_OWNER_REASON = "Runner owner is no longer running; offline stale-reservation review is required."
 
 
 class OwnedRunnerError(RuntimeError):
@@ -71,7 +96,14 @@ class _ProcessRef:
 
 
 class OwnedRunnerManager:
-    """Launch detached children and control only exact in-process Popen handles."""
+    """Launch detached children and control only verified exact process incarnations.
+
+    A manager that launched a child keeps its ``Popen`` handle. A different or
+    restarted manager may reattach only after proving, from the root-private
+    owner record and native process evidence, that the live process is the exact
+    child launched for this root, fund, nonce and operation; PID alone is never
+    trusted and nothing is ever signalled except via the cooperative control record.
+    """
 
     def __init__(
         self,
@@ -238,6 +270,14 @@ class OwnedRunnerManager:
             "stop_requested": False,
             "requested_at": None,
         }
+        try:
+            command = _runner_command(self._root, name)
+            command_sha256 = launch_command_digest(command)
+            executable_sha256 = _executable_digest(command[0])
+        except ProcessIdentityError:
+            raise OwnedRunnerError("runner launch command is unverifiable") from None
+        launch_cwd = os.fspath(Path(__file__).resolve().parents[2])
+        owner_path = f"{directory}/owner.json"
         _write_record(self._root, launch_path, launch)
         _write_record(self._root, state_path, state)
         _write_record(self._root, control_path, control)
@@ -247,12 +287,11 @@ class OwnedRunnerManager:
             child_id=f"runner-{key[:24]}",
             settings=_capture_settings(capture),
         )
-        command = _runner_command(self._root, name)
         options: dict[str, object] = {
             "stdin": subprocess.DEVNULL,
             "stdout": subprocess.DEVNULL,
             "stderr": subprocess.DEVNULL,
-            "cwd": os.fspath(Path(__file__).resolve().parents[2]),
+            "cwd": launch_cwd,
             "env": env,
         }
         if os.name == "nt":
@@ -263,6 +302,32 @@ class OwnedRunnerManager:
         try:
             process = subprocess.Popen(command, **options)
             identity = process_identity(process.pid)
+            fingerprint = process_launch_fingerprint(process.pid)
+            if not identity_matches(process.pid, identity):
+                raise OwnedRunnerError("runner process incarnation changed during launch")
+            if fingerprint["command_sha256"] != command_sha256 or not _same_executable(identity["image"], command[0]):
+                raise OwnedRunnerError("runner process does not match its launch command")
+            if "cwd" in fingerprint and os.path.realpath(fingerprint["cwd"]) != os.path.realpath(launch_cwd):
+                raise OwnedRunnerError("runner process does not match its launch directory")
+            if _executable_digest(command[0]) != executable_sha256:
+                raise OwnedRunnerError("runner executable changed during launch")
+            owner = {
+                "schema": 1,
+                "protocol_version": PROTOCOL_VERSION,
+                "build_id": code_version(),
+                "root": root_binding(self._root),
+                "fund": name,
+                "nonce_hash": nonce_hash,
+                "operation_id": operation_id,
+                "operation_digest": operation_digest,
+                "process_identity": identity,
+                "launch_fingerprint": fingerprint,
+                "command_sha256": command_sha256,
+                "executable_sha256": executable_sha256,
+                "manager_identity": process_identity(os.getpid()),
+                "created_at": launch["created_at"],
+            }
+            _write_record(self._root, owner_path, owner)
             state["pid"] = process.pid
             state["process_identity"] = identity
             _write_record(self._root, state_path, state)
@@ -328,8 +393,16 @@ class OwnedRunnerManager:
             return self._public_state(state, stopping=False)
         if status not in _ACTIVE_STATES:
             return _unknown_state("runner ownership state is unknown")
-        if not self._matches_process(key, state):
-            return _unknown_state("runner owner is not verified in this server process")
+        verified, reason = self._verify_owner(name, key, state)
+        if not verified:
+            # The owner writes its terminal record before releasing its reservation and exiting.
+            try:
+                latest = _read_record(self._root, state_path, missing_ok=True)
+            except OwnedRunnerError:
+                latest = None
+            if latest is not None and latest.get("nonce_hash") == state["nonce_hash"] and latest.get("status") in _TERMINAL_STATES and self._valid_state(latest, name):
+                return self._public_state(latest, stopping=False)
+            return _unknown_state(reason)
         try:
             control = _read_record(
                 self._root,
@@ -341,15 +414,29 @@ class OwnedRunnerManager:
         if not validate_runner_control(self._root, name, state["nonce_hash"], control):
             return _unknown_state("runner control record is invalid")
         stopping = bool(control["stop_requested"] is True)
-        return self._public_state(state, stopping=stopping)
+        public = self._public_state(state, stopping=stopping)
+        if verified == "reattached" and public["reason"] is None:
+            public["reason"] = REATTACHED_REASON
+        return public
 
     def request_stop(self, fund: str) -> dict[str, object]:
         name, key = _fund_key(fund)
+        try:
+            # Fence against a concurrent start replacing the record set under this stop.
+            with self._admission.deployment_lock(name, timeout=0):
+                return self._request_stop_locked(name, key)
+        except AdmissionError:
+            raise RunnerOwnershipUnknown("runner deployment admission is busy; no stop was recorded") from None
+        except (OSError, RootPathError, ValueError):
+            raise RunnerOwnershipUnknown("runner deployment admission cannot be observed; no stop was recorded") from None
+
+    def _request_stop_locked(self, name: str, key: str) -> dict[str, object]:
         state_path = f"{RUNNER_ROOT}/{key}/state.json"
         state = _read_record(self._root, state_path, missing_ok=True)
         if state is None or not self._valid_state(state, name) or state.get("status") not in _ACTIVE_STATES:
             raise RunnerOwnershipUnknown("owned runner is not available for stop")
-        if not self._matches_process(key, state):
+        verified, _reason = self._verify_owner(name, key, state)
+        if not verified:
             raise RunnerOwnershipUnknown("runner process incarnation is not verified")
         if self._legacy_pid_present(name):
             raise RunnerOwnershipUnknown("legacy runner presence blocks stop")
@@ -361,7 +448,85 @@ class OwnedRunnerManager:
             control["stop_requested"] = True
             control["requested_at"] = _datetime_text(datetime.now(timezone.utc))
             _write_record(self._root, control_path, control)
-        return self._public_state(state, stopping=True)
+        public = self._public_state(state, stopping=True)
+        if verified == "reattached" and public["reason"] is None:
+            public["reason"] = REATTACHED_REASON
+        return public
+
+    def _verify_owner(self, name: str, key: str, state: dict[str, Any]) -> tuple[str | None, str]:
+        """Return ("memory"|"reattached", "") or (None, fail-closed reason)."""
+        if self._matches_process(key, state):
+            return "memory", ""
+        return self._verify_reattach(name, key, state)
+
+    def _verify_reattach(self, name: str, key: str, state: dict[str, Any]) -> tuple[str | None, str]:
+        pid = state.get("pid")
+        identity = state.get("process_identity")
+        if state.get("status") not in {"running", "stopping"}:
+            if type(pid) is int and isinstance(identity, dict) and not identity_matches(pid, identity):
+                return None, STALE_OWNER_REASON
+            return None, "runner launch is not confirmed; ownership is unverified"
+        if type(pid) is not int or not isinstance(identity, dict):
+            return None, "runner process identity is unavailable"
+        try:
+            owner = _read_record(self._root, f"{RUNNER_ROOT}/{key}/owner.json", missing_ok=True)
+            launch = _read_record(self._root, f"{RUNNER_ROOT}/{key}/launch.json", missing_ok=True)
+        except OwnedRunnerError:
+            return None, "runner owner record is unavailable"
+        if owner is None or launch is None:
+            return None, "runner owner record is unavailable"
+        if not validate_runner_owner(self._root, name, owner):
+            return None, "runner owner record is invalid"
+        nonce = launch.get("nonce")
+        authorization = launch.get("authorization")
+        if (
+            owner["nonce_hash"] != state["nonce_hash"]
+            or not isinstance(nonce, str)
+            or _sha256(nonce.encode("utf-8")) != owner["nonce_hash"]
+            or launch.get("fund") != name
+            or launch.get("root") != owner["root"]
+            or not isinstance(authorization, dict)
+            or authorization.get("operation_id") != owner["operation_id"]
+            or authorization.get("operation_digest") != owner["operation_digest"]
+            or owner["process_identity"] != identity
+            or owner["process_identity"]["pid"] != pid
+        ):
+            return None, "runner owner record does not match its launch"
+        try:
+            command = _runner_command(self._root, name)
+            expected_command = launch_command_digest(command)
+        except (OwnedRunnerError, ProcessIdentityError):
+            return None, "runner launch command is unverifiable"
+        if owner["command_sha256"] != expected_command or owner["launch_fingerprint"]["command_sha256"] != expected_command:
+            return None, "runner launch command does not match this server"
+        if not _same_executable(identity["image"], command[0]):
+            return None, "runner executable does not match this server"
+        try:
+            if _executable_digest(command[0]) != owner["executable_sha256"]:
+                return None, "runner executable was replaced"
+        except ProcessIdentityError:
+            return None, "runner executable is unverifiable"
+        if not identity_matches(pid, identity):
+            return None, STALE_OWNER_REASON
+        try:
+            fingerprint = process_launch_fingerprint(pid)
+        except (OSError, ProcessIdentityError):
+            return None, "runner process fingerprint is unverifiable"
+        # Re-check the incarnation so the fingerprint cannot come from a reused PID.
+        if not identity_matches(pid, identity):
+            return None, STALE_OWNER_REASON
+        if fingerprint != owner["launch_fingerprint"]:
+            return None, "runner process does not match its recorded launch"
+        try:
+            # A server without a verified root-owner lease cannot observe reservations.
+            self._admission.require_root_owner()
+            with self._admission.runner_reservation(name, timeout=0):
+                return None, "runner reservation is not held by the verified owner"
+        except WriterConflict:
+            pass
+        except (AdmissionError, OSError, RootPathError, ValueError):
+            return None, "runner reservation cannot be observed by this server"
+        return "reattached", ""
 
     def _matches_process(self, key: str, state: dict[str, Any]) -> bool:
         with self._guard:
@@ -455,8 +620,10 @@ def read_runner_record(
     fund: str,
     kind: str,
 ) -> dict[str, Any] | None:
-    if kind not in {"launch", "state", "control"}:
+    if kind not in {"launch", "state", "control", "owner"}:
         raise ValueError("runner record kind is invalid")
+    if kind == "owner":
+        return _read_record(root, f"{RUNNER_ROOT}/{runner_key(fund)}/owner.json", missing_ok=True)
     launch_path, state_path, control_path = runner_paths(fund)
     path = {"launch": launch_path, "state": state_path, "control": control_path}[kind]
     return _read_record(root, path, missing_ok=True)
@@ -583,6 +750,76 @@ def validate_runner_control(
             _parse_datetime(requested_at)
         return control["stop_requested"] == (requested_at is not None)
     except (OSError, OwnedRunnerError, RootPathError, TypeError, ValueError):
+        return False
+
+
+def validate_runner_owner(
+    root: RootContext,
+    fund: str,
+    owner: object,
+) -> bool:
+    """Validate the root-private launch owner record written by the manager."""
+    if not isinstance(owner, dict) or set(owner) != _OWNER_FIELDS:
+        return False
+    try:
+        name, _key = _fund_key(fund)
+        if type(owner["schema"]) is not int or owner["schema"] != 1 or type(owner["protocol_version"]) is not int or owner["protocol_version"] != PROTOCOL_VERSION or owner["build_id"] != code_version() or owner["root"] != root_binding(root) or owner["fund"] != name or not isinstance(owner["operation_id"], str) or not re.fullmatch(r"[a-f0-9]{32}", owner["operation_id"]):
+            return False
+        for field in ("nonce_hash", "operation_digest", "command_sha256", "executable_sha256"):
+            if not isinstance(owner[field], str) or not _SHA256.fullmatch(owner[field]):
+                return False
+        for field in ("process_identity", "manager_identity"):
+            identity = owner[field]
+            if not isinstance(identity, dict) or set(identity) != _IDENTITY_FIELDS or type(identity["pid"]) is not int or identity["pid"] <= 0 or any(not isinstance(identity[item], str) or not identity[item] for item in ("creation_time", "image", "host", "namespace")):
+                return False
+        fingerprint = owner["launch_fingerprint"]
+        if not isinstance(fingerprint, dict) or set(fingerprint) != _FINGERPRINT_FIELDS or any(not isinstance(value, str) or not value for value in fingerprint.values()):
+            return False
+        if not _SHA256.fullmatch(fingerprint["command_sha256"]):
+            return False
+        _parse_datetime(owner["created_at"])
+        return True
+    except (OSError, OwnedRunnerError, RootPathError, TypeError, ValueError):
+        return False
+
+
+_EXECUTABLE_DIGESTS: dict[tuple[str, int, int, int], str] = {}
+_EXECUTABLE_GUARD = threading.Lock()
+
+
+def _executable_digest(path: str) -> str:
+    """Digest the interpreter file; any replacement changes the cache key and digest."""
+    try:
+        resolved = os.path.realpath(path)
+        before = os.stat(resolved)
+        cache_key = (os.path.normcase(resolved), before.st_size, before.st_mtime_ns, before.st_ino)
+        with _EXECUTABLE_GUARD:
+            cached = _EXECUTABLE_DIGESTS.get(cache_key)
+        if cached is not None:
+            return cached
+        digest = hashlib.sha256()
+        with open(resolved, "rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        after = os.stat(resolved)
+    except OSError:
+        raise ProcessIdentityError("runner executable is unavailable") from None
+    if (after.st_size, after.st_mtime_ns, after.st_ino) != (before.st_size, before.st_mtime_ns, before.st_ino):
+        raise ProcessIdentityError("runner executable changed while hashing")
+    value = digest.hexdigest()
+    with _EXECUTABLE_GUARD:
+        if len(_EXECUTABLE_DIGESTS) > 64:
+            _EXECUTABLE_DIGESTS.clear()
+        _EXECUTABLE_DIGESTS[cache_key] = value
+    return value
+
+
+def _same_executable(image: object, executable: str) -> bool:
+    if not isinstance(image, str) or not image:
+        return False
+    try:
+        return os.path.normcase(os.path.realpath(image)) == os.path.normcase(os.path.realpath(executable))
+    except (OSError, TypeError, ValueError):
         return False
 
 

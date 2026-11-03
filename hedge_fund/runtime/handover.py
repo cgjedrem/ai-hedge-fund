@@ -1202,7 +1202,7 @@ def recover_stale_reservation(
                 "recovered_at": datetime.now(timezone.utc).isoformat(timespec="microseconds"),
             }
             record = {**body, "record_digest": _digest(body)}
-            _validate_stale_recovery_record(root, fund, record)
+            _validate_stale_recovery_record(root, fund, record, require_local_scope=True)
             root.mkdir(f"{RECOVERY_ROOT}/{runner_identity}", parents=True, mode=0o700)
             try:
                 root.file_info(recovery_path)
@@ -1323,10 +1323,23 @@ def _prior_owner_identity(state: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _same_process_scope(identity: dict[str, Any]) -> bool:
+    """Bind a recorded owner to this host boot and process namespace, using the native identity scheme."""
+    from hedge_fund.runtime.ownership import process_identity, ProcessIdentityError
+
+    try:
+        current = process_identity(os.getpid())
+    except (OSError, ProcessIdentityError):
+        return False
+    return identity["host"].casefold() == current["host"].casefold() and identity["namespace"] == current["namespace"]
+
+
 def _validate_stale_recovery_record(
     root: RootContext,
     fund: str,
     record: object,
+    *,
+    require_local_scope: bool = False,
 ) -> None:
     fields = {
         "schema",
@@ -1378,8 +1391,7 @@ def _validate_stale_recovery_record(
         or type(process_identity.get("pid")) is not int
         or process_identity["pid"] != prior["pid"]
         or any(not isinstance(process_identity.get(key), str) or not process_identity[key] for key in ("creation_time", "image", "host", "namespace"))
-        or process_identity["host"].casefold() != root.host_identity.casefold()
-        or process_identity["namespace"] != root.namespace_identity
+        or (require_local_scope and not _same_process_scope(process_identity))
     ):
         raise HandoverError("stale recovery process identity is invalid")
     body = {key: value for key, value in record.items() if key != "record_digest"}

@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import ctypes
+import hashlib
+import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -38,6 +41,148 @@ def identity_matches(pid: int, expected: object) -> bool:
         return process_identity(pid) == expected
     except (OSError, ProcessIdentityError, ValueError):
         return False
+
+
+def launch_command_digest(command: list[str]) -> str:
+    """Digest the exact command form the native OS exposes for a child."""
+    if not isinstance(command, list) or not command or any(not isinstance(value, str) for value in command):
+        raise ProcessIdentityError("launch command is invalid")
+    if os.name == "nt":
+        canonical = subprocess.list2cmdline(command)
+    else:
+        canonical = json.dumps(command, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def process_launch_fingerprint(pid: int) -> dict[str, str]:
+    """Return command/token (and Linux cwd) evidence for one live process."""
+    if type(pid) is not int or pid <= 0:
+        raise ProcessIdentityError("process fingerprint input is invalid")
+    if os.name == "nt":
+        return _windows_launch_fingerprint(pid)
+    if sys.platform.startswith("linux"):
+        return _linux_launch_fingerprint(pid)
+    raise ProcessIdentityError("process fingerprint primitive is unsupported")
+
+
+def current_user_identity() -> str:
+    return process_launch_fingerprint(os.getpid())["user"]
+
+
+def _windows_launch_fingerprint(pid: int) -> dict[str, str]:
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    ntdll = ctypes.WinDLL("ntdll")
+    kernel32.OpenProcess.argtypes = [ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = ctypes.c_int
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel32.LocalFree.restype = ctypes.c_void_p
+    ntdll.NtQueryInformationProcess.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_ulong,
+        ctypes.c_void_p,
+        ctypes.c_ulong,
+        ctypes.POINTER(ctypes.c_ulong),
+    ]
+    ntdll.NtQueryInformationProcess.restype = ctypes.c_long
+    advapi32.OpenProcessToken.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_void_p)]
+    advapi32.OpenProcessToken.restype = ctypes.c_int
+    advapi32.GetTokenInformation.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_ulong,
+        ctypes.POINTER(ctypes.c_ulong),
+    ]
+    advapi32.GetTokenInformation.restype = ctypes.c_int
+    advapi32.ConvertSidToStringSidW.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_wchar_p)]
+    advapi32.ConvertSidToStringSidW.restype = ctypes.c_int
+
+    handle = kernel32.OpenProcess(0x1000, False, pid)
+    if not handle:
+        raise ProcessIdentityError("process is not observable")
+    try:
+        # ProcessCommandLineInformation (60) returns a UNICODE_STRING followed by its buffer.
+        needed = ctypes.c_ulong(0)
+        size = 4096
+        status = 0
+        for _attempt in range(4):
+            buffer = ctypes.create_string_buffer(size)
+            status = ntdll.NtQueryInformationProcess(handle, 60, buffer, size, ctypes.byref(needed))
+            if status == 0:
+                break
+            if needed.value <= size or needed.value > 1024 * 1024:
+                raise ProcessIdentityError("process command line is unavailable")
+            size = needed.value
+        if status != 0:
+            raise ProcessIdentityError("process command line is unavailable")
+        length = ctypes.c_ushort.from_buffer(buffer, 0).value
+        pointer = ctypes.c_void_p.from_buffer(buffer, ctypes.sizeof(ctypes.c_void_p)).value
+        if not pointer or length % 2:
+            raise ProcessIdentityError("process command line is malformed")
+        command_line = ctypes.wstring_at(pointer, length // 2)
+
+        token = ctypes.c_void_p()
+        if not advapi32.OpenProcessToken(handle, 0x0008, ctypes.byref(token)):
+            raise ProcessIdentityError("process token is unavailable")
+        try:
+            token_size = ctypes.c_ulong(0)
+            advapi32.GetTokenInformation(token, 1, None, 0, ctypes.byref(token_size))
+            if not 0 < token_size.value <= 4096:
+                raise ProcessIdentityError("process token user is unavailable")
+            token_buffer = ctypes.create_string_buffer(token_size.value)
+            if not advapi32.GetTokenInformation(token, 1, token_buffer, token_size, ctypes.byref(token_size)):
+                raise ProcessIdentityError("process token user is unavailable")
+            sid = ctypes.c_void_p.from_buffer(token_buffer, 0).value
+            text = ctypes.c_wchar_p()
+            if not sid or not advapi32.ConvertSidToStringSidW(sid, ctypes.byref(text)):
+                raise ProcessIdentityError("process token user is unavailable")
+            try:
+                user = text.value or ""
+            finally:
+                kernel32.LocalFree(text)
+        finally:
+            kernel32.CloseHandle(token)
+    finally:
+        kernel32.CloseHandle(handle)
+    if not command_line or not user:
+        raise ProcessIdentityError("process fingerprint is incomplete")
+    return {
+        "command_sha256": hashlib.sha256(command_line.encode("utf-8")).hexdigest(),
+        "user": user,
+    }
+
+
+def _linux_launch_fingerprint(pid: int) -> dict[str, str]:
+    proc = Path("/proc") / str(pid)
+    try:
+        raw = (proc / "cmdline").read_bytes()
+        cwd = os.readlink(proc / "cwd")
+        status = (proc / "status").read_text(encoding="ascii")
+    except (OSError, UnicodeError) as exc:
+        raise ProcessIdentityError("process fingerprint is unavailable") from exc
+    if not raw.endswith(b"\0"):
+        raise ProcessIdentityError("process command line is malformed")
+    try:
+        argv = [part.decode("utf-8") for part in raw[:-1].split(b"\0")]
+    except UnicodeDecodeError as exc:
+        raise ProcessIdentityError("process command line is malformed") from exc
+    user = None
+    for line in status.splitlines():
+        if line.startswith("Uid:"):
+            fields = line.split()
+            if len(fields) >= 3:
+                user = f"uid:{fields[2]}"
+            break
+    if not argv or not user or not cwd.startswith("/") or cwd.endswith(" (deleted)"):
+        raise ProcessIdentityError("process fingerprint is incomplete")
+    return {
+        "command_sha256": launch_command_digest(argv),
+        "user": user,
+        "cwd": cwd,
+    }
 
 
 def _windows_process_identity(pid: int) -> dict[str, Any]:

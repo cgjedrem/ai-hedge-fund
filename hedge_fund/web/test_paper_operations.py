@@ -1,4 +1,5 @@
-import os
+﻿import os
+import subprocess
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -669,6 +670,164 @@ def test_owned_runner_readiness_timeout_fails_closed_and_stops_child(
         assert after.latest().hash == head
     finally:
         _stop_owned_runner(service, name)
+
+
+def _reopen_service(root_path: Path) -> DeskService:
+    reopened = DeskService(root_path, allow_writes=True, network_enabled=True)
+    reopened._runtime_settings = _local_settings()
+    return reopened
+
+
+def test_owned_runner_reattaches_after_web_restart_and_parallel_manager(demo_root):
+    name = "owned-runner-reattach"
+    service, root_path, session_record, head, accepted = _start_owned_runner(demo_root, name)
+    others: list[DeskService] = []
+    process = None
+    service_open = True
+    try:
+        completed = _wait_for_operation(service, accepted["operation_id"])
+        assert completed["status"] == "completed", completed.get("error")
+        process = service._runner_manager._processes[runner_key(name)].process
+        owner = read_runner_record(service.root_context, name, "owner")
+        state = read_runner_record(service.root_context, name, "state")
+        assert owner["process_identity"] == state["process_identity"]
+        assert owner["process_identity"]["pid"] == process.pid
+        assert owner["nonce_hash"] == state["nonce_hash"]
+
+        parallel = _reopen_service(root_path)
+        others.append(parallel)
+        assert parallel.allow_writes is True
+        observed = parallel.runner_status(name)
+        assert observed["status"] == "running"
+        assert observed["available"] is True
+        assert observed["reason"] == owned_runner.REATTACHED_REASON
+        assert "pid" not in observed
+        assert service.runner_status(name)["reason"] is None
+
+        # Simulated web-service restart: the launching manager and its handle go away.
+        service.close()
+        service_open = False
+        assert process.poll() is None
+        from fastapi.testclient import TestClient
+
+        from hedge_fund.web.app import create_app
+
+        restarted_app = create_app(root=root_path, allow_writes=True, network_enabled=True)
+        with TestClient(restarted_app, client=("127.0.0.1", 50000)) as client:
+            capability = client.get("/api/capabilities", headers={"host": "127.0.0.1"}).json()
+            headers = {
+                "host": "127.0.0.1",
+                "origin": "http://127.0.0.1",
+                "x-csrf-token": capability["mutation_token"],
+            }
+            reattached = client.get(f"/api/paper/{name}/runner", headers={"host": "127.0.0.1"})
+            assert reattached.status_code == 200
+            assert reattached.json()["status"] == "running"
+            assert reattached.json()["reason"] == owned_runner.REATTACHED_REASON
+            assert "pid" not in reattached.json()
+
+            stopping = client.post(f"/api/paper/{name}/runner/stop", headers=headers)
+            assert stopping.status_code == 200, stopping.json()
+            assert stopping.json()["status"] == "stopping"
+            observed = parallel.runner_status(name)
+            assert observed["status"] in {"stopping", "stopped"}, observed
+            deadline = time.monotonic() + 30
+            latest = None
+            while time.monotonic() < deadline:
+                latest = client.get(f"/api/paper/{name}/runner", headers={"host": "127.0.0.1"}).json()
+                if latest["status"] == "stopped":
+                    break
+                time.sleep(0.05)
+            assert latest is not None and latest["status"] == "stopped", latest
+            assert latest["available"] is False
+        assert process.wait(timeout=30) == 0
+        assert parallel.runner_status(name)["status"] == "stopped"
+        after = Ledger(root_path / "paper" / name)
+        assert after.sessions() == [session_record.session]
+        assert after.latest().hash == head
+    finally:
+        try:
+            if process is not None and process.poll() is None:
+                for other in others:
+                    try:
+                        if other.runner_status(name)["status"] in {"running", "stopping"}:
+                            other.stop_runner(name)
+                            break
+                    except Exception:
+                        continue
+                try:
+                    process.wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    # Test-owned handle only; never a PID lookup.
+                    process.kill()
+                    process.wait(timeout=30)
+        finally:
+            for other in others:
+                other.close()
+            if service_open:
+                _stop_owned_runner(service, name)
+
+
+def test_crashed_owned_runner_requires_offline_stale_review_before_restart(demo_root):
+    from hedge_fund.runtime.handover import (
+        read_stale_recovery,
+        recover_stale_reservation,
+        STALE_RECOVERY_ATTESTATION,
+    )
+    from hedge_fund.runtime.root import RootContext
+
+    name = "owned-runner-crash"
+    service, root_path, session_record, head, accepted = _start_owned_runner(demo_root, name)
+    restarted = None
+    service_open = True
+    try:
+        completed = _wait_for_operation(service, accepted["operation_id"])
+        assert completed["status"] == "completed", completed.get("error")
+        process = service._runner_manager._processes[runner_key(name)].process
+        # Crash the test-owned synthetic child through its own handle; never by PID.
+        process.kill()
+        process.wait(timeout=30)
+        service.close()
+        service_open = False
+
+        restarted = _reopen_service(root_path)
+        before = read_runner_record(restarted.root_context, name, "control")
+        status = restarted.runner_status(name)
+        assert status["status"] == "unknown"
+        assert status["available"] is False
+        assert status["reason"] == owned_runner.STALE_OWNER_REASON
+        with pytest.raises(ServiceError) as denied:
+            restarted.stop_runner(name)
+        assert denied.value.status_code == 409
+        assert denied.value.code == "ownership-unknown"
+        assert read_runner_record(restarted.root_context, name, "control") == before
+        restarted.close()
+        restarted = None
+
+        with RootContext.open(root_path) as root:
+            record = recover_stale_reservation(
+                root,
+                name,
+                evidence={
+                    "owner_quiescence": "Synthetic test-owned child was terminated through its handle.",
+                    "legacy_exclusion": "Isolated synthetic root has no legacy launcher or container writers.",
+                },
+                operator_attestation=STALE_RECOVERY_ATTESTATION,
+            )
+            assert read_stale_recovery(root, name) == record
+
+        restarted = _reopen_service(root_path)
+        recovered = restarted.runner_status(name)
+        assert recovered["status"] == "failed"
+        assert recovered["reason"] == "operator-stale-recovery"
+        after = Ledger(root_path / "paper" / name)
+        assert after.sessions() == [session_record.session]
+        assert after.latest().hash == head
+    finally:
+        if restarted is not None:
+            restarted.close()
+        if service_open:
+            _stop_owned_runner(service, name)
 
 
 def test_runner_start_rejects_head_changed_after_acceptance_before_spawn(

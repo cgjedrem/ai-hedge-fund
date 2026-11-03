@@ -35,6 +35,7 @@ from hedge_fund.runtime.owned_runner import (
     RUNNER_ROOT,
     write_runner_record,
 )
+from hedge_fund.runtime.ownership import process_identity
 from hedge_fund.runtime.root import PRIVATE_ROOT, RootContext
 
 
@@ -248,12 +249,13 @@ def _active_runner_state(root, fund="alpha"):
     now = datetime.now(timezone.utc)
     created = now - timedelta(hours=2)
     root.mkdir(f"{RUNNER_ROOT}/{runner_key(fund)}", parents=True, mode=0o700)
+    scope = process_identity(os.getpid())
     owner = {
         "pid": 987654321,
         "creation_time": "synthetic-incarnation",
         "image": "synthetic-runner",
-        "host": root.host_identity,
-        "namespace": root.namespace_identity,
+        "host": scope["host"],
+        "namespace": scope["namespace"],
     }
     return {
         "schema": 1,
@@ -325,6 +327,26 @@ def test_stale_reservation_recovery_records_identity_evidence_and_operator_actio
         assert handover.require_enrollment(root)["heads"] == {}
         assert handover.read_stale_recovery(root, "alpha") == persisted
         assert read_runner_record(root, "alpha", "state")["status"] == "failed"
+
+
+def test_stale_reservation_recovery_rejects_owner_from_another_host_namespace(tmp_path):
+    with RootContext.open(tmp_path) as root:
+        enroll_fresh(root)
+        original = _active_runner_state(root)
+        foreign = {**original["process_identity"], "namespace": "foreign-namespace"}
+        write_runner_record(root, "alpha", "state", {**original, "process_identity": foreign})
+        before = root.read_bytes(f"{RUNNER_ROOT}/{runner_key('alpha')}/state.json")
+
+        with pytest.raises(HandoverError, match="process identity"):
+            handover.recover_stale_reservation(
+                root,
+                "alpha",
+                evidence=_recovery_evidence(),
+                operator_attestation=handover.STALE_RECOVERY_ATTESTATION,
+            )
+
+        assert root.read_bytes(f"{RUNNER_ROOT}/{runner_key('alpha')}/state.json") == before
+        assert handover.read_stale_recovery(root, "alpha") is None
 
 
 def test_stale_reservation_recovery_waits_for_shared_root_owners(tmp_path):
