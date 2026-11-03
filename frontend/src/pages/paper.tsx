@@ -5,6 +5,7 @@ import {
   CalendarClock,
   CirclePause,
   CirclePlay,
+  Download,
   FileCheck2,
   FileText,
   ShieldCheck,
@@ -41,6 +42,7 @@ import type { PendingOperation } from "@/lib/pending-operations";
 import { usePendingOperations } from "@/lib/use-pending-operations";
 import type {
   Approval,
+  ClampEventDto,
   HaltState,
   LiveValuation,
   PaperCollection,
@@ -51,6 +53,7 @@ import type {
   PendingDecision,
   Position,
   RunnerState,
+  RiskLimitsDto,
   ScoreMetrics,
   SessionReport,
   SessionSummary,
@@ -1217,9 +1220,20 @@ export function SessionReportPage() {
     { key: "quantity", label: "Quantity", align: "right", render: (item) => <span className="mono">{item.quantity}</span> },
     { key: "price", label: "Price", align: "right", render: (item) => <span className="mono">{money(item.price, 2)}</span> },
   ];
-  const weightColumns: TableColumn<[string, number]>[] = [
-    { key: "ticker", label: "Ticker", render: ([ticker]) => <span className="mono text-foreground">{ticker}</span> },
-    { key: "weight", label: "Target weight", align: "right", render: ([, weight]) => <span className="mono">{pct(weight)}</span> },
+  const proposed = report?.proposed;
+  const weights = proposed
+    ? [...new Set([...Object.keys(proposed.target_weights), ...Object.keys(proposed.final_weights)])]
+      .sort()
+      .map((ticker) => ({
+        ticker,
+        requested: proposed.target_weights[ticker],
+        final: proposed.final_weights[ticker],
+      }))
+    : [];
+  const weightColumns: TableColumn<(typeof weights)[number]>[] = [
+    { key: "ticker", label: "Ticker", render: (item) => <span className="mono text-foreground">{item.ticker}</span> },
+    { key: "requested", label: "Requested weight (pre-risk)", align: "right", render: (item) => <span className="mono">{pct(item.requested)}</span> },
+    { key: "final", label: "Final weight (post-risk)", align: "right", render: (item) => <span className="mono">{pct(item.final)}</span> },
   ];
 
   return (
@@ -1228,7 +1242,18 @@ export function SessionReportPage() {
         eyebrow="Portfolio / session report"
         title={report ? dateLabel(report.session) : dateLabel(session)}
         description={`${name} · immutable ledger session · executed and proposed records stay separate`}
-        actions={<Button asChild variant="secondary"><Link to={`/paper/${encodeURIComponent(name)}`}><ArrowLeft className="h-3.5 w-3.5" /> Paper fund</Link></Button>}
+        actions={
+          <>
+            <Button asChild variant="secondary"><Link to={`/paper/${encodeURIComponent(name)}`}><ArrowLeft className="h-3.5 w-3.5" /> Paper fund</Link></Button>
+            {report ? (
+              <Button asChild variant="secondary">
+                <a href={`/api/paper/${encodeURIComponent(name)}/sessions/${encodeURIComponent(session)}/download?expected_hash=${encodeURIComponent(report.hash)}`}>
+                  <Download className="h-3.5 w-3.5" /> Download canonical JSON
+                </a>
+              </Button>
+            ) : null}
+          </>
+        }
       />
       {resource.loading ? <div className="h-48 animate-pulse rounded-xl border border-border bg-white/[0.025]" /> : null}
       {resource.error ? <ErrorState message={resource.error} error={resource.apiError} onRetry={resource.refresh} /> : null}
@@ -1267,8 +1292,9 @@ export function SessionReportPage() {
               <CardContent>
                 {report.proposed ? (
                   <div className="space-y-4">
-                    <DataTable columns={weightColumns} rows={Object.entries(report.proposed.final_weights).sort(([a], [b]) => a.localeCompare(b))} rowKey={([ticker]) => ticker} emptyTitle="No targets" emptyDescription="The decision contained no target weights." />
+                    <DataTable ariaLabel="Proposed weights table" columns={weightColumns} rows={weights} rowKey={(item) => item.ticker} emptyTitle="No targets" emptyDescription="The decision contained no target weights." />
                     <p className="text-[10px] text-muted-foreground">Target universe: {report.proposed.universe.join(" · ")}</p>
+                    <RecordedRisk label="Proposed risk" limits={report.proposed.risk} clamps={report.proposed.clamps} scaleFactor={report.proposed.risk_scale_factor} />
                     <div className="space-y-3 border-t border-border pt-4">
                       <p className="mono text-[9px] uppercase tracking-[0.14em] text-muted-foreground">Analyst evidence</p>
                       {report.proposed.strategies.map((strategy) => (
@@ -1294,19 +1320,62 @@ export function SessionReportPage() {
                 ) : <EmptyState title="No proposed decision" description="This record contains no separate target proposal." />}
               </CardContent>
             </Card>
-            <Card>
-              <CardHeader><CardTitle>Audit identity</CardTitle></CardHeader>
-              <CardContent className="space-y-3">
-                <HashRow label="Record hash" value={report.hash} />
-                <HashRow label="Previous hash" value={report.prev_hash} />
-                <HashRow label="Mandate hash" value={report.mandate_hash} />
-                <p className="border-t border-border pt-3 text-[10px] text-muted-foreground">Code version: <span className="mono">{report.code_version}</span></p>
-              </CardContent>
-            </Card>
+            <div className="min-w-0 space-y-5">
+              <Card>
+                <CardHeader><CardTitle>Executed risk</CardTitle></CardHeader>
+                <CardContent>
+                  {report.executed
+                    ? <RecordedRisk label="Executed risk" limits={report.executed.spec.risk} clamps={report.executed.clamps} scaleFactor={report.executed.risk_scale_factor} />
+                    : <EmptyState title="No executed decision" description="No execution risk record was stored in this session." />}
+                </CardContent>
+              </Card>
+              <Card>
+                <CardHeader><CardTitle>Audit identity</CardTitle></CardHeader>
+                <CardContent className="space-y-3">
+                  <HashRow label="Record hash" value={report.hash} />
+                  <HashRow label="Previous hash" value={report.prev_hash} />
+                  <HashRow label="Mandate hash" value={report.mandate_hash} />
+                  <p className="border-t border-border pt-3 text-[10px] text-muted-foreground">Code version: <span className="mono">{report.code_version}</span></p>
+                </CardContent>
+              </Card>
+            </div>
           </div>
         </>
       ) : null}
     </>
+  );
+}
+
+function RecordedRisk({ label, limits, clamps, scaleFactor }: {
+  label: "Proposed risk" | "Executed risk";
+  limits: RiskLimitsDto;
+  clamps: ClampEventDto[];
+  scaleFactor: number | null;
+}) {
+  const columns: TableColumn<ClampEventDto>[] = [
+    { key: "limit", label: "Limit", render: (item) => item.limit === "max_position_pct" ? "Position limit" : "Gross exposure" },
+    { key: "ticker", label: "Scope", render: (item) => <span className="mono">{item.ticker ?? "Portfolio"}</span> },
+    { key: "before", label: "Before", align: "right", render: (item) => <span className="mono">{pct(item.before)}</span> },
+    { key: "after", label: "After", align: "right", render: (item) => <span className="mono">{pct(item.after)}</span> },
+  ];
+  return (
+    <section aria-label={label} className="space-y-3 border-t border-border pt-3">
+      <h3 className="text-xs font-medium text-foreground">{label}</h3>
+      <p className="text-[10px] text-muted-foreground">Recorded limits and events, not a new risk assessment.</p>
+      <div className="mono space-y-1 text-[11px] text-muted-foreground">
+        <p>Max position: {pct(limits.max_position_pct)}</p>
+        <p>Max gross exposure: {pct(limits.max_gross_exposure)}</p>
+        {scaleFactor !== null ? <p>Risk scale factor: {pct(scaleFactor)}</p> : <p>No common scale factor recorded.</p>}
+      </div>
+      <DataTable
+        ariaLabel={`${label} clamps table`}
+        columns={columns}
+        rows={clamps}
+        rowKey={(item, index) => `${item.limit}-${item.ticker}-${index}`}
+        emptyTitle={label === "Proposed risk" ? "No proposed clamps" : "No executed clamps"}
+        emptyDescription="The stored record contains no clamp events."
+      />
+    </section>
   );
 }
 

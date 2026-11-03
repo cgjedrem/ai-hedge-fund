@@ -201,6 +201,9 @@ const sessionReport: SessionReport = {
   rebalance: true,
   executed: {
     as_of: "2024-06-03",
+    spec: { risk: { max_position_pct: 0.25, max_gross_exposure: 1 } },
+    clamps: [],
+    risk_scale_factor: null,
     orders: [{ ticker: "AAPL", side: "buy", quantity: 100, price: 100 }],
     fills: [{ ticker: "AAPL", side: "buy", quantity: 100, price: 100 }],
     trading_cost: 5,
@@ -213,6 +216,9 @@ const sessionReport: SessionReport = {
     universe: ["AAPL", "MSFT"],
     target_weights: { AAPL: 0.1 },
     final_weights: { AAPL: 0.1 },
+    clamps: [],
+    risk: { max_position_pct: 0.25, max_gross_exposure: 1 },
+    risk_scale_factor: null,
     strategies: [
       {
         name: "earnings-drift",

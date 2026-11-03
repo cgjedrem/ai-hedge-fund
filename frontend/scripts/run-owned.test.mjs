@@ -140,6 +140,22 @@ test("owned child strips interpreter and Node module overrides", () => {
   assert.equal(basename(env.PLAYWRIGHT_BROWSERS_PATH), "playwright-browsers");
 });
 
+test("inherited report fixture flags cannot select an unseeded clamped case", () => {
+  const env = isolatedEnvironment(
+    { AIHF_REPORT_PARITY_FIXTURE: "clamped" },
+    "C:\\Python\\python.exe",
+  );
+  assert.equal(env.AIHF_REPORT_PARITY_FIXTURE, "empty");
+  assert.match(env.AIHF_WEB_SERVER_COMMAND, /--demo/);
+});
+
+test("explicit report acceptance uses a preseeded read-only server instead of demo reseeding", () => {
+  const env = isolatedEnvironment({}, "C:\\Python\\python.exe", true);
+  assert.equal(env.AIHF_REPORT_PARITY_FIXTURE, "clamped");
+  assert.doesNotMatch(env.AIHF_WEB_SERVER_COMMAND, /--demo|--allow-writes|--enable-network/);
+  assert.match(env.AIHF_WEB_SERVER_COMMAND, /--port 8876/);
+});
+
 test("artifact fingerprint binds sorted relative paths and bytes", () => {
   mkdirSync(outputRoot, { recursive: true });
   const root = mkdtempSync(join(outputRoot, "spec005-test-artifact-"));

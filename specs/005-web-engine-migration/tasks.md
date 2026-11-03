@@ -32,6 +32,13 @@ artifact or full-migration acceptance is claimed. Only one verified paid provide
 authorized per operation; combined paid Financial Datasets plus TypeSafe is unsupported.
 T139, T141 and T146 have bounded partial evidence but remain unchecked; convergence tasks
 T138–T148 remain open.
+The read-only session-report slice contributes partial T111/T112/T113/T119/T122/T146
+coverage: canonical proposed clamps/limits, explicitly requested versus post-risk weights,
+separate recorded execution risk, and hash-bound canonical JSON downloads. Its isolated
+API/React/owned-browser/review evidence is in `report-parity-evidence.md`, including
+separate rerun evidence after integration onto the T145 settings-provenance head. No report task
+or story checkbox is completed by this slice; research drilldowns/scorecards, full book/tape
+parity, headless export acceptance and the remaining platform criteria are still open.
 PR8's focused review repairs also cover synced approval consumption and
 cooperating-control races. Incomplete consumption is checked across ledger
 head changes, and inherited enrolled or standalone admission is denied after

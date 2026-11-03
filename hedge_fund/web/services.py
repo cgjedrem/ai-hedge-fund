@@ -104,13 +104,13 @@ from hedge_fund.runtime.credentials import (
 )
 from hedge_fund.runtime.dispatch import make_one_shot_dispatch, ProviderDispatch
 from hedge_fund.runtime.handover import (
-    write_authority,
     enrollment_status,
     HandoverError,
     LedgerHeadPublicationError,
     LedgerInventoryCorrupt,
     require_enrollment,
     verify_root_inventory,
+    write_authority,
 )
 from hedge_fund.runtime.lifecycle import (
     ArchiveConflict,
@@ -1713,6 +1713,15 @@ class DeskService:
         return estimate
 
     def session_report(self, name: str, session: str) -> dict:
+        return self._session_report(self._verified_session_record(name, session))
+
+    def session_report_download(self, name: str, session: str, expected_hash: str) -> str:
+        record = self._verified_session_record(name, session)
+        if record.hash != expected_hash:
+            raise ServiceError(409, "Session report changed; reload the report before downloading.", code="stale-preview", current_head=record.hash)
+        return record.model_dump_json(indent=2)
+
+    def _verified_session_record(self, name: str, session: str) -> SessionRecord:
         normalized = self._validated_name(name)
         if not re.fullmatch(r"\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}:\d{2})?", session):
             raise ServiceError(400, "Session key is invalid.")
@@ -1739,7 +1748,7 @@ class DeskService:
             raise
         except (LedgerError, OSError, ValueError) as exc:
             raise ServiceError(423, f"Ledger verification failed ({type(exc).__name__}).", code="replay-corrupt") from None
-        return self._session_report(record)
+        return record
 
     def paper_scorecard(self, name: str) -> dict:
         snapshot = self.paper_detail(name)
@@ -3183,9 +3192,7 @@ class DeskService:
         approval = None
         if state is not None:
             try:
-                approval = ledger.observe_approval_for_display(
-                    state, approval_required=deployed.spec.approval_required
-                )
+                approval = ledger.observe_approval_for_display(state, approval_required=deployed.spec.approval_required)
             except PaperReconciliationRequired:
                 ledger_status = {"ok": False, "error": "Paper work is in progress or requires reconciliation."}
             except (LedgerError, OSError, ValueError):
@@ -3332,6 +3339,9 @@ class DeskService:
                 "universe": decision.universe,
                 "target_weights": decision.target_weights,
                 "final_weights": decision.final_weights,
+                "clamps": [clamp.model_dump(mode="json") for clamp in decision.clamps],
+                "risk": decision.spec.risk.model_dump(mode="json"),
+                "risk_scale_factor": decision.risk_scale_factor,
                 "strategies": [strategy.model_dump(mode="json") for strategy in decision.strategies],
             }
             if decision is not None
@@ -3834,6 +3844,7 @@ class DeskService:
         key = _windows_name_key(name)
         with self._locks_guard:
             return self._locks.setdefault(key, threading.RLock())
+
 
 def _is_reparse_point(path: Path) -> bool:
     try:

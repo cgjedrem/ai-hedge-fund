@@ -327,6 +327,18 @@ export interface SignalDto {
   components: Record<string, number>;
 }
 
+export interface RiskLimitsDto {
+  max_position_pct: number;
+  max_gross_exposure: number;
+}
+
+export interface ClampEventDto {
+  limit: "max_position_pct" | "max_gross_exposure";
+  ticker: string | null;
+  before: number;
+  after: number;
+}
+
 export interface SessionReport {
   session: string;
   fund: string;
@@ -343,6 +355,9 @@ export interface SessionReport {
   rebalance: boolean;
   executed: {
     as_of: string;
+    spec: { risk: RiskLimitsDto };
+    clamps: ClampEventDto[];
+    risk_scale_factor: number | null;
     orders: OrderDto[];
     fills: FillDto[];
     trading_cost?: number;
@@ -355,6 +370,9 @@ export interface SessionReport {
     universe: string[];
     target_weights: Record<string, number>;
     final_weights: Record<string, number>;
+    clamps: ClampEventDto[];
+    risk: RiskLimitsDto;
+    risk_scale_factor: number | null;
     strategies: {
       name: string;
       signals: SignalDto[];

@@ -9,8 +9,9 @@ import secrets
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from fastapi import FastAPI, Query, Request
+from fastapi import FastAPI
 from fastapi import Path as ApiPath
+from fastapi import Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, Response
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -367,6 +368,16 @@ def create_app(
     @app.get("/api/paper/{name}/sessions/{session}")
     def session_report(name: str, session: str):
         return service.session_report(name, session)
+
+    @app.get("/api/paper/{name}/sessions/{session}/download")
+    def session_report_download(
+        name: str,
+        session: str,
+        expected_hash: str = Query(pattern=r"^[a-f0-9]{64}$"),
+    ):
+        content = service.session_report_download(name, session, expected_hash)
+        filename = f"{name}-{session.replace(':', '-')}.json"
+        return Response(content, media_type="application/json", headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
     @app.get("/api/paper/{name}/scorecard")
     def paper_scorecard(name: str):

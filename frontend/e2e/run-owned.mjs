@@ -24,6 +24,10 @@ const repositoryRoot = resolve(frontendRoot, "..");
 const outputRoot = resolve(repositoryRoot, "outputs");
 const port = 8876;
 const lifecycleAcceptance = process.argv.includes("--lifecycle");
+const reportAcceptance = process.argv.includes("--reports");
+if (lifecycleAcceptance && reportAcceptance) {
+  throw new Error("Report acceptance is read-only and cannot enable lifecycle writes.");
+}
 const rootName = `spec005-test-e2e-${process.pid}-${randomUUID().slice(0, 8)}`;
 const testRoot = resolve(outputRoot, rootName);
 const marker = join(testRoot, ".test-owned");
@@ -111,13 +115,17 @@ const unsafeOverrides = [
   "HEDGE_FUND_TEST_ROOT",
   "PLAYWRIGHT_BROWSERS_PATH",
   "AIHF_WEB_LIFECYCLE_ACCEPTANCE",
+  "AIHF_REPORT_PARITY_FIXTURE",
 ];
 
 let activeChild;
 let activeChildUsesGroup = false;
 let interrupted = false;
 
-export function isolatedEnvironment(source, python) {
+export function isolatedEnvironment(source, python, reports = reportAcceptance) {
+  if (reports && lifecycleAcceptance) {
+    throw new Error("Report acceptance cannot enable lifecycle writes.");
+  }
   const env = { ...source };
   for (const name of Object.keys(env)) {
     if (
@@ -177,9 +185,11 @@ export function isolatedEnvironment(source, python) {
   env.AIHF_PLAYWRIGHT_SCREENSHOT_DIR = screenshotDir;
   env.AIHF_E2E_PYTHON = python;
   env.AIHF_WEB_LIFECYCLE_ACCEPTANCE = lifecycleAcceptance ? "1" : "0";
+  env.AIHF_REPORT_PARITY_FIXTURE = reports ? "clamped" : "empty";
   env.AIHF_WEB_SERVER_COMMAND = [
     shellQuote(python),
-    "-m hedge_fund.web --demo",
+    "-m hedge_fund.web",
+    ...(reports ? [] : ["--demo"]),
     `--port ${port}`,
     `--root ${shellQuote(demoRoot)}`,
     ...(lifecycleAcceptance ? ["--allow-writes"] : []),
@@ -353,6 +363,39 @@ function cleanupTestRoot(python, env) {
   }
 }
 
+function prepareReportFixture(python, env) {
+  return runPythonHelper(
+    python,
+    [
+      "import json, sys",
+      "from pathlib import Path",
+      "from hedge_fund.web.test_reports import seed_clamped_report, tree_digest",
+      "root = seed_clamped_report(Path(sys.argv[1]))",
+      "print(json.dumps(tree_digest(root), sort_keys=True))",
+    ].join("\n"),
+    [demoRoot],
+    env,
+  );
+}
+
+function verifyReportFixture(python, env, before) {
+  const after = runPythonHelper(
+    python,
+    [
+      "import json, sys",
+      "from pathlib import Path",
+      "from hedge_fund.web.test_reports import tree_digest",
+      "print(json.dumps(tree_digest(Path(sys.argv[1])), sort_keys=True))",
+    ].join("\n"),
+    [demoRoot],
+    env,
+  );
+  if (after !== before) {
+    throw new Error("Read-only report acceptance changed the synthetic data tree.");
+  }
+  console.log(`Read-only report tree SHA-256: ${createHash("sha256").update(before).digest("hex")} (unchanged).`);
+}
+
 function assertShellPath(value) {
   if (process.platform === "win32" && /["%&|<>^!]/.test(value)) {
     throw new Error("Test path contains an unsupported shell character.");
@@ -518,6 +561,7 @@ async function main() {
   let runnerResult;
   let failure = false;
   let serverStarted = false;
+  let reportBefore;
 
   try {
     const preflight = preflightEnvironment(process.env);
@@ -539,14 +583,20 @@ async function main() {
     } else if (interrupted) {
       failure = true;
     } else {
+      if (reportAcceptance) {
+        reportBefore = prepareReportFixture(python, env);
+      }
       serverStarted = true;
-      runnerResult = await runPlaywright(env, process.argv.slice(2).filter((arg) => arg !== "--lifecycle"));
+      runnerResult = await runPlaywright(env, process.argv.slice(2).filter((arg) => arg !== "--lifecycle" && arg !== "--reports"));
       if (runnerResult.code !== 0) failure = true;
       if (interrupted) failure = true;
       if (!(await waitForPortRelease())) {
         throw new Error(`Owned server did not release test port ${port}; root retained.`);
       }
       serverStarted = false;
+      if (reportAcceptance) {
+        verifyReportFixture(python, env, reportBefore);
+      }
     }
   } catch (error) {
     failure = true;

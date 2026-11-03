@@ -114,6 +114,33 @@ verified live owner or unknown; bounded jobs interrupted, fenced and never auto-
 
 ## Acceptance obligations
 
+### Bounded implemented session-report adapter
+
+The existing paper-resource spelling is retained for this partial read-only slice:
+
+- GET `/api/paper/{name}/sessions/{session}` projects the verified session record.
+  `proposed.clamps`, `proposed.risk` and `proposed.risk_scale_factor` come directly from
+  its stored decision and mandate. Requested pre-risk and final post-risk weights remain
+  distinct; executed clamps and limits come from the separate stored execution record.
+- GET `/api/paper/{name}/sessions/{session}/download?expected_hash={displayed_record_hash}`
+  returns the complete canonical `SessionRecord` JSON, not the display projection.
+  The server serializes the exact record captured by full ledger replay using the existing
+  canonical serializer. The browser follows a native link and performs no numeric
+  parse/stringify or authoritative-record round trip.
+- A changed record hash returns 409 `stale-preview` and requires reopening the report;
+  malformed/missing hashes return 400 `invalid-request`, and corrupt replay returns
+  423 `replay-corrupt`. Only successful downloads receive an attachment header.
+  Existing root/Host/Origin/security-header guards remain unchanged.
+
+`node .\e2e\run-owned.mjs --reports reports.spec.ts` from `frontend` builds production
+assets, preseeds deterministic clamped records before starting a read-only server, rejects
+combining report acceptance with lifecycle writes, and verifies the entire fixture tree
+is unchanged after browser reads. It refuses an occupied 8876 port and removes only its
+owned fixture after the server releases the port.
+
+This does not complete the general report resource row, FR-050/051, research scorecards,
+book/tape drilldowns, headless export acceptance, or any Spec005 story.
+
 Contract tests must assert denial yields zero downstream path/provider/process/fill/append
 effects with fakes below production guards, not by mocking the route itself. Verify cross-
 process duplicate CLI/web/runner/lifecycle races and legacy ownership-unknown; lost responses/

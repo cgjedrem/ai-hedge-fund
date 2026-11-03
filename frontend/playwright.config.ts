@@ -33,9 +33,14 @@ const expectedScreenshotDir = resolve(
 );
 const expectedDemoRelative = relative(testRoot, demoRoot);
 const marker = resolve(testRoot, ".test-owned");
+const reportAcceptance = process.env.AIHF_REPORT_PARITY_FIXTURE === "clamped";
+if (reportAcceptance && process.env.AIHF_WEB_LIFECYCLE_ACCEPTANCE === "1") {
+  throw new Error("Report acceptance cannot enable lifecycle writes.");
+}
 const expectedServerCommand = [
   shellQuote(python),
-  "-m hedge_fund.web --demo",
+  "-m hedge_fund.web",
+  ...(reportAcceptance ? [] : ["--demo"]),
   `--port ${port}`,
   `--root ${shellQuote(demoRoot)}`,
   ...(process.env.AIHF_WEB_LIFECYCLE_ACCEPTANCE === "1" ? ["--allow-writes"] : []),
