@@ -1116,9 +1116,9 @@ No other session process, checkout, preview or the worktree itself was removed.
 - Startup recovery (pre-existing) interrupts every unfinished record on the root after sidecar verification; under the shared owner
   lease it does not prove owner liveness, so a live peer process sharing the root would also be fenced (in-flight work lost, no
   durable effect). Exclusive-lease or liveness-proof recovery is open.
-- Residual test risk: `--capacity` runs with writes and network capability; if the asserted 429 ever regressed, the single browser
-  Accept could start a demo backtest whose only reachable model endpoint is the approved local loopback Ollama (non-loopback data
-  fetches stay denied). It did not occur in the recorded run. `hedge_fund\test_support\*` (including the guarded holder) ships in the
+- `--capacity` runs with writes and network capability, but the owned server's test guard is restricted to its own loopback port
+  (see "Capacity browser model-endpoint lockout" below), so even a regressed 429 cannot reach a local model endpoint.
+  `hedge_fund\test_support\*` (including the guarded holder) ships in the
   wheel like the existing test-support modules; packaging exclusion is open.
 - Browser server-restart observation, the pre-existing desk/lifecycle browser failures, full Python suite, Linux, wheel/container
   and cross-browser evidence remain open.
@@ -1168,3 +1168,20 @@ No other session process, checkout, preview or the worktree itself was removed.
   **1 passed (21.9 s)**; owned default **22 passed, 4 failed, 6 skipped**, identical failing set on an unmodified temporary
   `c2d56a4` checkout (**22 passed, 4 failed, 5 skipped**). Black: only the pre-existing `test_operations.py` drift (also fails at
   `c2d56a4`); isort clean. Recorded 2026-11-03T02:53:59.9072361+01:00.
+
+### Capacity browser model-endpoint lockout (post-publication review fix)
+
+- Defect: the network-capable `--capacity` server allowed every loopback connect, so a regressed 429 could let the single browser
+  Accept start a demo backtest that reaches a local loopback model endpoint (e.g. default Ollama `localhost:11434`).
+- Fix: `network_guard.install_network_guard` honours `HEDGE_FUND_TEST_LOOPBACK_PORTS` (comma-separated ports; any invalid value
+  fails closed, so the guarded child exits before running). When set, `connect`/`connect_ex`/`sendto`/`create_connection` to
+  loopback are refused unless the port is listed; only the in-process `socket.socketpair` fallback (Windows asyncio self-pipe) is
+  exempt. `run-owned.mjs --capacity` strips any inherited value and sets it to the owned server port `8876`; `playwright.config.ts`
+  refuses capacity mode unless it equals `8876` (and refuses the variable in other modes); `capacity.spec.ts` asserts it.
+  Owned runner children keep `HEDGE_FUND_TEST_BLOCK_LOOPBACK=1` (no loopback at all).
+- Tests: `test_acceptance_isolation.py` adds a guarded-child probe (allowed port connects; other loopback port, `localhost`, and
+  `11434` refused via `create_connection` and `connect_ex`; `socketpair` and an asyncio loop still work) and 6 fail-closed invalid
+  values: **57 passed in 7.28 s** (with `web\test_main.py`: **68 passed in 18.03 s**). Harness unit **9 passed**; Vitest **12
+  files, 184 passed**; `tsc --noEmit` passed; owned `--capacity` **1 passed (18.0 s)** with the allowlist active; owned default
+  **22 passed, 4 failed, 6 skipped** (same 4 pre-existing desk failures). flake8/isort clean; Black drift in the two touched
+  Python files is pre-existing and unchanged in size. Recorded 2026-11-03T03:08:08+01:00.

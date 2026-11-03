@@ -8,10 +8,13 @@ import socket
 import stat
 import sys
 import sysconfig
+import threading
 from pathlib import Path
 from typing import Any
 
 _GUARD = "__hedge_fund_test_network_guard__"
+LOOPBACK_PORTS_ENV = "HEDGE_FUND_TEST_LOOPBACK_PORTS"
+_SOCKETPAIR = threading.local()
 _CHILD_GUARD_PREFLIGHT = """\
 try:
     import importlib.util
@@ -329,8 +332,40 @@ def cleanup_test_root(test_root: Path, marker: Path) -> bool:
     return not resolved_root.exists()
 
 
+def _loopback_port_allowlist() -> frozenset[int] | None:
+    value = os.environ.get(LOOPBACK_PORTS_ENV)
+    if value is None:
+        return None
+    ports = set()
+    for item in value.split(","):
+        if not item.isascii() or not item.isdigit() or not 0 < int(item) < 65536:
+            raise RuntimeError("test loopback port allowlist is invalid")
+        ports.add(int(item))
+    return frozenset(ports)
+
+
+def _loopback_port_allowed(address: Any, ports: frozenset[int] | None) -> bool:
+    if ports is None or getattr(_SOCKETPAIR, "depth", 0):
+        return True
+    return len(address) > 1 and isinstance(address[1], int) and address[1] in ports
+
+
 def install_network_guard() -> None:
     block_loopback = os.environ.get("HEDGE_FUND_TEST_BLOCK_LOOPBACK") == "1"
+    # When set, loopback connects are limited to these ports (plus the in-process socketpair fallback).
+    loopback_ports = _loopback_port_allowlist()
+    original_socketpair = socket.socketpair
+    if not getattr(original_socketpair, _GUARD, False):
+
+        def socketpair(*args, _original=original_socketpair, **kwargs):
+            _SOCKETPAIR.depth = getattr(_SOCKETPAIR, "depth", 0) + 1
+            try:
+                return _original(*args, **kwargs)
+            finally:
+                _SOCKETPAIR.depth -= 1
+
+        setattr(socketpair, _GUARD, True)
+        socket.socketpair = socketpair
     for name in ("connect", "connect_ex", "sendto"):
         original = getattr(socket.socket, name)
         if getattr(original, _GUARD, False):
@@ -345,7 +380,7 @@ def install_network_guard() -> None:
                 "AF_UNIX",
                 object(),
             )
-            if not is_unix and (block_loopback or not _is_loopback_address(address)):
+            if not is_unix and (block_loopback or not _is_loopback_address(address) or not _loopback_port_allowed(address, loopback_ports)):
                 raise AssertionError("external network disabled in tests")
             return _original(sock, *args, **kwargs)
 
@@ -368,7 +403,7 @@ def install_network_guard() -> None:
             host = args[0] if args else kwargs.get("host")
             if _name == "create_connection":
                 address = host
-                allowed = not block_loopback and _is_loopback_address(address)
+                allowed = not block_loopback and _is_loopback_address(address) and _loopback_port_allowed(address, loopback_ports)
             elif _name == "getaddrinfo":
                 flags = args[5] if len(args) > 5 else kwargs.get("flags", 0)
                 allowed = not block_loopback and host is not None and _is_loopback_host(host)

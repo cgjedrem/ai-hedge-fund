@@ -42,6 +42,10 @@ if (reportAcceptance && lifecycleAcceptance) {
 if (capacityAcceptance && (reportAcceptance || lifecycleAcceptance)) {
   throw new Error("Capacity acceptance runs alone in its own owned fixture.");
 }
+const loopbackPorts = process.env.HEDGE_FUND_TEST_LOOPBACK_PORTS;
+if (capacityAcceptance ? loopbackPorts !== port : loopbackPorts !== undefined) {
+  throw new Error("Capacity acceptance must restrict loopback to the owned server port.");
+}
 const expectedServerCommand = [
   shellQuote(python),
   "-m hedge_fund.web",

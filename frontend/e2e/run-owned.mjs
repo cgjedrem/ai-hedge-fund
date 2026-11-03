@@ -25,7 +25,8 @@ const outputRoot = resolve(repositoryRoot, "outputs");
 const port = 8876;
 const lifecycleAcceptance = process.argv.includes("--lifecycle");
 const reportAcceptance = process.argv.includes("--reports");
-// Capacity acceptance needs the network-gated operation endpoints; the test child guard still denies non-loopback.
+// Capacity acceptance needs the network-gated operation endpoints; the test child guard denies non-loopback
+// sockets and every loopback port except the owned server's.
 const capacityAcceptance = process.argv.includes("--capacity");
 const capacitySpec = "e2e/capacity.spec.ts";
 if (lifecycleAcceptance && reportAcceptance) {
@@ -122,6 +123,7 @@ const unsafeOverrides = [
   "PLAYWRIGHT_BROWSERS_PATH",
   "AIHF_WEB_LIFECYCLE_ACCEPTANCE",
   "AIHF_REPORT_PARITY_FIXTURE",
+  "HEDGE_FUND_TEST_LOOPBACK_PORTS",
 ];
 
 let activeChild;
@@ -195,6 +197,8 @@ export function isolatedEnvironment(source, python, reports = reportAcceptance, 
   env.AIHF_E2E_PYTHON = python;
   env.AIHF_WEB_LIFECYCLE_ACCEPTANCE = lifecycleAcceptance ? "1" : "0";
   env.AIHF_WEB_CAPACITY_ACCEPTANCE = capacity ? "1" : "0";
+  // The network-capable capacity server may only connect to its own port: no local model endpoint is reachable.
+  if (capacity) env.HEDGE_FUND_TEST_LOOPBACK_PORTS = String(port);
   env.AIHF_REPORT_PARITY_FIXTURE = reports ? "clamped" : "empty";
   env.AIHF_WEB_SERVER_COMMAND = [
     shellQuote(python),

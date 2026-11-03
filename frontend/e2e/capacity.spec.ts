@@ -37,8 +37,9 @@ test("real capacity denial is unaccepted and observation recovers after a lost c
   await page.goto("/backtests");
   const capabilities = await (await page.request.get("/api/capabilities")).json();
   expect(capabilities.writes).toBe(true);
-  // Capability only: the owned test child guard still refuses every non-loopback connection.
+  // Capability only: the owned server's guard refuses non-loopback and every loopback port but its own.
   expect(capabilities.network).toBe(true);
+  expect(process.env.HEDGE_FUND_TEST_LOOPBACK_PORTS).toBe("8876");
   await page.waitForLoadState("networkidle");
 
   // Another process sharing the root takes the only durable backtest slot after this page loaded.

@@ -56,6 +56,77 @@ def test_external_socket_connect_is_denied_before_io() -> None:
             connection.connect(("203.0.113.1", 443))
 
 
+def test_loopback_port_allowlist_denies_other_local_endpoints(tmp_path: Path) -> None:
+    probe = "\n".join(
+        (
+            "import asyncio, socket, sys",
+            "allowed, other = int(sys.argv[1]), int(sys.argv[2])",
+            "with socket.create_connection(('127.0.0.1', allowed), timeout=5):",
+            "    pass",
+            "for target in (('127.0.0.1', other), ('localhost', other), ('127.0.0.1', 11434)):",
+            "    try:",
+            "        socket.create_connection(target, timeout=5)",
+            "    except AssertionError as error:",
+            "        assert 'external network disabled' in str(error)",
+            "    else:",
+            "        raise SystemExit('loopback port allowed: %r' % (target,))",
+            "with socket.socket() as raw:",
+            "    try:",
+            "        raw.connect_ex(('127.0.0.1', other))",
+            "    except AssertionError:",
+            "        pass",
+            "    else:",
+            "        raise SystemExit('connect_ex allowed')",
+            "left, right = socket.socketpair()",
+            "left.close()",
+            "right.close()",
+            "loop = asyncio.new_event_loop()",
+            "loop.run_until_complete(asyncio.sleep(0))",
+            "loop.close()",
+            "print('LOOPBACK_ALLOWLIST_OK')",
+        )
+    )
+    with socket.socket() as allowed, socket.socket() as other:
+        allowed.bind(("127.0.0.1", 0))
+        allowed.listen()
+        other.bind(("127.0.0.1", 0))
+        other.listen()
+        allowed_port = allowed.getsockname()[1]
+        other_port = other.getsockname()[1]
+        env = child_test_environment()
+        env[network_guard.LOOPBACK_PORTS_ENV] = str(allowed_port)
+        result = subprocess.run(
+            guarded_test_python_command("-c", probe, str(allowed_port), str(other_port)),
+            cwd=tmp_path,
+            env=env,
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=30,
+        )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "LOOPBACK_ALLOWLIST_OK" in result.stdout
+
+
+@pytest.mark.parametrize("value", ["", "abc", "0", "65536", "8876,", "８８７６"])
+def test_invalid_loopback_port_allowlist_fails_closed(tmp_path: Path, value: str) -> None:
+    env = child_test_environment()
+    env[network_guard.LOOPBACK_PORTS_ENV] = value
+    result = subprocess.run(
+        guarded_test_python_command("-c", "print('CHILD_SCRIPT_RAN')"),
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=10,
+    )
+
+    assert result.returncode != 0
+    assert "CHILD_SCRIPT_RAN" not in result.stdout + result.stderr
+
+
 def test_dotenv_is_disabled_for_test_owned_child(tmp_path: Path) -> None:
     parent = tmp_path / "parent"
     child = parent / "child"
