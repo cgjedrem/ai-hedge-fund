@@ -31,6 +31,7 @@ from hedge_fund.brokers.account_binding import (
     SimAccountIdentity,
     StaleRelease,
 )
+from hedge_fund.runtime.handover import write_authority
 from hedge_fund.runtime.root import RootContext
 from hedge_fund.test_support.handover import enroll_synthetic_root
 
@@ -333,6 +334,7 @@ def test_non_protocol_native_root_is_ownership_unknown(registry, tmp_path, accou
 
 def test_enrolled_root_without_out_of_band_exclusion_proof_cannot_bind(registry, roots, account, custody, monkeypatch):
     monkeypatch.delenv("HEDGE_FUND_TEST_MODE")
+    assert write_authority(roots[0]) == {"authority": "ownership-unknown", "reason": "out-of-band-exclusion-unproven"}
     with pytest.raises(AccountOwnershipUnknown, match="protocol-native"):
         registry.bind(roots[0], "demo-alpha", account, custody=custody)
     assert custody.calls == 0 and _state(registry)["bindings"] == {}

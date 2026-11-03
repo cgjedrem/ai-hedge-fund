@@ -612,3 +612,28 @@ def test_service_error_rejects_unknown_retry_policy():
 
     with pytest.raises(ValueError, match="unknown retry policy"):
         ServiceError(409, "Denied.", code="writer-conflict", retry_policy="always")
+
+
+def test_observation_is_polling_only_with_no_stream_or_socket_channel(tmp_path):
+    """runtime-api.md fixes observation as polling only; any new channel must add its own guards."""
+    from pathlib import Path
+
+    from fastapi.routing import APIRoute
+    from starlette.routing import Mount, Route, WebSocketRoute
+
+    def walk(routes):
+        for route in routes:
+            yield route
+            if isinstance(route, Mount) and getattr(route, "routes", None):
+                yield from walk(route.routes)
+
+    app = create_app(root=tmp_path)
+    with TestClient(app):
+        routes = list(walk(app.routes))
+    assert routes
+    assert not [route for route in routes if isinstance(route, WebSocketRoute)]
+    assert all(isinstance(route, (APIRoute, Route, Mount)) for route in routes)
+    web = Path(__file__).resolve().parent
+    channel_markers = ("WebSocket", "StreamingResponse", "EventSourceResponse", "text/event-stream")
+    offenders = [(source.name, marker) for source in web.glob("*.py") if not source.name.startswith("test_") for marker in channel_markers if marker in source.read_text(encoding="utf-8")]
+    assert offenders == []
