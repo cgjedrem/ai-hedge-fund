@@ -1002,7 +1002,7 @@ No other session process, checkout, preview or the worktree itself was removed.
 
 ## T019 / T020 operation capacity and continuity slice (2026-11-03)
 
-**Status: implemented bounded slice; T019/T020 remain unchecked (PARTIAL). Migration remains 20/148, NOT READY TO MERGE.**
+**Status: implemented bounded slice; T019/T020 remain unchecked (PARTIAL). Migration remains 21/148 at `c2d56a4` (T096 accepted upstream in `294f9db`; this slice checks none), NOT READY TO MERGE.**
 
 ### Candidate and isolation
 
