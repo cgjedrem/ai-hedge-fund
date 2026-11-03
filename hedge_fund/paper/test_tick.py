@@ -13,30 +13,12 @@ import pytest
 import yaml
 
 from hedge_fund.backtesting.fund import backtest_fund
-from hedge_fund.backtesting.test_fund import (
-    FakeAnalyst,
-    FakeDataClient,
-    SERIES,
-    WEEKDAYS,
-)
+from hedge_fund.backtesting.test_fund import FakeAnalyst, FakeDataClient, SERIES, WEEKDAYS
 from hedge_fund.brokers.paper import PaperBroker
 from hedge_fund.data import sessions
 from hedge_fund.data.sessions import NEW_YORK
 from hedge_fund.fund import Fund, FundSpec, TradingWindow
-from hedge_fund.paper import (
-    assessment_dates,
-    deploy,
-    following_session,
-    Ledger,
-    LedgerError,
-    list_deployed,
-    load_deployed,
-    next_session,
-    NothingDue,
-    redo,
-    tick,
-    validate_fund_name,
-)
+from hedge_fund.paper import assessment_dates, deploy, following_session, Ledger, LedgerError, list_deployed, load_deployed, next_session, NothingDue, redo, tick, validate_fund_name
 from hedge_fund.pipeline import DecisionRecord, FundState
 from hedge_fund.pipeline.session import FundHalted
 
@@ -487,9 +469,7 @@ def test_redo_replays_consumed_gated_approval_for_same_decision(tmp_path, clock,
 
 
 @pytest.mark.parametrize("verdict", ["approve", "reject"])
-def test_redo_replays_consumed_approval_when_later_mailbox_cannot_be_removed(
-    tmp_path, clock, SPEC, monkeypatch, verdict
-):
+def test_redo_replays_consumed_approval_when_later_mailbox_cannot_be_removed(tmp_path, clock, SPEC, monkeypatch, verdict):
     spec = SPEC.model_copy(update={"approval_required": True, "rebalance": "daily"})
     clock("2024-06-04")
     directory = deploy("alpha", spec, ["AAPL"], root=tmp_path)
@@ -802,9 +782,7 @@ def test_unfinished_consumption_denies_before_due_session_data(tmp_path, clock, 
 
 @pytest.mark.parametrize("verdict", ["approve", "reject"])
 @pytest.mark.parametrize("rebalance", ["daily", "weekly"])
-def test_unfinished_consumption_after_ledger_advance_blocks_next_work(
-    tmp_path, clock, SPEC, verdict, rebalance
-):
+def test_unfinished_consumption_after_ledger_advance_blocks_next_work(tmp_path, clock, SPEC, verdict, rebalance):
     spec = SPEC.model_copy(update={"approval_required": True, "rebalance": rebalance})
     clock("2024-06-04")
     directory = deploy("alpha", spec, ["AAPL"], root=tmp_path)
@@ -814,11 +792,7 @@ def test_unfinished_consumption_after_ledger_advance_blocks_next_work(
     clock("2024-06-05")
     second = _tick(directory)
     assert (second.decision is not None) is (rebalance == "daily")
-    events = [
-        event
-        for event in ledger.events()
-        if not (event["kind"] == "tick" and event["session"] == second.session)
-    ]
+    events = [event for event in ledger.events() if not (event["kind"] == "tick" and event["session"] == second.session)]
     ledger.events_path.write_text("".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
     assert any(event["kind"] == "consume" and event["session"] == second.session for event in events)
     book = (directory / "broker.json").read_bytes()
@@ -845,11 +819,7 @@ def test_explicit_session_retry_does_not_hide_unfinished_consumption(tmp_path, c
     ledger.set_approval("approve", first.decision.as_of, first.hash, "cli")
     clock("2024-06-05")
     second = _tick(directory)
-    events = [
-        event
-        for event in ledger.events()
-        if not (event["kind"] == "tick" and event["session"] == second.session)
-    ]
+    events = [event for event in ledger.events() if not (event["kind"] == "tick" and event["session"] == second.session)]
     ledger.events_path.write_text("".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
 
     class NoPreflightData(FakeDataClient):
@@ -907,9 +877,7 @@ def test_standalone_retry_does_not_halt_a_live_tick(tmp_path, clock, SPEC, monke
     assert ledger.halted() is None
 
 
-def test_standalone_execution_lock_blocks_another_process_but_not_halt(
-    tmp_path, clock, SPEC, owned_test_process
-):
+def test_standalone_execution_lock_blocks_another_process_but_not_halt(tmp_path, clock, SPEC, owned_test_process):
     from hedge_fund.runtime.admission import paper_execution_transition
 
     clock("2024-06-04")
@@ -944,9 +912,7 @@ with paper_execution_transition(Path({str(directory)!r}), "alpha"):
 
 
 @pytest.mark.parametrize("transition", ["publication", "redo"])
-def test_explicit_retry_rechecks_transition_markers_under_control(
-    tmp_path, clock, SPEC, monkeypatch, transition
-):
+def test_explicit_retry_rechecks_transition_markers_under_control(tmp_path, clock, SPEC, monkeypatch, transition):
     from hedge_fund.runtime import admission
 
     spec = SPEC.model_copy(update={"approval_required": True})
@@ -1186,9 +1152,7 @@ except BaseException as exc:
     assert ledger.latest().hash == second.hash
 
 
-def test_interrupted_redo_blocks_new_work_after_owned_child_exit(
-    tmp_path, clock, SPEC, owned_test_process
-):
+def test_interrupted_redo_blocks_new_work_after_owned_child_exit(tmp_path, clock, SPEC, owned_test_process):
     spec = SPEC.model_copy(update={"approval_required": True})
     clock("2024-06-04")
     directory = deploy("alpha", spec, ["AAPL"], root=tmp_path)
@@ -1286,9 +1250,7 @@ def test_successful_redo_records_completion_and_allows_next_tick(tmp_path, clock
     "contents",
     [
         "{invalid",
-        '{"version": 1, "state": [], "redo_id": "' + "a" * 32
-        + '", "source_session": "2024-06-03", "source_hash": "' + "b" * 64
-        + '", "result_hash": null}',
+        '{"version": 1, "state": [], "redo_id": "' + "a" * 32 + '", "source_session": "2024-06-03", "source_hash": "' + "b" * 64 + '", "result_hash": null}',
     ],
 )
 def test_invalid_redo_guard_blocks_new_work(tmp_path, clock, SPEC, contents):
@@ -1926,11 +1888,7 @@ def test_enrolled_tick_redo_and_ledger_writes_require_admission(tmp_path, SPEC):
 
 
 def test_enrolled_tick_rejects_inventory_drift_before_data_access(tmp_path, SPEC):
-    from hedge_fund.runtime.admission import (
-        AdmissionCoordinator,
-        AdmissionError,
-        RootOwnerLease,
-    )
+    from hedge_fund.runtime.admission import AdmissionCoordinator, AdmissionError, RootOwnerLease
     from hedge_fund.runtime.root import RootContext
 
     directory = _enrolled_paper_directory(tmp_path / "enrolled", SPEC)
@@ -1955,3 +1913,78 @@ def test_enrolled_tick_rejects_inventory_drift_before_data_access(tmp_path, SPEC
     finally:
         owner.close()
         root.close()
+
+
+# ---------------------------------------------------------------------------
+# cadence regressions (T026)
+# ---------------------------------------------------------------------------
+
+
+def test_weekly_cadence_records_every_session_oldest_first_and_rebalances_once_per_iso_week(tmp_path, clock, SPEC):
+    spec = SPEC.model_copy(update={"rebalance": "weekly"})
+    clock("2024-06-04")
+    directory = deploy("alpha", spec, ["AAPL"], root=tmp_path)
+    assert _tick(directory).session == "2024-06-03"
+
+    clock("2024-06-12")  # a reviewed backlog of six closes, run strictly oldest first
+    backlog = [_tick(directory) for _ in range(6)]
+    with pytest.raises(NothingDue):
+        _tick(directory)
+
+    assert [record.session for record in backlog] == ["2024-06-04", "2024-06-05", "2024-06-06", "2024-06-07", "2024-06-10", "2024-06-11"]
+    assert [record.rebalance for record in backlog] == [False, False, False, False, True, False]
+    assert Ledger(directory).sessions() == WEEKDAYS[:7]
+
+
+def test_monthly_cadence_skips_market_holidays_and_rebalances_at_the_month_open(tmp_path, clock, SPEC):
+    days = ["2024-05-23", "2024-05-24", "2024-05-28", "2024-05-29", "2024-05-30", "2024-05-31", "2024-06-03", "2024-06-04"]  # 05-27 Memorial Day
+    series = {"SPY": {day: 100.0 for day in days}, "AAPL": {day: 200.0 + i for i, day in enumerate(days)}}
+    spec = SPEC.model_copy(update={"rebalance": "monthly"})
+    clock("2024-05-25")  # Saturday: Friday is the latest completed close
+    directory = deploy("alpha", spec, ["AAPL"], root=tmp_path)
+    first = _tick(directory, data=FakeDataClient(series))
+    assert first.session == "2024-05-24" and first.rebalance
+
+    clock("2024-06-05")
+    owed = []
+    while True:
+        try:
+            owed.append(_tick(directory, data=FakeDataClient(series)))
+        except NothingDue:
+            break
+
+    assert [record.session for record in owed] == days[2:]
+    assert [record.session for record in owed if record.rebalance] == ["2024-06-03"]
+    assert "2024-05-27" not in Ledger(directory).sessions()
+
+
+def test_explicit_backfill_cannot_skip_or_reorder_the_owed_backlog_and_recorded_dates_are_idempotent(tmp_path, clock, SPEC):
+    clock("2024-06-04")
+    directory = deploy("alpha", SPEC, ["AAPL"], root=tmp_path)
+    _tick(directory)
+    clock("2024-06-08")
+
+    for skipped in ("2024-06-05", "2024-06-07"):
+        with pytest.raises(ValueError, match="not the next unrecorded session \\(2024-06-04\\)"):
+            _tick(directory, session=skipped)
+    assert Ledger(directory).sessions() == ["2024-06-03"]
+    assert [_tick(directory, session=day).session for day in ("2024-06-04", "2024-06-05")] == ["2024-06-04", "2024-06-05"]
+    recorded = Ledger(directory).read("2024-06-03")
+    assert _tick(directory, session="2024-06-03") == recorded  # recorded history is returned, never re-run
+    assert Ledger(directory).sessions() == ["2024-06-03", "2024-06-04", "2024-06-05"]
+
+
+def test_one_second_minute_cadence_is_keyed_to_the_second_and_late_runs_take_the_latest_bar(SPEC):
+    spec = FundSpec.model_validate({**SPEC.model_dump(mode="json"), "rebalance": "minute", "interval": 1 / 60, "window": {"start": "13:00", "end": "13:01"}})
+    assert spec.interval_seconds == 1
+    at = lambda hhmmss, micro=0: datetime.fromisoformat(f"2024-06-04T{hhmmss}").replace(microsecond=micro, tzinfo=NEW_YORK)  # noqa: E731
+
+    assert next_session(None, spec, None, now=lambda: at("12:59:59", 999_999)) is None
+    assert next_session(None, spec, None, now=lambda: at("13:00:00", 700_000)) == "2024-06-04T13:00:00"
+    assert next_session(None, spec, "2024-06-04T13:00:00", now=lambda: at("13:00:00", 999_999)) is None
+    assert next_session(None, spec, "2024-06-04T13:00:00", now=lambda: at("13:00:01")) == "2024-06-04T13:00:01"
+    assert next_session(None, spec, "2024-06-04T13:00:01", now=lambda: at("13:00:07", 500_000)) == "2024-06-04T13:00:07"
+    assert next_session(None, spec, "2024-06-04T13:00:59", now=lambda: at("13:05:00")) == "2024-06-04T13:01:00"
+    assert next_session(None, spec, "2024-06-04T13:01:00", now=lambda: at("15:00:00")) is None
+    with pytest.raises(ValueError, match="floor is 1 second"):
+        FundSpec.model_validate({**SPEC.model_dump(mode="json"), "rebalance": "minute", "interval": 0.5 / 60, "window": {"start": "13:00", "end": "13:01"}})

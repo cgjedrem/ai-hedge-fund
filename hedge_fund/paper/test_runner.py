@@ -507,10 +507,7 @@ def test_is_running_never_sends_console_control_events(tmp_path, monkeypatch):
     import sys
 
     from hedge_fund.paper import runner as runner_module
-    from hedge_fund.test_support.network_guard import (
-        child_test_environment,
-        guarded_test_python_command,
-    )
+    from hedge_fund.test_support.network_guard import child_test_environment, guarded_test_python_command
 
     def forbidden(*_args):
         raise AssertionError("os.kill(pid, 0) is CTRL_C_EVENT on Windows and interrupts the whole console")
@@ -527,3 +524,18 @@ def test_is_running_never_sends_console_control_events(tmp_path, monkeypatch):
     for invalid in ("0", "-1", "999999999", "not-a-pid"):
         pid_file.write_text(invalid, encoding="utf-8")
         assert not runner_module.is_running(tmp_path)
+
+
+def test_a_one_second_fund_runs_each_second_bar_once_in_order(tmp_path):
+    seconds = ["13:00:00", "13:00:01", "13:00:02"]
+    path = {"AAPL": {f"{DAY}T{s}": 100.0 + i for i, s in enumerate(seconds)}, "SPY": {f"{DAY}T{s}": 500.0 for s in seconds}}
+    directory = deploy("bars", _spec(interval=1 / 60, window={"start": "13:00", "end": "13:01"}), ["AAPL"], root=tmp_path)
+    tape = Tape(path, now=_at(DAY, "12:59:59"))
+    loop = Loop(directory, tape, records=3)
+    loop()
+
+    assert [record.session for record in loop.records] == [f"{DAY}T{s}" for s in seconds]
+    assert Ledger(directory).sessions() == [record.session for record in loop.records]
+    assert loop.events == []
+    with pytest.raises(NothingDue):
+        tick(directory, tape, build_fund=build_fund, now=lambda: _at(DAY, "13:00:02"))
