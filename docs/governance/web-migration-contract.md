@@ -238,7 +238,9 @@ enrolled root are rejected. Lane acquisition re-verifies owner/authority after t
 lock is granted. `runtime/test_writer_inventory.py` is an AST ratchet over every raw
 write/replace/unlink/mkdir/open-for-write site in `hedge_fund/` production modules
 (including any `os`/`shutil`/`tempfile` writer call, names imported from them, and `open`
-with a non-literal mode), classified as
+with a non-literal mode; `hedge_fund/test_support/` is not scanned even though it ships in
+the wheel — its synthetic enrollment helper refuses any root without the
+`synthetic-test-owned` basis), classified as
 paths-routed, registry, paper-lanes, deployment, web-gated, bootstrap, lock-file, root
 primitive, disabled, outside-root or test-harness; an unclassified, stale or recounted
 site fails. `runtime/test_writer_admission_race_matrix.py` drives the central primitives with a real
@@ -256,7 +258,12 @@ use without `--root` keeps legacy behavior outside this protocol; (5) the ratche
 dynamic dispatch (`getattr`, writer callables passed as values) and scripts outside
 `hedge_fund/` (for example `check_stock.py`) are not scanned; (6) the synthetic basis trusts
 test-mode environment variables a same-account process could set — that grants nothing the
-process could not already write directly, but it is not an isolation proof. T015/T021 stay open
+process could not already write directly, but it is not an isolation proof; (7) `aihf-web
+--demo` seeding is a mutation, so outside the synthetic harness it exits before enrollment
+with an A3 explanation (the 2026-11-01 wheel demo smoke predates A3 and no longer
+reproduces); (8) owned-runner `write_runner_record` status writes rely on the owner lease
+taken at child start, with no per-write authority re-check (unreachable in production, where
+the lease is denied). T015/T021 stay open
 until a production basis is implemented and evidenced.
 
 Scoped archive/restore uses registry-before-object admission and a retained

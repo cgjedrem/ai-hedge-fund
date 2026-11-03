@@ -15,9 +15,12 @@ from hedge_fund.paper.deployed import deploy
 from hedge_fund.paper.ledger import Ledger
 from hedge_fund.pipeline.models import CycleRecord, DecisionRecord, StrategyRecord
 from hedge_fund.pipeline.session import mandate_hash, SessionRecord
-from hedge_fund.runtime.admission import AdmissionCoordinator, RootOwnerLease
+from hedge_fund.runtime.admission import AdmissionCoordinator, OwnershipUnknown, RootOwnerLease
+from hedge_fund.runtime.exclusion import out_of_band_exclusion_basis
 from hedge_fund.runtime.handover import enroll_fresh
 from hedge_fund.runtime.root import RootContext
+
+DEMO_SEEDING_UNAVAILABLE = "Demo seeding is unavailable: roots stay read-only until out-of-band writer exclusion is proven " "(OS sandbox, dedicated account or ACL); cooperative locks do not prove it. " "The synthetic demo currently runs only under the test harness."
 
 
 def seed_demo(root: str | Path) -> Path:
@@ -26,6 +29,9 @@ def seed_demo(root: str | Path) -> Path:
     data_root.mkdir(parents=True, exist_ok=True)
     if any(data_root.iterdir()):
         raise ValueError("demo root must be empty")
+    # Seeding mutates the root; under Spec005 A3 that needs a proven out-of-band exclusion basis.
+    if out_of_band_exclusion_basis(data_root) is None:
+        raise OwnershipUnknown(DEMO_SEEDING_UNAVAILABLE)
 
     with RootContext.open(data_root) as context:
         enroll_fresh(context)

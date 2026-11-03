@@ -5,6 +5,7 @@ import shutil
 import uuid
 from pathlib import Path
 
+from hedge_fund.runtime.exclusion import out_of_band_exclusion_basis, SYNTHETIC_TEST_OWNED
 from hedge_fund.runtime.handover import (
     enroll_fresh,
     HANDOVER_PATH,
@@ -26,6 +27,8 @@ def enroll_synthetic_root(path: str | Path) -> Path:
     """
     root_path = Path(path)
     with RootContext.open(root_path) as root:
+        if out_of_band_exclusion_basis(root) != SYNTHETIC_TEST_OWNED:
+            raise RuntimeError("synthetic enrollment requires a test-mode root inside the marked test-owned root")
         try:
             root.file_info(HANDOVER_PATH)
         except FileNotFoundError:

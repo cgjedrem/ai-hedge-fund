@@ -140,6 +140,12 @@ starts a synthetic demo on `http://127.0.0.1:8876`. Demo files live in a tempora
 directory and are removed when the server exits. Node is needed for the build,
 not for Python to serve an already-built bundle.
 
+> **Currently disabled outside the test harness.** Seeding the demo writes to its
+> root, and under the Spec005 A3 decision every root stays read-only until
+> out-of-band writer exclusion is proven (OS sandbox, dedicated account or ACL).
+> `--demo` therefore exits with an explanation before writing anything; the
+> commands below describe the intended flow once such proof exists.
+
 On Windows, use the native launcher instead of GNU Make:
 
 ```powershell

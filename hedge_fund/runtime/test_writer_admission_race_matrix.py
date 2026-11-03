@@ -238,6 +238,19 @@ def test_production_root_without_exclusion_proof_is_read_only(native_root, monke
     assert not (root / "mandates").exists()
 
 
+def test_shipped_synthetic_enrollment_helper_refuses_outside_test_mode(tmp_path, monkeypatch):
+    from hedge_fund.test_support.handover import enroll_synthetic_root
+
+    populated = tmp_path / "populated"
+    populated.mkdir()
+    (populated / "keep.txt").write_text("untouched\n", encoding="utf-8")
+    monkeypatch.delenv("HEDGE_FUND_TEST_MODE")
+    with pytest.raises(RuntimeError, match="test-mode root"):
+        enroll_synthetic_root(populated)
+    assert sorted(entry.name for entry in populated.iterdir()) == ["keep.txt"]
+    assert sorted(entry.name for entry in tmp_path.iterdir()) == ["populated"]
+
+
 @pytest.mark.parametrize("mutate", ["outside-test-root", "marker-missing", "marker-content", "marker-directory", "test-root-env"])
 def test_synthetic_exclusion_basis_is_bound_to_the_test_owned_harness(tmp_path, monkeypatch, mutate):
     shared = Path(os.environ["HEDGE_FUND_TEST_ROOT"])

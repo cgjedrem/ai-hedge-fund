@@ -123,7 +123,12 @@ def _run(context: RootContext, args: argparse.Namespace, host: str) -> None:
         except (RootPathError, UnicodeError, ValueError) as exc:
             raise SystemExit(str(exc)) from None
         if args.demo:
-            seed_demo(context.path)
+            from hedge_fund.runtime.admission import OwnershipUnknown
+
+            try:
+                seed_demo(context.path)
+            except OwnershipUnknown as exc:
+                raise SystemExit(str(exc)) from None
         _serve(context, args, host)
 
 

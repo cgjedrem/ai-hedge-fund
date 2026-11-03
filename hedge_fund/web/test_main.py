@@ -129,6 +129,26 @@ def test_demo_launcher_uses_temporary_root_and_seeds_synthetic_records(monkeypat
     assert not Path(observed["root"]).exists()
 
 
+def test_demo_seeding_fails_closed_without_out_of_band_exclusion_proof(tmp_path, monkeypatch):
+    from hedge_fund.runtime.admission import OwnershipUnknown
+    from hedge_fund.web.demo import DEMO_SEEDING_UNAVAILABLE
+
+    monkeypatch.setattr(launcher, "_require_static_bundle", lambda: None)
+    served = []
+    monkeypatch.setattr(launcher.uvicorn, "run", lambda *_a, **_k: served.append(True))
+    monkeypatch.delenv("HEDGE_FUND_TEST_MODE")
+
+    with pytest.raises(SystemExit) as denied:
+        launcher.main(["--demo", "--port", "8766"])
+
+    assert denied.value.code == DEMO_SEEDING_UNAVAILABLE
+    assert served == []
+    explicit = tmp_path / "demo"
+    with pytest.raises(OwnershipUnknown, match="out-of-band writer exclusion"):
+        seed_demo(explicit)
+    assert list(explicit.iterdir()) == []
+
+
 def test_demo_seed_rejects_root_outside_test_root_before_resolution(
     monkeypatch,
 ):
