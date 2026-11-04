@@ -174,6 +174,7 @@ const capabilities: Capabilities = {
   enrollment_state: "enrolled",
   write_authority: "protocol-native",
   write_unavailable_reason: null,
+  operator_trust_warning: null,
   protected_names: [],
   mutation_token: "synthetic-mutation-token",
   deferred_actions: {},
@@ -283,7 +284,11 @@ function json(value: unknown, status = 200): Response {
   return new Response(JSON.stringify(value), { status, headers: { "Content-Type": "application/json" } });
 }
 
-function renderDesk(runner: RunnerState, handlers: Record<string, Handler> = {}) {
+function renderDesk(
+  runner: RunnerState,
+  handlers: Record<string, Handler> = {},
+  caps: Capabilities = capabilities,
+) {
   const calls: Call[] = [];
   vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const path = String(input);
@@ -293,7 +298,7 @@ function renderDesk(runner: RunnerState, handlers: Record<string, Handler> = {})
     const handler = handlers[`${method} ${path}`];
     if (handler) return handler(call);
     if (method !== "GET") throw new Error(`Unexpected mutation: ${method} ${path}`);
-    if (path === "/api/capabilities") return json(capabilities);
+    if (path === "/api/capabilities") return json(caps);
     if (path === `/api/paper/${FUND}`) return json(paperSnapshot(runner));
     if (path === `/api/paper/${FUND}/runner`) return json(runner);
     if (path.startsWith(`/api/paper/${FUND}/sessions?`)) {
@@ -312,6 +317,23 @@ function renderDesk(runner: RunnerState, handlers: Record<string, Handler> = {})
 }
 
 const mutations = (calls: Call[]) => calls.filter((call) => call.method !== "GET");
+
+it("shows operator responsibility in trusted single-writer mode", async () => {
+  const warning = "Stop and exclude every other program that can reach this root.";
+  renderDesk(
+    stoppedRunner,
+    {},
+    {
+      ...capabilities,
+      write_authority: "operator-trusted-single-writer",
+      operator_trust_warning: warning,
+    },
+  );
+
+  const notice = await screen.findByTestId("operator-trust-warning");
+  expect(notice).toHaveTextContent("Trusted single-writer mode.");
+  expect(notice).toHaveTextContent(warning);
+});
 
 async function enabledButton(name: string) {
   const button = await screen.findByRole("button", { name });

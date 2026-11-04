@@ -961,6 +961,10 @@ class OperationStore:
         self._require_private_storage()
         self._admission.require_root_owner()
         _validate_datetime(now)
+        with self._admission.operation_recovery_lease(timeout=0):
+            return self._recover_unfinished_locked(now=now)
+
+    def _recover_unfinished_locked(self, *, now: datetime) -> tuple[OperationRecord, ...]:
         recovered: list[OperationRecord] = []
         with self._admission.registry_lock(timeout=_MAX_LOCK_WAIT_SECONDS):
             index = self._read_index()

@@ -33,6 +33,7 @@ const capabilities: Capabilities = {
   container_observer: false,
   enrollment_state: "unenrolled",
   write_unavailable_reason: null,
+  operator_trust_warning: null,
   protected_names: ["watchtower", "watchtower-weekly", "umbrella"],
   mutation_token: null,
   deferred_actions: {

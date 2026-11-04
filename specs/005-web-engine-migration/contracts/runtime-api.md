@@ -36,6 +36,13 @@ Validation/mutation error body: `code`, safe `message`, subject/request identity
 current safe head/revision where permitted, `refresh_required`, `retry_policy`.
 Never include credentials, unsafe paths or raw provider errors.
 
+`GET /api/capabilities` reports `write_authority`, a denial reason and the current
+read-only/writable mode. Operator-trusted mode includes a warning that the operator must
+exclude every other program that can reach the root; it does not claim OS-enforced
+exclusion. No browser route can create, renew or revoke the offline acknowledgement.
+Missing, invalid, stale or revoked acknowledgement leaves production roots read-only.
+Fresh enrollment, existing-data migration and relocation do not grant writes by themselves.
+
 | HTTP / code | Meaning / effect boundary |
 | --- | --- |
 | 400 invalid-request | Unknown field/provider/model/parameter, unsupported endpoint scheme or bad range; zero provider/worker calls. |
@@ -96,6 +103,11 @@ valuation slices, source-tested):
   valuation; earlier provider calls may already have completed. There is no `Retry-After` or
   assumed reset window, and the client does not retry the mutation automatically. This is not
   a cumulative spend cap or a claim that background operations emit the same HTTP response.
+- Writable-service recovery guard (2026-11-04): startup recovery takes an exclusive
+  root-scoped operation-service lane before inspecting or fencing unfinished records. A
+  writable service holds the corresponding shared lane for its lifetime. A second
+  participating service cannot recover while a peer holds the shared lane; it serves
+  read-only and reports contention. This protects cooperating services only.
 - A manual paper preview maps an occupied admission lane to 409 `writer-conflict` and unavailable
   ownership to `ownership-unknown`. A denial during lane acquisition starts no provider; if
   authority is lost later, earlier calls may already have occurred.

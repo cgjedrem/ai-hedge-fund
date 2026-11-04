@@ -2,16 +2,15 @@
 
 ## Result and limits
 
-**T024 BLOCKED; this is a partial checkpoint, not migration acceptance.** At the
-2026-11-02 checkpoint, T015, T019–T021 and T023 were open. T023 has since been
-checked, but T015 and T019–T021 remain open, so T024's T002–T023 dependency is
-still not met.
-In particular, an existing-root attestation and cooperative locks do not prove
-that legacy or out-of-band writers have lost access. Such roots must remain
-read-only when exclusion cannot be established. Later scoped evidence covers
-capacity denial and a synchronous valuation budget denial, not an exhaustive
-budget or writer integration/race matrix. No new host-mutation capability is
-enabled by this checkpoint.
+**Historical 2026-11-02 checkpoint: T024 BLOCKED; partial, not migration
+acceptance.** At that checkpoint, T015, T019–T021 and T023 were open. T023 has
+since been checked, but the remaining prerequisites were not met at that time.
+An existing-root attestation and cooperative locks did not prove that legacy or
+out-of-band writers had lost access. Later evidence records the explicit
+operator-trusted single-writer decision; it does not claim OS enforcement.
+Capacity and valuation budget denials were covered, not an exhaustive budget or
+writer integration/race matrix. No new host-mutation capability was enabled by
+this historical checkpoint.
 
 The baseline backend and native observations below ran against
 `32537b23c8428365aa5d39b69e649b2aaeb6b2cc`. The same committed
@@ -157,3 +156,57 @@ Two independent reviewers examined the operation slice in three bounded
 cycles. Their final targeted re-reviews found no significant blockers after
 the reported findings and malformed-detail regression were repaired. This is
 not approval of T024, production deployment or full migration.
+
+## Final bounded validation snapshot (2026-11-04)
+
+**T024 BLOCKED; partial evidence only.** Test base:
+`146a242610d7ba50c72620db398498d34520cc1d`, branch
+`cgjedrem-vigilant-robot`. Final changed source/test diff under `hedge_fund/`
+and `frontend/`: 28 files, 142,499 diff bytes, SHA-256
+`ee1a9e12939a105805fa329d59d907295e2a28312703c27804f7dfbc01d37f51`;
+normalized changed-source manifest 1,434,222 bytes, SHA-256
+`dd829f011b549605045aef05df9ae17dc3b1a2590d31abbcf43cdc241b82ad7d`.
+
+| Validation | Exact selection / environment | Result and status |
+| --- | --- | --- |
+| Non-TUI full Python suite | `python -m pytest -q --tb=short hedge_fund --ignore=hedge_fund/tui`; Windows 11 Enterprise build 26200, NTFS, Python 3.13.7; isolated synthetic roots and fakes | **FAIL**, 14 failed / 2,367 passed / 51 skipped in 5,452.28 s, exit 1. Run `11:35:49.9994857+01:00`–`13:06:45.6327229+01:00`; output SHA-256 `e5434bf3b44037aad9e7ed631c4173c8a5ee01abc37704ff835d5fdd08c83efc`. Exact 14 node IDs and observations in `implementation-evidence.md`. This run predates the final demo-denial wording correction; full suite was not repeated on final source. |
+| Final failure reruns | Writer-race file 12 tests; three previously failing `web/test_actions.py` nodes; eight previously failing `web/test_jobs.py` nodes; all serial, synthetic roots/fakes | **PASS focused**: 12 / 3 / 8 passed, respectively. Full-run cause remains unknown; focused passes do not erase full-suite failure. |
+| T015 | Handover/authority/CLI/web/peer-recovery selection; synthetic Windows/NTFS, Python 3.13, fake transport | **55 passed in 30.42 s**, exit 0. Existing and relocated roots remain read-only pending exact offline acknowledgement; second service cannot recover the live peer operation. |
+| T019/T020 backend | `web/test_app.py`, `test_actions.py`, `test_jobs.py`, `test_valuation.py`, plus `web/test_main.py`; synthetic NTFS, fake transport | **145 passed in 282.76 s** and **12 passed in 4.82 s**, exit 0. Includes common error/status/CSRF/origin/readonly/observation contract and budget-exhausted emitter. |
+| T019/T020 frontend/build/browser | Vitest in `frontend/`; TypeScript/Vite; owned real-API browser on loopback 8876 | **13 files / 216 tests passed**; TypeScript + Vite build passed, 3 files / 1,035,387 bytes, artifact SHA-256 `57f1e1c18ab9f70739b8f4ec8e6f958b064a30407ef1664cb403e5e1fb9142e1`; **3 Playwright tests passed in 17.3 s**. Fake/unit, build, and browser are separate evidence types. |
+| TUI | All 11 `hedge_fund/tui/test_*.py` files, one process at a time | **90 passed, 0 failed files**, exit 0. Unit/fake tests; no concurrent pytest. |
+| Windows native | `runtime/test_native_primitives.py` and `runtime/test_native_credentials.py`; Windows/NTFS | **10 passed, 3 skipped in 10.46 s**, exit 0. Native filesystem/credential primitive row only. |
+| Linux native | Same tests; Docker 29.9.2, image `aihf-qa2-pytest:d054b3ae` (SHA-256 `f46586c33e835ed3ecf57a9b3199396d0301571007955c87cf69905ac4e67412`), WSL2 kernel `6.6.87.2-microsoft-standard-WSL2`, ext4 named volume, UID 1000, `--network none` | **9 passed, 4 skipped in 4.74 s**, exit 0. Linux native row only; volume and stage removed. |
+| POSIX append boundary | `hedge_fund/runtime/test_root.py::test_handle_relative_append_preserves_bytes_and_rejects_hardlinks`; pinned Linux image, ext4 named volume, UID 1000, `--network none`, read-only source mounts | **1 passed in 0.19 s**, exit 0, host `14:30:09.7656523+01:00`–`14:30:14.5056497+01:00`. Unique volume removed. Selected append boundary only; no broad POSIX writer/race acceptance. |
+| Style | Changed Python files, existing isolated Python 3.13 venv; Black 420, isort Black profile, Flake8 420, `git diff --check` | **PASS**: Black 24 files unchanged; isort, Flake8 and diff check exit 0. |
+
+### Current LM/LB/HM disposition
+
+| Obligation | Evidence / remaining acceptance | Status |
+| --- | --- | --- |
+| LM1 | Root-bound operator trust and cooperative writer tests pass focused; unaware/out-of-band writers remain outside the guarantee and broad T027 failures are unexplained. No OS-enforcement claim. | PARTIAL |
+| LM2 | Owned loopback browser recovery passes; host-writer/read-only-container and no-autostart deployment proof absent. | NOT VERIFIED |
+| LM3 | Ledger append/fill and selected approval races pass; durable rewind intent and complete post-fill reconciliation remain open. | PARTIAL |
+| LM4 | Selected archive/restore and stale-review cases pass; full due-set/backlog and stopped-deployment restore remain open. | PARTIAL |
+| LM5 | Synthetic account-binding tests do not establish complete production SIM lifecycle wiring. | NOT VERIFIED |
+| LB1 | Root, isolation, headless and writer selections pass; active-child credential lifecycle and complete writer integration remain open. | PARTIAL |
+| LB2 | Selected Host/Origin/CSRF and loopback checks pass; read-only-container and future-channel guarantees absent. | PARTIAL |
+| LB3 | No live endpoint/DNS/TLS/redirect test is claimed. | NOT VERIFIED |
+| LB4 | Windows/NTFS and Linux/ext4 native primitive selections pass with skips; credential UI and active-capture workflow remain open. | PARTIAL |
+| LB5 | Native rows pass on tested NTFS and ext4; skipped cases, other filesystems and full deployment remain outside evidence. | PARTIAL |
+| HM1 | The full non-TUI suite failed 14 tests; focused reruns pass, root cause unresolved. | PARTIAL |
+| HM2 | Selected bounded-policy tests use fakes; complete provider/UI acceptance is not established. | PARTIAL |
+| HM3 | Selected bounded-policy regressions pass; scheduled-runner and dispatch acceptance remain open. | PARTIAL |
+| HM4 | Selected durable/interruption and fencing tests pass; detached-owner/restart and platform lifecycle acceptance remain open. | PARTIAL |
+| HM5 | Selected durable confirmation/idempotency and approval boundary tests pass; complete provenance and operation UI acceptance remain open. | PARTIAL |
+
+T021 remains unchecked for durable rewind intent, mandate rename-plus-rewrite
+journaling, identity-fenced POSIX unlink evidence, complete Saxo
+credential/demo/bootstrap admission, and exhaustive dynamic/out-of-repository
+writer inventory with race-level evidence. The selected POSIX append boundary
+passes one ext4 regression but does not establish broad POSIX writer/race
+behavior. T024 is blocked by these open
+T002–T023 prerequisites and the failed full-suite result. Final task state:
+T015, T019 and T020 checked; T021, T024 and T027 unchecked. T027 remains open
+because three race-file cases failed in the full run despite passing focused.
+T023/T025/T026/T028 checkboxes remain unchanged.

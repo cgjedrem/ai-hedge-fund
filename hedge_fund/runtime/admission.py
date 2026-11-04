@@ -27,6 +27,7 @@ from hedge_fund.runtime.root import (
 PROTOCOL_VERSION = 1
 LOCK_DIRECTORY = f"{PRIVATE_ROOT}/admission/v{PROTOCOL_VERSION}"
 OWNER_LOCK_PATH = f"{LOCK_DIRECTORY}/owner.lock"
+OPERATION_SERVICE_LANE = "service:operations"
 MAX_LOCK_WAIT_SECONDS = 5.0
 MAX_CONTROL_WAIT_SECONDS = 0.5
 _LOCK_POLL_SECONDS = 0.01
@@ -217,8 +218,12 @@ RootParticipantLease = RootOwnerLease
 
 
 def _require_protocol_native_authority(root: RootContext) -> None:
-    """Enrollment alone is not write authority; only protocol-native roots qualify."""
-    from hedge_fund.runtime.handover import HandoverError, require_write_authority, WriteAuthorityDenied
+    """Enrollment alone is not write authority."""
+    from hedge_fund.runtime.handover import (
+        HandoverError,
+        require_write_authority,
+        WriteAuthorityDenied,
+    )
 
     try:
         require_write_authority(root)
@@ -262,13 +267,42 @@ class AdmissionCoordinator:
         with self._lock("registry", timeout=timeout):
             yield
 
+    @contextmanager
+    def operation_recovery_lease(self, *, timeout: float = 0.0) -> Iterator[None]:
+        """Exclude live participating services while unfinished operations are fenced."""
+        with self._lock(OPERATION_SERVICE_LANE, timeout=timeout):
+            yield
+
+    @contextmanager
+    def operation_service_lease(self, *, timeout: float = 0.0) -> Iterator[None]:
+        """Hold shared root admission for a writable operation service lifetime."""
+        wait = _validate_timeout(timeout, MAX_LOCK_WAIT_SECONDS)
+        relative = f"{LOCK_DIRECTORY}/{_lock_filename(OPERATION_SERVICE_LANE)}"
+        self._require_open_owner_lease()
+        self._root.mkdir(LOCK_DIRECTORY, parents=True, mode=0o700)
+        handle = self._root.open_lock_file(relative, mode=0o600)
+        acquired = False
+        token = None
+        try:
+            self._root.revalidate()
+            token = _acquire_os_lock(handle, wait, exclusive=False)
+            acquired = True
+            self._require_verified_owner()
+            yield
+        finally:
+            try:
+                if acquired and os.getpid() == _ADMISSION_PROCESS_ID:
+                    _release_os_lock(handle, token)
+            finally:
+                handle.close()
+
     def require_root_owner(self) -> None:
         self._require_verified_owner()
 
     def lane_is_held(self, lane: str, identity: str | None = None) -> bool:
         if lane == "registry":
             key = "registry"
-        elif lane in {"deployment", "runner", "execution", "control", "halt", "audit", "research"} and identity is not None:
+        elif lane in {"deployment", "runner", "execution", "control", "halt", "audit", "research", "service"} and identity is not None:
             key = f"{lane}:{_resource_identity(identity)}"
         else:
             raise AdmissionError("admission lane is invalid")
@@ -797,16 +831,8 @@ class PaperApprovalAdmission:
         except AdmissionError:
             return False
         candidate = os.path.normcase(os.path.abspath(os.fspath(path)))
-        expected = os.path.normcase(
-            os.path.abspath(os.fspath(self._admission.root.path / "paper" / identity))
-        )
-        return (
-            self._active
-            and _resource_identity(identity) == self._identity
-            and candidate == expected
-            and self._admission.lane_is_held("registry")
-            and self._admission.lane_is_held("control", identity)
-        )
+        expected = os.path.normcase(os.path.abspath(os.fspath(self._admission.root.path / "paper" / identity)))
+        return self._active and _resource_identity(identity) == self._identity and candidate == expected and self._admission.lane_is_held("registry") and self._admission.lane_is_held("control", identity)
 
 
 @contextmanager
@@ -977,7 +1003,7 @@ def _lock_filename(key: str) -> str:
     if not isinstance(key, str) or ":" not in key:
         raise AdmissionError("admission lane is invalid")
     namespace, identity = key.split(":", 1)
-    if namespace not in {"deployment", "runner", "execution", "control", "halt", "audit", "research"} or not identity:
+    if namespace not in {"deployment", "runner", "execution", "control", "halt", "audit", "research", "service"} or not identity:
         raise AdmissionError("admission lane is invalid")
     digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
     return f"{namespace}-{digest}.lock"

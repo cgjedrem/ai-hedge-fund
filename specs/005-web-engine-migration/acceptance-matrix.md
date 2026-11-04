@@ -132,12 +132,13 @@ negative web-operation test remains pending.
 | FR-060 | T127–T136 | Test-first convergence, three independent QA passes, final review, and open human-review PR. | PENDING |
 | FR-061 | T127, T134 | User-authorized governance amendment and paid/free/scheduled policy are explicit; no suite pass inferred. | PENDING |
 | FR-062 | T080, T087–T094, T127–T136 | No TUI retirement before fresh package, Windows/Linux, browser, writer, and parity evidence. | PENDING |
+| FR-063 | T015, T021, T024, T027 | Production writes require explicit root/build/inventory-bound offline acknowledgement; existing roots stay read-only by default and the trusted single-writer assumption is not OS-enforced. | PENDING |
 
 ## Local-boundary, ledger-money, and human-control findings
 
 | Finding | Required closure | Planned discriminating tests/evidence | Status |
 | --- | --- | --- | --- |
-| LM1 | All-writer admission, unknown legacy denial, ordered locks, bounded emergency lane. | T009, T014, T015, T021, T027, T073 | PENDING |
+| LM1 | Participating-writer admission, unknown legacy denial, ordered locks, bounded emergency lane, explicit operator responsibility for excluding unaware writers. | T009, T014, T015, T021, T027, T073 | PENDING |
 | LM2 | Host writer/read-only container observer; no TUI/ttyd services or autorestart. | T078, T080, T084, T087–T093 | PENDING |
 | LM3 | Durable reconciliation before Resume after ambiguous fills. | T064, T068, T069, T073, T074 | PENDING |
 | LM4 | Exact head/due-set review, bounded backlog, stopped restore. | T026, T033, T036, T095, T101 | PENDING |

@@ -212,6 +212,25 @@ def test_audit_observation_without_a_writer_is_read_only(tmp_path):
     assert list(directory.iterdir()) == [ledger.events_path]
 
 
+def test_audit_append_rejects_hardlinked_event_file(tmp_path):
+    import os
+
+    from hedge_fund.runtime.root import RootPathError
+
+    directory = tmp_path / "paper" / "alpha"
+    directory.mkdir(parents=True)
+    ledger = Ledger(directory)
+    outside = tmp_path / "outside.jsonl"
+    outside.write_bytes(b"protected\n")
+    os.link(outside, ledger.events_path)
+
+    with pytest.raises(RootPathError, match="single-link regular file"):
+        ledger.log_event("synthetic")
+
+    assert outside.read_bytes() == b"protected\n"
+    assert ledger.events_path.read_bytes() == b"protected\n"
+
+
 def test_initialization_cannot_overwrite_a_concurrent_halt(tmp_path, monkeypatch):
     import time
     from threading import Event, Thread

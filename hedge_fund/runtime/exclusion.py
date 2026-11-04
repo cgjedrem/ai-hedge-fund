@@ -1,17 +1,7 @@
-"""Out-of-band writer exclusion basis for production write authority.
+"""Harness-only exclusion basis.
 
-Spec005 A3 decision: cooperative registry/OS locks only exclude writers that
-participate in the protocol. They do not prove that an unaware or out-of-band
-writer running under the same account (an older checkout, a shell script, a
-copied engine) cannot mutate the root. Write authority therefore additionally
-requires an explicit exclusion basis.
-
-No production basis (OS sandbox, dedicated account, or ACL proof) is
-implemented, so production roots stay read-only. The only basis recognised is
-the synthetic test harness: a test-mode process whose root lies inside a
-checkout-owned ``outputs/spec005-test-*`` directory carrying the exact
-``.test-owned`` marker. Those roots are created by the harness and are not
-addressable by any shipped writer.
+Production operator trust lives in ``runtime.handover``. It does not prove OS
+exclusion; cooperating locks do not fence unaware same-account writers.
 """
 
 from __future__ import annotations

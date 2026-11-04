@@ -25,6 +25,7 @@ REPO = PACKAGE.parent
 PRIMITIVES = {
     "write_text",
     "write_bytes",
+    "append_bytes",
     "unlink",
     "unlink_file",
     "rename",
@@ -129,7 +130,16 @@ WRITER_MAP: dict[tuple[str, str, str], Writer] = {
     ("hedge_fund.paper.ledger", "Ledger._publish_approval", "write_atomic"): Writer(BOUND, "denial", ("hedge_fund/web/test_paper_operations.py::test_paper_accept_retries_only_busy_storage_and_records_no_effects",), BOUND_NOTE),
     ("hedge_fund.paper.ledger", "Ledger._clear_approval", "unlink"): Writer(LEGACY, "denial", ("hedge_fund/paper/test_ledger.py::test_approval_clear_logs_unlink_error",), LEGACY_NOTE),
     ("hedge_fund.paper.ledger", "Ledger._unlink_enrolled", "unlink_file"): Writer(ROOT, "race", (M + "test_authority_flip_between_entry_and_approval_unlink_keeps_approval", M + "test_junction_swap_before_approval_unlink_removes_nothing_outside")),
-    ("hedge_fund.paper.ledger", "Ledger.log_event", "open:a"): Writer(RESIDUAL, "race", (M + "test_authority_flip_inside_audit_transition_appends_no_event", "hedge_fund/runtime/test_inventory_cache_race.py::test_busy_audit_observation_is_explicit_and_does_not_halt"), "raw append follows links; authority is rechecked before the append and later drift is detected, not prevented"),
+    ("hedge_fund.paper.ledger", "Ledger.log_event", "append_bytes"): Writer(
+        ROOT,
+        "race",
+        (
+            M + "test_authority_flip_inside_audit_transition_appends_no_event",
+            "hedge_fund/paper/test_ledger.py::test_audit_append_rejects_hardlinked_event_file",
+            "hedge_fund/runtime/test_writer_races.py::test_two_process_audit_appends_are_complete_and_uninterleaved",
+        ),
+        "handle-relative append runs under paper_audit_transition; reparse and hard-link targets deny",
+    ),
     # legacy paper runner (disabled on enrolled roots)
     ("hedge_fund.paper.runner", "serve", "write_text"): Writer(DENIED, "denial", ("hedge_fund/paper/test_runner.py::test_legacy_runner_entrypoints_deny_before_pid_or_provider_effects", "hedge_fund/paper/test_runner.py::test_enrolled_root_blocks_legacy_runner_start_and_pid_signaling")),
     ("hedge_fund.paper.runner", "serve", "unlink"): Writer(DENIED, "denial", ("hedge_fund/paper/test_runner.py::test_legacy_runner_entrypoints_deny_before_pid_or_provider_effects",)),
@@ -154,6 +164,12 @@ WRITER_MAP: dict[tuple[str, str, str], Writer] = {
     ("hedge_fund.runtime.admission", "RootOwnerLease.acquire", "mkdir"): Writer(ROOT, "race", ("hedge_fund/runtime/test_handover.py::test_migration_exclusive_lock_conflicts_with_shared_participant",)),
     ("hedge_fund.runtime.admission", "RootMigrationLease.acquire", "mkdir"): Writer(ROOT, "race", ("hedge_fund/runtime/test_handover.py::test_migration_exclusive_lock_conflicts_with_shared_participant",)),
     ("hedge_fund.runtime.admission", "AdmissionCoordinator._lock", "mkdir"): Writer(ROOT, "race", LANE_LOCK),
+    ("hedge_fund.runtime.admission", "AdmissionCoordinator.operation_service_lease", "mkdir"): Writer(
+        ROOT,
+        "race",
+        ("hedge_fund/web/test_jobs.py::test_second_process_cannot_recover_a_live_peer_operation",),
+        "root-private lifetime lock; cooperating service recovery only",
+    ),
     ("hedge_fund.runtime.admission", "_local_lane", "remove"): Writer(PRIMITIVE, "primitive", (), "list.remove on an in-memory waiter queue; not a filesystem write"),
     # settings, child environment, credentials
     ("hedge_fund.runtime.configuration", "save_settings", "mkdir"): Writer(ROOT, "race", ("hedge_fund/web/test_settings_provenance.py::test_version_changes_and_external_writer_require_restart_and_reject_stale_saves",)),
@@ -165,6 +181,18 @@ WRITER_MAP: dict[tuple[str, str, str], Writer] = {
     # handover records and relocation
     ("hedge_fund.runtime.handover", "relocate_existing", "mkdir"): Writer(ROOT, "denial", ("hedge_fund/runtime/test_write_authority.py::test_relocation_refuses_reparse_points_in_source",)),
     ("hedge_fund.runtime.handover", "relocate_existing", "write_bytes"): Writer(ROOT, "denial", ("hedge_fund/runtime/test_write_authority.py::test_relocation_refuses_reparse_points_in_source",)),
+    ("hedge_fund.runtime.handover", "_write_private_json", "write_bytes"): Writer(
+        BOOTSTRAP,
+        "denial",
+        ("hedge_fund/runtime/test_write_authority.py::test_existing_root_needs_fresh_root_bound_trust_ack_and_revocation_is_fail_closed",),
+        "root-private trust records require offline RootMigrationLease admission",
+    ),
+    ("hedge_fund.runtime.handover", "_remove_single_writer_challenge", "unlink_file"): Writer(
+        BOOTSTRAP,
+        "denial",
+        ("hedge_fund/runtime/test_write_authority.py::test_existing_root_needs_fresh_root_bound_trust_ack_and_revocation_is_fail_closed",),
+        "root-private review challenge removal requires offline RootMigrationLease admission",
+    ),
     ("hedge_fund.runtime.handover", "PaperInventoryTransition.mkdir", "mkdir"): Writer(TRANSITION, "race", (M + "test_authority_flip_inside_deploy_creates_no_fund", M + "test_ledger_directory_swap_during_append_cannot_write_outside_root")),
     ("hedge_fund.runtime.handover", "PaperInventoryTransition.write_text", "write_bytes"): Writer(TRANSITION, "race", (M + "test_authority_flip_inside_ledger_transaction_denies_effect_and_publication", M + "test_authority_flip_between_deploy_effects_denies_the_next_effect")),
     ("hedge_fund.runtime.handover", "PaperInventoryTransition.write_bytes", "write_bytes"): Writer(TRANSITION, "race", (M + "test_authority_flip_between_deploy_effects_denies_the_next_effect",)),
@@ -194,6 +222,8 @@ WRITER_MAP: dict[tuple[str, str, str], Writer] = {
     ("hedge_fund.runtime.root", "_posix_read_relative", "os.open"): Writer(PRIMITIVE, "primitive", ROOT_TESTS, "POSIX-only no-follow open with computed flags (directory/read, no create); not executed on the Windows evidence host"),
     ("hedge_fund.runtime.root", "_posix_mkdir_relative", "os.open"): Writer(PRIMITIVE, "primitive", ROOT_TESTS, "POSIX-only reopen of the created directory with O_NOFOLLOW; not executed on the Windows evidence host"),
     ("hedge_fund.runtime.root", "_posix_open_lock_relative", "os.open"): Writer(PRIMITIVE, "primitive", ("hedge_fund/runtime/test_admission.py::test_control_lane_conflict_has_a_bounded_wait",), "POSIX-only O_CREAT|O_NOFOLLOW lock file relative to a no-follow parent fd; not executed on the Windows evidence host"),
+    ("hedge_fund.runtime.root", "_posix_append_relative", "os.open"): Writer(PRIMITIVE, "primitive", ("hedge_fund/runtime/test_root.py::test_handle_relative_append_preserves_bytes_and_rejects_hardlinks",), "POSIX-only O_APPEND|O_NOFOLLOW open; not executed on the Windows evidence host"),
+    ("hedge_fund.runtime.root", "_posix_append_relative", "os.write"): Writer(PRIMITIVE, "primitive", ("hedge_fund/runtime/test_root.py::test_handle_relative_append_preserves_bytes_and_rejects_hardlinks",), "POSIX-only write through the verified append handle; not executed on the Windows evidence host"),
     ("hedge_fund.runtime.root", "_posix_write_relative", "os.open"): Writer(PRIMITIVE, "primitive", ROOT_TESTS),
     ("hedge_fund.runtime.root", "_posix_write_relative", "fdopen:wb"): Writer(PRIMITIVE, "primitive", ROOT_TESTS),
     ("hedge_fund.runtime.root", "_posix_write_relative", "replace"): Writer(PRIMITIVE, "primitive", ROOT_TESTS),
@@ -249,6 +279,8 @@ class _Scanner(ast.NodeVisitor):
             # Flags built elsewhere (a variable) cannot be proven read-only, so they must be mapped.
             if not flags or flags & {"O_CREAT", "O_WRONLY", "O_RDWR", "O_APPEND", "O_TRUNC"}:
                 primitive = "os.open"
+        elif name == "write" and isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name) and func.value.id == "os":
+            primitive = "os.write"
         elif name == "fdopen":
             mode = _open_mode(node)
             if mode is not None:
@@ -321,7 +353,6 @@ def test_writer_map_reports_residuals_explicitly():
         "hedge_fund.brokers.saxo:_refresh_lock:unlink",
         "hedge_fund.brokers.saxo:_refresh_lock:write_text",
         "hedge_fund.paper.ledger:Ledger.init:write_atomic",
-        "hedge_fund.paper.ledger:Ledger.log_event:open:a",
         "hedge_fund.paths:write_atomic:fdopen:w",
         "hedge_fund.paths:write_atomic:os.open",
         "hedge_fund.paths:write_atomic:replace",

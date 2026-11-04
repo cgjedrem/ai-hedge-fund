@@ -7,6 +7,7 @@ root; it is not a replacement financial ledger. Authority is the [forward contra
 | Entity | Fields / relationships | Validation and immutability |
 | --- | --- | --- |
 | RootContext | canonical path, filesystem/device identity, host/boot/namespace identity, protocol/build, launch capabilities, handover evidence | Explicit launch argument before imports; local supported filesystem, protected/path guards; no env/browser redirection/elevation. |
+| OperatorTrustAcknowledgement | canonical root binding, enrollment identity, protocol/build, reviewed inventory digest, exact operator statement, timestamp | Created/revoked only by offline CLI; missing/invalid/stale means read-only. Records operator responsibility, not OS exclusion. |
 | MandateTemplate | canonical name, revision/content digest, validated existing FundSpec | All supported fields/default omissions round-trip; YAML/YML/case collisions reject; edits/clone/rename expect revision. |
 | Deployment | stable ID, root ID, immutable mandate snapshot/digest, universe, broker, ledger head, lifecycle, predecessor/archive links | No snapshot mutation; local-paper web mutations only; halt/replay/quiescence checks. |
 | SIMAccountBinding | SIM environment/account identity, deployment/root owner, status, transfer provenance | Single active binding across deployments/roots; unverifiable exclusivity denies mutation; no real-broker option. |
@@ -15,7 +16,7 @@ root; it is not a replacement financial ledger. Authority is the [forward contra
 | FrozenCapture | ID/digest, mandate/universe/config/credential versions, endpoints/provider/model/broker, code stamp | Private credential references/material remain stable for active work; public redacted view shows effective/source/restart-needed status. |
 | RunnerAuthorization | deployment/root/capture digest, allowed free/local providers, initial due-set, expiry, session/call/resource counters | No cloud/paid loops; finite bounds, explicit action; first bound denies next work. |
 | Ownership | root/deployment/protocol/build, PID namespace/boot, PID/incarnation, handshake nonce, process group/control channel, auth/capture IDs | PID alone insufficient; unknown/stale/legacy fails closed; nonce private, no cross-namespace signal. |
-| AdmissionReservation | resource identity, owner/operation, runner lifetime or bounded lease, journal phase, recovery evidence | Kernel locks coordinate all processes; release on crash does not authorize recovery; control lane remains bounded/responsive. |
+| AdmissionReservation | resource identity, owner/operation, runner lifetime or bounded lease, journal phase, recovery evidence | OS locks coordinate participating processes only; release on crash does not authorize recovery; control lane remains bounded/responsive. |
 | ConfirmationPreview | action/subject, expected revision/head, ordered exact due-set/range, universe/capture, budget/consequences, operator session, expiry, digest | Immutable preview; digest canonical bytes, single-use consumption; admission revalidates head/due-set and fixed root. |
 | Operation | durable request ID, payload digest, confirmation ID, capture/authorization, owner, stage/events/result, status/ambiguity | Persist before effects; same ID/payload returns status, changed payload conflicts; no browser-only evidence. |
 | ReconciliationProvenance | operation/head identities, broker book/fill evidence, captured version, operator/time/decision, residual uncertainty | Required for ambiguous post-fill Resume in addition to replay; cannot fabricate ledger success. |
@@ -55,3 +56,6 @@ Duplicate request and token consumption share a durable transaction/journal: rec
 interprets an incomplete marker as permission to repeat financial effects.
 Read-only observer cannot create sidecars; paired immutable snapshots either verify or
 return observation conflict. Journal/credential ACL failure blocks privileged capability.
+Fresh enrollment, migration and relocation remain read-only until exact root-specific
+operator acknowledgement. The operator must exclude other programs; shared locks do not
+fence unaware or malicious same-account writers.

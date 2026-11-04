@@ -13,16 +13,35 @@ import pytest
 import yaml
 
 from hedge_fund.backtesting.fund import backtest_fund
-from hedge_fund.backtesting.test_fund import FakeAnalyst, FakeDataClient, SERIES, WEEKDAYS
+from hedge_fund.backtesting.test_fund import (
+    FakeAnalyst,
+    FakeDataClient,
+    SERIES,
+    WEEKDAYS,
+)
 from hedge_fund.brokers.paper import PaperBroker
 from hedge_fund.data import sessions
 from hedge_fund.data.sessions import NEW_YORK
 from hedge_fund.fund import Fund, FundSpec, TradingWindow
-from hedge_fund.paper import assessment_dates, deploy, following_session, Ledger, LedgerError, list_deployed, load_deployed, next_session, NothingDue, redo, tick, validate_fund_name
+from hedge_fund.paper import (
+    assessment_dates,
+    deploy,
+    following_session,
+    Ledger,
+    LedgerError,
+    list_deployed,
+    load_deployed,
+    next_session,
+    NothingDue,
+    redo,
+    tick,
+    validate_fund_name,
+)
 from hedge_fund.pipeline import DecisionRecord, FundState
 from hedge_fund.pipeline.session import FundHalted
 
 paper_tick_module = import_module("hedge_fund.paper.tick")
+root_module = import_module("hedge_fund.runtime.root")
 
 LEGACY_FUND_YAML = """schema_version: 2
 name: alpha
@@ -572,19 +591,33 @@ def test_consumption_is_synced_before_provider_or_broker_effects(tmp_path, clock
     if verdict is not None:
         ledger.set_approval(verdict, first.decision.as_of, first.hash, "cli")
     synced = []
-    fsync = os.fsync
     advance = paper_tick_module.advance
 
-    def observe_sync(fd):
-        synced.append(fd)
-        return fsync(fd)
+    if os.name == "nt":
+        append = root_module._windows_append_handle
+
+        def observe_append(handle, data, *, durable):
+            result = append(handle, data, durable=durable)
+            if durable:
+                synced.append(handle)
+            return result
+
+        monkeypatch.setattr(root_module, "_windows_append_handle", observe_append)
+    else:
+        fsync = os.fsync
+
+        def observe_sync(fd):
+            result = fsync(fd)
+            synced.append(fd)
+            return result
+
+        monkeypatch.setattr(os, "fsync", observe_sync)
 
     def require_sync_before_advance(*args, **kwargs):
         assert synced, "approval consumption was not synced before effects"
         assert ledger.events()[-1]["kind"] == ("expire" if verdict is None else "consume")
         return advance(*args, **kwargs)
 
-    monkeypatch.setattr(os, "fsync", observe_sync)
     monkeypatch.setattr(paper_tick_module, "advance", require_sync_before_advance)
     clock("2024-06-05")
     assert (_tick(directory).executed is not None) is (verdict == "approve")
@@ -601,10 +634,22 @@ def test_failed_consumption_sync_halts_before_effects(tmp_path, clock, SPEC, mon
         ledger.set_approval(verdict, first.decision.as_of, first.hash, "cli")
     book = (directory / "broker.json").read_bytes()
 
-    def fail_sync(_fd):
-        raise OSError("synthetic event sync failure")
+    if os.name == "nt":
+        append = root_module._windows_append_handle
 
-    monkeypatch.setattr(os, "fsync", fail_sync)
+        def fail_sync(handle, data, *, durable):
+            if durable:
+                append(handle, data, durable=False)
+                raise OSError("synthetic event sync failure")
+            return append(handle, data, durable=durable)
+
+        monkeypatch.setattr(root_module, "_windows_append_handle", fail_sync)
+    else:
+
+        def fail_sync(_fd):
+            raise OSError("synthetic event sync failure")
+
+        monkeypatch.setattr(os, "fsync", fail_sync)
     clock("2024-06-05")
     with pytest.raises(OSError, match="synthetic event sync failure"):
         tick(directory, FakeDataClient(SERIES), build_fund=lambda _spec: pytest.fail("fund was constructed"))
@@ -668,6 +713,7 @@ def test_busy_audit_admission_before_consumption_does_not_halt(tmp_path, clock, 
 
 def test_audit_failure_after_consumption_admission_still_halts(tmp_path, clock, SPEC, monkeypatch):
     from hedge_fund.runtime.admission import WriterConflict
+    from hedge_fund.runtime.root import RootContext
 
     spec = SPEC.model_copy(update={"approval_required": True, "rebalance": "daily"})
     clock("2024-06-04")
@@ -675,17 +721,17 @@ def test_audit_failure_after_consumption_admission_still_halts(tmp_path, clock, 
     first = _tick(directory)
     ledger = Ledger(directory)
     ledger.set_approval("approve", first.decision.as_of, first.hash, "cli")
-    original_open = Path.open
+    original_append = RootContext.append_bytes
     failed = False
 
-    def fail_inside_audit(candidate, mode="r", *args, **kwargs):
+    def fail_inside_audit(root, relative, data, *args, **kwargs):
         nonlocal failed
-        if candidate == ledger.events_path and mode == "a" and not failed:
+        if Path(relative).name == "events.jsonl" and not failed:
             failed = True
             raise WriterConflict("synthetic failure after audit admission")
-        return original_open(candidate, mode, *args, **kwargs)
+        return original_append(root, relative, data, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "open", fail_inside_audit)
+    monkeypatch.setattr(RootContext, "append_bytes", fail_inside_audit)
     clock("2024-06-05")
     with pytest.raises(WriterConflict, match="after audit admission"):
         _tick(directory)
@@ -1888,7 +1934,11 @@ def test_enrolled_tick_redo_and_ledger_writes_require_admission(tmp_path, SPEC):
 
 
 def test_enrolled_tick_rejects_inventory_drift_before_data_access(tmp_path, SPEC):
-    from hedge_fund.runtime.admission import AdmissionCoordinator, AdmissionError, RootOwnerLease
+    from hedge_fund.runtime.admission import (
+        AdmissionCoordinator,
+        AdmissionError,
+        RootOwnerLease,
+    )
     from hedge_fund.runtime.root import RootContext
 
     directory = _enrolled_paper_directory(tmp_path / "enrolled", SPEC)

@@ -526,6 +526,30 @@ class RootContext:
         self.revalidate()
         return self.path.joinpath(*parts)
 
+    def append_bytes(
+        self,
+        relative: str | os.PathLike[str],
+        data: bytes,
+        *,
+        mode: int = 0o600,
+        durable: bool = False,
+    ) -> Path:
+        """Append bytes through anchored handles. Caller holds the writer lane."""
+        parts = _relative_parts(relative)
+        if not isinstance(data, bytes):
+            raise TypeError("data must be bytes")
+        if type(mode) is not int or not 0 <= mode <= 0o777:
+            raise ValueError("mode must contain permission bits")
+        if type(durable) is not bool:
+            raise TypeError("durable must be a boolean")
+        self.revalidate()
+        if os.name == "nt":
+            _windows_append_relative(self._handles[-1], parts, data, durable=durable)
+        else:
+            _posix_append_relative(self._fd, parts, data, mode, durable=durable)
+        self.revalidate()
+        return self.path.joinpath(*parts)
+
     def rename_file(
         self,
         source: str | os.PathLike[str],
@@ -1333,6 +1357,49 @@ def _posix_write_relative(
         os.close(parent_fd)
 
 
+def _posix_append_relative(
+    root_fd: int,
+    parts: tuple[str, ...],
+    data: bytes,
+    mode: int,
+    *,
+    durable: bool,
+) -> None:
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise UnsupportedFilesystemError("no-follow append is unavailable")
+    parent_fd = _posix_parent_fd(root_fd, parts[:-1])
+    descriptor = None
+    try:
+        flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW
+        flags |= getattr(os, "O_NONBLOCK", 0)
+        descriptor = os.open(parts[-1], flags, mode, dir_fd=parent_fd)
+        info = os.fstat(descriptor)
+        # Hard links can mutate files outside the anchored root.
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise RootPathError("append target must be a single-link regular file")
+        os.fchmod(descriptor, mode)
+        offset = 0
+        while offset < len(data):
+            try:
+                written = os.write(descriptor, data[offset:])
+            except InterruptedError:
+                continue
+            if written <= 0:
+                raise OSError("append made no progress")
+            offset += written
+        if durable:
+            os.fsync(descriptor)
+            os.fsync(parent_fd)
+    except OSError as exc:
+        if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+            raise RootPathError("reparse paths are not allowed") from exc
+        raise
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        os.close(parent_fd)
+
+
 def _open_windows_chain(
     path: Path,
     parts: tuple[str, ...],
@@ -1847,6 +1914,57 @@ def _windows_write_relative(
             _close_windows_handles((owned_parent,))
 
 
+def _windows_append_relative(
+    root_handle: int,
+    parts: tuple[str, ...],
+    data: bytes,
+    *,
+    durable: bool,
+) -> None:
+    parent = root_handle
+    owned_parent = None
+    descriptor = None
+    try:
+        for part in parts[:-1]:
+            child = _nt_open_child(
+                parent,
+                part,
+                directory=True,
+                share_delete=True,
+            )
+            try:
+                _validate_windows_handle(child, directory=True)
+            except BaseException:
+                _close_windows_handles((child,))
+                raise
+            if owned_parent is not None:
+                _close_windows_handles((owned_parent,))
+            owned_parent = child
+            parent = child
+        descriptor = _nt_open_child(
+            parent,
+            parts[-1],
+            directory=False,
+            disposition=3,
+            access=0x00000004 | 0x00000080 | 0x00100000,
+            share_delete=True,
+        )
+        _validate_windows_handle(descriptor, directory=False)
+        info = _ByHandleInfo()
+        kernel32 = _kernel32()
+        if not kernel32.GetFileInformationByHandle(descriptor, ctypes.byref(info)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        # Hard links can mutate files outside the anchored root.
+        if info.links != 1:
+            raise RootPathError("append target must be a single-link regular file")
+        _windows_append_handle(descriptor, data, durable=durable)
+    finally:
+        if descriptor is not None:
+            _close_windows_handles((descriptor,))
+        if owned_parent is not None:
+            _close_windows_handles((owned_parent,))
+
+
 def _windows_write_handle(handle: int, data: bytes) -> None:
     kernel32 = _kernel32()
     offset = 0
@@ -1866,6 +1984,28 @@ def _windows_write_handle(handle: int, data: bytes) -> None:
             raise OSError("short write")
         offset += written.value
     if not kernel32.FlushFileBuffers(handle):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+def _windows_append_handle(handle: int, data: bytes, *, durable: bool) -> None:
+    kernel32 = _kernel32()
+    offset = 0
+    while offset < len(data):
+        chunk = data[offset : offset + 65536]
+        buffer = ctypes.create_string_buffer(chunk)
+        written = ctypes.c_ulong()
+        if not kernel32.WriteFile(
+            handle,
+            buffer,
+            len(chunk),
+            ctypes.byref(written),
+            None,
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        if written.value == 0:
+            raise OSError("append made no progress")
+        offset += written.value
+    if durable and not kernel32.FlushFileBuffers(handle):
         raise ctypes.WinError(ctypes.get_last_error())
 
 

@@ -78,6 +78,45 @@ def test_fresh_enrollment_requires_empty_root_and_records_fixed_identity(tmp_pat
     assert not (nonempty / PRIVATE_ROOT).exists()
 
 
+def test_child_process_admits_persisted_trust_and_rejects_revocation(tmp_path, monkeypatch, owned_test_process):
+    monkeypatch.setattr(handover, "out_of_band_exclusion_basis", lambda _root: None)
+    root_path = tmp_path / "trusted-child"
+    root_path.mkdir()
+    with RootContext.open(root_path) as root:
+        enroll_fresh(root)
+        review = handover.prepare_single_writer_acknowledgement(root)
+        handover.trust_single_writer(
+            root,
+            expected_inventory_digest=review["inventory_digest"],
+            operator_acknowledgement=review["operator_acknowledgement"],
+        )
+
+    def run_child(status_path):
+        script = (
+            "from pathlib import Path\n"
+            "from hedge_fund.runtime import handover\n"
+            "from hedge_fund.runtime.admission import RootOwnerLease\n"
+            "from hedge_fund.runtime.root import RootContext\n"
+            "handover.out_of_band_exclusion_basis = lambda _root: None\n"
+            f"with RootContext.open({str(root_path)!r}) as root:\n"
+            "    try:\n"
+            "        owner = RootOwnerLease.acquire(root, timeout=0)\n"
+            "        owner.close()\n"
+            "        result = 'admitted'\n"
+            "    except Exception as exc:\n"
+            "        result = type(exc).__name__\n"
+            f"Path({str(status_path)!r}).write_text(result, encoding='utf-8')\n"
+        )
+        child = owned_test_process(script)
+        assert child.wait(timeout=30) == 0
+        return status_path.read_text(encoding="utf-8")
+
+    assert run_child(tmp_path / "trusted-child.txt") == "admitted"
+    with RootContext.open(root_path) as root:
+        handover.revoke_single_writer(root)
+    assert run_child(tmp_path / "revoked-child.txt") == "OwnershipUnknown"
+
+
 def test_existing_root_requires_exact_attestation_and_inventory_digest(tmp_path):
     root = tmp_path / "legacy"
     root.mkdir()

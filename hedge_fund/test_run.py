@@ -272,6 +272,79 @@ def test_handover_cli_inspects_then_migrates_with_exact_attestation(
     assert forbidden.call_count == 0
 
 
+def test_handover_cli_trust_is_root_specific_explicit_and_revocable(tmp_path, monkeypatch, capsys):
+    from hedge_fund.runtime import handover
+    from hedge_fund.runtime.handover import (
+        build_head_inventory,
+        inventory_digest,
+        migrate_existing,
+        OPERATOR_ATTESTATION,
+        write_authority,
+    )
+    from hedge_fund.runtime.root import RootContext
+
+    root = tmp_path / "trusted-root"
+    (root / "mandates").mkdir(parents=True)
+    with RootContext.open(root) as context:
+        heads = build_head_inventory(context)
+        migrate_existing(
+            context,
+            expected_inventory_digest=inventory_digest(heads),
+            operator_attestation=OPERATOR_ATTESTATION,
+        )
+    monkeypatch.setattr(run, "PAPER_DIR", root / "paper")
+    monkeypatch.setattr(handover, "out_of_band_exclusion_basis", lambda _root: None)
+
+    _main(monkeypatch, "handover", "inspect")
+    inspection = json.loads(capsys.readouterr().out)
+    assert inspection["write_authority"] == {
+        "authority": "ownership-unknown",
+        "reason": "attested-migration-read-only",
+    }
+    assert inspection["operator_acknowledgement"]
+    assert "RESPONSIBILITY" in inspection["operator_acknowledgement"]
+    assert inspection["operator_acknowledgement_expires_at"]
+    assert "do not fence" in inspection["operator_responsibility"].lower()
+
+    with pytest.raises(SystemExit) as invalid:
+        _main(
+            monkeypatch,
+            "handover",
+            "trust-single-writer",
+            "--inventory-digest",
+            inspection["inventory_digest"],
+            "--operator-acknowledgement",
+            "I ACCEPT",
+        )
+    assert invalid.value.code == 2
+    with RootContext.open(root) as context:
+        assert write_authority(context)["authority"] == "ownership-unknown"
+
+    _main(
+        monkeypatch,
+        "handover",
+        "trust-single-writer",
+        "--inventory-digest",
+        inspection["inventory_digest"],
+        "--operator-acknowledgement",
+        inspection["operator_acknowledgement"],
+    )
+    trusted = json.loads(capsys.readouterr().out)
+    assert trusted["state"] == "trusted"
+    assert trusted["write_authority"]["authority"] == "operator-trusted-single-writer"
+
+    _main(monkeypatch, "handover", "inspect")
+    trusted_inspection = json.loads(capsys.readouterr().out)
+    assert trusted_inspection["write_authority"]["authority"] == "operator-trusted-single-writer"
+    assert trusted_inspection["operator_acknowledgement"] is None
+    assert trusted_inspection["operator_acknowledgement_expires_at"] is None
+
+    _main(monkeypatch, "handover", "revoke-single-writer")
+    revoked = json.loads(capsys.readouterr().out)
+    assert revoked["state"] == "revoked"
+    assert revoked["write_authority"]["reason"] == "operator-single-writer-acknowledgement-revoked"
+
+
 def test_handover_cli_relocates_legacy_root_without_writing_source(tmp_path, monkeypatch, capsys):
     from hedge_fund.paper.deployed import deploy
 

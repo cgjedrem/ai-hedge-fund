@@ -1,7 +1,6 @@
 import pytest
 from fastapi.testclient import TestClient
 
-from hedge_fund.runtime.admission import WriterConflict
 from hedge_fund.test_support.handover import enroll_synthetic_root
 from hedge_fund.web.app import create_app
 
@@ -22,6 +21,53 @@ def test_default_capabilities_are_immutable_read_only_and_disk_quiet(tmp_path):
     assert response.json()["mutation_token"] is None
     assert not (tmp_path / "paper").exists()
     assert not (tmp_path / "mandates").exists()
+
+
+def test_trusted_single_writer_is_explicit_warned_and_not_web_enrollable(tmp_path, monkeypatch):
+    from hedge_fund.runtime import handover
+    from hedge_fund.runtime.handover import (
+        prepare_single_writer_acknowledgement,
+        revoke_single_writer,
+        SINGLE_WRITER_RESPONSIBILITY_WARNING,
+        trust_single_writer,
+    )
+    from hedge_fund.runtime.root import RootContext
+
+    enroll_synthetic_root(tmp_path)
+    monkeypatch.setattr(handover, "out_of_band_exclusion_basis", lambda _root: None)
+    with RootContext.open(tmp_path) as root:
+        review = prepare_single_writer_acknowledgement(root)
+        authority = trust_single_writer(
+            root,
+            expected_inventory_digest=review["inventory_digest"],
+            operator_acknowledgement=review["operator_acknowledgement"],
+        )
+    assert authority["authority"] == "operator-trusted-single-writer"
+
+    app = create_app(root=tmp_path, allow_writes=True)
+    with TestClient(app, client=("127.0.0.1", 50000)) as client:
+        capabilities = client.get("/api/capabilities", headers=LOOPBACK)
+        mutation_token = capabilities.json()["mutation_token"]
+        forbidden_opt_in = client.post(
+            "/api/handover/trust-single-writer",
+            headers={**LOOPBACK, "origin": "http://127.0.0.1", "x-csrf-token": mutation_token},
+            json={"acknowledgement": review["operator_acknowledgement"]},
+        )
+    assert capabilities.status_code == 200
+    assert capabilities.json()["writes"] is True
+    assert capabilities.json()["write_authority"] == "operator-trusted-single-writer"
+    assert capabilities.json()["operator_trust_warning"] == SINGLE_WRITER_RESPONSIBILITY_WARNING
+    assert forbidden_opt_in.status_code == 405
+
+    with RootContext.open(tmp_path) as root:
+        revoked = revoke_single_writer(root)
+    assert revoked["reason"] == "operator-single-writer-acknowledgement-revoked"
+    restarted = create_app(root=tmp_path, allow_writes=True)
+    try:
+        assert restarted.state.service.allow_writes is False
+        assert restarted.state.service.write_unavailable_reason == "operator-single-writer-acknowledgement-revoked"
+    finally:
+        restarted.state.service.close()
 
 
 def test_host_and_origin_must_stay_loopback_same_origin(tmp_path):
@@ -198,19 +244,18 @@ def test_operation_cancellation_requires_startup_write_capability(tmp_path):
     assert response.json()["detail"] == "Write capability is disabled for this server."
 
 
-def test_shared_participants_join_while_fund_lanes_remain_exclusive(tmp_path):
+def test_second_writable_service_stays_read_only_while_peer_is_active(tmp_path):
+    from hedge_fund.web.services import ServiceError
+
     enroll_synthetic_root(tmp_path)
     first = create_app(root=tmp_path, allow_writes=True)
     second = create_app(root=tmp_path, allow_writes=True)
     try:
         assert first.state.service.allow_writes is True
-        assert second.state.service.allow_writes is True
-        with first.state.service._admission.manual_session("alpha", timeout=0):
-            with pytest.raises(WriterConflict):
-                with second.state.service._admission.manual_session("alpha", timeout=0):
-                    pass
-        with second.state.service._admission.manual_session("beta", timeout=0):
-            pass
+        assert second.state.service.allow_writes is False
+        assert second.state.service.write_unavailable_reason == "operation-service-active"
+        with pytest.raises(ServiceError, match="Write capability is disabled"):
+            second.state.service._require_writes()
     finally:
         first.state.service.close()
         second.state.service.close()
@@ -451,12 +496,12 @@ def _lifecycle_accept_body(request_id="req-1", archive_id="a" * 32):
 def test_restarted_server_rejects_prior_session_with_renewable_reload_and_no_effects(tmp_path):
     enroll_synthetic_root(tmp_path)
     first = create_app(root=tmp_path, allow_writes=True)
-    second = create_app(root=tmp_path, allow_writes=True)
     calls = []
-    second.state.service.halt_fund = lambda *a, **k: calls.append(a)
     with TestClient(first, client=("127.0.0.1", 50000)) as old_client:
         old_headers = _writable_headers(old_client)
         old_cookies = dict(old_client.cookies)
+    second = create_app(root=tmp_path, allow_writes=True)
+    second.state.service.halt_fund = lambda *a, **k: calls.append(a)
     before = sorted(path.relative_to(tmp_path) for path in tmp_path.rglob("*"))
     with TestClient(second, client=("127.0.0.1", 50000)) as client:
         client.cookies.update(old_cookies)

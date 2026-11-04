@@ -55,6 +55,30 @@ No paid invocation example is supplied for this planning execution.
 - Headless network/provider work now needs explicit operation policy; compatibility does
   not preserve previously unsafe implicit paid calls or unfenced writers.
 
+## Trusted single-writer handover
+
+Existing roots remain read-only by default, including fresh enrollment, `migrate-existing`
+and `relocate-from` results. The offline handover path is:
+
+1. `aihf --root ROOT handover inspect` verifies root/build/protocol and inventory, then
+   prints the current inventory digest and an exact root-specific operator acknowledgement.
+2. The operator confirms all other programs that can reach the root are stopped or excluded,
+   including old CLI versions, cron, services, writable containers and scripts.
+3. `aihf --root ROOT handover trust-single-writer --inventory-digest DIGEST
+   --operator-acknowledgement TEXT` accepts only the exact current acknowledgement and
+   inventory. It rechecks root identity, enrollment/build, legacy reachability and inventory
+   under offline exclusive admission before recording trust.
+4. `aihf --root ROOT handover revoke-single-writer` removes the trust record; absent,
+   invalid, mismatched or revoked trust returns the root to read-only mode.
+
+No environment default, enrollment, migration attestation, relocation, PID/TTL, marker,
+cooperative lock or web endpoint substitutes for this acknowledgement. The operator's
+exclusion is a declared trust assumption, not OS-enforced protection; protocol locks fence
+only cooperating participants. An unaware or malicious same-account writer remains
+unfenced. Known or unverified active legacy participants, unsafe roots and inventory/build
+mismatches still deny trust. This path does not touch real deployments unless an operator
+deliberately invokes it for the selected root.
+
 ## Supported topology
 
 One Windows or Linux host owns local supported root and all writable processes. Host local

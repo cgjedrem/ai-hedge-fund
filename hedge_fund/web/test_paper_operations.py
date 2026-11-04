@@ -539,15 +539,19 @@ def test_manual_tick_rejects_stale_head_before_creating_operation(
     assert accepted is None
 
 
-def _start_owned_runner(demo_root, name: str, *, before_accept=None):
-    root_path = Path(os.environ["HEDGE_FUND_TEST_ROOT"]) / f"{name}-root"
-    root_path.mkdir()
-    enroll_synthetic_root(root_path)
-    service = DeskService(
-        root_path,
-        allow_writes=True,
-        network_enabled=True,
-    )
+def _start_owned_runner(demo_root, name: str, *, before_accept=None, service: DeskService | None = None):
+    owns_service = service is None
+    if owns_service:
+        root_path = Path(os.environ["HEDGE_FUND_TEST_ROOT"]) / f"{name}-root"
+        root_path.mkdir()
+        enroll_synthetic_root(root_path)
+        service = DeskService(
+            root_path,
+            allow_writes=True,
+            network_enabled=True,
+        )
+    else:
+        root_path = Path(service.root_context.path)
     service._runtime_settings = _local_settings()
     try:
         payload = load_spec(demo_root / "mandates" / "demo-quality.yaml").model_dump(mode="python")
@@ -615,12 +619,13 @@ def _start_owned_runner(demo_root, name: str, *, before_accept=None):
             operator_session="owned-runner-test-session",
         )
     except BaseException:
-        service.close()
+        if owns_service:
+            service.close()
         raise
     return service, root_path, session_record, head, accepted
 
 
-def _stop_owned_runner(service: DeskService, name: str) -> None:
+def _stop_owned_runner(service: DeskService, name: str, *, close_service: bool = True) -> None:
     try:
         if service.runner_status(name)["status"] in {
             "starting",
@@ -634,7 +639,8 @@ def _stop_owned_runner(service: DeskService, name: str) -> None:
             if process_ref is not None and process_ref.process.poll() is None:
                 process_ref.process.wait(timeout=30)
         finally:
-            service.close()
+            if close_service:
+                service.close()
 
 
 def test_owned_runner_child_starts_and_stops_with_exact_process_identity(
@@ -697,6 +703,18 @@ def test_real_cli_and_web_tick_conflict_with_owned_runner(demo_root, tmp_path, o
         factory_calls.append(True)
         raise AssertionError("a denied web preview constructed a data client")
 
+    root_path = Path(os.environ["HEDGE_FUND_TEST_ROOT"]) / f"{name}-root"
+    root_path.mkdir()
+    enroll_synthetic_root(root_path)
+    app = create_app(
+        root=root_path,
+        allow_writes=True,
+        network_enabled=True,
+        data_client_factory=forbidden_data_client,
+    )
+    service = app.state.service
+    client_entered = False
+
     def stage_cli(root_path):
         script = "\n".join(
             [
@@ -745,40 +763,47 @@ def test_real_cli_and_web_tick_conflict_with_owned_runner(demo_root, tmp_path, o
         assert ready.exists(), f"CLI child failed before manual admission: {child.poll()}; {outcome}; {startup}"
 
     try:
-        service, root_path, session_record, head, accepted = _start_owned_runner(demo_root, name, before_accept=stage_cli)
-        completed = _wait_for_operation(service, accepted["operation_id"])
-        assert completed["status"] == "completed", completed.get("error")
-        runner = service.runner_status(name)
-        assert runner["status"] == "running"
-        paper_dir = root_path / "paper" / name
-        before = {path.relative_to(paper_dir).as_posix(): path.read_bytes() for path in paper_dir.rglob("*") if path.is_file()}
-
-        app = create_app(root=root_path, allow_writes=True, network_enabled=True, data_client_factory=forbidden_data_client)
         with TestClient(app, client=("127.0.0.1", 50000)) as client:
-            capability = client.get("/api/capabilities", headers={"host": "127.0.0.1"}).json()
-            headers = {
-                "host": "127.0.0.1",
-                "origin": "http://127.0.0.1",
-                "x-csrf-token": capability["mutation_token"],
-            }
-            go.write_text("go", encoding="utf-8")
-            response = client.post(f"/api/paper/{name}/tick/preview", headers=headers, json={"expected_head": head})
-            assert children[0].wait(timeout=30) == 0
-
-        assert response.status_code == 409
-        assert response.json()["code"] == "writer-conflict"
-        cli_outcome = result.read_text(encoding="utf-8")
-        assert cli_outcome.startswith("1\n")
-        assert "manual session is busy or unavailable" in cli_outcome
-        assert factory_calls == []
-        assert service.runner_status(name)["status"] == "running"
-        assert Ledger(paper_dir).sessions() == [session_record.session]
-        assert {path.relative_to(paper_dir).as_posix(): path.read_bytes() for path in paper_dir.rglob("*") if path.is_file()} == before
+            client_entered = True
+            try:
+                capability = client.get("/api/capabilities", headers={"host": "127.0.0.1"}).json()
+                assert capability["mutation_token"]
+                service, root_path, session_record, head, accepted = _start_owned_runner(
+                    demo_root,
+                    name,
+                    before_accept=stage_cli,
+                    service=service,
+                )
+                completed = _wait_for_operation(service, accepted["operation_id"])
+                assert completed["status"] == "completed", completed.get("error")
+                runner = service.runner_status(name)
+                assert runner["status"] == "running"
+                paper_dir = root_path / "paper" / name
+                before = {path.relative_to(paper_dir).as_posix(): path.read_bytes() for path in paper_dir.rglob("*") if path.is_file()}
+                headers = {
+                    "host": "127.0.0.1",
+                    "origin": "http://127.0.0.1",
+                    "x-csrf-token": capability["mutation_token"],
+                }
+                go.write_text("go", encoding="utf-8")
+                response = client.post(f"/api/paper/{name}/tick/preview", headers=headers, json={"expected_head": head})
+                assert children[0].wait(timeout=30) == 0
+                assert response.status_code == 409
+                assert response.json()["code"] == "writer-conflict"
+                cli_outcome = result.read_text(encoding="utf-8")
+                assert cli_outcome.startswith("1\n")
+                assert "manual session is busy or unavailable" in cli_outcome
+                assert factory_calls == []
+                assert service.runner_status(name)["status"] == "running"
+                assert Ledger(paper_dir).sessions() == [session_record.session]
+                assert {path.relative_to(paper_dir).as_posix(): path.read_bytes() for path in paper_dir.rglob("*") if path.is_file()} == before
+            finally:
+                if children and not go.exists():
+                    go.write_text("go", encoding="utf-8")
+                _stop_owned_runner(service, name, close_service=False)
     finally:
-        if children and not go.exists():
-            go.write_text("go", encoding="utf-8")
-        if service is not None:
-            _stop_owned_runner(service, name)
+        if not client_entered:
+            service.close()
 
 
 def test_owned_runner_readiness_timeout_fails_closed_and_stops_child(
@@ -830,7 +855,8 @@ def test_owned_runner_reattaches_after_web_restart_and_parallel_manager(demo_roo
 
         parallel = _reopen_service(root_path)
         others.append(parallel)
-        assert parallel.allow_writes is True
+        assert parallel.allow_writes is False
+        assert parallel.write_unavailable_reason == "operation-service-active"
         observed = parallel.runner_status(name)
         assert observed["status"] == "running"
         assert observed["available"] is True

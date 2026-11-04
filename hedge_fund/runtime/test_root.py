@@ -72,9 +72,7 @@ def test_inherited_root_close_does_not_acquire_parent_thread_lock(tmp_path, monk
         context.close()
 
 
-@pytest.mark.parametrize(
-    "operation", ["revalidate", "prepare_private_storage", "verify_private_storage", "read_bytes", "enter"]
-)
+@pytest.mark.parametrize("operation", ["revalidate", "prepare_private_storage", "verify_private_storage", "read_bytes", "enter"])
 def test_inherited_root_use_is_rejected_before_parent_mutex(tmp_path, monkeypatch, operation):
     context = RootContext.open(tmp_path)
     original_getpid = os.getpid
@@ -254,6 +252,7 @@ def test_invalid_filesystem_identity_shape_fails_closed():
         validate_filesystem(FilesystemIdentity(1, "", True, False))
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows cloud API")
 def test_cloud_detection_fails_closed_on_unknown_windows_status(monkeypatch):
     class Query:
         argtypes = None
@@ -305,6 +304,27 @@ def test_handle_relative_atomic_write_replaces_and_reads_inside_root(tmp_path):
     assert (root / "record.json").read_bytes() == b"second"
     assert (root / "cache" / "llm" / "prompt.json").read_bytes() == b"prompt"
     assert list(root.glob(".*.tmp")) == []
+
+
+def test_handle_relative_append_preserves_bytes_and_rejects_hardlinks(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "paper" / "alpha").mkdir(parents=True)
+
+    with RootContext.open(root) as context:
+        context.append_bytes("paper/alpha/events.jsonl", b"first\n")
+        context.append_bytes("paper/alpha/events.jsonl", b"second\n", durable=True)
+        assert context.read_bytes("paper/alpha/events.jsonl") == b"first\nsecond\n"
+
+    outside = tmp_path / "outside.jsonl"
+    outside.write_bytes(b"protected\n")
+    os.link(outside, root / "paper" / "alpha" / "linked.jsonl")
+    with RootContext.open(root) as context:
+        with pytest.raises(RootPathError, match="single-link regular file"):
+            context.append_bytes("paper/alpha/linked.jsonl", b"changed\n")
+
+    assert outside.read_bytes() == b"protected\n"
+    assert (root / "paper" / "alpha" / "linked.jsonl").read_bytes() == b"protected\n"
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows ctypes ABI retention")
@@ -405,14 +425,16 @@ def test_open_reader_does_not_block_atomic_replacement(tmp_path, monkeypatch):
 
             monkeypatch.setattr(root_module, "_windows_read_handle", paused_read)
         else:
-            original_read = root_module._posix_read_relative
+            original_open = root_module.os.open
 
-            def paused_read(root_fd, parts):
-                opened.set()
-                assert release.wait(timeout=5)
-                return original_read(root_fd, parts)
+            def paused_open(path, *args, **kwargs):
+                descriptor = original_open(path, *args, **kwargs)
+                if path == "record.json":
+                    opened.set()
+                    assert release.wait(timeout=5)
+                return descriptor
 
-            monkeypatch.setattr(root_module, "_posix_read_relative", paused_read)
+            monkeypatch.setattr(root_module.os, "open", paused_open)
 
         with ThreadPoolExecutor(max_workers=1) as pool:
             reader = pool.submit(context.read_bytes, "record.json")

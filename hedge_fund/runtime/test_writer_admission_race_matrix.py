@@ -1,14 +1,7 @@
-"""Spec005 T021 deterministic writer race matrix.
+"""Cross-process writer races use owned synthetic roots.
 
-Each admission class from ``test_writer_inventory.py`` is exercised against the
-central primitives it relies on: same-object contention, independent-object
-progress, authority loss while a lane is held (legacy runner marker, legacy
-alias, and removal of the out-of-band exclusion basis), snapshot serialisation
-during a commit, and crash/release followed by a successful retry.
-
-Contention uses a real second interpreter holding the OS lock (no sleeps decide
-outcomes; readiness and release are file handshakes). Every root is a synthetic
-root inside the test-owned harness with a synthetic HOME.
+Tests cover contention, authority loss, snapshots and crash/retry. File
+handshakes gate children; sleeps do not decide outcomes.
 """
 
 from __future__ import annotations
@@ -184,21 +177,22 @@ def _flip(root: Path, home: Path, how: str, monkeypatch) -> str:
             os.symlink(root, home / ".hedge-fund", target_is_directory=True)
         return "legacy-home-alias"
     monkeypatch.delenv("HEDGE_FUND_TEST_MODE")
-    return "out-of-band-exclusion-unproven"
+    return "operator-single-writer-acknowledgement-required"
 
 
-@pytest.mark.parametrize("how", ["runner-pid", "legacy-alias", "exclusion-basis-removed"])
+@pytest.mark.parametrize("how", ["runner-pid", "legacy-alias", "synthetic-test-owner-removed"])
 @pytest.mark.parametrize("lane", ALL_LANES)
 def test_authority_flip_while_lane_is_held_denies_every_write_time_check(native_root, synthetic_home, monkeypatch, lane, how):
     root, context, coordinator = native_root
     with _lane(coordinator, lane):
         reason = _flip(root, synthetic_home, how, monkeypatch)
         assert write_authority(context) == {"authority": "ownership-unknown", "reason": reason}
-        with pytest.raises(OwnershipUnknown, match=reason):
+        error_text = "trusted-single-writer acknowledgement is required" if reason == "operator-single-writer-acknowledgement-required" else reason
+        with pytest.raises(OwnershipUnknown, match=error_text):
             with root_registry_writer(context, coordinator, timeout=0):
                 pytest.fail("registry write admitted after authority loss")
         if lane in PAPER_WRITE_LANES:
-            with pytest.raises(OwnershipUnknown, match=reason):
+            with pytest.raises(OwnershipUnknown, match=error_text):
                 require_paper_write_lanes(root / "paper" / "alpha", "alpha", lane_sets=((lane,),))
         with pytest.raises(OwnershipUnknown):
             with _lane(coordinator, "deployment", "gamma"):
@@ -222,19 +216,21 @@ def test_authority_lost_while_waiting_for_the_os_lock_is_denied_before_admission
     assert not coordinator.lane_is_held("deployment", "alpha")
 
 
-def test_production_root_without_exclusion_proof_is_read_only(native_root, monkeypatch):
+def test_root_without_operator_acknowledgement_is_read_only(native_root, monkeypatch):
     root, context, _coordinator = native_root
     assert out_of_band_exclusion_basis(context) == SYNTHETIC_TEST_OWNED
     monkeypatch.delenv("HEDGE_FUND_TEST_MODE")
     assert out_of_band_exclusion_basis(context) is None
-    assert write_authority(context) == {"authority": "ownership-unknown", "reason": "out-of-band-exclusion-unproven"}
-    with pytest.raises(WriteAuthorityDenied, match="out-of-band-exclusion-unproven"):
+    reason = "operator-single-writer-acknowledgement-required"
+    assert write_authority(context) == {"authority": "ownership-unknown", "reason": reason}
+    error_text = "trusted-single-writer acknowledgement is required"
+    with pytest.raises(WriteAuthorityDenied, match=error_text):
         require_write_authority(context)
-    with pytest.raises(OwnershipUnknown, match="out-of-band-exclusion-unproven"):
+    with pytest.raises(OwnershipUnknown, match=error_text):
         RootOwnerLease.acquire(context)
     with pytest.raises(RootConfigurationError) as denied:
         paths.write_text(root / "mandates" / "alpha.yaml", "name: alpha\n")
-    assert "out-of-band-exclusion-unproven" in _denial_chain(denied.value)
+    assert error_text in _denial_chain(denied.value)
     assert not (root / "mandates").exists()
 
 

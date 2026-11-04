@@ -149,15 +149,7 @@ class Ledger:
         value = self._read_transition_state(self.approval_publication_path, "approval publication")
         if value is None:
             return None
-        if (
-            set(value) != {"version", "state", "approval_id"}
-            or type(value["version"]) is not int
-            or value["version"] != 1
-            or not isinstance(value["state"], str)
-            or value["state"] not in {"pending", "committed", "aborted"}
-            or not isinstance(value["approval_id"], str)
-            or _APPROVAL_ID.fullmatch(value["approval_id"]) is None
-        ):
+        if set(value) != {"version", "state", "approval_id"} or type(value["version"]) is not int or value["version"] != 1 or not isinstance(value["state"], str) or value["state"] not in {"pending", "committed", "aborted"} or not isinstance(value["approval_id"], str) or _APPROVAL_ID.fullmatch(value["approval_id"]) is None:
             raise PaperReconciliationRequired("approval publication state is invalid; reconciliation is required")
         return value
 
@@ -196,17 +188,8 @@ class Ledger:
             or not value["source_session"]
             or not isinstance(value["source_hash"], str)
             or _HASH.fullmatch(value["source_hash"]) is None
-            or (
-                value["state"] == "pending"
-                and value["result_hash"] is not None
-            )
-            or (
-                value["state"] == "completed"
-                and (
-                    not isinstance(value["result_hash"], str)
-                    or _HASH.fullmatch(value["result_hash"]) is None
-                )
-            )
+            or (value["state"] == "pending" and value["result_hash"] is not None)
+            or (value["state"] == "completed" and (not isinstance(value["result_hash"], str) or _HASH.fullmatch(value["result_hash"]) is None))
         ):
             raise PaperReconciliationRequired("redo state is invalid; reconciliation is required")
         return value
@@ -253,14 +236,10 @@ class Ledger:
         if not isinstance(state.prev_hash, str):
             raise PaperReconciliationRequired("pending decision has no source hash")
         event = self._latest_approval_event(state.pending.as_of, state.prev_hash, strict=True)
-        if event is not None and (
-            event.get("kind") in {"consume", "tick"} or event.get("consumed") is True
-        ):
+        if event is not None and (event.get("kind") in {"consume", "tick"} or event.get("consumed") is True):
             raise PaperReconciliationRequired("approval consumption is incomplete; reconciliation is required")
 
-    def observe_approval_for_display(
-        self, state: FundState, *, approval_required: bool
-    ) -> dict[str, str] | None:
+    def observe_approval_for_display(self, state: FundState, *, approval_required: bool) -> dict[str, str] | None:
         """Observe a stable approval state without granting execution authority."""
         self.require_ready_for_work(state, approval_required=approval_required)
         approval = None
@@ -533,9 +512,7 @@ class Ledger:
             try:
                 self.log_event("halt", reason=reason)
             except (AdmissionError, LedgerError, OSError, ValueError) as exc:
-                raise HaltAuditUnavailable(
-                    "Halt was applied but its audit record is unavailable; reconciliation is required"
-                ) from exc
+                raise HaltAuditUnavailable("Halt was applied but its audit record is unavailable; reconciliation is required") from exc
 
     def resume(self) -> None:
         self._require_write_lanes(_CONTROL_LANES)
@@ -579,10 +556,7 @@ class Ledger:
             return None
         if not isinstance(decided_at, str) or not isinstance(by, str) or by not in {"cli", "tui", "web"}:
             return None
-        if "approval_id" in value and (
-            not isinstance(value["approval_id"], str)
-            or _APPROVAL_ID.fullmatch(value["approval_id"]) is None
-        ):
+        if "approval_id" in value and (not isinstance(value["approval_id"], str) or _APPROVAL_ID.fullmatch(value["approval_id"]) is None):
             return None
         try:
             stamp = datetime.fromisoformat(decided_at.replace("Z", "+00:00"))
@@ -612,11 +586,7 @@ class Ledger:
             return None, mailbox
         if event is None or event.get("kind") not in {"approve", "reject"} or event.get("consumed") is True:
             return None, mailbox
-        if (
-            event["kind"] != mailbox["verdict"]
-            or event.get("by") != mailbox["by"]
-            or event.get("approval_id") != mailbox.get("approval_id")
-        ):
+        if event["kind"] != mailbox["verdict"] or event.get("by") != mailbox["by"] or event.get("approval_id") != mailbox.get("approval_id"):
             return None, mailbox
         return mailbox, mailbox
 
@@ -648,10 +618,7 @@ class Ledger:
     @staticmethod
     def _valid_approval_event(event: dict) -> bool:
         kind = event["kind"]
-        approval_tick = kind == "tick" and any(
-            field in event
-            for field in ("decision_as_of", "decision_hash", "approval_verdict", "approval_by", "approval_id")
-        )
+        approval_tick = kind == "tick" and any(field in event for field in ("decision_as_of", "decision_hash", "approval_verdict", "approval_by", "approval_id"))
         if kind not in {"approve", "reject", "expire", "consume"} and not approval_tick:
             return True
         decision_as_of = event.get("decision_as_of")
@@ -661,29 +628,18 @@ class Ledger:
         if not isinstance(decision_hash, str) or _HASH.fullmatch(decision_hash) is None:
             return False
         approval_id = event.get("approval_id")
-        if "approval_id" in event and (
-            not isinstance(approval_id, str) or _APPROVAL_ID.fullmatch(approval_id) is None
-        ):
+        if "approval_id" in event and (not isinstance(approval_id, str) or _APPROVAL_ID.fullmatch(approval_id) is None):
             return False
         if kind in {"approve", "reject"}:
             by = event.get("by")
-            valid = isinstance(by, str) and by in {"cli", "tui", "web"} and (
-                "consumed" not in event or isinstance(event["consumed"], bool)
-            )
+            valid = isinstance(by, str) and by in {"cli", "tui", "web"} and ("consumed" not in event or isinstance(event["consumed"], bool))
             if event.get("consumed") is True:
                 return valid and isinstance(event.get("session"), str) and bool(event["session"])
             return valid
         if kind == "consume" or approval_tick:
             verdict = event.get("approval_verdict")
             by = event.get("approval_by")
-            return (
-                isinstance(verdict, str)
-                and verdict in {"approve", "reject"}
-                and isinstance(by, str)
-                and by in {"cli", "tui", "web"}
-                and isinstance(event.get("session"), str)
-                and bool(event["session"])
-            )
+            return isinstance(verdict, str) and verdict in {"approve", "reject"} and isinstance(by, str) and by in {"cli", "tui", "web"} and isinstance(event.get("session"), str) and bool(event["session"])
         return True
 
     @staticmethod
@@ -701,13 +657,7 @@ class Ledger:
             return False
         if "consumed" not in event:
             return set(event) == common | {"by"}
-        return (
-            kind == "reject"
-            and event["consumed"] is True
-            and isinstance(event.get("session"), str)
-            and bool(event["session"])
-            and set(event) == common | {"by", "consumed", "session"}
-        )
+        return kind == "reject" and event["consumed"] is True and isinstance(event.get("session"), str) and bool(event["session"]) and set(event) == common | {"by", "consumed", "session"}
 
     def _validated_approval_events(self) -> list[dict]:
         try:
@@ -724,9 +674,7 @@ class Ledger:
                 continue
             if not self._valid_approval_event(event):
                 raise PaperReconciliationRequired("approval history is unavailable")
-            if event["kind"] in {"approve", "reject", "expire", "consume"} or (
-                event["kind"] == "tick" and "decision_hash" in event
-            ):
+            if event["kind"] in {"approve", "reject", "expire", "consume"} or (event["kind"] == "tick" and "decision_hash" in event):
                 identity_bound = True
         return events
 
@@ -808,14 +756,7 @@ class Ledger:
                 raise ValueError("legacy rejection has no source record")
             source = self.read(sessions[index - 1])
             record = self.read(event["session"])
-            if (
-                source.hash != source.compute_hash()
-                or record.hash != record.compute_hash()
-                or record.prev_hash != source.hash
-                or source.decision is None
-                or source.decision.as_of != event["decision_as_of"]
-                or record.executed is not None
-            ):
+            if source.hash != source.compute_hash() or record.hash != record.compute_hash() or record.prev_hash != source.hash or source.decision is None or source.decision.as_of != event["decision_as_of"] or record.executed is not None:
                 raise ValueError("legacy rejection does not match the recorded decision")
         except (LedgerError, OSError, ValueError) as exc:
             raise PaperReconciliationRequired("legacy approval history requires reconciliation") from exc
@@ -834,10 +775,7 @@ class Ledger:
                 events = self.events()
             except (OSError, UnicodeError, ValueError):
                 return None
-        if strict and any(
-            self._legacy_approval_event(event) and event.get("decision_as_of") == decision_as_of
-            for event in events
-        ):
+        if strict and any(self._legacy_approval_event(event) and event.get("decision_as_of") == decision_as_of for event in events):
             raise PaperReconciliationRequired("legacy approval identity requires reconciliation")
         for event in reversed(events):
             if not isinstance(event, dict):
@@ -871,10 +809,7 @@ class Ledger:
         from hedge_fund.runtime.admission import PaperApprovalAdmission
 
         enrolled = self._require_write_lanes((("control",),))
-        if enrolled and (
-            not isinstance(admission, PaperApprovalAdmission)
-            or not admission.matches(self.directory, self.directory.name)
-        ):
+        if enrolled and (not isinstance(admission, PaperApprovalAdmission) or not admission.matches(self.directory, self.directory.name)):
             raise LedgerError("verified paper verdict admission is required")
         if not enrolled:
             from hedge_fund.runtime.admission import paper_control_transition
@@ -905,12 +840,7 @@ class Ledger:
             raise ApprovalHalted("fund is halted")
         if enrolled:
             latest = self.latest()
-            if (
-                latest is None
-                or latest.hash != decision_hash
-                or latest.decision is None
-                or latest.decision.as_of != decision_as_of
-            ):
+            if latest is None or latest.hash != decision_hash or latest.decision is None or latest.decision.as_of != decision_as_of:
                 raise ApprovalStale("pending decision changed")
         value = {
             "verdict": verdict,
@@ -1019,7 +949,12 @@ class Ledger:
                     "decision_as_of": expected["decision_as_of"],
                     "decision_hash": expected["decision_hash"],
                 }
-            self.log_event("approval_clear_failed", error=type(exc).__name__, **fields)
+            try:
+                self.log_event("approval_clear_failed", error=type(exc).__name__, **fields)
+            except RootPathError:
+                if enrolled:
+                    return False
+                raise
             return False
         return True
 
@@ -1029,15 +964,13 @@ class Ledger:
         halt_event = kind == "halt"
         self._require_write_lanes(_HALT_LANES if halt_event else _CONTROL_LANES)
         from hedge_fund.runtime.admission import paper_audit_transition
+        from hedge_fund.runtime.root import RootContext
 
         with paper_audit_transition(self.directory, self.directory.name, halt_event=halt_event):
             line = json.dumps({"time": _now(), "kind": kind, **fields}, default=str)
             self._require_write_lanes(_HALT_LANES if halt_event else _CONTROL_LANES)
-            with self.events_path.open("a", encoding="utf-8") as handle:
-                handle.write(line + "\n")
-                if durable:
-                    handle.flush()
-                    os.fsync(handle.fileno())
+            with RootContext.open(self.directory) as root:
+                root.append_bytes(EVENTS_FILE, (line + "\n").encode("utf-8"), durable=durable)
 
     def events(self) -> list[dict]:
         from hedge_fund.runtime.admission import (

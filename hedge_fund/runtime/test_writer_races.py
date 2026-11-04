@@ -23,7 +23,13 @@ from hedge_fund.fund import FundSpec
 from hedge_fund.paper.deployed import deploy
 from hedge_fund.paper.ledger import Ledger, LedgerError
 from hedge_fund.pipeline.session import code_version, mandate_hash, SessionRecord
-from hedge_fund.runtime.admission import AdmissionCoordinator, MAX_CONTROL_WAIT_SECONDS, OwnershipUnknown, RootOwnerLease, WriterConflict
+from hedge_fund.runtime.admission import (
+    AdmissionCoordinator,
+    MAX_CONTROL_WAIT_SECONDS,
+    OwnershipUnknown,
+    RootOwnerLease,
+    WriterConflict,
+)
 from hedge_fund.runtime.handover import enroll_fresh, write_authority
 from hedge_fund.runtime.root import RootContext
 
@@ -100,16 +106,21 @@ def wait_for(path):
             sys.exit(3)
         time.sleep(0.01)
 
+def write_signal(path, value):
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(value, encoding="utf-8")
+    temporary.replace(path)
+
 
 with RootContext.open(root_path) as root:
     with RootOwnerLease.acquire(root, timeout=5) as owner, paths.bound_root(root):
         coordinator = AdmissionCoordinator(root, owner_lease=owner)
         ledger = Ledger(root_path / "paper" / fund)
-        ready.write_text("ready", encoding="utf-8")
+        write_signal(ready, "ready")
         wait_for(go)
         try:
             with coordinator.manual_session(fund, timeout=0):
-                status.write_text("admitted", encoding="utf-8")
+                write_signal(status, "admitted")
                 wait_for(release)
                 try:
                     ledger.append(record)
@@ -117,9 +128,9 @@ with RootContext.open(root_path) as root:
                 except LedgerError:
                     result = "ledger-error"
         except WriterConflict:
-            status.write_text("conflict", encoding="utf-8")
+            write_signal(status, "conflict")
             result = "conflict"
-        final.write_text(result, encoding="utf-8")
+        write_signal(final, result)
 sys.exit(0)
 """
 
@@ -141,6 +152,52 @@ with RootContext.open(root_path) as root:
 sys.exit(0 if release.exists() else 3)
 """
 
+_AUDIT_APPENDER = """
+import sys, time
+from pathlib import Path
+from hedge_fund import paths
+from hedge_fund.paper.ledger import Ledger
+from hedge_fund.runtime.admission import AdmissionCoordinator, RootOwnerLease, WriterConflict
+from hedge_fund.runtime.root import RootContext
+
+root_path, fund, writer = Path(ROOT), FUND, WRITER
+ready, go, final, error = Path(READY), Path(GO), Path(FINAL), Path(ERROR)
+count, payload = int(COUNT), PAYLOAD
+
+def publish(path, value):
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(value, encoding="utf-8")
+    temporary.replace(path)
+
+try:
+    with RootContext.open(root_path) as root:
+        with RootOwnerLease.acquire(root, timeout=5) as owner, paths.bound_root(root):
+            coordinator = AdmissionCoordinator(root, owner_lease=owner)
+            ledger = Ledger(root_path / "paper" / fund)
+            publish(ready, "ready")
+            deadline = time.monotonic() + 60
+            while not go.exists():
+                if time.monotonic() > deadline:
+                    sys.exit(3)
+                time.sleep(0.01)
+            for sequence in range(count):
+                deadline = time.monotonic() + 30
+                while True:
+                    try:
+                        with coordinator.control_lane(fund, timeout=0.5):
+                            ledger.log_event("cross-process-audit", writer=writer, sequence=sequence, payload=payload)
+                        break
+                    except WriterConflict:
+                        if time.monotonic() >= deadline:
+                            raise
+                        time.sleep(0.01)
+            publish(final, "done")
+except BaseException as exc:
+    publish(error, f"{type(exc).__name__}: {exc}")
+    raise
+sys.exit(0)
+"""
+
 
 def _render(template: str, **values: str) -> str:
     for key, value in values.items():
@@ -150,13 +207,19 @@ def _render(template: str, **values: str) -> str:
 
 def _wait_file(path: Path, process, what: str, timeout: float = 30) -> str:
     deadline = time.monotonic() + timeout
-    while not path.exists():
+    last_error = None
+    while time.monotonic() < deadline:
+        try:
+            return path.read_text(encoding="utf-8")
+        except (FileNotFoundError, PermissionError) as exc:
+            last_error = exc
         if process is not None and process.poll() is not None and not path.exists():
-            raise AssertionError(f"{what} exited early: {process.returncode}")
-        if time.monotonic() > deadline:
-            raise AssertionError(f"{what} did not report")
+            raise AssertionError(f"{what} exited early: {process.returncode}") from last_error
         time.sleep(0.01)
-    return path.read_text(encoding="utf-8")
+    detail = f"{what} did not report"
+    if last_error is not None:
+        detail += f"; last read failed: {type(last_error).__name__}"
+    raise AssertionError(detail) from last_error
 
 
 class _Racer:
@@ -235,6 +298,53 @@ def _recorded_fills(root: Path, fund: str) -> list[dict]:
 def _paper_files(root: Path, fund: str) -> dict[str, bytes]:
     directory = root / "paper" / fund
     return {str(path.relative_to(directory)): path.read_bytes() for path in directory.rglob("*") if path.is_file()}
+
+
+def test_two_process_audit_appends_are_complete_and_uninterleaved(race_root, tmp_path, owned_test_process):
+    root, _admission = race_root
+    go = tmp_path / "audit-go"
+    count = 24
+    payload = "x" * 4096
+    children = []
+    for writer in ("first", "second"):
+        ready = tmp_path / f"audit-ready-{writer}"
+        final = tmp_path / f"audit-final-{writer}"
+        error = tmp_path / f"audit-error-{writer}"
+        script = _render(
+            _AUDIT_APPENDER,
+            ROOT=str(root),
+            FUND="alpha",
+            WRITER=writer,
+            READY=str(ready),
+            GO=str(go),
+            FINAL=str(final),
+            ERROR=str(error),
+            COUNT=str(count),
+            PAYLOAD=payload,
+        )
+        children.append((writer, ready, final, error, owned_test_process(script)))
+
+    try:
+        for writer, ready, _final, _error, process in children:
+            assert _wait_file(ready, process, f"audit writer {writer}") == "ready"
+        go.write_text("go", encoding="utf-8")
+        for writer, _ready, final, error, process in children:
+            try:
+                assert _wait_file(final, process, f"audit writer {writer}") == "done"
+            except AssertionError as exc:
+                detail = error.read_text(encoding="utf-8") if error.exists() else "child error unavailable"
+                raise AssertionError(f"{exc}; child error: {detail}") from exc
+            assert process.wait(timeout=60) == 0
+    finally:
+        go.write_text("release", encoding="utf-8")
+
+    events = Ledger(root / "paper" / "alpha").events()
+    audit = [event for event in events if event["kind"] == "cross-process-audit"]
+    expected = {(writer, sequence) for writer in ("first", "second") for sequence in range(count)}
+    observed = {(event["writer"], event["sequence"]) for event in audit}
+    assert len(audit) == count * 2
+    assert observed == expected
+    assert all(event["payload"] == payload for event in audit)
 
 
 def test_concurrent_manual_appends_to_one_fund_admit_exactly_one_writer(race_root, tmp_path, owned_test_process):
@@ -334,7 +444,7 @@ def test_legacy_runner_presence_denies_every_racing_writer(race_root, tmp_path, 
     assert _recorded(root, "beta") == []
 
 
-@pytest.mark.parametrize("revocation", ["legacy-runner", "exclusion-proof"])
+@pytest.mark.parametrize("revocation", ["legacy-runner", "synthetic-test-owner"])
 def test_authority_revoked_across_processes_blocks_an_admitted_append(race_root, tmp_path, owned_test_process, revocation):
     root, _admission = race_root
     marker = Path(os.environ["HEDGE_FUND_TEST_ROOT"]) / ".test-owned"
@@ -347,7 +457,7 @@ def test_authority_revoked_across_processes_blocks_an_admitted_append(race_root,
                 reason = "legacy-runner-present"
             else:
                 marker.rename(moved_marker)
-                reason = "out-of-band-exclusion-unproven"
+                reason = "operator-single-writer-acknowledgement-required"
             with RootContext.open(root) as context:
                 assert write_authority(context) == {"authority": "ownership-unknown", "reason": reason}
             release.write_text("release", encoding="utf-8")

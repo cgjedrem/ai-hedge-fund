@@ -1,3 +1,4 @@
+import json
 import logging
 import threading
 import time
@@ -128,6 +129,64 @@ def _wait_for_operation(store, operation_id, status, timeout=_WAIT_SECONDS):
         time.sleep(0.05)
     view = latest.public_view() if latest is not None else None
     raise AssertionError(f"operation did not reach {status.value}: {view}")
+
+
+def test_second_process_cannot_recover_a_live_peer_operation(demo_root, tmp_path, owned_test_process):
+    service = DeskService(demo_root, allow_writes=True, demo=True)
+    started = threading.Event()
+    release = threading.Event()
+    try:
+        assert service._operation_store is not None
+        assert service._operation_jobs is not None
+        capture = freeze_capture(
+            root=service.root_context,
+            subject_id="alpha",
+            mandate_digest="a" * 64,
+            universe=("AAA",),
+            broker="paper",
+            settings=service._runtime_settings,
+            credential_versions={},
+            code_version="synthetic-service-recovery",
+        )
+        operation = _accepted_operation(service._operation_store, capture, request_id="peer-recovery")
+
+        def held_work(_progress, _cancelled, _publish):
+            started.set()
+            if not release.wait(timeout=30):
+                raise TimeoutError("synthetic worker release timed out")
+            return {"synthetic": True}
+
+        service._operation_jobs.submit(operation, held_work)
+        assert started.wait(timeout=10)
+        status_path = tmp_path / "second-service.json"
+        script = (
+            "import json\n"
+            "from pathlib import Path\n"
+            "from hedge_fund.web.services import DeskService\n"
+            f"service = DeskService({str(demo_root)!r}, allow_writes=True, demo=True)\n"
+            "store = service._operation_store\n"
+            f"operation = store.get_operation({operation.operation_id!r}) if store is not None else None\n"
+            "payload = {'writes': service.allow_writes, "
+            "'reason': service.write_unavailable_reason, "
+            "'operation_status': operation.status.value if operation is not None else None}\n"
+            f"Path({str(status_path)!r}).write_text(json.dumps(payload), encoding='utf-8')\n"
+            "service.close()\n"
+        )
+        child = owned_test_process(script)
+        assert child.wait(timeout=30) == 0
+        result = json.loads(status_path.read_text(encoding="utf-8"))
+        assert result == {
+            "writes": False,
+            "reason": "operation-service-active",
+            "operation_status": OperationStatus.RUNNING.value,
+        }
+        assert service._operation_store.get_operation(operation.operation_id).status is OperationStatus.RUNNING
+
+        release.set()
+        _wait_for_operation(service._operation_store, operation.operation_id, OperationStatus.COMPLETED)
+    finally:
+        release.set()
+        service.close()
 
 
 class ManagedFakeDataClient(FakeDataClient):

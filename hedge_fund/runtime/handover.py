@@ -6,10 +6,11 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import stat
 import threading
 from contextlib import contextmanager, ExitStack
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator, TypedDict, TypeVar
 
@@ -26,7 +27,8 @@ from hedge_fund.runtime.admission import (
     RootOwnerLease,
     WriterConflict,
 )
-from hedge_fund.runtime.exclusion import out_of_band_exclusion_basis, UNPROVEN_REASON as EXCLUSION_UNPROVEN_REASON
+from hedge_fund.runtime.exclusion import out_of_band_exclusion_basis
+from hedge_fund.runtime.exclusion import UNPROVEN_REASON as EXCLUSION_UNPROVEN_REASON
 from hedge_fund.runtime.root import (
     ensure_unique_resource_name,
     PRIVATE_ROOT,
@@ -36,12 +38,22 @@ from hedge_fund.runtime.root import (
 
 HANDOVER_PATH = f"{PRIVATE_ROOT}/handover.json"
 RECOVERY_ROOT = f"{PRIVATE_ROOT}/recoveries"
+SINGLE_WRITER_STATE_PATH = f"{PRIVATE_ROOT}/single-writer.json"
+SINGLE_WRITER_CHALLENGE_PATH = f"{PRIVATE_ROOT}/single-writer-review.json"
 _SHA256 = re.compile(r"[a-f0-9]{64}")
 _MAX_RECORD_BYTES = 2 * 1024 * 1024
+_MAX_TRUST_RECORD_BYTES = 64 * 1024
+_MAX_TRUST_REVIEW_AGE = timedelta(minutes=15)
 _MAX_INVENTORY_FUNDS = 10000
 _MAX_LEDGER_SESSIONS = 1000000
-OPERATOR_ATTESTATION = "I confirm every legacy writer and out-of-band writer is stopped and excluded " "from this root, and this ledger-head inventory is exact."
-STALE_RECOVERY_ATTESTATION = "I confirm the runner owner is quiescent in this root namespace, legacy and out-of-band " "writers are excluded, and the recorded evidence is exact."
+OPERATOR_ATTESTATION = "I confirm known participants are quiescent during this exact root inventory; migration remains read-only."
+STALE_RECOVERY_ATTESTATION = "I confirm the runner owner is quiescent in this root namespace and I accept responsibility " "for excluding other programs while recording this recovery."
+TRUSTED_SINGLE_WRITER_AUTHORITY = "operator-trusted-single-writer"
+SINGLE_WRITER_RESPONSIBILITY_WARNING = "Operator responsibility: stop and exclude every other program that can reach this root. " "Cooperative locks do not fence unaware or malicious same-account writers."
+_WRITABLE_AUTHORITIES = frozenset({"protocol-native", TRUSTED_SINGLE_WRITER_AUTHORITY})
+_TRUST_REQUIRED_REASON = "operator-single-writer-acknowledgement-required"
+_TRUST_INVALID_REASON = "operator-single-writer-acknowledgement-invalid"
+_TRUST_REVOKED_REASON = "operator-single-writer-acknowledgement-revoked"
 
 
 class HandoverError(RuntimeError):
@@ -73,7 +85,7 @@ class InventoryObservationUnavailable(HandoverError):
 
 
 class WriteAuthorityDenied(HandoverError):
-    """Raised when a root cannot hold protocol-native production write authority."""
+    """Raised when a root cannot hold production write authority."""
 
 
 PROTOCOL_NATIVE_MODES = frozenset({"fresh", "relocated"})
@@ -117,11 +129,7 @@ class _PaperObservationWindow:
 
     def permits(self, root: RootContext) -> bool:
         with self._condition:
-            return (
-                self._active
-                and root._root_identity == self._root_identity
-                and threading.get_ident() in self._borrowers
-            )
+            return self._active and root._root_identity == self._root_identity and threading.get_ident() in self._borrowers
 
     def close_observations(self) -> None:
         if threading.get_ident() != self._owner_thread:
@@ -297,23 +305,44 @@ def require_enrollment(root: RootContext) -> dict[str, Any]:
 
 
 def write_authority(root: RootContext) -> dict[str, str | None]:
-    """Classify whether this process may claim production write authority.
-
-    Only protocol-native roots qualify: roots enrolled empty by this protocol or
-    populated exclusively by a verified relocation import. An operator
-    attestation is recorded evidence, not exclusion, so attested migrations are
-    ``ownership-unknown`` and read-only. A protocol-native root that a shipped
-    legacy writer could address (``<HOME>/.hedge-fund`` layout or alias) or that
-    carries a legacy runner marker is also ``ownership-unknown``.
-    """
+    """Classify production write authority; enrollment alone stays read-only."""
     try:
         record = require_enrollment(root)
     except HandoverRequired:
         return {"authority": "unavailable", "reason": "handover-required"}
     except Exception:
         return {"authority": "unavailable", "reason": "handover-unavailable"}
-    if record["mode"] not in PROTOCOL_NATIVE_MODES:
-        return {"authority": "ownership-unknown", "reason": "attested-migration-read-only"}
+    return _classify_write_authority(root, record)
+
+
+def has_write_authority(authority: object) -> bool:
+    """Return whether a classified authority permits protocol writes."""
+    return isinstance(authority, dict) and authority.get("authority") in _WRITABLE_AUTHORITIES
+
+
+def require_write_authority(root: RootContext) -> dict[str, Any]:
+    """Return the enrollment record only when current authority permits writes."""
+    record = require_enrollment(root)
+    authority = _classify_write_authority(root, record)
+    if has_write_authority(authority):
+        return record
+    reason = authority["reason"] or "handover-unavailable"
+    if reason == "attested-migration-read-only":
+        message = "attested migration is read-only until trusted-single-writer acknowledgement"
+    elif reason == _TRUST_REQUIRED_REASON:
+        message = "explicit root-specific offline trusted-single-writer acknowledgement is required"
+    elif reason == _TRUST_REVOKED_REASON:
+        message = "trusted-single-writer acknowledgement was revoked"
+    elif reason == _TRUST_INVALID_REASON:
+        message = "trusted-single-writer acknowledgement is invalid"
+    elif reason == EXCLUSION_UNPROVEN_REASON:
+        message = "synthetic test-owner basis is unavailable"
+    else:
+        message = f"root write authority is ownership-unknown ({reason})"
+    raise WriteAuthorityDenied(message)
+
+
+def _classify_write_authority(root: RootContext, enrollment: dict[str, Any]) -> dict[str, str | None]:
     reason = None
     try:
         reason = legacy_reachability_reason(root)
@@ -321,25 +350,316 @@ def write_authority(root: RootContext) -> dict[str, str | None]:
         reason = "legacy-reachability-unverified"
     if reason is not None:
         return {"authority": "ownership-unknown", "reason": reason}
-    if out_of_band_exclusion_basis(root) is None:
-        return {"authority": "ownership-unknown", "reason": EXCLUSION_UNPROVEN_REASON}
-    return {"authority": "protocol-native", "reason": None}
-
-
-def require_write_authority(root: RootContext) -> dict[str, Any]:
-    """Return the enrollment record only when write authority is protocol-native."""
-    record = require_enrollment(root)
-    if record["mode"] not in PROTOCOL_NATIVE_MODES:
-        raise WriteAuthorityDenied("attested migration is read-only; relocate into a protocol-native root")
+    if enrollment["mode"] in PROTOCOL_NATIVE_MODES and out_of_band_exclusion_basis(root) is not None:
+        return {"authority": "protocol-native", "reason": None}
     try:
-        reason = legacy_reachability_reason(root)
-    except Exception as exc:
-        raise WriteAuthorityDenied(f"root write authority is unverified ({type(exc).__name__})") from None
-    if reason is not None:
-        raise WriteAuthorityDenied(f"root write authority is ownership-unknown ({reason})")
-    if out_of_band_exclusion_basis(root) is None:
-        raise WriteAuthorityDenied(f"root write authority is ownership-unknown ({EXCLUSION_UNPROVEN_REASON}); cooperative locks do not exclude out-of-band same-account writers")
+        state = _read_single_writer_state(root, enrollment)
+    except FileNotFoundError:
+        reason = "attested-migration-read-only" if enrollment["mode"] == "migrate-existing" else _TRUST_REQUIRED_REASON
+        return {"authority": "ownership-unknown", "reason": reason}
+    except Exception:
+        return {"authority": "ownership-unknown", "reason": _TRUST_INVALID_REASON}
+    if state["state"] == "revoked":
+        return {"authority": "ownership-unknown", "reason": _TRUST_REVOKED_REASON}
+    return {"authority": TRUSTED_SINGLE_WRITER_AUTHORITY, "reason": None}
+
+
+def prepare_single_writer_acknowledgement(root: RootContext) -> dict[str, Any]:
+    """Review current root state and issue one non-authorizing challenge."""
+    if not isinstance(root, RootContext):
+        raise TypeError("an explicit RootContext is required")
+    try:
+        with RootMigrationLease.acquire(root, timeout=0):
+            enrollment = require_enrollment(root)
+            verify_root_inventory(root, record=enrollment)
+            heads = build_head_inventory(root)
+            digest = _digest(heads)
+            authority = _classify_write_authority(root, enrollment)
+            legacy_reason = legacy_reachability_reason(root)
+            if has_write_authority(authority) or legacy_reason is not None:
+                _remove_single_writer_challenge(root)
+                return {
+                    "heads": heads,
+                    "inventory_digest": digest,
+                    "write_authority": authority["authority"],
+                    "reason": authority["reason"] or legacy_reason,
+                    "operator_acknowledgement": None,
+                    "review_expires_at": None,
+                }
+
+            challenge_id = secrets.token_hex(16)
+            reviewed_at = datetime.now(timezone.utc)
+            body = {
+                "schema": 1,
+                "protocol_version": PROTOCOL_VERSION,
+                "build_id": code_version(),
+                "root": root_binding(root),
+                "enrollment_identity": _enrollment_identity(enrollment),
+                "inventory_digest": digest,
+                "challenge_id": challenge_id,
+                "prior_authority_digest": _single_writer_state_digest(root),
+                "reviewed_at": reviewed_at.isoformat(),
+            }
+            _write_single_writer_challenge(root, body)
+            return {
+                "heads": heads,
+                "inventory_digest": digest,
+                "write_authority": authority["authority"],
+                "reason": authority["reason"],
+                "operator_acknowledgement": _single_writer_acknowledgement(root, enrollment, digest, challenge_id),
+                "review_expires_at": (reviewed_at + _MAX_TRUST_REVIEW_AGE).isoformat(),
+            }
+    except WriterConflict as exc:
+        raise HandoverError("another root participant is active; offline trust review requires quiescence") from exc
+
+
+def trust_single_writer(
+    root: RootContext,
+    *,
+    expected_inventory_digest: str,
+    operator_acknowledgement: str,
+) -> dict[str, str | None]:
+    """Record exact root-specific operator trust after a fresh offline review."""
+    if not isinstance(root, RootContext):
+        raise TypeError("an explicit RootContext is required")
+    if not isinstance(expected_inventory_digest, str) or not _SHA256.fullmatch(expected_inventory_digest):
+        raise HandoverError("reviewed inventory digest is invalid")
+    if not isinstance(operator_acknowledgement, str) or not 1 <= len(operator_acknowledgement) <= 1024:
+        raise HandoverError("explicit root-specific operator acknowledgement is required")
+    try:
+        with RootMigrationLease.acquire(root, timeout=0):
+            enrollment = require_enrollment(root)
+            legacy_reason = legacy_reachability_reason(root)
+            if legacy_reason is not None:
+                _remove_single_writer_challenge(root)
+                raise WriteAuthorityDenied(f"known or unverified legacy participant blocks trust ({legacy_reason})")
+            verify_root_inventory(root, record=enrollment)
+            heads = build_head_inventory(root)
+            actual_digest = _digest(heads)
+            if actual_digest != expected_inventory_digest:
+                _remove_single_writer_challenge(root)
+                raise LedgerDrift("reviewed inventory changed; inspect the root again")
+            challenge = _read_single_writer_challenge(root, enrollment)
+            if challenge["inventory_digest"] != actual_digest:
+                _remove_single_writer_challenge(root)
+                raise LedgerDrift("reviewed inventory changed; inspect the root again")
+            if challenge["prior_authority_digest"] != _single_writer_state_digest(root):
+                _remove_single_writer_challenge(root)
+                raise HandoverError("trust review is stale; inspect the root again")
+            expected_acknowledgement = _single_writer_acknowledgement(
+                root,
+                enrollment,
+                actual_digest,
+                challenge["challenge_id"],
+            )
+            if operator_acknowledgement != expected_acknowledgement:
+                raise HandoverError("exact root-specific operator acknowledgement is required")
+
+            _remove_single_writer_challenge(root)
+            body = {
+                "schema": 1,
+                "state": "trusted",
+                "protocol_version": PROTOCOL_VERSION,
+                "build_id": code_version(),
+                "root": root_binding(root),
+                "enrollment_identity": _enrollment_identity(enrollment),
+                "reviewed_inventory_digest": actual_digest,
+                "challenge_id": challenge["challenge_id"],
+                "operator_acknowledgement": operator_acknowledgement,
+                "acknowledged_at": datetime.now(timezone.utc).isoformat(),
+            }
+            _write_single_writer_state(root, body)
+            authority = _classify_write_authority(root, enrollment)
+            if authority["authority"] != TRUSTED_SINGLE_WRITER_AUTHORITY:
+                raise WriteAuthorityDenied("trusted-single-writer authority could not be verified")
+            return authority
+    except WriterConflict as exc:
+        raise HandoverError("another root participant is active; trust requires quiescence") from exc
+
+
+def revoke_single_writer(root: RootContext) -> dict[str, str | None]:
+    """Persist revocation before removing any pending trust review."""
+    if not isinstance(root, RootContext):
+        raise TypeError("an explicit RootContext is required")
+    try:
+        with RootMigrationLease.acquire(root, timeout=0):
+            enrollment = require_enrollment(root)
+            body = {
+                "schema": 1,
+                "state": "revoked",
+                "protocol_version": PROTOCOL_VERSION,
+                "build_id": code_version(),
+                "root": root_binding(root),
+                "enrollment_identity": _enrollment_identity(enrollment),
+                "revoked_at": datetime.now(timezone.utc).isoformat(),
+            }
+            _write_single_writer_state(root, body)
+            _remove_single_writer_challenge(root)
+            return _classify_write_authority(root, enrollment)
+    except WriterConflict as exc:
+        raise HandoverError("another root participant is active; revocation requires quiescence") from exc
+
+
+def _read_single_writer_state(root: RootContext, enrollment: dict[str, Any]) -> dict[str, Any]:
+    record = _read_private_json(root, SINGLE_WRITER_STATE_PATH)
+    state = record.get("state")
+    if state == "trusted":
+        expected_fields = {
+            "schema",
+            "state",
+            "protocol_version",
+            "build_id",
+            "root",
+            "enrollment_identity",
+            "reviewed_inventory_digest",
+            "challenge_id",
+            "operator_acknowledgement",
+            "acknowledged_at",
+            "record_digest",
+        }
+        timestamp = record.get("acknowledged_at")
+    elif state == "revoked":
+        expected_fields = {
+            "schema",
+            "state",
+            "protocol_version",
+            "build_id",
+            "root",
+            "enrollment_identity",
+            "revoked_at",
+            "record_digest",
+        }
+        timestamp = record.get("revoked_at")
+    else:
+        raise HandoverError("single-writer state is invalid")
+    if set(record) != expected_fields:
+        raise HandoverError("single-writer state fields are invalid")
+    body = {key: value for key, value in record.items() if key != "record_digest"}
+    if record["schema"] != 1 or record["protocol_version"] != PROTOCOL_VERSION or record["build_id"] != code_version() or record["root"] != root_binding(root) or record["enrollment_identity"] != _enrollment_identity(enrollment) or not _valid_timestamp(timestamp) or record["record_digest"] != _digest(body):
+        raise HandoverError("single-writer state identity is invalid")
+    if state == "trusted":
+        reviewed_digest = record["reviewed_inventory_digest"]
+        challenge_id = record["challenge_id"]
+        acknowledgement = record["operator_acknowledgement"]
+        if not isinstance(reviewed_digest, str) or not _SHA256.fullmatch(reviewed_digest) or not _valid_challenge_id(challenge_id) or not isinstance(acknowledgement, str) or not 1 <= len(acknowledgement) <= 1024 or acknowledgement != _single_writer_acknowledgement(root, enrollment, reviewed_digest, challenge_id):
+            raise HandoverError("single-writer acknowledgement is invalid")
     return record
+
+
+def _read_single_writer_challenge(root: RootContext, enrollment: dict[str, Any]) -> dict[str, Any]:
+    try:
+        record = _read_private_json(root, SINGLE_WRITER_CHALLENGE_PATH)
+    except FileNotFoundError:
+        raise HandoverError("trust review challenge is missing; inspect the root again") from None
+    expected_fields = {
+        "schema",
+        "protocol_version",
+        "build_id",
+        "root",
+        "enrollment_identity",
+        "inventory_digest",
+        "challenge_id",
+        "prior_authority_digest",
+        "reviewed_at",
+        "challenge_digest",
+    }
+    body = {key: value for key, value in record.items() if key != "challenge_digest"}
+    if (
+        set(record) != expected_fields
+        or record["schema"] != 1
+        or record["protocol_version"] != PROTOCOL_VERSION
+        or record["build_id"] != code_version()
+        or record["root"] != root_binding(root)
+        or record["enrollment_identity"] != _enrollment_identity(enrollment)
+        or not isinstance(record["inventory_digest"], str)
+        or not _SHA256.fullmatch(record["inventory_digest"])
+        or not _valid_challenge_id(record["challenge_id"])
+        or not isinstance(record["prior_authority_digest"], str)
+        or not _SHA256.fullmatch(record["prior_authority_digest"])
+        or not _valid_timestamp(record["reviewed_at"])
+        or record["challenge_digest"] != _digest(body)
+    ):
+        raise HandoverError("single-writer review challenge is invalid")
+    reviewed_at = datetime.fromisoformat(record["reviewed_at"].replace("Z", "+00:00")).astimezone(timezone.utc)
+    review_age = (datetime.now(timezone.utc) - reviewed_at).total_seconds()
+    if not 0 <= review_age <= _MAX_TRUST_REVIEW_AGE.total_seconds():
+        raise HandoverError("trust review expired or is stale; inspect the root again")
+    return record
+
+
+def _read_private_json(root: RootContext, relative: str) -> dict[str, Any]:
+    info = root.file_info(relative)
+    if info.size <= 0 or info.size > _MAX_TRUST_RECORD_BYTES:
+        raise HandoverError("single-writer record size is invalid")
+    try:
+        record = json.loads(root.read_bytes(relative).decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, OSError, RootPathError):
+        raise HandoverError("single-writer record is malformed") from None
+    if not isinstance(record, dict):
+        raise HandoverError("single-writer record is malformed")
+    return record
+
+
+def _write_single_writer_state(root: RootContext, record: dict[str, Any]) -> None:
+    body = dict(record)
+    body["record_digest"] = _digest(record)
+    _write_private_json(root, SINGLE_WRITER_STATE_PATH, body)
+
+
+def _write_single_writer_challenge(root: RootContext, record: dict[str, Any]) -> None:
+    body = dict(record)
+    body["challenge_digest"] = _digest(record)
+    _write_private_json(root, SINGLE_WRITER_CHALLENGE_PATH, body)
+
+
+def _write_private_json(root: RootContext, relative: str, record: dict[str, Any]) -> None:
+    payload = json.dumps(record, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    if len(payload) > _MAX_TRUST_RECORD_BYTES:
+        raise HandoverError("single-writer record exceeds its storage bound")
+    root.write_bytes(relative, payload, mode=stat.S_IRUSR | stat.S_IWUSR)
+
+
+def _remove_single_writer_challenge(root: RootContext) -> None:
+    try:
+        root.unlink_file(SINGLE_WRITER_CHALLENGE_PATH)
+    except FileNotFoundError:
+        pass
+
+
+def _single_writer_state_digest(root: RootContext) -> str:
+    try:
+        data = root.read_bytes(SINGLE_WRITER_STATE_PATH)
+    except FileNotFoundError:
+        return _digest({"state": "absent"})
+    if len(data) > _MAX_TRUST_RECORD_BYTES:
+        raise HandoverError("single-writer state size is invalid")
+    return hashlib.sha256(data).hexdigest()
+
+
+def _enrollment_identity(enrollment: dict[str, Any]) -> str:
+    stable_fields = ("schema", "protocol_version", "build_id", "mode", "root", "created_at", "attestation")
+    return _digest({key: enrollment[key] for key in stable_fields})
+
+
+def _single_writer_acknowledgement(
+    root: RootContext,
+    enrollment: dict[str, Any],
+    inventory_digest_value: str,
+    challenge_id: str,
+) -> str:
+    root_digest = _digest(
+        {
+            "root": root_binding(root),
+            "protocol_version": PROTOCOL_VERSION,
+            "build_id": code_version(),
+            "enrollment_identity": _enrollment_identity(enrollment),
+        }
+    )
+    return f"I ACCEPT TRUSTED SINGLE-WRITER MODE ROOT={root_digest} " f"INVENTORY={inventory_digest_value} CHALLENGE={challenge_id}; " "I ACCEPT RESPONSIBILITY FOR STOPPING AND EXCLUDING ALL OTHER PROGRAMS " "THAT CAN REACH THIS ROOT."
+
+
+def _valid_challenge_id(value: object) -> bool:
+    return isinstance(value, str) and len(value) == 32 and all(character in "0123456789abcdef" for character in value)
 
 
 def legacy_reachability_reason(root: RootContext) -> str | None:
@@ -471,7 +791,7 @@ def _paper_runner_pid_present(root: RootContext) -> bool:
 
 
 def enroll_fresh(root: RootContext) -> dict[str, Any]:
-    """Enroll an empty root before any demo or production data is written."""
+    """Enroll an empty root; production writes still require deliberate trust."""
     if not isinstance(root, RootContext):
         raise TypeError("an explicit RootContext is required")
     root.revalidate()
@@ -563,13 +883,13 @@ def relocate_existing(
     source: RootContext,
     expected_content_digest: str,
 ) -> dict[str, Any]:
-    """Import a quiescent legacy root into an empty protocol-native target.
+    """Import a quiescent legacy root into an empty read-only target.
 
     The source is only read. Mandates, deployed paper funds and research are
     copied after a reviewed content digest matches, and the source must be
     byte-identical before and after the copy. Credentials, caches and runtime
-    state never transfer. The target is the only root that gains write
-    authority; the source remains whatever it was and is never enrolled.
+    state never transfer. The target remains read-only until separate
+    trusted-single-writer acknowledgement; the source is never enrolled.
     """
     if not isinstance(target, RootContext) or not isinstance(source, RootContext):
         raise TypeError("explicit RootContexts are required")
@@ -1077,9 +1397,7 @@ def paper_inventory_transition(
                     )
                     _verify_paper_transition_inventory(root, admission, name)
                 except (HandoverError, LedgerError, OSError, RootPathError, ValueError) as exc:
-                    raise LedgerHeadPublicationError(
-                        "paper head publication failed; offline reconciliation is required"
-                    ) from exc
+                    raise LedgerHeadPublicationError("paper head publication failed; offline reconciliation is required") from exc
 
 
 def _publish_expected_ledger_head(

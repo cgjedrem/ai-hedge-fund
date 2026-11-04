@@ -2,8 +2,10 @@
 
 **Branch:** `cgjedrem-vigilant-robot` | **Date:** 2026-10-31 | **Spec:** [spec.md](spec.md)
 **Input:** Historical spec005 plus [forward contract](../../docs/governance/web-migration-contract.md).
-**Source:** `24fbf1ff3eda4b92e0097859ec2279ef6ba49a79`; discovery/main baseline
-`6443490db64056742fbbe6a18abf92c903c10861`. Implementation pending; no tasks generated.
+**Source:** Planning baseline `24fbf1ff3eda4b92e0097859ec2279ef6ba49a79`; discovery/main baseline
+`6443490db64056742fbbe6a18abf92c903c10861`. Implementation continues in PR #8 on the
+existing `cgjedrem-vigilant-robot` branch. Current execution scope is T015, T019, T020,
+T021, T024 and T027 in `tasks.md`.
 
 `setup-plan.ps1 -Json` resolved feature pointer005 and returned logical BRANCH
 `005-web-engine-migration`; Git remains `cgjedrem-vigilant-robot`, not renamed.
@@ -14,7 +16,7 @@ not a rewrite of an earlier historical plan during red-team resolution.
 
 Make the existing React/shadcn desk the sole supported interactive engine surface, preserving
 terminal-inspired presentation and canonical domain behavior. First establish fixed-root,
-all-writer cross-process admission, verified detached runner ownership, private frozen
+participating-writer cross-process admission, verified detached runner ownership, private frozen
 configuration, durable operation/confirmation sidecars and reconciliation-aware recovery.
 Then add local-paper execution/lifecycle, full validated editor, authorized valuation,
 research progress/reporting and packaging before retiring TUI and Docker ttyd.
@@ -33,7 +35,8 @@ normative forward resolutions, not implemented/runtime closure.
 Uvicorn ^0.34, yfinance extra, React Router/shadcn-Radix/Tailwind/Recharts/Vite.
 Remove Textual/textual-dev only after replacement assertions and packaging acceptance.
 **Storage:** Existing byte-stable hash-chain/YAML; versioned root-private JSON snapshots/
-journals and OS locks. Local NTFS/ext4 only, no shared namespace/network filesystem.
+journals and participating-writer OS locks. Local NTFS/ext4 only, no shared
+namespace/network filesystem. OS locks do not exclude unaware writers.
 **Testing:** Co-located pytest; existing frontend Vitest/Testing Library/Playwright scripts
 and TypeScript build; black 420/isort/flake8; synthetic fakes beneath production guards.
 **Target Platform:** Windows/Linux hosts; read-only host-loopback-mapped container observer.
@@ -47,6 +50,24 @@ or bounded-job resumption. Unknown/absent OS primitives fail closed.
 **Scale/Scope:** One trusted local operator/root; 74 capabilities/six journeys; independent
 deployments, finite scheduled authorizations and bounded backtests.
 No unresolved design clarification remains; runtime risks are evidence gates, not passes.
+
+## A3 decision supersession (2026-11-04)
+
+The user explicitly accepted trusted single-writer operation for deliberately enabled
+production writes. An operator must use an offline, root-specific acknowledgement tied to
+the current enrollment/build and reviewed inventory. Fresh enrollment, existing-data
+migration, relocation, environment defaults, PID/TTL values, cooperative locks and web
+flags do not grant write authority. Missing, invalid, stale or revoked acknowledgement,
+unsafe/mismatched roots, and known or unverified active legacy participants remain
+read-only.
+
+The operator takes responsibility for stopping and excluding other programs that can
+reach the root: old CLI versions, cron, services, writable containers, scripts and other
+processes. This is a declared trust assumption, not OS-enforced exclusion. Protocol locks,
+leases and ownership checks still serialize cooperating participants; they do not fence
+unaware or malicious same-account writers. Do not claim otherwise. Existing funds remain
+read-only by default; migration is a supported read-only preparation path until the
+separate acknowledgement is deliberately recorded.
 
 ## Constitution Check
 
@@ -114,14 +135,14 @@ adapters do not reimplement scheduling/sizing/reconciliation/serialization.
 | Explicit change / mechanism | Why needed | Simpler alternative rejected |
 | --- | --- | --- |
 | User-directed doc amendment before runtime full suite | Resolve TUI/runner governance deadlock | Old wording blocks target design; blanket failure waiver destroys evidence. |
-| OS locks + reservation + durable journal | All-writer ownership and crash ambiguity | Web mutex/PID/TTL cannot fence CLI, PID reuse or partial effects. |
+| OS locks + reservation + durable journal | Cooperating-writer ownership and crash ambiguity; explicit operator trust handles unaware writers | Web mutex/PID/TTL cannot fence CLI, PID reuse or partial effects; no OS-enforcement claim is made for trusted single-writer mode. |
 | Host writer/read-only container; SIM browser exemption | Namespace/account control cannot be inferred | Shared writable compose and claimed SIM parity conceal unsupported mutation. |
 
 ## Design sequence (not an executable task list)
 
 1. Extract neutral TUI helpers and fixed-root/capability/provider bootstrap before execution
    routes; version private settings/credentials and complete domain editor validation.
-2. Establish shared admission/controlled legacy handover, owner handshake/durable journals;
+2. Establish shared admission, explicit trusted-single-writer handover, owner handshake/durable journals;
    independent-fund/emergency-control behavior, crash recovery and exclusive account binding.
 3. Add preview/digest/idempotent local-paper manual/runner/stop/recovery/verdict/redo;
    exact due-set/finite backlog and reconciliation of ambiguous post-fill halts.
@@ -169,5 +190,7 @@ declares Vitest/Playwright, not their installed/runtime readiness. Linux runtime
 actual evidence required if available, otherwise blocked. No tests/Docker/browser/providers/
 funds/credentials/creator port used.
 
-**Decision:** proceed to open main-targeting plan review only. Implementation pending;
-no tasks or implementation. Retirement remains blocked until full required evidence passes.
+**Historical planning decision (2026-10-31):** proceed to open main-targeting plan review.
+Implementation continuation was explicitly authorized on 2026-11-04. Retirement remains
+blocked until full required evidence passes; completing this continuation does not imply
+retirement acceptance.

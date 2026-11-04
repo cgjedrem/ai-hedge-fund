@@ -126,29 +126,40 @@ fail-closed marker even when ordinary controls are corrupt. Check Halt at admiss
 safe provider/execution boundaries; already-issued effects may complete. Configuration/
 template edits freeze versions and never modify deployments or active captures.
 
-**A3 — LM1.** Legacy/nonparticipating writer presence or uncertain ownership blocks all
-mutation/admission, not only stop/adoption. A protocol marker cannot fence an old binary
-that ignores it. Upgrade requires controlled offline handover with evidence old CLI/cron/
-services/writable containers cannot reach the root. Unverified handover is ownership-unknown,
-read-only. Never auto-adopt/start to test ownership. Locks do not defend against arbitrary
-out-of-band file writers; inability to exclude those writers denies mutation.
+**A3 — LM1 (superseded 2026-11-04 by explicit user direction).** The operator may
+deliberately enable a trusted single-writer mode and accepts responsibility for excluding
+other programs that can reach the root: old CLI versions, cron, services, writable
+containers, scripts and other processes. This is an operator trust assumption, not
+OS-enforced exclusion. Protocol markers, OS locks, leases and ownership checks still
+coordinate participating writers; they do not fence unaware or malicious same-account
+writers. Do not claim that they do. Known or unverified active legacy participants,
+unsafe/mismatched roots and authority loss still deny writes. Never auto-adopt/start to
+test ownership.
 
-**Current implementation boundary (not an A3 waiver).** Root enrollment, root/build
-binding, inventory drift checks and OS lanes fence cooperating participants only.
-`migrate-existing` records an exact operator attestation; it does not independently
-prove that an old executable, writable container or arbitrary filesystem writer has
-lost access. A successful attestation or lock probe is therefore not production
-handover acceptance. If exclusion cannot be established outside this protocol, keep
-the desk read-only. T015/T021/T138 remain incomplete on that criterion.
+**Default and handover contract.** Existing funds remain read-only by default. Fresh
+enrollment, `migrate-existing`, `relocate-from`, migration attestation, environment values,
+PID/TTL values, cooperative locks and web flags do not grant production write authority.
+The operator must inspect a fixed root and its inventory, then pass the exact root- and
+inventory-bound offline acknowledgement. The trust record binds canonical root, enrollment,
+protocol/build, reviewed inventory digest and the operator statement. Build/root/enrollment
+mismatch, missing/invalid/revoked acknowledgement, unsafe root, legacy reachability or
+unverifiable checks return to read-only. The reviewed inventory digest is acknowledgement
+provenance, not a permanent ledger-head pin: subsequent legitimate writes still use live
+inventory/head checks and drift continues to deny.
 
-**Write-authority classification (implemented).** `handover.write_authority(root)`
-separates enrollment from write authority. Only `fresh` and `relocated` roots that the
-legacy-reachability checks below do not flag are `protocol-native` (the checks cover the
-legacy home itself and aliases at its `<top>` and `<top>/<item>` levels; deeper per-file
-symlinks/hardlinks are left to inventory/head drift detection); every other enrolled root is
-`ownership-unknown` (or `unavailable` when enrollment is invalid) and read-only:
+The acknowledgement does not prove that other programs have been excluded. The operator
+must stop or exclude them before enabling writes and keep them excluded while authority
+remains active. Revocation removes protocol write authority but does not stop or fence an
+unaware writer. Migration is a supported read-only preparation path; it requires a
+separate deliberate acknowledgement before writes.
 
-- `migrate-existing` (attested in-place) roots → `attested-migration-read-only`.
+**Write-authority classification (contract).** `handover.write_authority(root)` separates
+enrollment from authority. Clean `fresh`, `migrate-existing` and `relocated` roots remain
+read-only until a valid trusted-single-writer acknowledgement is present. The harness-owned
+synthetic basis remains separate and test-only. Production trust returns
+`operator-trusted-single-writer`; every other enrolled production root is
+`ownership-unknown` or `unavailable`, with a safe denial reason.
+
 - Root path containing a `.hedge-fund` component (case-insensitive), a nested `.hedge-fund`
   entry, or a root that is, contains, or sits inside `<HOME>/.hedge-fund`, or that any
   `<HOME>/.hedge-fund/<top>` or `<top>/<item>` alias resolves into (junction/symlink, by
@@ -156,18 +167,19 @@ symlinks/hardlinks are left to inventory/head drift detection); every other enro
 - Any `paper/*/runner.pid` → `legacy-runner-present`; unverifiable or over-bound probes →
   `legacy-reachability-unverified`.
 
-`RootOwnerLease.acquire`/`matches`, `root_registry_writer`, `require_paper_write_lanes` and
-stale-reservation recovery enforce it, so web, CLI, owned-runner child, research/mandate and
-emergency Halt writers all fail closed once authority is lost, including writers already
-holding lanes. The web desk re-classifies on every capabilities read and write attempt,
-reports `write_authority`, and drops its mutation token and owner lease on denial.
+The trust command must repeat these checks under offline exclusive admission before
+recording acknowledgement. `RootOwnerLease.acquire`/`matches`, `root_registry_writer`,
+`require_paper_write_lanes`, CLI/web/child/runner gates and stale-reservation recovery enforce
+the current authority at their effect boundaries. The web desk reports authority and reason,
+warns on operator-trusted mode, and drops its mutation token and owner lease on denial.
 `aihf --root SOURCE handover inspect-source` (read-only) plus
 `aihf --root TARGET handover relocate-from SOURCE --content-digest D` copies engine data
 (`mandates`, `paper`, `research`) into an empty, disjoint, legacy-unreachable target. The
 top-level `.env`, `cache` and `runtime` are never copied, and any `.env`/`.env.*` file under
 the copied trees refuses relocation before its bytes are read. The copy is digest-pinned and verified per file, the
 source is re-snapshotted unchanged, and target heads must equal source heads. The source
-is never written. A failed copy leaves the target `invalid` and read-only.
+is never written. A successful relocation remains read-only until separate trusted-single-
+writer acknowledgement. A failed copy leaves the target `invalid` and read-only.
 Raw-write audit (this slice, source grep of non-test modules for file write/replace/unlink
 calls): enrolled-root writes in `paths.py`, `backtesting/research.py`, `fund/storage.py`,
 `paper/ledger.py` and `web/services.py` sit behind the owner-lease lanes,
@@ -201,8 +213,12 @@ Cooperative protocol writers are serialized with OS locks; authority and invento
 revalidated at defined effect/publication boundaries; supported no-follow primitives
 prevent reparse traversal. Same-account out-of-band writers are not fenced, and mutations
 completed before detected authority loss may require reconciliation.
+The event log is no longer a raw-write residual: `Ledger.log_event` uses
+handle-relative no-follow append with hard-link rejection under audit admission.
+The two-child audit-append regression checks exact event coverage and record
+boundaries; native-platform evidence is recorded separately.
+
 Residuals named by the map (open):
-- the raw `events.jsonl` append follows links (detected by drift, not prevented);
 - `paths.write_atomic` falls back to raw `os.replace` when no root is bound; for paths under an
   enrolled root the admission slice below now routes that fallback through the enclosing root's
   `RootContext` and admission, so the raw replace remains only for unenrolled paths;
@@ -212,7 +228,7 @@ Residuals named by the map (open):
 - the POSIX `lstat`→`unlinkat` delete is not identity-fenced;
 - Saxo token refresh locks and explicit credential files live outside root admission;
 - demo/bootstrap directory creation precedes enrollment.
-**A3 decision (2026-11-03, conservative default).** Cooperative registry/OS locks,
+**A3 decision at 2026-11-03 checkpoint (historical; superseded 2026-11-04).** Cooperative registry/OS locks,
 enrollment, attestation and inventory/head drift detection do **not** prove exclusion of
 unaware or out-of-band same-account writers, and no surface may claim they do. Write
 authority therefore additionally requires an out-of-band exclusion basis
@@ -226,6 +242,13 @@ today is `synthetic-test-owned`: test mode plus a root strictly inside the harne
 `<checkout>/outputs/spec005-test-*` directory carrying its regular `.test-owned` marker,
 with no reparse points on the chain. It exists so synthetic tests can exercise controlled
 flows; it is not production evidence.
+
+The user-directed 2026-11-04 disposition above supersedes the requirement for an OS-
+enforced out-of-band basis as a prerequisite to deliberately enabled trusted mode. The
+operator now accepts responsibility for excluding other programs. The limitations remain:
+cooperative locks do not fence unaware writers, same-account hostile writers remain outside
+the guarantee, and no OS-enforcement claim is permitted. The synthetic basis remains
+test-only and is not production evidence.
 
 **T021 admission slice: writer inventory and admission race matrix (2026-11-03).** Complements the writer map and barrier matrix above. A hidden bypass was fixed: the owned
 runner child never bound its root, so unbound `paths.write_bytes`/`ensure_directory`/
@@ -250,7 +273,9 @@ exclusion basis) and during OS-lock wait, registry snapshot versus in-flight com
 crash/kill then retry, cooperative release then retry, production read-only denial,
 exclusion-basis negatives and enrolled-root path routing.
 
-Uncovered surface (open): (1) production mutation is disabled pending an exclusion basis;
+Uncovered surface at the 2026-11-03 checkpoint (historical; current handover evidence pending):
+(1) production mutation was disabled pending an exclusion basis; this is superseded by the
+operator-trusted mode, not by an OS-exclusion proof;
 (2) the matrix exercises the shared admission primitives each writer class uses, not every
 domain writer end-to-end under every interleaving; (3) deeper per-file symlink/hardlink
 aliases inside a root rely on inventory/head drift; (4) legacy unenrolled `~/.hedge-fund`
@@ -265,8 +290,10 @@ reproduces); (8) owned-runner record writes now recheck root write authority imm
 before publication, but that helper does not itself verify a matching held owner lease and the
 check does not exclude an uncooperative writer racing after it. Runner provider dispatch also
 revalidates the held owner before each new transport, and an unpublishable terminal status
-causes the child to fail rather than report success. T015/T021 stay open
-until a production basis is implemented and evidenced.
+causes the child to fail rather than report success. At that checkpoint T015/T021 stayed
+open pending an exclusion basis. Current acceptance instead requires validated root-specific
+acknowledgement plus all other scoped handover and writer-boundary evidence; this change
+does not close either task by itself.
 
 Scoped archive/restore uses registry-before-object admission and a retained
 `archive-prepared`/`restore-prepared` journal outside the active stores. After a

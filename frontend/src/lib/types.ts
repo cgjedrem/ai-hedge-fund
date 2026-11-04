@@ -7,8 +7,9 @@ export interface Capabilities {
   csrf_authenticates_users: false;
   container_observer: boolean;
   enrollment_state: "unenrolled" | "enrolled" | "invalid" | "drift";
-  write_authority?: "protocol-native" | "ownership-unknown" | "unavailable";
+  write_authority?: "protocol-native" | "operator-trusted-single-writer" | "ownership-unknown" | "unavailable";
   write_unavailable_reason: string | null;
+  operator_trust_warning: string | null;
   protected_names: string[];
   mutation_token: string | null;
   deferred_actions: Record<string, string>;

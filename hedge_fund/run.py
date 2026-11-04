@@ -393,7 +393,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     handover_actions.add_parser(
         "inspect",
-        help="show current paper head inventory and migration digest",
+        help="show root identity, paper head inventory and any required trust acknowledgement",
     )
     handover_actions.add_parser(
         "enroll-fresh",
@@ -405,7 +405,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     relocation = handover_actions.add_parser(
         "relocate-from",
-        help="copy a quiescent legacy root into this empty root; only relocated or fresh roots gain write authority",
+        help="copy a quiescent legacy root into this empty target; target stays read-only until trusted",
     )
     relocation.add_argument("source", help="absolute path of the legacy root to copy (never written)")
     relocation.add_argument(
@@ -415,13 +415,27 @@ def _parser() -> argparse.ArgumentParser:
     )
     migration = handover_actions.add_parser(
         "migrate-existing",
-        help="record an attested existing root; the root stays read-only (ownership-unknown)",
+        help="record an existing root; migration stays read-only until separately trusted",
     )
     migration.add_argument("--inventory-digest", required=True)
     migration.add_argument(
         "--operator-attestation",
         required=True,
         help="exact statement printed by `aihf --root ROOT handover inspect`",
+    )
+    trust = handover_actions.add_parser(
+        "trust-single-writer",
+        help="deliberately enable operator-trusted single-writer mode for this root",
+    )
+    trust.add_argument("--inventory-digest", required=True, help="exact current digest printed by handover inspect")
+    trust.add_argument(
+        "--operator-acknowledgement",
+        required=True,
+        help="exact root-specific responsibility statement printed by handover inspect",
+    )
+    handover_actions.add_parser(
+        "revoke-single-writer",
+        help="revoke protocol write authority after participating writers are quiescent",
     )
     lifecycle = commands.add_parser("lifecycle", help="review and reversibly archive exact objects offline")
     lifecycle_actions = lifecycle.add_subparsers(dest="lifecycle_action", required=True)
@@ -556,7 +570,11 @@ def _handover(args, parser: argparse.ArgumentParser, root: RootContext) -> None:
         inventory_digest,
         migrate_existing,
         OPERATOR_ATTESTATION,
+        prepare_single_writer_acknowledgement,
         relocate_existing,
+        revoke_single_writer,
+        SINGLE_WRITER_RESPONSIBILITY_WARNING,
+        trust_single_writer,
         write_authority,
     )
 
@@ -570,7 +588,18 @@ def _handover(args, parser: argparse.ArgumentParser, root: RootContext) -> None:
             inspectable = status["state"] in {"unenrolled", "enrolled"} or orphaned_admission
             if not inspectable:
                 raise HandoverError("root enrollment or ledger inventory is unavailable")
-            if any(root.path.iterdir()):
+            acknowledgement = None
+            acknowledgement_expires_at = None
+            if status["state"] == "enrolled":
+                review = prepare_single_writer_acknowledgement(root)
+                heads = review["heads"]
+                authority = {
+                    "authority": review["write_authority"],
+                    "reason": review["reason"],
+                }
+                acknowledgement = review["operator_acknowledgement"]
+                acknowledgement_expires_at = review["review_expires_at"]
+            elif any(root.path.iterdir()):
                 if not root.verify_private_storage():
                     root.prepare_private_storage()
                 with RootMigrationLease.acquire(root, timeout=0):
@@ -586,14 +615,19 @@ def _handover(args, parser: argparse.ArgumentParser, root: RootContext) -> None:
                             raise HandoverError("root enrollment or ledger inventory changed")
             else:
                 heads = build_head_inventory(root)
+            if status["state"] != "enrolled":
+                authority = {"authority": "unavailable", "reason": status["reason"]}
             print(
                 json.dumps(
                     {
                         "state": status["state"],
-                        "write_authority": write_authority(root) if status["state"] == "enrolled" else {"authority": "unavailable", "reason": status["reason"]},
+                        "write_authority": authority,
                         "heads": heads,
                         "inventory_digest": inventory_digest(heads),
                         "operator_attestation": OPERATOR_ATTESTATION,
+                        "operator_acknowledgement": acknowledgement,
+                        "operator_acknowledgement_expires_at": acknowledgement_expires_at,
+                        "operator_responsibility": SINGLE_WRITER_RESPONSIBILITY_WARNING,
                     },
                     sort_keys=True,
                     indent=2,
@@ -606,6 +640,18 @@ def _handover(args, parser: argparse.ArgumentParser, root: RootContext) -> None:
         elif args.handover_action == "relocate-from":
             with RootContext.open(args.source) as source:
                 record = relocate_existing(root, source=source, expected_content_digest=args.content_digest)
+        elif args.handover_action == "trust-single-writer":
+            authority = trust_single_writer(
+                root,
+                expected_inventory_digest=args.inventory_digest,
+                operator_acknowledgement=args.operator_acknowledgement,
+            )
+            print(json.dumps({"state": "trusted", "write_authority": authority}, sort_keys=True))
+            return
+        elif args.handover_action == "revoke-single-writer":
+            authority = revoke_single_writer(root)
+            print(json.dumps({"state": "revoked", "write_authority": authority}, sort_keys=True))
+            return
         else:
             record = migrate_existing(
                 root,
@@ -637,6 +683,7 @@ def _paper_writer_admission(*, verify_inventory: bool = True) -> Iterator[tuple[
     from hedge_fund.runtime.handover import (
         enrollment_status,
         HandoverError,
+        has_write_authority,
         verify_root_inventory,
         write_authority,
     )
@@ -648,8 +695,8 @@ def _paper_writer_admission(*, verify_inventory: bool = True) -> Iterator[tuple[
     if status["state"] != "enrolled":
         raise PaperWriterDenied("Paper writes are blocked by root enrollment or ledger drift.")
     authority = write_authority(root)
-    if authority["authority"] != "protocol-native":
-        remedy = "no out-of-band writer exclusion proof (OS sandbox, account or ACL) is available, so production roots are read-only" if authority["reason"] == "out-of-band-exclusion-unproven" else "relocate into a protocol-native root"
+    if not has_write_authority(authority):
+        remedy = "run the offline handover inspect and provide its exact root-specific acknowledgement" if authority["reason"] in {"operator-single-writer-acknowledgement-required", "attested-migration-read-only"} else "resolve the reported root or participant issue before retrying"
         raise PaperWriterDenied(f"Paper writes are blocked: root write authority is {authority['authority']} ({authority['reason']}); {remedy}.")
 
     owner = None

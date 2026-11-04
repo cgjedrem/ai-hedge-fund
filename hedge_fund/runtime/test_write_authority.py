@@ -1,13 +1,13 @@
-"""Write-authority classification and relocation import (T015 boundary).
+"""Write-authority classification and relocation import.
 
-Attested migrations and legacy-addressable roots are ownership-unknown and
-read-only; only fresh or relocated, legacy-unreachable roots may hold writes.
+Existing roots stay read-only without explicit root-specific operator trust.
 Every test uses isolated synthetic roots and a synthetic HOME.
 """
 
 import hashlib
 import json
 import os
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
@@ -125,6 +125,159 @@ def test_fresh_root_is_protocol_native(tmp_path):
         enroll_fresh(context)
         assert write_authority(context) == {"authority": "protocol-native", "reason": None}
         RootOwnerLease.acquire(context).close()
+
+
+def test_existing_root_needs_fresh_root_bound_trust_ack_and_revocation_is_fail_closed(tmp_path, monkeypatch):
+    monkeypatch.setattr(handover, "out_of_band_exclusion_basis", lambda _root: None)
+    root = _legacy_source(tmp_path / "attested")
+    with RootContext.open(root) as context:
+        heads = build_head_inventory(context)
+        migrate_existing(
+            context,
+            expected_inventory_digest=inventory_digest(heads),
+            operator_attestation=OPERATOR_ATTESTATION,
+        )
+        assert write_authority(context) == {
+            "authority": "ownership-unknown",
+            "reason": "attested-migration-read-only",
+        }
+
+        review = handover.prepare_single_writer_acknowledgement(context)
+        acknowledgement = review["operator_acknowledgement"]
+        assert acknowledgement
+        assert review["inventory_digest"] == inventory_digest(heads)
+        with pytest.raises(HandoverError, match="acknowledgement"):
+            handover.trust_single_writer(
+                context,
+                expected_inventory_digest=review["inventory_digest"],
+                operator_acknowledgement="I ACCEPT",
+            )
+        assert write_authority(context)["authority"] == "ownership-unknown"
+
+        trust = handover.trust_single_writer(
+            context,
+            expected_inventory_digest=review["inventory_digest"],
+            operator_acknowledgement=acknowledgement,
+        )
+        assert trust["authority"] == "operator-trusted-single-writer"
+        assert handover.has_write_authority(trust)
+        RootOwnerLease.acquire(context).close()
+
+        revoked = handover.revoke_single_writer(context)
+        assert revoked["authority"] == "ownership-unknown"
+        assert revoked["reason"] == "operator-single-writer-acknowledgement-revoked"
+        with pytest.raises(OwnershipUnknown):
+            RootOwnerLease.acquire(context)
+        with pytest.raises(HandoverError, match="stale|challenge"):
+            handover.trust_single_writer(
+                context,
+                expected_inventory_digest=review["inventory_digest"],
+                operator_acknowledgement=acknowledgement,
+            )
+
+        renewed_review = handover.prepare_single_writer_acknowledgement(context)
+        assert renewed_review["operator_acknowledgement"] != acknowledgement
+        renewed = handover.trust_single_writer(
+            context,
+            expected_inventory_digest=renewed_review["inventory_digest"],
+            operator_acknowledgement=renewed_review["operator_acknowledgement"],
+        )
+        assert renewed["authority"] == "operator-trusted-single-writer"
+
+
+def test_trust_challenge_cannot_cross_roots_or_survive_inventory_drift(tmp_path, monkeypatch):
+    monkeypatch.setattr(handover, "out_of_band_exclusion_basis", lambda _root: None)
+    first_path = _legacy_source(tmp_path / "first")
+    second_path = _legacy_source(tmp_path / "second")
+    with RootContext.open(first_path) as first, RootContext.open(second_path) as second:
+        for context in (first, second):
+            heads = build_head_inventory(context)
+            migrate_existing(
+                context,
+                expected_inventory_digest=inventory_digest(heads),
+                operator_attestation=OPERATOR_ATTESTATION,
+            )
+
+        first_review = handover.prepare_single_writer_acknowledgement(first)
+        second_review = handover.prepare_single_writer_acknowledgement(second)
+        with pytest.raises(HandoverError, match="root|challenge|acknowledgement"):
+            handover.trust_single_writer(
+                second,
+                expected_inventory_digest=second_review["inventory_digest"],
+                operator_acknowledgement=first_review["operator_acknowledgement"],
+            )
+
+        (second_path / "paper" / "alpha" / "runner.pid").write_text("unknown", encoding="utf-8")
+        with pytest.raises(HandoverError, match="legacy|runner|inventory|changed"):
+            handover.trust_single_writer(
+                second,
+                expected_inventory_digest=second_review["inventory_digest"],
+                operator_acknowledgement=second_review["operator_acknowledgement"],
+            )
+        assert write_authority(second) == {
+            "authority": "ownership-unknown",
+            "reason": "legacy-runner-present",
+        }
+
+
+def test_unverified_legacy_participant_blocks_trust_review_and_authority(tmp_path, monkeypatch):
+    monkeypatch.setattr(handover, "out_of_band_exclusion_basis", lambda _root: None)
+    root_path = _legacy_source(tmp_path / "unknown-legacy")
+    with RootContext.open(root_path) as root:
+        heads = build_head_inventory(root)
+        migrate_existing(
+            root,
+            expected_inventory_digest=inventory_digest(heads),
+            operator_attestation=OPERATOR_ATTESTATION,
+        )
+        monkeypatch.setattr(handover, "legacy_reachability_reason", lambda _root: "legacy-reachability-unverified")
+        review = handover.prepare_single_writer_acknowledgement(root)
+        assert review["operator_acknowledgement"] is None
+        assert review["reason"] == "legacy-reachability-unverified"
+        with pytest.raises(WriteAuthorityDenied, match="legacy-reachability-unverified"):
+            handover.trust_single_writer(
+                root,
+                expected_inventory_digest=review["inventory_digest"],
+                operator_acknowledgement="unverified",
+            )
+        assert write_authority(root) == {
+            "authority": "ownership-unknown",
+            "reason": "legacy-reachability-unverified",
+        }
+        with pytest.raises(FileNotFoundError):
+            root.file_info(handover.SINGLE_WRITER_STATE_PATH)
+
+
+def test_single_writer_review_expires_before_acknowledgement(tmp_path, monkeypatch):
+    monkeypatch.setattr(handover, "out_of_band_exclusion_basis", lambda _root: None)
+    root_path = _legacy_source(tmp_path / "expired-review")
+    with RootContext.open(root_path) as root:
+        heads = build_head_inventory(root)
+        migrate_existing(
+            root,
+            expected_inventory_digest=inventory_digest(heads),
+            operator_attestation=OPERATOR_ATTESTATION,
+        )
+        review = handover.prepare_single_writer_acknowledgement(root)
+
+        base_datetime = handover.datetime
+
+        class FutureDateTime(base_datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return base_datetime.now(tz) + timedelta(minutes=16)
+
+        monkeypatch.setattr(handover, "datetime", FutureDateTime)
+        with pytest.raises(HandoverError, match="review.*expired|review.*stale"):
+            handover.trust_single_writer(
+                root,
+                expected_inventory_digest=review["inventory_digest"],
+                operator_acknowledgement=review["operator_acknowledgement"],
+            )
+        assert write_authority(root) == {
+            "authority": "ownership-unknown",
+            "reason": "attested-migration-read-only",
+        }
 
 
 def test_relocation_copies_only_engine_data_and_never_writes_the_source(tmp_path):

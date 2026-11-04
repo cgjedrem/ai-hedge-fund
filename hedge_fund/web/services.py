@@ -108,9 +108,12 @@ from hedge_fund.runtime.dispatch import make_one_shot_dispatch, ProviderDispatch
 from hedge_fund.runtime.handover import (
     enrollment_status,
     HandoverError,
+    has_write_authority,
     LedgerHeadPublicationError,
     LedgerInventoryCorrupt,
     require_enrollment,
+    SINGLE_WRITER_RESPONSIBILITY_WARNING,
+    TRUSTED_SINGLE_WRITER_AUTHORITY,
     verify_root_inventory,
     write_authority,
 )
@@ -319,17 +322,18 @@ class DeskService:
         status = enrollment_status(root_context, verify_inventory=True)
         self.enrollment_state = status["state"]
         self._owner_lease: RootOwnerLease | None = None
+        self._operation_service_lease = None
         self._admission = AdmissionCoordinator(root_context)
         self.allow_writes = False
         self.emergency_halt_available = False
         self.write_unavailable_reason: str | None = status["reason"]
         authority = write_authority(root_context) if status["state"] in {"enrolled", "drift"} else None
         self.write_authority = authority["authority"] if authority is not None else "unavailable"
-        if authority is not None and authority["authority"] != "protocol-native":
+        if authority is not None and not has_write_authority(authority):
             self.write_unavailable_reason = authority["reason"] if status["state"] == "enrolled" else status["reason"]
         elif not allow_writes and status["state"] == "enrolled":
             self.write_unavailable_reason = "write-capability-disabled"
-        if allow_writes and status["state"] in {"enrolled", "drift"} and self.write_authority == "protocol-native":
+        if allow_writes and status["state"] in {"enrolled", "drift"} and has_write_authority(authority):
             owner = None
             try:
                 owner = RootOwnerLease.acquire(root_context)
@@ -393,24 +397,30 @@ class DeskService:
                         self._operation_store,
                         max_active=_PAPER_POOL_CAPACITY,
                     )
+                    service_lease = self._admission.operation_service_lease(timeout=0)
                     try:
                         operation_jobs.recover_unfinished()
+                        service_lease.__enter__()
                     except Exception:
                         operation_jobs.close()
                         paper_operation_jobs.close()
                         raise
+                    self._operation_service_lease = service_lease
                     self._operation_jobs = operation_jobs
                     self._paper_operation_jobs = paper_operation_jobs
-            except (AdmissionError, JobConflict, OperationError, OSError, ValueError):
-                self._operation_store = None
+            except (AdmissionError, JobConflict, OperationError, OSError, ValueError) as exc:
                 if self.allow_writes:
                     self.allow_writes = False
                     self.network_enabled = False
-                    self.write_unavailable_reason = "operation-recovery-unavailable"
-                    if self._owner_lease is not None:
-                        self._owner_lease.close()
-                        self._owner_lease = None
-                    self._admission = AdmissionCoordinator(root_context)
+                    self.write_unavailable_reason = "operation-service-active" if isinstance(exc, WriterConflict) else "operation-recovery-unavailable"
+                    if isinstance(exc, WriterConflict):
+                        self._admission = AdmissionCoordinator(root_context, owner_lease=self._owner_lease)
+                    else:
+                        if self._owner_lease is not None:
+                            self._owner_lease.close()
+                            self._owner_lease = None
+                        self._admission = AdmissionCoordinator(root_context)
+                        self._operation_store = None
         self._runner_manager = OwnedRunnerManager(root_context, self._admission)
 
     def close(self) -> None:
@@ -423,12 +433,17 @@ class DeskService:
                     self._operation_jobs.close()
             finally:
                 try:
-                    if self._owner_lease is not None:
-                        self._owner_lease.close()
-                        self._owner_lease = None
+                    if self._operation_service_lease is not None:
+                        self._operation_service_lease.__exit__(None, None, None)
+                        self._operation_service_lease = None
                 finally:
-                    if self._owns_root_context:
-                        self.root_context.close()
+                    try:
+                        if self._owner_lease is not None:
+                            self._owner_lease.close()
+                            self._owner_lease = None
+                    finally:
+                        if self._owns_root_context:
+                            self.root_context.close()
 
     def capabilities(self, mutation_token: str | None) -> dict:
         if self.allow_writes or self.emergency_halt_available:
@@ -444,6 +459,7 @@ class DeskService:
             "enrollment_state": self.enrollment_state,
             "write_authority": self.write_authority,
             "write_unavailable_reason": self.write_unavailable_reason,
+            "operator_trust_warning": SINGLE_WRITER_RESPONSIBILITY_WARNING if self.write_authority == TRUSTED_SINGLE_WRITER_AUTHORITY else None,
             "protected_names": list(PROTECTED_NAMES),
             "mutation_token": mutation_token if self.allow_writes or self.emergency_halt_available else None,
             "deferred_actions": {
@@ -3732,20 +3748,20 @@ class DeskService:
             raise ServiceError(403, "Offline root enrollment is unavailable." if self.write_authority == "unavailable" else "Root write authority is unavailable; the root is read-only.")
 
     def _refresh_write_authority(self) -> bool:
-        """Re-classify the root; revoke write capabilities unless it is still protocol-native.
+        """Re-classify the root; revoke capabilities unless current authority permits writes.
 
         Ordinary writes need an enrolled root. A service that started in drift keeps its
-        emergency halt while the root stays protocol-native; mid-session drift revokes all.
+        emergency halt while authority remains valid; mid-session drift revokes all.
         """
         try:
             status = enrollment_status(self.root_context)
         except Exception:
             status = {"state": "unavailable", "reason": "handover-unavailable"}
         authority = write_authority(self.root_context) if status["state"] in {"enrolled", "drift"} else None
-        native = authority is not None and authority["authority"] == "protocol-native"
-        if native and status["state"] == "enrolled":
+        authorized = authority is not None and has_write_authority(authority)
+        if authorized and status["state"] == "enrolled":
             return True
-        if native and not self.allow_writes and self.emergency_halt_available:
+        if authorized and not self.allow_writes and self.emergency_halt_available:
             return False
         self.allow_writes = False
         self.emergency_halt_available = False

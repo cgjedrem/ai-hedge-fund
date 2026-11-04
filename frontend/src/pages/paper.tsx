@@ -562,6 +562,11 @@ export function PaperDetailPage() {
               Root enrollment: <span className="mono">{enrollmentState}</span>. Writes unavailable: <span className="mono">{capabilities?.write_unavailable_reason}</span>.
             </Alert>
           ) : null}
+          {capabilities?.operator_trust_warning ? (
+            <Alert tone="warning" className="mb-5" data-testid="operator-trust-warning">
+              <strong>Trusted single-writer mode.</strong> {capabilities.operator_trust_warning}
+            </Alert>
+          ) : null}
           {data.halt_state === "unreadable" ? (
             <Alert tone="warning" className="mb-5">Halt state is unreadable. Paper controls and approval writes are disabled.</Alert>
           ) : null}

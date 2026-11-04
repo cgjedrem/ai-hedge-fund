@@ -1669,11 +1669,11 @@ exclusion remain open, so T027 stays unchecked.
   a fixture; the here-string invocation above succeeded and cleaned its root.
   These fixture failures are not production runtime passes.
 
-No current-source Linux/native exclusion, installed-artifact, full-suite or
-live-provider acceptance is claimed. The earlier broader backend attempt
-remains **434 passed / 1 failed**, not a pass; its child exited before a
-barrier for a cause not captured. The existing read-only preview is not this
-source artifact.
+At this 2026-11-03 checkpoint, no current-source Linux/native exclusion,
+installed-artifact, full-suite or live-provider acceptance was claimed. The
+earlier broader backend attempt remained **434 passed / 1 failed**, not a pass;
+its child exited before a barrier for a cause not captured. The existing
+read-only preview was not that source artifact.
 
 ## T025/T026 historical date correction (2026-11-03)
 
@@ -1687,3 +1687,223 @@ reports 31 ownership tests and 115 cadence/runner tests passed. Original
 test-end timestamps and standalone stdout/exit records were not located;
 no tests were rerun for this date correction. These historical observations
 are not current-artifact or final migration acceptance.
+
+## Final bounded validation and dispositions (2026-11-04)
+
+**Result: partial; no full-suite, T021, T024 or broad T027 pass claimed.**
+The accepted trust model is deliberate operator trust for one identified root:
+existing data remain read-only until exact offline acknowledgement; the
+operator must stop and exclude old CLIs, cron, services, scripts and every
+other program able to reach that root. Cooperative locks coordinate
+participants only. They are not OS enforcement and do not fence unaware or
+malicious same-account writers.
+
+### Source identity and provenance
+
+- Test base: published `HEAD` `146a242610d7ba50c72620db398498d34520cc1d`,
+  branch `cgjedrem-vigilant-robot`.
+- Final changed code/test source: 28 files under `hedge_fund/` and
+  `frontend/`; code/test diff from that base: 142,499 bytes,
+  SHA-256 `ee1a9e12939a105805fa329d59d907295e2a28312703c27804f7dfbc01d37f51`.
+  The normalized changed-source manifest recorded for the final test snapshot
+  is 1,434,222 bytes, SHA-256
+  `dd829f011b549605045aef05df9ae17dc3b1a2590d31abbcf43cdc241b82ad7d`.
+- Environment: Windows 11 Enterprise build 26200, NTFS, Python 3.13.7;
+  pytest selections used isolated synthetic roots, disabled dotenv, scrubbed
+  provider/credential/proxy settings and fake provider/transport. Browser
+  tests used an owned loopback server on port 8876. No protected funds, live
+  runners, provider, broker or LLM were accessed; port 8765 was not touched.
+- Linux native snapshot: 248 tracked files from `hedge_fund/` plus
+  `pyproject.toml`, 3,536,711 bytes, manifest SHA-256
+  `5b509368df319f5dd2ae8a0ec493fa6bf3fe8d508ea730d47b9a6c9163eb0f1c`.
+  Container image `aihf-qa2-pytest:d054b3ae`, image SHA-256
+  `f46586c33e835ed3ecf57a9b3199396d0301571007955c87cf69905ac4e67412`.
+  Docker 29.9.2, WSL2 kernel `6.6.87.2-microsoft-standard-WSL2`, ext4 named
+  volume, `--network none`, effective UID 1000. Container-only `USER` and
+  `LOGNAME` values allowed `getpass` to resolve the existing UID; the test
+  process still ran as UID 1000. Volume and staging tree were removed.
+
+### Sequential full-suite result and triage
+
+Exact command: `python -m pytest -q --tb=short hedge_fund
+--ignore=hedge_fund/tui`.
+
+The serial run started `2026-11-04T11:35:49.9994857+01:00` and ended
+`2026-11-04T13:06:45.6327229+01:00`; **2,367 passed, 51 skipped, 14 failed
+in 5,452.28 s**, exit 1. Captured output was 20,914 bytes,
+SHA-256 `e5434bf3b44037aad9e7ed631c4173c8a5ee01abc37704ff835d5fdd08c83efc`.
+This was on the run-start source manifest `fe5c17db...` (27 files,
+1,426,640 normalized bytes), tracked dirty diff SHA-256 `e3a62cd0...`
+(201,740 bytes). The run predates the final `web/demo.py` denial-message
+correction; it is not represented as a full-suite result on the final source.
+The available run record gives failure classes and measurements but not the
+14 individual pytest node IDs; those IDs cannot be verified from retained
+artifacts.
+
+Recorded failures: cross-process audit-marker publication; research-saturated
+Halt/verdict latency, including **5.910 s against a 5.5 s bound** and a web
+verdict at **8.18 s**; archive/Halt and CLI-approval races; peer-service
+recovery timeout; operation-completion/backtest timeouts; worker-failure and
+busy-retry timeouts. Exact failed nodes:
+
+1. `hedge_fund/runtime/test_writer_races.py::test_two_process_audit_appends_are_complete_and_uninterleaved`
+2. `hedge_fund/runtime/test_writer_races.py::test_halt_and_verdict_lanes_stay_responsive_under_research_saturation`
+3. `hedge_fund/runtime/test_writer_races.py::test_web_verdict_and_halt_remain_responsive_during_cross_process_research_saturation`
+4. `hedge_fund/web/test_actions.py::test_archive_cannot_move_a_fund_during_an_inflight_halt`
+5. `hedge_fund/web/test_actions.py::test_web_halt_fences_cli_approval_publication_across_processes`
+6. `hedge_fund/web/test_actions.py::test_web_halt_does_not_wait_for_fund_work_lock`
+7. `hedge_fund/web/test_jobs.py::test_second_process_cannot_recover_a_live_peer_operation`
+8. `hedge_fund/web/test_jobs.py::test_reviewed_operation_preview_accept_persists_capture_and_report`
+9. `hedge_fund/web/test_jobs.py::test_paid_fd_web_backtest_uses_guarded_real_client_and_fake_transport`
+10. `hedge_fund/web/test_jobs.py::test_reviewed_backtest_executes_captured_mandate_after_template_edit`
+11. `hedge_fund/web/test_jobs.py::test_operation_worker_failures_log_safe_cause_without_payload[claim]`
+12. `hedge_fund/web/test_jobs.py::test_operation_worker_failures_log_safe_cause_without_payload[work]`
+13. `hedge_fund/web/test_jobs.py::test_operation_worker_failures_log_safe_cause_without_payload[complete]`
+14. `hedge_fund/web/test_jobs.py::test_busy_interrupt_after_claim_failure_is_retried`
+
+The audit children did not publish a marker before the parent's wait expired.
+`test_halt_and_verdict_lanes_stay_responsive_under_research_saturation`
+measured **5.9108674 s** against 5.5 s; cross-process web verdict measured
+**8.1832771 s** against 5.5 s; CLI approval publication measured
+**9.5433004 s** against 5.5 s. The inflight archive/Halt case observed
+`state=archived` while Halt timed out. The fund-work-lock case observed
+`responsive=False`. The peer-service child exceeded its 30 s process
+timeout. Operation preview/accept and guarded fake-transport backtest cases
+remained `running`; captured-mandate backtest exceeded its 30 s future wait.
+Worker-failure cases exceeded 5 s while logging `OSError(errno=5)`; the
+busy-retry case exceeded 5 s after `OperationBusy`. Root cause remains
+unproven. No timeout threshold was relaxed.
+
+All failing selections were rerun serially on the final changed source:
+
+| Selection | Final focused result | Relationship to full run |
+| --- | --- | --- |
+| `hedge_fund/runtime/test_writer_races.py` | 12 passed in 105.39 s, exit 0 | All three full-run failures from this race file passed focused; broader T027 remains partial because full-run saturation/marker failures are unexplained. |
+| Three previously failing `hedge_fund/web/test_actions.py` cases | 3 passed in 13.91 s, exit 0 | Archive/Halt and CLI-approval selections passed. |
+| Eight previously failing `hedge_fund/web/test_jobs.py` cases | 8 passed in 45.27 s, exit 0 | Peer recovery, operation completion/backtest, worker failure and busy retry selections passed. |
+
+These focused passes do not erase or convert the full-suite failure. A second
+full non-TUI suite was not run after the isolated demo-message correction;
+final-source broad-suite status is therefore not verified.
+
+### Final-source selections and platform checks
+
+- **T015:** `python -m pytest` over handover, write-authority, explicit CLI
+  trust/migration/relocation/revocation cases, trusted web capability, and
+  peer-recovery guards — **55 passed in 30.42 s**, exit 0,
+  `2026-11-04T14:05:09.885+01:00`–`14:05:42.895+01:00`. Synthetic
+  Windows/NTFS, fake providers. Existing, migrated and relocated roots remain
+  read-only until separate acknowledgement; peer service leaves a held
+  operation running. The CLI acknowledgement is root/build/protocol and
+  inventory-bound; no web enrollment path exists.
+- **T019/T020 backend:** final contract selection over
+  `hedge_fund/web/test_app.py`, `test_actions.py`, `test_jobs.py` and
+  `test_valuation.py` — **145 passed in 282.76 s**, exit 0,
+  `14:00:14.859+01:00`–`14:05:00.637+01:00`; final
+  `hedge_fund/web/test_main.py` — **12 passed in 4.82 s**, exit 0,
+  `14:00:01.783+01:00`–`14:00:09.751+01:00`. Synthetic NTFS and fake
+  transport cover common error/status envelopes, Host/Origin/CSRF, read-only
+  and SIM denials, zero denied downstream effects, polling/reconnect and the
+  existing synchronous valuation `budget-exhausted` 429 emitter. Accepted
+  dispatch budgets still have no truthful retry/reset hint.
+- **Web error-message correction:** the five-file run first returned
+  **156 passed, 1 failed in 523.12 s**, exit 1. The failing case was
+  `test_demo_seeding_fails_closed_without_out_of_band_exclusion_proof`;
+  expected denial wording was absent. `hedge_fund/web/demo.py` now reports
+  `out-of-band writer exclusion is unproven`. The affected `test_main.py`
+  and full backend contract selection above passed afterward on final source.
+- **T019/T020 frontend:** Vitest 4.1.12, Node 22.13.1/npm 10.9.2,
+  `npm test` in `frontend/` — **13 files / 216 tests passed**, exit 0,
+  `10:48:14.7504365+01:00`–`10:50:12.6643051+01:00`; `tsc --noEmit` and
+  Vite 6.4.5 build passed. Build artifact: 3 files / 1,035,387 bytes,
+  SHA-256 `57f1e1c18ab9f70739b8f4ec8e6f958b064a30407ef1664cb403e5e1fb9142e1`.
+  No frontend source changed after that build.
+- **T020 owned browser:** `node .\e2e\run-owned.mjs --lifecycle
+  e2e/recovery.spec.ts` in `frontend/`, owned synthetic root, loopback 8876,
+  real local API, external requests guarded — **3 Playwright tests passed
+  in 17.3 s**, exit 0. Covers stale review, expired session without resubmit
+  and lost-server GET-only reconnect. No live provider/broker/LLM.
+- **T027 focused races:** the same final `test_writer_races.py` selection
+  above passed **12 tests in 105.39 s**. It covers owned cross-process
+  audit append, fake-data ledger effects, independent funds, concurrent
+  runner fill, redo/archive contention, unsafe legacy/revoked authority and
+  bounded controls. Because the full run failed three tests in this file,
+  including saturation latency, T027 remains unchecked pending explanation.
+- **TUI:** all 11 files under `hedge_fund/tui/test_*.py` were invoked
+  sequentially, with no concurrent pytest process — **90 passed, 0 failed
+  files**, exit 0, `2026-11-04T14:14:16.350+01:00`–
+  `14:15:31.185+01:00`. Files:
+  `test_admission_regressions.py`, `test_backtest.py`, `test_builder.py`,
+  `test_builder_broker.py`, `test_funds.py`, `test_home.py`, `test_keys.py`,
+  `test_paper.py`, `test_paper_view.py`, `test_report.py`,
+  `test_scorecard_view.py`.
+- **Windows native:** `python -m pytest
+  hedge_fund/runtime/test_native_primitives.py
+  hedge_fund/runtime/test_native_credentials.py -q -p no:cacheprovider`
+  — **10 passed, 3 skipped in 10.46 s**, exit 0,
+  `14:10:22.178+01:00`–`14:10:34.930+01:00`, Windows/NTFS.
+- **Linux native:** same pytest selection in the isolated Linux container —
+  **9 passed, 4 skipped in 4.74 s**, exit 0,
+  `2026-11-04T14:10:59.497+01:00`–`14:11:08.433+01:00`; ext4 named
+  volume, UID 1000, no network. Initial setup without container-only
+  `USER`/`LOGNAME` had nine setup errors and no assertions; corrected
+  environment rerun produced the final result above.
+- **T021 POSIX append boundary:** `python -m pytest
+  hedge_fund/runtime/test_root.py::test_handle_relative_append_preserves_bytes_and_rejects_hardlinks
+  -q -p no:cacheprovider` in the same pinned Linux image, ext4 named test
+  volume, UID 1000, `--network none`, read-only source bind mounts and
+  `PYTHON_DOTENV_DISABLED=1` — **1 passed in 0.19 s**, exit 0,
+  host `2026-11-04T14:30:09.7656523+01:00`–`14:30:14.5056497+01:00`.
+  Unique volume `spec005-append-1333a918d2e14345929105affc46ce83` was removed.
+  This verifies the selected append boundary on ext4; it does not prove
+  identity-fenced POSIX unlink or broad POSIX writer behavior.
+- **Static checks, final source:** the global Python 3.13 interpreter lacked
+  Black/isort/flake8, so no dependency was installed; checks reran with the
+  existing isolated project venv. Black `--check --line-length 420`:
+  **24 changed Python files unchanged**; isort `--check-only --profile
+  black`: exit 0; Flake8 `--ignore=E203,W503 --max-line-length=420`: exit 0;
+  `git diff --check`: exit 0. The whitespace check emitted only Git's
+  LF-to-CRLF working-copy warning for `tasks.md`.
+
+### T021/T024 and red-team coverage disposition
+
+T021 remains unchecked. Remaining writer-boundary gaps are durable rewind
+intent, mandate rename-plus-rewrite journaling, identity-fenced POSIX unlink
+evidence, complete Saxo credential/demo/bootstrap admission, and exhaustive
+dynamic/out-of-repository writer inventory with race-level evidence. The
+POSIX append boundary has one focused ext4 pass; it lacks broad POSIX writer
+and race coverage. The Windows writer matrices passed 214 tests at the earlier
+final matrix checkpoint; the final focused cross-process race suite passed
+12 tests. These results do not prove all writers are inventoried or fence
+unaware processes.
+
+T024 remains unchecked and **BLOCKED**: its T002–T023 prerequisites include
+open T021; the non-TUI full suite failed and was not rerun on the final
+demo-message source. Both final native filesystem rows and one focused ext4
+append boundary passed. Native rows do not establish full migration acceptance.
+
+Current LM/LB/HM coverage is deliberately partial:
+
+| Obligation | Final evidence and open condition | Status |
+| --- | --- | --- |
+| LM1 | Root-bound operator trust and cooperative writer tests pass focused; out-of-band writers remain outside the guarantee and broad T027 failures are unexplained. No OS-enforcement claim. | PARTIAL |
+| LM2 | Owned loopback browser recovery passes; host-writer/read-only-container and no-autostart deployment proof absent. | NOT VERIFIED |
+| LM3 | Ledger append/fill and selected approval races pass; durable rewind intent and complete post-fill reconciliation remain open. | PARTIAL |
+| LM4 | Selected archive/restore and stale-review cases pass; full due-set/backlog and stopped-deployment restore remain open. | PARTIAL |
+| LM5 | Synthetic account-binding tests do not establish complete production SIM lifecycle wiring. | NOT VERIFIED |
+| LB1 | Root, isolation, headless and writer selections pass; active-child credential lifecycle and complete writer integration remain open. | PARTIAL |
+| LB2 | Selected Host/Origin/CSRF and loopback checks pass; read-only-container and future-channel guarantees absent. | PARTIAL |
+| LB3 | No live endpoint/DNS/TLS/redirect test is claimed. | NOT VERIFIED |
+| LB4 | Windows/NTFS and Linux/ext4 native primitive selections pass with skips; credential UI and active-capture workflow remain open. | PARTIAL |
+| LB5 | Native rows pass on tested NTFS and ext4; skipped cases, other filesystems and full deployment remain outside evidence. | PARTIAL |
+| HM1 | The full non-TUI suite failed 14 tests; focused reruns pass, root cause unresolved. | PARTIAL |
+| HM2 | Selected bounded-policy tests use fakes; complete provider/UI acceptance is not established. | PARTIAL |
+| HM3 | Selected bounded-policy regressions pass; scheduled-runner and dispatch acceptance remain open. | PARTIAL |
+| HM4 | Selected durable/interruption and fencing tests pass; detached-owner/restart and platform lifecycle acceptance remain open. | PARTIAL |
+| HM5 | Selected durable confirmation/idempotency and approval boundary tests pass; complete provenance and operation UI acceptance remain open. | PARTIAL |
+
+Task disposition on this evidence: **T015 checked; T019 checked; T020
+checked; T021 unchecked; T024 unchecked; T027 unchecked**. T027 is unchecked
+because its focused file passed but three of its cases failed in the full
+run; those failures have not been explained. Existing T023/T025/T026/T028
+checkboxes remain unchanged.

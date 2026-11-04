@@ -19,6 +19,7 @@ _PRIMITIVES = frozenset(
     {
         "write_text",
         "write_bytes",
+        "append_bytes",
         "mkdir",
         "unlink",
         "rename",
@@ -79,10 +80,10 @@ WRITER_INVENTORY: dict[tuple[str, str, str], tuple[int, str]] = {
     ("paper/deployed.py", "deploy", "write_bytes"): (2, PAPER_LANES),
     ("paper/deployed.py", "deploy", "write_text"): (1, PAPER_LANES),
     ("paper/ledger.py", "Ledger._clear_approval", "unlink"): (1, PAPER_LANES),
+    ("paper/ledger.py", "Ledger.log_event", "append_bytes"): (1, PAPER_LANES),
     ("paper/ledger.py", "Ledger.append", "mkdir"): (2, PAPER_LANES),
     ("paper/ledger.py", "Ledger.append", "write_text"): (1, PAPER_LANES),
     ("paper/ledger.py", "Ledger.init", "mkdir"): (2, PAPER_LANES),
-    ("paper/ledger.py", "Ledger.log_event", "open"): (1, PAPER_LANES),
     ("paper/ledger.py", "Ledger.rewind", "mkdir"): (2, PAPER_LANES),
     ("paper/ledger.py", "Ledger.rewind", "rename"): (1, PAPER_LANES),
     ("paper/ledger.py", "Ledger.rewind", "rename_file"): (1, PAPER_LANES),
@@ -105,6 +106,8 @@ WRITER_INVENTORY: dict[tuple[str, str, str], tuple[int, str]] = {
     ("run.py", "_handover", "prepare_private_storage"): (1, BOOTSTRAP),
     ("runtime/admission.py", "AdmissionCoordinator._lock", "mkdir"): (1, LOCK_FILE),
     ("runtime/admission.py", "AdmissionCoordinator._lock", "open_lock_file"): (1, LOCK_FILE),
+    ("runtime/admission.py", "AdmissionCoordinator.operation_service_lease", "mkdir"): (1, LOCK_FILE),
+    ("runtime/admission.py", "AdmissionCoordinator.operation_service_lease", "open_lock_file"): (1, LOCK_FILE),
     ("runtime/admission.py", "RootMigrationLease.acquire", "mkdir"): (1, LOCK_FILE),
     ("runtime/admission.py", "RootMigrationLease.acquire", "open_lock_file"): (1, LOCK_FILE),
     ("runtime/admission.py", "RootOwnerLease.acquire", "mkdir"): (1, LOCK_FILE),
@@ -119,6 +122,7 @@ WRITER_INVENTORY: dict[tuple[str, str, str], tuple[int, str]] = {
     ("runtime/credentials.py", "CredentialStore._write_bytes", "write_bytes"): (1, REGISTRY),
     ("runtime/handover.py", "_write_record", "write_bytes"): (1, BOOTSTRAP),
     ("runtime/handover.py", "_write_stale_recovery_record", "write_bytes"): (1, BOOTSTRAP),
+    ("runtime/handover.py", "_write_private_json", "write_bytes"): (1, BOOTSTRAP),
     ("runtime/handover.py", "PaperInventoryTransition.mkdir", "mkdir"): (2, PAPER_LANES),
     ("runtime/handover.py", "PaperInventoryTransition.rename_file", "rename_file"): (1, PAPER_LANES),
     ("runtime/handover.py", "PaperInventoryTransition.write_bytes", "write_bytes"): (1, PAPER_LANES),
@@ -143,6 +147,8 @@ WRITER_INVENTORY: dict[tuple[str, str, str], tuple[int, str]] = {
     ("runtime/root.py", "_posix_mkdir_relative", "os.mkdir"): (1, ROOT_PRIMITIVE),
     ("runtime/root.py", "_posix_mkdir_relative", "os.open"): (1, ROOT_PRIMITIVE),
     ("runtime/root.py", "_posix_open_lock_relative", "os.open"): (1, ROOT_PRIMITIVE),
+    ("runtime/root.py", "_posix_append_relative", "os.open"): (1, ROOT_PRIMITIVE),
+    ("runtime/root.py", "_posix_append_relative", "os.write"): (1, ROOT_PRIMITIVE),
     ("runtime/root.py", "_posix_parent_fd", "os.open"): (1, ROOT_PRIMITIVE),
     ("runtime/root.py", "_posix_read_relative", "os.open"): (1, ROOT_PRIMITIVE),
     ("runtime/root.py", "_posix_unlink_relative", "os.unlink"): (1, ROOT_PRIMITIVE),
@@ -163,7 +169,7 @@ WRITER_INVENTORY: dict[tuple[str, str, str], tuple[int, str]] = {
 
 
 _UNKNOWN_MODE = object()
-_OS_WRITERS = frozenset({"replace", "rename", "renames", "remove", "unlink", "rmdir", "removedirs", "mkdir", "makedirs", "symlink", "link", "truncate", "chmod", "utime", "open", "mkfifo"})
+_OS_WRITERS = frozenset({"replace", "rename", "renames", "remove", "unlink", "rmdir", "removedirs", "mkdir", "makedirs", "symlink", "link", "truncate", "chmod", "utime", "open", "write", "mkfifo"})
 _SHUTIL_WRITERS = frozenset({"copy", "copy2", "copyfile", "copytree", "move", "rmtree", "copymode", "copystat", "chown"})
 _TEMPFILE_WRITERS = frozenset({"mkstemp", "mkdtemp", "NamedTemporaryFile", "TemporaryFile", "SpooledTemporaryFile", "TemporaryDirectory"})
 _MODULE_WRITERS = {"os": _OS_WRITERS, "shutil": _SHUTIL_WRITERS, "tempfile": _TEMPFILE_WRITERS}
