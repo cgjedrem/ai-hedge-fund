@@ -4,6 +4,13 @@
 remain canonical except the expressly documented safety incompatibilities. No scripts,
 compose, entrypoints or provider defaults are changed by the planning PR.
 
+**Release 1 scope (2026-11-04, user-directed):** Release 1 keeps the TUI entrypoint as a
+fallback and retains all headless commands. It needs exactly one documented Docker path for
+the web desk. That choice is open: the current `web` compose profile mounts `/data` read-only
+(an observer), so it cannot perform Release 1 mutations. Observer snapshot topology, ttyd
+removal and dual-platform packaged distributions are deferred. The real funds' move from the
+legacy home root uses the offline handover below and is performed only by the operator.
+
 ## Launch and command compatibility
 
 The target console accepts explicit global `--root PATH` before every command. A no-command

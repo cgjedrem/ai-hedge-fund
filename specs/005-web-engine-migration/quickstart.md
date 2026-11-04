@@ -5,6 +5,13 @@ Current PR changes documentation/governance only. Proposed flags/interfaces in
 [contracts](contracts/headless-and-deployment.md) must first be implemented.
 No paid calls, live funds/runners, credentials or creator preview may be used.
 
+**Release 1 scope (2026-11-04, user-directed):** For Release 1, validate only the single-operator
+paper desk: recorded balances/holdings/fees/history, hash-bound approve/reject, manual next
+session, Halt/Resume, per-fund exclusion, post-fill ambiguity handling, guards and the single
+Docker path (see `spec.md` R1-01 to R1-09). TUI retirement and packaging steps below are
+deferred; the TUI remains available. Use synthetic roots only. The cutover of the real
+`watchtower`/`watchtower-weekly` funds is an operator-only handover, never an agent test step.
+
 ## Prerequisites and safety gate
 
 Use an isolated checkout-owned fixture directory, synthetic HOME/USERPROFILE and explicit

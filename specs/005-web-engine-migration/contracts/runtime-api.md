@@ -6,6 +6,12 @@ may be retained/aliased only with the same policy. Implement against the
 All endpoints are local, with fixed-root/path/Host/Origin/CSRF guards. No browser payload
 chooses a root, process PID, capability or arbitrary file path.
 
+**Release 1 scope (2026-11-04, user-directed):** Release 1 requires the paper detail, verdict,
+Halt/Resume, manual tick preview/accept, operation status and settings/credential routes for
+local paper funds. Runner, mandate, valuation, research and lifecycle routes remain as
+implemented, but they are not Release 1 acceptance. Archive/restore/replace beyond the existing
+code and SIM web execution are deferred; SIM mutation stays denied. Guards are unchanged.
+
 ## Common observation and mutation envelopes
 
 GET is observational: no network/provider construction, worker starts or root-side writes.

@@ -12,6 +12,30 @@ T021, T024 and T027 in `tasks.md`.
 This is a newly created Phase 0/1 plan consuming completed forward red-team resolutions,
 not a rewrite of an earlier historical plan during red-team resolution.
 
+## Release 1 scope revision (2026-11-04, user-directed)
+
+The user approved narrowing Spec005 to Release 1: one trusted local operator running the
+paper-only `watchtower` and `watchtower-weekly` funds from the React/shadcn desk, reusing
+the canonical engine. The TUI is **retained as a fallback**. This revision supersedes the
+earlier "current execution scope" line above and any conflicting retirement sequencing below.
+The historical plan remains the design reference for deferred work.
+
+- **Release 1 architecture:** reuse the existing fixed-root admission, operation preview and
+  accept, durable jobs, verdict binding, Halt and paper ledger. No new storage or
+  architecture is introduced for Release 1.
+- **Retained safety:** shared admission still fences cooperating writers. FR-063 trusted
+  single-writer acknowledgement is operator trust, not OS isolation. Legacy home roots stay
+  read-only; cutover is an operator-only offline handover. Ambiguous fills fail closed.
+  Loopback/Host/Origin/CSRF/path guards, secret non-disclosure and the free-data default stay.
+- **Deferred, not complete:** TUI/Textual/ttyd retirement; the host-writer/container-observer
+  snapshot split; dual-platform native distributions; SIM custody and provisioning;
+  archive/restore/replace; large catalogs and exhaustive exports; repeated overlapping review gates.
+- **Acceptance:** Release 1 capabilities R1-01 to R1-09 in `spec.md`, closed through the
+  bounded backlog RB-1 to RB-7 in `tasks.md`. The single Docker path is an open decision,
+  because the current `web` compose profile is a read-only observer.
+- **Gate deviation:** no new red-team or plan-review gate was run for this narrowing. It is
+  user-directed and recorded here and in the PR body.
+
 ## Summary
 
 Make the existing React/shadcn desk the sole supported interactive engine surface, preserving

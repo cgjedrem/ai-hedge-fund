@@ -7,6 +7,12 @@ contract obligations, and runtime checks start `PENDING`.
 files. A planned test or passing unit test alone does not close native, browser, package,
 or runtime obligations.
 
+**Release 1 scope (2026-11-04, user-directed):** Release 1 acceptance uses the R1-01 to R1-09
+capabilities in `spec.md` and the RB-1 to RB-7 backlog in `tasks.md`. Rows that cover only
+deferred scope (TUI retirement, observer snapshot, native distributions, SIM custody,
+archive/restore/replace, large catalogs, exhaustive exports) stay `PENDING`. They are
+excluded from Release 1, not passed.
+
 ## Discovery capabilities
 
 | Discovery ID | FR | Acceptance tests | Required disposition | Status |

@@ -4,11 +4,54 @@
 
 **Created**: 2026-10-31
 
-**Status**: Draft specification; requirements-quality reviewed, not implementation accepted
+**Status**: Draft specification; requirements-quality reviewed, not implementation accepted. Scope revised 2026-11-04 to Release 1 single-user home scope (see below); the TUI is retained.
 
 **Input**: Complete the migration from the terminal UI so the existing React/shadcn desk is the sole supported interactive engine driver, preserving its terminal-inspired appearance, domain behavior and supported headless deployments. Deliver actual runner control, manual execution, live valuation, fund lifecycle, approvals, backtests, reports and complete supported configuration, including providers, models and credentials. Follow specify, assumptions clarification, adversarial red team, plan, open plan-review PR, tasks, implementation/convergence and multiple QA gates; create a new main-targeting PR and never merge it. This execution stops after specification.
 
-**Baseline and scope**: `main` at `6443490db64056742fbbe6a18abf92c903c10861`, merged PR #7, is an additive web desk and explicitly not retirement-ready. [Discovery and complete capability disposition](discovery.md) form the scope inventory. Framework names here are user-selected product constraints, not an architecture proposal. No engine algorithm, ledger-schema redesign, real brokerage, historical intraday engine, remote/public web exposure or unrelated defect repair is included.
+## Release scope revision — 2026-11-04 (user-directed, authoritative)
+
+**Authority**: The user explicitly approved revising Spec005 to single-user home scope. This section is authoritative for Release 1 and supersedes conflicting scope in the historical text below. The historical text, FR/SC identifiers, task IDs, task checkbox status and evidence are preserved unchanged for traceability. The revision is a user-directed gate deviation: no new red-team, plan-review or Spec number was run or allocated for it.
+
+**Release 1 target**: One trusted local operator runs the paper-only funds `watchtower` and `watchtower-weekly` through the React/shadcn desk, reusing the canonical engine (scheduling, execution, sizing, approvals, ledger, providers). The Textual TUI is **retained as a fallback**; it is not retired in Release 1.
+
+**Essential Release 1 capabilities** (acceptance is required):
+
+| ID | Capability | Governing historical requirements |
+|----|------------|------------------------------------|
+| R1-01 | Honest recorded balances, holdings, fees/commissions, session history and decisions; estimates are never presented as records | FR-003, FR-045, FR-046, FR-050 (recorded subset), FR-055 |
+| R1-02 | Hash-bound Approve/Reject of the displayed pending decision, preserving expiry and existing ledger mailbox semantics | FR-035, FR-036 |
+| R1-03 | Safe, deliberately confirmed manual next session with durable progress, honest no-work outcome and visible errors | FR-014, FR-015, FR-016, FR-017, FR-023, FR-024 |
+| R1-04 | Halt and Resume. Resume must not bypass verified reconciliation of ambiguous outcomes | FR-013, FR-036, FR-037 |
+| R1-05 | Per-fund mutual exclusion and request idempotency for manual, verdict, control and participating headless writers; independent funds stay usable | FR-007, FR-017, FR-063 |
+| R1-06 | Honest post-fill ambiguity: fail closed, halt, surface it, and provide an explicit recovery path; never auto-repeat a fill | FR-017, FR-039 |
+| R1-07 | Loopback-only server, Host/Origin/CSRF/path guards, secret non-disclosure, free-data default; paid providers only by explicit operator enablement | FR-019, FR-021, FR-025, FR-053, FR-054, FR-058 |
+| R1-08 | Exactly one documented Docker deployment path for the web desk | FR-005 (narrowed to one path) |
+| R1-09 | Relevant regression and acceptance checks pass on the final artifact; known failures are fixed or explained, never ignored | FR-059 (narrowed), SC-010 (narrowed) |
+
+**Disposition of other historical requirements for Release 1**:
+
+- **Retained as constraints** (must not regress, but are not separate Release 1 gates): FR-002 terminal look, FR-004 headless CLI workflows, FR-006 explicit root, FR-044 real-fund protection, FR-056 non-TUI reusable behavior.
+- **Implemented code retained, not Release 1 acceptance**: web runner lifecycle (FR-008–FR-012; the headless runner remains the supported scheduled path), model/runtime settings and configuration precedence (FR-018, FR-020, FR-022), mandate editor and deploy (FR-028–FR-034, FR-040), live valuation refresh (FR-045 beyond honest labelling), backtests and research (FR-047, FR-048, FR-052), latest-session redo (FR-038).
+- **Deferred**: FR-001 sole driver and no-argument entry; FR-026/FR-027 SIM web and provisioning; FR-041–FR-043 archive/restore/replace; FR-049 large-catalog pagination; FR-051 exhaustive export parity; FR-057 exhaustive A01–F13 acceptance; FR-060–FR-062 retirement and repeated review gates.
+- **Success criteria**: SC-003, SC-005 and SC-009 apply to Release 1 capabilities. SC-001, SC-002 and SC-007 are deferred with retirement. SC-004, SC-006 and SC-008 apply only to Release 1 surfaces. SC-010 is narrowed to R1-09.
+
+**Preserved safety (not relaxed)**: Ordinary cooperating concurrent writers still require fencing through shared admission. Operator trust (FR-063 trusted single-writer) is a declared assumption, **not proof of OS isolation**; unaware or malicious same-account writers remain unfenced. Existing roots stay read-only until the explicit offline handover. Ambiguous fills fail closed. No paid or network calls are made in tests.
+
+**Deferred (excluded from Release 1 acceptance; not complete)**:
+
+- TUI retirement and removal of Textual, ttyd and the TUI entrypoint (US6, FR-039–FR-041, FR-062, SC-007 retirement clauses).
+- Separate observer snapshot architecture for a read-only container (plan's host-writer/container-observer split).
+- Exhaustive dual-platform native distributions and packaged-install acceptance (SC-007 beyond the chosen Docker path).
+- Browser/SIM account custody and provisioning (Assumption 9; SIM remains denied in the web desk).
+- Advanced archive, restore and replace lifecycle (US4, FR-041-style reversible archival beyond existing code).
+- Very large catalogs or pagination beyond current limits, and exhaustive export parity.
+- Repeated overlapping evidence and review gates beyond the release check in R1-09.
+
+Deferred items keep their historical requirements and tasks for a later release. Completed code for deferred items stays in place and is not removed. The release backlog and task-by-task mapping are in [tasks.md](tasks.md#release-1-scope-mapping-and-bounded-backlog-2026-11-04).
+
+**Operator cutover (operator-only, never performed by agents)**: The real funds live under the legacy home root, which is read-only to the web desk. To operate them from the web, the operator deliberately stops the legacy runners, then runs `aihf --root NEW handover inspect-source`, `relocate-from` with the content digest, and `trust-single-writer` with the inventory digest and acknowledgement. The operator must keep every other writer (old CLI, cron, TUI writes, containers) stopped while trust is enabled.
+
+**Historical baseline and scope**: `main` at `6443490db64056742fbbe6a18abf92c903c10861`, merged PR #7, is an additive web desk and explicitly not retirement-ready. [Discovery and complete capability disposition](discovery.md) form the scope inventory. Framework names here are user-selected product constraints, not an architecture proposal. No engine algorithm, ledger-schema redesign, real brokerage, historical intraday engine, remote/public web exposure or unrelated defect repair is included.
 
 ## User Scenarios & Testing *(mandatory)*
 

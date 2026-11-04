@@ -10,6 +10,14 @@ description: "Executable, mandatory-test work plan for complete web-only engine 
 `docs\governance\web-migration-contract.md`.
 **Prerequisite gate:** [exact Git/API receipt](tasks-gate-2026-10-31.md): clean/pushed
 spec and plan at `193d16dc754567710c8dd5703e4f427184c9079f`, open main-targeting PR #8.
+**Release scope revision (2026-11-04, user-directed):** Release 1 is now the
+single trusted local operator, paper-only `watchtower`/`watchtower-weekly` desk
+with the TUI retained as a fallback (see `spec.md`). Every historical task ID,
+checkbox and note below is preserved unchanged. The authoritative classification
+and bounded release backlog are in
+[Release 1 scope mapping](#release-1-scope-mapping-and-bounded-backlog-2026-11-04).
+Deferred tasks are excluded from Release 1 acceptance; they are not complete.
+
 **Latest scoped state (2026-11-04):** 28/148 tasks are checked. Of T015, T019,
 T020, T021, T023, T024, T025, T026, T027 and T028, T015, T019, T020, T023,
 T025, T026 and T028 are checked; T021, T024 and T027 remain unchecked.
@@ -642,3 +650,51 @@ while a required acceptance row remains blocked or inconclusive.
 - [ ] T146 Implement stable bounded pagination/search beyond 100 research/history records, complete canonical report drilldowns/precision JSON exports, and honest per-ticker valuation freshness/source/coverage without changing recorded NAV.
 - [ ] T147 Implement a safe host-generated immutable paired-head snapshot for the read-only observer container, mounted read-only and isolated from provider credentials, caches, jobs and writes. Bind publication to host loopback only; remove ttyd/TUI/shared-writable runner topology from supported compose paths while documenting intentional compatibility limits.
 - [ ] T148 Make the explicit-root React desk the default web driver and prove supported headless imports without Textual; migrate every remaining TUI assertion before removal. Retire TUI/Textual/ttyd/dependencies/entrypoint/docs only after final parity/package/browser/Windows/Linux gates pass; otherwise preserve TUI and record retirement as blocked while retaining the candidate headless path.
+
+## Release 1 scope mapping and bounded backlog (2026-11-04)
+
+**Authority and rules.** This section is a user-directed scope revision (see `spec.md`,
+"Release scope revision"). It classifies every historical task without changing any
+ID, checkbox or note above. "Deferred" means excluded from Release 1 acceptance, **not
+complete**. Implemented code for deferred tasks stays in place. Narrowed tasks remain
+unchecked until their Release 1 subset is verified; a later release must still finish
+the remainder. Operator trust (T015/FR-063) is a declared assumption, not proof of OS
+isolation; cooperating writers still require fencing and ambiguous fills still fail closed.
+
+### Classification of all 148 tasks
+
+| Class | Tasks |
+|-------|-------|
+| **Complete** (checked; 28) | T001–T020, T022, T023, T025, T026, T028, T059, T096, T137 |
+| **Retained incomplete, Release 1 blocking** | T021, T024, T027, T029 (narrowed), T033, T034, T038 (manual/review panel only), T039, T043 (narrowed), T052, T060 (narrowed), T063–T072, T073 (narrowed), T074, T075, T085 (narrowed), T086 (narrowed), T128 (narrowed), T129 (narrowed), T130–T132 (consolidated into one pass), T134 (narrowed), T136, T138 (narrowed), T139 (web denial only), T140, T143 (narrowed) |
+| **Implemented code retained, not Release 1 acceptance** | T030–T032, T035–T037, T040–T042, T142 (web runner lifecycle; the headless runner remains the scheduled path); T045–T051, T053–T058, T061, T141, T145 (settings/model/editor/deploy); T109, T110, T112–T117, T119–T125 (valuation, backtest, research) |
+| **Deferred** (excluded from Release 1 acceptance) | T044, T062, T076, T090, T126, T127 (exhaustive capability matrices); T077–T084, T087–T089, T091–T094, T147, T148 (TUI retirement, observer snapshot, native distributions); T095, T097–T108, T144 (archive/restore/replace, SIM custody beyond web denial); T111, T118, T146 (large catalogs, exhaustive exports); T133 (post-retirement re-review) |
+| **Superseded** | T135: PR #8 is the main-targeting implementation PR; no further PR is created |
+
+"Narrowed" retains only the Release 1 subset stated below. The remainder of each
+narrowed task is deferred with its historical text.
+
+### Bounded Release 1 backlog
+
+Seven work packages, reusing existing task IDs and implementation. A package closes
+only when its listed checks pass on the final artifact.
+
+| Package | Tasks | Release 1 subset and closure evidence |
+|---------|-------|----------------------------------------|
+| RB-1 Writer fencing and idempotency (R1-05) | T021, T027, T138 | Close or deny every writer that can reach a Release 1 fund root: paper, CLI, web, headless runner. Saxo/demo/bootstrap writers stay denied or documented as out of scope. Explain or fix the three T027 race failures from the full run. |
+| RB-2 Manual next session (R1-03) | T033, T034, T038, T039, T143 | Reviewed one-session preview and accept, durable stage progress, visible errors and an honest nothing-due outcome. Today the server returns 409 `No paper session is currently due.` (`hedge_fund\web\services.py`). Explicit backlog selection is deferred. |
+| RB-3 Verdict, Halt, Resume and post-fill recovery (R1-02, R1-04, R1-06) | T063–T072, T073, T140 | Byte-parity verdict regressions, corruption and append-failure tests, emergency Halt lane, head-bound reconciliation receipts, and a Resume that clears only a verified halt. Today `Ledger.resume()` always raises and web Resume returns 423 `reconciliation-required`. Native cross-process runs are narrowed to the release deployment platform. |
+| RB-4 Configuration and secret safety (R1-07) | T052, T060, T139 | Free yfinance default confirmed across CLI/web/runner; credential sentinel and secret non-disclosure regressions; web SIM mutation denied before effects. Paid providers stay explicit opt-in. |
+| RB-5 One Docker path and operator docs (R1-08) | T085, T086, T134 | Select and validate one Docker deployment path. **Open decision:** the current `web` compose profile mounts `/data` read-only (observer), so it cannot approve, halt or run sessions. Choose either a writable single-writer desk container or a host-run desk with no container writer. Document the operator-only cutover: stop legacy runners, `handover inspect-source`, `relocate-from`, `trust-single-writer`. TUI/ttyd profiles remain as fallback, not the release path. |
+| RB-6 Release checks (R1-09) | T024, T029, T043, T074, T075, T128, T129 | Foundation and Release 1 regressions; synthetic-root browser scenarios for manual run, approve/reject, Halt/Resume and recovery; a green full non-TUI pytest run on the final artifact, or each failure attributed. Known: 14 failures (2,367 passed, 51 skipped) on the 2026-11-04 run, unexplained after focused reruns passed. |
+| RB-7 Final review and artifact check (R1-09) | T130–T132, T136 | One consolidated independent QA pass over ledger/money, local boundary and human control for the Release 1 diff; final manifest, clean tree, remote and PR head verification. |
+
+### Release 1 blockers known at revision time
+
+1. Resume is unavailable until reconciliation receipts exist (RB-3).
+2. The full non-TUI suite failed 14 tests; the cause is unresolved (RB-1, RB-6).
+3. T021 residuals: no durable rewind intent, no mandate rename/rewrite journal, POSIX unlink not identity-fenced, Saxo/demo/bootstrap writers outside the lanes, static inventory limits (RB-1).
+4. Manual no-work reports 409 instead of a nothing-due result (RB-2).
+5. The Docker path decision is open (RB-5).
+6. No browser end-to-end coverage for manual run, approvals or recovery (RB-6).
+7. The real funds live under the legacy home root, which is read-only to the desk. Only the operator may perform the cutover; agents must not (RB-5).
