@@ -238,12 +238,13 @@ filesystem, drop all capabilities and enable `no-new-privileges`. Only
 literal `http://127.0.0.1:11434`; no credentials are placed in Compose. Paid
 provider approvals remain separate per-operation gates.
 
-The supported browser topology is a Linux host with local ext4 and the Linux
+The configured browser topology is a Linux host with local ext4 and the Linux
 host-network overlay. The app binds literal loopback; the overlay removes bridge
-ports/networks. The Windows Docker Desktop bridge is unsupported: a Windows
-host bind reports `9p`, which `RootContext.open` rejects. Do not accept Docker
-gateway peers, use `host.docker.internal` for Ollama, or weaken root/filesystem
-identity checks.
+ports/networks. The Compose merge was checked, but browser access and host Ollama
+were not runtime-tested. The Windows Docker Desktop bridge is unsupported: a
+Windows host bind reports `9p`, which `RootContext.open` rejects. Do not accept
+Docker gateway peers, use `host.docker.internal` for Ollama, or weaken root/
+filesystem identity checks.
 
 Build labels and `SessionRecord.code_version` use a baked full Git revision and
 package-source SHA-256. Set both build inputs from the checkout:
@@ -274,6 +275,13 @@ fails closed, and no rebind/upgrade workflow is accepted. The operator must
 exclude every other writer. Never run the TUI, CLI or legacy runner as a second
 writer on that root; the TUI/ttyd fallback remains available only when the web
 writer is stopped.
+
+The final image was exercised against disposable synthetic ext4 volumes. Runtime
+observations and evidence limits are recorded in
+`specs/005-web-engine-migration/implementation-evidence.md`; the exact runtime
+timestamp and full invocation were not retained, so formal runtime acceptance is
+INCONCLUSIVE. This synthetic validation is not support evidence for existing
+funds, root relocation or container recreation.
 
 This is not a cutover instruction for existing funds. The existing
 `watchtower`/`watchtower-weekly` roots remain denied by protected-name guards;

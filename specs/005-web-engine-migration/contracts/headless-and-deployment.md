@@ -7,10 +7,13 @@ compose, entrypoints or provider defaults are changed by the planning PR.
 **Release 1 scope (user-directed, 2026-11-04 and 2026-11-05):** Release 1 keeps the TUI
 entrypoint as a fallback and retains all headless commands. The selected Docker path is one
 writable, single-user paper desk, published only on host loopback, reusing canonical root
-trust and cooperating-writer admission. This resolves the RB-5 choice but not implementation
-acceptance. The separate observer-snapshot architecture, TUI/ttyd retirement and dual-platform
-packaged distributions remain deferred. The real funds' move from the legacy home root uses
-the offline handover below and is performed only by the operator.
+trust and cooperating-writer admission. The final image was exercised on disposable
+synthetic ext4 volumes; observed results and evidence limits are in
+`implementation-evidence.md`. The exact runtime timestamp and full invocation were not
+retained, so formal runtime acceptance remains INCONCLUSIVE. The separate observer-snapshot
+architecture, TUI/ttyd retirement and dual-platform packaged distributions remain deferred.
+The real funds' move from the legacy home root uses the offline handover below and is
+performed only by the operator.
 
 ## Launch and command compatibility
 
@@ -114,15 +117,19 @@ override them.
 The Windows Docker Desktop bind filesystem is not currently supported: a synthetic host
 directory mounted at `/data` reports `9p`, and `RootContext.open` rejects it because only
 local NTFS/ext4 are admitted. A Docker Desktop ext4 named volume is permitted for disposable
-synthetic runtime validation only; it does not support NTFS-to-ext4 relocation. New container
-identity/build mismatch denies trust. Same-container restart behavior and recreation denial
-must be checked on the final image. No rebind, cross-filesystem copy, or upgrade workflow is
-approved. FR-044 protected names remain globally denied, so the R1 `watchtower` targets are
-blocked pending a user decision. Never remove the protected-name guards or add fixture/
-agent-specific bypasses.
+synthetic runtime validation only; it does not support NTFS-to-ext4 relocation. On the final
+image, same-container restart retained PID/mount namespace identity and trusted write
+capability; a replacement container changed namespace identity and remained read-only.
+These observations do not approve rebind, cross-filesystem copy or upgrade. Host-network/
+browser/Ollama runtime remains untested. FR-044 protected names remain globally denied, so
+the R1 `watchtower` targets are blocked pending a user decision. Never remove the protected-
+name guards or add fixture/agent-specific bypasses.
 
-Keep the TUI and `tui-web` fallback services. Disable competing runner/TUI writers during any
-operator session; fallback use begins only after the web writer stops. Compose examples use
+Keep the TUI and `tui-web` fallback services. A sequential TUI render was observed on a
+separate synthetic volume after a graceful web-child stop; first TUI launch creates the
+example mandate. This does not establish same-root cross-namespace rebind or writable
+fallback on the trusted Docker root. Disable competing runner/TUI writers during any operator
+session; fallback use begins only after the web writer stops. Compose examples use
 synthetic names and isolated roots/ports. Do not operate existing compose services or actual
 funds to validate migration. Container/Linux runtime acceptance requires final-image evidence.
 

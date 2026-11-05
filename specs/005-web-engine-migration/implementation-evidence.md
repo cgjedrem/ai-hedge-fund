@@ -1910,9 +1910,10 @@ checkboxes remain unchanged.
 
 ## 2026-11-05 report-byte and Docker continuation
 
-**Status:** report byte parity **PASS** for synthetic source/API/browser tests.
-Release 1 implementation remains **PARTIAL**; selected Docker desk **BLOCKED**;
-independent QA and operator cutover pending. No task checkbox was changed here.
+**Status at this checkpoint:** report byte parity **PASS** for synthetic
+source/API/browser tests. The selected Docker desk was blocked at this checkpoint.
+The later final-image observations and current evidence limits are appended below;
+independent QA and operator cutover remain pending. No task checkbox was changed here.
 
 ### Source and environment
 
@@ -2004,3 +2005,127 @@ docker run --name spec005-web-final-default-6629c68f --network none --read-only 
 
 docker run --name spec005-web-final-root-6629c68f --network none --read-only --cap-drop ALL --security-opt no-new-privileges:true --mount "type=bind,source=C:\Users\ChristianGjedrem\source\repos\copilot-worktrees\ai-hedge-fund\cgjedrem-super-fiesta\outputs\spec005-test-docker-final-1720-6629c68fe9c240b18c0d36cfe62e666e\demo-quality,target=/data" aihf-web-spec005-r1-20261105-1720-ee1441d6e50 --port 8876 --allow-writes
 ```
+
+## Final Docker continuation evidence — 2026-11-05
+
+### Identity and artifact mapping
+
+- Source revision: `cad96a05875efe13d229a8a079d2348ed6d0cf95` on
+  `cgjedrem-super-fiesta`; source worktree was clean at build. The documentation/evidence
+  commit below the image source changes no Python, frontend, Dockerfile or Compose behavior.
+- Build command: `docker build --progress=plain --file Dockerfile.web --tag aihf-web-spec005-r1-cad96a0-8875cf1 .`
+- Build observation: `2026-11-05T19:24:08.3366748+01:00`–`19:24:52.8510996+01:00`;
+  exit 0, **44.5122 s**.
+- Image: `aihf-web-spec005-r1-cad96a0-8875cf1`, ID
+  `sha256:21582eeedfa316925b6656f4eedcb4dfd0b999062af3d3aa72f84ceaaa9597b6`,
+  Linux/amd64, image-created `2026-11-05T18:24:31.448453995Z` UTC.
+- Baked OCI revision label: `cad96a05875efe13d229a8a079d2348ed6d0cf95`.
+  Baked package-source SHA-256:
+  `8875cf13798d0b6f8468bba97ab3e7f4a21eb48ccd1f61f951b30cd94026d815`.
+- Environment: Windows 11 build 26200; Docker Desktop 29.9.2, Linux/amd64;
+  Compose 5.6.1. Synthetic Docker Desktop ext4 named volumes only. No provider, broker,
+  paid endpoint, live market data, actual fund or production root was used.
+
+### Evidence rows
+
+| Row | Time / duration | Scenario and provenance | Expected / observed | Result |
+|---|---|---|---|---|
+| Final image build | `2026-11-05T19:24:08.3366748+01:00`–`2026-11-05T19:24:52.8510996+01:00`; **44.5122 s** | Exact `docker build` command above; source-to-image identity and baked labels recorded above. | Image built successfully; ID and labels match source revision/package digest. | **PASS — build only** |
+| Final Compose merge | `2026-11-05T19:52:45.5403224+01:00`–`2026-11-05T19:52:46.0710415+01:00`; **0.528331 s** | `docker compose -f docker-compose.yml -f docker-compose.linux.yml --profile web --profile web-operator --profile tui --profile tui-web config --format json`; env: `AIHF_DATA_ROOT=/tmp/spec005-compose-config-only`, baked revision/digest supplied as build inputs; PowerShell assertions. | 13/13 checks: read-only `web`, writable operator `/data`, read-only image, host network, explicit flags, no bridge ports/networks, retained TUI services, literal-loopback Ollama setting, `CAP_DROP=ALL` and `no-new-privileges`. | **PASS — configuration only** |
+| Final-image runtime matrix | Exact timezone start/end, full command invocation and per-check durations not retained in the current evidence record; outcomes are summarized below. | Implementation-owner runtime observation on the final image; `--network none`, no published ports, read-only image rootfs, dropped capabilities, `no-new-privileges`, tmpfs `/tmp`, synthetic ext4 volume. | The observed outcomes were positive, but required timestamp/provenance fields are incomplete. | **INCONCLUSIVE — not a formal acceptance PASS** |
+| Final targeted Python regression | `2026-11-05T20:01:02.7436917+01:00`–`2026-11-05T20:05:59.4019964+01:00`; **293.92 s pytest**, **296.6548349 s process**. | Source revision `cad96a05875efe13d229a8a079d2348ed6d0cf95`; immutable source snapshot `HEAD:hedge_fund` tree `36ad8b23874224ca3883bd6f6b05686d7c5ef145`; Python 3.11.15 / pytest 7.4.4; `Windows-10-10.0.26200-SP0`; synthetic fixtures and fakes. Exact selector below. | Ten modules, **302 passed**, exit 0. | **PASS — targeted unit/fake tests only; not full suite** |
+| Python style | Black `2026-11-05T20:08:09.5697509+01:00`–`2026-11-05T20:08:10.1517368+01:00`, **0.579279 s**; isort `2026-11-05T20:08:22.2553086+01:00`–`2026-11-05T20:08:22.6204871+01:00`, **0.3626526 s**; Flake8 `2026-11-05T20:08:09.5427636+01:00`–`2026-11-05T20:08:11.2700414+01:00`, **1.7238262 s**. | Revision and source snapshot above; repository-configured tools on all 13 task-changed Python files. Exact commands below. | Black, isort and Flake8 exited 0. | **PASS — static style only** |
+| Synthetic credential log scan | `2026-11-05T19:47:20.2135310+01:00`–`2026-11-05T19:47:20.8711177+01:00`; **0.6575867 s**. | `docker logs` for the exact three final-image containers; 16 lines inspected. | Unique synthetic credential sentinel absent from logs. API settings/status non-disclosure is a separate observation with incomplete runtime provenance. | **PASS — log scan only** |
+| Owned resource cleanup | `2026-11-05T19:47:46.7461202+01:00`–`2026-11-05T19:48:34.1820983+01:00`; **47.4359781 s**. | Exact container IDs and volume names listed in `implementation-progress.md`; ownership and mounts inspected before stop. | Four task-owned containers and three task-owned synthetic volumes removed; final image retained. | **PASS — owned resources only** |
+| Final cleanup and image identity | `2026-11-05T19:59:24.1365443+01:00`–`2026-11-05T19:59:25.9085009+01:00`; **1.7719566 s**. | Exact-ID `docker inspect`, exact-name `docker volume inspect`, `docker image inspect` on retained final tag. | Four owned containers absent, three owned volumes absent; image ID, revision and package-source labels match the mapping above. | **PASS — final state** |
+| Final retained image/resource recheck | `2026-11-05T20:13:29.3788001+01:00`–`2026-11-05T20:13:31.0562602+01:00`; **1.6774601 s**. | `docker image inspect aihf-web-spec005-r1-cad96a0-8875cf1`; exact-ID `docker ps -a -q --filter id=...` and exact-name `docker volume ls -q --filter name=...` for the four IDs and three names in `implementation-progress.md`; PowerShell JSON/absence checks. | ID `sha256:21582eeedfa316925b6656f4eedcb4dfd0b999062af3d3aa72f84ceaaa9597b6`, `linux/amd64`, baked revision/digest match; four owned container IDs and three volume names absent; exit 0. | **PASS — read-only identity/cleanup recheck** |
+
+### Timestamped Python and style checks
+
+- Source revision: `cad96a05875efe13d229a8a079d2348ed6d0cf95`; immutable package/test
+  snapshot: `git rev-parse HEAD:hedge_fund` →
+  `36ad8b23874224ca3883bd6f6b05686d7c5ef145`. The worktree package subtree was clean;
+  tests imported the source tree, not a wheel or container.
+- Environment: Python 3.11.15, pytest 7.4.4,
+  `C:\Users\ChristianGjedrem\AppData\Local\pypoetry\Cache\virtualenvs\aihf-WidgQWGy-py3.11\Scripts\python.exe`;
+  `platform.platform()` returned `Windows-10-10.0.26200-SP0`.
+- Exact test command, exit 0:
+  `C:\Users\ChristianGjedrem\AppData\Local\pypoetry\Cache\virtualenvs\aihf-WidgQWGy-py3.11\Scripts\python.exe -m pytest -q --tb=short hedge_fund/paper/test_ledger.py hedge_fund/pipeline/test_session_build_identity.py hedge_fund/runtime/test_build_identity.py hedge_fund/test_run.py hedge_fund/tui/test_paper.py hedge_fund/web/test_app.py hedge_fund/web/test_main.py hedge_fund/web/test_reports.py hedge_fund/web/test_services.py hedge_fund/web/test_write_authority.py`
+- Result: **302 passed in 293.92 s**; PowerShell process elapsed **296.6548349 s**.
+  Start `2026-11-05T20:01:02.7436917+01:00`; end
+  `2026-11-05T20:05:59.4019964+01:00`.
+- Style commands ran on these 13 task-changed files:
+  `hedge_fund/paper/ledger.py`, `hedge_fund/pipeline/session.py`,
+  `hedge_fund/pipeline/test_session_build_identity.py`,
+  `hedge_fund/runtime/build_identity.py`, `hedge_fund/runtime/test_build_identity.py`,
+  `hedge_fund/test_run.py`, `hedge_fund/tui/test_paper.py`,
+  `hedge_fund/web/__main__.py`, `hedge_fund/web/app.py`,
+  `hedge_fund/web/services.py`, `hedge_fund/web/test_app.py`,
+  `hedge_fund/web/test_main.py`, `hedge_fund/web/test_reports.py`.
+- Exact PowerShell invocations, all exit 0:
+  ```powershell
+  $python = 'C:\Users\ChristianGjedrem\AppData\Local\pypoetry\Cache\virtualenvs\aihf-WidgQWGy-py3.11\Scripts\python.exe'
+  $files = @(
+      'hedge_fund/paper/ledger.py',
+      'hedge_fund/pipeline/session.py',
+      'hedge_fund/pipeline/test_session_build_identity.py',
+      'hedge_fund/runtime/build_identity.py',
+      'hedge_fund/runtime/test_build_identity.py',
+      'hedge_fund/test_run.py',
+      'hedge_fund/tui/test_paper.py',
+      'hedge_fund/web/__main__.py',
+      'hedge_fund/web/app.py',
+      'hedge_fund/web/services.py',
+      'hedge_fund/web/test_app.py',
+      'hedge_fund/web/test_main.py',
+      'hedge_fund/web/test_reports.py'
+  )
+  & $python -m black --check --line-length 420 @files
+  & $python -m isort --check-only @files
+  & $python -m flake8 --ignore=E203,W503 --max-line-length=420 @files
+  ```
+  Black left **13 files unchanged** in **0.579279 s**. Isort 5.13.2 used repository
+  config (`profile=black`, `force_alphabetical_sort_within_sections=true`) and passed
+  in **0.3626526 s**. Flake8 passed in **1.7238262 s**. Exact timezone start/end values
+  are in the Python style evidence row above.
+- An exploratory isort command that manually supplied `--profile black --line-length
+  420` but omitted the repository's alphabetical-sort setting failed. The configured
+  isort command passed; no source files were changed by either check.
+- The earlier **274 passed** selection had no retained selector/time and is not counted
+  as a formal row. The timestamped 302-test selection supersedes it for these modules.
+
+### Runtime observations; incomplete formal provenance
+
+The final image's bounded runtime observations are transcribed here from the preceding
+implementation execution. Their exact command script and timezone-qualified start/end
+timestamps were not retained. Do not upgrade this row to PASS from the prose summary.
+
+- Fresh synthetic ext4 root reached the API. Runtime identity environment overrides did
+  not override the baked revision or package digest.
+- Wrong root-specific trust acknowledgement exited 2 and left a three-file, 1,365-byte
+  synthetic root unchanged; SHA-256
+  `f92595826ad79ed68c5580d97f4ba770b626732a7546c3d2cab5965e222652f0`.
+- Correct offline trust was recorded inside the same container. After same-container
+  restart, PID namespace `pid:[4026532992]` and mount namespace `mnt:[4026532985]`
+  were unchanged; API capability reported writes/network enabled and
+  `operator-trusted-single-writer`.
+- Missing session, missing/bad CSRF, bad Origin and bad Host returned 403. Protected-name
+  create/deploy returned 403 `protected-root`. Synthetic
+  `spec005-runtime-fund` create/deploy returned 201 with universe `SYNTH`.
+- A cooperating process held the synthetic fund deployment lane; duplicate deploy
+  returned 409. Root stayed at 11 files / 3,073 bytes, SHA-256
+  `0b8384dd7ab849ec57101da4409bbba1dc6d91da2c1f3aa9c0fde549046ec681`.
+- A replacement container changed PID/mount namespaces and reported invalid enrollment,
+  unavailable authority, read-only mode and writes/network disabled. Host/Origin and write
+  requests were denied; root stayed at 12 files / 5,165 bytes, SHA-256
+  `7a8c5c2e0312acb0656197ca43b6f1ec7137736dec576737310f3b3f58660f20`.
+- Sequential TUI rendering used a separate synthetic volume after graceful stop of exact
+  web child PID 97. Textual 8.2.8 rendered `HomeScreen` with two menu options and created
+  only `mandates/` plus the expected 2,092-byte `mandates/example.yaml`. The initial
+  exploratory TUI assertion failed because first render creates that example; it is not
+  evidence of a no-write fallback. Same-root cross-namespace TUI use remains untested.
+
+The Linux host-network/browser/Ollama path was checked as Compose configuration only.
+Windows bridge/browser/Ollama, actual funds, FR-044 target operation, NTFS-to-ext4
+relocation, container recreation/rebind, and operator cutover remain unsupported, blocked
+or unverified. RB-5 remains unchecked. Independent QA is pending.

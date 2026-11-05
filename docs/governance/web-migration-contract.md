@@ -59,20 +59,25 @@ as fallback. This supersedes the read-only-observer deployment choice for R1 onl
 relax root trust, local-paper-only actions, provider authorization, filesystem admission or
 operator-only cutover. The container must reuse the root's enrollment and offline
 trusted-single-writer acknowledgement and the existing cooperating-writer locks. No automatic
-enrollment, cross-namespace adoption, or second writer is allowed. The selected path is not
-accepted for existing funds until the final image and supported host filesystem/lifecycle
-pass runtime checks. `web` remains read-only inspection; `web-operator` requires explicit
-`--allow-writes --enable-network`, writable `/data`, and the Linux host-network overlay.
-The host bind and root identity rules do not change. On the current Windows Docker Desktop
-Linux engine, a synthetic Windows bind mounted at `/data` reports `9p` and `RootContext.open`
-denies it; do not widen R3 to make it pass. Docker Desktop ext4 named-volume validation does
-not authorize NTFS-to-ext4 migration or a production-root cutover.
+enrollment, cross-namespace adoption, or second writer is allowed. The final image was
+exercised on disposable synthetic ext4 volumes; observed results are recorded in
+`implementation-evidence.md`. The exact runtime timestamp and full invocation were not
+retained, so formal runtime acceptance remains INCONCLUSIVE. `web` remains read-only
+inspection; `web-operator` requires explicit `--allow-writes --enable-network`, writable
+`/data`, and the Linux host-network overlay. Compose topology assertions passed, but
+host-network/browser/Ollama runtime is untested. The host bind and root identity rules do not
+change. On the current Windows Docker Desktop Linux engine, a synthetic Windows bind mounted
+at `/data` reports `9p` and `RootContext.open` denies it; do not widen R3 to make it pass.
+Docker Desktop ext4 named-volume validation does not authorize NTFS-to-ext4 migration or a
+production-root cutover.
 
 The selected R1 names `watchtower` and `watchtower-weekly` remain protected by FR-044.
 Their operation is blocked pending an explicit user decision; do not remove the root or web
-guard and do not substitute a fixture/agent exception. A new container namespace or build
-identity does not inherit root trust. No rebind, cross-filesystem copy, or upgrade workflow is
-approved. The TUI/ttyd fallback remains installed and must not run as a concurrent writer.
+guard and do not substitute a fixture/agent exception. Final-image observation: same-container
+restart retained namespace identity and trust; a replacement container changed namespace
+identity and remained read-only. No rebind, cross-filesystem copy, or upgrade workflow is
+approved. The TUI/ttyd fallback remains installed and must not run as a concurrent writer;
+sequential TUI rendering on a separate synthetic volume does not prove same-root rebind.
 
 ## 2. Launch, root and exposure boundary
 

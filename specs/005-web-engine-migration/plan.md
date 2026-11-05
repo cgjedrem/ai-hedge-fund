@@ -33,9 +33,11 @@ The historical plan remains the design reference for deferred work.
 - **Acceptance:** Release 1 capabilities R1-01 to R1-09 in `spec.md`, closed through the
   bounded backlog RB-1 to RB-7 in `tasks.md`. The user selected one writable, single-user
   Docker web desk for RB-5. Compose now separates read-only inspection from explicit
-  operator writes and selects Linux host networking; final-image synthetic ext4 validation
-  remains pending. Existing protected-name operation, Windows NTFS relocation and
-  container-replacement workflow remain blocked.
+  operator writes and selects Linux host networking. The final image was exercised on
+  disposable synthetic ext4 volumes; observed runtime outcomes are recorded, but the
+  formal evidence row is INCONCLUSIVE because the exact runtime timestamp and full
+  invocation were not retained. Existing protected-name operation, Windows NTFS relocation
+  and container-replacement workflow remain blocked.
 - **Gate deviation:** no new red-team or plan-review gate was run for this narrowing. It is
   user-directed and recorded here and in the PR body.
 
@@ -49,13 +51,23 @@ Root enrollment, offline operator trust and cooperating-writer admission remain 
 neither a mount nor a Compose profile grants authority. The operator-only cutover remains
 unperformed.
 
+Final image `aihf-web-spec005-r1-cad96a0-8875cf1` is
+`sha256:21582eeedfa316925b6656f4eedcb4dfd0b999062af3d3aa72f84ceaaa9597b6`, built from
+source revision `cad96a05875efe13d229a8a079d2348ed6d0cf95` with baked package digest
+`8875cf13798d0b6f8468bba97ab3e7f4a21eb48ccd1f61f951b30cd94026d815`. Bounded synthetic
+ext4 observations include successful service/API startup, trusted write after explicit
+offline acknowledgement, same-container restart retaining namespace identity, and a new
+container failing closed as read-only. The image was also used for synthetic write, lock,
+secret-boundary and sequential TUI checks. Runtime timestamps and the full invocation were
+not retained in the current evidence record; its formal result is INCONCLUSIVE.
+
 In the current Windows Docker Desktop 29.9.2 Linux/amd64 environment, a temporary synthetic
 Windows bind mounted at `/data` reports filesystem type `9p` and `fstatfs` magic
 `0x01021997`; `RootContext.open('/data')` denies it because only local NTFS or ext4 is
-supported. A Docker Desktop ext4 named volume may be used for disposable synthetic runtime
-validation, not as evidence for NTFS-to-ext4 migration. Same-container restart and new-
-container identity must be measured on the final image; identity changes remain fail-closed,
-with no approved rebind or upgrade workflow.
+supported. A Docker Desktop ext4 named volume is permitted for disposable synthetic runtime
+validation only, not as evidence for NTFS-to-ext4 migration. The Linux host-network/browser/
+Ollama topology was checked as Compose configuration only; it was not exercised end-to-end.
+Identity changes remain fail-closed, with no approved rebind or upgrade workflow.
 
 FR-044 still denies `watchtower` and `watchtower-weekly` in root and web guards. Target-fund
 operation remains **BLOCKED** pending an explicit user decision; no fixture/agent exception
@@ -92,7 +104,8 @@ namespace/network filesystem. OS locks do not exclude unaware writers.
 and TypeScript build; black 420/isort/flake8; synthetic fakes beneath production guards.
 **Target Platform:** Windows/Linux hosts; one host-loopback-published writable Docker desk
 only on a root filesystem accepted by `RootContext`. Current Windows Docker Desktop bind
-mount evidence is `9p` and denied; Linux/ext4 container acceptance remains unrun.
+mount evidence is `9p` and denied; synthetic ext4 runtime was exercised, while host-network/
+browser/Ollama and existing-fund lifecycle acceptance remain unrun.
 **Project Type:** Local Python CLI/web server plus packaged React SPA.
 **Performance Goals:** SC-009 local acknowledgment/status ≤2 seconds in ≥95% synthetic
 observations excluding provider computation; bounded jobs, diagnostics and polling.
