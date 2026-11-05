@@ -5,7 +5,11 @@ from types import ModuleType
 
 import pytest
 
-from hedge_fund.runtime.build_identity import bake_build_identity, baked_build_identity, source_sha256
+from hedge_fund.runtime.build_identity import (
+    bake_build_identity,
+    baked_build_identity,
+    source_sha256,
+)
 
 
 def test_source_sha256_uses_relative_paths_and_ignores_generated_files(tmp_path):
