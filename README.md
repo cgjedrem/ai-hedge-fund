@@ -230,28 +230,22 @@ report write already in progress.
 
 #### Docker Compose web service
 
-The web profile builds local assets in a Node stage and runs a Python-only
-image. Compose publishes the service only on host loopback:
+**Status: BLOCKED.** The user selected one writable, single-user Docker paper
+desk, host-loopback-published, with the TUI retained as fallback. The current
+Compose profile is not that operating desk: it mounts `/data` read-only, and
+`Dockerfile.web` passes `--container-bind`, which the launcher currently rejects.
 
-```bash
-docker compose --profile web up --build web
-```
+The current Windows Docker Desktop Linux engine also presents a synthetic
+Windows host bind at `/data` as filesystem type `9p`; `RootContext.open` rejects
+it because only local NTFS/ext4 are supported. Do not work around this by
+weakening filesystem or root-identity checks, and do not mount or cut over real
+funds. Linux/ext4, actual image writes/exclusion, container replacement and
+web-container Ollama compatibility remain unverified. No Docker start/cutover
+command is an accepted Release 1 operating instruction yet.
 
-Open `http://127.0.0.1:8876`. The service reads the mounted local data root and
-starts read-only with network access disabled. Set `AIHF_DATA_ROOT` to an
-existing absolute data root before running Compose; for example:
-
-```bash
-export AIHF_DATA_ROOT="$PWD/.aihf-demo-data"
-mkdir -p "$AIHF_DATA_ROOT"
-```
-
-Do not publish this port on a non-loopback interface. On Linux, the override keeps the same loopback port
-mapping. The web observer remains read-only and does not access host Ollama:
-
-```bash
-docker compose -f docker-compose.yml -f docker-compose.linux.yml --profile web up --build web
-```
+Keep the TUI fallback. Do not let a TUI/CLI writer and a trusted Docker writer
+operate on the same fund concurrently. The operator alone performs any later
+real-root cutover after the Docker path is supported and independently accepted.
 
 ### Mandate cadence
 
@@ -368,11 +362,12 @@ configuration. On other Docker hosts, use the native CLI with
 
 ```bash
 docker compose run --rm tui
-docker compose --profile web up --build web
 ```
 
-The web profile mounts the same root read-only. Rebuild only the selected
-service after code changes. Do not run one paper fund from multiple processes.
+The web Compose profile is not an accepted R1 operating path. Its read-only
+mount cannot perform the selected paper operations, and the current image startup
+is blocked as documented above. Do not start it as an operating desk. Do not run
+one paper fund from multiple processes.
 
 #### Local models in containers
 
@@ -392,8 +387,9 @@ docker compose -f docker-compose.yml -f docker-compose.linux.yml --profile runne
 docker compose -f docker-compose.yml -f docker-compose.linux.yml run --rm tui   # terminal TUI
 ```
 
-The web observer remains host-loopback-published. Remote access, reverse proxies,
-and non-loopback publication are unsupported. The legacy browser TUI also remains
+The current web profile is not an accepted R1 operating path; its writable
+replacement is blocked as described above. Remote access, reverse proxies and
+non-loopback publication remain unsupported. The legacy browser TUI remains
 local-only.
 
 ## Development

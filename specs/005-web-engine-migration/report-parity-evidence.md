@@ -1,6 +1,24 @@
 # Bounded read-only session-report parity evidence
 
-## Current integration on the reviewed T145 PR8 tip
+## Current continuation: verified persisted-byte downloads (2026-11-05)
+
+**Status:** PASS for the synthetic report download API and owned browser checks only.
+This does not complete report tasks, RB-5, Release 1 or independent QA.
+
+| Field | Evidence |
+|---|---|
+| Initial API/browser source identity | Base revision `3498ef8a7a1751917b16936c9219dda70dd7fa74`; six changed source/test files, 375,701 bytes, snapshot SHA-256 `90cb132f20f18aa5131f866d87e22af33d3af3f63fca496b0a0979b077e6dda5` using sorted slash-normalized path + NUL + full bytes + NUL. |
+| Final-source regression rerun | At `2026-11-05T17:13:08.8611670+01:00`, the TUI/report command passed **40 tests in 79.43 s**, process elapsed 82.6465 s, exit 0. Final six-file source/test SHA-256 `ee1441d6e50a58093b1c5ce06ffc114734feaf2ee9eb2c5ecd5f92d3f0506c15`; only the `Ledger.replay` docstring differs from the initial API/browser source identity. |
+| Artifact | Source-run backend; owned Vite bundle SHA-256 `ae28e5180ddf67269bc02034228223741471981cf6af3e13bde27c5f40eafc79` (3 files, 1,040,584 bytes). Separate Docker probe image `sha256:668bd2945183b4ad1e8d350d1d5a43c2efcc02c82e83b6518325e1a5866b9ec0` was built, but its startup/root-admission checks failed closed before the report API could run; it is not the report-test server artifact. No installed wheel. |
+| Environment | Windows 11 build 26200 / NTFS, Python 3.11.15 / pytest 7.4.4, Node 22.13.1 / npm 10.9.2, Vite 6.4.5, owned Chromium browser. |
+| Scenario | Synthetic `demo-quality` ledger only. The persisted session JSON is rewritten with CRLF before the fixture digest; API performs full chain replay, verifies the displayed hash, and returns captured record bytes without rewriting the root. |
+| Provenance | Python Developer, direct pytest and owned Playwright commands in this worktree; no real root, provider, broker or external request. Full run records and Docker blocker are in `implementation-progress.md`. |
+| Commands and timing | Backend started `2026-11-05T15:29:23.6974840+01:00`: `C:\Users\ChristianGjedrem\AppData\Local\pypoetry\Cache\virtualenvs\aihf-WidgQWGy-py3.11\Scripts\python.exe -m pytest hedge_fund/web/test_reports.py -q --tb=short`; process elapsed **52.0228 s**. Browser started `2026-11-05T15:30:26.1586491+01:00` from `frontend`: `node .\e2e\run-owned.mjs --reports reports.spec.ts`; process elapsed **108.1182 s**. |
+| Result | Backend **12 passed in 49.65 s**, exit 0. Owned browser **2 passed in 8.5 s**, exit 0. Full persisted report-tree digest `992c0a0f420df549689937346bc7496b6a4c52819e7327a21527b425b38011ba` unchanged before/after browser reads. |
+
+Expected-red evidence: before the byte-preserving path, the CRLF API regression failed (**1 failed in 5.15 s**); the response contained LF bytes while the persisted file contained CRLF. The implementation now captures original bytes during the same verified replay as the `SessionRecord`, and returns those bytes after matching the displayed record hash. It does not normalize or serialize the body a second time. An interim report-suite failure was a test-double mismatch (`Ledger.read` patched while download used `Ledger.read_with_bytes`); after correcting the double, the report file passed. The browser fixture and assertion exercise the persisted CRLF case, not only the LF canonical fixture.
+
+## Prior integration on the reviewed T145 PR8 tip (historical record)
 
 The independently approved report commit
 `5441dcd314c946d941d791bd1983809fa582cf27` is a direct child of
@@ -127,11 +145,12 @@ The bounded implementation now:
   canonical JSON download bound to the displayed record hash.
 
 The implemented routes and error semantics are recorded in
-`contracts\runtime-api.md`. Export uses the exact `SessionRecord` captured by successful
-full ledger replay and its existing `model_dump_json(indent=2)` serializer. It is not the
-presentation projection, and the browser does not parse/rebuild the authoritative JSON.
-Byte equality is proved for the canonical synthetic persisted serialization, not arbitrary
-historical JSON whitespace layouts.
+`contracts\runtime-api.md`. At that earlier source identity, export used the exact
+`SessionRecord` captured by successful full ledger replay and its
+`model_dump_json(indent=2)` serializer; byte equality covered the canonical synthetic
+serialization only. The 2026-11-05 continuation above supersedes that body contract:
+downloads now return the original verified record bytes, preserving CRLF and other stored
+whitespace without reserialization.
 
 ## Reproducible synthetic acceptance
 

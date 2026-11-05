@@ -23,6 +23,8 @@ test.beforeEach(async ({ context }) => {
 
 test("real read-only API renders recorded clamps and downloads exact canonical JSON by keyboard", async ({ page }) => {
   const persisted = readFileSync(persistedPath);
+  expect(persisted.includes(Buffer.from("\r\n"))).toBe(true);
+  expect(persisted.toString("utf8").replaceAll("\r\n", "")).not.toContain("\n");
   const canonical = JSON.parse(persisted.toString("utf8"));
   const requests: { method: string; url: string }[] = [];
   page.on("request", (request) => requests.push({ method: request.method(), url: request.url() }));

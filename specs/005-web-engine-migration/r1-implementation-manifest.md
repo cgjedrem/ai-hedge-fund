@@ -1,6 +1,16 @@
 # Spec005 Release 1 implementation manifest
 
-## Scope and identity
+## Current continuation (2026-11-05)
+
+- Worktree/branch: `cgjedrem-super-fiesta`; base `3498ef8a7a1751917b16936c9219dda70dd7fa74`. Prior implementation commits are unchanged.
+- Scope result: report downloads now return exact ledger bytes captured during verified replay; the TUI report-selection regression uses actual keyboard input. The Docker target is selected but **BLOCKED** on the current Windows Docker Desktop bind filesystem (`9p`) and unverified container-identity lifecycle. No Docker application/compose guard was bypassed, and no operator cutover occurred.
+- Final source/test snapshot: six changed runtime/test files, 375,729 bytes, SHA-256 `ee1441d6e50a58093b1c5ce06ffc114734feaf2ee9eb2c5ecd5f92d3f0506c15`. The full non-TUI runs used prior hash `90cb132f20f18aa5131f866d87e22af33d3af3f63fca496b0a0979b077e6dda5`; only a `Ledger.replay` docstring clarification differs. Final-source TUI/report rerun: **40 passed**. See exact evidence in `implementation-progress.md`.
+- Test status: second full non-TUI suite **2,414 passed, 51 skipped** on the prior docstring wording; final-source TUI/report group **40 passed**; frontend Vitest **223 passed**, owned-browser harness **9 passed**, TypeScript/static checks pass. An earlier full backend run had one synthetic-root WinError 5 during relocation setup; focused rerun and second full run passed, but cause remains unattributed. See exact evidence in `implementation-progress.md`.
+- Current source/test files: `frontend/e2e/reports.spec.ts`, `frontend/e2e/run-owned.mjs`, `hedge_fund/paper/ledger.py`, `hedge_fund/tui/test_paper.py`, `hedge_fund/web/services.py`, `hedge_fund/web/test_reports.py`.
+- Current specification/deployment/evidence changes: `README.md`, `docs/governance/web-migration-contract.md`, `memory.md`, `specs/005-web-engine-migration/contracts/headless-and-deployment.md`, `specs/005-web-engine-migration/contracts/runtime-api.md`, `specs/005-web-engine-migration/implementation-evidence.md`, `specs/005-web-engine-migration/implementation-progress.md`, `specs/005-web-engine-migration/plan.md`, `specs/005-web-engine-migration/r1-implementation-manifest.md`, `specs/005-web-engine-migration/report-parity-evidence.md`, `specs/005-web-engine-migration/spec.md`, and `specs/005-web-engine-migration/tasks.md`.
+- Docker source files remain unchanged. README-inclusive final QA image tag `aihf-web-spec005-r1-20261105-1720-ee1441d6e50`, image ID `sha256:4c78a55ad7ff0e55df9dde3ff5527946163adb5491734037f6d7b2948c9df1e8`, `linux/amd64`. Build passed. Its configured entrypoint exits 2 because `--container-bind` is rejected; overriding that flag reaches `/data` and exits 2 because the Windows bind is `9p` rather than local NTFS/ext4. Final synthetic root digest stayed unchanged and both exact probe containers were removed. Linux/ext4, writable action/exclusion, local-Ollama and container replacement remain unverified. No release-ready claim.
+
+## Prior implementation scope and identity
 
 - Branch: `cgjedrem-shiny-tribble`.
 - Base revision: `8660cc5f93c0fb81a7d1273abfd42b2fddd85f68`.
@@ -8,7 +18,7 @@
 - Source/test snapshot: 38 files, 1,638,124 bytes, SHA-256 `8bd944b98a805c15ea44b5b01d6a1b5b077a628e7ec781b6531be310a34aa7bc`.
 - Snapshot covers sorted UTF-8 repository-relative path + NUL + full file bytes + NUL; excludes evidence documents, `memory.md`, and root `node_modules/`.
 - Implementation preserves the published engine and React UI. No Docker or deployment topology changes.
-- RB-5 remains blocked pending the operator choice between a writable single-writer desk container and a host-run desk with no container writer. The choice changes writer/root topology, validation, and deployment documentation.
+- RB-5 was open at this earlier implementation checkpoint. The user later selected a writable single-writer Docker desk; current implementation remains blocked by the filesystem and container-identity evidence above.
 - Evidence and test outcomes are implementation-owner observations, not independent QA sign-off. See `implementation-progress.md` for timestamped observations, exact commands, results, and remaining limits.
 
 ## Python implementation
@@ -71,5 +81,5 @@
 - RB-3: inspect hash-bound reconciliation receipt checks, Halt/Resume transitions, stale-head rejection, and no retry of ambiguous effects.
 - RB-4: inspect provider defaults, secret handling, and CLI/web SIM denial tests.
 - RB-6: inspect targeted regression tests and the synthetic-root browser lifecycle flow.
-- RB-5: do not mark complete or alter deployment topology until the operator chooses a writer/root model.
+- RB-5: choice is selected but implementation/acceptance is blocked; do not mark complete until supported filesystem, final image, writer exclusion and identity lifecycle have current evidence.
 - Test boundary: synthetic roots and fakes only. No live provider/broker calls, production-root activation, or real-fund writes.

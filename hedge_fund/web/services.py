@@ -1853,13 +1853,28 @@ class DeskService:
     def session_report(self, name: str, session: str) -> dict:
         return self._session_report(self._verified_session_record(name, session))
 
-    def session_report_download(self, name: str, session: str, expected_hash: str) -> str:
-        record = self._verified_session_record(name, session)
+    def session_report_download(self, name: str, session: str, expected_hash: str) -> bytes:
+        record, payload = self._verified_session_record_with_bytes(name, session)
         if record.hash != expected_hash:
             raise ServiceError(409, "Session report changed; reload the report before downloading.", code="stale-preview", current_head=record.hash)
-        return record.model_dump_json(indent=2)
+        return payload
 
     def _verified_session_record(self, name: str, session: str) -> SessionRecord:
+        return self._verified_session_snapshot(name, session, include_bytes=False)[0]
+
+    def _verified_session_record_with_bytes(self, name: str, session: str) -> tuple[SessionRecord, bytes]:
+        record, payload = self._verified_session_snapshot(name, session, include_bytes=True)
+        if payload is None:
+            raise ServiceError(404, "Session report not found.")
+        return record, payload
+
+    def _verified_session_snapshot(
+        self,
+        name: str,
+        session: str,
+        *,
+        include_bytes: bool,
+    ) -> tuple[SessionRecord, bytes | None]:
         normalized = self._validated_name(name)
         if not re.fullmatch(r"\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}:\d{2})?", session):
             raise ServiceError(400, "Session key is invalid.")
@@ -1872,21 +1887,31 @@ class DeskService:
             raise ServiceError(409, f"Paper fund is invalid ({type(exc).__name__}).") from None
         ledger = Ledger(directory)
         record: SessionRecord | None = None
+        payload: bytes | None = None
 
         def capture_verified(candidate: SessionRecord) -> None:
             nonlocal record
             if candidate.session == session:
                 record = candidate
 
+        def capture_verified_bytes(candidate: SessionRecord, data: bytes) -> None:
+            nonlocal record, payload
+            if candidate.session == session:
+                record = candidate
+                payload = data
+
         try:
-            ledger.replay(deployed.spec.capital, full=True, on_verified=capture_verified)
-            if record is None:
+            if include_bytes:
+                ledger.replay(deployed.spec.capital, full=True, on_verified_bytes=capture_verified_bytes)
+            else:
+                ledger.replay(deployed.spec.capital, full=True, on_verified=capture_verified)
+            if record is None or (include_bytes and payload is None):
                 raise ServiceError(404, "Session report not found.")
         except ServiceError:
             raise
         except (LedgerError, OSError, ValueError) as exc:
             raise ServiceError(423, f"Ledger verification failed ({type(exc).__name__}).", code="replay-corrupt") from None
-        return record
+        return record, payload
 
     def paper_scorecard(self, name: str) -> dict:
         snapshot = self.paper_detail(name)

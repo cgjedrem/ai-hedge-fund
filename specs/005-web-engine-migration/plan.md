@@ -27,14 +27,31 @@ The historical plan remains the design reference for deferred work.
   single-writer acknowledgement is operator trust, not OS isolation. Legacy home roots stay
   read-only; cutover is an operator-only offline handover. Ambiguous fills fail closed.
   Loopback/Host/Origin/CSRF/path guards, secret non-disclosure and the free-data default stay.
-- **Deferred, not complete:** TUI/Textual/ttyd retirement; the host-writer/container-observer
-  snapshot split; dual-platform native distributions; SIM custody and provisioning;
+- **Deferred, not complete:** TUI/Textual/ttyd retirement; a separate immutable
+  host-writer/container-observer snapshot architecture; dual-platform native distributions; SIM custody and provisioning;
   archive/restore/replace; large catalogs and exhaustive exports; repeated overlapping review gates.
 - **Acceptance:** Release 1 capabilities R1-01 to R1-09 in `spec.md`, closed through the
-  bounded backlog RB-1 to RB-7 in `tasks.md`. The single Docker path is an open decision,
-  because the current `web` compose profile is a read-only observer.
+  bounded backlog RB-1 to RB-7 in `tasks.md`. The user selected one writable, single-user
+  Docker web desk for RB-5; implementation remains blocked by the current host bind filesystem
+  and container-identity lifecycle evidence.
 - **Gate deviation:** no new red-team or plan-review gate was run for this narrowing. It is
   user-directed and recorded here and in the PR body.
+
+## Docker choice and current blocker (2026-11-05)
+
+The user selected a writable, single-user Docker paper desk, host-loopback publication, and
+the retained TUI fallback. The selected container must use the canonical root trust and
+cooperating-writer admission; neither a mount nor `--container-bind` grants write authority.
+The operator-only cutover remains unperformed.
+
+In the current Windows Docker Desktop 29.9.2 Linux/amd64 environment, a temporary synthetic
+Windows bind mounted at `/data` reports filesystem type `9p` and `fstatfs` magic
+`0x01021997`. `RootContext.open('/data')` denies it because only local NTFS or ext4 is
+supported. A same-container stop/start retained PID/mount namespace identities; a newly
+created container changed both. No filesystem guard or root-identity binding was weakened.
+Linux/ext4 Docker runtime, final-image mutation, local Ollama transport, and container
+replacement behavior remain unverified. RB-5 is selected but **BLOCKED**; this plan does not
+authorize cutover.
 
 ## Summary
 
@@ -45,12 +62,14 @@ configuration, durable operation/confirmation sidecars and reconciliation-aware 
 Then add local-paper execution/lifecycle, full validated editor, authorized valuation,
 research progress/reporting and packaging before retiring TUI and Docker ttyd.
 
-The host is writable driver; container is read-only observer, with no cross-namespace mutation.
-SIM web control is expressly exempted; non-TUI headless SIM remains under exclusive account
-binding. Free default is an intentional compatibility change. Cloud/paid scheduled loops
-stay prohibited; bounded free/local scheduled paper is authorized by the user-directed
-constitution amendment. All 15 [red-team findings](red-team-findings-2026-10-31.md) have
-normative forward resolutions, not implemented/runtime closure.
+The host-writer/read-only-observer split is the historical full-migration target, not the
+selected Release 1 deployment. Release 1 selects one writable, identity-bound Docker web
+desk; cross-namespace runner stop/adoption remains unsupported. SIM web control is expressly
+exempted; non-TUI headless SIM remains under exclusive account binding. Free default is an
+intentional compatibility change. Cloud/paid scheduled loops stay prohibited; bounded
+free/local scheduled paper is authorized by the user-directed constitution amendment. All
+15 [red-team findings](red-team-findings-2026-10-31.md) have normative forward resolutions,
+not implemented/runtime closure.
 
 ## Technical Context
 
@@ -63,8 +82,9 @@ journals and participating-writer OS locks. Local NTFS/ext4 only, no shared
 namespace/network filesystem. OS locks do not exclude unaware writers.
 **Testing:** Co-located pytest; existing frontend Vitest/Testing Library/Playwright scripts
 and TypeScript build; black 420/isort/flake8; synthetic fakes beneath production guards.
-**Target Platform:** Windows/Linux hosts; read-only host-loopback-mapped container observer.
-Both host platforms require actual runtime evidence, never inferred from static source.
+**Target Platform:** Windows/Linux hosts; one host-loopback-published writable Docker desk
+only on a root filesystem accepted by `RootContext`. Current Windows Docker Desktop bind
+mount evidence is `9p` and denied; Linux/ext4 container acceptance remains unrun.
 **Project Type:** Local Python CLI/web server plus packaged React SPA.
 **Performance Goals:** SC-009 local acknowledgment/status ≤2 seconds in ≥95% synthetic
 observations excluding provider computation; bounded jobs, diagnostics and polling.

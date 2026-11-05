@@ -171,10 +171,11 @@ The existing paper-resource spelling is retained for this partial read-only slic
   its stored decision and mandate. Requested pre-risk and final post-risk weights remain
   distinct; executed clamps and limits come from the separate stored execution record.
 - GET `/api/paper/{name}/sessions/{session}/download?expected_hash={displayed_record_hash}`
-  returns the complete canonical `SessionRecord` JSON, not the display projection.
-  The server serializes the exact record captured by full ledger replay using the existing
-  canonical serializer. The browser follows a native link and performs no numeric
-  parse/stringify or authoritative-record round trip.
+  returns the complete persisted `SessionRecord` JSON bytes, not the display projection.
+  The server captures the bytes with the parsed record during full ledger replay, verifies
+  the displayed record hash, and returns those same bytes without normalization,
+  reserialization or a second ledger read. The browser follows a native link and performs
+  no numeric parse/stringify or authoritative-record round trip.
 - A changed record hash returns 409 `stale-preview` and requires reopening the report;
   malformed/missing hashes return 400 `invalid-request`, and corrupt replay returns
   423 `replay-corrupt`. Only successful downloads receive an attachment header.

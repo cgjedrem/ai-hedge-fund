@@ -4,12 +4,13 @@
 remain canonical except the expressly documented safety incompatibilities. No scripts,
 compose, entrypoints or provider defaults are changed by the planning PR.
 
-**Release 1 scope (2026-11-04, user-directed):** Release 1 keeps the TUI entrypoint as a
-fallback and retains all headless commands. It needs exactly one documented Docker path for
-the web desk. That choice is open: the current `web` compose profile mounts `/data` read-only
-(an observer), so it cannot perform Release 1 mutations. Observer snapshot topology, ttyd
-removal and dual-platform packaged distributions are deferred. The real funds' move from the
-legacy home root uses the offline handover below and is performed only by the operator.
+**Release 1 scope (user-directed, 2026-11-04 and 2026-11-05):** Release 1 keeps the TUI
+entrypoint as a fallback and retains all headless commands. The selected Docker path is one
+writable, single-user paper desk, published only on host loopback, reusing canonical root
+trust and cooperating-writer admission. This resolves the RB-5 choice but not implementation
+acceptance. The separate observer-snapshot architecture, TUI/ttyd retirement and dual-platform
+packaged distributions remain deferred. The real funds' move from the legacy home root uses
+the offline handover below and is performed only by the operator.
 
 ## Launch and command compatibility
 
@@ -36,7 +37,7 @@ Proposed explicit per-invocation policy flags:
 | `--allow-network` | Enable reviewed allowed providers only for this operation; does not authorize paid usage. |
 | `--authorize-paid`, `--max-cost AMOUNT`, `--max-calls COUNT` | Explicit one-shot/backtest provider/cost authorization; never permitted for scheduled paid/cloud work, never env-implied. |
 | `--expires-at TIME`, `--max-sessions COUNT`, `--max-calls COUNT` | Finite free/local scheduled authorization bound to reviewed deployment/capture/provider set. |
-| `--read-only`, `--container-bind` | Observer-only role and tightly scoped internal-bind carveout; cannot be promoted to writable. |
+| `--read-only`, `--container-bind` | Read-only role or explicit container-interface bind; neither flag grants writes or substitutes for root trust and operator exclusion. |
 
 Exact argparse spelling remains implementation work; normative semantics above must be
 preserved and published commands must be tested, not copied unverified from this proposal.
@@ -93,12 +94,25 @@ model endpoint is literal loopback. Host desk binds loopback. CLI/runner share t
 OS/namespace/device/root identity and admission. Process lifetime is detached from server/
 browser; verified graceful stop only. No system/compose auto-restart for upgraded runners.
 
-Optional container serves packaged read-only observer. Mount only a sanitized observation
-subtree/snapshots read-only, never root credentials/config secrets; if a safe projection cannot
-be exposed, deny observer startup. No providers, mutations or proxy. Internal interface bind
-is allowed only with explicit observer mode and exclusively loopback-published host port.
-No host network mode or remote/public publication. Cross-namespace mutation unsupported.
-Separate writable container deployments are not supported by this migration topology.
+Selected Release 1 topology is one writable, single-user paper desk in Docker. Mount only the
+selected root at `/data`; that mount is writable for canonical ledger, operation and private
+runtime state. Keep the image filesystem read-only, drop capabilities, and publish only to
+host loopback. Do not mount the host home or unrelated credential paths. Credentials already
+stored inside the selected root remain private to the service and must never appear in API
+responses, logs or browser state. Root enrollment, offline trust, immutable capabilities and
+the existing RootOwnerLease, operation-service lease and per-fund admission remain mandatory.
+The operator excludes every other writer while trust is enabled. A TUI fallback does not
+permit a second concurrent writer. No cross-namespace runner stop/adoption, automatic
+enrollment or identity rebind is supported.
+
+The Windows Docker Desktop bind filesystem is not currently supported: a synthetic host
+directory mounted at `/data` reports `9p`, and `RootContext.open` rejects it because only
+local NTFS/ext4 are admitted. Do not bypass the guard. A Linux/ext4 container, final-image
+write/exclusion behavior, container replacement and host-Ollama transport still require
+runtime evidence. The selected Docker path is **BLOCKED**, not an executable instruction.
+The web container must preserve the literal-loopback local-model policy; `host.docker.internal`
+does not authorize Ollama. Do not add a private-address exception or claim web-container
+Ollama compatibility without a bounded, reviewed transport.
 
 Implementation docs/compose must remove hard-coded real/protected deployment names, ttyd
 downloads and `tui`/`tui-web` services, writable runner examples and `restart: unless-stopped`.

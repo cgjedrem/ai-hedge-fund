@@ -108,23 +108,23 @@ def test_canonical_download_refuses_a_corrupt_earlier_record(tmp_path):
     assert tree_digest(root) == before
 
 
-def test_canonical_download_serializes_the_record_captured_by_verified_replay(tmp_path, monkeypatch):
+def test_canonical_download_returns_the_record_bytes_captured_by_verified_replay(tmp_path, monkeypatch):
     root = seed_clamped_report(tmp_path / "reports")
     persisted = (root / "paper" / "demo-quality" / "ledger" / "2024-06-04.json").read_bytes()
-    original_read = Ledger.read
+    original_read = Ledger.read_with_bytes
     reads = 0
 
     def change_on_reread(ledger, session):
         nonlocal reads
-        record = original_read(ledger, session)
+        record, payload = original_read(ledger, session)
         if session == "2024-06-04":
             reads += 1
             if reads > 1:
-                return record.model_copy(update={"nav": -1})
-        return record
+                return record.model_copy(update={"nav": -1}), payload
+        return record, payload
 
     app = create_app(root=root)
-    monkeypatch.setattr(Ledger, "read", change_on_reread)
+    monkeypatch.setattr(Ledger, "read_with_bytes", change_on_reread)
     with TestClient(app, client=("127.0.0.1", 50000)) as client:
         response = client.get(
             "/api/paper/demo-quality/sessions/2024-06-04/download",
@@ -206,4 +206,26 @@ def test_canonical_download_preserves_verified_record_bytes_without_writes(tmp_p
     assert payload["code_version"] == "report-parity-synthetic-v1"
     assert "proposed" not in payload
     assert "trading_cost" not in payload["executed"]
+    assert tree_digest(root) == before
+
+
+def test_canonical_download_preserves_crlf_record_bytes(tmp_path):
+    root = seed_clamped_report(tmp_path / "reports")
+    path = root / "paper" / "demo-quality" / "ledger" / "2024-06-04.json"
+    persisted = path.read_bytes()
+    persisted = persisted.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
+    path.write_bytes(persisted)
+    expected_hash = json.loads(persisted)["hash"]
+    before = tree_digest(root)
+
+    with TestClient(create_app(root=root), client=("127.0.0.1", 50000)) as client:
+        response = client.get(
+            "/api/paper/demo-quality/sessions/2024-06-04/download",
+            params={"expected_hash": expected_hash},
+            headers=LOOPBACK,
+        )
+
+    assert response.status_code == 200
+    assert b"\r\n" in response.content
+    assert response.content == persisted
     assert tree_digest(root) == before

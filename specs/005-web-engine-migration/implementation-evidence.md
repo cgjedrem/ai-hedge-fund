@@ -1907,3 +1907,100 @@ checked; T021 unchecked; T024 unchecked; T027 unchecked**. T027 is unchecked
 because its focused file passed but three of its cases failed in the full
 run; those failures have not been explained. Existing T023/T025/T026/T028
 checkboxes remain unchanged.
+
+## 2026-11-05 report-byte and Docker continuation
+
+**Status:** report byte parity **PASS** for synthetic source/API/browser tests.
+Release 1 implementation remains **PARTIAL**; selected Docker desk **BLOCKED**;
+independent QA and operator cutover pending. No task checkbox was changed here.
+
+### Source and environment
+
+- Worktree/branch: `cgjedrem-super-fiesta`; base `3498ef8a7a1751917b16936c9219dda70dd7fa74`.
+- Test snapshot used for the 15:29–17:05 rows: six changed files, 375,701 bytes;
+  SHA-256 `90cb132f20f18aa5131f866d87e22af33d3af3f63fca496b0a0979b077e6dda5`.
+  Formula: sorted slash-normalized relative path + NUL + full bytes + NUL.
+- Final source/test identity: six changed files, 375,729 bytes; SHA-256
+  `ee1441d6e50a58093b1c5ce06ffc114734feaf2ee9eb2c5ecd5f92d3f0506c15`.
+  Only `Ledger.replay` docstring wording differs from the earlier test snapshot;
+  executable code is unchanged.
+- Environment: Windows 11 build 26200 / NTFS; Python 3.11.15 / pytest 7.4.4;
+  Node 22.13.1 / npm 10.9.2; Vitest 4.1.12; Vite 6.4.5;
+  Docker Desktop 29.9.2, `linux/amd64`.
+- Test data: synthetic `demo-quality` paper root only. No real root/fund,
+  provider, broker, paid request or external runtime request.
+
+### Current measurements
+
+| Timestamp / scope | Status and observed result |
+|---|---|
+| `2026-11-05T15:29:23.6974840+01:00`; report API | **PASS** — `hedge_fund/web/test_reports.py`: **12 passed in 49.65 s**, process elapsed 52.0228 s, exit 0. CRLF persisted ledger bytes returned unchanged from verified replay. |
+| `2026-11-05T15:30:26.1586491+01:00`; owned report browser | **PASS** — `node .\e2e\run-owned.mjs --reports reports.spec.ts` from `frontend`: **2 passed in 8.5 s**, process elapsed 108.1182 s, exit 0. Production bundle SHA-256 `ae28e5180ddf67269bc02034228223741471981cf6af3e13bde27c5f40eafc79`; 3 files / 1,040,584 bytes. Synthetic report-tree hash unchanged. |
+| `2026-11-05T15:37:27.0948848+01:00`; first full backend run | **FAIL / attribution INCONCLUSIVE** — **1 failed, 2,413 passed, 51 skipped in 2,390.20 s**, process elapsed 2,392.6120 s, exit 1. One `test_create_mandate_rejects_duplicate_canonical_name[...]` failed before its assertion: Windows `PermissionError [WinError 5]` during `os.replace` in synthetic-root relocation setup. A bounded Docker filesystem probe overlapped this long run; no link to the failure is established. |
+| `2026-11-05T16:18:07.3538551+01:00`; exact failure node rerun | **PASS** — **1 passed in 2.32 s**, process elapsed 4.7962 s, exit 0. Cause of the prior full-run error remains **unattributed**. |
+| `2026-11-05T16:18:45.0056710+01:00`; second full backend run | **PASS** — `pytest hedge_fund --ignore=hedge_fund/tui -q --tb=short`: **2,414 passed, 51 skipped in 2,255.64 s**, process elapsed 2,258.6230 s, exit 0. The green rerun does not establish a cause for the earlier WinError 5. |
+| `2026-11-05T16:56:47.5349031+01:00`; TUI/report group | **PASS** — `pytest hedge_fund/tui/test_paper.py hedge_fund/web/test_reports.py -q --tb=short`: **40 passed in 85.75 s**, process elapsed 89.3230 s, exit 0. |
+| `2026-11-05T17:00:38.9198613+01:00`; frontend unit tests | **PASS** — package script `npm test` (`vitest run src`): **13 files / 223 tests passed in 24.26 s**, process elapsed 26.6878 s, exit 0. |
+| `2026-11-05T17:01:15.4845708+01:00`; browser harness safety | **PASS** — `npm run test:e2e-safety`: **9 passed**, Node duration 651.4047 ms, process elapsed 1.7330 s, exit 0. |
+| `2026-11-05T17:01:24.9396054+01:00`; TypeScript | **PASS** — `npm exec -- tsc --noEmit`, exit 0, process elapsed 17.7429 s. |
+| `2026-11-05T17:01:57.0782937+01:00`; static checks | **PASS** — Black, isort, configured Flake8, Node syntax and `git diff --check`; all exit 0. |
+| `2026-11-05T17:02:11.5894275+01:00`; `Dockerfile.web` | **PASS — build only** — build exit 0 in 59.9403 s. Image tag `aihf-web-spec005-r1-20261105-1a6159b96b4840d2918262e32d4f178f`; ID/repo digest `sha256:668bd2945183b4ad1e8d350d1d5a43c2efcc02c82e83b6518325e1a5866b9ec0`, `linux/amd64`. TypeScript and Vite production build succeeded; 2,317 modules transformed. |
+| `2026-11-05T17:05:10.5787101+01:00`; image default entrypoint | **BLOCKED** — owned synthetic root; network disabled, no ports. Configured `--container-bind` rejected as `container observer projection is unavailable`; container exit 2. |
+| `2026-11-05T17:05:24.0658523+01:00`; image root-open override | **BLOCKED** — removed only `--container-bind`, supplied `--port 8876 --allow-writes`; `RootContext.open` denied `/data` as `root requires local NTFS or ext4`; container exit 2. Docker mount was `9p`; no app server/API started. Synthetic root had 16 files; tree digest stayed `14ba05231e8448f9401b7e936915f966e87bceb84d06f962ff3ba452e14d65aa`. Both exact containers were removed; synthetic root was removed after another matching digest check; built image retained locally. |
+| `2026-11-05T17:13:08.8611670+01:00`; final-source TUI/report group | **PASS** — `C:\Users\ChristianGjedrem\AppData\Local\pypoetry\Cache\virtualenvs\aihf-WidgQWGy-py3.11\Scripts\python.exe -m pytest hedge_fund/tui/test_paper.py hedge_fund/web/test_reports.py -q --tb=short`: **40 passed in 79.43 s**, process elapsed 82.6465 s, exit 0. Final six-file identity `ee1441d6e50a58093b1c5ce06ffc114734feaf2ee9eb2c5ecd5f92d3f0506c15`; earlier full suite differs only by a `Ledger.replay` docstring clarification. |
+| `2026-11-05T17:14:45.7299788+01:00`; intermediate image before README correction | **PASS — build only** — `docker build --progress=plain --file Dockerfile.web --tag aihf-web-spec005-r1-20261105-1713-ee1441d6e50 .`; exit 0 in 4.6990 s. Image ID/repo digest `sha256:778675c638e6b2033bcf669d70f5682593b91d22f41a620b60cf40ef638359db`, `linux/amd64`, created `2026-11-05T16:14:49.914503749Z`. The image predates the final README command cleanup below. |
+| `2026-11-05T17:16:25.1288294+01:00`; intermediate-image default entrypoint | **BLOCKED** — image `sha256:778675c638e6b2033bcf669d70f5682593b91d22f41a620b60cf40ef638359db`; owned synthetic root, `--network none`, no ports, read-only image rootfs, dropped capabilities, no-new-privileges. Container `0daf0b587b2019ea7c4f8f27f8b6251ba28100c2b86f2d79b0f2c2655838d3c4` rejected `--container-bind` as `container observer projection is unavailable`; exit 2, elapsed 0.8447 s. |
+| `2026-11-05T17:16:27.0453952+01:00`; intermediate-image root-open override | **BLOCKED** — same image/root; container `ebf37d08b91e5a9140f849a2a6c152fc9283dc632ce71536caeb5dbbbfd457b0` used `--port 8876 --allow-writes`, without `--container-bind`; `RootContext.open` denied `/data` as `root requires local NTFS or ext4`, exit 2, elapsed 0.7632 s. Synthetic tree had 16 files / 40,399 bytes; digest `77b489543925478f72ec335ae31b48a807b419502816931e6053fd5c2524d904` unchanged before/after. Both containers were removed by full ID and verified absent; synthetic root was removed by the owned-root cleanup helper. |
+| `2026-11-05T17:24:17.1039712+01:00`; README-inclusive final image | **PASS — build only** — `docker build --progress=plain --file Dockerfile.web --tag aihf-web-spec005-r1-20261105-1720-ee1441d6e50 .`; exit 0 in 3.8389 s. Image ID/repo digest `sha256:4c78a55ad7ff0e55df9dde3ff5527946163adb5491734037f6d7b2948c9df1e8`, `linux/amd64`, created `2026-11-05T16:24:20.597893426Z`. Final README and Python source copied; application/dependency/frontend layers were cached. |
+| `2026-11-05T17:24:39.9564121+01:00`; README-inclusive final-image default entrypoint | **BLOCKED** — image `sha256:4c78a55ad7ff0e55df9dde3ff5527946163adb5491734037f6d7b2948c9df1e8`; owned synthetic root, no network/ports, read-only image rootfs, dropped capabilities, no-new-privileges. Container `722e56faa3e4fdd1f2e16876596cd6f9f157d87052fbf7567ec3cc776402a616` rejected `--container-bind` as `container observer projection is unavailable`; exit 2, elapsed 0.8388 s. |
+| `2026-11-05T17:24:41.6972386+01:00`; README-inclusive final-image root-open override | **BLOCKED** — same image/root; container `7a93a8b462b87417968a95dd05a528cf64abafc52097c3ace33cc77dd6b35d2f` used `--port 8876 --allow-writes`, without `--container-bind`; `RootContext.open` denied `/data` as `root requires local NTFS or ext4`, exit 2, elapsed 0.6031 s. Synthetic tree had 16 files / 40,404 bytes; digest `62642be04d0c702a235bb043790daa8caa59bed71eed6fad322db78bb9882ee4` unchanged before/after. Both containers were removed by full ID and verified absent; synthetic root was removed by the owned-root cleanup helper. |
+| `2026-11-05T17:28:22.3954832+01:00`; final changed-scope static checks | **PASS** — Black `--check` on four Python files, isort `--check-only`, Flake8 `--max-line-length=420 --extend-ignore=E203,W503`, Node syntax and `git diff --check`; all exit 0 in 2.5674 s. Final source/test identity remains `ee1441d6e50a58093b1c5ce06ffc114734feaf2ee9eb2c5ecd5f92d3f0506c15`. |
+
+### Failed attempts, limits and disposition
+
+- `npm exec -- vitest run` was the wrong selector: Vitest discovered Playwright/Node
+  files, reported **223 source tests passed** and eight suite-import errors. No source
+  change followed; configured `npm test` then passed its 223 source tests.
+- Docker image startup never reached a listener. Writable action, same-fund exclusion,
+  stale/ambiguous recovery, Host/Origin behavior inside the container, Linux/ext4,
+  Ollama transport and container replacement remain unverified. TUI regression tests
+  passed; they do not prove a running web container's fallback or coexistence behavior.
+- No cutover, root migration, production trust operation, real funds, provider calls,
+  credentials, or public/host-network container was used. The uniquely tagged image
+  is a build/runtime-probe artifact, not Release 1 acceptance.
+- Final image/runtime rows use the final source/test identity above. The full-suite,
+  frontend, and initial browser rows predate only a docstring-only code edit; no behavior
+  changed after those measurements. The final-source TUI/report group was rerun. The
+  README-only operating-instruction correction was included in the final Docker image.
+- The earlier full-suite WinError 5 remains unexplained. Do not infer a cause from the
+  focused or full green rerun. The independent coordinator QA gate remains pending.
+
+### Intermediate image runtime commands (before README correction)
+
+Image tag `aihf-web-spec005-r1-20261105-1713-ee1441d6e50` resolves to
+`sha256:778675c638e6b2033bcf669d70f5682593b91d22f41a620b60cf40ef638359db`.
+Both commands used a test-owned synthetic bind at
+`C:\Users\ChristianGjedrem\source\repos\copilot-worktrees\ai-hedge-fund\cgjedrem-super-fiesta\outputs\spec005-test-docker-final-f44921a7e9974623b1d64c1331e37760\demo-quality`.
+No network or published ports; rootfs read-only; all capabilities dropped;
+no-new-privileges. Only `/data` was writable.
+
+```powershell
+docker run --name spec005-web-final-default-f44921a7 --network none --read-only --cap-drop ALL --security-opt no-new-privileges:true --mount "type=bind,source=C:\Users\ChristianGjedrem\source\repos\copilot-worktrees\ai-hedge-fund\cgjedrem-super-fiesta\outputs\spec005-test-docker-final-f44921a7e9974623b1d64c1331e37760\demo-quality,target=/data" aihf-web-spec005-r1-20261105-1713-ee1441d6e50
+
+docker run --name spec005-web-final-root-f44921a7 --network none --read-only --cap-drop ALL --security-opt no-new-privileges:true --mount "type=bind,source=C:\Users\ChristianGjedrem\source\repos\copilot-worktrees\ai-hedge-fund\cgjedrem-super-fiesta\outputs\spec005-test-docker-final-f44921a7e9974623b1d64c1331e37760\demo-quality,target=/data" aihf-web-spec005-r1-20261105-1713-ee1441d6e50 --port 8876 --allow-writes
+```
+
+### README-inclusive final image runtime commands
+
+Image tag `aihf-web-spec005-r1-20261105-1720-ee1441d6e50` resolves to
+`sha256:4c78a55ad7ff0e55df9dde3ff5527946163adb5491734037f6d7b2948c9df1e8`.
+Both commands used a test-owned synthetic bind at
+`C:\Users\ChristianGjedrem\source\repos\copilot-worktrees\ai-hedge-fund\cgjedrem-super-fiesta\outputs\spec005-test-docker-final-1720-6629c68fe9c240b18c0d36cfe62e666e\demo-quality`.
+No network or published ports; rootfs read-only; all capabilities dropped;
+no-new-privileges. Only `/data` was writable.
+
+```powershell
+docker run --name spec005-web-final-default-6629c68f --network none --read-only --cap-drop ALL --security-opt no-new-privileges:true --mount "type=bind,source=C:\Users\ChristianGjedrem\source\repos\copilot-worktrees\ai-hedge-fund\cgjedrem-super-fiesta\outputs\spec005-test-docker-final-1720-6629c68fe9c240b18c0d36cfe62e666e\demo-quality,target=/data" aihf-web-spec005-r1-20261105-1720-ee1441d6e50
+
+docker run --name spec005-web-final-root-6629c68f --network none --read-only --cap-drop ALL --security-opt no-new-privileges:true --mount "type=bind,source=C:\Users\ChristianGjedrem\source\repos\copilot-worktrees\ai-hedge-fund\cgjedrem-super-fiesta\outputs\spec005-test-docker-final-1720-6629c68fe9c240b18c0d36cfe62e666e\demo-quality,target=/data" aihf-web-spec005-r1-20261105-1720-ee1441d6e50 --port 8876 --allow-writes
+```

@@ -53,6 +53,17 @@ reading and Assumption 9: SIM browser control is an intentional parity exemption
 web-control coverage. Discovery B12/C09/D07 and all affected SIM rows must record the exemption
 in future trace evidence; never silently claim all 74 capabilities are migrated.
 
+**G5 — Spec005 R1 Docker choice (2026-11-05, user-directed).** Select one writable,
+single-user Docker web desk for paper activity, host-loopback-published, with the TUI retained
+as fallback. This supersedes the read-only-observer deployment choice for R1 only; it does not
+relax root trust, local-paper-only actions, provider authorization, filesystem admission or
+operator-only cutover. The container must reuse the root's enrollment and offline
+trusted-single-writer acknowledgement and the existing cooperating-writer locks. No automatic
+enrollment, cross-namespace adoption, or second writer is allowed. The selected path is not
+accepted until the final image and supported host filesystem/lifecycle pass runtime checks.
+On the current Windows Docker Desktop Linux engine, a synthetic Windows bind mounted at
+`/data` reports `9p` and `RootContext.open` denies it; do not widen R3 to make it pass.
+
 ## 2. Launch, root and exposure boundary
 
 **R1 — LB1.** The writable driver requires an explicit launch root argument fixed before
@@ -79,22 +90,25 @@ until separately evidenced. Deny UNC, SMB/NFS, mapped network drives, cloud-sync
 remote mounts. Unknown filesystem/identity is unsupported. Namespace and filesystem/device
 identity are part of admissibility.
 
-**R4 — LM2/LB2.** One host PID namespace holds write authority per root. Host desk/CLI/
-owned children share admission. Container desk is a read-only observer: read-only state
-mount, no credentials mount/provider calls/root writes (including job/config/cache sidecars),
-workers/runners/lifecycle control or mutation proxy. It reads immutable snapshots, validates
-paired head/snapshot and returns observation conflict rather than an inconsistent view.
-Remove Docker ttyd download, `tui`/`tui-web`, automatic runner services/restart policies
-from supported images/compose examples during implementation. No automatic upgraded-runner
-start/restart. Separate isolated headless container deployments are outside this writable
-topology. Cross-namespace stop/adoption/mutation is unsupported and denied.
+**R4 — LM2/LB2.** One identity-bound writer holds write authority per root. Host
+desk/CLI/owned children share admission when their root identity matches. The selected R1
+Docker desk may be the sole writer only after the same offline trust and root admission checks;
+its `/data` mount holds canonical ledger, operation and private runtime state. No additional
+host-home or credential mount. Root-private credentials remain undisclosed. The operator
+excludes all other writers; a TUI fallback does not permit simultaneous writes. Cross-namespace
+runner stop/adoption remains unsupported. Keep the container image filesystem read-only, drop
+capabilities, and do not automatically enroll or rebind a root after image/container identity
+changes. TUI/Textual/ttyd fallback remains in Release 1; retirement is deferred. No automatic
+upgraded-runner start/restart. The separate observer snapshot architecture is not the selected
+R1 path.
 
-**R5 — LB2.** Host writable desk is loopback-only. Sole bind carveout: explicitly read-only
-container observer binding an internal interface while published exclusively to host loopback.
-Non-loopback publication/host networking and remote/public exposure are unsupported.
-Host/Origin/CSRF checks remain enforced on added routes/channels as applicable. Browser
-protection does not create container write authority. Ordinary examples never use protected
-deployment names, real home mounts or creator port 8765.
+**R5 — LB2.** Native writable desk is loopback-only. The selected container may bind its
+internal interface only when Docker publishes the service exclusively on host loopback and
+the application rejects direct non-owner peers. Host/Origin/CSRF/session checks remain
+enforced for reads and mutations. `--container-bind` never grants write authority; browser
+protection does not create root authority. Non-loopback publication, remote/public exposure
+and an unvalidated host-Ollama transport are unsupported. Ordinary examples never use
+protected deployment names, real home mounts or creator port 8765.
 
 **R6 — LB3.** Remote endpoints require HTTPS, no userinfo/query/fragment secrets, validated
 ports and approved provider host identity. Credentials bind to exact scheme/host/port and

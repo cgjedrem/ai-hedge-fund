@@ -25,7 +25,7 @@
 | R1-05 | Per-fund mutual exclusion and request idempotency for manual, verdict, control and participating headless writers; independent funds stay usable | FR-007, FR-017, FR-063 |
 | R1-06 | Honest post-fill ambiguity: fail closed, halt, surface it, and provide an explicit recovery path; never auto-repeat a fill | FR-017, FR-039 |
 | R1-07 | Loopback-only server, Host/Origin/CSRF/path guards, secret non-disclosure, free-data default; paid providers only by explicit operator enablement | FR-019, FR-021, FR-025, FR-053, FR-054, FR-058 |
-| R1-08 | Exactly one documented Docker deployment path for the web desk | FR-005 (narrowed to one path) |
+| R1-08 | Exactly one documented Docker deployment path for the web desk: the selected single-user writable paper desk, published only on host loopback | FR-005 (narrowed to one path) |
 | R1-09 | Relevant regression and acceptance checks pass on the final artifact; known failures are fixed or explained, never ignored | FR-059 (narrowed), SC-010 (narrowed) |
 
 **Disposition of other historical requirements for Release 1**:
@@ -35,12 +35,16 @@
 - **Deferred**: FR-001 sole driver and no-argument entry; FR-026/FR-027 SIM web and provisioning; FR-041–FR-043 archive/restore/replace; FR-049 large-catalog pagination; FR-051 exhaustive export parity; FR-057 exhaustive A01–F13 acceptance; FR-060–FR-062 retirement and repeated review gates.
 - **Success criteria**: SC-003, SC-005 and SC-009 apply to Release 1 capabilities. SC-001, SC-002 and SC-007 are deferred with retirement. SC-004, SC-006 and SC-008 apply only to Release 1 surfaces. SC-010 is narrowed to R1-09.
 
+**Docker choice and current gate (2026-11-05, user-directed)**: The selected R1 deployment is one writable, single-user Docker web desk for paper activity, published only on host loopback. Keep the TUI as fallback. Reuse root enrollment, offline trusted-single-writer authority, and cooperating admission; `--container-bind` alone never grants writes. This resolves the RB-5 choice, not its implementation or acceptance.
+
+On the current Windows Docker Desktop 29.9.2 Linux/amd64 host, a temporary synthetic Windows directory mounted at `/data` appeared as filesystem type `9p` with `fstatfs` magic `0x01021997`. `RootContext.open('/data')` returned `UnsupportedFilesystemError: root requires local NTFS or ext4`. The filesystem guard remains unchanged. A same-container stop/start retained PID/mount namespace identities; a newly created container changed both. Root binding includes host, namespace, filesystem/device and build identity; recreation is not an implicit rebind. A supported Linux/ext4 Docker deployment, final-image writes, host-Ollama access, and container replacement lifecycle remain unverified. RB-5 is **BLOCKED**, and no writable Docker acceptance is claimed.
+
 **Preserved safety (not relaxed)**: Ordinary cooperating concurrent writers still require fencing through shared admission. Operator trust (FR-063 trusted single-writer) is a declared assumption, **not proof of OS isolation**; unaware or malicious same-account writers remain unfenced. Existing roots stay read-only until the explicit offline handover. Ambiguous fills fail closed. No paid or network calls are made in tests.
 
 **Deferred (excluded from Release 1 acceptance; not complete)**:
 
 - TUI retirement and removal of Textual, ttyd and the TUI entrypoint (US6, FR-039–FR-041, FR-062, SC-007 retirement clauses).
-- Separate observer snapshot architecture for a read-only container (plan's host-writer/container-observer split).
+- Separate immutable snapshot architecture for a read-only observer container; the selected R1 path is the single-user writable Docker desk.
 - Exhaustive dual-platform native distributions and packaged-install acceptance (SC-007 beyond the chosen Docker path).
 - Browser/SIM account custody and provisioning (Assumption 9; SIM remains denied in the web desk).
 - Advanced archive, restore and replace lifecycle (US4, FR-041-style reversible archival beyond existing code).
@@ -49,7 +53,7 @@
 
 Deferred items keep their historical requirements and tasks for a later release. Completed code for deferred items stays in place and is not removed. The release backlog and task-by-task mapping are in [tasks.md](tasks.md#release-1-scope-mapping-and-bounded-backlog-2026-11-04).
 
-**Operator cutover (operator-only, never performed by agents)**: The real funds live under the legacy home root, which is read-only to the web desk. To operate them from the web, the operator deliberately stops the legacy runners, then runs `aihf --root NEW handover inspect-source`, `relocate-from` with the content digest, and `trust-single-writer` with the inventory digest and acknowledgement. The operator must keep every other writer (old CLI, cron, TUI writes, containers) stopped while trust is enabled.
+**Operator cutover (operator-only, never performed by agents)**: The real funds live under the legacy home root, which stays read-only until deliberate offline handover. The operator alone may stop legacy runners, run `aihf --root NEW handover inspect-source`, `relocate-from` with the content digest, and `trust-single-writer` with the inventory digest and acknowledgement, then exclude every other writer while trust is enabled. Do not run these commands against actual funds during this implementation. The selected Docker path remains blocked on the current Windows Docker Desktop bind filesystem; its root and container-identity lifecycle must be supported before a cutover is documented as executable.
 
 **Historical baseline and scope**: `main` at `6443490db64056742fbbe6a18abf92c903c10861`, merged PR #7, is an additive web desk and explicitly not retirement-ready. [Discovery and complete capability disposition](discovery.md) form the scope inventory. Framework names here are user-selected product constraints, not an architecture proposal. No engine algorithm, ledger-schema redesign, real brokerage, historical intraday engine, remote/public web exposure or unrelated defect repair is included.
 

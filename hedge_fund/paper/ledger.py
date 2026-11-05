@@ -381,7 +381,14 @@ class Ledger:
 
     def read(self, session: str) -> SessionRecord:
         try:
-            return SessionRecord.model_validate_json(self.path(session).read_text(encoding="utf-8"))
+            return self.read_with_bytes(session)[0]
+        except (OSError, ValueError) as exc:
+            raise LedgerError(f"{self.path(session)}: cannot read session record: {exc}") from exc
+
+    def read_with_bytes(self, session: str) -> tuple[SessionRecord, bytes]:
+        try:
+            data = self.path(session).read_bytes()
+            return SessionRecord.model_validate_json(data), data
         except (OSError, ValueError) as exc:
             raise LedgerError(f"{self.path(session)}: cannot read session record: {exc}") from exc
 
@@ -488,12 +495,16 @@ class Ledger:
         before: str | None = None,
         full: bool = False,
         on_verified: Callable[[SessionRecord], None] | None = None,
+        on_verified_bytes: Callable[[SessionRecord, bytes], None] | None = None,
     ) -> FundState:
         """Fold the chain into the fund's current state, verifying every link
         it walks. With *before*, stop short of that session: the state the
         fund was in going into it. Starts from the newest trusted checkpoint
         before the stop unless *full*, which walks from the first record.
-        Calls on_verified after each record passes chain checks."""
+        Callbacks run after link checks.
+        Byte callback receives persisted file bytes."""
+        if on_verified_bytes is not None and not callable(on_verified_bytes):
+            raise TypeError("on_verified_bytes must be callable")
         state = FundState.initial(capital)
         sessions = self.sessions()
         if not full:
@@ -504,7 +515,11 @@ class Ledger:
         for session in sessions:
             if before is not None and session >= before:
                 break
-            record = self.read(session)
+            if on_verified_bytes is None:
+                record = self.read(session)
+                raw_record = None
+            else:
+                record, raw_record = self.read_with_bytes(session)
             if record.session != session:
                 raise LedgerError(f"{self.path(session)}: file is named {session} but records {record.session}")
             if record.prev_hash != state.prev_hash:
@@ -514,6 +529,8 @@ class Ledger:
             state = next_state(state, record)
             if on_verified is not None:
                 on_verified(record)
+            if on_verified_bytes is not None:
+                on_verified_bytes(record, raw_record)
         return state.model_copy(update={"halted": self.halted()})
 
     # ---- checkpoints ------------------------------------------------------

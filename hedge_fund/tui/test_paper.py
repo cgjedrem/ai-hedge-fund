@@ -319,26 +319,34 @@ def test_session_report_separates_the_executed_cycle_from_the_new_decision(size,
             footer = render(screen.query_one("#report-foot", Static).content)
             menu = screen.query_one("#report-nav", OptionList)
             ids = [menu.get_option_at_index(i).id for i in range(menu.option_count)]
+
+            async def browse_to(option_id):
+                target = menu.get_option_index(option_id)
+                assert target is not None
+                for _ in range(menu.option_count * 2):
+                    if menu.highlighted == target:
+                        return
+                    await pilot.press("down")
+                    await pilot.pause()
+                raise AssertionError(f"report option {option_id} did not receive keyboard focus")
+
             assert "alpha" in head and "session 2025-01-20" in head
             assert "NAV $100,000.00" in footer
             if what in ("executed", "both"):
                 assert "executed the 2025-01-15 decision (refreshed 2025-01-19)" in head
                 assert "x:sec:orders" in ids and "x:sec:portfolio" in ids
-                menu.highlighted = menu.get_option_index("x:sec:portfolio")
-                await pilot.pause()
+                await browse_to("x:sec:portfolio")
                 assert "Target net" in render(screen.query_one("#detail-pane", Static).content)
             if what in ("decided", "both"):
                 assert "executes next session" in head
                 assert "d:sec:portfolio" in ids and "d:sec:orders" not in ids
-                menu.highlighted = menu.get_option_index("d:sec:portfolio")
-                await pilot.pause()
+                await browse_to("d:sec:portfolio")
                 detail = render(screen.query_one("#detail-pane", Static).content)
                 assert "PROPOSED ALLOCATIONS" in detail and "TEST: +25.00%" in detail
             if what == "neither":
                 assert "valuation only" in head
                 assert ids == [None, "book"]
-                menu.highlighted = menu.get_option_index("book")
-                await pilot.pause()
+                await browse_to("book")
                 assert "flat — no positions" in render(screen.query_one("#detail-pane", Static).content)
 
     asyncio.run(scenario())
