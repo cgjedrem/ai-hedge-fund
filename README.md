@@ -287,12 +287,12 @@ exclude every other writer. Never run the TUI CLI or legacy runner as a second
 writer on that root. The TUI CLI fallback starts only after the web writer stops;
 the browser `tui-web` service is not approved for use.
 
-The final image was exercised against disposable synthetic ext4 volumes. Runtime
-observations and evidence limits are recorded in
-`specs/005-web-engine-migration/implementation-evidence.md`; the exact runtime
-timestamp and full invocation were not retained, so formal runtime acceptance is
-INCONCLUSIVE. This synthetic validation is not support evidence for existing
-funds, root relocation or container recreation.
+Record container build and runtime evidence against the exact source revision,
+image identity, commands, timestamps and synthetic scenario in
+`specs/005-web-engine-migration/implementation-evidence.md`. Synthetic checks do
+not authorize existing-fund cutover, root relocation or container recreation.
+Overall acceptance remains INCONCLUSIVE until every required row has current
+evidence and independent review.
 
 This is not a cutover instruction for existing funds. The existing
 `watchtower`/`watchtower-weekly` roots remain denied by protected-name guards;
