@@ -55,19 +55,12 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="run npm ci and build the React bundle before serving; requires Node.js and npm",
     )
-    parser.add_argument(
-        "--container-bind",
-        action="store_true",
-        help="bind container interfaces; publish only to host loopback",
-    )
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> None:
     parser = _parser()
     args = parser.parse_args(argv)
-    if args.container_bind:
-        parser.error("container observer projection is unavailable")
     if not args.demo and args.root is None:
         parser.error("--root is required unless --demo is selected")
     host = "127.0.0.1"
@@ -142,7 +135,6 @@ def _serve(context: RootContext, args: argparse.Namespace, host: str) -> None:
         network_enabled=args.enable_network,
         demo=args.demo,
         static_dir=_static_directory(),
-        container_bind=args.container_bind,
     )
     uvicorn.run(
         app,

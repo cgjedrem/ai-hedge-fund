@@ -118,13 +118,8 @@ def create_app(
     data_client_factory=None,
     fund_factory=None,
     root_context: RootContext | None = None,
-    container_bind: bool = False,
 ) -> FastAPI:
     """Create a disk-backed app; reads never initialize or mutate the root."""
-    if type(container_bind) is not bool:
-        raise TypeError("container observer mode must be a boolean")
-    if container_bind:
-        raise ValueError("container observer projection is unavailable")
     service = DeskService(
         root,
         allow_writes=allow_writes,
@@ -133,7 +128,6 @@ def create_app(
         data_client_factory=data_client_factory,
         fund_factory=fund_factory,
         root_context=root_context,
-        container_observer=container_bind,
     )
     token = secrets.token_urlsafe(32) if service.allow_writes or service.emergency_halt_available else None
     requested_static = Path(static_dir) if static_dir is not None else Path(__file__).with_name("static")
@@ -149,7 +143,7 @@ def create_app(
     app.state.service = service
     app.state.capability_token = token
     app.state.static_root = static_root
-    app.state.container_observer = container_bind
+    app.state.container_observer = False
     app.state.session_signing_key = secrets.token_bytes(32)
     app.add_event_handler("shutdown", service.close)
 

@@ -263,8 +263,8 @@ def test_second_writable_service_stays_read_only_while_peer_is_active(tmp_path):
     assert not (tmp_path / "paper").exists()
 
 
-def test_container_observer_cannot_be_promoted_by_spoofed_host(tmp_path):
-    with pytest.raises(ValueError, match="projection is unavailable"):
+def test_container_bind_is_not_an_app_mode(tmp_path):
+    with pytest.raises(TypeError, match="container_bind"):
         create_app(root=tmp_path, allow_writes=True, container_bind=True)
 
     assert not (tmp_path / "runtime" / "private").exists()

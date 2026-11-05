@@ -226,21 +226,13 @@ def test_browser_runner_clears_provider_and_proxy_variables():
         assert required <= configured
 
 
-def test_container_bind_is_rejected_and_port_range_is_validated(monkeypatch, capsys):
-    observed = {}
-    monkeypatch.setattr(launcher, "_require_static_bundle", lambda: None)
-
-    def fake_run(*_args, **_kwargs):
-        observed["called"] = True
-
-    monkeypatch.setattr(launcher.uvicorn, "run", fake_run)
-    root = Path(os.environ["HEDGE_FUND_TEST_ROOT"]) / "container-bind-root"
+def test_container_bind_is_not_an_exposed_mode_and_port_range_is_validated(capsys):
+    root = Path(os.environ["HEDGE_FUND_TEST_ROOT"]) / "unsupported-container-mode"
     root.mkdir()
     with pytest.raises(SystemExit) as unavailable:
         launcher.main(["--container-bind", "--port", "8876", "--root", str(root)])
     assert unavailable.value.code == 2
-    assert "container observer projection is unavailable" in capsys.readouterr().err
-    assert not observed
+    assert "unrecognized arguments: --container-bind" in capsys.readouterr().err
     assert not (root / "runtime").exists()
 
     with pytest.raises(SystemExit) as invalid_port:

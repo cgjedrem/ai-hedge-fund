@@ -18,6 +18,12 @@ This does not complete report tasks, RB-5, Release 1 or independent QA.
 
 Expected-red evidence: before the byte-preserving path, the CRLF API regression failed (**1 failed in 5.15 s**); the response contained LF bytes while the persisted file contained CRLF. The implementation now captures original bytes during the same verified replay as the `SessionRecord`, and returns those bytes after matching the displayed record hash. It does not normalize or serialize the body a second time. An interim report-suite failure was a test-double mismatch (`Ledger.read` patched while download used `Ledger.read_with_bytes`); after correcting the double, the report file passed. The browser fixture and assertion exercise the persisted CRLF case, not only the LF canonical fixture.
 
+Hash scope: the displayed record hash covers validated `SessionRecord` semantics,
+not every byte of the JSON source. Direct model validation confirmed unknown JSON
+keys are ignored by `model_dump`; exact-byte downloads can therefore preserve extra
+persisted keys not covered by that semantic hash. This slice does not canonicalize
+or strip those bytes.
+
 ## Prior integration on the reviewed T145 PR8 tip (historical record)
 
 The independently approved report commit

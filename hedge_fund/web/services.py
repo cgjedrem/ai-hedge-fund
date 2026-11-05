@@ -301,14 +301,11 @@ class DeskService:
         data_client_factory: Callable[[], object] | None = None,
         fund_factory: Callable[[FundSpec], Fund] | None = None,
         root_context: RootContext | None = None,
-        container_observer: bool = False,
     ) -> None:
         if type(allow_writes) is not bool or type(network_enabled) is not bool:
             raise TypeError("write and network capabilities must be booleans")
-        if type(demo) is not bool or type(container_observer) is not bool:
+        if type(demo) is not bool:
             raise TypeError("service mode flags must be booleans")
-        if container_observer:
-            raise ValueError("container observer projection is unavailable")
         if root_context is None:
             root_context = RootContext.open(root)
             self._owns_root_context = True
@@ -349,7 +346,7 @@ class DeskService:
                 if owner is not None:
                     owner.close()
                 self.write_unavailable_reason = "private-storage-unverified" if not root_context.verify_private_storage() else "root-owner-unavailable"
-        self.network_enabled = bool(network_enabled and self.allow_writes and not container_observer)
+        self.network_enabled = bool(network_enabled and self.allow_writes)
         self.demo = bool(demo)
         self._data_client_factory = data_client_factory
         self._fund_factory = fund_factory if fund_factory is not None else self._default_fund_factory

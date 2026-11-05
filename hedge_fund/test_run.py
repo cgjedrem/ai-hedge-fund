@@ -493,26 +493,70 @@ def test_documented_cli_examples_include_explicit_root():
     assert all(command.startswith("aihf --root ") for command in commands)
 
 
+class _ComposeLoader(yaml.SafeLoader):
+    pass
+
+
+_ComposeLoader.add_constructor("!reset", lambda loader, node: loader.construct_sequence(node))
+
+
 def test_supported_container_launchers_pass_explicit_root():
     repository = Path(__file__).resolve().parents[1]
     compose = yaml.safe_load((repository / "docker-compose.yml").read_text(encoding="utf-8"))
-    linux_compose = yaml.safe_load((repository / "docker-compose.linux.yml").read_text(encoding="utf-8"))
+    linux_compose = yaml.load(
+        (repository / "docker-compose.linux.yml").read_text(encoding="utf-8"),
+        Loader=_ComposeLoader,
+    )
 
     dockerfile = (repository / "Dockerfile").read_text(encoding="utf-8")
     web_dockerfile = (repository / "Dockerfile.web").read_text(encoding="utf-8")
     assert 'ENTRYPOINT ["aihf", "--root", "/data"]' in dockerfile
     assert 'ENTRYPOINT ["aihf-web", "--root", "/data"]' in web_dockerfile
-    assert 'CMD ["--port", "8876", "--container-bind"]' in web_dockerfile
+    assert 'CMD ["--port", "8876"]' in web_dockerfile
+    assert "container-bind" not in web_dockerfile
+    assert "AIHF_SOURCE_REVISION" in web_dockerfile
+    assert "AIHF_SOURCE_SHA256" in web_dockerfile
+    assert "org.opencontainers.image.revision" in web_dockerfile
+    assert "org.opencontainers.image.source-sha256" in web_dockerfile
     for service_name in ("runner", "runner-weekly", "tui"):
         service = compose["services"][service_name]
         assert service["entrypoint"] == ["aihf", "--root", "/data"]
         assert "--root" not in service.get("command", [])
     web_service = compose["services"]["web"]
     assert web_service["entrypoint"] == ["aihf-web", "--root", "/data"]
-    assert web_service["command"] == ["--port", "8876", "--container-bind"]
+    assert web_service["command"] == ["--port", "8876"]
     assert web_service["ports"] == ["127.0.0.1:8876:8876"]
+    assert web_service["profiles"] == ["web"]
+    assert web_service["volumes"][0]["read_only"] is True
+    assert web_service["read_only"] is True
+    assert web_service["cap_drop"] == ["ALL"]
+    assert "no-new-privileges:true" in web_service["security_opt"]
+    assert web_service["build"]["args"]["AIHF_SOURCE_REVISION"] == "${AIHF_SOURCE_REVISION:-unconfigured}"
+    assert web_service["build"]["args"]["AIHF_SOURCE_SHA256"] == "${AIHF_SOURCE_SHA256:-unconfigured}"
+    assert web_service["image"] == "aihf-web:${AIHF_SOURCE_REVISION:-unconfigured}-${AIHF_SOURCE_SHA256:-unconfigured}"
+    web_operator = compose["services"]["web-operator"]
+    assert web_operator["entrypoint"] == ["aihf-web", "--root", "/data"]
+    assert web_operator["command"] == ["--port", "8876", "--allow-writes", "--enable-network"]
+    assert web_operator["profiles"] == ["web-operator"]
+    assert web_operator["volumes"][0]["target"] == "/data"
+    assert not web_operator["volumes"][0].get("read_only", False)
+    assert web_operator["read_only"] is True
+    assert web_operator["cap_drop"] == ["ALL"]
+    assert "no-new-privileges:true" in web_operator["security_opt"]
+    assert web_operator["build"]["dockerfile"] == "Dockerfile.web"
+    assert web_operator["build"]["args"]["AIHF_SOURCE_REVISION"] == "${AIHF_SOURCE_REVISION:-unconfigured}"
+    assert web_operator["build"]["args"]["AIHF_SOURCE_SHA256"] == "${AIHF_SOURCE_SHA256:-unconfigured}"
+    assert web_operator["image"] == "aihf-web:${AIHF_SOURCE_REVISION:-unconfigured}-${AIHF_SOURCE_SHA256:-unconfigured}"
+    assert "HEDGE_FUND_LLM_ENDPOINT=http://127.0.0.1:11434" in web_operator["environment"]
     assert "--root" in linux_compose["services"]["tui-web"]["entrypoint"]
     assert "/data" in linux_compose["services"]["tui-web"]["entrypoint"]
+    assert linux_compose["services"]["web"]["network_mode"] == "host"
+    assert linux_compose["services"]["web"]["ports"] == []
+    assert linux_compose["services"]["web"]["networks"] == []
+    assert "HEDGE_FUND_LLM_ENDPOINT=http://127.0.0.1:11434" in linux_compose["services"]["web"]["environment"]
+    assert linux_compose["services"]["web-operator"]["network_mode"] == "host"
+    assert linux_compose["services"]["web-operator"]["ports"] == []
+    assert linux_compose["services"]["web-operator"]["networks"] == []
 
 
 def test_makefile_write_targets_require_caller_selected_absolute_root():

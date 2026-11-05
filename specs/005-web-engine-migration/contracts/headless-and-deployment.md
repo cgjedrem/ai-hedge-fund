@@ -37,7 +37,7 @@ Proposed explicit per-invocation policy flags:
 | `--allow-network` | Enable reviewed allowed providers only for this operation; does not authorize paid usage. |
 | `--authorize-paid`, `--max-cost AMOUNT`, `--max-calls COUNT` | Explicit one-shot/backtest provider/cost authorization; never permitted for scheduled paid/cloud work, never env-implied. |
 | `--expires-at TIME`, `--max-sessions COUNT`, `--max-calls COUNT` | Finite free/local scheduled authorization bound to reviewed deployment/capture/provider set. |
-| `--read-only`, `--container-bind` | Read-only role or explicit container-interface bind; neither flag grants writes or substitutes for root trust and operator exclusion. |
+| `--allow-writes` | Explicit web capability; Docker inspection omits it, and operator mode still requires enrolled root trust. No container-bind flag exists. |
 
 Exact argparse spelling remains implementation work; normative semantics above must be
 preserved and published commands must be tested, not copied unverified from this proposal.
@@ -97,28 +97,34 @@ browser; verified graceful stop only. No system/compose auto-restart for upgrade
 Selected Release 1 topology is one writable, single-user paper desk in Docker. Mount only the
 selected root at `/data`; that mount is writable for canonical ledger, operation and private
 runtime state. Keep the image filesystem read-only, drop capabilities, and publish only to
-host loopback. Do not mount the host home or unrelated credential paths. Credentials already
+host loopback. The Compose `web` profile is read-only inspection; `web-operator` explicitly
+enables writes and network capability. Supported browser access uses the Linux host-network
+overlay: app binds literal `127.0.0.1`, and the overlay clears bridge ports/networks. Do not
+accept Docker gateway peers or add a `host.docker.internal` exception. Windows bridge/browser
+and Ollama access remain unsupported. Do not mount the host home or unrelated credential paths. Credentials already
 stored inside the selected root remain private to the service and must never appear in API
 responses, logs or browser state. Root enrollment, offline trust, immutable capabilities and
 the existing RootOwnerLease, operation-service lease and per-fund admission remain mandatory.
 The operator excludes every other writer while trust is enabled. A TUI fallback does not
 permit a second concurrent writer. No cross-namespace runner stop/adoption, automatic
-enrollment or identity rebind is supported.
+enrollment or identity rebind is supported. Image labels and the package code-version stamp
+bind a full source revision and package-source digest; runtime environment values cannot
+override them.
 
 The Windows Docker Desktop bind filesystem is not currently supported: a synthetic host
 directory mounted at `/data` reports `9p`, and `RootContext.open` rejects it because only
-local NTFS/ext4 are admitted. Do not bypass the guard. A Linux/ext4 container, final-image
-write/exclusion behavior, container replacement and host-Ollama transport still require
-runtime evidence. The selected Docker path is **BLOCKED**, not an executable instruction.
-The web container must preserve the literal-loopback local-model policy; `host.docker.internal`
-does not authorize Ollama. Do not add a private-address exception or claim web-container
-Ollama compatibility without a bounded, reviewed transport.
+local NTFS/ext4 are admitted. A Docker Desktop ext4 named volume is permitted for disposable
+synthetic runtime validation only; it does not support NTFS-to-ext4 relocation. New container
+identity/build mismatch denies trust. Same-container restart behavior and recreation denial
+must be checked on the final image. No rebind, cross-filesystem copy, or upgrade workflow is
+approved. FR-044 protected names remain globally denied, so the R1 `watchtower` targets are
+blocked pending a user decision. Never remove the protected-name guards or add fixture/
+agent-specific bypasses.
 
-Implementation docs/compose must remove hard-coded real/protected deployment names, ttyd
-downloads and `tui`/`tui-web` services, writable runner examples and `restart: unless-stopped`.
-Use only synthetic names such as `demo-alpha` and isolated project-owned roots/ports.
-Do not operate existing compose services to validate the migration: current examples remain
-nonconforming until rewritten. Container/Linux runtime is accepted only with actual evidence.
+Keep the TUI and `tui-web` fallback services. Disable competing runner/TUI writers during any
+operator session; fallback use begins only after the web writer stops. Compose examples use
+synthetic names and isolated roots/ports. Do not operate existing compose services or actual
+funds to validate migration. Container/Linux runtime acceptance requires final-image evidence.
 
 ## Filesystem/ownership recovery contract
 

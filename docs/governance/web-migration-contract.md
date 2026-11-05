@@ -60,9 +60,19 @@ relax root trust, local-paper-only actions, provider authorization, filesystem a
 operator-only cutover. The container must reuse the root's enrollment and offline
 trusted-single-writer acknowledgement and the existing cooperating-writer locks. No automatic
 enrollment, cross-namespace adoption, or second writer is allowed. The selected path is not
-accepted until the final image and supported host filesystem/lifecycle pass runtime checks.
-On the current Windows Docker Desktop Linux engine, a synthetic Windows bind mounted at
-`/data` reports `9p` and `RootContext.open` denies it; do not widen R3 to make it pass.
+accepted for existing funds until the final image and supported host filesystem/lifecycle
+pass runtime checks. `web` remains read-only inspection; `web-operator` requires explicit
+`--allow-writes --enable-network`, writable `/data`, and the Linux host-network overlay.
+The host bind and root identity rules do not change. On the current Windows Docker Desktop
+Linux engine, a synthetic Windows bind mounted at `/data` reports `9p` and `RootContext.open`
+denies it; do not widen R3 to make it pass. Docker Desktop ext4 named-volume validation does
+not authorize NTFS-to-ext4 migration or a production-root cutover.
+
+The selected R1 names `watchtower` and `watchtower-weekly` remain protected by FR-044.
+Their operation is blocked pending an explicit user decision; do not remove the root or web
+guard and do not substitute a fixture/agent exception. A new container namespace or build
+identity does not inherit root trust. No rebind, cross-filesystem copy, or upgrade workflow is
+approved. The TUI/ttyd fallback remains installed and must not run as a concurrent writer.
 
 ## 2. Launch, root and exposure boundary
 
@@ -102,13 +112,14 @@ changes. TUI/Textual/ttyd fallback remains in Release 1; retirement is deferred.
 upgraded-runner start/restart. The separate observer snapshot architecture is not the selected
 R1 path.
 
-**R5 — LB2.** Native writable desk is loopback-only. The selected container may bind its
-internal interface only when Docker publishes the service exclusively on host loopback and
-the application rejects direct non-owner peers. Host/Origin/CSRF/session checks remain
-enforced for reads and mutations. `--container-bind` never grants write authority; browser
-protection does not create root authority. Non-loopback publication, remote/public exposure
-and an unvalidated host-Ollama transport are unsupported. Ordinary examples never use
-protected deployment names, real home mounts or creator port 8765.
+**R5 — LB2.** Native writable desk is loopback-only. Docker web services use the Linux
+host-network overlay; the application remains bound to literal `127.0.0.1`, with no bridge
+port or network. Host/Origin/CSRF/session checks remain enforced for reads and mutations,
+and mutations require a loopback peer. No container-bind flag exists or grants authority.
+Windows Docker bridge/gateway access, non-loopback publication, remote/public exposure and
+an unvalidated host-Ollama transport are unsupported. `host.docker.internal` is not local
+model permission. Ordinary examples never use protected deployment names, real home mounts
+or creator port 8765.
 
 **R6 — LB3.** Remote endpoints require HTTPS, no userinfo/query/fragment secrets, validated
 ports and approved provider host identity. Credentials bind to exact scheme/host/port and

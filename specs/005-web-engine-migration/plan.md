@@ -32,26 +32,34 @@ The historical plan remains the design reference for deferred work.
   archive/restore/replace; large catalogs and exhaustive exports; repeated overlapping review gates.
 - **Acceptance:** Release 1 capabilities R1-01 to R1-09 in `spec.md`, closed through the
   bounded backlog RB-1 to RB-7 in `tasks.md`. The user selected one writable, single-user
-  Docker web desk for RB-5; implementation remains blocked by the current host bind filesystem
-  and container-identity lifecycle evidence.
+  Docker web desk for RB-5. Compose now separates read-only inspection from explicit
+  operator writes and selects Linux host networking; final-image synthetic ext4 validation
+  remains pending. Existing protected-name operation, Windows NTFS relocation and
+  container-replacement workflow remain blocked.
 - **Gate deviation:** no new red-team or plan-review gate was run for this narrowing. It is
   user-directed and recorded here and in the PR body.
 
-## Docker choice and current blocker (2026-11-05)
+## Docker choice and current blockers (2026-11-05)
 
-The user selected a writable, single-user Docker paper desk, host-loopback publication, and
-the retained TUI fallback. The selected container must use the canonical root trust and
-cooperating-writer admission; neither a mount nor `--container-bind` grants write authority.
-The operator-only cutover remains unperformed.
+The user selected a writable, single-user Docker paper desk, host-loopback access, and the
+retained TUI fallback. Read-only inspection is the default profile; `web-operator` explicitly
+enables writes/network capability and is supported only with the Linux host-network overlay.
+The image source revision and package-source digest are verified and baked at build time.
+Root enrollment, offline operator trust and cooperating-writer admission remain mandatory;
+neither a mount nor a Compose profile grants authority. The operator-only cutover remains
+unperformed.
 
 In the current Windows Docker Desktop 29.9.2 Linux/amd64 environment, a temporary synthetic
 Windows bind mounted at `/data` reports filesystem type `9p` and `fstatfs` magic
-`0x01021997`. `RootContext.open('/data')` denies it because only local NTFS or ext4 is
-supported. A same-container stop/start retained PID/mount namespace identities; a newly
-created container changed both. No filesystem guard or root-identity binding was weakened.
-Linux/ext4 Docker runtime, final-image mutation, local Ollama transport, and container
-replacement behavior remain unverified. RB-5 is selected but **BLOCKED**; this plan does not
-authorize cutover.
+`0x01021997`; `RootContext.open('/data')` denies it because only local NTFS or ext4 is
+supported. A Docker Desktop ext4 named volume may be used for disposable synthetic runtime
+validation, not as evidence for NTFS-to-ext4 migration. Same-container restart and new-
+container identity must be measured on the final image; identity changes remain fail-closed,
+with no approved rebind or upgrade workflow.
+
+FR-044 still denies `watchtower` and `watchtower-weekly` in root and web guards. Target-fund
+operation remains **BLOCKED** pending an explicit user decision; no fixture/agent exception
+or guard removal is authorized. No real funds, legacy roots or cutover have been used.
 
 ## Summary
 

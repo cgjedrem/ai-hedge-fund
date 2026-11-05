@@ -46,6 +46,7 @@ from hedge_fund.llm import DEFAULT_MODEL
 from hedge_fund.pipeline.clock import Clock, clock_for
 from hedge_fund.pipeline.models import CycleRecord, DecisionRecord
 from hedge_fund.pipeline.stages import assess_fund, execute_decision
+from hedge_fund.runtime.build_identity import baked_build_identity
 from hedge_fund.signals import LLMAgent
 
 __all__ = ["Cadence"]  # re-exported for callers that typed against the engine
@@ -317,11 +318,16 @@ def mandate_hash(spec: FundSpec) -> str:
 
 @lru_cache(maxsize=1)
 def code_version() -> str:
-    """Package version, plus the git commit when running from a checkout."""
+    """Package version with baked image identity or checkout revision."""
     try:
         version = _version("aihf")
     except PackageNotFoundError:
         version = "dev"
+    identity = baked_build_identity()
+    if identity is not None:
+        revision, source_hash = identity
+        return f"{version}+g{revision}.sha256.{source_hash}"
+
     root = Path(__file__).resolve().parents[2]
     try:
         sha = subprocess.run(

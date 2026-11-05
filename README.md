@@ -230,22 +230,55 @@ report write already in progress.
 
 #### Docker Compose web service
 
-**Status: BLOCKED.** The user selected one writable, single-user Docker paper
-desk, host-loopback-published, with the TUI retained as fallback. The current
-Compose profile is not that operating desk: it mounts `/data` read-only, and
-`Dockerfile.web` passes `--container-bind`, which the launcher currently rejects.
+The Compose package has separate profiles: `web` is read-only inspection;
+`web-operator` is the explicit writable paper desk. Both use a read-only image
+filesystem, drop all capabilities and enable `no-new-privileges`. Only
+`web-operator` mounts `/data` writable and passes `--allow-writes
+--enable-network`. Its free-data and local-model settings remain yfinance and
+literal `http://127.0.0.1:11434`; no credentials are placed in Compose. Paid
+provider approvals remain separate per-operation gates.
 
-The current Windows Docker Desktop Linux engine also presents a synthetic
-Windows host bind at `/data` as filesystem type `9p`; `RootContext.open` rejects
-it because only local NTFS/ext4 are supported. Do not work around this by
-weakening filesystem or root-identity checks, and do not mount or cut over real
-funds. Linux/ext4, actual image writes/exclusion, container replacement and
-web-container Ollama compatibility remain unverified. No Docker start/cutover
-command is an accepted Release 1 operating instruction yet.
+The supported browser topology is a Linux host with local ext4 and the Linux
+host-network overlay. The app binds literal loopback; the overlay removes bridge
+ports/networks. The Windows Docker Desktop bridge is unsupported: a Windows
+host bind reports `9p`, which `RootContext.open` rejects. Do not accept Docker
+gateway peers, use `host.docker.internal` for Ollama, or weaken root/filesystem
+identity checks.
 
-Keep the TUI fallback. Do not let a TUI/CLI writer and a trusted Docker writer
-operate on the same fund concurrently. The operator alone performs any later
-real-root cutover after the Docker path is supported and independently accepted.
+Build labels and `SessionRecord.code_version` use a baked full Git revision and
+package-source SHA-256. Set both build inputs from the checkout:
+
+```bash
+export AIHF_SOURCE_REVISION="$(git rev-parse HEAD)"
+export AIHF_SOURCE_SHA256="$(poetry run python -c 'from hedge_fund.runtime.build_identity import source_sha256; print(source_sha256("hedge_fund"))')"
+export AIHF_DATA_ROOT="/absolute/path/to/an/existing/local-ext4-root"
+```
+
+For a new, empty, local Linux/ext4 root assigned to one container identity, an
+operator-only setup sequence is:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.linux.yml --profile web-operator up -d web-operator
+docker compose -f docker-compose.yml -f docker-compose.linux.yml exec web-operator aihf --root /data handover enroll-fresh
+docker compose -f docker-compose.yml -f docker-compose.linux.yml exec web-operator aihf --root /data handover inspect
+# After offline writer-exclusion review, supply the exact values printed by inspect:
+docker compose -f docker-compose.yml -f docker-compose.linux.yml exec web-operator aihf --root /data handover trust-single-writer --inventory-digest DIGEST --operator-acknowledgement "EXACT ROOT-SPECIFIC ACKNOWLEDGEMENT"
+docker compose -f docker-compose.yml -f docker-compose.linux.yml restart web-operator
+```
+
+This sequence is operator-only and was not executed against any real root. It
+applies only to a deliberately new empty root in the same container namespace;
+trust is recorded inside that container, and restart must reuse that exact
+container. Never recreate or upgrade it: a changed container namespace/build
+fails closed, and no rebind/upgrade workflow is accepted. The operator must
+exclude every other writer. Never run the TUI, CLI or legacy runner as a second
+writer on that root; the TUI/ttyd fallback remains available only when the web
+writer is stopped.
+
+This is not a cutover instruction for existing funds. The existing
+`watchtower`/`watchtower-weekly` roots remain denied by protected-name guards;
+Windows NTFS-to-ext4 relocation is unsupported. Do not copy, enroll, trust or
+start a writable desk for those roots.
 
 ### Mandate cadence
 
@@ -364,10 +397,11 @@ configuration. On other Docker hosts, use the native CLI with
 docker compose run --rm tui
 ```
 
-The web Compose profile is not an accepted R1 operating path. Its read-only
-mount cannot perform the selected paper operations, and the current image startup
-is blocked as documented above. Do not start it as an operating desk. Do not run
-one paper fund from multiple processes.
+The `web` profile is read-only inspection; `web-operator` is the explicit
+writable path described above. Use the Linux host-network overlay only. Neither
+profile authorizes protected roots, cross-filesystem relocation, container
+recreation or an upgrade workflow. Do not run one paper fund from multiple
+processes.
 
 #### Local models in containers
 
@@ -380,17 +414,18 @@ networking and `HEDGE_FUND_LLM_ENDPOINT=http://127.0.0.1:11434`.
 
 On Linux, use the override for a one-session free-data/local-model run. It
 binds the local endpoint to `127.0.0.1` and supplies `--enable-network` only
-for the explicit `runner` profile:
+for explicit `runner` and `web-operator` profiles:
 
 ```bash
 docker compose -f docker-compose.yml -f docker-compose.linux.yml --profile runner run --rm runner
 docker compose -f docker-compose.yml -f docker-compose.linux.yml run --rm tui   # terminal TUI
 ```
 
-The current web profile is not an accepted R1 operating path; its writable
-replacement is blocked as described above. Remote access, reverse proxies and
-non-loopback publication remain unsupported. The legacy browser TUI remains
-local-only.
+The writable web path still requires an enrolled, explicitly trusted root and
+single-writer operator review. Protected-name operation, existing-root
+relocation, and container recreation/upgrade remain blocked as described above.
+Remote access, reverse proxies and non-loopback publication remain unsupported.
+The legacy browser TUI remains local-only and must not run as a second writer.
 
 ## Development
 

@@ -7,6 +7,9 @@
 #   Runner profiles are opt-in. The base bridge profile has no network
 #   authorization; use the Linux override for the supported host-local model.
 #
+# The web profile is read-only inspection. The web-operator profile enables
+# paper writes; use only with the Linux host-network override and approved root.
+# Unconfigured identity keeps runner/TUI profiles independent; Dockerfile rejects image builds without valid inputs.
 #   Interactive TUI:
 #     docker compose run --rm tui
 #
@@ -57,6 +60,10 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.web
+      args:
+        AIHF_SOURCE_REVISION: "${AIHF_SOURCE_REVISION:-unconfigured}"
+        AIHF_SOURCE_SHA256: "${AIHF_SOURCE_SHA256:-unconfigured}"
+    image: "aihf-web:${AIHF_SOURCE_REVISION:-unconfigured}-${AIHF_SOURCE_SHA256:-unconfigured}"
     ports:
       - "127.0.0.1:8876:8876"
     volumes:
@@ -65,7 +72,37 @@ services:
         target: /data
         read_only: true
     entrypoint: ["aihf-web", "--root", "/data"]
-    command: ["--port", "8876", "--container-bind"]
+    command: ["--port", "8876"]
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - webdesk
+
+  web-operator:
+    profiles: ["web-operator"]
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+      args:
+        AIHF_SOURCE_REVISION: "${AIHF_SOURCE_REVISION:-unconfigured}"
+        AIHF_SOURCE_SHA256: "${AIHF_SOURCE_SHA256:-unconfigured}"
+    image: "aihf-web:${AIHF_SOURCE_REVISION:-unconfigured}-${AIHF_SOURCE_SHA256:-unconfigured}"
+    environment:
+      - HEDGE_FUND_DATA_PROVIDER=yfinance
+      - HEDGE_FUND_LLM_ENDPOINT=http://127.0.0.1:11434
+    ports:
+      - "127.0.0.1:8876:8876"
+    volumes:
+      - type: bind
+        source: "${AIHF_DATA_ROOT:?Set AIHF_DATA_ROOT to an existing absolute data root}"
+        target: /data
+    entrypoint: ["aihf-web", "--root", "/data"]
+    command: ["--port", "8876", "--allow-writes", "--enable-network"]
     read_only: true
     tmpfs:
       - /tmp

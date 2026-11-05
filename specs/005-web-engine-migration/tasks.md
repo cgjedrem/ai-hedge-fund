@@ -39,9 +39,12 @@ selection, not implementation acceptance. A synthetic Windows bind mounted into 
 Docker Desktop Linux/amd64 engine appeared as `9p` (`0x01021997`); `RootContext.open('/data')`
 denied it because the supported filesystems are local NTFS/ext4. A same-container stop/start
 retained PID/mount namespace identities; a new container changed both. No guard was widened.
-A supported Linux/ext4 Docker path, actual image mutation, local-Ollama compatibility and
-container-recreation lifecycle remain unverified. RB-5 stays unchecked/BLOCKED. No operator
-cutover or actual-fund access occurred.
+The user then directed bounded synthetic validation on Docker Desktop ext4 named volumes.
+The web package now has read-only inspection and explicit operator profiles, Linux
+host-network overlay, and build-baked source identity. Final-image runtime evidence is
+pending; existing target names remain protected, NTFS-to-ext4 migration is unsupported, and
+container recreation has no approved rebind path. Keep RB-5 unchecked until evidence and
+protected-name scope are resolved. No operator cutover or actual-fund access occurred.
 
 **Historical state (before the scoped continuation):** user-directed implementation authorized. **21/148 tasks complete:**
 T001–T014, T016–T018, T022, T059, T096 and T137. T096 is the fake-only account-policy
@@ -695,7 +698,7 @@ only when its listed checks pass on the final artifact.
 | RB-2 Manual next session (R1-03) | T033, T034, T038, T039, T143 | Reviewed one-session preview and accept, durable stage progress, visible errors and an honest nothing-due outcome. Today the server returns 409 `No paper session is currently due.` (`hedge_fund\web\services.py`). Explicit backlog selection is deferred. |
 | RB-3 Verdict, Halt, Resume and post-fill recovery (R1-02, R1-04, R1-06) | T063–T072, T073, T140 | Byte-parity verdict regressions, corruption and append-failure tests, emergency Halt lane, head-bound reconciliation receipts, and a Resume that clears only a verified halt. Today `Ledger.resume()` always raises and web Resume returns 423 `reconciliation-required`. Native cross-process runs are narrowed to the release deployment platform. |
 | RB-4 Configuration and secret safety (R1-07) | T052, T060, T139 | Free yfinance default confirmed across CLI/web/runner; credential sentinel and secret non-disclosure regressions; web SIM mutation denied before effects. Paid providers stay explicit opt-in. |
-| RB-5 One Docker path and operator docs (R1-08) | T085, T086, T134 | **Selected:** one writable, single-user Docker paper desk, host-loopback publication, TUI retained as fallback. Reuse current root trust and cooperating writer locks; no automatic enrollment or cross-namespace mutation. **BLOCKED:** current Windows Docker Desktop host binds present as `9p` and `RootContext` rejects them; container recreation/build identity needs a supported lifecycle. Validate an actual image on a supported root before documenting startup as usable. T085's read-only-observer topology is historical and superseded for this R1 selection; keep that task unchecked. Operator-only cutover: stop legacy writers, `handover inspect-source`, `relocate-from`, `trust-single-writer`; do not perform it in implementation. |
+| RB-5 One Docker path and operator docs (R1-08) | T085, T086, T134 | **Selected:** one writable, single-user Docker paper desk, host-loopback access, TUI retained as fallback. Compose separates read-only inspection from explicit operator mode; Linux host networking, baked source identity, root trust and cooperating locks remain mandatory. **Runtime pending:** use a disposable Docker Desktop ext4 named volume; never weaken the Windows bind `9p` filesystem guard. **Existing-fund blockers:** FR-044 protects the selected target names, NTFS-to-ext4 relocation is unsupported, and container recreation has no approved rebind/upgrade path. T085's read-only-observer topology is historical and superseded for this R1 selection; keep that task unchecked. Operator-only cutover remains unperformed. |
 | RB-6 Release checks (R1-09) | T024, T029, T043, T074, T075, T128, T129 | Foundation and Release 1 regressions; synthetic-root browser scenarios for manual run, approve/reject, Halt/Resume and recovery; a green full non-TUI pytest run on the final artifact, or each failure attributed. Known: 14 failures (2,367 passed, 51 skipped) on the 2026-11-04 run, unexplained after focused reruns passed. |
 | RB-7 Final review and artifact check (R1-09) | T130–T132, T136 | One consolidated independent QA pass over ledger/money, local boundary and human control for the Release 1 diff; final manifest, clean tree, remote and PR head verification. |
 
@@ -705,6 +708,6 @@ only when its listed checks pass on the final artifact.
 2. The full non-TUI suite failed 14 tests; the cause is unresolved (RB-1, RB-6).
 3. T021 residuals: no durable rewind intent, no mandate rename/rewrite journal, POSIX unlink not identity-fenced, Saxo/demo/bootstrap writers outside the lanes, static inventory limits (RB-1).
 4. Manual no-work reports 409 instead of a nothing-due result (RB-2).
-5. RB-5's Docker path is selected but blocked: current Windows Docker Desktop bind mounts are unsupported `9p`; Linux/ext4 and identity-lifecycle runtime evidence are absent.
+5. RB-5 package acceptance is pending final-image synthetic ext4 runtime evidence. Existing `watchtower` targets remain blocked by FR-044; Windows bind `9p`, NTFS-to-ext4 relocation, and container recreation/rebind remain unsupported.
 6. No browser end-to-end coverage for manual run, approvals or recovery (RB-6).
-7. The real funds live under the legacy home root, which is read-only to the desk. Only the operator may perform the cutover; agents must not (RB-5).
+7. The real funds remain under the legacy home root and read-only. No cutover command is approved: the operator must first resolve FR-044 target-name protection, NTFS-to-ext4 migration and container-identity lifecycle; agents must not perform cutover (RB-5).

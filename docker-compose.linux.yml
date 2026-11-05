@@ -1,11 +1,12 @@
-# Linux hosts only. This override gives runner containers host networking,
-# literal-loopback Ollama endpoint and explicit network enablement.
+# Linux hosts only. This override gives services host networking and preserves
+# literal-loopback Ollama endpoint policy.
 #
 #   Set AIHF_DATA_ROOT to an existing absolute root before Compose commands.
 #   Runner:   docker compose -f docker-compose.yml -f docker-compose.linux.yml --profile runner run --rm runner
 #   TUI:      docker compose -f docker-compose.yml -f docker-compose.linux.yml run --rm tui
-#   Web desk: docker compose -f docker-compose.yml -f docker-compose.linux.yml --profile web up -d web
-#             (still published only on 127.0.0.1:8876)
+#   Web inspection: set build identity args, then use --profile web up -d web.
+#   Web operator:   set build identity args, then use --profile web-operator up -d web-operator.
+#                   Requires explicit offline enrollment and single-writer cutover.
 #   Web TUI:  docker compose -f docker-compose.yml -f docker-compose.linux.yml up -d tui-web
 #             (serves the TUI on local loopback port 7681)
 #
@@ -26,6 +27,18 @@ services:
 
   tui:
     network_mode: host
+
+  web:
+    network_mode: host
+    ports: !reset []
+    networks: !reset []
+    environment:
+      - HEDGE_FUND_LLM_ENDPOINT=http://127.0.0.1:11434
+
+  web-operator:
+    network_mode: host
+    ports: !reset []
+    networks: !reset []
 
   # Browser TUI: legacy app bound to local loopback.
   tui-web:
