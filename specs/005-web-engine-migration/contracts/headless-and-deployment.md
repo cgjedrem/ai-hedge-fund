@@ -111,8 +111,12 @@ the existing RootOwnerLease, operation-service lease and per-fund admission rema
 The operator excludes every other writer while trust is enabled. A TUI fallback does not
 permit a second concurrent writer. No cross-namespace runner stop/adoption, automatic
 enrollment or identity rebind is supported. Image labels and the package code-version stamp
-bind a full source revision and package-source digest; runtime environment values cannot
-override them.
+contain an operator-supplied revision, format-checked as a full lowercase Git object ID, and
+a package-source SHA-256 recomputed before baking; the revision is not checked against Git.
+The digest covers selected `hedge_fund` package files, excluding generated identity and
+`web/static`; it does not bind frontend inputs, Dockerfile, lockfiles, base images or OS layers.
+In an unbaked checkout, `code_version()` uses short Git `HEAD` and adds `.dirty` when Git
+reports a changed worktree. Runtime environment values cannot override baked values.
 
 The Windows Docker Desktop bind filesystem is not currently supported: a synthetic host
 directory mounted at `/data` reports `9p`, and `RootContext.open` rejects it because only
@@ -125,13 +129,14 @@ browser/Ollama runtime remains untested. FR-044 protected names remain globally 
 the R1 `watchtower` targets are blocked pending a user decision. Never remove the protected-
 name guards or add fixture/agent-specific bypasses.
 
-Keep the TUI and `tui-web` fallback services. A sequential TUI render was observed on a
-separate synthetic volume after a graceful web-child stop; first TUI launch creates the
-example mandate. This does not establish same-root cross-namespace rebind or writable
-fallback on the trusted Docker root. Disable competing runner/TUI writers during any operator
-session; fallback use begins only after the web writer stops. Compose examples use
-synthetic names and isolated roots/ports. Do not operate existing compose services or actual
-funds to validate migration. Container/Linux runtime acceptance requires final-image evidence.
+Keep the TUI CLI fallback. The `tui-web` service remains behind its explicit profile, but is
+not approved for use: Compose config supplies no ttyd credentials, and the Dockerfile downloads
+ttyd without a pinned checksum. Do not start it pending separate review. A sequential TUI CLI
+test on a synthetic root does not establish same-root cross-namespace rebind or writable
+fallback on a trusted Docker root. Disable competing runner/TUI writers during any operator
+session; fallback use begins only after the web writer stops. Compose examples use synthetic
+names and isolated roots/ports. Do not operate existing compose services or actual funds to
+validate migration. Container/Linux runtime acceptance requires final-image evidence.
 
 ## Filesystem/ownership recovery contract
 

@@ -318,7 +318,7 @@ def mandate_hash(spec: FundSpec) -> str:
 
 @lru_cache(maxsize=1)
 def code_version() -> str:
-    """Package version with baked image identity or checkout revision."""
+    """Package version with baked identity or short Git HEAD state."""
     try:
         version = _version("aihf")
     except PackageNotFoundError:
@@ -337,6 +337,16 @@ def code_version() -> str:
             timeout=2,
             check=True,
         ).stdout.strip()
+        if sha:
+            dirty = subprocess.run(
+                ["git", "-C", str(root), "status", "--porcelain"],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                check=True,
+            ).stdout.strip()
+            if dirty:
+                sha = f"{sha}.dirty"
     except (OSError, subprocess.SubprocessError):
         sha = ""
     return f"{version}+{sha}" if sha else version

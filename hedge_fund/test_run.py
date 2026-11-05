@@ -550,6 +550,7 @@ def test_supported_container_launchers_pass_explicit_root():
     assert "HEDGE_FUND_LLM_ENDPOINT=http://127.0.0.1:11434" in web_operator["environment"]
     assert "--root" in linux_compose["services"]["tui-web"]["entrypoint"]
     assert "/data" in linux_compose["services"]["tui-web"]["entrypoint"]
+    assert linux_compose["services"]["tui-web"]["profiles"] == ["tui-web"]
     assert linux_compose["services"]["web"]["network_mode"] == "host"
     assert linux_compose["services"]["web"]["ports"] == []
     assert linux_compose["services"]["web"]["networks"] == []

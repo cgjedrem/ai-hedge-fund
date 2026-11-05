@@ -55,6 +55,15 @@ def test_baked_build_identity_reads_validated_package_constants(monkeypatch):
     assert baked_build_identity() == (module.SOURCE_REVISION, module.SOURCE_SHA256)
 
 
+def test_baked_build_identity_is_absent_for_source_checkout(monkeypatch):
+    def missing_module(name):
+        raise ModuleNotFoundError(f"No module named {name!r}", name=name)
+
+    monkeypatch.setattr("hedge_fund.runtime.build_identity.importlib.import_module", missing_module)
+
+    assert baked_build_identity() is None
+
+
 def test_baked_build_identity_rejects_malformed_package_constants(monkeypatch):
     module = ModuleType("hedge_fund._build_identity")
     module.SOURCE_REVISION = "short"

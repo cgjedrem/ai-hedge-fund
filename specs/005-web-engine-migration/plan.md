@@ -46,7 +46,8 @@ The historical plan remains the design reference for deferred work.
 The user selected a writable, single-user Docker paper desk, host-loopback access, and the
 retained TUI fallback. Read-only inspection is the default profile; `web-operator` explicitly
 enables writes/network capability and is supported only with the Linux host-network overlay.
-The image source revision and package-source digest are verified and baked at build time.
+The package-source digest is recomputed and verified before baking. The revision is an
+operator-supplied, format-checked Git object ID; it is not checked against the source tree.
 Root enrollment, offline operator trust and cooperating-writer admission remain mandatory;
 neither a mount nor a Compose profile grants authority. The operator-only cutover remains
 unperformed.

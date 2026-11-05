@@ -30,6 +30,7 @@ frontend/coverage/
 frontend/playwright-report/
 frontend/test-results/
 hedge_fund/web/static/
+/hedge_fund/_build_identity.py
 
 # Environment Variables
 .env

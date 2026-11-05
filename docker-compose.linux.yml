@@ -1,5 +1,5 @@
 # Linux hosts only. This override gives services host networking and preserves
-# literal-loopback Ollama endpoint policy.
+# literal-loopback Ollama endpoint policy. Requires Compose 2.24.0+ for !reset.
 #
 #   Set AIHF_DATA_ROOT to an existing absolute root before Compose commands.
 #   Runner:   docker compose -f docker-compose.yml -f docker-compose.linux.yml --profile runner run --rm runner
@@ -7,8 +7,8 @@
 #   Web inspection: set build identity args, then use --profile web up -d web.
 #   Web operator:   set build identity args, then use --profile web-operator up -d web-operator.
 #                   Requires explicit offline enrollment and single-writer cutover.
-#   Web TUI:  docker compose -f docker-compose.yml -f docker-compose.linux.yml up -d tui-web
-#             (serves the TUI on local loopback port 7681)
+# tui-web remains opt-in, but is not approved for use: ttyd has no configured
+# credentials and is downloaded without a pinned checksum. Use TUI CLI only.
 #
 # Runner dispatch is free Yahoo data + local Ollama only.
 
@@ -40,7 +40,7 @@ services:
     ports: !reset []
     networks: !reset []
 
-  # Browser TUI: legacy app bound to local loopback.
+  # Legacy browser terminal. Explicit profile only; unresolved security review.
   tui-web:
     profiles: ["tui-web"]
     build: .

@@ -76,8 +76,9 @@ Their operation is blocked pending an explicit user decision; do not remove the 
 guard and do not substitute a fixture/agent exception. Final-image observation: same-container
 restart retained namespace identity and trust; a replacement container changed namespace
 identity and remained read-only. No rebind, cross-filesystem copy, or upgrade workflow is
-approved. The TUI/ttyd fallback remains installed and must not run as a concurrent writer;
-sequential TUI rendering on a separate synthetic volume does not prove same-root rebind.
+approved. The TUI CLI remains the sequential fallback; the browser `tui-web` service stays
+behind its explicit profile but is not approved for use. Sequential TUI rendering on a
+separate synthetic volume does not prove same-root rebind.
 
 ## 2. Launch, root and exposure boundary
 
@@ -113,9 +114,10 @@ host-home or credential mount. Root-private credentials remain undisclosed. The 
 excludes all other writers; a TUI fallback does not permit simultaneous writes. Cross-namespace
 runner stop/adoption remains unsupported. Keep the container image filesystem read-only, drop
 capabilities, and do not automatically enroll or rebind a root after image/container identity
-changes. TUI/Textual/ttyd fallback remains in Release 1; retirement is deferred. No automatic
-upgraded-runner start/restart. The separate observer snapshot architecture is not the selected
-R1 path.
+changes. TUI/Textual retirement is deferred; the CLI remains the fallback. The `tui-web`
+service is explicitly opt-in and not approved for use pending separate security review. No
+automatic upgraded-runner start/restart. The separate observer snapshot architecture is not
+the selected R1 path.
 
 **R5 — LB2.** Native writable desk is loopback-only. Docker web services use the Linux
 host-network overlay; the application remains bound to literal `127.0.0.1`, with no bridge

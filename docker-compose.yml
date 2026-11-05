@@ -4,8 +4,8 @@
 #     export AIHF_DATA_ROOT="$PWD/.aihf-demo-data"
 #     mkdir -p "$AIHF_DATA_ROOT"
 #
-#   Runner profiles are opt-in. The base bridge profile has no network
-#   authorization; use the Linux override for the supported host-local model.
+#   Runner profiles are opt-in. Base bridge web/web-operator profiles are
+#   unsupported; use the Linux override for the supported host-local topology.
 #
 # The web profile is read-only inspection. The web-operator profile enables
 # paper writes; use only with the Linux host-network override and approved root.

@@ -238,21 +238,32 @@ filesystem, drop all capabilities and enable `no-new-privileges`. Only
 literal `http://127.0.0.1:11434`; no credentials are placed in Compose. Paid
 provider approvals remain separate per-operation gates.
 
-The configured browser topology is a Linux host with local ext4 and the Linux
+The supported browser topology is a Linux host with local ext4 and the Linux
 host-network overlay. The app binds literal loopback; the overlay removes bridge
-ports/networks. The Compose merge was checked, but browser access and host Ollama
-were not runtime-tested. The Windows Docker Desktop bridge is unsupported: a
-Windows host bind reports `9p`, which `RootContext.open` rejects. Do not accept
-Docker gateway peers, use `host.docker.internal` for Ollama, or weaken root/
-filesystem identity checks.
+ports/networks. Compose 2.24.0 or later is required for the Linux override's
+`!reset` tags. The base bridge `web` and `web-operator` profiles are unsupported;
+do not use them without the Linux override. The Windows Docker Desktop bridge is
+unsupported: a Windows host bind reports `9p`, which `RootContext.open` rejects.
+Do not accept Docker gateway peers, use `host.docker.internal` for Ollama, or
+weaken root/filesystem identity checks.
 
-Build labels and `SessionRecord.code_version` use a baked full Git revision and
-package-source SHA-256. Set both build inputs from the checkout:
+The image revision label and `SessionRecord.code_version` include the
+operator-supplied `AIHF_SOURCE_REVISION`, checked only for full lowercase
+40/64-character Git-object-ID format; it is not verified against Git or the
+checkout's cleanliness. `AIHF_SOURCE_SHA256` is recomputed and verified over
+selected package-relative `hedge_fund` files. That digest excludes
+`hedge_fund/web/static`, `.env`, bytecode/cache files and generated
+`hedge_fund/_build_identity.py`; it does not bind frontend inputs, Dockerfile,
+lockfiles, base images or OS layers. Record those build inputs/artifact identity
+separately. In an unbaked source checkout, `SessionRecord.code_version` uses
+short Git `HEAD` and adds `.dirty` when `git status --porcelain` reports changes.
+Build from a clean committed source tree and set both inputs:
 
 ```bash
 export AIHF_SOURCE_REVISION="$(git rev-parse HEAD)"
 export AIHF_SOURCE_SHA256="$(poetry run python -c 'from hedge_fund.runtime.build_identity import source_sha256; print(source_sha256("hedge_fund"))')"
 export AIHF_DATA_ROOT="/absolute/path/to/an/existing/local-ext4-root"
+docker compose -f docker-compose.yml -f docker-compose.linux.yml --profile web-operator build web-operator
 ```
 
 For a new, empty, local Linux/ext4 root assigned to one container identity, an
@@ -272,9 +283,9 @@ applies only to a deliberately new empty root in the same container namespace;
 trust is recorded inside that container, and restart must reuse that exact
 container. Never recreate or upgrade it: a changed container namespace/build
 fails closed, and no rebind/upgrade workflow is accepted. The operator must
-exclude every other writer. Never run the TUI, CLI or legacy runner as a second
-writer on that root; the TUI/ttyd fallback remains available only when the web
-writer is stopped.
+exclude every other writer. Never run the TUI CLI or legacy runner as a second
+writer on that root. The TUI CLI fallback starts only after the web writer stops;
+the browser `tui-web` service is not approved for use.
 
 The final image was exercised against disposable synthetic ext4 volumes. Runtime
 observations and evidence limits are recorded in
@@ -411,6 +422,11 @@ profile authorizes protected roots, cross-filesystem relocation, container
 recreation or an upgrade workflow. Do not run one paper fund from multiple
 processes.
 
+The `tui-web` service remains behind its explicit profile but is not approved for
+use: it configures no ttyd credentials and its downloaded binary has no pinned
+checksum. Do not start it. The TUI CLI remains the fallback after the web writer
+has stopped.
+
 #### Local models in containers
 
 The local-model policy accepts literal loopback only. Bridge containers cannot
@@ -433,7 +449,7 @@ The writable web path still requires an enrolled, explicitly trusted root and
 single-writer operator review. Protected-name operation, existing-root
 relocation, and container recreation/upgrade remain blocked as described above.
 Remote access, reverse proxies and non-loopback publication remain unsupported.
-The legacy browser TUI remains local-only and must not run as a second writer.
+Do not start `tui-web`; use the TUI CLI fallback only after the web writer stops.
 
 ## Development
 
