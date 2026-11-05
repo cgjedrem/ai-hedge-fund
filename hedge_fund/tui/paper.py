@@ -316,9 +316,8 @@ class PaperScreen(Screen):
         if snap is None:
             return
         try:
-            snap.ledger.resume(snap.deployed.spec.capital, approval_required=snap.deployed.spec.approval_required)
+            snap.ledger.resume(snap.deployed.spec.capital, approval_required=snap.deployed.spec.approval_required, operator="tui")
         except (LedgerError, RootConfigurationError, AdmissionError) as exc:
-            # Resume is reconciliation-bound; the fund stays halted.
             self.notify(f"{snap.deployed.name} stays halted: {exc}", severity="warning")
             return
         self.notify(f"{snap.deployed.name} resumed")
