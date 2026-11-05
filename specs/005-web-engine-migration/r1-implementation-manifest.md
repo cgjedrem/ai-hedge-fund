@@ -4,8 +4,8 @@
 
 - Branch: `cgjedrem-shiny-tribble`.
 - Base revision: `8660cc5f93c0fb81a7d1273abfd42b2fddd85f68`.
-- Implementation commit: `9c1f5b8e6c5b69b648a68de49cb7164f638a9b2e` (`feat: implement Spec005 Release 1 paper desk flows`).
-- Source/test snapshot: 37 files, 1,629,986 bytes, SHA-256 `b80e55df9dc3c2493d41bdb98f511c7b1120aa96ff86eb90d901cd2e302de79a`.
+- Implementation commits: `9c1f5b8e6c5b69b648a68de49cb7164f638a9b2e` (`feat: implement Spec005 Release 1 paper desk flows`); `9c847d8fade403c18916f6b266cf4d38922d6a62` (`fix: record TUI Resume actor`).
+- Source/test snapshot: 38 files, 1,638,124 bytes, SHA-256 `8bd944b98a805c15ea44b5b01d6a1b5b077a628e7ec781b6531be310a34aa7bc`.
 - Snapshot covers sorted UTF-8 repository-relative path + NUL + full file bytes + NUL; excludes evidence documents, `memory.md`, and root `node_modules/`.
 - Implementation preserves the published engine and React UI. No Docker or deployment topology changes.
 - RB-5 remains blocked pending the operator choice between a writable single-writer desk container and a host-run desk with no container writer. The choice changes writer/root topology, validation, and deployment documentation.
@@ -31,7 +31,8 @@
 - `hedge_fund/runtime/test_writer_race_matrix.py` — cross-platform synthetic reparse-point writer regressions.
 - `hedge_fund/runtime/reconciliation.py` — hash-bound local-paper failure reconciliation.
 - `hedge_fund/runtime/test_reconciliation.py` — reconciliation identity, mismatch, and fail-closed regressions.
-- `hedge_fund/tui/paper.py` — retained TUI Resume path uses the same effect-intent fence.
+- `hedge_fund/tui/paper.py` — retained TUI Resume path passes the TUI audit identity and uses the same effect-intent fence.
+- `hedge_fund/tui/test_admission_regressions.py` — synthetic simple-Halt Resume identity and enrolled-root admission-denial regressions.
 
 ## Web implementation
 
