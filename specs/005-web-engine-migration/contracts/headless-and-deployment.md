@@ -8,12 +8,14 @@ compose, entrypoints or provider defaults are changed by the planning PR.
 entrypoint as a fallback and retains all headless commands. The selected Docker path is one
 writable, single-user paper desk, published only on host loopback, reusing canonical root
 trust and cooperating-writer admission. The final image was exercised on disposable
-synthetic ext4 volumes; observed results and evidence limits are in
-`implementation-evidence.md`. The exact runtime timestamp and full invocation were not
-retained, so formal runtime acceptance remains INCONCLUSIVE. The separate observer-snapshot
-architecture, TUI/ttyd retirement and dual-platform packaged distributions remain deferred.
-The real funds' move from the legacy home root uses the offline handover below and is
-performed only by the operator.
+synthetic ext4 volumes under the documented Linux Compose host-network profile. Current
+commands, timestamps, outcomes and evidence limits are in `implementation-evidence.md`.
+The replacement-container identity gate **FAIL**; overall runtime acceptance remains
+INCONCLUSIVE and RB-5 stays unchecked. The earlier `cad96a` build record omitted required
+identity args and does not establish that artifact's build provenance. The separate
+observer-snapshot architecture, TUI/ttyd retirement and dual-platform packaged distributions
+remain deferred. The real funds' move from the legacy home root uses the offline handover
+below and is performed only by the operator.
 
 ## Launch and command compatibility
 
@@ -121,13 +123,16 @@ reports a changed worktree. Runtime environment values cannot override baked val
 The Windows Docker Desktop bind filesystem is not currently supported: a synthetic host
 directory mounted at `/data` reports `9p`, and `RootContext.open` rejects it because only
 local NTFS/ext4 are admitted. A Docker Desktop ext4 named volume is permitted for disposable
-synthetic runtime validation only; it does not support NTFS-to-ext4 relocation. On the final
-image, same-container restart retained PID/mount namespace identity and trusted write
-capability; a replacement container changed namespace identity and remained read-only.
-These observations do not approve rebind, cross-filesystem copy or upgrade. Host-network/
-browser/Ollama runtime remains untested. FR-044 protected names remain globally denied, so
-the R1 `watchtower` targets are blocked pending a user decision. Never remove the protected-
-name guards or add fixture/agent-specific bypasses.
+synthetic runtime validation only; it does not support NTFS-to-ext4 relocation. The current
+`7ec7aaa` image was exercised under host networking. Its replacement container retained the
+enrolled PID/mount namespace identity and readiness reported `enrolled`; the probe failed
+before capability/write-denial checks. No write-enabled replacement or re-enrollment ran.
+The prior `cad96a` observation of namespace change/read-only behavior is historical and does
+not override this failure. These observations do not approve rebind, cross-filesystem copy
+or upgrade. Windows bridge and host Ollama access remain blocked; browser/Ollama runtime
+remains untested. FR-044 protected names remain globally denied, so the R1 `watchtower`
+targets are blocked pending a user decision. Never
+remove the protected-name guards or add fixture/agent-specific bypasses.
 
 Keep the TUI CLI fallback. The `tui-web` service remains behind its explicit profile, but is
 not approved for use: Compose config supplies no ttyd credentials, and the Dockerfile downloads

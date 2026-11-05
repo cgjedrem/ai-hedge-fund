@@ -59,26 +59,31 @@ as fallback. This supersedes the read-only-observer deployment choice for R1 onl
 relax root trust, local-paper-only actions, provider authorization, filesystem admission or
 operator-only cutover. The container must reuse the root's enrollment and offline
 trusted-single-writer acknowledgement and the existing cooperating-writer locks. No automatic
-enrollment, cross-namespace adoption, or second writer is allowed. The final image was
-exercised on disposable synthetic ext4 volumes; observed results are recorded in
-`implementation-evidence.md`. The exact runtime timestamp and full invocation were not
-retained, so formal runtime acceptance remains INCONCLUSIVE. `web` remains read-only
-inspection; `web-operator` requires explicit `--allow-writes --enable-network`, writable
-`/data`, and the Linux host-network overlay. Compose topology assertions passed, but
-host-network/browser/Ollama runtime is untested. The host bind and root identity rules do not
-change. On the current Windows Docker Desktop Linux engine, a synthetic Windows bind mounted
-at `/data` reports `9p` and `RootContext.open` denies it; do not widen R3 to make it pass.
-Docker Desktop ext4 named-volume validation does not authorize NTFS-to-ext4 migration or a
-production-root cutover.
+enrollment, cross-namespace adoption, or second writer is allowed. Current final-image
+commands, timestamps and synthetic ext4 runtime observations are in
+`implementation-evidence.md`. The replacement-container identity gate **FAIL**; overall
+runtime acceptance is INCONCLUSIVE. The earlier `cad96a` direct-build record omitted required
+identity args, so that artifact's build provenance is not accepted. The current
+Compose-built `7ec7aaa` image was exercised under the Linux host-network overlay; Windows
+bridge and host Ollama access remain blocked, and browser/Ollama runtime remains untested.
+`web` remains read-only inspection; `web-operator` requires
+explicit `--allow-writes --enable-network`, writable `/data`, and the Linux host-network
+overlay. The host bind and root identity rules do not change. On the current Windows Docker
+Desktop Linux engine, a synthetic Windows bind mounted at `/data` reports `9p` and
+`RootContext.open` denies it; do not widen R3 to make it pass. Docker Desktop ext4
+named-volume validation does not authorize NTFS-to-ext4 migration or a production-root
+cutover.
 
 The selected R1 names `watchtower` and `watchtower-weekly` remain protected by FR-044.
 Their operation is blocked pending an explicit user decision; do not remove the root or web
-guard and do not substitute a fixture/agent exception. Final-image observation: same-container
-restart retained namespace identity and trust; a replacement container changed namespace
-identity and remained read-only. No rebind, cross-filesystem copy, or upgrade workflow is
-approved. The TUI CLI remains the sequential fallback; the browser `tui-web` service stays
-behind its explicit profile but is not approved for use. Sequential TUI rendering on a
-separate synthetic volume does not prove same-root rebind.
+guard and do not substitute a fixture/agent exception. On the current image, a replacement
+container retained the enrolled PID/mount namespace identity and readiness reported
+`enrolled`; the probe failed before capability/write-denial checks. No write-enabled
+replacement or re-enrollment ran. An earlier `cad96a` observation of changed namespaces is
+historical, not current acceptance evidence. No rebind, cross-filesystem copy, or upgrade
+workflow is approved. The TUI CLI remains the sequential fallback; the browser `tui-web`
+service stays behind its explicit profile but is not approved for use. Sequential TUI
+rendering on a separate synthetic volume does not prove same-root rebind.
 
 ## 2. Launch, root and exposure boundary
 

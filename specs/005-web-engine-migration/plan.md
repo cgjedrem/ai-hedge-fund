@@ -33,11 +33,10 @@ The historical plan remains the design reference for deferred work.
 - **Acceptance:** Release 1 capabilities R1-01 to R1-09 in `spec.md`, closed through the
   bounded backlog RB-1 to RB-7 in `tasks.md`. The user selected one writable, single-user
   Docker web desk for RB-5. Compose now separates read-only inspection from explicit
-  operator writes and selects Linux host networking. The final image was exercised on
-  disposable synthetic ext4 volumes; observed runtime outcomes are recorded, but the
-  formal evidence row is INCONCLUSIVE because the exact runtime timestamp and full
-  invocation were not retained. Existing protected-name operation, Windows NTFS relocation
-  and container-replacement workflow remain blocked.
+  operator writes and selects Linux host networking. Current final-image runtime evidence
+  is recorded with exact commands and timestamps. Replacement-container identity gate
+  **FAIL**; overall acceptance remains **INCONCLUSIVE**. Existing protected-name operation,
+  Windows NTFS relocation and container-replacement workflow remain blocked.
 - **Gate deviation:** no new red-team or plan-review gate was run for this narrowing. It is
   user-directed and recorded here and in the PR body.
 
@@ -52,22 +51,32 @@ Root enrollment, offline operator trust and cooperating-writer admission remain 
 neither a mount nor a Compose profile grants authority. The operator-only cutover remains
 unperformed.
 
-Final image `aihf-web-spec005-r1-cad96a0-8875cf1` is
-`sha256:21582eeedfa316925b6656f4eedcb4dfd0b999062af3d3aa72f84ceaaa9597b6`, built from
-source revision `cad96a05875efe13d229a8a079d2348ed6d0cf95` with baked package digest
-`8875cf13798d0b6f8468bba97ab3e7f4a21eb48ccd1f61f951b30cd94026d815`. Bounded synthetic
-ext4 observations include successful service/API startup, trusted write after explicit
-offline acknowledgement, same-container restart retaining namespace identity, and a new
-container failing closed as read-only. The image was also used for synthetic write, lock,
-secret-boundary and sequential TUI checks. Runtime timestamps and the full invocation were
-not retained in the current evidence record; its formal result is INCONCLUSIVE.
+The current Compose-built image is
+`aihf-web:7ec7aaa970a1805478940691a948f1b0dbed4649-152aa83b71b6cab8569aaf270ee7215208444335713bc4887cd17544c9bad263`,
+ID `sha256:b998cd64d5d28c5853ee36fe88381b3ff4a5b4ea7cabb0f1c7d239d5ba7fd977`.
+It was built from clean source revision `7ec7aaa970a1805478940691a948f1b0dbed4649`;
+the verified package digest is
+`152aa83b71b6cab8569aaf270ee7215208444335713bc4887cd17544c9bad263`. The revision
+label is operator-supplied and format-checked, not verified against Git. The earlier
+`cad96a` record listed a direct `docker build` without required identity args; its build
+provenance is INCONCLUSIVE and is not the current artifact.
+
+Disposable ext4 runtime checks used the actual Linux Compose host-network profile. Fresh
+read-only startup, API boundary denials, protected names, synthetic paper creation/deploy,
+same-fund exclusion, stale recovery denial and sequential CLI TUI rendering passed. The
+replacement container retained the enrolled PID/mount namespace identity and readiness
+reported `enrolled`; the probe exited 1 before capability/write-denial checks. No
+write-enabled replacement or re-enrollment ran. The replacement gate is **FAIL** and
+overall acceptance remains **INCONCLUSIVE / not accepted**. Exact commands, timestamps,
+recorded environment and known environment gaps are in `implementation-evidence.md`.
 
 In the current Windows Docker Desktop 29.9.2 Linux/amd64 environment, a temporary synthetic
 Windows bind mounted at `/data` reports filesystem type `9p` and `fstatfs` magic
 `0x01021997`; `RootContext.open('/data')` denies it because only local NTFS or ext4 is
 supported. A Docker Desktop ext4 named volume is permitted for disposable synthetic runtime
-validation only, not as evidence for NTFS-to-ext4 migration. The Linux host-network/browser/
-Ollama topology was checked as Compose configuration only; it was not exercised end-to-end.
+validation only, not as evidence for NTFS-to-ext4 migration. The final image's service runtime
+was exercised with Linux host networking; Windows bridge and host Ollama access remain
+blocked, and browser/Ollama end-to-end paths were not tested.
 Identity changes remain fail-closed, with no approved rebind or upgrade workflow.
 
 FR-044 still denies `watchtower` and `watchtower-weekly` in root and web guards. Target-fund

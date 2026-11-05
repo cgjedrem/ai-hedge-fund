@@ -33,17 +33,20 @@ full run; the cause remains unresolved, so broad race acceptance is not claimed.
 See `implementation-evidence.md` for limits and exact results.
 See `implementation-evidence.md` for limits and exact results.
 
-**Continuation update (2026-11-05, user-directed):** RB-5 selects one writable, single-user
-Docker paper desk with the TUI retained as fallback. The web package separates read-only
-inspection from explicit operator mode, configures the Linux host-network overlay and bakes
-source identity into the final image. Disposable synthetic ext4 runtime observations include
-startup, explicit trust, same-container restart, API denials, synthetic write/deploy,
-same-fund exclusion and stale-container read-only behavior. The exact runtime timestamp and
-full invocation were not retained, so the formal runtime evidence status is INCONCLUSIVE;
-keep RB-5 unchecked. Compose merge assertions passed for the configured topology, but
-host-network/browser/Ollama runtime was not tested. FR-044 target names remain protected,
-NTFS-to-ext4 migration and container rebind are unsupported, and no operator cutover or
-actual-fund access occurred.
+**Current continuation update (2026-11-05, user-directed):** RB-5 still selects one writable,
+single-user Docker paper desk with the TUI retained as fallback. The final Compose-built
+image uses clean source revision `7ec7aaa970a1805478940691a948f1b0dbed4649` and verified
+package digest `152aa83b71b6cab8569aaf270ee7215208444335713bc4887cd17544c9bad263`.
+Exact build/runtime commands and timestamps are in `implementation-evidence.md`. The
+documented Linux host-network profile and disposable ext4 volume were exercised. Fresh-root,
+API-boundary, protected-name, synthetic write/deploy, same-fund exclusion, stale-recovery
+denial and sequential CLI TUI checks passed. The replacement-container identity gate **FAIL**:
+it retained the enrolled PID/mount namespace identity and readiness reported `enrolled`;
+the probe stopped before capability/write-denial checks. No write-enabled replacement or
+re-enrollment ran. Overall acceptance remains **INCONCLUSIVE / not accepted**; keep RB-5
+unchecked. Browser/Ollama, Windows bridge, NTFS-to-ext4 migration, real-fund operation and
+cutover remain unsupported, untested or blocked. The earlier `cad96a` build record omitted
+required identity arguments and does not establish build provenance.
 
 **Historical state (before the scoped continuation):** user-directed implementation authorized. **21/148 tasks complete:**
 T001–T014, T016–T018, T022, T059, T096 and T137. T096 is the fake-only account-policy
@@ -697,7 +700,7 @@ only when its listed checks pass on the final artifact.
 | RB-2 Manual next session (R1-03) | T033, T034, T038, T039, T143 | Reviewed one-session preview and accept, durable stage progress, visible errors and an honest nothing-due outcome. Today the server returns 409 `No paper session is currently due.` (`hedge_fund\web\services.py`). Explicit backlog selection is deferred. |
 | RB-3 Verdict, Halt, Resume and post-fill recovery (R1-02, R1-04, R1-06) | T063–T072, T073, T140 | Byte-parity verdict regressions, corruption and append-failure tests, emergency Halt lane, head-bound reconciliation receipts, and a Resume that clears only a verified halt. Today `Ledger.resume()` always raises and web Resume returns 423 `reconciliation-required`. Native cross-process runs are narrowed to the release deployment platform. |
 | RB-4 Configuration and secret safety (R1-07) | T052, T060, T139 | Free yfinance default confirmed across CLI/web/runner; credential sentinel and secret non-disclosure regressions; web SIM mutation denied before effects. Paid providers stay explicit opt-in. |
-| RB-5 One Docker path and operator docs (R1-08) | T085, T086, T134 | **Selected:** one writable, single-user Docker paper desk, host-loopback access, TUI retained as fallback. Compose separates read-only inspection from explicit operator mode; Linux host networking, baked source identity, root trust and cooperating locks remain mandatory. **Observed:** final-image synthetic ext4 startup/write/exclusion/replacement checks ran; formal runtime row is INCONCLUSIVE because exact runtime timestamp and full invocation were not retained. Compose merge passed; host-network/browser/Ollama runtime remains untested. Never weaken the Windows bind `9p` guard. **Existing-fund blockers:** FR-044 protects the selected target names, NTFS-to-ext4 relocation is unsupported, and container recreation has no approved rebind/upgrade path. T085's read-only-observer topology is historical and superseded for this R1 selection; keep that task unchecked. Operator-only cutover remains unperformed. |
+| RB-5 One Docker path and operator docs (R1-08) | T085, T086, T134 | **Selected:** one writable, single-user Docker paper desk, host-loopback access, TUI retained as fallback. Compose separates read-only inspection from explicit operator mode; Linux host networking, baked source identity, root trust and cooperating locks remain mandatory. **Observed on current image:** exact Compose build and runtime provenance recorded; synthetic ext4 Linux host-network startup, API boundaries, protected names, paper create/deploy, same-fund exclusion, stale recovery denial and sequential CLI TUI passed. **Replacement gate FAIL:** replacement retained enrolled PID/mount namespace identity and readiness reported `enrolled`; probe stopped before capability/write-denial checks. No write-enabled replacement or re-enrollment ran. Overall acceptance INCONCLUSIVE; keep unchecked. Windows bridge and host Ollama access remain blocked; browser/Ollama runtime remains untested. Never weaken the Windows bind `9p` guard. **Existing-fund blockers:** FR-044 protects the selected target names, NTFS-to-ext4 relocation is unsupported, and container recreation has no approved rebind/upgrade path. T085's read-only-observer topology is historical and superseded for this R1 selection. Operator-only cutover remains unperformed. |
 | RB-6 Release checks (R1-09) | T024, T029, T043, T074, T075, T128, T129 | Foundation and Release 1 regressions; synthetic-root browser scenarios for manual run, approve/reject, Halt/Resume and recovery; a green full non-TUI pytest run on the final artifact, or each failure attributed. Known: 14 failures (2,367 passed, 51 skipped) on the 2026-11-04 run, unexplained after focused reruns passed. |
 | RB-7 Final review and artifact check (R1-09) | T130–T132, T136 | One consolidated independent QA pass over ledger/money, local boundary and human control for the Release 1 diff; final manifest, clean tree, remote and PR head verification. |
 
@@ -707,6 +710,6 @@ only when its listed checks pass on the final artifact.
 2. The full non-TUI suite failed 14 tests; the cause is unresolved (RB-1, RB-6).
 3. T021 residuals: no durable rewind intent, no mandate rename/rewrite journal, POSIX unlink not identity-fenced, Saxo/demo/bootstrap writers outside the lanes, static inventory limits (RB-1).
 4. Manual no-work reports 409 instead of a nothing-due result (RB-2).
-5. RB-5 remains unchecked: bounded final-image synthetic ext4 runtime outcomes were observed, but the formal evidence record lacks the exact runtime timestamp and full invocation. Existing `watchtower` targets remain blocked by FR-044; Windows bind `9p`, NTFS-to-ext4 relocation, host-network/browser/Ollama runtime and container recreation/rebind remain unsupported or unverified.
+5. RB-5 remains unchecked. The current Compose-built image has exact identity build inputs and runtime provenance and ran on the documented Linux host-network profile with a synthetic ext4 volume. The replacement identity gate **FAIL**: the replacement retained the enrolled PID/mount namespace identity; its later fail-closed write-denial path was not reached. Cause is unknown; no write-enabled replacement or reenrollment ran. Existing `watchtower` targets remain blocked by FR-044; Windows bind `9p`, host Ollama access, NTFS-to-ext4 relocation, browser/Ollama runtime and container rebind remain unsupported or unverified. The earlier `cad96a` direct-build record omitted required identity args and is not accepted as build provenance.
 6. Owned synthetic-root desk lifecycle browser coverage **15 passed** and report-download browser coverage **2 passed**; both predate only the final import-formatting change. RB-6 remains open for final-artifact evidence review, full-suite disposition and independent QA.
 7. The real funds remain under the legacy home root and read-only. No cutover command is approved: the operator must first resolve FR-044 target-name protection, NTFS-to-ext4 migration and container-identity lifecycle; agents must not perform cutover (RB-5).

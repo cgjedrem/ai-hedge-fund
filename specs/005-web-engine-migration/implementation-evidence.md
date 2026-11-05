@@ -2006,31 +2006,32 @@ docker run --name spec005-web-final-default-6629c68f --network none --read-only 
 docker run --name spec005-web-final-root-6629c68f --network none --read-only --cap-drop ALL --security-opt no-new-privileges:true --mount "type=bind,source=C:\Users\ChristianGjedrem\source\repos\copilot-worktrees\ai-hedge-fund\cgjedrem-super-fiesta\outputs\spec005-test-docker-final-1720-6629c68fe9c240b18c0d36cfe62e666e\demo-quality,target=/data" aihf-web-spec005-r1-20261105-1720-ee1441d6e50 --port 8876 --allow-writes
 ```
 
-## Final Docker continuation evidence — 2026-11-05
+## Historical Docker continuation evidence — 2026-11-05 (cad96a; superseded)
 
-### Identity and artifact mapping
+### Historical identity and provenance record
 
-- Source revision: `cad96a05875efe13d229a8a079d2348ed6d0cf95` on
-  `cgjedrem-super-fiesta`; source worktree was clean at build. The documentation/evidence
-  commit below the image source changes no Python, frontend, Dockerfile or Compose behavior.
-- Build command: `docker build --progress=plain --file Dockerfile.web --tag aihf-web-spec005-r1-cad96a0-8875cf1 .`
-- Build observation: `2026-11-05T19:24:08.3366748+01:00`–`19:24:52.8510996+01:00`;
-  exit 0, **44.5122 s**.
-- Image: `aihf-web-spec005-r1-cad96a0-8875cf1`, ID
+- The prior record attributed image `aihf-web-spec005-r1-cad96a0-8875cf1`, ID
   `sha256:21582eeedfa316925b6656f4eedcb4dfd0b999062af3d3aa72f84ceaaa9597b6`,
-  Linux/amd64, image-created `2026-11-05T18:24:31.448453995Z` UTC.
-- Baked OCI revision label: `cad96a05875efe13d229a8a079d2348ed6d0cf95`.
-  Baked package-source SHA-256:
+  with reported labels `cad96a05875efe13d229a8a079d2348ed6d0cf95` and
   `8875cf13798d0b6f8468bba97ab3e7f4a21eb48ccd1f61f951b30cd94026d815`.
-- Environment: Windows 11 build 26200; Docker Desktop 29.9.2, Linux/amd64;
-  Compose 5.6.1. Synthetic Docker Desktop ext4 named volumes only. No provider, broker,
-  paid endpoint, live market data, actual fund or production root was used.
+- Earlier evidence listed `docker build --progress=plain --file Dockerfile.web
+  --tag aihf-web-spec005-r1-cad96a0-8875cf1 .` and a 44.5122 s interval. That
+  command string omits `AIHF_SOURCE_REVISION` and `AIHF_SOURCE_SHA256`. The
+  `Dockerfile.web` at `cad96a05875efe13d229a8a079d2348ed6d0cf95` declares both
+  required build args and passes them to `bake_build_identity`. No prior image-build
+  log remains in `outputs/`; the recorded command does not establish how that image
+  was built. Treat its build/source provenance as **INCONCLUSIVE**, not PASS.
+- Revision labels are operator-supplied, format-checked values; they do not verify
+  a Git checkout. Package digest scope and exclusions are described in `README.md`.
+- The prior runtime observations below are retained as historical observations only.
+  Their exact timestamped invocation was not retained and they do not satisfy the
+  current replacement-container gate.
 
-### Evidence rows
+### Historical evidence rows
 
 | Row | Time / duration | Scenario and provenance | Expected / observed | Result |
 |---|---|---|---|---|
-| Final image build | `2026-11-05T19:24:08.3366748+01:00`–`2026-11-05T19:24:52.8510996+01:00`; **44.5122 s** | Exact `docker build` command above; source-to-image identity and baked labels recorded above. | Image built successfully; ID and labels match source revision/package digest. | **PASS — build only** |
+| Historical `cad96a` image record | Prior record reports `2026-11-05T19:24:08.3366748+01:00`–`19:24:52.8510996+01:00`; **44.5122 s** | Previously listed direct `docker build` string omits required identity args; no build log retained. | Image ID and labels were reported, but exact build invocation/source mapping is not established. | **INCONCLUSIVE — provenance not accepted** |
 | Final Compose merge | `2026-11-05T19:52:45.5403224+01:00`–`2026-11-05T19:52:46.0710415+01:00`; **0.528331 s** | `docker compose -f docker-compose.yml -f docker-compose.linux.yml --profile web --profile web-operator --profile tui --profile tui-web config --format json`; env: `AIHF_DATA_ROOT=/tmp/spec005-compose-config-only`, baked revision/digest supplied as build inputs; PowerShell assertions. | 13/13 checks: read-only `web`, writable operator `/data`, read-only image, host network, explicit flags, no bridge ports/networks, retained TUI services, literal-loopback Ollama setting, `CAP_DROP=ALL` and `no-new-privileges`. | **PASS — configuration only** |
 | Final-image runtime matrix | Exact timezone start/end, full command invocation and per-check durations not retained in the current evidence record; outcomes are summarized below. | Implementation-owner runtime observation on the final image; `--network none`, no published ports, read-only image rootfs, dropped capabilities, `no-new-privileges`, tmpfs `/tmp`, synthetic ext4 volume. | The observed outcomes were positive, but required timestamp/provenance fields are incomplete. | **INCONCLUSIVE — not a formal acceptance PASS** |
 | Final targeted Python regression | `2026-11-05T20:01:02.7436917+01:00`–`2026-11-05T20:05:59.4019964+01:00`; **293.92 s pytest**, **296.6548349 s process**. | Source revision `cad96a05875efe13d229a8a079d2348ed6d0cf95`; immutable source snapshot `HEAD:hedge_fund` tree `36ad8b23874224ca3883bd6f6b05686d7c5ef145`; Python 3.11.15 / pytest 7.4.4; `Windows-10-10.0.26200-SP0`; synthetic fixtures and fakes. Exact selector below. | Ten modules, **302 passed**, exit 0. | **PASS — targeted unit/fake tests only; not full suite** |
@@ -2125,7 +2126,158 @@ timestamps were not retained. Do not upgrade this row to PASS from the prose sum
   exploratory TUI assertion failed because first render creates that example; it is not
   evidence of a no-write fallback. Same-root cross-namespace TUI use remains untested.
 
-The Linux host-network/browser/Ollama path was checked as Compose configuration only.
-Windows bridge/browser/Ollama, actual funds, FR-044 target operation, NTFS-to-ext4
-relocation, container recreation/rebind, and operator cutover remain unsupported, blocked
-or unverified. RB-5 remains unchecked. Independent QA is pending.
+For this earlier `cad96a` observation, Linux host-network/browser/Ollama was checked as
+Compose configuration only. Windows bridge/browser/Ollama, actual funds, FR-044 target
+operation, NTFS-to-ext4 relocation, container recreation/rebind, and operator cutover
+remain unsupported, blocked or unverified. RB-5 remains unchecked. Independent QA is
+pending.
+
+## Current Compose-built image and runtime gate — 2026-11-05
+
+### Source and artifact identity
+
+- Clean source at build: revision `7ec7aaa970a1805478940691a948f1b0dbed4649`,
+  tree `494c596575e7b74eb0af0d0ab5d8ae4bfb4916a9`, `hedge_fund` tree
+  `79bc529e6207667271a5cf79063bee0e5f121994`, tracked diff SHA-256
+  `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`.
+- Compose image tag:
+  `aihf-web:7ec7aaa970a1805478940691a948f1b0dbed4649-152aa83b71b6cab8569aaf270ee7215208444335713bc4887cd17544c9bad263`.
+- Image ID `sha256:b998cd64d5d28c5853ee36fe88381b3ff4a5b4ea7cabb0f1c7d239d5ba7fd977`,
+  Linux/amd64, image-created `2026-11-05T20:13:08.455929837Z` UTC.
+- `AIHF_SOURCE_REVISION=7ec7aaa970a1805478940691a948f1b0dbed4649` is operator-supplied
+  and format-checked; it is not checked against Git.
+  `AIHF_SOURCE_SHA256=152aa83b71b6cab8569aaf270ee7215208444335713bc4887cd17544c9bad263`
+  was recomputed from selected package-relative `hedge_fund` files and verified before baking.
+  The package digest excludes generated `_build_identity.py`, `web/static`, frontend
+  inputs, Dockerfile, lockfiles, base-image contents and OS layers. See `README.md`.
+- OCI labels and a read-only networkless image probe returned the same baked tuple.
+  The final source-tree digest recomputation returned the same package SHA-256.
+
+### Build identity inputs and recorded command
+
+The identity inputs and recorded Compose build command:
+
+```powershell
+$env:AIHF_SOURCE_REVISION='7ec7aaa970a1805478940691a948f1b0dbed4649'
+$env:AIHF_SOURCE_SHA256='152aa83b71b6cab8569aaf270ee7215208444335713bc4887cd17544c9bad263'
+docker compose -p spec005r1-7ec7aaa-20261105-2111 -f docker-compose.yml -f docker-compose.linux.yml --profile web-operator build --progress plain web-operator
+```
+
+Build ran `2026-11-05T21:12:44.2275928+01:00`–`21:13:29.7910203+01:00`,
+**45.5606261 s**, exit 0. Compose emitted a flag-placement warning; the command
+completed and built the tag above. Raw output: `outputs/spec005-r1-runtime-7ec7aaa-20261105-2111/docker-compose-build.log`.
+The build log does not retain the `AIHF_DATA_ROOT` value. That variable supplies
+Compose bind-source interpolation; it is not a Docker build argument. No prior value
+is inferred. The recorded runtime/config check used an existing synthetic artifact path.
+
+The final merged config command was
+`docker compose -p spec005r1-7ec7aaa-20261105-2111 -f docker-compose.yml -f docker-compose.linux.yml -f outputs/spec005-r1-runtime-7ec7aaa-20261105-2111/compose.synthetic.yml --profile web-operator config --format json`.
+At `2026-11-05T21:51:23.1059720+01:00`–`21:51:23.6011727+01:00`,
+**0.4922582 s**, exit 0, **13/13** assertions passed. Selected service used
+`network_mode: host`, no port bindings or Compose bridge network, read-only image
+root, all capabilities dropped, `no-new-privileges`, the exact ext4 named volume
+at `/data` and `/app/outputs`, test loopback allowlist `8876`, scrubbed credentials,
+and no `tui-web` service in the selected profile. This is config evidence, not
+browser/Ollama evidence.
+
+### Runtime environment and provenance
+
+- Host: Windows 11 build 26200.0; Docker Desktop server 29.9.2; Compose 5.6.1;
+  Python 3.11.15. Image: Linux/amd64.
+- Volume: `spec005r1-ext4-7ec7aaa-20261105-2111`, Compose project
+  `spec005r1-7ec7aaa-20261105-2111`; `/proc/mounts` reported `/data` as ext4.
+  Test marker `.test-owned`; roots `fresh-root`, `recovery-root`, `home`, `tmp`.
+- All roots and mandates were synthetic and disposable. No actual fund, real root,
+  cutover, NTFS-to-ext4 copy, provider, market-data, LLM or broker call. App traffic
+  used `docker exec` and loopback `127.0.0.1:8876`; API capabilities reported
+  `network=false`, the test guard blocked an unlisted loopback port, and Compose
+  exposed no host port. Host networking still permits reachability in principle;
+  no external endpoint was called.
+- `tui-web`/ttyd was not started and remains unapproved. The browser and Ollama paths
+  were not exercised. Base bridge profiles remain unsupported; validation used the
+  documented Linux overlay.
+- Raw commands and logs are retained locally under
+  `outputs/spec005-r1-runtime-7ec7aaa-20261105-2111/` (ignored runtime artifacts).
+
+### Current evidence rows
+
+| Row | Time / duration | Scenario and provenance | Observed result | Disposition |
+|---|---|---|---|---|
+| Compose image build | `21:12:44.2275928+01:00`–`21:13:29.7910203+01:00`; **45.5606261 s** | Identity inputs and recorded Compose command above; clean source and baked identity. `AIHF_DATA_ROOT` was not retained and is not a build arg. | Compose tag and image ID match; package digest matches source recomputation. Revision label carries the operator-supplied, format-checked value. | **PASS — image build and package mapping; revision not Git-verified** |
+| Baked identity and digest | Identity probe `21:48:49.8987371+01:00`–`21:48:50.3720654+01:00`; digest recompute `21:50:03.4306137+01:00`–`21:50:11.9781684+01:00`, **8.5451879 s**; image inspect `21:55:01.2891997+01:00`–`21:55:01.5311331+01:00`. | `baked-identity-probe.log`, `package-digest-recompute.log`, `docker-image-inspect-final-corrected.log`. | Probe and OCI labels match the baked tuple; source digest recomputation matches. | **PASS — package digest verified; revision format-only** |
+| Compose merge | `21:51:23.1059720+01:00`–`21:51:23.6011727+01:00`; **0.4922582 s**. | Exact command above; `compose-final-config-check.log`, `compose-final.config.json`. | **13/13** topology and guard assertions passed. | **PASS — config only** |
+| Fresh-root read-only service | `21:57:02.4669552+01:00`–`21:57:06.6129489+01:00`; separate create/readiness/probe/stop timings in `fresh-trace-runtime.log`. | Linux overlay, host network, same ext4 named volume; exact `docker compose run` and `docker exec` commands in the log. | Capabilities/empty mandates 200; bad Host/foreign Origin 403; mutation 403 `read-only`; root unchanged. Container `d0a5a1c109b63d5e8c0ceedf3cf5a3b8706c4208af5e3dd28d369ab061d55211`, exit 0. | **PASS — fresh synthetic root** |
+| Enrolled recovery-root API scenarios | HTTP probe `21:36:09.6642992+01:00`–`21:36:11.5538767+01:00`, **1.8867976 s**. | `recovery-http-scenarios.log`; server launched by `recovery-container-start.log`; loopback network guard in `network-guard-probe.log`. | Host/Origin/session/CSRF failures 403; credential status redacted, credential-like mandate rejected 400; protected roots `watchtower`, `watchtower-weekly`, `umbrella` denied 403; synthetic create/deploy 201; duplicate same-fund 409; ambiguous recovery preview 200; stale recovery 409 with Halt/events unchanged; unlisted loopback port blocked. API writes true only for the synthetic enrolled root; network false. | **PASS — synthetic API scenarios** |
+| Replacement-container identity | Start `21:38:53.7960996+01:00`–`21:38:54.4967824+01:00`; readiness `21:38:55.0545225+01:00`–`21:38:56.8162680+01:00`; corrected probe `21:40:52.1251749+01:00`–`21:40:54.3006122+01:00`, **2.1720159 s**, exit 1. | Same Compose host-network profile and ext4 volume; replacement ID `82aa2c03ecbe0bacb1f333318eceb585645980649352d523a0a8415fd6e41570`; original recovery ID `c839d4fc140eb7d9efbe097f846e510657a0f93ebe797b23cf6dee9c27fc8bdb`. | Recovery seed log records `pid:pid:[4026532817];mnt:mnt:[4026532804]`. Corrected probe aborts at equality check (`stored_namespace == current_namespace`) with “replacement container unexpectedly retained the enrolled namespace”; readiness reports `enrollment=enrolled`. The probe does not print the replacement tuple, and aborts before capability/mutation checks. No write-enabled replacement or reenrollment ran. Cause is unknown. | **FAIL — replacement identity gate; fail-closed denial not established** |
+| Sequential TUI CLI fallback | Web child shutdown `21:43:54.6823685+01:00`–`21:43:55.1108314+01:00`; TUI probe `21:44:09.9673569+01:00`–`21:44:14.1381211+01:00`, **4.1694781 s**. | `cli-web-shutdown.log`, `cli-processes-after-web-shutdown.log`, `cli-tui-probe.log`, terminal capture `cli-tui-render.bin`. | Web child absent after graceful shutdown; TUI exited 0 and rendered 15,731 bytes, SHA-256 `8ade2127e3e48a111040ee2896d8bfe2af7b221d430b70c5b86ffb1feb414290`. First use added only synthetic `mandates/example.yaml` (2,092 bytes). | **PASS — sequential CLI fallback; expected first-use write** |
+| Identity regressions and style | Tests `21:54:25.1222691+01:00`–`21:54:28.9888218+01:00`, **3.8635065 s**; style `21:57:58.3821588+01:00`–`21:58:00.3200438+01:00`, **1.9348404 s**. | Exact pytest, Black, isort and Flake8 commands in `final-identity-tests.log` and `final-python-style.log`. | **13 passed**; four Python files pass Black, repository-configured isort, and Flake8 with `--max-line-length=420`. | **PASS — focused unit/fake and style checks only** |
+| Runtime supervisor shutdown | `21:37:10.5566481+01:00`–`21:37:25.8712599+01:00`. | Recovery harness received SIGTERM; `recovery-supervisor-exit.log`. | Uvicorn logged application shutdown complete; test supervisor recorded child exit `-15` and container exited 241. This harness exit is retained, not counted as an API-scenario failure or a clean supervisor exit. | **INCONCLUSIVE — harness shutdown status** |
+| Owned runtime cleanup | `2026-11-05T22:09:07.3937573+01:00`–`22:09:15.3986133+01:00`; **8.004856 s**. | `runtime-cleanup.log`; exact five container IDs and the Compose-labeled synthetic volume were inspected before removal. | Removed only five stopped task-owned containers and `spec005r1-ext4-7ec7aaa-20261105-2111`; no project containers, networks or that volume remain. Final image tag/ID retained. | **PASS — exact task-owned resources only** |
+| Final resource state | `2026-11-05T22:12:29.8108480+01:00`–`22:12:31.1186163+01:00`; **1.3046777 s**. | `final-resource-state.log`; exact project label, volume name, `probe2` name and image tag inspected. | No project containers, running containers, named volume, networks or `probe2` containers; final image ID/tag/platform remain. | **PASS — read-only final state** |
+
+### Raw evidence file integrity
+
+Logs and terminal capture remain in the ignored local directory
+`outputs/spec005-r1-runtime-7ec7aaa-20261105-2111/`; each digest below identifies the
+exact retained bytes. These files are not included in the docs-only commit.
+
+| File | Bytes | SHA-256 |
+|---|---:|---|
+| `prepare_synthetic_volume.py` | 1050 | `4fccbbd2ebf8757be21cdebaa0f0213c8b47185bad032a5c4c8fba673680b9c5` |
+| `runtime_fresh_probe.py` | 3265 | `7b9f9bc117677fdee85a945ecac3717eed8f86655afcb49b7929b31f6bcc695e` |
+| `runtime_http_scenarios.py` | 13262 | `7eef33cf94b11fabb673aa7a901af627e6ba0ee0fbcf189400d04101b786b4aa` |
+| `runtime_replacement_probe_v2.py` | 3854 | `ed4ac0ac83d02862c0c4051e5157398544c9f0885eb1f62f9223e13ac9e1791d` |
+| `runtime_seed_server_v2.py` | 5423 | `283a74cfc9b73aa83ff203936abdbdde9c46f9e96fe74c02eebd222beaa858e9` |
+| `runtime_tui_probe_v2.py` | 4124 | `d6b93cebd59013b0c30eb7e6c293bef377d9d3a333e8dcb7a119775de419f02d` |
+| `docker-compose-build.log` | 28219 | `7c8434cd266e83f63b70170e97d9a488385c6b5a80d6d31518fb9410629029d9` |
+| `baked-identity-probe.log` | 601 | `7cf334e69c65081cf6aa45ad4933c378b2b807b40735913b62322aecca29fee4` |
+| `package-digest-recompute.log` | 308 | `51f6523440d39a8d3813087db6b4cdeb0228f417e3de0605bf7fe0456fc2b803` |
+| `docker-image-inspect-final-corrected.json` | 3922 | `1dd94e9b315dafa2fd13c3f3a19aa6f8e4220cda638d8587d2ca5a59fe732dc6` |
+| `docker-image-inspect-final-corrected.log` | 912 | `2080c0dfa6ea1436121608b9f179faf2d1cea8ee4bbdee9afc64a0348bb69651` |
+| `compose.synthetic.yml` | 1414 | `d39de8d4d6b56439c18dbc6b257ad8fae80776eec1f27456d4cacadda0f24c5e` |
+| `compose-final.config.json` | 2587 | `bdda2d9a25e6ad4e7dead841f66b929845dc453cd1f21a5a33066a3549fbfe61` |
+| `compose-final-config-check.log` | 1061 | `68802d3390f616d790a11dd78374dc203b5a8934c74f8aefce509cf6449f50a2` |
+| `synthetic-volume-setup.log` | 122 | `0301fcf0cdb47882101525bfdaac323c4ea9bf9461395bfaee14cc2392fdb270` |
+| `synthetic-volume-verify.log` | 230 | `850056afd4b30bc4afb0cb585996b391469305e7d391cbb3b9357ca54282bce9` |
+| `fresh-container-start.log` | 538 | `b0b75b70e97da68bd50a94d18a5d48aec50be56f21caa13d82c7ea4c7ef02e88` |
+| `fresh-readiness.log` | 240 | `4c12428b979f8b67ca7395769d0714487d2bc599f4cfde4fe6c33ee6978d93a0` |
+| `fresh-probe.log` | 907 | `749bd9a35eed971f5c30262b123fc841235db2aa0467f9cd5966fcbabbb2bb6c` |
+| `fresh-container-stop.log` | 221 | `0145381fd4db26836f3bc1dfe7d13f8b98dae07051908515e1b9fb3a76e6b848` |
+| `fresh-trace-runtime.log` | 3249 | `d7f53012d93ea8b98683f06ecf02bb89a70e22900da0fef69ff8834aaa205082` |
+| `recovery-container-start.log` | 947 | `a891f23d4c6fa82eddfb79d133020a224c9e0b093e671b6ef02345f62a7cec3d` |
+| `recovery-readiness.log` | 269 | `07bc26553614b2bfdbe922e66b90e9caaaa848e8e5319bc0f89765d4e05083ca` |
+| `recovery-supervisor-live.log` | 702 | `24413716c023d392914b34233030d1b56954f0c9b484b139d0feca191c68caf5` |
+| `recovery-supervisor-exit.log` | 1222 | `d93aa0d472821634d0842ac8147c906fd52fd3b93474c0237a5cd4c629d1042f` |
+| `recovery-http-scenarios.log` | 3451 | `13307dbc41d796dbd0a50ba40b42f2d6beb54742867d2f36d641c7b3fc782d1f` |
+| `replacement-container-start.log` | 1011 | `eb09c8669e76e88ae6a7add4c0bd1bfb9c4928351580396b0824aa6f62220cf9` |
+| `replacement-readiness.log` | 273 | `6e0347848bc91b395832dadbf8813bf755df1a12f156304b07d1914145d7585f` |
+| `replacement-volume-diagnosis.log` | 1039 | `3e95f249d5e5dec1598da753e7072b3d7c076450a784ea46c9b885f7f7c30964` |
+| `replacement-container-stop.log` | 233 | `25d88218588bb6368a1221f428cd0c22955de03809d24fdbe2ae23a9a462746b` |
+| `replacement-probe-v2.log` | 711 | `0e5bc9b62957fc67e02a1fe1613af835395ff247afecb6898061ee6f0032bbf5` |
+| `network-guard-probe.log` | 215 | `b10603c95d2c02eb7799ad245d210351ecdc2aa5eae74ab6b7570c7d7dd0cc03` |
+| `cli-web-shutdown.log` | 1290 | `4fbcca96dc0b89af658c08212f708444326d6e4f12a091be6779955d348f8834` |
+| `cli-processes-after-web-shutdown.log` | 531 | `af2bebd6e69b65f6d834359c15065e7057c3773acb7a9de98a9b605ba816e044` |
+| `cli-tui-probe.log` | 499 | `f50c3aa232a4daed9849b6ce8a2e02f68bf3e0f69ac0ab638a5a79ac675fb379` |
+| `cli-tui-render.bin` | 15731 | `8ade2127e3e48a111040ee2896d8bfe2af7b221d430b70c5b86ffb1feb414290` |
+| `cli-tui-added-file-inspect.log` | 2319 | `95a40b74f4060f389eefc3485e557a661a843e168203a7d78b524a5ad57212f2` |
+| `cli-post-tui-root-status-v2.log` | 1716 | `c0bdc89075e40ae34fea195552847e5a00540f1e75fafb48e13c363b5e0d5cf9` |
+| `final-identity-tests.log` | 464 | `3bc2010c9939ea3558ae46faa22ca37e8b50e27d4fb3edb0ef1ef296852aa543` |
+| `final-python-style.log` | 1114 | `5aafa4446936bc3fbf7126dbb60ef8386956b8b868af23c24571388f57bfb675` |
+| `final-flake8-configured.log` | 419 | `a33e9dc67e674d96ca2474cad29d8ebae48e9fd9b91725e1ca2e60e36ff08025` |
+| `runtime-cleanup.log` | 2984 | `877729c4260a6f45faeed1ca8be947fcb472654d2f65fd5469317ea8757830d5` |
+| `final-resource-state.log` | 424 | `0d9e2f4d1dbfe8733bff235849876b40ae566377f72bed1741be848ca3dbe1ac` |
+
+### Acceptance disposition
+
+Overall Spec005 acceptance remains **INCONCLUSIVE / not accepted**. The required
+replacement-container identity gate is **FAIL**: the new container retained the enrolled
+PID/mount namespace identity and readiness still reported `enrolled`. Because the probe
+stopped at that comparison, it did not establish the later fail-closed write-denial path.
+Do not treat the replacement as safe, do not launch a write-enabled replacement, and do not
+reenroll or rebind. Next diagnostic should compare namespace identifiers across two
+simultaneously running host-network containers, then across a stop/recreate using separate
+marked synthetic roots; no real root or write-enabled replacement. RB-5 stays unchecked.
+
+FR-044 protected names remain denied. Windows bridge and host Ollama access remain blocked;
+browser/Ollama runtime, NTFS-to-ext4 relocation, real-fund operation, cutover and container
+rebind remain unsupported, blocked or unverified. Independent QA remains pending.

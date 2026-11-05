@@ -1,11 +1,42 @@
 # Spec005 Release 1 implementation manifest
 
-## Current continuation (2026-11-05)
+## Latest runtime evidence and documentation continuation (2026-11-05)
 
-- Worktree/branch: `cgjedrem-super-fiesta`; continuation base `3498ef8a7a1751917b16936c9219dda70dd7fa74`. Commits: `81959b6fa70b25d6a6d40a27d20ec809264efbaa`, `672d69379dc3558f498fd0a2992f9a5c82adc50d` and `cad96a05875efe13d229a8a079d2348ed6d0cf95`. Prior required commits remain in ancestry.
+- Source/artifact: clean source revision `7ec7aaa970a1805478940691a948f1b0dbed4649`,
+  package digest `152aa83b71b6cab8569aaf270ee7215208444335713bc4887cd17544c9bad263`,
+  Compose tag `aihf-web:7ec7aaa970a1805478940691a948f1b0dbed4649-152aa83b71b6cab8569aaf270ee7215208444335713bc4887cd17544c9bad263`,
+  image ID `sha256:b998cd64d5d28c5853ee36fe88381b3ff4a5b4ea7cabb0f1c7d239d5ba7fd977`,
+  Linux/amd64. Exact build/runtime provenance is in `implementation-evidence.md`.
+- Runtime: Linux Compose host-network profile and synthetic ext4 named volume exercised.
+  Fresh-root, API-security, protected-root, synthetic paper, same-fund exclusion,
+  stale-recovery and sequential CLI-TUI checks passed. **Replacement identity gate FAIL:**
+  replacement retained the enrolled PID/mount namespace identity and readiness remained
+  `enrolled`; probe stopped before capability/write-denial checks. No write-enabled
+  replacement or reenrollment ran. Overall acceptance remains **INCONCLUSIVE / not
+  accepted**; RB-5 stays unchecked.
+- Revision label is operator-supplied and format-checked, not Git-verified. Package digest
+  is verified for selected `hedge_fund` files; it excludes generated identity, web static
+  assets, frontend, Dockerfile, lockfiles, base image and OS layers. `tui-web`/ttyd was not
+  started and remains unapproved. No real roots, funds, cutover, external provider calls or
+  broker calls.
+- Targeted `test_build_identity.py` and `test_session_build_identity.py`: **13 passed**;
+  Black, configured isort and Flake8 (`--max-line-length=420`) passed on four relevant
+  Python files.
+- Exact task-owned cleanup: five stopped containers and the synthetic ext4 volume removed;
+  final image retained. `runtime-cleanup.log` records IDs, commands and timestamps;
+  `final-resource-state.log` confirms no project containers, networks, volume or `probe2`.
+- Evidence/docs changed in this continuation: `docs/governance/web-migration-contract.md`,
+  `memory.md`, `specs/005-web-engine-migration/contracts/headless-and-deployment.md`,
+  `implementation-evidence.md`, `implementation-progress.md`, `plan.md`,
+  `r1-implementation-manifest.md`, `spec.md`, and `tasks.md`. Structured blocker recorded
+  at `C:\Users\ChristianGjedrem\.copilot\session-state\67b35421-22ab-450f-9b9c-b1d67e6c4e5e\files\spec005-r1-replacement-identity-blocker.json`.
+
+## Earlier continuation summary — cad96a artifact (superseded)
+
+- Worktree/branch: `cgjedrem-super-fiesta`; continuation base `3498ef8a7a1751917b16936c9219dda70dd7fa74`. Commits: `81959b6fa70b25d6a6d40a27d20ec809264efbaa`, `672d69379dc3558f498fd0a2992f9a5c82adc50d`, `cad96a05875efe13d229a8a079d2348ed6d0cf95`, `4ed878775c00ef47fcd3fd82bf8ac99f37eb4c7f` and `7ec7aaa970a1805478940691a948f1b0dbed4649`. Prior required commits remain in ancestry.
 - Scope result: exact report-download bytes are preserved; report-selection regression uses keyboard input. Docker now has read-only inspection, explicit writable operator mode, Linux host-network overlay and build-baked source identity. No admission guard was weakened. Real roots, operator cutover and actual funds remain untouched.
-- Final image: `aihf-web-spec005-r1-cad96a0-8875cf1`, ID `sha256:21582eeedfa316925b6656f4eedcb4dfd0b999062af3d3aa72f84ceaaa9597b6`, Linux/amd64, created `2026-11-05T18:24:31.448453995Z` UTC. Baked revision `cad96a05875efe13d229a8a079d2348ed6d0cf95`; baked package SHA-256 `8875cf13798d0b6f8468bba97ab3e7f4a21eb48ccd1f61f951b30cd94026d815`. Build ran **44.5122 s** from `2026-11-05T19:24:08.3366748+01:00` to `19:24:52.8510996+01:00`.
-- Runtime status: bounded synthetic ext4 checks observed startup, trust, same-container restart, API denials, synthetic create/deploy, same-fund exclusion, stale-container denial, secret non-disclosure and sequential TUI rendering. The exact runtime observation timestamp and full invocation were not retained in the current evidence record; formal runtime status is **INCONCLUSIVE**, not PASS. Linux host-network/browser/Ollama, Windows bridge/browser/Ollama, target-fund operation, NTFS relocation and recreation/rebind remain unverified or blocked. See `implementation-evidence.md`.
+- Historical image record: `aihf-web-spec005-r1-cad96a0-8875cf1`, ID `sha256:21582eeedfa316925b6656f4eedcb4dfd0b999062af3d3aa72f84ceaaa9597b6`, Linux/amd64. The prior record listed a direct `docker build` command without the Dockerfile's required identity args; no prior build log remains. Treat exact build provenance as **INCONCLUSIVE**. It is not the current image.
+- Historical runtime status: bounded synthetic ext4 checks were reported, but exact runtime provenance was missing and the old replacement-success claim is not current evidence. See the historical section in `implementation-evidence.md`; the current `7ec7aaa` replacement identity gate failed.
 - Test status: timestamped Python selection **302 passed in 293.92 s** (process elapsed **296.6548349 s**, exit 0) across ten backend/runtime/API/TUI modules; immutable package/test tree `36ad8b23874224ca3883bd6f6b05686d7c5ef145`. Black, repository-configured isort and Flake8 passed on all 13 changed Python files. Exact commands and times: `implementation-evidence.md`. This is not a full-suite result. Frontend Vitest **223 passed**, TypeScript exit 0, owned-browser safety **9 passed**, report browser **2 passed**, and desk lifecycle browser **15 passed** predate only an import-formatting change; they were not rerun after `cad96a0`. The earlier full-suite WinError 5 and historical 14-failure discrepancy remain unattributed. Independent QA remains pending; no release-ready claim.
 - Compose merge: exact final-source configuration check passed **13 assertions** at `2026-11-05T19:52:45.5403224+01:00`–`19:52:46.0710415+01:00` in **0.528331 s**. This is configuration evidence only, not browser or host-network runtime evidence.
 - Changed source/test files: `Dockerfile.web`, `docker-compose.yml`, `docker-compose.linux.yml`, `frontend/e2e/reports.spec.ts`, `frontend/e2e/run-owned.mjs`, `hedge_fund/paper/ledger.py`, `hedge_fund/pipeline/session.py`, `hedge_fund/pipeline/test_session_build_identity.py`, `hedge_fund/runtime/build_identity.py`, `hedge_fund/runtime/test_build_identity.py`, `hedge_fund/test_run.py`, `hedge_fund/tui/test_paper.py`, `hedge_fund/web/__main__.py`, `hedge_fund/web/app.py`, `hedge_fund/web/services.py`, `hedge_fund/web/test_app.py`, `hedge_fund/web/test_main.py`, and `hedge_fund/web/test_reports.py`.
