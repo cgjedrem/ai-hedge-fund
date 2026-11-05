@@ -150,6 +150,7 @@ def advance(
     on_fill: Callable[[Order, Fill], None] | None = None,
     before_effect: Callable[[], None] | None = None,
     before_order: Callable[[], None] | None = None,
+    on_progress: Callable[[int], None] | None = None,
 ) -> SessionRecord:
     """Advance *fund* through one completed *session*: a date (YYYY-MM-DD)
     for a daily/weekly/monthly fund, a bar (YYYY-MM-DDTHH:MM:SS, New York)
@@ -162,6 +163,32 @@ def advance(
     switch is set, BookMismatch if the broker disagrees with the state, and
     ValueError for a session that is out of order or not yet complete.
     """
+    if on_progress is not None and not callable(on_progress):
+        raise ValueError("session progress callback must be callable")
+
+    last_progress = -1
+
+    def report_progress(value: int) -> None:
+        nonlocal last_progress
+        if on_progress is None:
+            return
+        if type(value) is not int or not 0 <= value <= 99:
+            raise ValueError("session progress is invalid")
+        if value > last_progress:
+            on_progress(value)
+            last_progress = value
+
+    def agent_progress(start: int, end: int) -> Callable[[int, int], None] | None:
+        if on_progress is None:
+            return None
+
+        def report(completed: int, total: int) -> None:
+            if type(completed) is not int or type(total) is not int or total < 1 or not 0 <= completed <= total:
+                raise ValueError("agent progress is invalid")
+            report_progress(start + (end - start) * completed // total)
+
+        return report
+
     spec = fund.spec
     clock = clock or clock_for(spec, data_client)
     if state.halted is not None:
@@ -174,6 +201,7 @@ def advance(
         raise ValueError(f"{spec.name}: session {session} is not complete yet")
     universe = normalize_universe(universe)
     reconcile(state, broker, spec.name)
+    report_progress(40)
 
     executed: CycleRecord | None = None
     if state.pending is not None:
@@ -187,7 +215,9 @@ def advance(
             on_fill=on_fill,
             before_effect=before_effect,
             before_order=before_order,
+            on_progress=agent_progress(40, 60),
         )
+    report_progress(65)
 
     held = broker.positions()
     marked = clock.marks([*held, spec.benchmark], session)
@@ -195,13 +225,22 @@ def advance(
     cash = broker.cash()
     positions = {t: p.shares for t, p in sorted(held.items())}
     nav = cash + sum(shares * marks[t] for t, shares in positions.items())
+    report_progress(70)
 
     rebalance = is_rebalance_session(session, state.last_session, spec.rebalance)
     decision = None
     if rebalance:
         if before_effect is not None:
             before_effect()
-        decision = assess_fund(fund, session, data_client, universe, clock)
+        decision = assess_fund(
+            fund,
+            session,
+            data_client,
+            universe,
+            clock,
+            on_progress=agent_progress(70, 90),
+        )
+    report_progress(90)
 
     record = SessionRecord(
         fund=spec.name,

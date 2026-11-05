@@ -51,6 +51,7 @@ def test_approval_is_bound_to_the_displayed_timestamp_and_source_hash(write_clie
         "/api/paper/demo-quality/approval",
         headers=headers,
         json={
+            "request_id": "approval-bound-1",
             "verdict": "approve",
             "decision_as_of": pending["decision_as_of"],
             "source_record_hash": pending["source_record_hash"],
@@ -65,6 +66,49 @@ def test_approval_is_bound_to_the_displayed_timestamp_and_source_hash(write_clie
     assert ledger.replay(100_000, full=True).pending.as_of == pending["decision_as_of"]
 
 
+def test_approval_request_replay_returns_original_verdict_without_duplicate_event(write_client, demo_root, monkeypatch):
+    client, headers = write_client
+    pending = client.get("/api/paper/demo-quality", headers={"host": "127.0.0.1"}).json()["pending"]
+    body = {
+        "request_id": "approval-replay-001",
+        "verdict": "approve",
+        "decision_as_of": pending["decision_as_of"],
+        "source_record_hash": pending["source_record_hash"],
+    }
+
+    first = client.post("/api/paper/demo-quality/approval", headers=headers, json=body)
+    service = client.app.state.service
+    monkeypatch.setattr(service, "_replay_paper_state", lambda *_args, **_kwargs: pytest.fail("committed request must not be replayed"))
+    second = client.post("/api/paper/demo-quality/approval", headers=headers, json=body)
+
+    ledger = Ledger(demo_root / "paper" / "demo-quality")
+    events = ledger.events()
+    assert first.status_code == second.status_code == 200
+    assert second.json() == first.json()
+    assert ledger.approval()["approval_id"]
+    assert sum(event.get("kind") == "approve" and event.get("request_id") == body["request_id"] for event in events) == 1
+    assert sum(event.get("kind") == "approval_commit" and event.get("request_id") == body["request_id"] for event in events) == 1
+
+
+def test_approval_request_id_conflicts_when_payload_changes(write_client, demo_root):
+    client, headers = write_client
+    pending = client.get("/api/paper/demo-quality", headers={"host": "127.0.0.1"}).json()["pending"]
+    body = {
+        "request_id": "approval-replay-conflict",
+        "verdict": "approve",
+        "decision_as_of": pending["decision_as_of"],
+        "source_record_hash": pending["source_record_hash"],
+    }
+    first = client.post("/api/paper/demo-quality/approval", headers=headers, json=body)
+    changed = {**body, "verdict": "reject"}
+    second = client.post("/api/paper/demo-quality/approval", headers=headers, json=changed)
+
+    assert first.status_code == 200
+    assert second.status_code == 409
+    assert second.json()["code"] == "request-conflict"
+    assert Ledger(demo_root / "paper" / "demo-quality").approval()["verdict"] == "approve"
+
+
 def test_stale_and_expired_approvals_fail_without_rebinding(write_client, demo_root):
     client, headers = write_client
     detail = client.get("/api/paper/demo-quality", headers={"host": "127.0.0.1"}).json()
@@ -73,6 +117,7 @@ def test_stale_and_expired_approvals_fail_without_rebinding(write_client, demo_r
         "/api/paper/demo-quality/approval",
         headers=headers,
         json={
+            "request_id": "approval-stale-1",
             "verdict": "approve",
             "decision_as_of": pending["decision_as_of"],
             "source_record_hash": "0" * 64,
@@ -93,6 +138,7 @@ def test_stale_and_expired_approvals_fail_without_rebinding(write_client, demo_r
         "/api/paper/demo-quality/approval",
         headers=headers,
         json={
+            "request_id": "approval-expired-1",
             "verdict": "reject",
             "decision_as_of": pending["decision_as_of"],
             "source_record_hash": pending["source_record_hash"],
@@ -113,6 +159,7 @@ def test_paper_detail_does_not_present_stale_mailbox_as_current(
     detail = client.get("/api/paper/demo-quality", headers={"host": "127.0.0.1"}).json()
     pending = detail["pending"]
     request = {
+        "request_id": "approval-mailbox-1",
         "verdict": "approve",
         "decision_as_of": pending["decision_as_of"],
         "source_record_hash": pending["source_record_hash"],
@@ -134,7 +181,7 @@ def test_paper_detail_does_not_present_stale_mailbox_as_current(
         response = client.post(
             "/api/paper/demo-quality/approval",
             headers=headers,
-            json={**request, "verdict": "reject"},
+            json={**request, "request_id": "approval-mailbox-replacement-1", "verdict": "reject"},
         )
         assert response.status_code == 409
     elif stale_reason == "expiry":
@@ -166,6 +213,7 @@ def test_paper_detail_exposes_unfinished_approval_reconciliation(write_client, d
         "/api/paper/demo-quality/approval",
         headers=headers,
         json={
+            "request_id": "approval-reconciliation-1",
             "verdict": "approve",
             "decision_as_of": pending["decision_as_of"],
             "source_record_hash": pending["source_record_hash"],
@@ -200,6 +248,7 @@ def test_paper_detail_detects_consumption_during_verdict_read(write_client, demo
         "/api/paper/demo-quality/approval",
         headers=headers,
         json={
+            "request_id": "approval-consumption-race-1",
             "verdict": "approve",
             "decision_as_of": pending["decision_as_of"],
             "source_record_hash": pending["source_record_hash"],
@@ -250,6 +299,7 @@ def test_approval_is_rejected_when_gate_is_disabled(write_client, demo_root):
         "/api/paper/no-gate/approval",
         headers=headers,
         json={
+            "request_id": "approval-no-gate-1",
             "verdict": "approve",
             "decision_as_of": "2024-06-05",
             "source_record_hash": "0" * 64,
@@ -272,6 +322,7 @@ def test_approval_is_rejected_for_halted_fund(write_client, demo_root):
         "/api/paper/demo-quality/approval",
         headers=headers,
         json={
+            "request_id": "approval-halted-1",
             "verdict": "approve",
             "decision_as_of": pending["decision_as_of"],
             "source_record_hash": pending["source_record_hash"],
@@ -296,6 +347,7 @@ def test_approval_is_rejected_when_control_is_unreadable(write_client, demo_root
         "/api/paper/demo-quality/approval",
         headers=headers,
         json={
+            "request_id": "approval-control-corrupt-1",
             "verdict": "approve",
             "decision_as_of": pending["decision_as_of"],
             "source_record_hash": pending["source_record_hash"],
@@ -308,7 +360,7 @@ def test_approval_is_rejected_when_control_is_unreadable(write_client, demo_root
     assert not (demo_root / "paper" / "demo-quality" / "pending-approval.json").exists()
 
 
-def test_halt_reuses_ledger_control_and_resume_requires_reconciliation(tmp_path):
+def test_halt_and_resume_record_control_without_repeating_work(tmp_path):
     from hedge_fund.web.demo import seed_demo
 
     root = seed_demo(tmp_path / "writes")
@@ -322,19 +374,123 @@ def test_halt_reuses_ledger_control_and_resume_requires_reconciliation(tmp_path)
             "origin": "http://127.0.0.1",
             "x-csrf-token": token,
         }
-        halted = client.post("/api/paper/demo-quality/halt", headers=headers, json={"reason": "operator pause"})
+        halted = client.post("/api/paper/demo-quality/halt", headers=headers, json={"request_id": "halt-manual-001", "reason": "operator pause"})
         current = client.get("/api/paper/demo-quality", headers={"host": "127.0.0.1"}).json()
-        resumed = client.post("/api/paper/demo-quality/resume", headers=headers)
+        resumed = client.post("/api/paper/demo-quality/resume", headers=headers, json={"request_id": "resume-manual-001"})
 
     ledger = Ledger(root / "paper" / "demo-quality")
     assert halted.status_code == 200
     assert current["halted"] == "operator pause"
-    assert resumed.status_code == 423
-    assert resumed.json()["code"] == "reconciliation-required"
-    assert resumed.json()["retry_policy"] == "inspect-status"
-    assert "reconciliation receipt" in resumed.json()["detail"]
+    assert resumed.status_code == 200
+    assert resumed.json() == {"name": "demo-quality", "halted": False, "reconciliation_id": None}
+    assert ledger.halted() is None
+    assert [event["kind"] for event in ledger.events()][-5:] == ["halt_intent", "halt", "resume", "resume_effect_intent", "resume_completed"]
+
+
+def test_halt_request_replay_is_idempotent_and_payload_bound(write_client, demo_root):
+    client, headers = write_client
+    body = {"request_id": "halt-replay-001", "reason": "operator pause"}
+
+    first = client.post("/api/paper/demo-quality/halt", headers=headers, json=body)
+    repeated = client.post("/api/paper/demo-quality/halt", headers=headers, json=body)
+    changed = client.post(
+        "/api/paper/demo-quality/halt",
+        headers=headers,
+        json={**body, "reason": "different pause"},
+    )
+
+    events = Ledger(demo_root / "paper" / "demo-quality").events()
+    assert first.status_code == repeated.status_code == 200
+    assert repeated.json() == first.json()
+    assert changed.status_code == 409
+    assert changed.json()["code"] == "request-conflict"
+    assert sum(event.get("kind") == "halt" and event.get("request_id") == body["request_id"] for event in events) == 1
+    assert sum(event.get("kind") == "halt_intent" and event.get("request_id") == body["request_id"] for event in events) == 1
+
+
+def test_halt_retries_an_uncommitted_intent_without_duplicate_audit(write_client, demo_root, monkeypatch):
+    client, headers = write_client
+    original = Ledger._write_control
+    attempts = []
+
+    def fail_before_control(self, halted, reason, **kwargs):
+        attempts.append(halted)
+        if len(attempts) == 1:
+            raise OSError("synthetic control write failure")
+        return original(self, halted, reason, **kwargs)
+
+    monkeypatch.setattr(Ledger, "_write_control", fail_before_control)
+    body = {"request_id": "halt-incomplete-intent-001", "reason": "operator pause"}
+
+    first = client.post("/api/paper/demo-quality/halt", headers=headers, json=body)
+    retry = client.post("/api/paper/demo-quality/halt", headers=headers, json=body)
+
+    ledger = Ledger(demo_root / "paper" / "demo-quality")
+    events = ledger.events()
+    assert first.status_code == 409
+    assert retry.status_code == 200
+    assert attempts == [True, True]
+    assert ledger.halted() == body["reason"]
+    assert sum(event.get("kind") == "halt_intent" and event.get("request_id") == body["request_id"] for event in events) == 1
+    assert sum(event.get("kind") == "halt" and event.get("request_id") == body["request_id"] for event in events) == 1
+
+
+def test_manual_resume_request_replay_returns_original_result_and_conflicts_on_payload_change(write_client, demo_root):
+    client, headers = write_client
+    ledger = Ledger(demo_root / "paper" / "demo-quality")
+    with _demo_control_lane(demo_root, "demo-quality"):
+        ledger.halt("operator pause", request_id="halt-manual-resume-001")
+    body = {"request_id": "resume-replay-001"}
+
+    first = client.post("/api/paper/demo-quality/resume", headers=headers, json=body)
+    repeated = client.post("/api/paper/demo-quality/resume", headers=headers, json=body)
+    changed = client.post(
+        "/api/paper/demo-quality/resume",
+        headers=headers,
+        json={
+            **body,
+            "failure_id": "a" * 64,
+            "preview_digest": "b" * 64,
+            "decision": "confirm-paper-book-matches-ledger",
+        },
+    )
+
+    events = ledger.events()
+    assert first.status_code == repeated.status_code == 200, (first.json(), repeated.json(), changed.json())
+    assert repeated.json() == first.json()
+    assert changed.status_code == 409
+    assert changed.json()["code"] == "request-conflict"
+    assert ledger.halted() is None
+    assert sum(event.get("kind") == "resume_completed" and event.get("request_id") == body["request_id"] for event in events) == 1
+
+
+def test_resume_does_not_repeat_after_uncertain_control_write(write_client, demo_root, monkeypatch):
+    client, headers = write_client
+    ledger = Ledger(demo_root / "paper" / "demo-quality")
+    with _demo_control_lane(demo_root, "demo-quality"):
+        ledger.halt("operator pause", request_id="halt-before-uncertain-resume-001")
+    original = Ledger._write_control
+    attempts = []
+
+    def fail_clear(self, halted, reason, **kwargs):
+        attempts.append(halted)
+        if halted is False:
+            raise OSError("synthetic Resume control write failure")
+        return original(self, halted, reason, **kwargs)
+
+    monkeypatch.setattr(Ledger, "_write_control", fail_clear)
+    body = {"request_id": "resume-uncertain-control-001"}
+    first = client.post("/api/paper/demo-quality/resume", headers=headers, json=body)
+    retry = client.post("/api/paper/demo-quality/resume", headers=headers, json=body)
+
+    events = ledger.events()
+    assert first.status_code == retry.status_code == 423
+    assert first.json()["code"] == retry.json()["code"] == "reconciliation-required"
+    assert attempts == [False]
     assert ledger.halted() == "operator pause"
-    assert [event["kind"] for event in ledger.events()][-1:] == ["halt"]
+    assert sum(event.get("kind") == "resume" and event.get("request_id") == body["request_id"] for event in events) == 1
+    assert sum(event.get("kind") == "resume_effect_intent" and event.get("request_id") == body["request_id"] for event in events) == 1
+    assert sum(event.get("kind") == "resume_completed" and event.get("request_id") == body["request_id"] for event in events) == 0
 
 
 def test_halt_works_for_corrupt_ledger_but_resume_still_requires_valid_replay(demo_root):
@@ -352,8 +508,8 @@ def test_halt_works_for_corrupt_ledger_but_resume_still_requires_valid_replay(de
             "origin": "http://127.0.0.1",
             "x-csrf-token": token,
         }
-        halted = client.post("/api/paper/demo-quality/halt", headers=headers, json={"reason": "ledger review"})
-        resumed = client.post("/api/paper/demo-quality/resume", headers=headers)
+        halted = client.post("/api/paper/demo-quality/halt", headers=headers, json={"request_id": "halt-corrupt-ledger-001", "reason": "ledger review"})
+        resumed = client.post("/api/paper/demo-quality/resume", headers=headers, json={"request_id": "resume-corrupt-ledger-001"})
 
     ledger = Ledger(demo_root / "paper" / "demo-quality")
     assert halted.status_code == 200
@@ -382,7 +538,7 @@ def test_emergency_halt_recovers_an_unreadable_control_file(demo_root):
         halted = client.post(
             "/api/paper/demo-quality/halt",
             headers=headers,
-            json={"reason": "control recovery"},
+            json={"request_id": "halt-control-recovery-001", "reason": "control recovery"},
         )
 
     ledger = Ledger(demo_root / "paper" / "demo-quality")
@@ -419,7 +575,7 @@ def test_protected_name_guard_runs_before_fund_adapter(tmp_path, monkeypatch):
                 "origin": "http://127.0.0.1",
                 "x-csrf-token": token,
             },
-            json={"reason": "not allowed"},
+            json={"request_id": "halt-protected-001", "reason": "not allowed"},
         )
 
     assert response.status_code == 403
@@ -460,9 +616,9 @@ def test_protected_windows_aliases_are_rejected_before_control_writes(tmp_path, 
             "origin": "http://127.0.0.1",
             "x-csrf-token": token,
         }
-        canonical = client.post("/api/paper/watchtower/halt", headers=headers, json={"reason": "blocked"})
-        trailing_dot = client.post("/api/paper/watchtower./halt", headers=headers, json={"reason": "blocked"})
-        trailing_space = client.post("/api/paper/watchtower%20/halt", headers=headers, json={"reason": "blocked"})
+        canonical = client.post("/api/paper/watchtower/halt", headers=headers, json={"request_id": "halt-protected-002", "reason": "blocked"})
+        trailing_dot = client.post("/api/paper/watchtower./halt", headers=headers, json={"request_id": "halt-protected-003", "reason": "blocked"})
+        trailing_space = client.post("/api/paper/watchtower%20/halt", headers=headers, json={"request_id": "halt-protected-004", "reason": "blocked"})
 
     assert canonical.status_code == 403
     assert trailing_dot.status_code == 400
@@ -487,6 +643,7 @@ def test_nonlocal_broker_mutations_stop_before_ledger_adapter(demo_root, monkeyp
     ).pending
     assert pending is not None
     request = ApprovalRequest(
+        request_id="approval-nonlocal-1",
         verdict="approve",
         decision_as_of=pending.as_of,
         source_record_hash=Ledger(directory).replay(
@@ -508,7 +665,7 @@ def test_nonlocal_broker_mutations_stop_before_ledger_adapter(demo_root, monkeyp
             if action == "approve":
                 service.approve("demo-quality", request)
             elif action == "halt":
-                service.halt_fund("demo-quality", "must not write")
+                service.halt_fund("demo-quality", "must not write", "halt-nonlocal-001")
             elif action == "runner-stop":
                 monkeypatch.setattr(service._runner_manager, "request_stop", forbidden)
                 service.stop_runner("demo-quality")
@@ -572,13 +729,14 @@ def test_saxo_web_routes_deny_before_provider_or_writer_effects(
             (
                 "/api/paper/demo-quality/approval",
                 {
+                    "request_id": "approval-sim-denied-1",
                     "verdict": "approve",
                     "decision_as_of": "2024-06-05",
                     "source_record_hash": "b" * 64,
                 },
             ),
-            ("/api/paper/demo-quality/halt", {"reason": "blocked"}),
-            ("/api/paper/demo-quality/resume", None),
+            ("/api/paper/demo-quality/halt", {"request_id": "halt-sim-denied-001", "reason": "blocked"}),
+            ("/api/paper/demo-quality/resume", {"request_id": "resume-sim-denied-001"}),
             ("/api/paper/demo-quality/runner/stop", None),
             ("/api/paper/demo-quality/tick/preview", {"expected_head": head}),
             ("/api/paper/demo-quality/runner/preview", {"expected_head": head}),
@@ -785,7 +943,7 @@ def test_web_halt_enters_halt_only_lane(tmp_path, monkeypatch):
 
     monkeypatch.setattr(service._admission, "halt_lane", observe)
     try:
-        result = service.halt_fund("demo-quality", "operator pause")
+        result = service.halt_fund("demo-quality", "operator pause", "halt-lane-001")
     finally:
         service.close()
 
@@ -817,7 +975,7 @@ def test_web_halt_succeeds_while_a_control_scan_is_in_flight(tmp_path):
     holder.start()
     try:
         assert entered.wait(timeout=10), failures
-        result = service.halt_fund("demo-quality", "synthetic emergency")
+        result = service.halt_fund("demo-quality", "synthetic emergency", "halt-control-inflight-001")
         assert result == {"name": "demo-quality", "halted": True}
         assert Ledger(root / "paper" / "demo-quality").halted() == "synthetic emergency"
     finally:
@@ -854,7 +1012,7 @@ def test_web_halt_reports_applied_switch_when_audit_is_unavailable(tmp_path):
     try:
         assert held.wait(timeout=10), failures
         with pytest.raises(ServiceError) as error:
-            service.halt_fund("demo-quality", "synthetic emergency")
+            service.halt_fund("demo-quality", "synthetic emergency", "halt-audit-unavailable-001")
         assert error.value.status_code == 423
         assert "Halt was applied" in error.value.detail
         assert "audit" in error.value.detail
@@ -893,7 +1051,7 @@ def test_archive_cannot_move_a_fund_during_an_inflight_halt(tmp_path, monkeypatc
 
     def halt():
         try:
-            results.append(service.halt_fund("demo-quality", "synthetic emergency"))
+            results.append(service.halt_fund("demo-quality", "synthetic emergency", "halt-archive-race-001"))
         except BaseException as exc:
             failures.append(exc)
 
@@ -965,7 +1123,7 @@ def test_web_halt_fences_an_inflight_verdict_before_it_commits(tmp_path, monkeyp
     publisher.start()
     try:
         assert before_commit.wait(timeout=10), outcomes
-        assert service.halt_fund("demo-quality", "synthetic emergency")["halted"]
+        assert service.halt_fund("demo-quality", "synthetic emergency", "halt-verdict-race-001")["halted"]
     finally:
         release.set()
         publisher.join(timeout=10)
@@ -1008,7 +1166,7 @@ def test_web_halt_fences_cli_approval_publication_across_processes(write_client,
             "        if not release.exists(): raise TimeoutError('approval release missing')",
             "    return written",
             "ledger_module.write_atomic = paused_write",
-            f"sys.argv = ['aihf', '--root', {str(demo_root)!r}, 'paper', 'approve', 'demo-quality']",
+            f"sys.argv = ['aihf', '--root', {str(demo_root)!r}, 'paper', 'approve', 'demo-quality', '--expected-head', {latest.hash!r}, '--request-id', 'approval-cross-process-001']",
             "try:",
             "    run.main()",
             "except SystemExit as exc:",
@@ -1025,7 +1183,7 @@ def test_web_halt_fences_cli_approval_publication_across_processes(write_client,
             time.sleep(0.01)
         assert ready.exists(), f"CLI approval did not reach pending publication: {child.poll()}"
         started = time.monotonic()
-        response = client.post("/api/paper/demo-quality/halt", headers=headers, json={"reason": "synthetic emergency"})
+        response = client.post("/api/paper/demo-quality/halt", headers=headers, json={"request_id": "halt-bounded-control-001", "reason": "synthetic emergency"})
         elapsed = time.monotonic() - started
         assert response.status_code == 200
         assert elapsed < MAX_CONTROL_WAIT_SECONDS + 5
@@ -1088,14 +1246,14 @@ def test_halt_cannot_acknowledge_during_verdict_commit_before_a_publisher_crash(
         try:
             assert committed.wait(timeout=10), failures
             with pytest.raises(ServiceError) as blocked:
-                service.halt_fund("demo-quality", "synthetic emergency")
+                service.halt_fund("demo-quality", "synthetic emergency", "halt-publisher-crash-001")
             assert blocked.value.status_code == 409
         finally:
             release.set()
             worker.join(timeout=10)
         assert not worker.is_alive()
         assert failures == []
-        assert service.halt_fund("demo-quality", "synthetic emergency")["halted"]
+        assert service.halt_fund("demo-quality", "synthetic emergency", "halt-publisher-crash-001")["halted"]
         assert ledger.halted() == "synthetic emergency"
     finally:
         service.close()
@@ -1115,7 +1273,7 @@ def test_web_halt_does_not_wait_for_fund_work_lock(tmp_path):
 
     def halt():
         try:
-            result.append(service.halt_fund("demo-quality", "operator pause"))
+            result.append(service.halt_fund("demo-quality", "operator pause", "halt-lock-independent-001"))
         except Exception as exc:
             failures.append(exc)
         finally:
@@ -1170,6 +1328,7 @@ def test_approval_and_resume_reject_symlinked_control_files(demo_root, tmp_path,
     state = Ledger(directory).replay(deployed.spec.capital, full=True)
     assert state.pending is not None
     request = ApprovalRequest(
+        request_id="approval-symlink-1",
         verdict="approve",
         decision_as_of=state.pending.as_of,
         source_record_hash=state.prev_hash,

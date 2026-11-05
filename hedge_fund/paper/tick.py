@@ -182,6 +182,12 @@ def tick(
     session: str | None = None,
     build_fund: Callable[[FundSpec], Fund] | None = None,
     now: Callable[[], datetime] | None = None,
+    expected_head: str | None = None,
+    operation_id: str | None = None,
+    request_id: str | None = None,
+    capture_id: str | None = None,
+    capture_digest: str | None = None,
+    on_progress: Callable[[int], None] | None = None,
 ) -> SessionRecord:
     """Advance the paper fund in *directory* by one session and record it.
 
@@ -192,11 +198,112 @@ def tick(
     benchmark has not printed today), FundHalted when the kill switch is
     set. *now* is the clock; tests inject it.
     """
+    if on_progress is not None and not callable(on_progress):
+        raise ValueError("paper tick progress callback must be callable")
     directory = Path(directory)
-    from hedge_fund.runtime.admission import paper_execution_transition
+    operation_context = None
+    if request_id is not None:
+        from hedge_fund.paper.ledger import Ledger
+
+        operation_values = (operation_id, capture_id, capture_digest)
+        if any(value is not None for value in operation_values):
+            from hedge_fund.runtime.reconciliation import TickOperationIdentity
+
+            try:
+                operation_context = TickOperationIdentity(
+                    operation_id=operation_id,
+                    request_id=request_id,
+                    capture_id=capture_id,
+                    capture_digest=capture_digest,
+                ).model_dump(mode="json")
+            except ValueError:
+                raise ValueError("paper tick operation identity is invalid") from None
+        else:
+            operation_context = {"request_id": request_id}
+        ledger = Ledger(directory)
+        try:
+            request_digest = ledger.tick_request_digest(
+                request_id,
+                expected_head=expected_head,
+                session=session,
+                operation_id=operation_id,
+                capture_id=capture_id,
+                capture_digest=capture_digest,
+            )
+        except ValueError:
+            raise ValueError("paper tick operation identity is invalid") from None
+        operation_context.update(
+            {
+                "request_action": "tick",
+                "request_digest": request_digest,
+                "expected_head": expected_head,
+            }
+        )
+    elif any(value is not None for value in (operation_id, capture_id, capture_digest)):
+        raise ValueError("paper tick operation identity is invalid")
+    from hedge_fund.runtime.admission import (
+        paper_execution_transition,
+        PaperPreflightBusy,
+    )
 
     with paper_execution_transition(directory, directory.name):
-        return _tick(directory, data_client, session=session, build_fund=build_fund, now=now)
+        if operation_context is not None:
+            from hedge_fund.paper.ledger import Ledger, PaperTickNoWork
+
+            ledger = Ledger(directory)
+            try:
+                replayed = ledger.tick_request_result(
+                    request_id,
+                    expected_head=expected_head,
+                    session=session,
+                    operation_id=operation_id,
+                    capture_id=capture_id,
+                    capture_digest=capture_digest,
+                )
+            except AuditObservationUnavailable as exc:
+                raise PaperPreflightBusy("Paper preflight audit observation is occupied.") from exc
+            except PaperTickNoWork as exc:
+                raise NothingDue(str(exc)) from exc
+            if replayed is not None:
+                return replayed
+            latest = ledger.latest()
+            current_head = latest.hash if latest is not None else None
+            if current_head != expected_head:
+                raise LedgerError("paper ledger head changed before the tick request")
+            if session is not None and session in ledger.sessions():
+                record = ledger.read(session)
+                ledger.log_event(
+                    "tick",
+                    request_id=request_id,
+                    request_action="tick",
+                    request_digest=operation_context["request_digest"],
+                    expected_head=expected_head,
+                    result={"session": record.session, "hash": record.hash},
+                    durable=True,
+                )
+                return record
+        try:
+            return _tick(
+                directory,
+                data_client,
+                session=session,
+                build_fund=build_fund,
+                now=now,
+                operation_context=operation_context,
+                on_progress=on_progress,
+            )
+        except NothingDue as exc:
+            if operation_context is not None:
+                ledger.log_event(
+                    "tick_no_work",
+                    request_id=request_id,
+                    request_action="tick",
+                    request_digest=operation_context["request_digest"],
+                    expected_head=expected_head,
+                    result={"outcome": "nothing-due", "message": str(exc)},
+                    durable=True,
+                )
+            raise
 
 
 @contextmanager
@@ -225,6 +332,8 @@ def _tick(
     session: str | None,
     build_fund: Callable[[FundSpec], Fund] | None,
     now: Callable[[], datetime] | None,
+    operation_context: dict | None,
+    on_progress: Callable[[int], None] | None,
 ) -> SessionRecord:
     deployed = load_deployed(directory)
     if deployed.broker == "saxo":
@@ -270,7 +379,32 @@ def _tick(
         benchmark = clock.observe([spec.benchmark], due)[spec.benchmark]
         if print_day(benchmark.time) < session_date(due):
             raise NothingDue(f"{deployed.name}: {spec.benchmark} has not printed today (market closed); " f"next {following_session(spec, state.last_session, now())}")
-    return _run(directory, deployed, ledger, state, due, data_client, build_fund, clock=clock)
+    if operation_context is not None:
+        ledger.log_event(
+            "tick_intent",
+            request_id=operation_context["request_id"],
+            request_action=operation_context["request_action"],
+            request_digest=operation_context["request_digest"],
+            expected_head=state.prev_hash,
+            requested_session=session,
+            session=due,
+            **{key: operation_context[key] for key in ("operation_id", "capture_id", "capture_digest") if key in operation_context},
+            durable=True,
+        )
+    if on_progress is not None:
+        on_progress(35)
+    return _run(
+        directory,
+        deployed,
+        ledger,
+        state,
+        due,
+        data_client,
+        build_fund,
+        clock=clock,
+        operation_context=operation_context,
+        on_progress=on_progress,
+    )
 
 
 def print_day(time: str) -> str:
@@ -284,6 +418,8 @@ def redo(
     *,
     build_fund: Callable[[FundSpec], Fund] | None = None,
     on_rewind: Callable[[SessionRecord], None] | None = None,
+    request_id: str | None = None,
+    expected_head: str | None = None,
 ) -> SessionRecord:
     """Run the latest recorded session again and replace its record.
 
@@ -299,7 +435,14 @@ def redo(
     from hedge_fund.runtime.admission import paper_execution_transition
 
     with paper_execution_transition(directory, directory.name):
-        return _redo(directory, data_client, build_fund=build_fund, on_rewind=on_rewind)
+        return _redo(
+            directory,
+            data_client,
+            build_fund=build_fund,
+            on_rewind=on_rewind,
+            request_id=request_id,
+            expected_head=expected_head,
+        )
 
 
 def _redo(
@@ -308,11 +451,27 @@ def _redo(
     *,
     build_fund: Callable[[FundSpec], Fund] | None,
     on_rewind: Callable[[SessionRecord], None] | None,
+    request_id: str | None,
+    expected_head: str | None,
 ) -> SessionRecord:
     deployed = load_deployed(directory)
     if deployed.broker != "paper":
         raise ValueError(f"redo is only supported for paper broker funds, not {deployed.broker}")
     ledger = Ledger(directory)
+    request_digest = None
+    if request_id is not None:
+        if expected_head is None:
+            raise ValueError("redo expected head is required")
+        replayed = ledger.redo_request_result(request_id, expected_head)
+        if replayed is not None:
+            return replayed
+        latest = ledger.latest()
+        current_head = latest.hash if latest is not None else None
+        if current_head != expected_head:
+            raise LedgerError("paper ledger head changed before the redo request")
+        request_digest = ledger.redo_request_digest(request_id, expected_head)
+    elif expected_head is not None:
+        raise ValueError("redo request identity is invalid")
     ledger._require_completed_redo()
     state = ledger.replay(deployed.spec.capital)  # verifies the whole chain first
     if state.halted is not None:
@@ -333,7 +492,22 @@ def _redo(
             if deployed.spec.approval_required:
                 _verified_redo_approval(ledger, before, superseded)
             ledger.require_ready_for_work(state, approval_required=deployed.spec.approval_required)
-            redo_id = ledger.begin_redo(superseded)
+            redo_id = ledger.begin_redo(
+                superseded,
+                request_id=request_id,
+                request_digest=request_digest,
+            )
+            if request_id is not None:
+                ledger.log_event(
+                    "redo_intent",
+                    request_id=request_id,
+                    request_action="redo",
+                    request_digest=request_digest,
+                    expected_head=expected_head,
+                    source_session=superseded.session,
+                    source_hash=superseded.hash,
+                    durable=True,
+                )
             if deployed.spec.approval_required:
                 if superseded.decision is not None:
                     ledger.log_event(
@@ -362,7 +536,17 @@ def _redo(
                 ledger.halt("redo authorization denied after rewind")
                 raise
         PaperBroker.restore(directory / BROKER_FILE, before.cash, before.positions, deployed.spec.costs)
-        ledger.log_event("redo", session=superseded.session, superseded=superseded.hash)
+        request_fields = (
+            {
+                "request_id": request_id,
+                "request_action": "redo",
+                "request_digest": request_digest,
+                "expected_head": expected_head,
+            }
+            if request_id is not None
+            else {}
+        )
+        ledger.log_event("redo", session=superseded.session, superseded=superseded.hash, **request_fields)
         clock = None
         if deployed.spec.is_intraday:  # a bar's prints are gone; run it at the ones it kept
             clock = RecordedClock(superseded, deployed.spec.interval_seconds, deployed.spec.window)
@@ -381,6 +565,15 @@ def _redo(
             active_redo_id=redo_id,
         )
         ledger.finish_redo(redo_id, record)
+        if request_id is not None:
+            ledger.log_event(
+                "redo_completed",
+                request_id=request_id,
+                request_action="redo",
+                request_digest=request_digest,
+                result={"session": record.session, "hash": record.hash},
+                durable=True,
+            )
         return record
     except Exception as exc:
         try:
@@ -436,6 +629,8 @@ def _run(
     redo_nonce: str | None = None,
     replay_record: SessionRecord | None = None,
     active_redo_id: str | None = None,
+    operation_context: dict | None = None,
+    on_progress: Callable[[int], None] | None = None,
 ) -> SessionRecord:
     """Advance one session from *state* and record it, halting on failure.
     *fund* lets a long-running caller keep one Fund (and its analysts'
@@ -566,6 +761,7 @@ def _run(
                 on_fill=record_fill if deployed.broker == "saxo" else None,
                 before_effect=check_effect_admission,
                 before_order=reserve_publication,
+                on_progress=on_progress,
             )
             if registry_observation is not None:
                 registry_observation.close_observations()
@@ -593,7 +789,10 @@ def _run(
                 )
                 if "approval_id" in consumed_verdict:
                     tick_fields["approval_id"] = consumed_verdict["approval_id"]
-            ledger.log_event("tick", **tick_fields)
+            if operation_context is not None:
+                tick_fields.update(operation_context)
+                tick_fields["result"] = {"session": record.session, "hash": record.hash}
+            ledger.log_event("tick", durable=operation_context is not None, **tick_fields)
             if clear_verdict is not None:
                 with paper_control_transition(directory, deployed.name):
                     ledger.clear_approval(expected=clear_verdict)
@@ -604,8 +803,17 @@ def _run(
         raise
     except Exception as exc:
         reason = f"tick {session} failed: {type(exc).__name__}: {exc}"
+        failure_fields = {"expected_head": state.prev_hash}
+        if operation_context is not None:
+            failure_fields.update(operation_context)
         try:
-            ledger.log_event("tick_failed", session=session, error=f"{type(exc).__name__}: {exc}")
+            ledger.log_event(
+                "tick_failed",
+                session=session,
+                error=f"{type(exc).__name__}: {exc}",
+                durable=operation_context is not None,
+                **failure_fields,
+            )
         finally:
             ledger.halt(reason)
         raise

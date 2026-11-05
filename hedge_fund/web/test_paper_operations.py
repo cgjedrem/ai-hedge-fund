@@ -197,6 +197,144 @@ def test_reviewed_manual_tick_executes_one_session_with_local_fakes(
     assert len(data_client.calls) > 0
 
 
+def test_reviewed_manual_tick_persists_agent_progress(
+    demo_root,
+    monkeypatch,
+):
+    data_client = _OfflineDataClient()
+    second_agent_started = threading.Event()
+    release_second_agent = threading.Event()
+    call_count = 0
+
+    class BlockingAnalyst(_OfflineAnalyst):
+        def predict(self, ticker, as_of, view):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 2:
+                second_agent_started.set()
+                if not release_second_agent.wait(timeout=30):
+                    raise TimeoutError("synthetic agent release timed out")
+            return super().predict(ticker, as_of, view)
+
+    class BlockingFund:
+        def __init__(self, spec):
+            self.spec = spec
+            self.strategies = [(spec.strategies[0], [BlockingAnalyst()])]
+
+    def no_provider_client(*_args, **_kwargs):
+        raise AssertionError("manual tick must use the injected offline data client")
+
+    monkeypatch.setattr(web_services, "make_data_client", no_provider_client)
+    service = DeskService(
+        demo_root,
+        allow_writes=True,
+        network_enabled=True,
+        data_client_factory=lambda: data_client,
+        fund_factory=BlockingFund,
+    )
+    service._runtime_settings = _local_settings()
+    try:
+        spec = load_spec(demo_root / "mandates" / "demo-quality.yaml").model_copy(update={"name": "manual-progress-test"})
+        service.create_mandate(spec.model_dump(mode="python"))
+        service.deploy_mandate("manual-progress-test", DeployRequest(universe=["AAPL", "MSFT"]))
+        preview = service.create_manual_tick_preview(
+            "manual-progress-test",
+            PaperTickPreviewRequest(expected_head=None),
+            operator_session="offline-test-session",
+        )
+        request = PaperTickAcceptRequest(
+            request_id="offline-manual-progress",
+            preview_id=preview["preview_id"],
+            preview_digest=preview["preview_digest"],
+            confirmation_token=preview["confirmation_token"],
+            expected_head=None,
+            due_set=preview["due_set"],
+        )
+        accepted = service.accept_manual_tick(
+            "manual-progress-test",
+            request,
+            operator_session="offline-test-session",
+        )
+
+        assert second_agent_started.wait(timeout=30)
+        running = service.get_operation(accepted["operation_id"])
+        assert running["status"] == "running"
+        assert running["progress"] >= 40
+        release_second_agent.set()
+        completed = _wait_for_operation(service, accepted["operation_id"])
+    finally:
+        release_second_agent.set()
+        service.close()
+
+    assert completed["status"] == "completed"
+    assert completed["progress"] == 100
+
+
+def test_reviewed_manual_tick_completes_nothing_due_without_provider_or_session(
+    demo_root,
+    monkeypatch,
+):
+    provider_calls = []
+
+    def forbidden_provider(*_args, **_kwargs):
+        provider_calls.append("called")
+        raise AssertionError("nothing-due manual operation must not construct a provider")
+
+    service = DeskService(
+        demo_root,
+        allow_writes=True,
+        network_enabled=True,
+        data_client_factory=forbidden_provider,
+        fund_factory=_OfflineFund,
+    )
+    service._runtime_settings = _local_settings()
+    try:
+        spec = load_spec(demo_root / "mandates" / "demo-quality.yaml").model_copy(update={"name": "nothing-due-test"})
+        service.create_mandate(spec.model_dump(mode="python"))
+        service.deploy_mandate("nothing-due-test", DeployRequest(universe=["AAPL"]))
+        monkeypatch.setattr(service, "_next_paper_session", lambda *_args, **_kwargs: None)
+        ledger = Ledger(demo_root / "paper" / "nothing-due-test")
+        before = ledger.sessions()
+
+        preview = service.create_manual_tick_preview(
+            "nothing-due-test",
+            PaperTickPreviewRequest(expected_head=None),
+            operator_session="offline-test-session",
+        )
+        request = PaperTickAcceptRequest(
+            request_id="offline-manual-nothing-due",
+            preview_id=preview["preview_id"],
+            preview_digest=preview["preview_digest"],
+            confirmation_token=preview["confirmation_token"],
+            expected_head=None,
+            due_set=[],
+        )
+        accepted = service.accept_manual_tick(
+            "nothing-due-test",
+            request,
+            operator_session="offline-test-session",
+        )
+        completed = _wait_for_operation(service, accepted["operation_id"])
+        replayed = service.accept_manual_tick(
+            "nothing-due-test",
+            request,
+            operator_session="offline-test-session",
+        )
+        after = ledger.sessions()
+    finally:
+        service.close()
+
+    assert preview["due_set"] == []
+    assert preview["outcome"] == "nothing-due"
+    assert accepted["status"] == "accepted"
+    assert completed["status"] == "completed"
+    assert completed["result"]["outcome"] == "nothing-due"
+    assert "session" not in completed["result"]
+    assert replayed["operation_id"] == accepted["operation_id"]
+    assert after == before
+    assert provider_calls == []
+
+
 def test_interrupted_redo_denies_web_preview_before_provider_and_allows_halt(demo_root):
     calls = []
 
@@ -244,7 +382,7 @@ def test_interrupted_redo_denies_web_preview_before_provider_and_allows_halt(dem
             )
         assert exc.value.code == "reconciliation-required"
         assert calls == []
-        service.halt_fund(name, "emergency")
+        service.halt_fund(name, "emergency", "halt-redo-guard-001")
         assert ledger.halted() == "emergency"
     finally:
         service.close()
@@ -299,7 +437,7 @@ def test_unfinished_consumption_denies_web_preview_before_provider_and_halts(dem
         assert exc.value.code == "reconciliation-required"
         assert calls == []
         assert ledger.halted() == "approval journal requires reconciliation"
-        service.halt_fund(name, "emergency")
+        service.halt_fund(name, "emergency", f"halt-unfinished-consume-{journal_state}")
         assert ledger.halted() == "emergency"
     finally:
         service.close()
@@ -716,6 +854,7 @@ def test_real_cli_and_web_tick_conflict_with_owned_runner(demo_root, tmp_path, o
     client_entered = False
 
     def stage_cli(root_path):
+        expected_head = Ledger(root_path / "paper" / name).latest().hash
         script = "\n".join(
             [
                 "import contextlib, io, sys, time, traceback",
@@ -741,7 +880,7 @@ def test_real_cli_and_web_tick_conflict_with_owned_runner(demo_root, tmp_path, o
                 "    with original_lane(participant, fund, lane):",
                 "        yield",
                 "run._paper_lane = gated_lane",
-                f"sys.argv = ['aihf', '--root', {str(root_path)!r}, '--enable-network', 'paper', 'tick', {name!r}]",
+                f"sys.argv = ['aihf', '--root', {str(root_path)!r}, '--enable-network', 'paper', 'tick', {name!r}, '--expected-head', {expected_head!r}, '--request-id', 'owned-runner-conflict-cli-001']",
                 "stderr = io.StringIO()",
                 "with contextlib.redirect_stderr(stderr):",
                 "    try:",

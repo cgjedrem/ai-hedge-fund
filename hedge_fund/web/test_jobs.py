@@ -261,7 +261,9 @@ def test_builder_canonical_validation_conflicts_and_deployment(tmp_path):
     assert created["name"] == "research-sample"
     deployed = service.deploy_mandate("research-sample", DeployRequest(universe=["aapl", "msft"]))
     assert deployed["universe"] == ["AAPL", "MSFT"]
-    assert load_deployed(tmp_path / "paper" / "research-sample").universe == ["AAPL", "MSFT"]
+    directory = tmp_path / "paper" / "research-sample"
+    assert load_deployed(directory).universe == ["AAPL", "MSFT"]
+    deployment_before = {item.relative_to(directory): item.read_bytes() for item in directory.rglob("*") if item.is_file()}
 
     with pytest.raises(ServiceError) as conflict:
         service.create_mandate(_spec("RESEARCH-SAMPLE"))
@@ -269,6 +271,7 @@ def test_builder_canonical_validation_conflicts_and_deployment(tmp_path):
     with pytest.raises(ServiceError) as duplicate_deploy:
         service.deploy_mandate("research-sample", DeployRequest(universe=["AAPL"]))
     assert duplicate_deploy.value.status_code == 409
+    assert {item.relative_to(directory): item.read_bytes() for item in directory.rglob("*") if item.is_file()} == deployment_before
 
     invalid = _spec("invalid-cadence")
     invalid["interval"] = 1.0

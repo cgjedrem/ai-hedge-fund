@@ -29,12 +29,14 @@ Corrupt `control.json` raises; a broken halt must fail loud. Corrupt
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from math import isfinite
 from pathlib import Path
 from typing import TYPE_CHECKING
 from uuid import uuid4
@@ -59,6 +61,7 @@ _DAY = re.compile(r"\d{4}-\d{2}-\d{2}")
 _BAR_FILE = re.compile(r"(\d{2})(\d{2})(\d{2})")
 _HASH = re.compile(r"[0-9a-f]{64}")
 _APPROVAL_ID = re.compile(r"[0-9a-f]{32}")
+_REQUEST_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
 _DEPLOYMENT_LANES = (("deployment",),)
 _EXECUTION_LANES = (("runner", "execution"),)
 _CONTROL_LANES = (("control",), ("runner", "execution"))
@@ -83,6 +86,14 @@ class ApprovalExpired(LedgerError):
 
 class PaperReconciliationRequired(LedgerError):
     """A previous paper-control transition has an uncertain outcome."""
+
+
+class PaperRequestConflict(LedgerError):
+    """A request ID was reused for another or already-failed control action."""
+
+
+class PaperTickNoWork(LedgerError):
+    """A tick request completed without a due session."""
 
 
 class HaltAuditUnavailable(LedgerError):
@@ -176,8 +187,10 @@ class Ledger:
         value = self._read_transition_state(self.redo_state_path, "redo")
         if value is None:
             return None
+        fields = {"version", "state", "redo_id", "source_session", "source_hash", "result_hash"}
+        request_fields = {"request_id", "request_digest"}
         if (
-            set(value) != {"version", "state", "redo_id", "source_session", "source_hash", "result_hash"}
+            frozenset(value) not in {frozenset(fields), frozenset(fields | request_fields)}
             or type(value["version"]) is not int
             or value["version"] != 1
             or not isinstance(value["state"], str)
@@ -190,6 +203,7 @@ class Ledger:
             or _HASH.fullmatch(value["source_hash"]) is None
             or (value["state"] == "pending" and value["result_hash"] is not None)
             or (value["state"] == "completed" and (not isinstance(value["result_hash"], str) or _HASH.fullmatch(value["result_hash"]) is None))
+            or ("request_id" in value and (not isinstance(value["request_id"], str) or _REQUEST_ID.fullmatch(value["request_id"]) is None or not isinstance(value["request_digest"], str) or _HASH.fullmatch(value["request_digest"]) is None))
         ):
             raise PaperReconciliationRequired("redo state is invalid; reconciliation is required")
         return value
@@ -202,9 +216,21 @@ class Ledger:
         elif value is not None and value["state"] == "pending":
             raise PaperReconciliationRequired("interrupted redo requires reconciliation")
 
-    def begin_redo(self, source: SessionRecord) -> str:
+    def begin_redo(
+        self,
+        source: SessionRecord,
+        *,
+        request_id: str | None = None,
+        request_digest: str | None = None,
+    ) -> str:
         self._require_write_lanes(_EXECUTION_LANES)
         self._require_completed_redo()
+        if request_id is not None:
+            _validate_request_id(request_id)
+            if not isinstance(request_digest, str) or _HASH.fullmatch(request_digest) is None:
+                raise ValueError("redo request digest is invalid")
+        elif request_digest is not None:
+            raise ValueError("redo request identity is invalid")
         redo_id = uuid4().hex
         value = {
             "version": 1,
@@ -214,8 +240,59 @@ class Ledger:
             "source_hash": source.hash,
             "result_hash": None,
         }
+        if request_id is not None:
+            value.update({"request_id": request_id, "request_digest": request_digest})
         write_atomic(self.redo_state_path, json.dumps(value, indent=2), mode=0o600, durable=True)
         return redo_id
+
+    def redo_request_digest(self, request_id: str, expected_head: str) -> str:
+        _validate_request_id(request_id)
+        if not isinstance(expected_head, str) or _HASH.fullmatch(expected_head) is None:
+            raise ValueError("redo expected head is invalid")
+        return _control_request_digest("redo", self.directory.name, {"expected_head": expected_head})
+
+    def redo_request_result(self, request_id: str, expected_head: str) -> SessionRecord | None:
+        """Return committed redo; pending rewind requests never repeat."""
+        digest = self.redo_request_digest(request_id, expected_head)
+        matches = [event for event in self.events() if isinstance(event, dict) and event.get("request_id") == request_id]
+        if matches and any(event.get("request_action") != "redo" or event.get("request_digest") != digest for event in matches):
+            raise PaperRequestConflict("request identity conflicts with durable paper history")
+        completed = [event for event in matches if event.get("kind") == "redo_completed"]
+        if completed:
+            if len(completed) != 1:
+                raise PaperReconciliationRequired("redo request result is duplicated; reconciliation is required")
+            result = completed[0].get("result")
+            if not isinstance(result, dict) or set(result) != {"session", "hash"}:
+                raise PaperReconciliationRequired("redo request result is invalid; reconciliation is required")
+            session = result.get("session")
+            result_hash = result.get("hash")
+            if not isinstance(session, str) or not session or not isinstance(result_hash, str) or _HASH.fullmatch(result_hash) is None:
+                raise PaperReconciliationRequired("redo request result is invalid; reconciliation is required")
+            try:
+                record = self.read(session)
+            except (LedgerError, OSError, ValueError) as exc:
+                raise PaperReconciliationRequired("redo request record is unavailable; reconciliation is required") from exc
+            if record.hash != result_hash:
+                raise PaperReconciliationRequired("redo request record changed; reconciliation is required")
+            return record
+        if matches and any(event.get("kind") in {"redo_intent", "redo"} for event in matches):
+            raise PaperReconciliationRequired("redo request outcome is uncertain; reconciliation is required")
+        state = self._redo_state()
+        if state is None or state.get("request_id") != request_id:
+            if matches:
+                raise PaperRequestConflict("request identity conflicts with durable paper history")
+            return None
+        if state["request_digest"] != digest:
+            raise PaperRequestConflict("request identity conflicts with durable paper history")
+        if state["state"] != "completed":
+            raise PaperReconciliationRequired("redo request outcome is uncertain; reconciliation is required")
+        try:
+            record = self.read(state["source_session"])
+        except (LedgerError, OSError, ValueError) as exc:
+            raise PaperReconciliationRequired("redo request record is unavailable; reconciliation is required") from exc
+        if record.hash != state["result_hash"]:
+            raise PaperReconciliationRequired("redo request record changed; reconciliation is required")
+        return record
 
     def finish_redo(self, redo_id: str, record: SessionRecord) -> None:
         self._require_write_lanes(_EXECUTION_LANES)
@@ -496,6 +573,10 @@ class Ledger:
             raise LedgerError(f"{self.control_path}: cannot read the kill switch: {exc}") from exc
         if not isinstance(control, dict) or not isinstance(control.get("halted"), bool):
             raise LedgerError(f"{self.control_path}: kill switch has no boolean halt state")
+        request_fields = {"request_id", "request_action", "request_digest"}
+        present = request_fields.intersection(control)
+        if present and (present != request_fields or not isinstance(control["request_id"], str) or _REQUEST_ID.fullmatch(control["request_id"]) is None or control["request_action"] != "halt" or not isinstance(control["request_digest"], str) or _HASH.fullmatch(control["request_digest"]) is None or control["halted"] is not True):
+            raise LedgerError(f"{self.control_path}: kill switch request identity is invalid")
         if not control["halted"]:
             return None
         reason = control.get("reason")
@@ -503,30 +584,486 @@ class Ledger:
             raise LedgerError(f"{self.control_path}: kill switch reason is invalid")
         return reason or "halted"
 
-    def halt(self, reason: str) -> None:
+    def halt(self, reason: str, *, request_id: str | None = None) -> None:
+        if not isinstance(reason, str) or not reason.strip() or len(reason) > 240 or any(ord(char) < 32 or ord(char) == 127 for char in reason):
+            raise ValueError("halt reason is invalid")
+        request_digest = None
+        request_fields = {}
+        if request_id is not None:
+            _validate_request_id(request_id)
+            request_digest = _control_request_digest("halt", self.directory.name, {"reason": reason})
+            request_fields = {
+                "request_id": request_id,
+                "request_action": "halt",
+                "request_digest": request_digest,
+            }
         self._require_write_lanes(_HALT_LANES)
         from hedge_fund.runtime.admission import AdmissionError, paper_halt_transition
 
         with paper_halt_transition(self.directory, self.directory.name):
-            self._write_control(True, reason)
+            if request_id is not None:
+                try:
+                    previous = self.control_request_result(request_id, "halt", {"reason": reason})
+                except PaperRequestConflict:
+                    raise
+                except LedgerError:
+                    previous = None
+                if previous is not None:
+                    return
+                current = self._halt_request_identity()
+                if current is not None and current["request_id"] == request_id and current["request_digest"] != request_digest:
+                    raise PaperRequestConflict("request identity conflicts with the active Halt state")
+                try:
+                    prior_events = self.events()
+                except (LedgerError, OSError, UnicodeError, ValueError):
+                    prior_events = []
+                if not any(event.get("kind") == "halt_intent" and event.get("request_id") == request_id for event in prior_events):
+                    try:
+                        self.log_event(
+                            "halt_intent",
+                            reason=reason,
+                            **request_fields,
+                            durable=True,
+                        )
+                    except (AdmissionError, LedgerError, OSError, ValueError) as exc:
+                        self._write_control(True, reason, request_id=request_id, request_digest=request_digest)
+                        raise HaltAuditUnavailable("Halt was applied but its intent record is unavailable; reconciliation is required") from exc
+                if current is not None and current["request_id"] == request_id:
+                    if self.halted() != reason:
+                        raise PaperReconciliationRequired("Halt state and request identity disagree; reconciliation is required")
+                else:
+                    self._write_control(True, reason, request_id=request_id, request_digest=request_digest)
+            else:
+                self._write_control(True, reason)
             try:
-                self.log_event("halt", reason=reason)
+                self.log_event(
+                    "halt",
+                    reason=reason,
+                    **request_fields,
+                    **({"result": {"name": self.directory.name, "halted": True}} if request_id is not None else {}),
+                    durable=request_id is not None,
+                )
             except (AdmissionError, LedgerError, OSError, ValueError) as exc:
                 raise HaltAuditUnavailable("Halt was applied but its audit record is unavailable; reconciliation is required") from exc
+        return
 
-    def resume(self) -> None:
+    def _halt_request_identity(self) -> dict[str, str] | None:
+        try:
+            control = json.loads(self.control_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return None
+        if not isinstance(control, dict):
+            return None
+        fields = {"request_id", "request_action", "request_digest"}
+        if not fields.issubset(control) or control.get("request_action") != "halt":
+            return None
+        request_id = control.get("request_id")
+        request_digest = control.get("request_digest")
+        if control.get("halted") is not True or not isinstance(request_id, str) or _REQUEST_ID.fullmatch(request_id) is None or not isinstance(request_digest, str) or _HASH.fullmatch(request_digest) is None:
+            return None
+        return {"request_id": request_id, "request_digest": request_digest}
+
+    def control_request_result(self, request_id: str, action: str, payload: dict[str, object]) -> dict[str, object] | None:
+        """Return a terminal control result; incomplete requests never repeat."""
+        _validate_request_id(request_id)
+        if action not in {"halt", "resume"}:
+            raise ValueError("control action is invalid")
+        if not isinstance(payload, dict):
+            raise ValueError("control request payload is invalid")
+        digest = _control_request_digest(action, self.directory.name, payload)
+        try:
+            events = self.events()
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            if action != "halt":
+                raise PaperReconciliationRequired("control request history is unavailable; reconciliation is required") from exc
+            identity = self._halt_request_identity()
+            if identity is not None and identity["request_id"] == request_id:
+                if identity["request_digest"] != digest:
+                    raise PaperRequestConflict("request identity conflicts with durable control history") from exc
+                return {"name": self.directory.name, "halted": True}
+            return None
+        matches = [event for event in events if isinstance(event, dict) and event.get("request_id") == request_id]
+        if not matches:
+            return None
+        if any(event.get("request_action") != action or event.get("request_digest") != digest for event in matches):
+            raise PaperRequestConflict("request identity conflicts with durable control history")
+        completed_kind = "halt" if action == "halt" else "resume_completed"
+        completed = [event for event in matches if event.get("kind") == completed_kind]
+        if completed:
+            results = [event.get("result") for event in completed]
+            if any(not isinstance(result, dict) for result in results) or any(result != results[0] for result in results[1:]):
+                raise PaperReconciliationRequired("control request result is invalid; reconciliation is required")
+            result = results[0]
+            if action == "halt":
+                valid = result == {"name": self.directory.name, "halted": True}
+            else:
+                valid = set(result) == {"name", "halted", "reconciliation_id"} and result.get("name") == self.directory.name and result.get("halted") is False and (result.get("reconciliation_id") is None or isinstance(result.get("reconciliation_id"), str))
+            if not valid:
+                raise PaperReconciliationRequired("control request result is invalid; reconciliation is required")
+            return result
+        if action == "resume":
+            receipts = [event for event in matches if event.get("kind") == "reconciliation"]
+            resumes = [event for event in matches if event.get("kind") == "resume"]
+            if len(receipts) > 1 or len(resumes) > 1:
+                raise PaperReconciliationRequired("Resume request history is ambiguous; reconciliation is required")
+            receipt = None
+            if receipts:
+                from hedge_fund.runtime.reconciliation import ReconciliationReceipt
+
+                try:
+                    receipt = ReconciliationReceipt.model_validate(receipts[0].get("receipt"))
+                except (TypeError, ValueError):
+                    raise PaperReconciliationRequired("Resume receipt is invalid; reconciliation is required") from None
+                if receipt.request_id != request_id or receipt.failure_id != payload.get("failure_id") or receipt.operator != payload.get("operator") or receipt.decision != payload.get("decision"):
+                    raise PaperReconciliationRequired("Resume receipt conflicts with its request; reconciliation is required")
+            expected_receipt_id = receipt.receipt_id if receipt is not None else None
+            if resumes:
+                resume_event = resumes[0]
+                head_hash = resume_event.get("head_hash")
+                if (payload.get("failure_id") is not None and receipt is None) or resume_event.get("by") != payload.get("operator") or resume_event.get("reconciliation_id") != expected_receipt_id or (head_hash is not None and (not isinstance(head_hash, str) or _HASH.fullmatch(head_hash) is None)):
+                    raise PaperReconciliationRequired("Resume event conflicts with its request; reconciliation is required")
+            effect_intents = [event for event in matches if event.get("kind") == "resume_effect_intent"]
+            if len(effect_intents) > 1:
+                raise PaperReconciliationRequired("Resume request has multiple control-write intents; reconciliation is required")
+            if effect_intents:
+                effect = effect_intents[0]
+                head_hash = effect.get("head_hash")
+                if not resumes or effect.get("by") != payload.get("operator") or effect.get("reconciliation_id") != expected_receipt_id or effect.get("head_hash") != resumes[0].get("head_hash") or (head_hash is not None and (not isinstance(head_hash, str) or _HASH.fullmatch(head_hash) is None)):
+                    raise PaperReconciliationRequired("Resume control-write intent conflicts with its request; reconciliation is required")
+                raise PaperReconciliationRequired("Resume control write outcome is uncertain; reconciliation is required")
+            if receipts or resumes:
+                return None
+        expected_intents = {"halt"} if action == "halt" else {"resume", "reconciliation", "resume_effect_intent"}
+        if action == "halt" and any(event.get("kind") == "halt_intent" for event in matches):
+            return None
+        if any(event.get("kind") in expected_intents for event in matches):
+            raise PaperReconciliationRequired("control request outcome is uncertain; inspect paper state")
+        raise PaperRequestConflict("request identity conflicts with durable control history")
+
+    def tick_request_digest(
+        self,
+        request_id: str,
+        *,
+        expected_head: str | None,
+        session: str | None,
+        operation_id: str | None = None,
+        capture_id: str | None = None,
+        capture_digest: str | None = None,
+    ) -> str:
+        _validate_tick_request_values(
+            request_id,
+            expected_head,
+            session,
+            operation_id,
+            capture_id,
+            capture_digest,
+        )
+        return _control_request_digest(
+            "tick",
+            self.directory.name,
+            _tick_request_payload(expected_head, session, operation_id, capture_id, capture_digest),
+        )
+
+    def tick_request_result(
+        self,
+        request_id: str,
+        *,
+        expected_head: str | None,
+        session: str | None,
+        operation_id: str | None = None,
+        capture_id: str | None = None,
+        capture_digest: str | None = None,
+    ) -> SessionRecord | None:
+        """Return committed tick; uncertain or no-work requests never repeat."""
+        digest = self.tick_request_digest(
+            request_id,
+            expected_head=expected_head,
+            session=session,
+            operation_id=operation_id,
+            capture_id=capture_id,
+            capture_digest=capture_digest,
+        )
+        try:
+            events = self.events()
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise PaperReconciliationRequired("approval history is unavailable") from exc
+        matches = [event for event in events if isinstance(event, dict) and event.get("request_id") == request_id]
+        if not matches:
+            return None
+        if any(event.get("request_action") != "tick" or event.get("request_digest") != digest for event in matches):
+            raise PaperRequestConflict("request identity conflicts with durable paper history")
+        if any(event.get("kind") == "tick_failed" for event in matches):
+            raise PaperReconciliationRequired("tick request outcome is uncertain; reconciliation is required")
+        no_work = [event for event in matches if event.get("kind") == "tick_no_work"]
+        if no_work:
+            if len(no_work) != 1:
+                raise PaperReconciliationRequired("tick no-work result is invalid; reconciliation is required")
+            result = no_work[0].get("result")
+            if not isinstance(result, dict) or set(result) != {"outcome", "message"} or result.get("outcome") != "nothing-due" or not isinstance(result.get("message"), str) or not result["message"]:
+                raise PaperReconciliationRequired("tick no-work result is invalid; reconciliation is required")
+            raise PaperTickNoWork(result["message"])
+        completed = [event for event in matches if event.get("kind") == "tick"]
+        if completed:
+            if len(completed) != 1:
+                raise PaperReconciliationRequired("tick request result is duplicated; reconciliation is required")
+            result = completed[0].get("result")
+            if not isinstance(result, dict) or set(result) != {"session", "hash"}:
+                raise PaperReconciliationRequired("tick request result is invalid; reconciliation is required")
+            result_session = result.get("session")
+            result_hash = result.get("hash")
+            if not isinstance(result_session, str) or not result_session or not isinstance(result_hash, str) or _HASH.fullmatch(result_hash) is None:
+                raise PaperReconciliationRequired("tick request result is invalid; reconciliation is required")
+            try:
+                record = self.read(result_session)
+            except (LedgerError, OSError, ValueError) as exc:
+                raise PaperReconciliationRequired("tick request record is unavailable; reconciliation is required") from exc
+            if record.hash != result_hash:
+                raise PaperReconciliationRequired("tick request record changed; reconciliation is required")
+            return record
+        if any(event.get("kind") == "tick_intent" for event in matches):
+            raise PaperReconciliationRequired("tick request outcome is uncertain; reconciliation is required")
+        raise PaperRequestConflict("request identity conflicts with durable paper history")
+
+    def resume_request_result(
+        self,
+        request_id: str,
+        *,
+        failure_id: str | None = None,
+        preview_digest: str | None = None,
+        decision: str | None = None,
+        operator: str = "web",
+    ) -> dict[str, object] | None:
+        _validate_request_id(request_id)
+        if not isinstance(operator, str) or operator not in {"cli", "tui", "web"}:
+            raise ValueError("Resume operator identity is invalid.")
+        values = (failure_id, preview_digest, decision)
+        if any(value is not None for value in values) and any(value is None for value in values):
+            raise ValueError("Resume confirmation fields must be supplied together.")
+        if failure_id is not None and (not isinstance(failure_id, str) or _HASH.fullmatch(failure_id) is None):
+            raise ValueError("Resume failure identity is invalid.")
+        if preview_digest is not None and (not isinstance(preview_digest, str) or _HASH.fullmatch(preview_digest) is None):
+            raise ValueError("Resume preview digest is invalid.")
+        if decision is not None and decision != "confirm-paper-book-matches-ledger":
+            raise ValueError("Resume decision is invalid.")
+        return self.control_request_result(
+            request_id,
+            "resume",
+            {
+                "operator": operator,
+                "failure_id": failure_id,
+                "preview_digest": preview_digest,
+                "decision": decision,
+            },
+        )
+
+    def resume(
+        self,
+        capital: float | None = None,
+        *,
+        approval_required: bool = False,
+        reconciliation: dict | None = None,
+        request_id: str | None = None,
+        operator: str = "web",
+    ) -> str | None:
+        if capital is None or isinstance(capital, bool) or not isinstance(capital, (int, float)) or not isfinite(capital) or capital <= 0:
+            raise LedgerError("Resume requires valid mandate capital for full ledger replay.")
+        if type(approval_required) is not bool:
+            raise LedgerError("Resume approval policy is invalid.")
+        if not isinstance(operator, str) or operator not in {"cli", "tui", "web"}:
+            raise LedgerError("Resume operator identity is invalid.")
+        from hedge_fund.runtime.reconciliation import (
+            build_reconciliation_snapshot,
+            failure_digest,
+            find_receipt_for_request,
+            ReconciliationConfirmation,
+            ReconciliationReceipt,
+            unresolved_tick_failures,
+            verify_reconciliation_receipt,
+        )
+
+        try:
+            confirmation = ReconciliationConfirmation.model_validate(reconciliation) if reconciliation is not None else None
+        except ValueError:
+            raise LedgerError("Resume confirmation is invalid.") from None
+        if request_id is not None:
+            _validate_request_id(request_id)
+        if confirmation is not None:
+            if request_id is None:
+                request_id = confirmation.request_id
+            elif request_id != confirmation.request_id:
+                raise LedgerError("Resume request identity does not match its reconciliation confirmation.")
+        request_digest = None
+        request_fields = {}
+        if request_id is not None:
+            request_digest = _control_request_digest(
+                "resume",
+                self.directory.name,
+                {
+                    "operator": operator,
+                    "failure_id": confirmation.failure_id if confirmation is not None else None,
+                    "preview_digest": confirmation.preview_digest if confirmation is not None else None,
+                    "decision": confirmation.decision if confirmation is not None else None,
+                },
+            )
+            request_fields = {
+                "request_id": request_id,
+                "request_action": "resume",
+                "request_digest": request_digest,
+            }
         self._require_write_lanes(_CONTROL_LANES)
-        raise LedgerError("Resume requires a verified reconciliation receipt.")
+        from hedge_fund.paper.deployed import load_deployed
+        from hedge_fund.runtime.admission import paper_control_transition
 
-    def _write_control(self, halted: bool, reason: str | None) -> None:
+        with paper_control_transition(self.directory, self.directory.name):
+            if request_id is not None:
+                previous = self.resume_request_result(
+                    request_id,
+                    failure_id=confirmation.failure_id if confirmation is not None else None,
+                    preview_digest=confirmation.preview_digest if confirmation is not None else None,
+                    decision=confirmation.decision if confirmation is not None else None,
+                    operator=operator,
+                )
+                if previous is not None:
+                    return previous["reconciliation_id"]
+            halted = self.halted()
+            state = self.replay(capital, full=True)
+            self.require_ready_for_work(state, approval_required=approval_required)
+            latest = self.latest()
+            events = self.events()
+            pending_halt = self._halt_request_identity()
+            if pending_halt is not None and not any(event.get("kind") == "halt" and event.get("request_id") == pending_halt["request_id"] and event.get("request_digest") == pending_halt["request_digest"] for event in events):
+                raise PaperReconciliationRequired("Halt request audit is incomplete; reconciliation is required.")
+            if any(event.get("kind") == "resume_effect_intent" and not _resume_effect_has_completion(events, index) for index, event in enumerate(events)):
+                raise PaperReconciliationRequired("Resume control write outcome is uncertain; reconciliation is required.")
+            receipt = None
+            if halted is None:
+                if confirmation is None:
+                    raise LedgerError("Paper fund is not halted.")
+                receipt = find_receipt_for_request(events, confirmation.request_id)
+                if receipt is None or receipt.failure_id != confirmation.failure_id:
+                    raise LedgerError("Resume request has no matching reconciliation receipt.")
+                failure = next((event for event in events if event.get("kind") == "tick_failed" and failure_digest(event) == receipt.failure_id), None)
+                if failure is None:
+                    raise LedgerError("Resume receipt does not match a failed paper operation.")
+                snapshot = build_reconciliation_snapshot(self.directory, load_deployed(self.directory), self, state, latest, failure_event=failure)
+                if confirmation.preview_digest != snapshot.preview.preview_digest:
+                    raise LedgerError("Resume confirmation is stale; review the current paper state.")
+                try:
+                    verify_reconciliation_receipt(self.directory, load_deployed(self.directory), self, state, latest, receipt)
+                except ValueError:
+                    raise LedgerError("Reconciliation receipt no longer matches the paper state.") from None
+                if not any(event.get("kind") == "resume" and event.get("request_id") == confirmation.request_id and event.get("reconciliation_id") == receipt.receipt_id for event in events):
+                    raise LedgerError("Completed Resume audit is unavailable.")
+                return receipt.receipt_id
+
+            failures = unresolved_tick_failures(events)
+            if failures:
+                if len(failures) != 1 or confirmation is None:
+                    raise LedgerError("Resume requires a verified reconciliation receipt for the failed tick.")
+                deployed = load_deployed(self.directory)
+                snapshot = build_reconciliation_snapshot(self.directory, deployed, self, state, latest, failure_event=failures[0])
+                if not snapshot.preview.recoverable or confirmation.failure_id != snapshot.preview.failure_id or confirmation.preview_digest != snapshot.preview.preview_digest:
+                    raise LedgerError("Resume confirmation is stale or paper state is not reconcilable.")
+                receipt = find_receipt_for_request(events, confirmation.request_id)
+                if receipt is None:
+                    receipt = ReconciliationReceipt.create(
+                        failure_event=snapshot.failure_event,
+                        request_id=confirmation.request_id,
+                        current_head=snapshot.preview.current_head,
+                        broker_book_sha256=snapshot.preview.broker_book_sha256,
+                        fill_identity_sha256=snapshot.preview.fill_identity_sha256,
+                        operator=operator,
+                        recorded_at=_now(),
+                    )
+                    self.log_event(
+                        "reconciliation",
+                        time=receipt.recorded_at,
+                        receipt=receipt.model_dump(mode="json"),
+                        **request_fields,
+                        durable=True,
+                    )
+                    receipt = find_receipt_for_request(self.events(), confirmation.request_id)
+                    if receipt is None:
+                        raise LedgerError("Reconciliation receipt could not be verified after writing.")
+                if receipt.failure_id != confirmation.failure_id:
+                    raise LedgerError("Resume request conflicts with its existing reconciliation receipt.")
+                if confirmation.preview_digest != snapshot.preview.preview_digest:
+                    raise LedgerError("Resume confirmation is stale; review the current paper state.")
+                try:
+                    verify_reconciliation_receipt(self.directory, deployed, self, state, latest, receipt)
+                except ValueError:
+                    raise LedgerError("Reconciliation receipt no longer matches the paper state.") from None
+            elif confirmation is not None:
+                receipt = find_receipt_for_request(events, confirmation.request_id)
+                if receipt is None or receipt.failure_id != confirmation.failure_id:
+                    raise LedgerError("Resume request has no matching reconciliation receipt.")
+                failure = next((event for event in events if event.get("kind") == "tick_failed" and failure_digest(event) == receipt.failure_id), None)
+                if failure is None:
+                    raise LedgerError("Resume receipt does not match a failed paper operation.")
+                deployed = load_deployed(self.directory)
+                snapshot = build_reconciliation_snapshot(self.directory, deployed, self, state, latest, failure_event=failure)
+                if confirmation.preview_digest != snapshot.preview.preview_digest:
+                    raise LedgerError("Resume confirmation is stale; review the current paper state.")
+                try:
+                    verify_reconciliation_receipt(self.directory, deployed, self, state, latest, receipt)
+                except ValueError:
+                    raise LedgerError("Reconciliation receipt no longer matches the paper state.") from None
+            elif any(event.get("kind") == "resume" and isinstance(event.get("reconciliation_id"), str) and not any(later.get("kind") == "halt" for later in events[index + 1 :]) for index, event in enumerate(events)):
+                raise LedgerError("Resume requires the matching reconciliation request.")
+
+            resume_fields = {
+                "head_hash": latest.hash if latest is not None else None,
+                "by": operator,
+            }
+            if request_id is not None:
+                resume_fields.update(request_fields)
+            if confirmation is not None and receipt is not None:
+                resume_fields.update(
+                    {
+                        "reconciliation_id": receipt.receipt_id,
+                    }
+                )
+            if not any(event.get("kind") == "resume" and event.get("request_id") == resume_fields.get("request_id") and event.get("reconciliation_id") == resume_fields.get("reconciliation_id") for event in events):
+                self.log_event("resume", durable=True, **resume_fields)
+            self.log_event("resume_effect_intent", durable=True, **resume_fields)
+            self._write_control(False, None)
+            result = {
+                "name": self.directory.name,
+                "halted": False,
+                "reconciliation_id": receipt.receipt_id if receipt is not None else None,
+            }
+            self.log_event(
+                "resume_completed",
+                **resume_fields,
+                result=result,
+                durable=True,
+            )
+            return receipt.receipt_id if receipt is not None else None
+
+    def _write_control(self, halted: bool, reason: str | None, *, request_id: str | None = None, request_digest: str | None = None) -> None:
         self._require_write_lanes(_HALT_LANES if halted is True else _CONTROL_LANES)
+        if request_id is not None:
+            _validate_request_id(request_id)
+            if not isinstance(request_digest, str) or _HASH.fullmatch(request_digest) is None:
+                raise ValueError("halt request digest is invalid")
         write_atomic(
             self.control_path,
             json.dumps(
                 {
-                    "halted": halted,
-                    "reason": reason,
-                    "since": _now(),
+                    **{
+                        "halted": halted,
+                        "reason": reason,
+                        "since": _now(),
+                    },
+                    **(
+                        {
+                            "request_id": request_id,
+                            "request_action": "halt",
+                            "request_digest": request_digest,
+                        }
+                        if request_id is not None
+                        else {}
+                    ),
                 },
                 indent=2,
             ),
@@ -796,6 +1333,7 @@ class Ledger:
         decision_hash: str,
         by: str,
         *,
+        request_id: str | None = None,
         admission: PaperApprovalAdmission | None = None,
     ) -> dict[str, str]:
         if not isinstance(verdict, str) or verdict not in {"approve", "reject"}:
@@ -806,6 +1344,8 @@ class Ledger:
             raise ValueError("decision_hash must be a lowercase SHA-256 hash")
         if not isinstance(by, str) or by not in {"cli", "tui", "web"}:
             raise ValueError("by must be 'cli', 'tui' or 'web'")
+        if request_id is not None:
+            _validate_request_id(request_id)
         from hedge_fund.runtime.admission import PaperApprovalAdmission
 
         enrolled = self._require_write_lanes((("control",),))
@@ -815,8 +1355,91 @@ class Ledger:
             from hedge_fund.runtime.admission import paper_control_transition
 
             with paper_control_transition(self.directory, self.directory.name):
-                return self._publish_approval(verdict, decision_as_of, decision_hash, by, enrolled=False)
-        return self._publish_approval(verdict, decision_as_of, decision_hash, by, enrolled=True)
+                return self._publish_approval(verdict, decision_as_of, decision_hash, by, request_id=request_id, enrolled=False)
+        return self._publish_approval(verdict, decision_as_of, decision_hash, by, request_id=request_id, enrolled=True)
+
+    def approval_request_result(
+        self,
+        request_id: str,
+        verdict: str,
+        decision_as_of: str,
+        decision_hash: str,
+        by: str,
+    ) -> dict[str, str] | None:
+        """Return committed verdict for a request; uncertain requests never replay."""
+        _validate_request_id(request_id)
+        if not isinstance(verdict, str) or verdict not in {"approve", "reject"}:
+            raise ValueError("verdict must be 'approve' or 'reject'")
+        if not isinstance(decision_as_of, str) or not decision_as_of.strip():
+            raise ValueError("decision_as_of must be a non-empty string")
+        if not isinstance(decision_hash, str) or _HASH.fullmatch(decision_hash) is None:
+            raise ValueError("decision_hash must be a lowercase SHA-256 hash")
+        if not isinstance(by, str) or by not in {"cli", "tui", "web"}:
+            raise ValueError("by must be 'cli', 'tui' or 'web'")
+        payload = {
+            "verdict": verdict,
+            "decision_as_of": decision_as_of,
+            "decision_hash": decision_hash,
+            "by": by,
+        }
+        digest = _control_request_digest("approval", self.directory.name, payload)
+        return self._approval_request_result(request_id, digest)
+
+    def approval_command_result(
+        self,
+        request_id: str,
+        verdict: str,
+        by: str,
+        expected_head: str | None,
+    ) -> dict[str, str] | None:
+        """Return CLI verdict replay without requiring the pending head again."""
+        _validate_request_id(request_id)
+        if not isinstance(verdict, str) or verdict not in {"approve", "reject"} or not isinstance(by, str) or by not in {"cli", "tui", "web"}:
+            raise ValueError("verdict request identity is invalid")
+        matches = [event for event in self.events() if isinstance(event, dict) and event.get("request_id") == request_id]
+        if not matches:
+            return None
+        if not isinstance(expected_head, str) or _HASH.fullmatch(expected_head) is None:
+            raise PaperRequestConflict("request identity conflicts with durable control history")
+        if any(event.get("request_action") != "approval" for event in matches):
+            raise PaperRequestConflict("request identity conflicts with durable control history")
+        digests = [event.get("request_digest") for event in matches]
+        if not isinstance(digests[0], str) or _HASH.fullmatch(digests[0]) is None or any(digest != digests[0] for digest in digests[1:]):
+            raise PaperReconciliationRequired("verdict request identity is invalid; reconciliation is required")
+        result = self._approval_request_result(request_id, digests[0])
+        if result is not None:
+            if result["verdict"] != verdict or result["by"] != by or result["decision_hash"] != expected_head:
+                raise PaperRequestConflict("request identity conflicts with durable control history")
+            return result
+        if any(event.get("kind") == "approval_abort" for event in matches):
+            raise PaperRequestConflict("verdict request already completed without a saved approval")
+        raise PaperReconciliationRequired("verdict request outcome is uncertain; inspect paper state")
+
+    def _approval_request_result(self, request_id: str, request_digest: str) -> dict[str, str] | None:
+        matches = [event for event in self.events() if isinstance(event, dict) and event.get("request_id") == request_id]
+        if not matches:
+            return None
+        if any(event.get("request_action") != "approval" or event.get("request_digest") != request_digest for event in matches):
+            raise PaperRequestConflict("request identity conflicts with durable control history")
+        committed = [event for event in matches if event.get("kind") == "approval_commit"]
+        if committed:
+            event = committed[-1]
+            result = {
+                "verdict": event.get("verdict"),
+                "decision_as_of": event.get("decision_as_of"),
+                "decision_hash": event.get("decision_hash"),
+                "decided_at": event.get("decided_at"),
+                "by": event.get("by"),
+                "approval_id": event.get("approval_id"),
+            }
+            if result["verdict"] not in {"approve", "reject"} or not isinstance(result["decision_as_of"], str) or not isinstance(result["decision_hash"], str) or _HASH.fullmatch(result["decision_hash"]) is None or not isinstance(result["decided_at"], str) or result["by"] not in {"cli", "tui", "web"} or not isinstance(result["approval_id"], str) or _APPROVAL_ID.fullmatch(result["approval_id"]) is None:
+                raise PaperReconciliationRequired("verdict request result is invalid; reconciliation is required")
+            return result
+        if any(event.get("kind") == "approval_abort" for event in matches):
+            raise PaperRequestConflict("verdict request already completed without a saved approval")
+        if any(event.get("kind") in {"approve", "reject"} for event in matches):
+            raise PaperReconciliationRequired("verdict request outcome is uncertain; inspect paper state")
+        raise PaperRequestConflict("request identity conflicts with durable control history")
 
     def _publish_approval(
         self,
@@ -825,8 +1448,30 @@ class Ledger:
         decision_hash: str,
         by: str,
         *,
+        request_id: str | None,
         enrolled: bool,
     ) -> dict[str, str]:
+        request_digest = None
+        request_fields = {}
+        if request_id is not None:
+            request_digest = _control_request_digest(
+                "approval",
+                self.directory.name,
+                {
+                    "verdict": verdict,
+                    "decision_as_of": decision_as_of,
+                    "decision_hash": decision_hash,
+                    "by": by,
+                },
+            )
+            previous = self._approval_request_result(request_id, request_digest)
+            if previous is not None:
+                return previous
+            request_fields = {
+                "request_id": request_id,
+                "request_action": "approval",
+                "request_digest": request_digest,
+            }
         self._require_completed_approval_publication()
         latest_event = self._latest_approval_event(decision_as_of, decision_hash, strict=True)
         if latest_event is not None:
@@ -859,6 +1504,7 @@ class Ledger:
                 decision_hash=decision_hash,
                 by=by,
                 approval_id=value["approval_id"],
+                **request_fields,
             )
             write_atomic(self.approval_path, json.dumps({**value, "pending": True}, indent=2))
             if self.halted() is not None:
@@ -879,6 +1525,18 @@ class Ledger:
                     raise ApprovalHalted("fund is halted")
                 write_atomic(self.approval_path, json.dumps(value, indent=2))
                 self._write_approval_publication(value["approval_id"], "committed")
+                if request_id is not None:
+                    self.log_event(
+                        "approval_commit",
+                        **request_fields,
+                        verdict=verdict,
+                        decision_as_of=decision_as_of,
+                        decision_hash=decision_hash,
+                        by=by,
+                        approval_id=value["approval_id"],
+                        decided_at=value["decided_at"],
+                        durable=True,
+                    )
         except Exception:
             if publication_attempted:
                 try:
@@ -900,6 +1558,20 @@ class Ledger:
                 self._write_approval_publication(value["approval_id"], "aborted")
             except (OSError, ValueError, LedgerError) as exc:
                 raise PaperReconciliationRequired("approval publication cleanup failed; reconciliation is required") from exc
+            if request_id is not None:
+                try:
+                    self.log_event(
+                        "approval_abort",
+                        **request_fields,
+                        verdict=verdict,
+                        decision_as_of=decision_as_of,
+                        decision_hash=decision_hash,
+                        by=by,
+                        approval_id=value["approval_id"],
+                        durable=True,
+                    )
+                except Exception as exc:
+                    raise PaperReconciliationRequired("verdict request outcome is unavailable; reconciliation is required") from exc
             raise
         return value
 
@@ -961,7 +1633,7 @@ class Ledger:
     # ---- events -----------------------------------------------------------
 
     def log_event(self, kind: str, *, durable: bool = False, **fields) -> None:
-        halt_event = kind == "halt"
+        halt_event = kind in {"halt_intent", "halt"}
         self._require_write_lanes(_HALT_LANES if halt_event else _CONTROL_LANES)
         from hedge_fund.runtime.admission import paper_audit_transition
         from hedge_fund.runtime.root import RootContext
@@ -996,3 +1668,56 @@ class Ledger:
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _tick_request_payload(
+    expected_head: str | None,
+    session: str | None,
+    operation_id: str | None,
+    capture_id: str | None,
+    capture_digest: str | None,
+) -> dict[str, object]:
+    return {
+        "expected_head": expected_head,
+        "session": session,
+        "operation_id": operation_id,
+        "capture_id": capture_id,
+        "capture_digest": capture_digest,
+    }
+
+
+def _validate_tick_request_values(
+    request_id: object,
+    expected_head: object,
+    session: object,
+    operation_id: object,
+    capture_id: object,
+    capture_digest: object,
+) -> None:
+    _validate_request_id(request_id)
+    if expected_head is not None and (not isinstance(expected_head, str) or _HASH.fullmatch(expected_head) is None):
+        raise ValueError("expected_head must be a lowercase SHA-256 hash or None")
+    if session is not None and (not isinstance(session, str) or not session or len(session) > 64):
+        raise ValueError("tick session identity is invalid")
+    operation_values = (operation_id, capture_id, capture_digest)
+    if any(value is not None for value in operation_values):
+        if not isinstance(operation_id, str) or _APPROVAL_ID.fullmatch(operation_id) is None or not isinstance(capture_id, str) or _APPROVAL_ID.fullmatch(capture_id) is None or not isinstance(capture_digest, str) or _HASH.fullmatch(capture_digest) is None:
+            raise ValueError("tick operation identity is invalid")
+
+
+def _control_request_digest(action: str, subject: str, payload: dict[str, object]) -> str:
+    record = {"action": action, "subject": subject, "payload": payload}
+    encoded = json.dumps(record, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _resume_effect_has_completion(events: list[dict], index: int) -> bool:
+    intent = events[index]
+    identity_keys = ("request_id", "request_digest", "head_hash", "by", "reconciliation_id")
+    return any(event.get("kind") == "resume_completed" and all(event.get(key) == intent.get(key) for key in identity_keys) for event in events[index + 1 :])
+
+
+def _validate_request_id(value: object) -> str:
+    if not isinstance(value, str) or _REQUEST_ID.fullmatch(value) is None:
+        raise ValueError("request_id must be a bounded opaque identifier")
+    return value

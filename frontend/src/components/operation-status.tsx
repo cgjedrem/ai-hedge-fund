@@ -55,6 +55,9 @@ export function PaperOperationStatus({ operation }: { operation: Operation }) {
         <div className="h-full rounded-full bg-accent transition-[width]" style={{ width: `${progress}%` }} />
       </div>
       <p className="mono mt-2 break-all text-[9px] text-muted-foreground">{operation.id}</p>
+      {operation.action === "paper-tick" && operation.status === "completed" && operation.result?.outcome === "nothing-due" ? (
+        <p className="mt-2 text-[10px] text-muted-foreground">Manual operation completed with nothing due. No session was recorded.</p>
+      ) : null}
       {operation.error ? <p className="mt-2 text-[10px] text-rose-300">{operation.error}</p> : null}
     </div>
   );

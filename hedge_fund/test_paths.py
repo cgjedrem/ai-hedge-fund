@@ -127,6 +127,28 @@ def test_paper_root_writer_accepts_enrolled_deployment_lane(tmp_path: Path) -> N
             owner.close()
 
 
+def test_paper_root_writer_rejects_enrolled_root_without_a_held_lane(tmp_path: Path) -> None:
+    from hedge_fund.fund import custom_strategy, FundSpec
+    from hedge_fund.paper.deployed import deploy
+
+    spec = FundSpec(schema_version=2, name="alpha", strategies=[custom_strategy(["buffett"])], risk={"max_position_pct": 0.25, "max_gross_exposure": 1})
+    with RootContext.open(tmp_path) as root:
+        enroll_fresh(root)
+        owner = RootOwnerLease.acquire(root, timeout=0)
+        admission = AdmissionCoordinator(root, owner_lease=owner)
+        try:
+            with paths.bound_root(root):
+                with admission.deployment_lock("alpha"):
+                    directory = deploy("alpha", spec, ["AAPL"], root=root.path / "paper")
+                    target = directory / "export.json"
+                    paths.write_bytes(target, b"reviewed")
+                with pytest.raises(RootConfigurationError):
+                    paths.write_bytes(target, b"changed")
+            assert target.read_bytes() == b"reviewed"
+        finally:
+            owner.close()
+
+
 def test_halt_only_lane_cannot_write_resume_or_approval_state(tmp_path: Path) -> None:
     from hedge_fund.paper.ledger import Ledger, LedgerError
 
@@ -145,6 +167,9 @@ def test_halt_only_lane_cannot_write_resume_or_approval_state(tmp_path: Path) ->
                         b'{"halted":false,"reason":"resume","since":"now"}',
                         b'{"halted":true,"reason":null,"since":"now"}',
                         b'{"halted":true}',
+                        b'{"halted":true,"reason":"halt","since":"now","request_id":"bad id","request_action":"halt","request_digest":"' + b"a" * 64 + b'"}',
+                        b'{"halted":true,"reason":"halt","since":"now","request_id":"halt-request-1","request_action":"resume","request_digest":"' + b"a" * 64 + b'"}',
+                        b'{"halted":true,"reason":"halt","since":"now","request_id":"halt-request-1","request_action":"halt","request_digest":"bad"}',
                         b"not-json",
                     ):
                         with pytest.raises(RootConfigurationError):
@@ -154,7 +179,9 @@ def test_halt_only_lane_cannot_write_resume_or_approval_state(tmp_path: Path) ->
                     with pytest.raises(LedgerError):
                         Ledger(control.parent)._write_control(False, "resume")
                     paths.write_bytes(control, b'{"halted":true,"reason":"halt","since":"now"}')
-            assert control.read_bytes() == b'{"halted":true,"reason":"halt","since":"now"}'
+                    request_control = b'{"halted":true,"reason":"halt","since":"now","request_id":"halt-request-1","request_action":"halt","request_digest":"' + b"a" * 64 + b'"}'
+                    paths.write_bytes(control, request_control)
+            assert control.read_bytes() == request_control
         finally:
             owner.close()
 

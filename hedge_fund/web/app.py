@@ -32,6 +32,7 @@ from hedge_fund.web.schemas import (
     OperationAcceptRequest,
     OperationCancelRequest,
     OperationPreviewRequest,
+    PaperResumeRequest,
     PaperTickAcceptRequest,
     PaperTickPreviewRequest,
     RunnerPreviewRequest,
@@ -312,6 +313,10 @@ def create_app(
     def paper_detail(name: str):
         return service.paper_detail(name)
 
+    @app.get("/api/paper/{name}/reconciliation")
+    def paper_reconciliation(name: str):
+        return service.paper_reconciliation(name)
+
     @app.post("/api/paper/{name}/tick/preview", status_code=201)
     def paper_tick_preview(name: str, request: PaperTickPreviewRequest, http_request: Request):
         return service.create_manual_tick_preview(
@@ -389,15 +394,27 @@ def create_app(
 
     @app.post("/api/paper/{name}/approval")
     def approval(name: str, request: ApprovalRequest):
-        return service.approve(name, request)
+        return _with_request_identity(
+            lambda: service.approve(name, request),
+            request_id=request.request_id,
+            subject_id=name,
+        )
 
     @app.post("/api/paper/{name}/halt")
     def halt(name: str, request: HaltRequest):
-        return service.halt_fund(name, request.reason)
+        return _with_request_identity(
+            lambda: service.halt_fund(name, request.reason, request.request_id),
+            request_id=request.request_id,
+            subject_id=name,
+        )
 
     @app.post("/api/paper/{name}/resume")
-    def resume(name: str):
-        return service.resume_fund(name)
+    def resume(name: str, request: PaperResumeRequest):
+        return _with_request_identity(
+            lambda: service.resume_fund(name, request),
+            request_id=request.request_id if request is not None else None,
+            subject_id=name,
+        )
 
     @app.get("/api/research")
     def research(

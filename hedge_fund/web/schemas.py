@@ -227,6 +227,7 @@ class DeployRequest(RequestModel):
 
 
 class ApprovalRequest(RequestModel):
+    request_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
     verdict: Literal["approve", "reject"]
     decision_as_of: str = Field(min_length=1, max_length=32)
     source_record_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -237,6 +238,7 @@ class ValuationRefreshRequest(RequestModel):
 
 
 class HaltRequest(RequestModel):
+    request_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
     reason: str = Field(min_length=1, max_length=240)
 
     @field_validator("reason")
@@ -245,6 +247,20 @@ class HaltRequest(RequestModel):
         if any(ord(char) < 32 or ord(char) == 127 for char in value):
             raise ValueError("reason cannot contain control characters")
         return value
+
+
+class PaperResumeRequest(RequestModel):
+    request_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+    failure_id: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+    preview_digest: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+    decision: Literal["confirm-paper-book-matches-ledger"] | None = None
+
+    @model_validator(mode="after")
+    def _validate_confirmation_group(self) -> PaperResumeRequest:
+        fields = (self.failure_id, self.preview_digest, self.decision)
+        if any(value is not None for value in fields) and any(value is None for value in fields):
+            raise ValueError("reconciliation confirmation fields must be supplied together")
+        return self
 
 
 class BacktestRequest(RequestModel):
@@ -392,7 +408,7 @@ class PaperOperationAcceptRequest(RequestModel):
 
 
 class PaperTickAcceptRequest(PaperOperationAcceptRequest):
-    due_set: list[str] = Field(min_length=1, max_length=1)
+    due_set: list[str] = Field(default_factory=list, max_length=1)
 
 
 class RunnerStartAcceptRequest(PaperOperationAcceptRequest):

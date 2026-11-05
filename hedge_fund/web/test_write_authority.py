@@ -4,7 +4,12 @@ import pytest
 from fastapi.testclient import TestClient
 
 from hedge_fund.paper.ledger import Ledger
-from hedge_fund.runtime.handover import build_head_inventory, inventory_digest, migrate_existing, OPERATOR_ATTESTATION
+from hedge_fund.runtime.handover import (
+    build_head_inventory,
+    inventory_digest,
+    migrate_existing,
+    OPERATOR_ATTESTATION,
+)
 from hedge_fund.runtime.root import RootContext
 from hedge_fund.web.app import create_app
 from hedge_fund.web.services import DeskService, ServiceError
@@ -37,7 +42,7 @@ def test_service_revokes_writes_and_halt_when_a_legacy_runner_appears(demo_root)
         runner_pid.write_text("4242", encoding="utf-8")
 
         with pytest.raises(ServiceError) as halted:
-            service.halt_fund("demo-quality", "legacy writer appeared")
+            service.halt_fund("demo-quality", "legacy writer appeared", "halt-legacy-writer-001")
         assert halted.value.status_code in {403, 409}
         assert Ledger(demo_root / "paper" / "demo-quality").halted() is None
 
@@ -50,7 +55,7 @@ def test_service_revokes_writes_and_halt_when_a_legacy_runner_appears(demo_root)
         assert capabilities["write_unavailable_reason"] == "legacy-runner-present"
         assert capabilities["mutation_token"] is None
         with pytest.raises(ServiceError) as after:
-            service.halt_fund("demo-quality", "legacy writer appeared")
+            service.halt_fund("demo-quality", "legacy writer appeared", "halt-legacy-writer-002")
         assert after.value.status_code == 403
         assert Ledger(demo_root / "paper" / "demo-quality").halted() is None
     finally:
@@ -71,7 +76,7 @@ def test_capabilities_reclassify_authority_without_a_prior_write_attempt(demo_ro
         assert capabilities["mutation_token"] is None
         assert service._owner_lease is None
         with pytest.raises(ServiceError) as halted:
-            service.halt_fund("demo-quality", "legacy writer appeared")
+            service.halt_fund("demo-quality", "legacy writer appeared", "halt-legacy-writer-003")
         assert halted.value.status_code == 403
         assert Ledger(demo_root / "paper" / "demo-quality").halted() is None
     finally:

@@ -65,6 +65,7 @@ from hedge_fund.paper.ledger import (
     Ledger,
     LedgerError,
     PaperReconciliationRequired,
+    PaperRequestConflict,
 )
 from hedge_fund.paper.tick import following_session, next_session, tick
 from hedge_fund.pipeline.session import (
@@ -150,6 +151,7 @@ from hedge_fund.runtime.policy import (
     ProviderClass,
     ProviderTarget,
 )
+from hedge_fund.runtime.reconciliation import build_reconciliation_snapshot
 from hedge_fund.runtime.root import RootContext, RootPathError
 from hedge_fund.scorecard import score
 from hedge_fund.web.jobs import JobCancelled, JobConflict, OperationJobRegistry
@@ -165,6 +167,7 @@ from hedge_fund.web.schemas import (
     OperationAcceptRequest,
     OperationCancelRequest,
     OperationPreviewRequest,
+    PaperResumeRequest,
     PaperTickAcceptRequest,
     PaperTickPreviewRequest,
     RETRY_POLICIES,
@@ -712,6 +715,26 @@ class DeskService:
             raise ServiceError(422, f"Paper fund is invalid ({type(exc).__name__}).", code="readiness-denied") from None
         return self._paper_snapshot(deployed, directory, include_records=True)
 
+    def paper_reconciliation(self, name: str) -> dict:
+        normalized = self._validated_name(name)
+        directory, deployed, ledger, state, latest = self._paper_state(
+            normalized,
+            local_paper_only=True,
+        )
+        self._safe_child("paper", normalized, "broker.json")
+        try:
+            snapshot = build_reconciliation_snapshot(directory, deployed, ledger, state, latest)
+            halted = ledger.halted()
+        except (LedgerError, OSError, ValueError):
+            raise ServiceError(423, "Paper state is invalid (LedgerError).", code="replay-corrupt") from None
+        preview = snapshot.preview
+        return {
+            "name": normalized,
+            "halted": halted,
+            "resume_allowed": halted is not None and (not preview.required or preview.recoverable),
+            "preview": preview.model_dump(mode="json"),
+        }
+
     def paper_sessions(
         self,
         name: str,
@@ -788,18 +811,26 @@ class DeskService:
     ) -> dict:
         if not isinstance(request, PaperTickPreviewRequest):
             raise ServiceError(400, "Paper tick preview is invalid.")
-        return self._create_local_paper_preview(
+
+        def payload(head, due, _spec, _calls, _universe_size):
+            if not due:
+                return {"kind": "manual-no-work", "expected_head": head}
+            return {
+                "kind": "manual-tick",
+                "session": due[0],
+                "expected_head": head,
+            }
+
+        preview = self._create_local_paper_preview(
             name,
             expected_head=request.expected_head,
             action="paper-tick",
             operator_session=operator_session,
-            require_due=True,
-            payload_builder=lambda head, due, _spec, _calls, _universe_size: {
-                "kind": "manual-tick",
-                "session": due[0],
-                "expected_head": head,
-            },
+            require_due=False,
+            payload_builder=payload,
         )
+        preview["outcome"] = "nothing-due" if not preview["due_set"] else "ready"
+        return preview
 
     def create_runner_preview(
         self,
@@ -986,13 +1017,15 @@ class DeskService:
     ) -> dict:
         if not isinstance(request, PaperTickAcceptRequest):
             raise ServiceError(400, "Paper tick acceptance is invalid.")
-        if len(request.due_set) != 1:
-            raise ServiceError(400, "Manual tick requires exactly one reviewed session.")
-        payload = {
-            "kind": "manual-tick",
-            "session": request.due_set[0],
-            "expected_head": request.expected_head,
-        }
+        if len(request.due_set) > 1:
+            raise ServiceError(400, "Manual tick accepts at most one reviewed session.")
+        payload = {"kind": "manual-no-work", "expected_head": request.expected_head}
+        if request.due_set:
+            payload = {
+                "kind": "manual-tick",
+                "session": request.due_set[0],
+                "expected_head": request.expected_head,
+            }
         return self._accept_local_paper_operation(
             name,
             request,
@@ -1172,8 +1205,9 @@ class DeskService:
         cancelled: Callable[[], bool],
     ) -> dict[str, object]:
         payload = dict(operation.payload)
-        expected = {"kind", "session", "expected_head"}
-        if set(payload) != expected or payload.get("kind") != "manual-tick":
+        kind = payload.get("kind")
+        expected = {"kind", "expected_head"} if kind == "manual-no-work" else {"kind", "session", "expected_head"}
+        if set(payload) != expected or kind not in {"manual-tick", "manual-no-work"}:
             raise OperationError("stored paper tick request is invalid")
         if capture.code_version != code_version() or capture.broker != "paper":
             raise OperationError("captured paper tick is incompatible")
@@ -1186,19 +1220,21 @@ class DeskService:
         if spec.name != operation.subject_id or mandate_hash(spec) != capture.mandate_digest or capture.credential_versions or capture.credential_handles:
             raise OperationError("captured paper inputs changed")
         session = payload.get("session")
-        if not isinstance(session, str):
+        if kind == "manual-tick" and not isinstance(session, str):
             raise OperationError("stored paper session is invalid")
         model_calls = _estimate_paper_model_calls(spec, len(capture.universe))
         if model_calls > 1000:
             raise AuthorizationDenied("manual model-call bound is invalid")
         now = _utcnow()
-        dispatch = self._authorize_manual_capture(
-            capture,
-            now=now,
-            model_calls=model_calls,
-            operation=operation,
-            cancelled=cancelled,
-        )
+        dispatch = None
+        if kind == "manual-tick":
+            dispatch = self._authorize_manual_capture(
+                capture,
+                now=now,
+                model_calls=model_calls,
+                operation=operation,
+                cancelled=cancelled,
+            )
         progress(10)
         if cancelled():
             raise JobCancelled()
@@ -1219,29 +1255,40 @@ class DeskService:
                     if state.halted is not None:
                         raise ServiceError(423, "Halted funds cannot run a paper tick.", code="halted")
                     self._require_paper_work_ready(deployed, ledger, state)
-                    with self._make_data_client(
-                        capture.data_provider,
-                        dispatch=dispatch,
-                    ) as client:
-                        due = self._next_paper_session(
-                            deployed,
-                            state.last_session,
-                            provider=capture.data_provider,
-                            now=now,
-                            data_client=client,
-                        )
-                        if due != session:
-                            raise ServiceError(409, "Paper due-set changed after review.", code="stale-preview")
-                        record = tick(
-                            directory,
-                            client,
-                            session=session,
-                            build_fund=self._captured_fund_factory(
-                                capture,
-                                dispatch,
-                            ),
-                            now=lambda: now.astimezone(NEW_YORK),
-                        )
+                    if head != payload["expected_head"]:
+                        raise ServiceError(409, "Paper ledger head changed after review.", code="stale-preview")
+                    progress(20)
+                    if kind == "manual-tick":
+                        progress(30)
+                        with self._make_data_client(
+                            capture.data_provider,
+                            dispatch=dispatch,
+                        ) as client:
+                            due = self._next_paper_session(
+                                deployed,
+                                state.last_session,
+                                provider=capture.data_provider,
+                                now=now,
+                                data_client=client,
+                            )
+                            if due != session:
+                                raise ServiceError(409, "Paper due-set changed after review.", code="stale-preview")
+                            record = tick(
+                                directory,
+                                client,
+                                session=session,
+                                expected_head=payload["expected_head"],
+                                build_fund=self._captured_fund_factory(
+                                    capture,
+                                    dispatch,
+                                ),
+                                now=lambda: now.astimezone(NEW_YORK),
+                                operation_id=operation.operation_id,
+                                request_id=operation.request_id,
+                                capture_id=capture.capture_id,
+                                capture_digest=capture.digest,
+                                on_progress=progress,
+                            )
         except ServiceError:
             raise
         except LedgerHeadPublicationError:
@@ -1249,6 +1296,12 @@ class DeskService:
         except (AdmissionError, HandoverError, LedgerError, OSError, ValueError):
             raise ServiceError(409, "Paper tick could not be executed safely.") from None
         progress(95)
+        if kind == "manual-no-work":
+            return {
+                "outcome": "nothing-due",
+                "capture_id": capture.capture_id,
+                "capture_digest": capture.digest,
+            }
         return {
             "session": record.session,
             "ledger_head": record.hash,
@@ -3129,6 +3182,30 @@ class DeskService:
         with self._fund_lock(normalized):
             self._verify_root_inventory()
             _directory, deployed, ledger = self._paper_control_state(normalized)
+            try:
+                previous = ledger.approval_request_result(
+                    request.request_id,
+                    request.verdict,
+                    request.decision_as_of,
+                    request.source_record_hash,
+                    "web",
+                )
+            except PaperRequestConflict:
+                raise ServiceError(
+                    409,
+                    "Request ID was already used for a different or failed verdict.",
+                    code="request-conflict",
+                    request_id=request.request_id,
+                ) from None
+            except LedgerError:
+                raise ServiceError(
+                    423,
+                    "Approval history or root inventory is unavailable.",
+                    code="reconciliation-required",
+                    request_id=request.request_id,
+                ) from None
+            if previous is not None:
+                return {"verdict": previous["verdict"], "decision_as_of": previous["decision_as_of"], "saved": True}
             state, latest = self._replay_paper_state(deployed, ledger)
             if not deployed.spec.approval_required:
                 raise ServiceError(409, "This fund does not require approval.")
@@ -3141,13 +3218,27 @@ class DeskService:
                 raise ServiceError(409, "Pending decision changed; reload before submitting a verdict.", code="stale-preview")
             try:
                 with paper_approval_transition(self._admission, normalized) as proof:
-                    vote = ledger.set_approval(request.verdict, pending.as_of, latest.hash, "web", admission=proof)
+                    vote = ledger.set_approval(
+                        request.verdict,
+                        pending.as_of,
+                        latest.hash,
+                        "web",
+                        request_id=request.request_id,
+                        admission=proof,
+                    )
             except ApprovalHalted:
                 raise ServiceError(423, "Halted funds cannot accept a verdict.", code="halted") from None
             except ApprovalStale:
                 raise ServiceError(409, "Pending decision changed; reload before submitting a verdict.", code="stale-preview") from None
             except ApprovalExpired:
                 raise ServiceError(409, "This decision is already consumed or expired.") from None
+            except PaperRequestConflict:
+                raise ServiceError(
+                    409,
+                    "Request ID was already used for a different or failed verdict.",
+                    code="request-conflict",
+                    request_id=request.request_id,
+                ) from None
             except LedgerInventoryCorrupt:
                 raise ServiceError(423, "Paper state is invalid (LedgerError).", code="replay-corrupt") from None
             except LedgerError:
@@ -3160,36 +3251,196 @@ class DeskService:
                 raise ServiceError(409, f"Verdict could not be saved ({type(exc).__name__}).") from None
         return {"verdict": vote["verdict"], "decision_as_of": vote["decision_as_of"], "saved": True}
 
-    def halt_fund(self, name: str, reason: str) -> dict:
+    def halt_fund(self, name: str, reason: str, request_id: str) -> dict:
         if not self.allow_writes and not self.emergency_halt_available:
             self._require_writes()
         normalized = self._validated_name(name)
         self._guard_protected(normalized)
+        if not isinstance(request_id, str) or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", request_id) is None:
+            raise ServiceError(400, "Halt request identity is invalid.")
         if not isinstance(reason, str) or not reason.strip() or len(reason) > 240 or any(ord(char) < 32 or ord(char) == 127 for char in reason):
             raise ServiceError(400, "Halt reason is invalid.")
         with self._paper_halt_lane(normalized):
             _, _, ledger = self._paper_control_state(normalized)
             try:
-                ledger.halt(reason)
+                previous = ledger.control_request_result(request_id, "halt", {"reason": reason})
+                if previous is not None:
+                    return previous
+            except PaperRequestConflict:
+                raise ServiceError(
+                    409,
+                    "Request ID was already used for a different Halt request.",
+                    code="request-conflict",
+                    request_id=request_id,
+                ) from None
+            except LedgerError:
+                previous = None
+            try:
+                ledger.halt(reason, request_id=request_id)
             except HaltAuditUnavailable:
                 raise ServiceError(
                     423,
                     "Halt was applied, but its audit record is unavailable; reconciliation is required.",
                     code="reconciliation-required",
+                    request_id=request_id,
                 ) from None
+            except PaperRequestConflict:
+                raise ServiceError(
+                    409,
+                    "Request ID was already used for a different Halt request.",
+                    code="request-conflict",
+                    request_id=request_id,
+                ) from None
+            except PaperReconciliationRequired:
+                raise ServiceError(
+                    423,
+                    "Halt request outcome is uncertain; inspect paper state.",
+                    code="reconciliation-required",
+                    request_id=request_id,
+                ) from None
+            except LedgerError:
+                raise ServiceError(423, "Halt request history is unavailable.", code="reconciliation-required", request_id=request_id) from None
             except OSError as exc:
-                raise ServiceError(409, f"Fund could not be halted ({type(exc).__name__}).") from None
+                raise ServiceError(409, f"Fund could not be halted ({type(exc).__name__}).", request_id=request_id) from None
         return {"name": normalized, "halted": True}
 
-    def resume_fund(self, name: str) -> dict:
-        if not self.allow_writes and not self.emergency_halt_available:
+    def resume_fund(self, name: str, request: PaperResumeRequest | None = None) -> dict:
+        if not self.emergency_halt_available:
             self._require_writes()
         normalized = self._validated_name(name)
         self._guard_protected(normalized)
+        if request is not None and not isinstance(request, PaperResumeRequest):
+            raise ServiceError(400, "Resume confirmation is invalid.")
         with self._fund_lock(normalized):
             with self._paper_control_lane(normalized):
-                self._paper_control_state(normalized)
-                raise ServiceError(423, "Resume is disabled until a reconciliation receipt is available.", code="reconciliation-required")
+                directory, deployed, ledger = self._paper_control_state(normalized)
+                if request is not None:
+                    try:
+                        previous = ledger.resume_request_result(
+                            request.request_id,
+                            failure_id=request.failure_id,
+                            preview_digest=request.preview_digest,
+                            decision=request.decision,
+                            operator="web",
+                        )
+                    except PaperRequestConflict:
+                        raise ServiceError(
+                            409,
+                            "Request ID was already used for a different Resume request.",
+                            code="request-conflict",
+                            request_id=request.request_id,
+                        ) from None
+                    except PaperReconciliationRequired:
+                        raise ServiceError(
+                            423,
+                            "Resume request outcome is uncertain; inspect paper state before further action.",
+                            code="reconciliation-required",
+                            request_id=request.request_id,
+                        ) from None
+                    except LedgerError:
+                        raise ServiceError(
+                            423,
+                            "Resume request history is unavailable.",
+                            code="reconciliation-required",
+                            request_id=request.request_id,
+                        ) from None
+                    if previous is not None:
+                        return previous
+                self._safe_child("paper", normalized, "broker.json")
+                state, latest = self._replay_paper_state(deployed, ledger)
+                try:
+                    halted = ledger.halted()
+                    snapshot = build_reconciliation_snapshot(directory, deployed, ledger, state, latest)
+                except (LedgerError, OSError, ValueError):
+                    raise ServiceError(423, "Paper state is invalid (LedgerError).", code="replay-corrupt") from None
+                preview = snapshot.preview
+                if halted is not None and preview.required:
+                    if request is None:
+                        raise ServiceError(
+                            423,
+                            "Paper work remains halted until the current reconciliation preview is reviewed.",
+                            code="reconciliation-required",
+                        )
+                    if request.failure_id != preview.failure_id or request.preview_digest != preview.preview_digest:
+                        raise ServiceError(
+                            409,
+                            "Paper state changed after reconciliation review.",
+                            code="stale-preview",
+                            request_id=request.request_id,
+                        )
+                    if not preview.recoverable:
+                        raise ServiceError(
+                            423,
+                            "The current local paper book does not match the replayed ledger; Halt remains active.",
+                            code="reconciliation-required",
+                            request_id=request.request_id,
+                        )
+                elif halted is not None and request is not None and request.failure_id is not None:
+                    raise ServiceError(
+                        409,
+                        "No ambiguous tick failure requires this reconciliation confirmation.",
+                        code="request-conflict",
+                        request_id=request.request_id,
+                    )
+                try:
+                    reconciliation = request.model_dump(mode="json") if request is not None and request.failure_id is not None else None
+                    receipt_id = ledger.resume(
+                        deployed.spec.capital,
+                        approval_required=deployed.spec.approval_required,
+                        reconciliation=reconciliation,
+                        request_id=request.request_id if request is not None else None,
+                        operator="web",
+                    )
+                except PaperRequestConflict:
+                    raise ServiceError(
+                        409,
+                        "Request ID was already used for a different Resume request.",
+                        code="request-conflict",
+                        request_id=request.request_id if request is not None else None,
+                    ) from None
+                except PaperReconciliationRequired:
+                    raise ServiceError(
+                        423,
+                        "Resume request outcome is uncertain; inspect paper state before further action.",
+                        code="reconciliation-required",
+                        request_id=request.request_id if request is not None else None,
+                    ) from None
+                except LedgerError as exc:
+                    message = str(exc).casefold()
+                    if "stale" in message:
+                        raise ServiceError(
+                            409,
+                            "Paper state changed after reconciliation review.",
+                            code="stale-preview",
+                            request_id=request.request_id if request is not None else None,
+                        ) from None
+                    if any(term in message for term in ("reconciliation", "receipt", "reconcilable")):
+                        raise ServiceError(
+                            423,
+                            "Paper work remains halted; reconciliation could not be verified.",
+                            code="reconciliation-required",
+                            request_id=request.request_id if request is not None else None,
+                        ) from None
+                    if "not halted" in message:
+                        raise ServiceError(
+                            409,
+                            "Paper fund is not halted.",
+                            code="request-conflict",
+                            request_id=request.request_id if request is not None else None,
+                        ) from None
+                    raise ServiceError(423, "Paper state is invalid (LedgerError).", code="replay-corrupt") from None
+                except AdmissionError:
+                    raise ServiceError(409, "Paper control admission is unavailable.") from None
+                except HandoverError:
+                    raise ServiceError(423, "Offline paper ledger inventory changed; writes are denied.", code="reconciliation-required") from None
+                except (OSError, ValueError):
+                    raise ServiceError(
+                        423,
+                        "Resume outcome is uncertain; inspect paper state before any further action.",
+                        code="reconciliation-required",
+                        request_id=request.request_id if request is not None else None,
+                    ) from None
+        return {"name": normalized, "halted": False, "reconciliation_id": receipt_id}
 
     @contextmanager
     def _paper_halt_lane(self, name: str) -> Iterator[None]:

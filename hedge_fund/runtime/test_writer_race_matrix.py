@@ -376,10 +376,13 @@ def test_junction_swap_before_approval_unlink_removes_nothing_outside(funds, tmp
     fund = root.path / "paper" / "alpha"
     moved = fund.with_name("alpha.moved")
     calls = []
+    swapped = False
 
     def swap():
+        nonlocal swapped
         fund.rename(moved)
         _link_directory(fund, outside)
+        swapped = True
 
     from hedge_fund.runtime import admission as admission_module
 
@@ -400,7 +403,7 @@ def test_junction_swap_before_approval_unlink_removes_nothing_outside(funds, tmp
         with admission.control_lane("alpha"):
             assert ledger.clear_approval() is False
     finally:
-        if fund.is_symlink() or fund.is_junction():
+        if swapped:
             os.rmdir(fund) if os.name == "nt" else os.unlink(fund)
         if moved.exists():
             moved.rename(fund)

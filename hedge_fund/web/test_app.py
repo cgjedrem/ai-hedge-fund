@@ -102,7 +102,7 @@ def test_read_only_mutation_is_denied_before_storage_or_domain_access(tmp_path, 
         response = client.post(
             "/api/paper/demo/halt",
             headers=LOOPBACK,
-            json={"reason": "test"},
+            json={"request_id": "halt-readonly-001", "reason": "test"},
         )
 
     assert response.status_code == 403
@@ -119,12 +119,12 @@ def test_writes_require_same_origin_token_and_loopback_peer(tmp_path):
         missing_origin = client.post(
             "/api/paper/demo/halt",
             headers={"host": "127.0.0.1", "x-csrf-token": token},
-            json={"reason": "test"},
+            json={"request_id": "halt-origin-denied-001", "reason": "test"},
         )
         missing_token = client.post(
             "/api/paper/demo/halt",
             headers={"host": "127.0.0.1", "origin": "http://127.0.0.1"},
-            json={"reason": "test"},
+            json={"request_id": "halt-token-denied-001", "reason": "test"},
         )
         wrong_token = client.post(
             "/api/paper/demo/halt",
@@ -133,7 +133,7 @@ def test_writes_require_same_origin_token_and_loopback_peer(tmp_path):
                 "origin": "http://127.0.0.1",
                 "x-csrf-token": "wrong",
             },
-            json={"reason": "test"},
+            json={"request_id": "halt-csrf-denied-001", "reason": "test"},
         )
         remote_peer = TestClient(
             app,
@@ -145,7 +145,7 @@ def test_writes_require_same_origin_token_and_loopback_peer(tmp_path):
                 "origin": "http://127.0.0.1",
                 "x-csrf-token": token,
             },
-            json={"reason": "test"},
+            json={"request_id": "halt-remote-denied-001", "reason": "test"},
         )
 
     assert isinstance(token, str) and len(token) >= 32
@@ -304,18 +304,18 @@ def test_boundary_denials_use_common_error_envelope_without_side_effects(tmp_pat
         no_session = client.post(
             "/api/paper/demo/halt",
             headers={"host": "127.0.0.1", "origin": "http://127.0.0.1", "x-csrf-token": "x"},
-            json={"reason": "test"},
+            json={"request_id": "halt-no-session-001", "reason": "test"},
         )
         token = client.get("/api/capabilities", headers=LOOPBACK).json()["mutation_token"]
         valid = {"host": "127.0.0.1", "origin": "http://127.0.0.1", "x-csrf-token": token}
         responses = {
-            "foreign-host": client.post("/api/paper/demo/halt", headers={**valid, "host": "desk.attacker.example"}, json={"reason": "t"}),
-            "foreign-origin": client.post("/api/paper/demo/halt", headers={**valid, "origin": "https://desk.attacker.example"}, json={"reason": "t"}),
-            "absent-origin": client.post("/api/paper/demo/halt", headers={"host": "127.0.0.1", "x-csrf-token": token}, json={"reason": "t"}),
-            "absent-csrf": client.post("/api/paper/demo/halt", headers={"host": "127.0.0.1", "origin": "http://127.0.0.1"}, json={"reason": "t"}),
-            "wrong-csrf": client.post("/api/paper/demo/halt", headers={**valid, "x-csrf-token": "expired-or-forged"}, json={"reason": "t"}),
+            "foreign-host": client.post("/api/paper/demo/halt", headers={**valid, "host": "desk.attacker.example"}, json={"request_id": "halt-foreign-host-001", "reason": "t"}),
+            "foreign-origin": client.post("/api/paper/demo/halt", headers={**valid, "origin": "https://desk.attacker.example"}, json={"request_id": "halt-foreign-origin-001", "reason": "t"}),
+            "absent-origin": client.post("/api/paper/demo/halt", headers={"host": "127.0.0.1", "x-csrf-token": token}, json={"request_id": "halt-absent-origin-001", "reason": "t"}),
+            "absent-csrf": client.post("/api/paper/demo/halt", headers={"host": "127.0.0.1", "origin": "http://127.0.0.1"}, json={"request_id": "halt-absent-csrf-001", "reason": "t"}),
+            "wrong-csrf": client.post("/api/paper/demo/halt", headers={**valid, "x-csrf-token": "expired-or-forged"}, json={"request_id": "halt-wrong-csrf-001", "reason": "t"}),
         }
-        remote_peer = TestClient(app, client=("192.0.2.10", 50000)).post("/api/paper/demo/halt", headers=valid, json={"reason": "t"})
+        remote_peer = TestClient(app, client=("192.0.2.10", 50000)).post("/api/paper/demo/halt", headers=valid, json={"request_id": "halt-remote-peer-001", "reason": "t"})
     # No-session request is denied before any cookie existed; session/token denials are renewable by read-only reload.
     session_denial = _assert_envelope(no_session, 403, "capability-denied", root=tmp_path)
     assert session_denial["detail"] == "A valid server-owned operator session is required."
@@ -352,7 +352,7 @@ def test_validation_routing_and_unhandled_errors_are_coded_and_inert(tmp_path):
     with TestClient(app, client=("127.0.0.1", 50000), raise_server_exceptions=False) as client:
         token = client.get("/api/capabilities", headers=LOOPBACK).json()["mutation_token"]
         headers = {"host": "127.0.0.1", "origin": "http://127.0.0.1", "x-csrf-token": token}
-        invalid = client.post("/api/paper/demo/halt", headers=headers, json={"reason": "x", hostile: hostile})
+        invalid = client.post("/api/paper/demo/halt", headers=headers, json={"request_id": "halt-invalid-extra-001", "reason": "x", hostile: hostile})
         wrong_method = client.post("/api/capabilities", headers=headers, json={})
         missing = client.get("/api/not-a-route", headers=LOOPBACK)
         crashed = client.get("/api/catalog", headers=LOOPBACK)
@@ -505,7 +505,7 @@ def test_restarted_server_rejects_prior_session_with_renewable_reload_and_no_eff
     before = sorted(path.relative_to(tmp_path) for path in tmp_path.rglob("*"))
     with TestClient(second, client=("127.0.0.1", 50000)) as client:
         client.cookies.update(old_cookies)
-        stale = client.post("/api/paper/demo/halt", headers=old_headers, json={"reason": "t"})
+        stale = client.post("/api/paper/demo/halt", headers=old_headers, json={"request_id": "halt-stale-session-001", "reason": "t"})
         renewed = _writable_headers(client)
 
     body = _assert_envelope(stale, 403, "capability-denied", root=tmp_path)

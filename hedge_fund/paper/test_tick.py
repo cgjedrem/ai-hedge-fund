@@ -246,6 +246,107 @@ def test_ticks_advance_one_session_each_and_match_the_backtest(tmp_path, clock, 
     assert kinds == ["tick", "tick", "tick"]
 
 
+def test_tick_request_id_replays_record_and_conflicts_on_changed_payload(tmp_path, clock, SPEC):
+    from hedge_fund.paper.ledger import PaperRequestConflict
+
+    directory = deploy("alpha", SPEC, ["AAPL"], root=tmp_path)
+    clock("2024-06-04")
+    data_calls = []
+
+    class CountingClient(FakeDataClient):
+        def get_prices(self, ticker, start_date, end_date, **kwargs):
+            data_calls.append((ticker, start_date, end_date))
+            return super().get_prices(ticker, start_date, end_date, **kwargs)
+
+    client = CountingClient(SERIES)
+    record = tick(
+        directory,
+        client,
+        build_fund=build_fund,
+        request_id="cli-tick-alpha-001",
+        expected_head=None,
+    )
+    calls_after_commit = list(data_calls)
+
+    replayed = tick(
+        directory,
+        client,
+        build_fund=build_fund,
+        request_id="cli-tick-alpha-001",
+        expected_head=None,
+    )
+
+    assert replayed.hash == record.hash
+    assert data_calls == calls_after_commit
+    with pytest.raises(PaperRequestConflict, match="request identity conflicts"):
+        tick(
+            directory,
+            client,
+            session=record.session,
+            build_fund=build_fund,
+            request_id="cli-tick-alpha-001",
+            expected_head=None,
+        )
+
+
+def test_uncertain_tick_request_never_repeats_work(tmp_path, clock, SPEC):
+    from hedge_fund.paper.ledger import PaperReconciliationRequired
+
+    directory = deploy("alpha", SPEC, ["AAPL"], root=tmp_path)
+    clock("2024-06-04")
+    build_calls = []
+
+    def failing_build(_spec):
+        build_calls.append(True)
+        raise RuntimeError("synthetic pipeline failure")
+
+    with pytest.raises(RuntimeError, match="synthetic pipeline failure"):
+        tick(
+            directory,
+            FakeDataClient(SERIES),
+            build_fund=failing_build,
+            request_id="cli-tick-alpha-failed",
+            expected_head=None,
+        )
+
+    with pytest.raises(PaperReconciliationRequired, match="reconciliation is required"):
+        tick(
+            directory,
+            FakeDataClient(SERIES),
+            build_fund=failing_build,
+            request_id="cli-tick-alpha-failed",
+            expected_head=None,
+        )
+
+    assert build_calls == [True]
+
+
+def test_tick_request_id_keeps_nothing_due_terminal(tmp_path, clock, SPEC):
+    directory = deploy("alpha", SPEC, ["AAPL"], root=tmp_path)
+    clock("2024-06-04")
+    unavailable = FakeDataClient({})
+
+    with pytest.raises(NothingDue):
+        tick(
+            directory,
+            unavailable,
+            build_fund=build_fund,
+            request_id="cli-tick-alpha-no-work",
+            expected_head=None,
+        )
+
+    with pytest.raises(NothingDue):
+        tick(
+            directory,
+            FakeDataClient(SERIES),
+            build_fund=build_fund,
+            request_id="cli-tick-alpha-no-work",
+            expected_head=None,
+        )
+
+    assert Ledger(directory).sessions() == []
+
+
 def test_gate_expires_unapproved_decision_and_continues(tmp_path, clock, SPEC):
     spec = SPEC.model_copy(update={"approval_required": True, "rebalance": "daily"})
     clock("2024-06-04")
@@ -1751,12 +1852,42 @@ def test_redo_runs_the_latest_session_again_and_replaces_its_record(tmp_path, cl
     assert ledger.sessions() == ["2024-06-03", "2024-06-04"] and ledger.latest() == bearish
     assert ledger.replay(spec.capital).pending == bearish.decision  # the chain still verifies
     assert [e["kind"] for e in ledger.events()] == ["tick", "tick", "redo", "tick", "redo", "tick"]
-
     # The next real tick still finds 06-05 due and executes the redone decision.
     clock("2024-06-06")
     wednesday = _tick(directory)
     assert wednesday.session == "2024-06-05" and wednesday.executed.as_of == "2024-06-04"
     assert wednesday.positions == {"AAPL": -500}
+
+
+def test_redo_request_id_replays_result_and_conflicts_on_changed_head(tmp_path, clock, SPEC):
+    from hedge_fund.paper.ledger import PaperRequestConflict
+
+    clock("2024-06-04")
+    directory = deploy("alpha", SPEC, ["AAPL"], root=tmp_path)
+    original = _tick(directory)
+    build_calls = []
+
+    def counted_build(spec):
+        build_calls.append(True)
+        return build_fund(spec)
+
+    request = {
+        "request_id": "cli-redo-alpha-001",
+        "expected_head": original.hash,
+    }
+    record = redo(directory, FakeDataClient(SERIES), build_fund=counted_build, **request)
+    replayed = redo(directory, FakeDataClient(SERIES), build_fund=counted_build, **request)
+
+    assert replayed.hash == record.hash
+    assert build_calls == [True]
+    with pytest.raises(PaperRequestConflict, match="request identity conflicts"):
+        redo(
+            directory,
+            FakeDataClient(SERIES),
+            build_fund=counted_build,
+            request_id=request["request_id"],
+            expected_head="0" * 64,
+        )
 
 
 def test_redo_refuses_a_halted_fund_and_leaves_it_untouched(tmp_path, clock, SPEC):
@@ -1786,12 +1917,81 @@ def test_failure_inside_advance_stays_halted_without_reconciliation_receipt(tmp_
     control_before = ledger.control_path.read_bytes()
     events_before = ledger.events_path.read_bytes()
     with pytest.raises(LedgerError, match="verified reconciliation receipt"):
-        ledger.resume()
+        ledger.resume(SPEC.capital)
     with pytest.raises(FundHalted):
         _tick(directory)
     assert ledger.sessions() == ["2024-06-04"]
     assert ledger.control_path.read_bytes() == control_before
     assert ledger.events_path.read_bytes() == events_before
+
+
+def test_tick_failure_event_binds_manual_operation_and_capture(tmp_path, clock, SPEC):
+    clock("2024-06-05")
+    directory = deploy("alpha", SPEC, ["AAPL"], root=tmp_path)
+    first = _tick(directory)
+    clock("2024-06-06")
+    series = {ticker: dict(values) for ticker, values in SERIES.items()}
+    del series["AAPL"]["2024-06-05"]
+
+    with pytest.raises(ValueError, match="AAPL: missing close on 2024-06-05"):
+        tick(
+            directory,
+            FakeDataClient(series),
+            build_fund=build_fund,
+            expected_head=first.hash,
+            operation_id="a" * 32,
+            request_id="web-tick-1",
+            capture_id="b" * 32,
+            capture_digest="c" * 64,
+        )
+
+    failure = next(event for event in Ledger(directory).events() if event["kind"] == "tick_failed")
+    assert failure["expected_head"] == first.hash
+    assert failure["operation_id"] == "a" * 32
+    assert failure["request_id"] == "web-tick-1"
+    assert failure["capture_id"] == "b" * 32
+    assert failure["capture_digest"] == "c" * 64
+
+
+def test_fill_then_append_failure_stays_halted_without_fabricated_ledger_success(tmp_path, clock, SPEC, monkeypatch):
+    from hedge_fund.runtime.reconciliation import (
+        build_reconciliation_snapshot,
+        ReconciliationConfirmation,
+    )
+
+    clock("2024-06-05")
+    directory = deploy("alpha", SPEC, ["AAPL"], root=tmp_path)
+    first = _tick(directory)
+    original_append = Ledger.append
+
+    def fail_append(self, record):
+        raise OSError("synthetic append failure after fill")
+
+    monkeypatch.setattr(Ledger, "append", fail_append)
+    clock("2024-06-06")
+    with pytest.raises(OSError, match="synthetic append failure after fill"):
+        _tick(directory)
+    monkeypatch.setattr(Ledger, "append", original_append)
+
+    ledger = Ledger(directory)
+    assert ledger.latest() == first
+    assert ledger.sessions() == [first.session]
+    assert PaperBroker(directory / "broker.json").positions()
+    state = ledger.replay(SPEC.capital, full=True)
+    preview = build_reconciliation_snapshot(directory, load_deployed(directory), ledger, state, ledger.latest())
+    confirmation = ReconciliationConfirmation(
+        request_id="recover-fill-1",
+        failure_id=preview.preview.failure_id,
+        preview_digest=preview.preview.preview_digest,
+        decision="confirm-paper-book-matches-ledger",
+    )
+
+    with pytest.raises(LedgerError, match="not reconcilable"):
+        ledger.resume(SPEC.capital, reconciliation=confirmation, operator="web")
+
+    assert ledger.halted() is not None
+    assert ledger.sessions() == [first.session]
+    assert not any(event["kind"] in {"reconciliation", "resume"} for event in ledger.events())
 
 
 def test_gated_approval_survives_failed_advance_and_resume_denial(tmp_path, clock, SPEC, monkeypatch):
@@ -1816,8 +2016,8 @@ def test_gated_approval_survives_failed_advance_and_resume_denial(tmp_path, cloc
     assert ledger.approval() == verdict
     assert ledger.sessions() == ["2024-06-03"]
 
-    with pytest.raises(LedgerError, match="verified reconciliation receipt"):
-        ledger.resume()
+    with pytest.raises(LedgerError, match="reconciliation"):
+        ledger.resume(spec.capital, approval_required=True)
     monkeypatch.setattr(paper_tick_module, "advance", real_advance)
     with pytest.raises(FundHalted):
         _tick(directory)
@@ -1920,7 +2120,7 @@ def test_enrolled_tick_redo_and_ledger_writes_require_admission(tmp_path, SPEC):
     with pytest.raises(LedgerError, match="admission"):
         ledger.halt("unadmitted")
     with pytest.raises(LedgerError, match="admission"):
-        ledger.resume()
+        ledger.resume(1.0)
     with pytest.raises(LedgerError, match="admission"):
         ledger.set_approval("approve", "2024-06-03", "0" * 64, "cli")
     with pytest.raises(LedgerError, match="admission"):

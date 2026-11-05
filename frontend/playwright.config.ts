@@ -25,12 +25,7 @@ const browserArgs = [
   "--no-first-run",
 ];
 const expectedOutputDir = resolve(testRoot, "playwright-results");
-const expectedScreenshotDir = resolve(
-  repositoryRoot,
-  "specs",
-  "005-web-engine-migration",
-  "screenshots",
-);
+const expectedScreenshotDir = resolve(testRoot, "screenshots");
 const expectedDemoRelative = relative(testRoot, demoRoot);
 const marker = resolve(testRoot, ".test-owned");
 const reportAcceptance = process.env.AIHF_REPORT_PARITY_FIXTURE === "clamped";

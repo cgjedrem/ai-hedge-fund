@@ -185,16 +185,43 @@ def test_kill_switch_round_trips_and_logs(tmp_path):
     ledger.halt("drawdown breach")
     assert ledger.halted() == "drawdown breach"
     assert ledger.replay(1.0).halted == "drawdown breach"
-    control_before = ledger.control_path.read_bytes()
-    events_before = ledger.events_path.read_bytes()
-    with pytest.raises(LedgerError, match="verified reconciliation receipt"):
-        ledger.resume()
-    assert ledger.halted() == "drawdown breach"
     assert [e["kind"] for e in ledger.events()] == ["halt"]
-    assert ledger.control_path.read_bytes() == control_before
-    assert ledger.events_path.read_bytes() == events_before
     assert ledger.events()[0]["reason"] == "drawdown breach"
     assert all("time" in e for e in ledger.events())
+
+
+def test_resume_clears_manual_halt_after_full_replay(tmp_path):
+    ledger = Ledger(tmp_path)
+    ledger.init()
+    ledger.halt("operator pause")
+
+    ledger.resume(capital=100_000)
+
+    assert ledger.halted() is None
+    assert [event["kind"] for event in ledger.events()] == ["halt", "resume", "resume_effect_intent", "resume_completed"]
+
+
+def test_resume_does_not_repeat_after_uncertain_control_write_without_request_id(tmp_path, monkeypatch):
+    ledger = Ledger(tmp_path)
+    ledger.init()
+    ledger.halt("operator pause")
+    attempts = []
+
+    def fail_clear(self, halted, reason, **kwargs):
+        if halted is False:
+            attempts.append(halted)
+            raise OSError("synthetic Resume control write failure")
+        raise AssertionError("unexpected Halt write")
+
+    monkeypatch.setattr(Ledger, "_write_control", fail_clear)
+    with pytest.raises(OSError, match="synthetic Resume control write failure"):
+        ledger.resume(capital=100_000)
+    with pytest.raises(LedgerError, match="Resume control write outcome is uncertain"):
+        ledger.resume(capital=100_000)
+
+    assert attempts == [False]
+    assert ledger.halted() == "operator pause"
+    assert [event["kind"] for event in ledger.events()] == ["halt", "resume", "resume_effect_intent"]
 
 
 def test_audit_observation_without_a_writer_is_read_only(tmp_path):

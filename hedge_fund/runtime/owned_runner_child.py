@@ -561,8 +561,13 @@ def _execute_session(
                     root.path / "paper" / fund,
                     data_client,
                     session=due,
+                    expected_head=current.prev_hash,
                     build_fund=((lambda selected: build_fund(selected, capture, root, dispatch)) if build_fund is not None else (lambda selected: _build_fund(selected, capture, root, dispatch))),
                     now=lambda: _validated_now(retry_clock()).astimezone(NEW_YORK),
+                    operation_id=authorization.operation_id,
+                    request_id=f"runner:{authorization.operation_id}:{due}",
+                    capture_id=capture.capture_id,
+                    capture_digest=capture.digest,
                 )
                 break
             except PaperPreflightBusy:

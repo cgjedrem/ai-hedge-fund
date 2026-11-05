@@ -504,6 +504,7 @@ def test_web_archive_waits_for_real_cli_redo_admission_without_duplicate_fills(t
     ready = tmp_path / "redo-admitted"
     release = tmp_path / "redo-release"
     outcome = tmp_path / "redo-outcome"
+    expected_head = Ledger(root / "paper" / fund).latest().hash
     script = "\n".join(
         [
             "import contextlib, time, traceback",
@@ -524,7 +525,7 @@ def test_web_archive_waits_for_real_cli_redo_admission_without_duplicate_fills(t
             "        yield",
             "run._paper_lane = staged_lane",
             "try:",
-            f"    run.main(['--root', {str(root)!r}, '--enable-network', 'paper', 'tick', {fund!r}, '--again'])",
+            f"    run.main(['--root', {str(root)!r}, '--enable-network', 'paper', 'tick', {fund!r}, '--again', '--expected-head', {expected_head!r}, '--request-id', 'redo-archive-cli-001'])",
             "except StagedStop:",
             "    outcome.write_text('stopped-before-redo-effects', encoding='utf-8')",
             "except BaseException:",
@@ -669,6 +670,7 @@ from hedge_fund.backtesting.test_fund import FakeAnalyst, FakeDataClient, SERIES
 from hedge_fund.fund import Fund
 
 root, fund, ready, release, result, stage, mode = Path(ROOT), FUND, Path(READY), Path(RELEASE), Path(RESULT), STAGE, MODE
+expected_head, request_id = EXPECTED_HEAD, REQUEST_ID
 original_load = run._load_runtime
 original_lane = run._paper_lane
 
@@ -707,7 +709,7 @@ try:
     with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
         try:
             options = ["--again"] if mode == "redo" else ["--session", "2024-06-04"]
-            run.main(["--root", str(root), "--enable-network", "paper", "tick", fund, *options])
+            run.main(["--root", str(root), "--enable-network", "paper", "tick", fund, *options, "--expected-head", expected_head, "--request-id", request_id])
         except SystemExit as exc:
             outcome = str(exc.code)
         else:
@@ -733,6 +735,7 @@ result.write_text(outcome + "\\n" + output.getvalue(), encoding="utf-8")
                 f"/api/paper/{fund}/approval",
                 headers=headers,
                 json={
+                    "request_id": "race-fill-verdict-001",
                     "verdict": "approve",
                     "decision_as_of": latest.decision.as_of,
                     "source_record_hash": latest.hash,
@@ -751,6 +754,8 @@ result.write_text(outcome + "\\n" + output.getvalue(), encoding="utf-8")
                     RESULT=str(result),
                     STAGE=stage,
                     MODE=mode,
+                    EXPECTED_HEAD=ledger.latest().hash,
+                    REQUEST_ID=f"race-cli-{mode}-001",
                 )
 
             winner = owned_test_process(child_script("winner", winner_result))
@@ -780,7 +785,11 @@ result.write_text(outcome + "\\n" + output.getvalue(), encoding="utf-8")
             assert recorded.executed.fills[0].side == "buy"
             assert recorded.executed.fills[0].quantity == 500
             assert len(_recorded_fills(root, fund)) == len(before_fills) + 1
-            assert [event["kind"] for event in ledger.events()] == ["tick", "approve", "consume", "tick"]
+            events = ledger.events()
+            assert [event["kind"] for event in events] == ["tick", "approve", "approval_commit", "tick_intent", "consume", "tick"]
+            assert events[2]["request_id"] == "race-fill-verdict-001"
+            assert events[3]["request_id"] == "race-cli-tick-001"
+            assert events[3]["request_action"] == "tick"
             assert ledger.approval() is None
             book = PaperBroker(root / "paper" / fund / "broker.json")
             assert book.cash() == pytest.approx(recorded.cash)
@@ -1062,7 +1071,7 @@ output = io.StringIO()
 try:
     with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
         try:
-            run.main(["--root", ROOT, "--enable-network", "paper", "tick", FUND])
+            run.main(["--root", ROOT, "--enable-network", "paper", "tick", FUND, "--expected-head", EXPECTED_HEAD, "--request-id", REQUEST_ID])
         except SystemExit as exc:
             outcome = str(exc.code)
         else:
@@ -1075,6 +1084,8 @@ result.write_text(outcome + "\\n" + output.getvalue(), encoding="utf-8")
         ROOT=str(root),
         FUND=fund,
         RESULT=str(cli_result),
+        EXPECTED_HEAD=first.hash,
+        REQUEST_ID="runner-cli-tick-001",
     )
     try:
         with TestClient(app, client=("127.0.0.1", 50000)) as client:
@@ -1101,7 +1112,12 @@ result.write_text(outcome + "\\n" + output.getvalue(), encoding="utf-8")
             approved = client.post(
                 f"/api/paper/{fund}/approval",
                 headers=headers,
-                json={"verdict": "approve", "decision_as_of": first.decision.as_of, "source_record_hash": first.hash},
+                json={
+                    "request_id": "runner-fill-verdict-001",
+                    "verdict": "approve",
+                    "decision_as_of": first.decision.as_of,
+                    "source_record_hash": first.hash,
+                },
             )
             assert approved.status_code == 200, approved.text
 
@@ -1178,7 +1194,11 @@ result.write_text(outcome + "\\n" + output.getvalue(), encoding="utf-8")
             fill = recorded.executed.fills[0]
             assert (fill.ticker, fill.side, fill.quantity) == ("AAPL", "buy", 500)
             assert len(_recorded_fills(root, fund)) == 1
-            assert [event["kind"] for event in ledger.events()] == ["tick", "approve", "consume", "tick"]
+            events = ledger.events()
+            assert [event["kind"] for event in events] == ["tick", "approve", "approval_commit", "tick_intent", "consume", "tick"]
+            assert events[2]["request_id"] == "runner-fill-verdict-001"
+            assert events[3]["request_action"] == "tick"
+            assert events[3]["request_id"].startswith("runner:")
             assert ledger.approval() is None
             book = PaperBroker(directory / "broker.json")
             assert book.cash() == pytest.approx(recorded.cash)
@@ -1352,6 +1372,7 @@ def test_web_verdict_and_halt_remain_responsive_during_cross_process_research_sa
                     f"/api/paper/{fund}/approval",
                     headers=headers,
                     json={
+                        "request_id": "t027-saturation-approval-001",
                         "verdict": "approve",
                         "decision_as_of": pending["decision_as_of"],
                         "source_record_hash": pending["source_record_hash"],
@@ -1363,7 +1384,11 @@ def test_web_verdict_and_halt_remain_responsive_during_cross_process_research_sa
                 assert ledger.approval()["decision_hash"] == pending["source_record_hash"]
 
                 started_at = time.monotonic()
-                halted = client.post(f"/api/paper/{fund}/halt", headers=headers, json={"reason": "synthetic saturation halt"})
+                halted = client.post(
+                    f"/api/paper/{fund}/halt",
+                    headers=headers,
+                    json={"request_id": "halt-t027-saturation-001", "reason": "synthetic saturation halt"},
+                )
                 halt_seconds = time.monotonic() - started_at
                 assert halted.status_code == 200, halted.text
                 assert halt_seconds < MAX_CONTROL_WAIT_SECONDS + 5

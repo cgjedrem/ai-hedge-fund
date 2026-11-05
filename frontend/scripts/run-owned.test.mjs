@@ -58,10 +58,11 @@ test("browser config fixes port and output ownership without server reuse", () =
   assert.doesNotMatch(config, /8765|AIHF_WEB_REUSE_EXISTING_SERVER/);
 });
 
-test("dev proxy and browser screenshots avoid the protected preview and old spec", () => {
+test("dev proxy and browser screenshots stay inside the owned fixture", () => {
   const vite = readFileSync(resolve(frontendRoot, "vite.config.ts"), "utf8");
   const browser = readFileSync(resolve(frontendRoot, "e2e", "desk.spec.ts"), "utf8");
   const runner = readFileSync(resolve(frontendRoot, "e2e", "run-owned.mjs"), "utf8");
+  const config = readFileSync(resolve(frontendRoot, "playwright.config.ts"), "utf8");
   const vitestGuard = readFileSync(
     resolve(frontendRoot, "src", "test", "setup.ts"),
     "utf8",
@@ -69,8 +70,10 @@ test("dev proxy and browser screenshots avoid the protected preview and old spec
 
   assert.match(vite, /127\.0\.0\.1:8876/);
   assert.doesNotMatch(vite, /8765/);
-  assert.match(browser, /005-web-engine-migration\/screenshots/);
-  assert.doesNotMatch(browser, /004-react-web-ui\/screenshots|8765/);
+  assert.match(browser, /AIHF_PLAYWRIGHT_SCREENSHOT_DIR/);
+  assert.doesNotMatch(browser, /specs\/005-web-engine-migration\/screenshots|004-react-web-ui\/screenshots|8765/);
+  assert.match(runner, /join\(testRoot, "screenshots"\)/);
+  assert.match(config, /resolve\(testRoot, "screenshots"\)/);
   assert.match(vitestGuard, /globalThis\.fetch = async/);
   assert.match(vitestGuard, /XMLHttpRequest\.prototype, "open"/);
   assert.match(runner, /AIHF_WEB_STATIC_DIR/);
@@ -139,6 +142,7 @@ test("owned child strips interpreter and Node module overrides", () => {
   assert.ok(basename(testRoot).length <= 32);
   assert.equal(dirname(resolve(env.PLAYWRIGHT_BROWSERS_PATH)), testRoot);
   assert.equal(basename(env.PLAYWRIGHT_BROWSERS_PATH), "playwright-browsers");
+  assert.equal(resolve(env.AIHF_PLAYWRIGHT_SCREENSHOT_DIR), resolve(testRoot, "screenshots"));
 });
 
 test("inherited report fixture flags cannot select an unseeded clamped case", () => {

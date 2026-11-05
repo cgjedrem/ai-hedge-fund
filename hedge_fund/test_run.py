@@ -9,6 +9,7 @@ from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import Mock
+from uuid import uuid4
 
 import pytest
 import yaml
@@ -86,14 +87,30 @@ def _mandate(tmp_path, mode="long_short", name="mixed"):
 
 def _main(monkeypatch, *argv):
     root = Path(run.PAPER_DIR).parent if run.PAPER_DIR is not None else Path(os.environ["HEDGE_FUND_TEST_ROOT"])
+    argv = list(argv)
     if argv and argv[0] == "backtest" and "--enable-network" not in argv:
-        argv = ("--enable-network", *argv)
+        argv = ["--enable-network", *argv]
     if argv and argv[0] == "paper":
         action = argv[1] if len(argv) > 1 else None
         if action == "tick" and "--enable-network" not in argv:
-            argv = ("--enable-network", *argv)
+            argv = ["--enable-network", *argv]
         if action == "approve" and "--now" in argv and "--enable-network" not in argv:
-            argv = ("--enable-network", *argv)
+            argv = ["--enable-network", *argv]
+        if action in {"tick", "approve", "reject"}:
+            if "--expected-head" not in argv:
+                from hedge_fund.paper.ledger import Ledger
+
+                paper_index = argv.index("paper")
+                name = argv[paper_index + 2]
+                directory = root / "paper" / name
+                latest = Ledger(directory).latest() if directory.is_dir() else None
+                argv.extend(("--expected-head", latest.hash if latest is not None else "none"))
+            if "--request-id" not in argv:
+                argv.extend(("--request-id", f"test-cli-{uuid4().hex}"))
+        elif action == "halt" and "--request-id" not in argv:
+            argv.extend(("--request-id", f"test-cli-{uuid4().hex}"))
+        if action == "approve" and "--now" in argv and "--tick-request-id" not in argv:
+            argv.extend(("--tick-request-id", f"test-cli-tick-{uuid4().hex}"))
     monkeypatch.setattr(sys, "argv", ["aihf", "--root", str(root), *argv])
     run.main()
 
@@ -201,7 +218,23 @@ def test_cli_sim_create_denies_before_root_admission_with_ownership_reason(tmp_p
     assert "busy" not in error
     assert forbidden.call_count == 0
     assert {str(entry.relative_to(tmp_path)): entry.read_bytes() for entry in tmp_path.rglob("*") if entry.is_file()} == before
-    assert not (tmp_path / "paper").exists()
+
+
+def test_cli_paper_create_retry_conflicts_without_rewriting_deployment(tmp_path, monkeypatch, capsys, offline):
+    path = _mandate(tmp_path)
+    _enroll_test_root(tmp_path)
+    request = ("paper", "create", "alpha", "--mandate", str(path), "--universe", "AAPL")
+    _main(monkeypatch, *request)
+    capsys.readouterr()
+
+    directory = tmp_path / "paper" / "alpha"
+    before = {item.relative_to(directory): item.read_bytes() for item in directory.rglob("*") if item.is_file()}
+    with pytest.raises(SystemExit) as conflict:
+        _main(monkeypatch, *request)
+
+    assert conflict.value.code == 2
+    assert "already exists" in capsys.readouterr().err
+    assert {item.relative_to(directory): item.read_bytes() for item in directory.rglob("*") if item.is_file()} == before
 
 
 @pytest.mark.parametrize("command", [("tick",), ("tick", "--again"), ("approve", "--now")])
@@ -964,18 +997,19 @@ def test_paper_create_overrides_day_grid_to_minute_with_standard_defaults(tmp_pa
 def test_deployed_fund_commands_do_not_accept_rebalance_override(capsys, action):
     parser = run._parser()
 
+    arguments = [
+        "--root",
+        os.environ["HEDGE_FUND_TEST_ROOT"],
+        "paper",
+        action,
+        "alpha",
+    ]
+    if action == "tick":
+        arguments.extend(["--expected-head", "none", "--request-id", "rebalance-parser-test-001"])
+    arguments.extend(["--rebalance", "daily"])
+
     with pytest.raises(SystemExit) as exc:
-        parser.parse_args(
-            [
-                "--root",
-                os.environ["HEDGE_FUND_TEST_ROOT"],
-                "paper",
-                action,
-                "alpha",
-                "--rebalance",
-                "daily",
-            ]
-        )
+        parser.parse_args(arguments)
 
     assert exc.value.code == 2
     assert "unrecognized arguments: --rebalance daily" in capsys.readouterr().err
@@ -1046,6 +1080,107 @@ def test_paper_flow_resume_requires_reconciliation_receipt(tmp_path, monkeypatch
     with pytest.raises(SystemExit) as exc:
         _main(monkeypatch, "paper", "status", "nobody")
     assert exc.value.code == 2 and "no paper fund named 'nobody'" in capsys.readouterr().err
+
+
+def test_cli_tick_request_replay_skips_provider_and_binds_expected_head(tmp_path, monkeypatch, capsys, offline):
+    from hedge_fund.paper.ledger import Ledger
+
+    path = _mandate(tmp_path)
+    _enroll_test_root(tmp_path)
+    offline("2025-01-07")
+    _main(monkeypatch, "paper", "create", "alpha", "--mandate", str(path), "--universe", "AAPL")
+    capsys.readouterr()
+    request_id = "cli-tick-alpha-replay-001"
+
+    _main(
+        monkeypatch,
+        "paper",
+        "tick",
+        "alpha",
+        "--expected-head",
+        "none",
+        "--request-id",
+        request_id,
+    )
+    first = json.loads(capsys.readouterr().out)
+    ledger = Ledger(tmp_path / "paper" / "alpha")
+    events_before_replay = ledger.events()
+
+    monkeypatch.setattr(run, "make_data_client", Mock(side_effect=AssertionError("replay constructed a provider")))
+    _main(
+        monkeypatch,
+        "paper",
+        "tick",
+        "alpha",
+        "--expected-head",
+        "none",
+        "--request-id",
+        request_id,
+    )
+    replayed = json.loads(capsys.readouterr().out)
+
+    assert replayed["hash"] == first["hash"]
+    assert ledger.events() == events_before_replay
+    with pytest.raises(SystemExit) as conflict:
+        _main(
+            monkeypatch,
+            "paper",
+            "tick",
+            "alpha",
+            "--session",
+            first["session"],
+            "--expected-head",
+            "none",
+            "--request-id",
+            request_id,
+        )
+    assert conflict.value.code == 1
+    assert "request identity conflicts" in capsys.readouterr().err
+    _main(monkeypatch, "paper", "status", "alpha", "--head")
+    assert capsys.readouterr().out.strip() == first["hash"]
+
+
+def test_cli_halt_request_id_replays_and_conflicts_on_reason(tmp_path, monkeypatch, capsys, offline):
+    from hedge_fund.paper.ledger import Ledger
+
+    path = _mandate(tmp_path)
+    _enroll_test_root(tmp_path)
+    _main(monkeypatch, "paper", "create", "alpha", "--mandate", str(path), "--universe", "AAPL")
+    capsys.readouterr()
+    request = ("paper", "halt", "alpha", "--reason", "operator pause", "--request-id", "cli-halt-alpha-001")
+    ledger = Ledger(tmp_path / "paper" / "alpha")
+
+    _main(monkeypatch, *request)
+    events_after_commit = ledger.events()
+    _main(monkeypatch, *request)
+    assert ledger.events() == events_after_commit
+    assert ledger.halted() == "operator pause"
+
+    with pytest.raises(SystemExit) as conflict:
+        _main(monkeypatch, "paper", "halt", "alpha", "--reason", "different reason", "--request-id", "cli-halt-alpha-001")
+    assert conflict.value.code == 1
+    assert "request identity conflicts" in capsys.readouterr().err
+    assert ledger.events() == events_after_commit
+
+
+@pytest.mark.parametrize(
+    ("arguments", "required"),
+    [
+        (("paper", "tick", "alpha"), ("--expected-head", "--request-id")),
+        (("paper", "halt", "alpha", "--reason", "operator"), ("--request-id",)),
+        (("paper", "approve", "alpha"), ("--expected-head", "--request-id")),
+        (("paper", "reject", "alpha"), ("--expected-head", "--request-id")),
+    ],
+)
+def test_cli_paper_writers_require_review_identity(tmp_path, capsys, arguments, required):
+    parser = run._parser()
+
+    with pytest.raises(SystemExit) as failure:
+        parser.parse_args(["--root", str(tmp_path), *arguments])
+
+    output = capsys.readouterr().err
+    assert failure.value.code == 2
+    assert all(option in output for option in required)
 
 
 def test_cli_interrupted_redo_denies_before_provider_and_allows_halt(tmp_path, monkeypatch, capsys, offline):
@@ -1491,7 +1626,7 @@ def test_enrolled_cli_tick_lane_conflict_leaves_ledger_unchanged(
                     "import sys",
                     "from pathlib import Path",
                     "from hedge_fund import run",
-                    f"sys.argv = ['aihf', '--root', {str(root)!r}, '--enable-network', 'paper', 'tick', 'alpha']",
+                    f"sys.argv = ['aihf', '--root', {str(root)!r}, '--enable-network', 'paper', 'tick', 'alpha', '--expected-head', 'none', '--request-id', 'cli-tick-conflict-001']",
                     "try:",
                     "    run.main()",
                     "except SystemExit as exc:",
@@ -1560,7 +1695,8 @@ def test_paper_minute_fund_ticks_and_denies_legacy_runner(tmp_path, monkeypatch,
     err = " ".join(capsys.readouterr().err.split())  # the console wraps; read it as one line
     assert "every 30s" in err and "09:30–12:00 ET" in err
     root_argument = "--root <selected-root>"
-    assert f"aihf {root_argument} --enable-network paper tick fast` to authorize one bounded session" in err
+    assert f"aihf {root_argument} paper status fast --head`" in err
+    assert "paper tick fast --expected-head <head|none> --request-id <unique-id>` for one bounded session" in err
     assert "Headless scheduled runners are disabled" in err
 
     class CliTape(Tape):
@@ -1661,11 +1797,13 @@ def test_paper_create_approval_and_approve_commands_show_status(tmp_path, monkey
     mailbox = json.loads((directory / "pending-approval.json").read_text())
     events = [json.loads(line) for line in (directory / "events.jsonl").read_text().splitlines()]
     assert mailbox["verdict"] == "approve" and mailbox["by"] == "cli"
-    assert [event["kind"] for event in events] == ["tick", "approve"]
+    assert [event["kind"] for event in events] == ["tick", "approve", "approval_commit"]
     assert "approved" in approved.err.lower()
 
 
 def test_paper_approve_now_executes_when_a_session_is_due(tmp_path, monkeypatch, capsys, offline):
+    from hedge_fund.paper.ledger import Ledger
+
     set_today = offline
     path = _mandate(tmp_path)
     set_today("2025-01-07")
@@ -1677,7 +1815,20 @@ def test_paper_approve_now_executes_when_a_session_is_due(tmp_path, monkeypatch,
 
     set_today("2025-01-08")
     _disable_status_animation(monkeypatch)
-    _main(monkeypatch, "paper", "approve", "alpha", "--now")
+    expected_head = Ledger(directory).latest().hash
+    request = (
+        "paper",
+        "approve",
+        "alpha",
+        "--now",
+        "--expected-head",
+        expected_head,
+        "--request-id",
+        "cli-approve-alpha-now-001",
+        "--tick-request-id",
+        "cli-approve-alpha-now-tick-001",
+    )
+    _main(monkeypatch, *request)
     output = capsys.readouterr()
 
     record = json.loads(output.out)
@@ -1685,6 +1836,21 @@ def test_paper_approve_now_executes_when_a_session_is_due(tmp_path, monkeypatch,
     assert record["executed"] is not None
     assert not (directory / "pending-approval.json").exists()
     assert "executed" in output.err.lower()
+    events_after_commit = Ledger(directory).events()
+    monkeypatch.setattr(run, "make_data_client", Mock(side_effect=AssertionError("replayed approval constructed a provider")))
+
+    _main(monkeypatch, *request)
+
+    replayed = json.loads(capsys.readouterr().out)
+    assert replayed["hash"] == record["hash"]
+    assert Ledger(directory).events() == events_after_commit
+    conflict = list(request)
+    conflict[5] = "0" * 64
+    with pytest.raises(SystemExit) as denied:
+        _main(monkeypatch, *conflict)
+    assert denied.value.code == 1
+    assert "request identity conflicts" in capsys.readouterr().err
+    assert Ledger(directory).events() == events_after_commit
 
 
 def test_paper_approve_now_without_a_due_session_schedules_next_close(tmp_path, monkeypatch, capsys, offline):
@@ -1719,7 +1885,7 @@ def test_paper_reject_records_verdict_and_event(tmp_path, monkeypatch, capsys, o
 
     assert json.loads((directory / "pending-approval.json").read_text())["verdict"] == "reject"
     events = [json.loads(line) for line in (directory / "events.jsonl").read_text().splitlines()]
-    assert [event["kind"] for event in events] == ["tick", "reject"]
+    assert [event["kind"] for event in events] == ["tick", "reject", "approval_commit"]
     assert "rejected" in rejected.err.lower()
 
 

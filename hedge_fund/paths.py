@@ -422,13 +422,11 @@ def _is_halt_control_write(data: bytes | None) -> bool:
         value = json.loads(data)
     except (UnicodeError, ValueError):
         return False
-    return (
-        isinstance(value, dict)
-        and set(value) == {"halted", "reason", "since"}
-        and value["halted"] is True
-        and isinstance(value["reason"], str)
-        and isinstance(value["since"], str)
-    )
+    fields = {"halted", "reason", "since"}
+    request_fields = {"request_id", "request_action", "request_digest"}
+    actual_fields = set(value) if isinstance(value, dict) else set()
+    request_identity_valid = actual_fields == fields | request_fields and (isinstance(value.get("request_id"), str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", value["request_id"]) is not None and value.get("request_action") == "halt" and isinstance(value.get("request_digest"), str) and re.fullmatch(r"[a-f0-9]{64}", value["request_digest"]) is not None)
+    return isinstance(value, dict) and (actual_fields == fields or request_identity_valid) and value["halted"] is True and isinstance(value["reason"], str) and isinstance(value["since"], str)
 
 
 def write_atomic(path: Path, text: str, *, mode: int | None = None, durable: bool = False) -> None:

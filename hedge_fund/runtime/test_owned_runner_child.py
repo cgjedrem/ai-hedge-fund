@@ -413,6 +413,7 @@ def test_runner_retries_pre_effect_control_contention_without_spending_another_s
             tick_once = owned_runner_child.tick
             control_attempts = 0
             tick_attempts = 0
+            tick_requests = []
 
             def observed_control(current, identity, *, timeout=0.1):
                 nonlocal control_attempts
@@ -425,6 +426,7 @@ def test_runner_retries_pre_effect_control_contention_without_spending_another_s
             def observed_tick(*args, **kwargs):
                 nonlocal tick_attempts
                 tick_attempts += 1
+                tick_requests.append(dict(kwargs))
                 if stage == "tick-preflight":
                     if tick_attempts == 1:
                         ready.set()
@@ -486,6 +488,13 @@ def test_runner_retries_pre_effect_control_contention_without_spending_another_s
                 assert final["sessions_completed"] == 1
                 assert final["last_session"] == _DUE_SESSION
                 assert Ledger(directory).sessions() == [_INITIAL_SESSION, _DUE_SESSION]
+                request = tick_requests[0]
+                operation_id = launch["authorization"]["operation_id"]
+                assert request["expected_head"] == initial.hash
+                assert request["operation_id"] == operation_id
+                assert request["request_id"] == f"runner:{operation_id}:{_DUE_SESSION}"
+                assert request["capture_id"] == capture.capture_id
+                assert request["capture_digest"] == capture.digest
             else:
                 assert final["status"] == ("stopped" if outcome == "stop" else "completed")
                 assert final["reason"] == ("stop-requested" if outcome == "stop" else "expiry-reached")

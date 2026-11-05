@@ -1015,6 +1015,7 @@ def test_approval_waiting_for_sibling_publication_does_not_block_halt(
             service.approve(
                 "gamma",
                 ApprovalRequest(
+                    request_id="approval-inventory-race-1",
                     verdict="approve",
                     decision_as_of=pending.decision.as_of,
                     source_record_hash=pending.hash,
@@ -1042,7 +1043,7 @@ def test_approval_waiting_for_sibling_publication_does_not_block_halt(
             time.sleep(0.01)
         assert queued, failures
         started = time.monotonic()
-        result = service.halt_fund("gamma", "synthetic emergency")
+        result = service.halt_fund("gamma", "synthetic emergency", "halt-inventory-cache-race-001")
         halt_elapsed = time.monotonic() - started
         assert halt_elapsed < 2.0
         assert writer.is_alive() and not release.is_set()
@@ -1372,6 +1373,8 @@ def test_cli_halt_succeeds_while_sibling_head_publication_is_inflight(enrolled_f
                 "beta",
                 "--reason",
                 "synthetic emergency",
+                "--request-id",
+                "t027-sibling-halt-001",
             ),
             env=child_test_environment(),
             capture_output=True,

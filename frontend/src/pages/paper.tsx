@@ -49,6 +49,7 @@ import type {
   LiveValuation,
   PaperCollection,
   PaperOperationPreview,
+  PaperReconciliation,
   PaperSessionsCollection,
   PaperSnapshot,
   PaperSummary,
@@ -150,6 +151,11 @@ export function PaperDetailPage() {
   const navigate = useNavigate();
   const { capabilities, reconnect } = useDesk();
   const resource = useResource<PaperSnapshot>(name ? `/api/paper/${encodeURIComponent(name)}` : null);
+  const reconciliationResource = useResource<PaperReconciliation>(
+    name && resource.data?.halt_state === "halted" && resource.data.ledger.ok
+      ? `/api/paper/${encodeURIComponent(name)}/reconciliation`
+      : null,
+  );
   const [sessionSearchText, setSessionSearchText] = useState("");
   const [sessionSearch, setSessionSearch] = useState("");
   const [sessionCursorStack, setSessionCursorStack] = useState<(string | null)[]>([null]);
@@ -185,11 +191,16 @@ export function PaperDetailPage() {
   const paperAdmissionController = useRef<AbortController | null>(null);
   const refreshedOperation = useRef<string | null>(null);
   const activeFundName = useRef(name);
+  const recoveryRequest = useRef<{ failureId: string; previewDigest: string; requestId: string } | null>(null);
+  const verdictRequest = useRef<{ key: string; requestId: string } | null>(null);
+  const manualResumeRequest = useRef<{ key: string; requestId: string } | null>(null);
+  const haltRequest = useRef<{ key: string; requestId: string } | null>(null);
   activeFundName.current = name;
   useEffect(() => () => paperAdmissionController.current?.abort(), [name]);
   const protectedName = capabilities?.protected_names.some((entry) => entry.toLowerCase() === name.toLowerCase()) ?? false;
   const canWrite = capabilities?.writes === true && !protectedName;
   const data = resource.data;
+  const recovery = reconciliationResource.data?.name === name ? reconciliationResource.data : null;
   const writeUnavailable = capabilities?.write_unavailable_reason != null;
   const enrollmentState = capabilities?.enrollment_state ?? "unenrolled";
   const runner = runnerResource.data ?? data?.runner;
@@ -202,6 +213,7 @@ export function PaperDetailPage() {
   const approvalRequired = data?.spec.approval_required === true;
   const canWritePaper = canWrite && data?.broker === "paper";
   const canApprove = canWritePaper && approvalRequired && data?.halt_state === "clear" && data?.ledger.ok === true;
+  const canResumePaper = Boolean(canWritePaper && data?.halt_state === "halted" && data.ledger.ok && recovery?.resume_allowed === true);
   const canRefreshValuation = canWritePaper && capabilities?.network === true && data?.ledger.ok === true;
   const liveValue = valuationResult ?? data?.live_value;
   const paperOperationActive = Boolean(
@@ -241,6 +253,7 @@ export function PaperDetailPage() {
     setConfirmAction(null);
     setFeedback(null);
     resource.refresh();
+    reconciliationResource.refresh();
     runnerResource.refresh();
     if (operationId) operationResource.refresh();
   };
@@ -265,6 +278,7 @@ export function PaperDetailPage() {
     setOperationId(readPaperOperationId(name));
     setPaperPreview(null);
     setPaperPreviewKind(null);
+    recoveryRequest.current = null;
   }, [name]);
 
   useEffect(() => {
@@ -298,7 +312,7 @@ export function PaperDetailPage() {
     if (
       confirmAction === "approve" || confirmAction === "reject"
         ? !canApprove
-        : !canWritePaper
+        : !canResumePaper
     ) return;
     setBusy(true);
     setFeedback(null);
@@ -310,16 +324,61 @@ export function PaperDetailPage() {
           resource.refresh();
           return;
         }
-        await submitVerdict(name, confirmAction, pending);
+        const key = `${name}:${confirmAction}:${pending.decision_as_of}:${pending.source_record_hash}`;
+        const current = verdictRequest.current;
+        const request = current?.key === key ? current : { key, requestId: newRequestId() };
+        verdictRequest.current = request;
+        await submitVerdict(name, confirmAction, pending, request.requestId);
+        verdictRequest.current = null;
         setFeedback({ tone: "neutral", message: `Verdict ${confirmAction} was saved to the local approval mailbox. It does not execute immediately.` });
       } else {
-        await apiPost(`/api/paper/${encodeURIComponent(name)}/resume`);
-        setFeedback({ tone: "neutral", message: "Resume request recorded. The web desk does not start or control the runner." });
+        const preview = recovery?.preview;
+        if (!recovery?.resume_allowed || !preview) {
+          setFeedback({ tone: "danger", message: "Recovery state is unavailable. Reload the current paper state before resuming." });
+          reconciliationResource.refresh();
+          return;
+        }
+        if (preview.required) {
+          if (!preview.recoverable || !preview.failure_id || !preview.preview_digest) {
+            setFeedback({ tone: "danger", message: "The current recovery preview is incomplete or not recoverable. Halt remains active." });
+            reconciliationResource.refresh();
+            return;
+          }
+          const current = recoveryRequest.current;
+          const requestId = current?.failureId === preview.failure_id && current.previewDigest === preview.preview_digest
+            ? current.requestId
+            : newRequestId();
+          recoveryRequest.current = {
+            failureId: preview.failure_id,
+            previewDigest: preview.preview_digest,
+            requestId,
+          };
+          await apiPost(`/api/paper/${encodeURIComponent(name)}/resume`, {
+            request_id: requestId,
+            failure_id: preview.failure_id,
+            preview_digest: preview.preview_digest,
+            decision: preview.decision,
+          });
+          recoveryRequest.current = null;
+          setFeedback({ tone: "neutral", message: "Reconciliation receipt recorded. Halt cleared. Failed tick was not retried; no runner was started." });
+        } else {
+          const key = `${name}:${data?.last_record_hash ?? ""}`;
+          const current = manualResumeRequest.current;
+          const request = current?.key === key ? current : { key, requestId: newRequestId() };
+          manualResumeRequest.current = request;
+          await apiPost(`/api/paper/${encodeURIComponent(name)}/resume`, { request_id: request.requestId });
+          manualResumeRequest.current = null;
+          setFeedback({ tone: "neutral", message: "Halt cleared. No paper operation ran and no runner was started." });
+        }
       }
       setConfirmAction(null);
       resource.refresh();
     } catch (cause) {
       fail(cause, "Action failed.");
+      if (confirmAction === "resume") {
+        resource.refresh();
+        reconciliationResource.refresh();
+      }
       // The reviewed confirmation is spent; close it so the recovery notice is reachable.
       setConfirmAction(null);
     } finally {
@@ -337,7 +396,12 @@ export function PaperDetailPage() {
     setBusy(true);
     setFeedback(null);
     try {
-      await apiPost(`/api/paper/${encodeURIComponent(name)}/halt`, { reason });
+      const key = `${name}:${reason}`;
+      const current = haltRequest.current;
+      const request = current?.key === key ? current : { key, requestId: newRequestId() };
+      haltRequest.current = request;
+      await apiPost(`/api/paper/${encodeURIComponent(name)}/halt`, { request_id: request.requestId, reason });
+      haltRequest.current = null;
       setHaltDialogOpen(false);
       setHaltReason("");
       setFeedback({ tone: "neutral", message: "Halt state recorded in the ledger. Runner process control is not available here." });
@@ -469,6 +533,8 @@ export function PaperDetailPage() {
         tone: saved ? "neutral" : "danger",
         message: !saved
           ? "Browser storage could not preserve the operation monitor. The request identity remains saved."
+          : paperPreviewKind === "tick" && paperPreview.outcome === "nothing-due"
+            ? "Reviewed no-work result accepted. Completion status will confirm that nothing was due; no session will run."
           : paperPreviewKind === "tick"
             ? "Reviewed one-session paper tick accepted. Progress is durable and will reload with this page."
             : "Reviewed finite runner start accepted. Process control remains limited to this server-owned child.",
@@ -569,6 +635,51 @@ export function PaperDetailPage() {
           ) : null}
           {data.halt_state === "unreadable" ? (
             <Alert tone="warning" className="mb-5">Halt state is unreadable. Paper controls and approval writes are disabled.</Alert>
+          ) : null}
+          {data.halt_state === "halted" && data.ledger.ok ? (
+            <Card className="mb-5" data-testid="paper-reconciliation">
+              <CardHeader><CardTitle>Paper recovery review</CardTitle></CardHeader>
+              <CardContent className="space-y-3">
+                {reconciliationResource.loading ? <LoadingState label="Checking local paper recovery state" /> : null}
+                {reconciliationResource.apiError ? (
+                  <ErrorNotice error={reconciliationResource.apiError} onAction={() => recover(reconciliationResource.apiError as ActionableError)} />
+                ) : null}
+                {recovery ? (
+                  <>
+                    {recovery.preview.required ? (
+                      <>
+                        <p className="font-medium">Ambiguous tick failure</p>
+                        <p className="text-xs leading-relaxed text-muted-foreground">
+                          Failed request <span className="mono">{recovery.preview.failed_request_id ?? "unavailable"}</span>
+                          {" · "}operation <span className="mono">{shortHash(recovery.preview.operation_id)}</span>
+                        </p>
+                        <div className="grid gap-2 text-xs sm:grid-cols-2">
+                          <p>Expected ledger head: <span className="mono">{shortHash(recovery.preview.expected_head)}</span></p>
+                          <p>Current ledger head: <span className="mono">{shortHash(recovery.preview.current_head)}</span></p>
+                          <p>Local paper book digest: <span className="mono">{shortHash(recovery.preview.broker_book_sha256)}</span></p>
+                          <p>Recorded fill digest: <span className="mono">{shortHash(recovery.preview.fill_identity_sha256)}</span></p>
+                          <p>Capture identity: <span className="mono">{shortHash(recovery.preview.capture_id)}</span></p>
+                          <p>Recovery preview: <span className="mono">{shortHash(recovery.preview.preview_digest)}</span></p>
+                        </div>
+                        {recovery.resume_allowed ? (
+                          <Alert tone="warning">
+                            The local paper book matches full ledger replay. Resume records a reconciliation receipt and clears Halt only. It never retries the failed tick or starts a runner.
+                          </Alert>
+                        ) : (
+                          <Alert tone="danger">
+                            Resume denied. Halt remains active. Current check: <span className="mono">{recovery.preview.reason}</span>.
+                          </Alert>
+                        )}
+                      </>
+                    ) : (
+                      <p className="text-xs leading-relaxed text-muted-foreground">
+                        Manual Halt only. No ambiguous tick failure requires reconciliation. Resume clears Halt without running a paper operation or starting a runner.
+                      </p>
+                    )}
+                  </>
+                ) : null}
+              </CardContent>
+            </Card>
           ) : null}
           {protectedName ? <Alert tone="warning" className="mb-5">This protected fund can be inspected but not modified through the web desk.</Alert> : null}
           {feedback?.error ? (
@@ -703,10 +814,10 @@ export function PaperDetailPage() {
                     <Button
                       variant="secondary"
                       onClick={() => setConfirmAction("resume")}
-                      disabled={!canWritePaper || data.halt_state !== "halted" || !data.ledger.ok}
-                      title={!data.ledger.ok ? "Resume requires a valid, replayable ledger." : undefined}
+                      disabled={!canResumePaper}
+                      title={!data.ledger.ok ? "Resume requires a valid, replayable ledger." : recovery?.preview.required && !recovery.resume_allowed ? "Current paper state is not reconcilable." : undefined}
                     >
-                      <CirclePlay className="h-3.5 w-3.5" /> Resume
+                      <CirclePlay className="h-3.5 w-3.5" /> {recovery?.preview.required ? "Review recovery" : "Resume"}
                     </Button>
                   </div>
                   <div className="border-t border-border pt-3">
@@ -882,9 +993,9 @@ export function PaperDetailPage() {
       <ConfirmDialog
         open={confirmAction !== null}
         onOpenChange={(open) => { if (!open) setConfirmAction(null); }}
-        title={confirmTitle(confirmAction)}
-        description={confirmDescription(confirmAction, data?.pending)}
-        confirmLabel={confirmAction === "approve" ? "Approve displayed decision" : confirmAction === "reject" ? "Reject displayed decision" : "Record resume"}
+        title={confirmTitle(confirmAction, recovery)}
+        description={confirmDescription(confirmAction, data?.pending, recovery)}
+        confirmLabel={confirmAction === "approve" ? "Approve displayed decision" : confirmAction === "reject" ? "Reject displayed decision" : recovery?.preview.required ? "Confirm recovery and resume" : "Record resume"}
         destructive={confirmAction === "reject"}
         busy={busy}
         onConfirm={() => void submitAction()}
@@ -912,7 +1023,9 @@ export function PaperDetailPage() {
               <p className="text-xs">
                 Reviewed due-set:{" "}
                 <span className="mono">
-                  {nothingDueLabel(paperPreview.due_set) ?? paperPreview.due_set.map(dateLabel).join(" · ")}
+                  {paperPreviewKind === "tick" && paperPreview.outcome === "nothing-due"
+                    ? "No session is due. Accept records a completed no-work result; no session will be created."
+                    : nothingDueLabel(paperPreview.due_set) ?? paperPreview.due_set.map(dateLabel).join(" · ")}
                 </span>
               </p>
               <p className="text-xs">
@@ -949,7 +1062,7 @@ export function PaperDetailPage() {
               {paperActionBusy
                 ? "Accepting…"
                 : paperPreviewKind === "tick"
-                  ? "Accept one-session tick"
+                  ? paperPreview?.outcome === "nothing-due" ? "Accept no-work result" : "Accept one-session tick"
                   : "Accept finite runner"}
             </Button>
           </DialogFooter>
@@ -984,8 +1097,9 @@ export function PaperDetailPage() {
   );
 }
 
-async function submitVerdict(name: string, verdict: "approve" | "reject", pending: PendingDecision): Promise<void> {
+async function submitVerdict(name: string, verdict: "approve" | "reject", pending: PendingDecision, requestId: string): Promise<void> {
   await apiPost(`/api/paper/${encodeURIComponent(name)}/approval`, {
+    request_id: requestId,
     verdict,
     decision_as_of: pending.decision_as_of,
     source_record_hash: pending.source_record_hash,
@@ -1031,19 +1145,27 @@ function newRequestId(): string {
   return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
-function confirmTitle(action: PendingAction | null): string {
+function confirmTitle(action: PendingAction | null, recovery?: PaperReconciliation | null): string {
   if (action === "approve") return "Approve pending decision";
   if (action === "reject") return "Reject pending decision";
+  if (recovery?.preview.required) return "Reconcile and resume paper fund";
   return "Resume paper fund";
 }
 
-function confirmDescription(action: PendingAction | null, pending: PendingDecision | null | undefined): string {
+function confirmDescription(
+  action: PendingAction | null,
+  pending: PendingDecision | null | undefined,
+  recovery?: PaperReconciliation | null,
+): string {
   if (action === "approve" || action === "reject") {
     return pending
       ? `This verdict is bound to ${pending.decision_as_of} and source ${shortHash(pending.source_record_hash)}. A changed decision will be rejected by the server.`
       : "No pending decision is currently displayed.";
   }
-  return "This only records the ledger resume state. It does not start or control a runner.";
+  if (recovery?.preview.required) {
+    return `Receipt binds failure ${shortHash(recovery.preview.failure_id)} to local book ${shortHash(recovery.preview.broker_book_sha256)} and preview ${shortHash(recovery.preview.preview_digest)}. Failed tick will not be retried. No runner will be started.`;
+  }
+  return "This clears Halt only. It does not run a paper operation or start a runner.";
 }
 
 function PendingDecisionCard({

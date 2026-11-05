@@ -296,6 +296,44 @@ export interface PaperSnapshot {
   scorecard_error: string | null;
 }
 
+export interface PaperReconciliationPreview {
+  schema_version: 1;
+  required: boolean;
+  recoverable: boolean;
+  reason:
+    | "no-ambiguous-tick-failure"
+    | "multiple-unreconciled-failures"
+    | "failure-identity-incomplete"
+    | "ledger-head-changed"
+    | "broker-not-local-paper"
+    | "broker-book-unavailable"
+    | "broker-book-invalid"
+    | "broker-book-changed"
+    | "broker-book-mismatch"
+    | "ready";
+  failure_id: string | null;
+  failed_request_id: string | null;
+  operation_id: string | null;
+  expected_head: string | null;
+  current_head: string | null;
+  broker_book_sha256: string | null;
+  fill_identity_sha256: string;
+  capture_id: string | null;
+  capture_digest: string | null;
+  book_matches_ledger: boolean;
+  head_matches_failure: boolean;
+  decision: "confirm-paper-book-matches-ledger";
+  residual_uncertainty: "external-broker-state-not-applicable-local-paper-only";
+  preview_digest: string | null;
+}
+
+export interface PaperReconciliation {
+  name: string;
+  halted: string | null;
+  resume_allowed: boolean;
+  preview: PaperReconciliationPreview;
+}
+
 export interface PaperSessionsCollection {
   items: SessionSummary[];
   errors: { id: string; error: string }[];
@@ -541,6 +579,7 @@ export interface PaperOperationPreview {
   subject_id: string;
   expected_head: string | null;
   due_set: string[];
+  outcome?: "ready" | "nothing-due";
   capture_id: string;
   capture_digest: string;
   expires_at: string;

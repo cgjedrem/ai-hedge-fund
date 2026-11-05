@@ -8,10 +8,9 @@ if (port !== "8876") {
   throw new Error("Run browser acceptance through the owned 8876 harness.");
 }
 const origin = `http://127.0.0.1:${port}`;
-const screenshotDir = resolve(
-  process.cwd(),
-  "../specs/005-web-engine-migration/screenshots",
-);
+const screenshotOutput = process.env.AIHF_PLAYWRIGHT_SCREENSHOT_DIR;
+if (!screenshotOutput) throw new Error("Run browser acceptance through the owned fixture.");
+const screenshotDir = resolve(screenshotOutput);
 const screenRoutes = [
   { path: "/", heading: "Research with a clear view of risk.", screenshot: "overview" },
   { path: "/mandates", heading: "Mandates", screenshot: "mandates" },
@@ -288,7 +287,7 @@ test("paper session history search follows verified cursors", async ({ page }) =
 
   await page.getByRole("button", { name: "Next" }).click();
   await expect(page.getByText("Page 2")).toBeVisible();
-  await expect(page.getByText("No verified sessions")).toBeVisible();
+  await expect(page.getByText("No matching verified sessions")).toBeVisible();
   const secondPage = new URL(sessionRequests.at(-1)!);
   expect(secondPage.searchParams.get("search")).toBe("2024");
   expect(secondPage.searchParams.get("cursor")).toBe("2024-01-01");
@@ -441,6 +440,7 @@ test("manual tick review accepts once and reload restores durable progress", asy
       due_set: [dueSession],
     });
     expect(body.request_id).toMatch(/^[a-f0-9]{32}$/);
+    operation.request_id = String(body.request_id);
     await route.fulfill({ status: 202, json: operation });
   });
   await page.route(`**/api/operations/${operationId}`, (route) =>
@@ -465,7 +465,7 @@ test("manual tick review accepts once and reload restores durable progress", asy
   });
   await expect(page.getByText("Manual tick · running")).toBeVisible();
   await expect(page.getByRole("progressbar", { name: "Paper operation progress" })).toHaveAttribute("aria-valuenow", "25");
-  await expect(page.getByText(operationId)).toBeVisible();
+  await expect(page.getByText(operationId, { exact: true })).toBeVisible();
   expect(acceptCount).toBe(1);
 
   await page.reload();
@@ -475,6 +475,184 @@ test("manual tick review accepts once and reload restores durable progress", asy
   expect(previewCount).toBe(1);
   const unchangedPaper = await (await page.request.get("/api/paper/demo-quality")).json();
   expect(unchangedPaper.last_record_hash).toBe(head);
+});
+
+test("browser verdict binds request identity to the displayed decision", async ({ page }) => {
+  const head = await installSyntheticPaperCapabilities(page);
+  const paperResponse = await page.request.get("/api/paper/demo-quality");
+  const paper = await paperResponse.json();
+  paper.spec.approval_required = true;
+  paper.pending = {
+    decision_as_of: "2024-06-05",
+    source_record_hash: head,
+    universe: ["AAPL"],
+    target_weights: { AAPL: 1 },
+    final_weights: { AAPL: 1 },
+    strategies: ["synthetic"],
+  };
+  const verdicts: Record<string, unknown>[] = [];
+  await page.route("**/api/paper/demo-quality", (route) => route.fulfill({ json: paper }));
+  await page.route("**/api/paper/demo-quality/approval", async (route) => {
+    expect(route.request().headers()["x-csrf-token"]).toBe("browser-paper-control-token");
+    verdicts.push(route.request().postDataJSON() as Record<string, unknown>);
+    await route.fulfill({ json: { saved: true } });
+  });
+
+  await page.goto("/paper/demo-quality");
+  await page.getByRole("button", { name: "Approve" }).click();
+  const dialog = page.getByRole("dialog", { name: "Approve pending decision" });
+  await expect(dialog).toBeVisible();
+  await dialog.getByRole("button", { name: "Approve displayed decision" }).click();
+  await expect(page.getByText("Verdict approve was saved to the local approval mailbox. It does not execute immediately.")).toBeVisible();
+
+  expect(verdicts).toHaveLength(1);
+  expect(verdicts[0]).toMatchObject({
+    verdict: "approve",
+    decision_as_of: "2024-06-05",
+    source_record_hash: head,
+  });
+  expect(verdicts[0].request_id).toMatch(/^[a-f0-9]{32}$/);
+  const unchangedPaper = await (await page.request.get("/api/paper/demo-quality")).json();
+  expect(unchangedPaper.last_record_hash).toBe(head);
+  expect(unchangedPaper.approval).toBeNull();
+});
+
+test("browser Halt and manual Resume send stable control request bodies", async ({ page }) => {
+  const head = await installSyntheticPaperCapabilities(page);
+  const paper = await (await page.request.get("/api/paper/demo-quality")).json();
+  let halted = false;
+  const controls: { action: string; body: Record<string, unknown> }[] = [];
+  const noFailurePreview = {
+    schema_version: 1,
+    required: false,
+    recoverable: true,
+    reason: "no-ambiguous-tick-failure",
+    failure_id: null,
+    failed_request_id: null,
+    operation_id: null,
+    expected_head: null,
+    current_head: null,
+    broker_book_sha256: null,
+    fill_identity_sha256: null,
+    capture_id: null,
+    capture_digest: null,
+    book_matches_ledger: false,
+    head_matches_failure: false,
+    decision: "confirm-paper-book-matches-ledger",
+    residual_uncertainty: "external-broker-state-not-applicable-local-paper-only",
+    preview_digest: null,
+  };
+  await page.route("**/api/paper/demo-quality", (route) => route.fulfill({
+    json: {
+      ...paper,
+      halted: halted ? "synthetic browser pause" : null,
+      halt_state: halted ? "halted" : "clear",
+    },
+  }));
+  await page.route("**/api/paper/demo-quality/reconciliation", (route) => route.fulfill({
+    json: {
+      name: "demo-quality",
+      halted: "synthetic browser pause",
+      resume_allowed: true,
+      preview: noFailurePreview,
+    },
+  }));
+  await page.route("**/api/paper/demo-quality/halt", async (route) => {
+    expect(route.request().headers()["x-csrf-token"]).toBe("browser-paper-control-token");
+    controls.push({ action: "halt", body: route.request().postDataJSON() as Record<string, unknown> });
+    halted = true;
+    await route.fulfill({ json: { name: "demo-quality", halted: true } });
+  });
+  await page.route("**/api/paper/demo-quality/resume", async (route) => {
+    expect(route.request().headers()["x-csrf-token"]).toBe("browser-paper-control-token");
+    controls.push({ action: "resume", body: route.request().postDataJSON() as Record<string, unknown> });
+    halted = false;
+    await route.fulfill({ json: { name: "demo-quality", halted: false, reconciliation_id: null } });
+  });
+
+  await page.goto("/paper/demo-quality");
+  await page.getByRole("button", { name: "Halt" }).click();
+  const haltDialog = page.getByRole("dialog", { name: "Halt demo-quality" });
+  await expect(haltDialog).toBeVisible();
+  await haltDialog.getByLabel("Reason").fill("synthetic browser pause");
+  await haltDialog.getByRole("button", { name: "Record halt" }).click();
+  await expect(page.getByText("Halt state recorded in the ledger. Runner process control is not available here.")).toBeVisible();
+  const resumeButton = page.getByRole("button", { name: "Resume" });
+  await expect(resumeButton).toBeEnabled();
+  await resumeButton.click();
+  const resumeDialog = page.getByRole("dialog", { name: "Resume paper fund" });
+  await expect(resumeDialog).toBeVisible();
+  await resumeDialog.getByRole("button", { name: "Record resume" }).click();
+  await expect(page.getByText("Halt cleared. No paper operation ran and no runner was started.")).toBeVisible();
+
+  expect(controls).toHaveLength(2);
+  expect(controls[0].action).toBe("halt");
+  expect(controls[0].body).toMatchObject({ reason: "synthetic browser pause" });
+  expect(controls[0].body.request_id).toMatch(/^[a-f0-9]{32}$/);
+  expect(controls[1]).toMatchObject({
+    action: "resume",
+    body: { request_id: expect.stringMatching(/^[a-f0-9]{32}$/) },
+  });
+  const unchangedPaper = await (await page.request.get("/api/paper/demo-quality")).json();
+  expect(unchangedPaper.last_record_hash).toBe(head);
+  expect(unchangedPaper.halt_state).toBe("clear");
+});
+
+test("browser recovery confirms hash-bound preview without retrying a tick or starting a runner", async ({ page }) => {
+  const head = await installSyntheticPaperCapabilities(page);
+  const paper = await (await page.request.get("/api/paper/demo-quality")).json();
+  paper.halted = "synthetic tick failure";
+  paper.halt_state = "halted";
+  const preview = {
+    schema_version: 1,
+    required: true,
+    recoverable: true,
+    reason: "ready",
+    failure_id: "a".repeat(64),
+    failed_request_id: "tick-synthetic",
+    operation_id: "b".repeat(32),
+    expected_head: head,
+    current_head: head,
+    broker_book_sha256: "c".repeat(64),
+    fill_identity_sha256: "d".repeat(64),
+    capture_id: "e".repeat(32),
+    capture_digest: "f".repeat(64),
+    book_matches_ledger: true,
+    head_matches_failure: true,
+    decision: "confirm-paper-book-matches-ledger",
+    residual_uncertainty: "external-broker-state-not-applicable-local-paper-only",
+    preview_digest: "1".repeat(64),
+  };
+  const submissions: Record<string, unknown>[] = [];
+  await page.route("**/api/paper/demo-quality", (route) => route.fulfill({ json: paper }));
+  await page.route("**/api/paper/demo-quality/reconciliation", (route) => route.fulfill({
+    json: { name: "demo-quality", halted: "synthetic tick failure", resume_allowed: true, preview },
+  }));
+  await page.route("**/api/paper/demo-quality/resume", async (route) => {
+    submissions.push(route.request().postDataJSON() as Record<string, unknown>);
+    await route.fulfill({
+      json: { name: "demo-quality", halted: false, reconciliation_id: "2".repeat(64) },
+    });
+  });
+
+  await page.goto("/paper/demo-quality");
+  await expect(page.getByText("Ambiguous tick failure")).toBeVisible();
+  await page.getByRole("button", { name: "Review recovery" }).click();
+  const dialog = page.getByRole("dialog", { name: "Reconcile and resume paper fund" });
+  await expect(dialog).toBeVisible();
+  await dialog.getByRole("button", { name: "Confirm recovery and resume" }).click();
+  await expect(page.getByText("Reconciliation receipt recorded. Halt cleared. Failed tick was not retried; no runner was started.")).toBeVisible();
+
+  expect(submissions).toHaveLength(1);
+  expect(submissions[0]).toMatchObject({
+    failure_id: preview.failure_id,
+    preview_digest: preview.preview_digest,
+    decision: preview.decision,
+  });
+  expect(submissions[0].request_id).toMatch(/^[a-f0-9]{32}$/);
+  const unchangedPaper = await (await page.request.get("/api/paper/demo-quality")).json();
+  expect(unchangedPaper.last_record_hash).toBe(head);
+  expect(unchangedPaper.halt_state).toBe("clear");
 });
 
 test("manual tick rejects stale-head acceptance without creating an operation", async ({ page }) => {
@@ -631,6 +809,7 @@ test("runner browser controls accept finite bounds and request cooperative stop"
         max_runtime_minutes: 60,
       });
       expect(body.request_id).toMatch(/^[a-f0-9]{32}$/);
+      operation.request_id = String(body.request_id);
       currentRunner = {
         status: "running",
         available: true,
@@ -796,7 +975,7 @@ test("backtest requires a server preview, durable acceptance, and boundary cance
   };
   const fakeOperation = () => ({
     operation_id: operationId,
-    request_id: "browser-backtest",
+    request_id: String(acceptedRequest?.request_id ?? "browser-backtest"),
     action: "backtest",
     subject_id: "demo-quality",
     capture_id: "c".repeat(32),
@@ -1014,7 +1193,7 @@ test("restores a running durable operation after navigation and reload", async (
   });
 
   await page.goto("/backtests");
-  await expect(page.getByText(operationId)).toBeVisible();
+  await expect(page.getByText(operationId, { exact: true })).toBeVisible();
   await expect(page.getByText("40%", { exact: true }).first()).toBeVisible();
   await page.getByRole("button", { name: "Request cancellation" }).click();
   await expect(page.getByRole("button", { name: "Cancellation requested…" })).toBeVisible();
@@ -1023,9 +1202,9 @@ test("restores a running durable operation after navigation and reload", async (
   await primaryNavigation.getByRole("link", { name: "Research" }).click();
   await expect(page.getByRole("heading", { name: "Research reports" })).toBeVisible();
   await primaryNavigation.getByRole("link", { name: "Backtests" }).click();
-  await expect(page.getByText(operationId)).toBeVisible();
+  await expect(page.getByText(operationId, { exact: true })).toBeVisible();
 
   await page.reload();
-  await expect(page.getByText(operationId)).toBeVisible();
+  await expect(page.getByText(operationId, { exact: true })).toBeVisible();
   await expect(page.getByText("40%", { exact: true }).first()).toBeVisible();
 });

@@ -20,7 +20,10 @@ Usage::
         Deploy a paper fund: snapshot the mandate, fix the universe, open an
         empty ledger and a book with the mandate's capital.
 
-    aihf --root /path/to/hedge-fund-data --enable-network paper tick alpha
+    aihf --root /path/to/hedge-fund-data paper status alpha --head
+        Print the exact head required by a reviewed headless mutation.
+
+    aihf --root /path/to/hedge-fund-data --enable-network paper tick alpha --expected-head none --request-id RUN-001
         Advance the fund by exactly one session and append it to the ledger:
         the oldest unrecorded completed close for a daily fund, the current
         bar at prints taken now for a minute fund. Network authority is
@@ -31,8 +34,9 @@ Usage::
 
     aihf --root /path/to/hedge-fund-data paper status alpha
     aihf --root /path/to/hedge-fund-data paper list
-    aihf --root /path/to/hedge-fund-data paper halt alpha --reason "..."
+    aihf --root /path/to/hedge-fund-data paper halt alpha --reason "..." --request-id HALT-001
     aihf --root /path/to/hedge-fund-data paper resume alpha
+    aihf --root /path/to/hedge-fund-data paper approve alpha --expected-head SHA256 --request-id APPROVE-001
 
     aihf --root /path/to/hedge-fund-data paper scorecard alpha
         Grade every analyst (hit rate, slugging, IC) and every strategy
@@ -252,6 +256,14 @@ def _load_runtime() -> None:
     _CONFIGURED_PAPER_DIR = paths.PAPER_DIR
 
 
+def _expected_head_argument(value: str) -> str | None:
+    if value == "none":
+        return None
+    if len(value) == 64 and all(character in "0123456789abcdef" for character in value):
+        return value
+    raise argparse.ArgumentTypeError("expected head must be a lowercase SHA-256 hash or 'none'")
+
+
 # ---------------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------------
@@ -334,6 +346,8 @@ def _parser() -> argparse.ArgumentParser:
     advance.add_argument("name")
     advance.add_argument("--session", help="the session to record (YYYY-MM-DD, or a bar's YYYY-MM-DDTHH:MM:SS); " "must be the next unrecorded one")
     advance.add_argument("--again", action="store_true", help="run the latest recorded session again and replace its record")
+    advance.add_argument("--expected-head", type=_expected_head_argument, required=True, help="reviewed ledger head from `paper status --head`; use 'none' for an empty ledger")
+    advance.add_argument("--request-id", required=True, help="stable request identity reused only for an exact retry")
     advance.add_argument("--deadline-minutes", type=int, default=60, help="one-shot authorization lifetime, 1–1440 minutes")
     advance.add_argument("--authorize-paid-provider", metavar="PROVIDER")
     advance.add_argument(
@@ -353,6 +367,7 @@ def _parser() -> argparse.ArgumentParser:
 
     status = actions.add_parser("status", help="NAV, last session, pending decision, halt state")
     status.add_argument("name")
+    status.add_argument("--head", action="store_true", help="print current ledger head, or 'none' for an empty ledger")
 
     actions.add_parser("list", help="every deployed paper fund")
 
@@ -362,6 +377,7 @@ def _parser() -> argparse.ArgumentParser:
     halt = actions.add_parser("halt", help="set the kill switch: ticks refuse to trade")
     halt.add_argument("name")
     halt.add_argument("--reason", required=True)
+    halt.add_argument("--request-id", required=True, help="stable request identity reused only for an exact retry")
 
     resume = actions.add_parser("resume", help="resume only after verified reconciliation")
     resume.add_argument("name")
@@ -369,6 +385,9 @@ def _parser() -> argparse.ArgumentParser:
     approve = actions.add_parser("approve", help="approve a pending decision")
     approve.add_argument("name")
     approve.add_argument("--now", action="store_true", help="run a session now when one is due")
+    approve.add_argument("--expected-head", type=_expected_head_argument, required=True, help="reviewed source record hash for the pending decision")
+    approve.add_argument("--request-id", required=True, help="stable verdict request identity reused only for an exact retry")
+    approve.add_argument("--tick-request-id", help="separate stable request identity required with --now")
     approve.add_argument("--deadline-minutes", type=int, default=60, help="one-shot authorization lifetime, 1–1440 minutes")
     approve.add_argument("--authorize-paid-provider", metavar="PROVIDER")
     approve.add_argument(
@@ -382,6 +401,8 @@ def _parser() -> argparse.ArgumentParser:
 
     reject = actions.add_parser("reject", help="reject a pending decision")
     reject.add_argument("name")
+    reject.add_argument("--expected-head", type=_expected_head_argument, required=True, help="reviewed source record hash for the pending decision")
+    reject.add_argument("--request-id", required=True, help="stable verdict request identity reused only for an exact retry")
 
     handover = commands.add_parser(
         "handover",
@@ -1199,20 +1220,42 @@ def _run_cli_tick(
     root: RootContext,
     parser: argparse.ArgumentParser,
     args,
+    request_id: str,
+    expected_head: str | None,
     authorization=None,
 ):
     _require_cli_sim_account_ownership(deployed.broker, parser)
 
     def execute():
-        from hedge_fund.paper.ledger import PaperReconciliationRequired
+        from hedge_fund.paper.ledger import PaperReconciliationRequired, PaperTickNoWork
         from hedge_fund.runtime.admission import paper_control_transition
 
         _verify_enrolled_head(participant, name)
         ledger = Ledger(directory)
+        try:
+            if again:
+                if expected_head is None:
+                    raise LedgerError("paper ledger head changed before the redo request")
+                prior = ledger.redo_request_result(request_id, expected_head)
+            else:
+                prior = ledger.tick_request_result(
+                    request_id,
+                    expected_head=expected_head,
+                    session=session,
+                )
+        except PaperTickNoWork as exc:
+            raise NothingDue(str(exc)) from exc
+        except PaperReconciliationRequired:
+            ledger.halt("approval journal requires reconciliation")
+            raise
+        if prior is not None:
+            return prior
         state = ledger.replay(
             deployed.spec.capital,
             full=True,
         )
+        if state.prev_hash != expected_head:
+            raise LedgerError(f"paper ledger head changed before the tick request " f"(expected {expected_head or 'none'}, found {state.prev_hash or 'none'})")
         if state.halted is not None:
             raise FundHalted(f"{name} is halted: {state.halted}")
         try:
@@ -1293,12 +1336,21 @@ def _run_cli_tick(
                     on_rewind = provider_authority.get("advance_redo_fence")
                     if not callable(on_rewind):
                         raise AuthorizationDenied("paper redo transition was not captured")
-                    return redo(directory, data, build_fund=build_fund, on_rewind=on_rewind)
+                    return redo(
+                        directory,
+                        data,
+                        build_fund=build_fund,
+                        on_rewind=on_rewind,
+                        request_id=request_id,
+                        expected_head=expected_head,
+                    )
                 return tick(
                     directory,
                     data,
                     session=session,
+                    expected_head=expected_head,
                     build_fund=build_fund,
+                    request_id=request_id,
                 )
 
     if participant is None:
@@ -1448,7 +1500,7 @@ def _paper(
         approval_note = "  ·  approval required" if spec.approval_required else ""
         console.print(f"[bold]{args.name}[/] deployed at {directory}  ·  mandate {spec.name}  ·  " f"{', '.join(universe)}  ·  ${spec.capital:,.0f}  ·  broker {spec.broker}  ·  {cadence}{approval_note}")
         root_argument = "--root <selected-root>"
-        console.print(f"[dim]next: `aihf {root_argument} --enable-network paper tick {args.name}` to authorize one bounded session, `aihf {root_argument} paper status {args.name}` any time. Headless scheduled runners are disabled.[/]")
+        console.print(f"[dim]next: `aihf {root_argument} paper status {args.name} --head` for the reviewed head, " f"then `aihf {root_argument} --enable-network paper tick {args.name} --expected-head <head|none> " f"--request-id <unique-id>` for one bounded session. Headless scheduled runners are disabled.[/]")
         return
 
     if args.action == "list":
@@ -1464,6 +1516,8 @@ def _paper(
     if args.action == "tick":
         if not args.enable_network:
             parser.error("paper tick requires explicit --enable-network")
+        if args.again and args.session is not None:
+            parser.error("paper tick --session cannot be combined with --again")
         deployed = load_deployed(directory)
         _require_cli_sim_account_ownership(deployed.broker, parser)
         with _paper_writer_admission() as participant:
@@ -1478,12 +1532,23 @@ def _paper(
                 root=root,
                 parser=parser,
                 args=args,
+                request_id=args.request_id,
+                expected_head=args.expected_head,
             )
         print(record.model_dump_json(indent=2))
         console.print(_tick_summary(deployed.name, record))
         return
 
     if args.action == "status":
+        if args.head:
+            deployed = load_deployed(directory)
+            ledger = Ledger(directory)
+            state = ledger.replay(deployed.spec.capital, full=True)
+            latest = ledger.latest()
+            if state.prev_hash != (latest.hash if latest is not None else None):
+                raise LedgerError("paper ledger head changed during status")
+            print(latest.hash if latest is not None else "none")
+            return
         line, deployed, latest, approval, approval_error = _status_view(directory)
         print(line)
         if deployed is not None and latest is not None and latest.decision is not None:
@@ -1520,16 +1585,53 @@ def _paper(
     if args.action in {"approve", "reject"}:
         if args.action == "approve" and args.now and not args.enable_network:
             parser.error("approve --now requires explicit --enable-network before the ledger verdict")
+        if args.action == "approve" and args.now and not args.tick_request_id:
+            parser.error("approve --now requires a separate --tick-request-id")
         deployed = load_deployed(directory)
         if args.action == "approve" and args.now:
             _require_cli_sim_account_ownership(deployed.broker, parser)
         ledger = Ledger(directory)
+
+        def run_approved_tick(participant, authorization):
+            try:
+                record = _run_cli_tick(
+                    directory,
+                    args.name,
+                    deployed,
+                    console,
+                    session=None,
+                    again=False,
+                    participant=participant,
+                    root=root,
+                    parser=parser,
+                    args=args,
+                    request_id=args.tick_request_id,
+                    expected_head=args.expected_head,
+                    authorization=authorization,
+                )
+            except NothingDue:
+                console.print(f"{args.name}: will execute at the next close")
+                return
+            print(record.model_dump_json(indent=2))
+            console.print(_tick_summary(deployed.name, record))
+
         with _paper_writer_admission() as participant:
             provider_authority = None
             _verify_enrolled_head(participant, args.name)
+            prior = ledger.approval_command_result(args.request_id, args.action, "cli", args.expected_head)
+            if prior is not None:
+                if args.action == "approve":
+                    console.print(f"[green]{args.name}[/] approved decision from {prior['decision_as_of']}")
+                else:
+                    console.print(f"[yellow]{args.name}[/] rejected decision from {prior['decision_as_of']}")
+                if args.action == "approve" and args.now:
+                    run_approved_tick(participant, provider_authority)
+                return
             state = ledger.replay(deployed.spec.capital)
             if state.halted is not None:
                 raise FundHalted(f"{args.name} is halted: {state.halted}")
+            if state.prev_hash != args.expected_head:
+                raise LedgerError(f"paper ledger head changed before the verdict request " f"(expected {args.expected_head or 'none'}, found {state.prev_hash or 'none'})")
             if not deployed.spec.approval_required:
                 parser.error(f"approval gate is not enabled for '{args.name}'")
             if state.pending is None:
@@ -1565,7 +1667,13 @@ def _paper(
                     participant=participant,
                 )
             if participant is None:
-                ledger.set_approval(args.action, state.pending.as_of, state.prev_hash, "cli")
+                ledger.set_approval(
+                    args.action,
+                    state.pending.as_of,
+                    state.prev_hash,
+                    "cli",
+                    request_id=args.request_id,
+                )
             else:
                 from hedge_fund.runtime.admission import (
                     AdmissionError,
@@ -1575,7 +1683,14 @@ def _paper(
 
                 try:
                     with paper_approval_transition(participant[1], args.name) as proof:
-                        ledger.set_approval(args.action, state.pending.as_of, state.prev_hash, "cli", admission=proof)
+                        ledger.set_approval(
+                            args.action,
+                            state.pending.as_of,
+                            state.prev_hash,
+                            "cli",
+                            request_id=args.request_id,
+                            admission=proof,
+                        )
                 except (AdmissionError, HandoverError) as exc:
                     raise PaperWriterDenied("Paper verdict admission is unavailable.") from exc
             if args.action == "approve":
@@ -1583,25 +1698,7 @@ def _paper(
             else:
                 console.print(f"[yellow]{args.name}[/] rejected decision from {state.pending.as_of}")
             if args.action == "approve" and args.now:
-                try:
-                    record = _run_cli_tick(
-                        directory,
-                        args.name,
-                        deployed,
-                        console,
-                        session=None,
-                        again=False,
-                        participant=participant,
-                        root=root,
-                        parser=parser,
-                        args=args,
-                        authorization=provider_authority,
-                    )
-                except NothingDue:
-                    console.print(f"{args.name}: will execute at the next close")
-                    return
-                print(record.model_dump_json(indent=2))
-                console.print(_tick_summary(deployed.name, record))
+                run_approved_tick(participant, provider_authority)
         return
 
     ledger = Ledger(directory)
@@ -1622,7 +1719,7 @@ def _paper(
             with _paper_lane(participant, args.name, "halt_lane"):
                 if directory_identity() != expected_identity:
                     parser.error(f"paper fund {args.name!r} changed before halt admission")
-                ledger.halt(args.reason)
+                ledger.halt(args.reason, request_id=args.request_id)
                 console.print(f"[red]{args.name} halted:[/] {args.reason}")
         elif args.action == "resume":
             with _paper_lane(participant, args.name, "control_lane"):

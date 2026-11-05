@@ -39,12 +39,7 @@ const rootName = `spec005-test-e2e-${process.pid}-${randomUUID().slice(0, 8)}`;
 const testRoot = resolve(outputRoot, rootName);
 const marker = join(testRoot, ".test-owned");
 const demoRoot = join(testRoot, "demo-data");
-const screenshotDir = resolve(
-  repositoryRoot,
-  "specs",
-  "005-web-engine-migration",
-  "screenshots",
-);
+const screenshotDir = join(testRoot, "screenshots");
 
 const credentialVariables = [
   "ANTHROPIC_API_KEY",

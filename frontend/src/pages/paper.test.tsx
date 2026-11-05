@@ -5,7 +5,15 @@ import { afterEach, expect, it, vi } from "vitest";
 
 import { DeskProvider } from "@/lib/hooks";
 import { PaperDetailPage, SessionReportPage } from "@/pages/paper";
-import type { Capabilities, Operation, PaperOperationPreview, PaperSnapshot, RunnerState, SessionReport } from "@/lib/types";
+import type {
+  Capabilities,
+  Operation,
+  PaperOperationPreview,
+  PaperReconciliationPreview,
+  PaperSnapshot,
+  RunnerState,
+  SessionReport,
+} from "@/lib/types";
 
 const report = {
   session: "2024-06-04",
@@ -182,7 +190,7 @@ const capabilities: Capabilities = {
 
 const stoppedRunner: RunnerState = { status: "stopped", available: false, reason: null };
 
-function paperSnapshot(runner: RunnerState): PaperSnapshot {
+function paperSnapshot(runner: RunnerState, halted = false): PaperSnapshot {
   return {
     name: FUND,
     spec: { name: FUND, approval_required: false },
@@ -200,8 +208,8 @@ function paperSnapshot(runner: RunnerState): PaperSnapshot {
     pending: null,
     approval: null,
     next_run: null,
-    halted: null,
-    halt_state: "clear",
+    halted: halted ? "synthetic tick failure" : null,
+    halt_state: halted ? "halted" : "clear",
     ledger: { ok: true, error: null },
     runner,
     live_value: {
@@ -230,10 +238,15 @@ function paperPreview(kind: "tick" | "runner", dueSet: string[]): PaperOperation
     subject_id: FUND,
     expected_head: HEAD,
     due_set: dueSet,
+    outcome: kind === "tick" && dueSet.length === 0 ? "nothing-due" : "ready",
     capture_id: "3".repeat(32),
     capture_digest: "4".repeat(64),
     expires_at: "2099-01-01T00:00:00Z",
-    payload: kind === "runner" ? { max_sessions: 1, max_runtime_minutes: 60 } : { kind: "manual-tick", session: dueSet[0] },
+    payload: kind === "runner"
+      ? { max_sessions: 1, max_runtime_minutes: 60 }
+      : dueSet.length === 0
+        ? { kind: "manual-no-work" }
+        : { kind: "manual-tick", session: dueSet[0] },
     capture: {},
     estimate: {
       maximum_model_calls_per_session: 3,
@@ -243,6 +256,32 @@ function paperPreview(kind: "tick" | "runner", dueSet: string[]): PaperOperation
       market_data_provider: "synthetic-free",
     },
     warnings: ["Synthetic readiness warning."],
+  };
+}
+
+function paperReconciliationPreview(
+  overrides: Partial<PaperReconciliationPreview> = {},
+): PaperReconciliationPreview {
+  return {
+    schema_version: 1,
+    required: true,
+    recoverable: true,
+    reason: "ready",
+    failure_id: "a".repeat(64),
+    failed_request_id: "tick-synthetic",
+    operation_id: "b".repeat(32),
+    expected_head: HEAD,
+    current_head: HEAD,
+    broker_book_sha256: "c".repeat(64),
+    fill_identity_sha256: "d".repeat(64),
+    capture_id: "e".repeat(32),
+    capture_digest: "f".repeat(64),
+    book_matches_ledger: true,
+    head_matches_failure: true,
+    decision: "confirm-paper-book-matches-ledger",
+    residual_uncertainty: "external-broker-state-not-applicable-local-paper-only",
+    preview_digest: "1".repeat(64),
+    ...overrides,
   };
 }
 
@@ -341,6 +380,76 @@ async function enabledButton(name: string) {
   return button;
 }
 
+it("reuses the reviewed verdict request ID after a lost response", async () => {
+  const user = userEvent.setup();
+  const pending = {
+    decision_as_of: "2024-06-04",
+    source_record_hash: HEAD,
+    universe: ["AAPL"],
+    target_weights: { AAPL: 1 },
+    final_weights: { AAPL: 1 },
+    strategies: ["synthetic"],
+  };
+  let attempts = 0;
+  const calls = renderDesk(stoppedRunner, {
+    [`GET /api/paper/${FUND}`]: () => json({
+      ...paperSnapshot(stoppedRunner),
+      spec: { name: FUND, approval_required: true },
+      pending,
+    }),
+    [`POST /api/paper/${FUND}/approval`]: () => {
+      attempts += 1;
+      return attempts === 1 ? Promise.reject(new TypeError("synthetic response loss")) : json({ saved: true });
+    },
+  });
+
+  await user.click(await enabledButton("Approve"));
+  await user.click(screen.getByRole("button", { name: "Approve displayed decision" }));
+  await waitFor(() => expect(mutations(calls)).toHaveLength(1));
+  await user.click(await enabledButton("Approve"));
+  await user.click(screen.getByRole("button", { name: "Approve displayed decision" }));
+  await waitFor(() => expect(mutations(calls)).toHaveLength(2));
+
+  const submissions = mutations(calls);
+  const requestId = submissions[0].body?.request_id;
+  expect(requestId).toEqual(expect.stringMatching(/^[a-f0-9]{32}$/));
+  expect(submissions[1].body).toMatchObject({
+    request_id: requestId,
+    verdict: "approve",
+    decision_as_of: pending.decision_as_of,
+    source_record_hash: pending.source_record_hash,
+  });
+});
+
+it("reuses a Halt request ID after a lost response", async () => {
+  const user = userEvent.setup();
+  let attempts = 0;
+  const calls = renderDesk(stoppedRunner, {
+    [`POST /api/paper/${FUND}/halt`]: () => {
+      attempts += 1;
+      return attempts === 1 ? Promise.reject(new TypeError("synthetic Halt response loss")) : json({ name: FUND, halted: true });
+    },
+  });
+
+  await user.click(await enabledButton("Halt"));
+  let dialog = await screen.findByRole("dialog", { name: `Halt ${FUND}` });
+  await user.type(within(dialog).getByLabelText("Reason"), "operator pause");
+  await user.click(within(dialog).getByRole("button", { name: "Record halt" }));
+  await waitFor(() => expect(mutations(calls)).toHaveLength(1));
+  await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  const requestId = mutations(calls)[0].body?.request_id;
+  expect(requestId).toMatch(/^[a-f0-9]{32}$/);
+
+  await user.click(await enabledButton("Halt"));
+  dialog = await screen.findByRole("dialog", { name: `Halt ${FUND}` });
+  expect(within(dialog).getByLabelText("Reason")).toHaveValue("operator pause");
+  await user.click(within(dialog).getByRole("button", { name: "Record halt" }));
+  await waitFor(() => expect(mutations(calls)).toHaveLength(2));
+
+  expect(mutations(calls)[1].body).toEqual({ request_id: requestId, reason: "operator pause" });
+  expect(await screen.findByText("Halt state recorded in the ledger. Runner process control is not available here.")).toBeInTheDocument();
+});
+
 it("reviews readiness, capture and the exact due-set before one accepted manual tick", async () => {
   const user = userEvent.setup();
   let accept!: (value: Response) => void;
@@ -400,22 +509,234 @@ it("labels an empty reviewed runner due-set as nothing due and sends the reviewe
   expect(mutations(calls)).toHaveLength(1);
 });
 
-it("reports a nothing-due manual preview denial without opening an admission", async () => {
+it("reviews and records an idempotent nothing-due manual operation", async () => {
   const user = userEvent.setup();
+  let requestId = "";
   const calls = renderDesk(stoppedRunner, {
-    [`POST /api/paper/${FUND}/tick/preview`]: () => json({
-      detail: "No paper session is currently due.",
-      code: "request-conflict",
-      message: "No paper session is currently due.",
-      refresh_required: false,
-      retry_policy: "reload",
-    }, 409),
+    [`POST /api/paper/${FUND}/tick/preview`]: () => json(paperPreview("tick", [])),
+    [`POST /api/paper/${FUND}/tick`]: (call) => {
+      requestId = String(call.body?.request_id ?? "");
+      return json(paperOperation(requestId), 202);
+    },
+    [`GET /api/operations/${OPERATION_ID}`]: () => json(paperOperation(requestId, {
+      status: "completed",
+      progress: 100,
+      result: { outcome: "nothing-due" },
+    })),
   });
 
   await user.click(await enabledButton("Manual one-session tick"));
-  expect(await screen.findByText(/No paper session is currently due/)).toBeInTheDocument();
-  expect(screen.queryByRole("dialog")).toBeNull();
+  const dialog = await screen.findByRole("dialog", { name: "Confirm one-session paper tick" });
+  expect(within(dialog).getByText(/No session is due\. Accept records a completed no-work result; no session will be created\./)).toBeInTheDocument();
   expect(mutations(calls).map((call) => call.path)).toEqual([`/api/paper/${FUND}/tick/preview`]);
+
+  await user.click(within(dialog).getByRole("button", { name: "Accept no-work result" }));
+  await waitFor(() => expect(mutations(calls)).toHaveLength(2));
+  expect(mutations(calls)[1].body).toMatchObject({
+    expected_head: HEAD,
+    due_set: [],
+  });
+  expect(await screen.findByText("Manual operation completed with nothing due. No session was recorded.")).toBeInTheDocument();
+  expect(requestId).toMatch(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/);
+  expect(window.localStorage.getItem(`aihf.paper.${FUND}.operation`)).toBe(OPERATION_ID);
+  expect(JSON.stringify({ ...window.localStorage })).not.toContain("synthetic-confirmation");
+});
+
+it("reviews hash-bound local reconciliation before resuming without retrying the failed tick", async () => {
+  const user = userEvent.setup();
+  const preview = paperReconciliationPreview();
+  const calls = renderDesk(stoppedRunner, {
+    [`GET /api/paper/${FUND}`]: () => json(paperSnapshot(stoppedRunner, true)),
+    [`GET /api/paper/${FUND}/reconciliation`]: () => json({
+      name: FUND,
+      halted: "synthetic tick failure",
+      resume_allowed: true,
+      preview,
+    }),
+    [`POST /api/paper/${FUND}/resume`]: () => json({
+      name: FUND,
+      halted: false,
+      reconciliation_id: "2".repeat(64),
+    }),
+  });
+
+  expect(await screen.findByText("Ambiguous tick failure")).toBeInTheDocument();
+  expect(screen.getByText(/Local paper book digest:/)).toBeInTheDocument();
+  expect(screen.getByText(/^c{10}…c{6}$/)).toBeInTheDocument();
+  await user.click(await enabledButton("Review recovery"));
+  const dialog = await screen.findByRole("dialog", { name: "Reconcile and resume paper fund" });
+  expect(dialog).toHaveTextContent("Failed tick will not be retried");
+  expect(dialog).toHaveTextContent("No runner will be started");
+
+  await user.click(within(dialog).getByRole("button", { name: "Confirm recovery and resume" }));
+  await waitFor(() => expect(mutations(calls)).toHaveLength(1));
+  expect(mutations(calls)[0].path).toBe(`/api/paper/${FUND}/resume`);
+  expect(mutations(calls)[0].body).toMatchObject({
+    failure_id: preview.failure_id,
+    preview_digest: preview.preview_digest,
+    decision: preview.decision,
+  });
+  expect(mutations(calls)[0].body?.request_id).toMatch(/^[a-f0-9]{32}$/);
+  expect(await screen.findByText("Reconciliation receipt recorded. Halt cleared. Failed tick was not retried; no runner was started.")).toBeInTheDocument();
+});
+
+it("does not auto-resubmit a lost recovery response and reuses its request identity after review", async () => {
+  const user = userEvent.setup();
+  const preview = paperReconciliationPreview();
+  let attempts = 0;
+  const calls = renderDesk(stoppedRunner, {
+    [`GET /api/paper/${FUND}`]: () => json(paperSnapshot(stoppedRunner, true)),
+    [`GET /api/paper/${FUND}/reconciliation`]: () => json({
+      name: FUND,
+      halted: "synthetic tick failure",
+      resume_allowed: true,
+      preview,
+    }),
+    [`POST /api/paper/${FUND}/resume`]: () => {
+      attempts += 1;
+      return attempts === 1
+        ? Promise.reject(new TypeError("synthetic recovery response loss"))
+        : json({ name: FUND, halted: false, reconciliation_id: "2".repeat(64) });
+    },
+  });
+
+  await user.click(await enabledButton("Review recovery"));
+  const firstDialog = await screen.findByRole("dialog", { name: "Reconcile and resume paper fund" });
+  await user.click(within(firstDialog).getByRole("button", { name: "Confirm recovery and resume" }));
+  await waitFor(() => expect(mutations(calls)).toHaveLength(1));
+  const firstRequestId = mutations(calls)[0].body?.request_id;
+  await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  expect(mutations(calls)).toHaveLength(1);
+
+  await user.click(await enabledButton("Review recovery"));
+  const secondDialog = await screen.findByRole("dialog", { name: "Reconcile and resume paper fund" });
+  await user.click(within(secondDialog).getByRole("button", { name: "Confirm recovery and resume" }));
+  await waitFor(() => expect(mutations(calls)).toHaveLength(2));
+
+  expect(mutations(calls)[1].body?.request_id).toBe(firstRequestId);
+  expect(await screen.findByText("Reconciliation receipt recorded. Halt cleared. Failed tick was not retried; no runner was started.")).toBeInTheDocument();
+});
+
+it("resumes a manual halt with an empty confirmation and no paper operation", async () => {
+  const user = userEvent.setup();
+  const preview = paperReconciliationPreview({
+    required: false,
+    reason: "no-ambiguous-tick-failure",
+    failure_id: null,
+    failed_request_id: null,
+    operation_id: null,
+    expected_head: null,
+    current_head: null,
+    broker_book_sha256: null,
+    capture_id: null,
+    capture_digest: null,
+    book_matches_ledger: false,
+    head_matches_failure: false,
+    preview_digest: null,
+  });
+  const calls = renderDesk(stoppedRunner, {
+    [`GET /api/paper/${FUND}`]: () => json(paperSnapshot(stoppedRunner, true)),
+    [`GET /api/paper/${FUND}/reconciliation`]: () => json({
+      name: FUND,
+      halted: "operator pause",
+      resume_allowed: true,
+      preview,
+    }),
+    [`POST /api/paper/${FUND}/resume`]: () => json({
+      name: FUND,
+      halted: false,
+      reconciliation_id: null,
+    }),
+  });
+
+  expect(await screen.findByText(/No ambiguous tick failure requires reconciliation/)).toBeInTheDocument();
+  await user.click(await enabledButton("Resume"));
+  const dialog = await screen.findByRole("dialog", { name: "Resume paper fund" });
+  expect(dialog).toHaveTextContent("clears Halt only");
+  expect(dialog).toHaveTextContent("does not run a paper operation");
+  await user.click(within(dialog).getByRole("button", { name: "Record resume" }));
+
+  await waitFor(() => expect(mutations(calls)).toHaveLength(1));
+  expect(mutations(calls)[0].body).toMatchObject({
+    request_id: expect.stringMatching(/^[a-f0-9]{32}$/),
+  });
+  expect(await screen.findByText("Halt cleared. No paper operation ran and no runner was started.")).toBeInTheDocument();
+});
+
+it("reuses a manual Resume request ID after a lost response", async () => {
+  const user = userEvent.setup();
+  const preview = paperReconciliationPreview({
+    required: false,
+    reason: "no-ambiguous-tick-failure",
+    failure_id: null,
+    failed_request_id: null,
+    operation_id: null,
+    expected_head: null,
+    current_head: null,
+    broker_book_sha256: null,
+    capture_id: null,
+    capture_digest: null,
+    book_matches_ledger: false,
+    head_matches_failure: false,
+    preview_digest: null,
+  });
+  let attempts = 0;
+  const calls = renderDesk(stoppedRunner, {
+    [`GET /api/paper/${FUND}`]: () => json(paperSnapshot(stoppedRunner, true)),
+    [`GET /api/paper/${FUND}/reconciliation`]: () => json({
+      name: FUND,
+      halted: "operator pause",
+      resume_allowed: true,
+      preview,
+    }),
+    [`POST /api/paper/${FUND}/resume`]: () => {
+      attempts += 1;
+      return attempts === 1
+        ? Promise.reject(new TypeError("synthetic Resume response loss"))
+        : json({ name: FUND, halted: false, reconciliation_id: null });
+    },
+  });
+
+  await user.click(await enabledButton("Resume"));
+  let dialog = await screen.findByRole("dialog", { name: "Resume paper fund" });
+  await user.click(within(dialog).getByRole("button", { name: "Record resume" }));
+  await waitFor(() => expect(mutations(calls)).toHaveLength(1));
+  await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  const requestId = mutations(calls)[0].body?.request_id;
+  expect(requestId).toMatch(/^[a-f0-9]{32}$/);
+
+  await user.click(await enabledButton("Resume"));
+  dialog = await screen.findByRole("dialog", { name: "Resume paper fund" });
+  await user.click(within(dialog).getByRole("button", { name: "Record resume" }));
+  await waitFor(() => expect(mutations(calls)).toHaveLength(2));
+
+  expect(mutations(calls)[1].body).toEqual({ request_id: requestId });
+  expect(await screen.findByText("Halt cleared. No paper operation ran and no runner was started.")).toBeInTheDocument();
+});
+
+it("keeps resume disabled when local reconciliation is not recoverable", async () => {
+  const preview = paperReconciliationPreview({
+    recoverable: false,
+    reason: "broker-book-mismatch",
+    book_matches_ledger: false,
+  });
+  const calls = renderDesk(stoppedRunner, {
+    [`GET /api/paper/${FUND}`]: () => json(paperSnapshot(stoppedRunner, true)),
+    [`GET /api/paper/${FUND}/reconciliation`]: () => json({
+      name: FUND,
+      halted: "synthetic tick failure",
+      resume_allowed: false,
+      preview,
+    }),
+  });
+
+  await screen.findByText("Ambiguous tick failure");
+  const recovery = screen.getByTestId("paper-reconciliation");
+  expect(recovery).toHaveTextContent("Resume denied. Halt remains active.");
+  expect(recovery).toHaveTextContent("broker-book-mismatch");
+  expect(screen.getByRole("button", { name: "Review recovery" })).toBeDisabled();
+  expect(mutations(calls)).toEqual([]);
 });
 
 it.each([

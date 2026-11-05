@@ -1099,6 +1099,7 @@ describe("local desk screens", () => {
     expect(await screen.findByText("Pending decision changed; reload before submitting a verdict.")).toBeInTheDocument();
     const request = fetchRequests.find((item) => item.path === "/api/paper/demo-quality/approval" && item.method === "POST");
     expect(request?.body).toEqual({
+      request_id: expect.stringMatching(/^[a-f0-9]{32}$/),
       verdict: "approve",
       decision_as_of: "2024-06-05",
       source_record_hash: sourceHash,
