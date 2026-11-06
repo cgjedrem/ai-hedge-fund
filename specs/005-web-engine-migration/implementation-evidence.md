@@ -2281,3 +2281,88 @@ marked synthetic roots; no real root or write-enabled replacement. RB-5 stays un
 FR-044 protected names remain denied. Windows bridge and host Ollama access remain blocked;
 browser/Ollama runtime, NTFS-to-ext4 relocation, real-fund operation, cutover and container
 rebind remain unsupported, blocked or unverified. Independent QA remains pending.
+
+## Runtime-incarnation trust change: code evidence and Docker disposition
+
+This addendum preserves the earlier replacement-container observation. That observation
+was made against source `7ec7aaa` before the runtime-scope fix; it is not evidence that
+the committed fix passed a container replacement test. Overall Spec005 acceptance remains
+INCONCLUSIVE.
+
+### Source implementation and tests
+
+- Code commit: `0b6f30aeb0c504a7741fc4e2adcda8ead06139d8`, parent
+  `b7af9b57fba9bb1c0998073599167a041a37fdc9`, branch
+  `cgjedrem-super-fiesta`. Commit includes the Copilot coauthor trailer. No push or merge.
+- Source package digest: `99ea8cd62078af860570388d768ba827c84ae659d911f46c842b15f3a56448e1`,
+  computed from `hedge_fund` using `hedge_fund.runtime.build_identity.source_sha256`.
+  The Docker revision and digest were explicit operator-supplied build args. A failed
+  build produces no image provenance mapping.
+- Source validation ran Python 3.11.15 / pytest 7.4.4 on Windows/NTFS, from
+  `2026-11-06T08:45:29.075859+01:00` through
+  `2026-11-06T08:49:37.532335+01:00`. Exact pytest command:
+
+  ```text
+  C:\Users\ChristianGjedrem\AppData\Local\pypoetry\Cache\virtualenvs\aihf-WidgQWGy-py3.11\Scripts\python.exe -m pytest hedge_fund/runtime/test_handover.py hedge_fund/runtime/test_write_authority.py hedge_fund/runtime/test_admission.py hedge_fund/test_run.py hedge_fund/tui/test_admission_regressions.py hedge_fund/web/test_app.py hedge_fund/web/test_main.py hedge_fund/web/test_services.py hedge_fund/web/test_write_authority.py -q --tb=short
+  ```
+
+- Result: **277 passed, 7 skipped in 243.46 s**; pytest process elapsed
+  `246.066527 s`. Black, isort, Flake8 and `git diff --check` all exited 0.
+  This is targeted unit/fake-test evidence, not a full-suite or Docker runtime result.
+- Exact stdout/stderr, per-command durations and manifest:
+  `outputs/spec005-runtime-incarnation-20261106/source-validation-9dd1e095/`.
+  Manifest SHA-256:
+  `617e820f69575911f6f8011abd87362fb09f82ae12cfc7ab7192ea4cf2c6a77c`.
+  The validated source revision had no tracked diff; empty-diff SHA-256:
+  `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`.
+
+### Final Docker image build: BLOCKED
+
+- Attempted image tag:
+  `aihf-web:0b6f30aeb0c504a7741fc4e2adcda8ead06139d8-99ea8cd62078af860570388d768ba827c84ae659d911f46c842b15f3a56448e1`.
+  No image ID was produced; this tag is not an artifact mapping.
+- Exact build command:
+
+  ```text
+  docker build --network=none --pull=false --progress=plain --file Dockerfile.web --tag aihf-web:0b6f30aeb0c504a7741fc4e2adcda8ead06139d8-99ea8cd62078af860570388d768ba827c84ae659d911f46c842b15f3a56448e1 --build-arg AIHF_SOURCE_REVISION=0b6f30aeb0c504a7741fc4e2adcda8ead06139d8 --build-arg AIHF_SOURCE_SHA256=99ea8cd62078af860570388d768ba827c84ae659d911f46c842b15f3a56448e1 .
+  ```
+
+- Build interval:
+  `2026-11-06T08:55:10.699385+01:00` to
+  `2026-11-06T08:55:23.193607+01:00`; elapsed `12.494129 s`; exit 1.
+  BuildKit failed at `pip install poetry==2.5.1`: network was disabled, `/simple/poetry/`
+  name resolution failed, and pip reported `No matching distribution found for
+  poetry==2.5.1`. The concurrent `npm ci` stage was cancelled. No alternate build path,
+  dependency download, or network-enabled retry was attempted.
+- Exact build artifacts:
+  `outputs/spec005-runtime-incarnation-20261106/docker-build-35f780ed/`.
+  `build.stdout.bin`: 0 bytes, SHA-256
+  `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`.
+  `build.stderr.bin`: 8,726 bytes, SHA-256
+  `5a7bc9b0be6584ed040921fba00bf3e8e665b10059d085ea8c5b9528a2a274a9`.
+  Build manifest SHA-256:
+  `7675a6f2d595893463a57075eab4f4c4dcf4e3d08869fa7c239e8f2b3e2beb33`.
+
+### Docker runtime acceptance: BLOCKED / NOT RUN
+
+- Read-only final inventory ran from `2026-11-06T09:04:52.120892+01:00` through
+  `2026-11-06T09:04:55.180385+01:00`. Environment: Docker client/server 29.9.2,
+  Compose 5.6.1, context `desktop-linux`, Docker server `linux/x86_64` on Windows
+  Docker Desktop. This is not a native Linux host observation.
+- Exact per-command stdout/stderr and hashes:
+  `outputs/spec005-runtime-incarnation-20261106/docker-final-inventory-20261106T0900/`.
+  Manifest SHA-256:
+  `df1182725153e44ac9ebac1b6cd8d0463550c68a65442051e622fac88d9e18cc`.
+- The uniquely named task project had no containers, service container, volume or network.
+  Inspection of the exact attempted image tag returned `No such image`. No task container
+  or volume was started or created; no API request, loopback or forwarded-port probe ran.
+- Runtime A enrollment/trust; runtime B stale-trust denial and explicit re-trust;
+  one synthetic paper deployment; runtime C replacement denial; ext4 confirmation;
+  host/Origin/API behavior; same-fund exclusion; protected-name attempts; and TUI runtime
+  behavior are all **BLOCKED / NOT RUN** in Docker. No secrets, provider, market-data,
+  LLM, broker, real root or real fund were used. CSRF, stale/ambiguous recovery and
+  same-fund behavior were not observed in a Docker runtime and are not claimed here.
+- The source test result above does not establish the A→B→C container behavior. The prior
+  replacement finding is not yet resolved by runtime evidence. Resume only with the
+  approved final image build and synthetic-volume protocol; do not infer acceptance from
+  the unit tests or the absent-image inventory. Independent QA remains coordinator-owned.
