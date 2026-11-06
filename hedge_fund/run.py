@@ -611,6 +611,7 @@ def _handover(args, parser: argparse.ArgumentParser, root: RootContext) -> None:
                 raise HandoverError("root enrollment or ledger inventory is unavailable")
             acknowledgement = None
             acknowledgement_expires_at = None
+            runtime_scope = None
             if status["state"] == "enrolled":
                 review = prepare_single_writer_acknowledgement(root)
                 heads = review["heads"]
@@ -620,6 +621,7 @@ def _handover(args, parser: argparse.ArgumentParser, root: RootContext) -> None:
                 }
                 acknowledgement = review["operator_acknowledgement"]
                 acknowledgement_expires_at = review["review_expires_at"]
+                runtime_scope = review["runtime_scope"]
             elif any(root.path.iterdir()):
                 if not root.verify_private_storage():
                     root.prepare_private_storage()
@@ -648,6 +650,7 @@ def _handover(args, parser: argparse.ArgumentParser, root: RootContext) -> None:
                         "operator_attestation": OPERATOR_ATTESTATION,
                         "operator_acknowledgement": acknowledgement,
                         "operator_acknowledgement_expires_at": acknowledgement_expires_at,
+                        "runtime_scope": runtime_scope,
                         "operator_responsibility": SINGLE_WRITER_RESPONSIBILITY_WARNING,
                     },
                     sort_keys=True,
@@ -717,7 +720,7 @@ def _paper_writer_admission(*, verify_inventory: bool = True) -> Iterator[tuple[
         raise PaperWriterDenied("Paper writes are blocked by root enrollment or ledger drift.")
     authority = write_authority(root)
     if not has_write_authority(authority):
-        remedy = "run the offline handover inspect and provide its exact root-specific acknowledgement" if authority["reason"] in {"operator-single-writer-acknowledgement-required", "attested-migration-read-only"} else "resolve the reported root or participant issue before retrying"
+        remedy = "run the offline handover inspect and provide its exact root-specific acknowledgement" if authority["reason"] in {"operator-single-writer-acknowledgement-required", "operator-single-writer-runtime-scope-changed", "attested-migration-read-only"} else "resolve the reported root or participant issue before retrying"
         raise PaperWriterDenied(f"Paper writes are blocked: root write authority is {authority['authority']} ({authority['reason']}); {remedy}.")
 
     owner = None

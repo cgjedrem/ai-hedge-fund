@@ -7,13 +7,14 @@ Every test uses isolated synthetic roots and a synthetic HOME.
 import hashlib
 import json
 import os
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 
 from hedge_fund.fund import FundSpec
 from hedge_fund.paper.deployed import deploy
+from hedge_fund.pipeline.session import code_version
 from hedge_fund.runtime import handover
 from hedge_fund.runtime.admission import OwnershipUnknown, RootOwnerLease
 from hedge_fund.runtime.handover import (
@@ -88,6 +89,41 @@ def _tree(path: Path) -> dict[str, object]:
             stat = item.stat()
             observed[relative] = (hashlib.sha256(item.read_bytes()).hexdigest(), stat.st_mtime_ns)
     return observed
+
+
+def _filesystem_snapshot(path: Path) -> dict[str, object]:
+    observed: dict[str, object] = {}
+    items = [path, *sorted(path.rglob("*"))]
+    for item in items:
+        relative = "." if item == path else item.relative_to(path).as_posix()
+        info = item.lstat()
+        if item.is_symlink():
+            observed[relative] = ("symlink", os.readlink(item), info.st_mode, info.st_mtime_ns)
+        elif item.is_dir():
+            observed[relative] = ("dir", info.st_mode, info.st_mtime_ns)
+        else:
+            observed[relative] = (
+                "file",
+                hashlib.sha256(item.read_bytes()).hexdigest(),
+                info.st_mode,
+                info.st_size,
+                info.st_mtime_ns,
+            )
+    return observed
+
+
+def _synthetic_runtime_scope(creation_time: str) -> dict[str, object]:
+    return {
+        "kind": "linux-pid1",
+        "pid1": {
+            "pid": 1,
+            "creation_time": creation_time,
+            "image": "/sbin/init",
+            "host": "synthetic-boot-id",
+            "namespace": "4026533000",
+        },
+        "namespace": "pid:[4026533000];mnt:[4026533001]",
+    }
 
 
 def _link_directory(link: Path, target: Path) -> None:
@@ -183,6 +219,246 @@ def test_existing_root_needs_fresh_root_bound_trust_ack_and_revocation_is_fail_c
             operator_acknowledgement=renewed_review["operator_acknowledgement"],
         )
         assert renewed["authority"] == "operator-trusted-single-writer"
+
+
+def test_trusted_authority_is_bound_to_pid1_incarnation_and_retrust_is_explicit(tmp_path, monkeypatch):
+    monkeypatch.setattr(handover, "out_of_band_exclusion_basis", lambda _root: None)
+    runtime = {"scope": _synthetic_runtime_scope("100")}
+    monkeypatch.setattr(
+        handover,
+        "_runtime_scope_identity",
+        lambda _root: runtime["scope"],
+        raising=False,
+    )
+    root_path = _legacy_source(tmp_path / "runtime-bound")
+    with RootContext.open(root_path) as root:
+        heads = build_head_inventory(root)
+        migrate_existing(
+            root,
+            expected_inventory_digest=inventory_digest(heads),
+            operator_attestation=OPERATOR_ATTESTATION,
+        )
+        enrollment_root = require_enrollment(root)["root"]
+        review_a = handover.prepare_single_writer_acknowledgement(root)
+        assert review_a["runtime_scope"] == runtime["scope"]
+        trust_a = handover.trust_single_writer(
+            root,
+            expected_inventory_digest=review_a["inventory_digest"],
+            operator_acknowledgement=review_a["operator_acknowledgement"],
+        )
+        state_a = json.loads(root.read_bytes(handover.SINGLE_WRITER_STATE_PATH))
+        assert trust_a["authority"] == "operator-trusted-single-writer"
+        assert write_authority(root)["authority"] == "operator-trusted-single-writer"
+        assert state_a["runtime_scope"] == runtime["scope"]
+        assert handover.root_binding(root) == enrollment_root
+        assert "runtime_scope" not in enrollment_root
+
+        runtime["scope"] = _synthetic_runtime_scope("200")
+        assert runtime["scope"]["pid1"]["namespace"] == state_a["runtime_scope"]["pid1"]["namespace"]
+        before_denial = _filesystem_snapshot(root_path)
+        assert write_authority(root) == {
+            "authority": "ownership-unknown",
+            "reason": "operator-single-writer-runtime-scope-changed",
+        }
+        with pytest.raises(WriteAuthorityDenied, match="another runtime"):
+            require_write_authority(root)
+        with pytest.raises(OwnershipUnknown):
+            RootOwnerLease.acquire(root)
+        assert _filesystem_snapshot(root_path) == before_denial
+
+        review_b = handover.prepare_single_writer_acknowledgement(root)
+        assert review_b["runtime_scope"] == runtime["scope"]
+        with pytest.raises(HandoverError, match="inventory"):
+            handover.trust_single_writer(
+                root,
+                expected_inventory_digest="0" * 64,
+                operator_acknowledgement=review_b["operator_acknowledgement"],
+            )
+        assert write_authority(root)["authority"] == "ownership-unknown"
+
+        review_b = handover.prepare_single_writer_acknowledgement(root)
+        with pytest.raises(HandoverError, match="acknowledgement"):
+            handover.trust_single_writer(
+                root,
+                expected_inventory_digest=review_b["inventory_digest"],
+                operator_acknowledgement="I ACCEPT",
+            )
+        assert root.read_bytes(handover.SINGLE_WRITER_STATE_PATH) == json.dumps(
+            state_a,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        assert write_authority(root)["authority"] == "ownership-unknown"
+
+        review_b = handover.prepare_single_writer_acknowledgement(root)
+        trust_b = handover.trust_single_writer(
+            root,
+            expected_inventory_digest=review_b["inventory_digest"],
+            operator_acknowledgement=review_b["operator_acknowledgement"],
+        )
+        state_b = json.loads(root.read_bytes(handover.SINGLE_WRITER_STATE_PATH))
+        assert trust_b["authority"] == "operator-trusted-single-writer"
+        assert state_b["runtime_scope"] == runtime["scope"]
+        assert state_b["schema"] == 2
+        assert state_b["challenge_id"] != state_a["challenge_id"]
+        assert write_authority(root)["authority"] == "operator-trusted-single-writer"
+        assert require_enrollment(root)["root"] == enrollment_root
+
+        runtime["scope"] = _synthetic_runtime_scope("300")
+        before_second_denial = _filesystem_snapshot(root_path)
+        assert write_authority(root)["reason"] == "operator-single-writer-runtime-scope-changed"
+        with pytest.raises(WriteAuthorityDenied):
+            require_write_authority(root)
+        assert _filesystem_snapshot(root_path) == before_second_denial
+
+
+def test_single_writer_review_cannot_cross_pid1_incarnations(tmp_path, monkeypatch):
+    monkeypatch.setattr(handover, "out_of_band_exclusion_basis", lambda _root: None)
+    runtime = {"scope": _synthetic_runtime_scope("100")}
+    monkeypatch.setattr(
+        handover,
+        "_runtime_scope_identity",
+        lambda _root: runtime["scope"],
+        raising=False,
+    )
+    root_path = _legacy_source(tmp_path / "runtime-review")
+    with RootContext.open(root_path) as root:
+        heads = build_head_inventory(root)
+        migrate_existing(
+            root,
+            expected_inventory_digest=inventory_digest(heads),
+            operator_attestation=OPERATOR_ATTESTATION,
+        )
+        review = handover.prepare_single_writer_acknowledgement(root)
+        runtime["scope"] = _synthetic_runtime_scope("200")
+        assert runtime["scope"]["pid1"]["namespace"] == "4026533000"
+        with pytest.raises(HandoverError, match="runtime"):
+            handover.trust_single_writer(
+                root,
+                expected_inventory_digest=review["inventory_digest"],
+                operator_acknowledgement=review["operator_acknowledgement"],
+            )
+        with pytest.raises(FileNotFoundError):
+            root.file_info(handover.SINGLE_WRITER_STATE_PATH)
+        assert write_authority(root) == {
+            "authority": "ownership-unknown",
+            "reason": "attested-migration-read-only",
+        }
+
+        current_review = handover.prepare_single_writer_acknowledgement(root)
+        trust = handover.trust_single_writer(
+            root,
+            expected_inventory_digest=current_review["inventory_digest"],
+            operator_acknowledgement=current_review["operator_acknowledgement"],
+        )
+        assert trust["authority"] == "operator-trusted-single-writer"
+
+
+def test_trusted_authority_fails_closed_when_runtime_identity_is_unavailable(tmp_path, monkeypatch):
+    monkeypatch.setattr(handover, "out_of_band_exclusion_basis", lambda _root: None)
+    runtime_scope = _synthetic_runtime_scope("100")
+    monkeypatch.setattr(
+        handover,
+        "_runtime_scope_identity",
+        lambda _root: runtime_scope,
+        raising=False,
+    )
+    root_path = _legacy_source(tmp_path / "runtime-unavailable")
+    with RootContext.open(root_path) as root:
+        heads = build_head_inventory(root)
+        migrate_existing(
+            root,
+            expected_inventory_digest=inventory_digest(heads),
+            operator_attestation=OPERATOR_ATTESTATION,
+        )
+        review = handover.prepare_single_writer_acknowledgement(root)
+        handover.trust_single_writer(
+            root,
+            expected_inventory_digest=review["inventory_digest"],
+            operator_acknowledgement=review["operator_acknowledgement"],
+        )
+
+        def unavailable(_root):
+            raise HandoverError("runtime identity unavailable")
+
+        monkeypatch.setattr(handover, "_runtime_scope_identity", unavailable)
+        before_denial = _filesystem_snapshot(root_path)
+        assert write_authority(root) == {
+            "authority": "ownership-unknown",
+            "reason": "operator-single-writer-runtime-scope-unavailable",
+        }
+        with pytest.raises(WriteAuthorityDenied, match="runtime identity is unavailable"):
+            require_write_authority(root)
+        with pytest.raises(OwnershipUnknown):
+            RootOwnerLease.acquire(root)
+        assert _filesystem_snapshot(root_path) == before_denial
+
+
+def test_legacy_trust_record_without_runtime_scope_fails_closed(tmp_path, monkeypatch):
+    monkeypatch.setattr(handover, "out_of_band_exclusion_basis", lambda _root: None)
+    runtime_scope = _synthetic_runtime_scope("100")
+    monkeypatch.setattr(
+        handover,
+        "_runtime_scope_identity",
+        lambda _root: runtime_scope,
+        raising=False,
+    )
+    root_path = _legacy_source(tmp_path / "legacy-trust-record")
+    with RootContext.open(root_path) as root:
+        heads = build_head_inventory(root)
+        migrate_existing(
+            root,
+            expected_inventory_digest=inventory_digest(heads),
+            operator_attestation=OPERATOR_ATTESTATION,
+        )
+        enrollment = require_enrollment(root)
+        reviewed_digest = inventory_digest(build_head_inventory(root))
+        challenge_id = "a" * 32
+        root_digest = handover._digest(
+            {
+                "root": handover.root_binding(root),
+                "protocol_version": handover.PROTOCOL_VERSION,
+                "build_id": code_version(),
+                "enrollment_identity": handover._enrollment_identity(enrollment),
+            }
+        )
+        acknowledgement = f"I ACCEPT TRUSTED SINGLE-WRITER MODE ROOT={root_digest} " f"INVENTORY={reviewed_digest} CHALLENGE={challenge_id}; " "I ACCEPT RESPONSIBILITY FOR STOPPING AND EXCLUDING ALL OTHER PROGRAMS " "THAT CAN REACH THIS ROOT."
+        handover._write_single_writer_state(
+            root,
+            {
+                "schema": 1,
+                "state": "trusted",
+                "protocol_version": handover.PROTOCOL_VERSION,
+                "build_id": code_version(),
+                "root": handover.root_binding(root),
+                "enrollment_identity": handover._enrollment_identity(enrollment),
+                "reviewed_inventory_digest": reviewed_digest,
+                "challenge_id": challenge_id,
+                "operator_acknowledgement": acknowledgement,
+                "acknowledged_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+        before_denial = _filesystem_snapshot(root_path)
+        authority = write_authority(root)
+        assert authority == {
+            "authority": "ownership-unknown",
+            "reason": "operator-single-writer-acknowledgement-invalid",
+        }
+        with pytest.raises(WriteAuthorityDenied):
+            require_write_authority(root)
+        assert _filesystem_snapshot(root_path) == before_denial
+
+        review = handover.prepare_single_writer_acknowledgement(root)
+        assert review["reason"] == "operator-single-writer-acknowledgement-invalid"
+        renewed = handover.trust_single_writer(
+            root,
+            expected_inventory_digest=review["inventory_digest"],
+            operator_acknowledgement=review["operator_acknowledgement"],
+        )
+        renewed_state = json.loads(root.read_bytes(handover.SINGLE_WRITER_STATE_PATH))
+        assert renewed["authority"] == "operator-trusted-single-writer"
+        assert renewed_state["schema"] == 2
+        assert renewed_state["runtime_scope"] == runtime_scope
 
 
 def test_trust_challenge_cannot_cross_roots_or_survive_inventory_drift(tmp_path, monkeypatch):

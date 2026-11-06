@@ -337,6 +337,7 @@ def test_handover_cli_trust_is_root_specific_explicit_and_revocable(tmp_path, mo
     assert inspection["operator_acknowledgement"]
     assert "RESPONSIBILITY" in inspection["operator_acknowledgement"]
     assert inspection["operator_acknowledgement_expires_at"]
+    assert inspection["runtime_scope"]["kind"] in {"linux-pid1", "windows-host-boot"}
     assert "do not fence" in inspection["operator_responsibility"].lower()
 
     with pytest.raises(SystemExit) as invalid:
@@ -371,6 +372,7 @@ def test_handover_cli_trust_is_root_specific_explicit_and_revocable(tmp_path, mo
     assert trusted_inspection["write_authority"]["authority"] == "operator-trusted-single-writer"
     assert trusted_inspection["operator_acknowledgement"] is None
     assert trusted_inspection["operator_acknowledgement_expires_at"] is None
+    assert trusted_inspection["runtime_scope"] is None
 
     _main(monkeypatch, "handover", "revoke-single-writer")
     revoked = json.loads(capsys.readouterr().out)

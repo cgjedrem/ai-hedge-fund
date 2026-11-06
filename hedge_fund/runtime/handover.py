@@ -8,6 +8,7 @@ import os
 import re
 import secrets
 import stat
+import sys
 import threading
 from contextlib import contextmanager, ExitStack
 from datetime import datetime, timedelta, timezone
@@ -29,6 +30,7 @@ from hedge_fund.runtime.admission import (
 )
 from hedge_fund.runtime.exclusion import out_of_band_exclusion_basis
 from hedge_fund.runtime.exclusion import UNPROVEN_REASON as EXCLUSION_UNPROVEN_REASON
+from hedge_fund.runtime.ownership import process_identity, ProcessIdentityError
 from hedge_fund.runtime.root import (
     ensure_unique_resource_name,
     PRIVATE_ROOT,
@@ -54,6 +56,8 @@ _WRITABLE_AUTHORITIES = frozenset({"protocol-native", TRUSTED_SINGLE_WRITER_AUTH
 _TRUST_REQUIRED_REASON = "operator-single-writer-acknowledgement-required"
 _TRUST_INVALID_REASON = "operator-single-writer-acknowledgement-invalid"
 _TRUST_REVOKED_REASON = "operator-single-writer-acknowledgement-revoked"
+_TRUST_RUNTIME_SCOPE_CHANGED_REASON = "operator-single-writer-runtime-scope-changed"
+_TRUST_RUNTIME_SCOPE_UNAVAILABLE_REASON = "operator-single-writer-runtime-scope-unavailable"
 
 
 class HandoverError(RuntimeError):
@@ -192,6 +196,45 @@ def root_binding(root: RootContext) -> dict[str, Any]:
         "host": root.host_identity.casefold(),
         "namespace": root.namespace_identity,
     }
+
+
+def _runtime_scope_identity(root: RootContext) -> dict[str, Any]:
+    """Return runtime scope shared by processes in this container or host boot."""
+    if not isinstance(root, RootContext):
+        raise TypeError("an explicit RootContext is required")
+    if sys.platform.startswith("linux"):
+        try:
+            pid1 = process_identity(1)
+        except (OSError, ProcessIdentityError, ValueError) as exc:
+            raise HandoverError("Linux PID 1 runtime identity is unavailable") from exc
+        try:
+            namespace = f"pid:{os.readlink('/proc/self/ns/pid')};mnt:{os.readlink('/proc/self/ns/mnt')}"
+            pid_namespace = str(os.stat("/proc/self/ns/pid").st_ino)
+        except OSError as exc:
+            raise HandoverError("Linux runtime namespace identity is unavailable") from exc
+        if not isinstance(pid1, dict):
+            raise HandoverError("Linux runtime scope identity is incomplete")
+        if type(pid1.get("pid")) is not int or pid1["pid"] != 1:
+            raise HandoverError("Linux runtime scope identity is incomplete")
+        required_fields = ("creation_time", "image", "host", "namespace")
+        if any(not isinstance(pid1.get(key), str) or not pid1[key] for key in required_fields):
+            raise HandoverError("Linux runtime scope identity is incomplete")
+        if not pid1["creation_time"].isdecimal() or not pid1["namespace"].isdecimal():
+            raise HandoverError("Linux runtime scope identity is incomplete")
+        if pid1["namespace"] != pid_namespace or pid1["host"] != root.boot_identity or namespace != root.namespace_identity:
+            raise HandoverError("Linux runtime scope identity is incomplete")
+        return {
+            "kind": "linux-pid1",
+            "pid1": pid1,
+            "namespace": namespace,
+        }
+    if os.name == "nt":
+        host = root.host_identity.casefold() if isinstance(root.host_identity, str) else ""
+        boot = root.boot_identity
+        if not host or not isinstance(boot, str) or not boot or boot.casefold() == "unknown":
+            raise HandoverError("Windows host boot identity is unavailable")
+        return {"kind": "windows-host-boot", "host": host, "boot": boot}
+    raise HandoverError("runtime scope identity is unsupported")
 
 
 def enrollment_status(root: RootContext, *, verify_inventory: bool = False) -> dict[str, str | None]:
@@ -335,6 +378,10 @@ def require_write_authority(root: RootContext) -> dict[str, Any]:
         message = "trusted-single-writer acknowledgement was revoked"
     elif reason == _TRUST_INVALID_REASON:
         message = "trusted-single-writer acknowledgement is invalid"
+    elif reason == _TRUST_RUNTIME_SCOPE_CHANGED_REASON:
+        message = "trusted-single-writer authority belongs to another runtime; review and trust this runtime explicitly"
+    elif reason == _TRUST_RUNTIME_SCOPE_UNAVAILABLE_REASON:
+        message = "trusted-single-writer runtime identity is unavailable"
     elif reason == EXCLUSION_UNPROVEN_REASON:
         message = "synthetic test-owner basis is unavailable"
     else:
@@ -361,6 +408,12 @@ def _classify_write_authority(root: RootContext, enrollment: dict[str, Any]) -> 
         return {"authority": "ownership-unknown", "reason": _TRUST_INVALID_REASON}
     if state["state"] == "revoked":
         return {"authority": "ownership-unknown", "reason": _TRUST_REVOKED_REASON}
+    try:
+        runtime_scope = _runtime_scope_identity(root)
+    except Exception:
+        return {"authority": "ownership-unknown", "reason": _TRUST_RUNTIME_SCOPE_UNAVAILABLE_REASON}
+    if state["runtime_scope"] != runtime_scope:
+        return {"authority": "ownership-unknown", "reason": _TRUST_RUNTIME_SCOPE_CHANGED_REASON}
     return {"authority": TRUSTED_SINGLE_WRITER_AUTHORITY, "reason": None}
 
 
@@ -385,16 +438,19 @@ def prepare_single_writer_acknowledgement(root: RootContext) -> dict[str, Any]:
                     "reason": authority["reason"] or legacy_reason,
                     "operator_acknowledgement": None,
                     "review_expires_at": None,
+                    "runtime_scope": None,
                 }
 
+            runtime_scope = _runtime_scope_identity(root)
             challenge_id = secrets.token_hex(16)
             reviewed_at = datetime.now(timezone.utc)
             body = {
-                "schema": 1,
+                "schema": 2,
                 "protocol_version": PROTOCOL_VERSION,
                 "build_id": code_version(),
                 "root": root_binding(root),
                 "enrollment_identity": _enrollment_identity(enrollment),
+                "runtime_scope": runtime_scope,
                 "inventory_digest": digest,
                 "challenge_id": challenge_id,
                 "prior_authority_digest": _single_writer_state_digest(root),
@@ -406,8 +462,15 @@ def prepare_single_writer_acknowledgement(root: RootContext) -> dict[str, Any]:
                 "inventory_digest": digest,
                 "write_authority": authority["authority"],
                 "reason": authority["reason"],
-                "operator_acknowledgement": _single_writer_acknowledgement(root, enrollment, digest, challenge_id),
+                "operator_acknowledgement": _single_writer_acknowledgement(
+                    root,
+                    enrollment,
+                    digest,
+                    challenge_id,
+                    runtime_scope,
+                ),
                 "review_expires_at": (reviewed_at + _MAX_TRUST_REVIEW_AGE).isoformat(),
+                "runtime_scope": runtime_scope,
             }
     except WriterConflict as exc:
         raise HandoverError("another root participant is active; offline trust review requires quiescence") from exc
@@ -433,13 +496,14 @@ def trust_single_writer(
             if legacy_reason is not None:
                 _remove_single_writer_challenge(root)
                 raise WriteAuthorityDenied(f"known or unverified legacy participant blocks trust ({legacy_reason})")
+            runtime_scope = _runtime_scope_identity(root)
             verify_root_inventory(root, record=enrollment)
             heads = build_head_inventory(root)
             actual_digest = _digest(heads)
             if actual_digest != expected_inventory_digest:
                 _remove_single_writer_challenge(root)
                 raise LedgerDrift("reviewed inventory changed; inspect the root again")
-            challenge = _read_single_writer_challenge(root, enrollment)
+            challenge = _read_single_writer_challenge(root, enrollment, runtime_scope)
             if challenge["inventory_digest"] != actual_digest:
                 _remove_single_writer_challenge(root)
                 raise LedgerDrift("reviewed inventory changed; inspect the root again")
@@ -451,18 +515,20 @@ def trust_single_writer(
                 enrollment,
                 actual_digest,
                 challenge["challenge_id"],
+                runtime_scope,
             )
             if operator_acknowledgement != expected_acknowledgement:
                 raise HandoverError("exact root-specific operator acknowledgement is required")
 
             _remove_single_writer_challenge(root)
             body = {
-                "schema": 1,
+                "schema": 2,
                 "state": "trusted",
                 "protocol_version": PROTOCOL_VERSION,
                 "build_id": code_version(),
                 "root": root_binding(root),
                 "enrollment_identity": _enrollment_identity(enrollment),
+                "runtime_scope": runtime_scope,
                 "reviewed_inventory_digest": actual_digest,
                 "challenge_id": challenge["challenge_id"],
                 "operator_acknowledgement": operator_acknowledgement,
@@ -504,6 +570,7 @@ def _read_single_writer_state(root: RootContext, enrollment: dict[str, Any]) -> 
     record = _read_private_json(root, SINGLE_WRITER_STATE_PATH)
     state = record.get("state")
     if state == "trusted":
+        schema = 2
         expected_fields = {
             "schema",
             "state",
@@ -511,6 +578,7 @@ def _read_single_writer_state(root: RootContext, enrollment: dict[str, Any]) -> 
             "build_id",
             "root",
             "enrollment_identity",
+            "runtime_scope",
             "reviewed_inventory_digest",
             "challenge_id",
             "operator_acknowledgement",
@@ -519,6 +587,7 @@ def _read_single_writer_state(root: RootContext, enrollment: dict[str, Any]) -> 
         }
         timestamp = record.get("acknowledged_at")
     elif state == "revoked":
+        schema = 1
         expected_fields = {
             "schema",
             "state",
@@ -535,18 +604,23 @@ def _read_single_writer_state(root: RootContext, enrollment: dict[str, Any]) -> 
     if set(record) != expected_fields:
         raise HandoverError("single-writer state fields are invalid")
     body = {key: value for key, value in record.items() if key != "record_digest"}
-    if record["schema"] != 1 or record["protocol_version"] != PROTOCOL_VERSION or record["build_id"] != code_version() or record["root"] != root_binding(root) or record["enrollment_identity"] != _enrollment_identity(enrollment) or not _valid_timestamp(timestamp) or record["record_digest"] != _digest(body):
+    if type(record["schema"]) is not int or record["schema"] != schema or record["protocol_version"] != PROTOCOL_VERSION or record["build_id"] != code_version() or record["root"] != root_binding(root) or record["enrollment_identity"] != _enrollment_identity(enrollment) or not _valid_timestamp(timestamp) or record["record_digest"] != _digest(body):
         raise HandoverError("single-writer state identity is invalid")
     if state == "trusted":
         reviewed_digest = record["reviewed_inventory_digest"]
         challenge_id = record["challenge_id"]
         acknowledgement = record["operator_acknowledgement"]
-        if not isinstance(reviewed_digest, str) or not _SHA256.fullmatch(reviewed_digest) or not _valid_challenge_id(challenge_id) or not isinstance(acknowledgement, str) or not 1 <= len(acknowledgement) <= 1024 or acknowledgement != _single_writer_acknowledgement(root, enrollment, reviewed_digest, challenge_id):
+        runtime_scope = record["runtime_scope"]
+        if not isinstance(runtime_scope, dict) or not isinstance(reviewed_digest, str) or not _SHA256.fullmatch(reviewed_digest) or not _valid_challenge_id(challenge_id) or not isinstance(acknowledgement, str) or not 1 <= len(acknowledgement) <= 1024 or acknowledgement != _single_writer_acknowledgement(root, enrollment, reviewed_digest, challenge_id, runtime_scope):
             raise HandoverError("single-writer acknowledgement is invalid")
     return record
 
 
-def _read_single_writer_challenge(root: RootContext, enrollment: dict[str, Any]) -> dict[str, Any]:
+def _read_single_writer_challenge(
+    root: RootContext,
+    enrollment: dict[str, Any],
+    runtime_scope: dict[str, Any],
+) -> dict[str, Any]:
     try:
         record = _read_private_json(root, SINGLE_WRITER_CHALLENGE_PATH)
     except FileNotFoundError:
@@ -557,6 +631,7 @@ def _read_single_writer_challenge(root: RootContext, enrollment: dict[str, Any])
         "build_id",
         "root",
         "enrollment_identity",
+        "runtime_scope",
         "inventory_digest",
         "challenge_id",
         "prior_authority_digest",
@@ -566,11 +641,13 @@ def _read_single_writer_challenge(root: RootContext, enrollment: dict[str, Any])
     body = {key: value for key, value in record.items() if key != "challenge_digest"}
     if (
         set(record) != expected_fields
-        or record["schema"] != 1
+        or type(record["schema"]) is not int
+        or record["schema"] != 2
         or record["protocol_version"] != PROTOCOL_VERSION
         or record["build_id"] != code_version()
         or record["root"] != root_binding(root)
         or record["enrollment_identity"] != _enrollment_identity(enrollment)
+        or not isinstance(record["runtime_scope"], dict)
         or not isinstance(record["inventory_digest"], str)
         or not _SHA256.fullmatch(record["inventory_digest"])
         or not _valid_challenge_id(record["challenge_id"])
@@ -580,6 +657,8 @@ def _read_single_writer_challenge(root: RootContext, enrollment: dict[str, Any])
         or record["challenge_digest"] != _digest(body)
     ):
         raise HandoverError("single-writer review challenge is invalid")
+    if record["runtime_scope"] != runtime_scope:
+        raise HandoverError("trust review challenge belongs to another runtime; inspect the root again")
     reviewed_at = datetime.fromisoformat(record["reviewed_at"].replace("Z", "+00:00")).astimezone(timezone.utc)
     review_age = (datetime.now(timezone.utc) - reviewed_at).total_seconds()
     if not 0 <= review_age <= _MAX_TRUST_REVIEW_AGE.total_seconds():
@@ -646,6 +725,7 @@ def _single_writer_acknowledgement(
     enrollment: dict[str, Any],
     inventory_digest_value: str,
     challenge_id: str,
+    runtime_scope: dict[str, Any],
 ) -> str:
     root_digest = _digest(
         {
@@ -653,6 +733,7 @@ def _single_writer_acknowledgement(
             "protocol_version": PROTOCOL_VERSION,
             "build_id": code_version(),
             "enrollment_identity": _enrollment_identity(enrollment),
+            "runtime_scope": runtime_scope,
         }
     )
     return f"I ACCEPT TRUSTED SINGLE-WRITER MODE ROOT={root_digest} " f"INVENTORY={inventory_digest_value} CHALLENGE={challenge_id}; " "I ACCEPT RESPONSIBILITY FOR STOPPING AND EXCLUDING ALL OTHER PROGRAMS " "THAT CAN REACH THIS ROOT."
