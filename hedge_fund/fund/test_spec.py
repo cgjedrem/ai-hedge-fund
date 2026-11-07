@@ -8,6 +8,7 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
+from hedge_fund import paths
 from hedge_fund.fund import (
     custom_strategy,
     discover_funds,
@@ -20,6 +21,11 @@ from hedge_fund.fund import (
     save_spec,
     StrategySpec,
 )
+from hedge_fund.fund.storage import StorageAdmissionError
+from hedge_fund.runtime.dispatch import make_one_shot_dispatch
+from hedge_fund.runtime.handover import enroll_fresh
+from hedge_fund.runtime.policy import KEN_FRENCH_BREAKPOINTS_TARGET
+from hedge_fund.runtime.root import RootContext
 from hedge_fund.signals import ALPHA_MODEL_REGISTRY, get_investment_approach
 
 MINIMAL = {
@@ -42,6 +48,28 @@ def test_yaml_load_happy_path(tmp_path):
     assert spec.capital == 50000
 
 
+def test_load_spec_reads_root_bound_path_through_context(tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    root.mkdir()
+    context = RootContext.open(root)
+    target = root / "mandates" / "fund.yaml"
+    try:
+        with paths.bound_root(context):
+            context.mkdir("mandates")
+            context.write_bytes("mandates/fund.yaml", yaml.safe_dump(MINIMAL).encode("utf-8"))
+            original_read_text = type(target).read_text
+
+            def reject_direct_read(path, *args, **kwargs):
+                if path == target:
+                    raise AssertionError("root-bound YAML bypassed RootContext")
+                return original_read_text(path, *args, **kwargs)
+
+            monkeypatch.setattr(type(target), "read_text", reject_direct_read)
+            assert load_spec(paths.resolve_user_path("mandates/fund.yaml")).name == "test-fund"
+    finally:
+        context.close()
+
+
 def test_load_strategy(tmp_path):
     path = tmp_path / "value.yaml"
     path.write_text("name: value\n" "blend: {mode: long_short}\n" "models:\n" "  - name: buffett\n" "  - name: pead\n")
@@ -59,6 +87,30 @@ def test_defaults_applied():
     assert spec.capital == 100_000.0
     assert spec.rebalance == "weekly"
     assert spec.benchmark == "SPY"
+
+
+def test_model_call_bounds_include_llm_samples_and_local_fallback():
+    from hedge_fund.fund.spec import model_call_bounds
+
+    raw = deepcopy(MINIMAL)
+    raw["strategies"][0]["models"] = [
+        {"name": "buffett", "params": {"samples": 3}},
+        {"name": "pead"},
+    ]
+    spec = FundSpec.model_validate(raw)
+
+    assert model_call_bounds(spec) == (4, 3)
+    assert model_call_bounds(spec, local_llm_fallback=True) == (7, 6)
+
+
+def test_llm_samples_must_be_positive():
+    raw = deepcopy(MINIMAL)
+    raw["strategies"][0]["models"] = [
+        {"name": "buffett", "params": {"samples": 0}},
+    ]
+
+    with pytest.raises(ValidationError):
+        FundSpec.model_validate(raw)
 
 
 def test_rebalance_cadence_validated():
@@ -255,6 +307,62 @@ def test_fund_staffs_each_strategy_once():
     assert fund.strategies[0][1][0] is staff[0]
 
 
+def test_fund_passes_operation_dispatch_to_blind_llm_agents():
+    from datetime import datetime, timedelta, timezone
+    from decimal import Decimal
+
+    now = datetime(2026, 11, 1, 12, 0, tzinfo=timezone.utc)
+    target = KEN_FRENCH_BREAKPOINTS_TARGET
+    dispatch = make_one_shot_dispatch(
+        root_id="fund-test-root",
+        subject_id="fund-test",
+        capture_digest="a" * 64,
+        operation_id="fund-operation",
+        operation_digest="b" * 64,
+        expires_at=now + timedelta(minutes=5),
+        targets=(target,),
+        max_calls=1,
+        max_cost=Decimal("0"),
+        max_resources=1,
+        upper_bound_costs={target.identity: Decimal("0")},
+        clock=lambda: now,
+        resolver=lambda _host, _port: ["8.8.8.8"],
+    )
+    spec = FundSpec(
+        **{
+            **MINIMAL,
+            "strategies": [
+                {
+                    "name": "value",
+                    "models": [{"name": "buffett"}],
+                    "blend": {"mode": "long_only"},
+                }
+            ],
+        }
+    )
+    fake_llm = Mock(model="fixture-model")
+    fund = Fund(
+        spec,
+        blind=True,
+        llm_factory=lambda _model_spec: fake_llm,
+        breakpoints_dispatch=dispatch,
+    )
+
+    assert fund.strategies[0][1][0]._breakpoints_dispatch is dispatch
+
+
+@pytest.mark.parametrize("parameter", ["breakpoints_dispatch", "fail_on_llm_error"])
+def test_runtime_only_agent_options_are_not_mandate_parameters(parameter):
+    payload = deepcopy(MINIMAL)
+    payload["strategies"][0]["models"][0] = {
+        "name": "buffett",
+        "params": {parameter: "untrusted"},
+    }
+
+    with pytest.raises(ValueError, match="constructor parameters"):
+        FundSpec(**payload)
+
+
 @pytest.mark.parametrize(
     "names,mode",
     [
@@ -272,6 +380,7 @@ def test_custom_rules_derive_without_constructing_analysts(names, mode, monkeypa
     spec = FundSpec(**{**MINIMAL, "strategies": [strategy]})
     path = tmp_path / "new.yaml"
     path.write_text(yaml.safe_dump(spec.model_dump()))
+    monkeypatch.undo()
     assert load_spec(path) == spec
     assert FundSpec.model_validate_json(spec.model_dump_json()) == spec
 
@@ -394,9 +503,55 @@ def test_blind_reaches_llm_agents_only(monkeypatch, blind):
 
 def test_save_spec_round_trips_and_never_overwrites(tmp_path):
     spec = FundSpec(**MINIMAL)
-    path = save_spec(spec, tmp_path / "mandates")
-    assert path == tmp_path / "mandates" / "test-fund.yaml"
-    assert load_spec(path) == spec
-    with pytest.raises(FileExistsError):
-        save_spec(spec, tmp_path / "mandates")
-    assert load_spec(path) == spec
+    context = RootContext.open(tmp_path)
+    try:
+        enroll_fresh(context)
+        with paths.bound_root(context):
+            path = save_spec(spec, tmp_path / "mandates")
+            assert path == tmp_path / "mandates" / "test-fund.yaml"
+            assert load_spec(path) == spec
+            with pytest.raises(FileExistsError):
+                save_spec(spec, tmp_path / "mandates")
+            assert load_spec(path) == spec
+    finally:
+        context.close()
+
+
+def test_optional_registered_constructor_parameter_accepts_none():
+    payload = deepcopy(MINIMAL)
+    payload["strategies"] = [
+        {
+            "name": "optional-temperature",
+            "models": [{"name": "buffett", "params": {"temperature": None}}],
+            "blend": {"mode": "long_only"},
+        }
+    ]
+
+    spec = FundSpec.model_validate(payload)
+
+    assert spec.strategies[0].models[0].params["temperature"] is None
+
+
+def test_save_spec_denies_unenrolled_root(tmp_path):
+    spec = FundSpec(**MINIMAL)
+    context = RootContext.open(tmp_path)
+    try:
+        context.prepare_private_storage()
+        with paths.bound_root(context):
+            with pytest.raises(StorageAdmissionError):
+                save_spec(spec, tmp_path / "mandates")
+            assert not (tmp_path / "mandates" / "test-fund.yaml").exists()
+    finally:
+        context.close()
+
+
+def test_save_spec_rejects_path_like_fund_name(tmp_path):
+    invalid = FundSpec(**MINIMAL).model_copy(update={"name": "../outside"})
+    context = RootContext.open(tmp_path)
+    try:
+        with paths.bound_root(context):
+            with pytest.raises(ValueError, match="mandate name"):
+                save_spec(invalid, tmp_path / "mandates")
+            assert not (tmp_path / "mandates").exists()
+    finally:
+        context.close()

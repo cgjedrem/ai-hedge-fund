@@ -11,7 +11,7 @@ Point-in-time: the breakpoints for month M use end-of-month-M prices, so on
 any day inside M they are not yet knowable. A filing in month M is placed
 against the latest published row strictly before M.
 
-The file is fetched into ~/.hedge-fund/cache/ and refreshed when it ages past
+The file is fetched into the configured root's cache/ and refreshed when it ages past
 a month. It is third-party data and is not vendored.
 """
 
@@ -22,17 +22,28 @@ import threading
 import time
 import zipfile
 from datetime import date as _date
+from math import isfinite
 from pathlib import Path
-from typing import Callable
 
-import requests
+import httpx
 
-from hedge_fund.paths import CACHE_DIR
+from hedge_fund import paths
+from hedge_fund.runtime.dispatch import ProviderDispatch
+from hedge_fund.runtime.policy import AuthorizationDenied, KEN_FRENCH_BREAKPOINTS_TARGET
+from hedge_fund.runtime.root import RootConfigurationError
 
-BREAKPOINTS_URL = (
-    "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/ME_Breakpoints_CSV.zip"
-)
-DEFAULT_CACHE_PATH = CACHE_DIR / "breakpoints" / "ME_Breakpoints.csv"
+BREAKPOINTS_URL = "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/ME_Breakpoints_CSV.zip"
+MAX_ARCHIVE_BYTES = 10 * 1024 * 1024
+MAX_CSV_BYTES = 5 * 1024 * 1024
+
+
+def _default_cache_path() -> Path:
+    if paths.CACHE_DIR is None:
+        raise RootConfigurationError("an explicit root must be configured first")
+    return paths.CACHE_DIR / "breakpoints" / "ME_Breakpoints.csv"
+
+
+DEFAULT_CACHE_PATH = _default_cache_path() if paths.CACHE_DIR is not None else None
 MAX_AGE_DAYS = 35  # the table updates monthly
 
 _PERCENTILES = tuple(range(5, 101, 5))  # 20 columns: 5th, 10th, ..., 100th
@@ -94,22 +105,54 @@ class MEBreakpoints:
         return min(exceeded, 19) * 5
 
 
-def fetch_breakpoints_csv(url: str = BREAKPOINTS_URL, timeout: float = 30.0) -> str:
-    """Download the zip and return the CSV text inside it."""
-    response = requests.get(url, timeout=timeout)
-    response.raise_for_status()
-    with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
-        names = [n for n in archive.namelist() if n.lower().endswith(".csv")]
-        if not names:
-            raise ValueError(f"{url}: no CSV inside the archive")
-        return archive.read(names[0]).decode("utf-8", errors="replace")
+def fetch_breakpoints_csv(
+    *,
+    dispatch: ProviderDispatch | None = None,
+    timeout: float = 30.0,
+    inner_transport: httpx.BaseTransport | None = None,
+) -> str:
+    """Fetch bounded CSV through the operation's guarded data transport."""
+    if not isinstance(dispatch, ProviderDispatch):
+        raise AuthorizationDenied("breakpoints provider authorization is required")
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not isfinite(timeout) or timeout <= 0:
+        raise ValueError("breakpoints timeout is invalid")
+    dispatch.validate_target(KEN_FRENCH_BREAKPOINTS_TARGET)
+    with dispatch.httpx_client(
+        KEN_FRENCH_BREAKPOINTS_TARGET,
+        timeout=timeout,
+        inner_transport=inner_transport,
+    ) as client:
+        with client.stream("GET", BREAKPOINTS_URL) as response:
+            response.raise_for_status()
+            content_length = response.headers.get("content-length")
+            if content_length is not None:
+                try:
+                    declared_size = int(content_length)
+                except ValueError:
+                    raise AuthorizationDenied("breakpoints archive size is invalid") from None
+                if not 0 <= declared_size <= MAX_ARCHIVE_BYTES:
+                    raise AuthorizationDenied("breakpoints archive exceeds its bound")
+            content = bytearray()
+            for chunk in response.iter_bytes():
+                if len(content) + len(chunk) > MAX_ARCHIVE_BYTES:
+                    raise AuthorizationDenied("breakpoints archive exceeds its bound")
+                content.extend(chunk)
+    with zipfile.ZipFile(io.BytesIO(content)) as archive:
+        csv_files = [item for item in archive.infolist() if item.filename.lower().endswith(".csv")]
+        if not csv_files:
+            raise ValueError(f"{BREAKPOINTS_URL}: no CSV inside the archive")
+        csv_file = csv_files[0]
+        if not 0 <= csv_file.file_size <= MAX_CSV_BYTES:
+            raise AuthorizationDenied("breakpoints CSV exceeds its bound")
+        return archive.read(csv_file).decode("utf-8", errors="replace")
 
 
 def load_breakpoints(
-    cache_path: Path | str = DEFAULT_CACHE_PATH,
+    cache_path: Path | str | None = None,
     *,
+    dispatch: ProviderDispatch | None = None,
     max_age_days: int = MAX_AGE_DAYS,
-    fetch: Callable[[], str] = fetch_breakpoints_csv,
+    inner_transport: httpx.BaseTransport | None = None,
 ) -> MEBreakpoints:
     """Read the cached CSV, refreshing it when stale or missing.
 
@@ -117,29 +160,38 @@ def load_breakpoints(
     backtest looks up are months old regardless. No cache and no fetch is
     an error — a blind prompt must not silently change shape.
     """
-    path = Path(cache_path)
-    fresh = path.exists() and (time.time() - path.stat().st_mtime) < max_age_days * 86400
+    if type(max_age_days) is not int or not 1 <= max_age_days <= 3650:
+        raise ValueError("breakpoints cache age is invalid")
+    path = Path(cache_path) if cache_path is not None else _default_cache_path()
+    cached_at = paths.file_mtime(path)
+    fresh = cached_at is not None and (time.time() - cached_at) < max_age_days * 86400
     if not fresh:
         try:
-            text = fetch()
+            text = fetch_breakpoints_csv(
+                dispatch=dispatch,
+                inner_transport=inner_transport,
+            )
+        except AuthorizationDenied:
+            raise
         except Exception:
-            if not path.exists():
+            if paths.file_mtime(path) is None:
                 raise
         else:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(text)
-    return MEBreakpoints.parse(path.read_text())
+            paths.write_text(path, text)
+    return MEBreakpoints.parse(paths.read_text(path))
 
 
 _shared: MEBreakpoints | None = None
 _shared_lock = threading.Lock()
 
 
-def shared_breakpoints() -> MEBreakpoints:
+def shared_breakpoints(
+    dispatch: ProviderDispatch | None = None,
+) -> MEBreakpoints:
     """Process-wide table, loaded once. Blind agents on many threads
     (the TUI warms them in parallel) share it."""
     global _shared
     with _shared_lock:
         if _shared is None:
-            _shared = load_breakpoints()
+            _shared = load_breakpoints(dispatch=dispatch)
         return _shared

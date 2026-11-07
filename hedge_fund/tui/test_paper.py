@@ -3,6 +3,7 @@
 import asyncio
 import os
 from datetime import datetime
+from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
@@ -11,7 +12,7 @@ from textual.widgets import ContentSwitcher, Input, OptionList, Static
 
 from hedge_fund import paths
 from hedge_fund.data.sessions import NEW_YORK
-from hedge_fund.paper import deploy, Ledger, load_deployed, PID_FILE
+from hedge_fund.paper import deploy, Ledger, load_deployed
 from hedge_fund.tui import backtest, funds, paper, paper_view, report
 from hedge_fund.tui.app import HedgeFundApp
 from hedge_fund.tui.fixtures import (
@@ -50,7 +51,112 @@ def test_all_modes_can_be_backtested_and_paper_traded(mode, size):
     asyncio.run(scenario())
 
 
-def test_paper_screen_records_approval_verdicts_from_y_and_n():
+def test_enrolled_root_displays_tui_write_denial_and_blocks_paper_controls(monkeypatch):
+    from hedge_fund.paper import runner as legacy_runner
+    from hedge_fund.runtime.admission import AdmissionCoordinator, RootOwnerLease
+    from hedge_fund.runtime.handover import enroll_fresh, record_ledger_head
+    from hedge_fund.runtime.root import RootContext
+
+    root = Path(os.environ["HEDGE_FUND_TEST_ROOT"]) / "tui-enrolled"
+    root.mkdir()
+    spec = make_spec(["pead"], "alpha").model_copy(update={"approval_required": True})
+    forbidden_client = Mock(side_effect=AssertionError("TUI reached provider setup"))
+    forbidden_action = Mock(side_effect=AssertionError("TUI reached a paper writer"))
+    monkeypatch.setattr(paper, "make_data_client", forbidden_client)
+    monkeypatch.setattr(paper, "tick", forbidden_action)
+    monkeypatch.setattr(paper, "redo", forbidden_action)
+    monkeypatch.setattr(legacy_runner, "spawn_runner", forbidden_action)
+    monkeypatch.setattr(legacy_runner, "stop_runner", forbidden_action)
+
+    with RootContext.open(root) as context, paths.bound_root(context):
+        enroll_fresh(context)
+        owner = RootOwnerLease.acquire(context, timeout=0)
+        admission = AdmissionCoordinator(context, owner_lease=owner)
+        try:
+            with admission.deployment_lock("alpha", timeout=0):
+                directory = deploy("alpha", spec, ["TEST"], root=paths.PAPER_DIR)
+            ledger = Ledger(directory)
+            pending = make_pending("2025-01-20")
+            with admission.manual_session("alpha", timeout=0):
+                ledger.append(make_session("2025-01-20", decision=pending))
+            record_ledger_head(context, "alpha", admission=admission)
+            before_files = {path.relative_to(root).as_posix(): path.read_bytes() for path in root.rglob("*") if path.is_file() and "runtime/private" not in path.relative_to(root).as_posix()}
+
+            async def scenario():
+                app = HedgeFundApp()
+                async with app.run_test(size=(140, 50)) as pilot:
+                    await app.push_screen(paper.PaperScreen(select="alpha"))
+                    screen = app.screen
+                    detail = render(screen.query_one("#detail-body", Static).content)
+                    assert "WRITE UNAVAILABLE" in detail
+                    assert "enrolled roots" in detail
+
+                    screen.action_run()
+                    assert app.screen is screen
+                    screen.action_runner()
+                    assert app.screen is screen
+                    screen.action_halt()
+                    screen.action_resume()
+                    screen.action_approve()
+                    screen.action_reject()
+                    screen.action_delete()
+                    screen._finish_delete("alpha", True)
+                    assert app.screen is screen
+
+                    await app.push_screen(paper.RunSessionScreen(directory))
+                    for _ in range(20):
+                        await pilot.pause(0.05)
+                        if app.screen._phase == "failed":
+                            break
+                    assert app.screen._phase == "failed"
+                    assert "TUI paper writes are disabled on enrolled roots" in render(app.screen.query_one("#run-phase", Static).content)
+
+                    await app.push_screen(paper.BuilderScreen(mode="paper"))
+                    app.screen._finish_build()
+
+            asyncio.run(scenario())
+            with pytest.raises(RuntimeError, match="TUI paper writes are disabled"):
+                funds.wipe_fund("alpha")
+
+            after_files = {path.relative_to(root).as_posix(): path.read_bytes() for path in root.rglob("*") if path.is_file() and "runtime/private" not in path.relative_to(root).as_posix()}
+            assert after_files == before_files
+            assert not (root / "mandates").exists()
+            forbidden_client.assert_not_called()
+            forbidden_action.assert_not_called()
+        finally:
+            owner.close()
+
+
+def test_tui_delete_denies_orphaned_admission_state_without_side_effects(tmp_path):
+    from hedge_fund.runtime.handover import enroll_fresh, HANDOVER_PATH
+    from hedge_fund.runtime.root import RootContext
+
+    root = tmp_path / "tui-orphan"
+    root.mkdir()
+    with RootContext.open(root) as context:
+        enroll_fresh(context)
+        mandate = root / "mandates" / "alpha.yaml"
+        mandate.parent.mkdir()
+        mandate.write_text("synthetic: true\n", encoding="utf-8")
+        paper_record = root / "paper" / "alpha" / "ledger" / "record.json"
+        paper_record.parent.mkdir(parents=True)
+        paper_record.write_text("synthetic-ledger\n", encoding="utf-8")
+        (root / HANDOVER_PATH).unlink()
+
+        with paths.bound_root(context):
+            with pytest.raises(
+                RuntimeError,
+                match="root enrollment or ledger inventory is unavailable",
+            ):
+                funds.wipe_fund("alpha")
+
+        assert mandate.read_text(encoding="utf-8") == "synthetic: true\n"
+        assert paper_record.read_text(encoding="utf-8") == "synthetic-ledger\n"
+
+
+def test_paper_screen_denies_approval_verdicts_from_y_and_n(monkeypatch):
+    """Approval verdicts write the ledger's approval lane, which the TUI never
+    holds: y and n are offered for a pending gated decision but denied."""
     spec = make_spec(["pead"], "alpha").model_copy(update={"approval_required": True})
     directory = deploy("alpha", spec, ["TEST"], root=paths.PAPER_DIR)
     ledger = Ledger(directory)
@@ -67,24 +173,16 @@ def test_paper_screen_records_approval_verdicts_from_y_and_n():
             detail = render(screen.query_one("#detail-body", Static).content)
             assert "awaiting approval — y approve · n reject" in detail
 
+            notified: list[str] = []
+            monkeypatch.setattr(screen, "notify", lambda message, **_kwargs: notified.append(message))
             await pilot.press("y")
             await pilot.pause()
-            approval = ledger.approval()
-            assert approval is not None
-            assert approval["verdict"] == "approve" and approval["by"] == "tui"
-            assert approval["decision_as_of"] == pending.as_of
-            assert approval["decision_hash"] == state.prev_hash
-            assert [event["kind"] for event in ledger.events()] == ["approve"]
-            detail = render(screen.query_one("#detail-body", Static).content)
-            assert "approved for execution" in detail
-
             await pilot.press("n")
             await pilot.pause()
-            rejection = ledger.approval()
-            assert rejection is not None
-            assert rejection["verdict"] == "reject" and rejection["by"] == "tui"
-            assert [event["kind"] for event in ledger.events()] == ["approve", "reject"]
-            assert "rejected; decision will lapse" in render(screen.query_one("#detail-body", Static).content)
+            assert notified == ["TUI paper writes are disabled on enrolled roots; use the web desk.", "TUI paper writes are disabled on enrolled roots; use the web desk."]
+            assert ledger.approval() is None and ledger.events() == []
+            assert ledger.replay(spec.capital).prev_hash == state.prev_hash
+            assert "awaiting approval" in render(screen.query_one("#detail-body", Static).content)
 
     asyncio.run(scenario())
 
@@ -169,67 +267,40 @@ def test_paper_screen_shows_live_prints_when_they_arrive(monkeypatch):
     asyncio.run(scenario())
 
 
-def test_paper_screen_runs_through_the_approval_step(monkeypatch):
+def test_paper_screen_execution_denies_before_provider_or_ledger_effects(monkeypatch):
     spec = make_spec(["pead"], "alpha")
     directory = deploy("alpha", spec, ["TEST"], root=paths.PAPER_DIR)
     ledger = Ledger(directory)
-    record, decided = executed_and_decided()
-    ledger.append(make_session("2025-01-17", decision=decided, nav=100000))
-    due = {"value": "2025-01-21"}
-    monkeypatch.setattr(paper, "make_data_client", lambda: Mock(__enter__=lambda s: s, __exit__=lambda s, *a: None))
-    monkeypatch.setattr(paper, "next_session", lambda data, spec, last, **kw: due["value"])
-    monkeypatch.setenv("FINANCIAL_DATASETS_API_KEY", "x")
-    monkeypatch.setenv("HEDGE_FUND_LLM_MODEL", "jev-1.13.0")
-    monkeypatch.setenv("TYPESAFE_API_KEY", "x")
-    started: list = []
-    monkeypatch.setattr(paper.RunSessionScreen, "_run", lambda self: started.append(self._directory))
+    before_records = ledger.records()
+    before_events = ledger.events()
+    forbidden_client = Mock(side_effect=AssertionError("TUI execution reached provider setup"))
+    monkeypatch.setattr(paper, "make_data_client", forbidden_client)
 
     async def scenario():
         app = HedgeFundApp()
         async with app.run_test(size=(140, 50)) as pilot:
             await app.push_screen(paper.PaperScreen())
             screen = app.screen
-            detail = render(screen.query_one("#detail-body", Static).content)
-            assert "NEXT RUN" in detail and "execute the 2025-01-20 decision" in detail
-            assert "TEST +25%" in detail and "SESSIONS" in detail and "2025-01-17" in detail
+            notified = []
+            monkeypatch.setattr(screen, "notify", lambda message, **_kwargs: notified.append(message))
             await pilot.press("enter")
             await pilot.pause()
-            modal = app.screen
-            assert isinstance(modal, paper.RunConfirmScreen)
-            body = render(modal.query_one("#run-body", Static).content)
-            assert "Execute the 2025-01-20 decision at the 2025-01-21 close" in body
-            assert "TEST +25%" in body and "first session of the week" in body
-            assert modal.check_action("confirm", ())
-            await pilot.press("escape")  # say no: nothing runs
-            assert app.screen is screen and started == []
-            await pilot.press("enter")
-            await pilot.pause()
-            await pilot.press("enter")  # say yes
-            await pilot.pause()
-            assert isinstance(app.screen, paper.RunSessionScreen) and started == [directory]
-            app.screen._phase = "done"
-            await pilot.press("escape")
             assert app.screen is screen
-            # Nothing due: the modal says when the next close is and offers
-            # to run the last session again; enter does that, esc does nothing.
-            due["value"] = None
-            await pilot.press("enter")
+            assert notified == ["TUI paper execution lacks operation-bound authorization. Use the explicit-root CLI or web desk."]
+            run_screen = paper.RunSessionScreen(directory)
+            await app.push_screen(run_screen)
+            for _ in range(20):
+                await pilot.pause(0.05)
+                if run_screen._phase == "failed":
+                    break
+            assert run_screen._phase == "failed"
+            assert "TUI paper writes are disabled on enrolled roots; use the web desk." in render(run_screen.query_one("#run-phase", Static).content)
             await pilot.pause()
-            modal = app.screen
-            assert isinstance(modal, paper.RunConfirmScreen) and modal.check_action("confirm", ())
-            body = render(modal.query_one("#run-body", Static).content)
-            assert "Up to date through 2025-01-17" in body and "Run 2025-01-17 again?" in body
-            assert "run again" in render(modal.query_one("#run-keys", Static).content)
-            await pilot.press("escape")
-            assert app.screen is screen and started == [directory]
-            await pilot.press("enter")
-            await pilot.pause()
-            await pilot.press("enter")
-            await pilot.pause()
-            assert isinstance(app.screen, paper.RunSessionScreen) and app.screen._redo
-            assert started == [directory, directory]
 
     asyncio.run(scenario())
+    forbidden_client.assert_not_called()
+    assert ledger.records() == before_records
+    assert ledger.events() == before_events
 
 
 @pytest.mark.parametrize("size", [(120, 45), (80, 24)])
@@ -248,32 +319,44 @@ def test_session_report_separates_the_executed_cycle_from_the_new_decision(size,
             footer = render(screen.query_one("#report-foot", Static).content)
             menu = screen.query_one("#report-nav", OptionList)
             ids = [menu.get_option_at_index(i).id for i in range(menu.option_count)]
+
+            async def browse_to(option_id):
+                target = menu.get_option_index(option_id)
+                assert target is not None
+                for _ in range(menu.option_count * 2):
+                    if menu.highlighted == target:
+                        return
+                    await pilot.press("down")
+                    await pilot.pause()
+                raise AssertionError(f"report option {option_id} did not receive keyboard focus")
+
             assert "alpha" in head and "session 2025-01-20" in head
             assert "NAV $100,000.00" in footer
             if what in ("executed", "both"):
                 assert "executed the 2025-01-15 decision (refreshed 2025-01-19)" in head
                 assert "x:sec:orders" in ids and "x:sec:portfolio" in ids
-                menu.highlighted = menu.get_option_index("x:sec:portfolio")
-                await pilot.pause()
+                await browse_to("x:sec:portfolio")
                 assert "Target net" in render(screen.query_one("#detail-pane", Static).content)
             if what in ("decided", "both"):
                 assert "executes next session" in head
                 assert "d:sec:portfolio" in ids and "d:sec:orders" not in ids
-                menu.highlighted = menu.get_option_index("d:sec:portfolio")
-                await pilot.pause()
+                await browse_to("d:sec:portfolio")
                 detail = render(screen.query_one("#detail-pane", Static).content)
                 assert "PROPOSED ALLOCATIONS" in detail and "TEST: +25.00%" in detail
             if what == "neither":
                 assert "valuation only" in head
                 assert ids == [None, "book"]
-                menu.highlighted = menu.get_option_index("book")
-                await pilot.pause()
+                await browse_to("book")
                 assert "flat — no positions" in render(screen.query_one("#detail-pane", Static).content)
 
     asyncio.run(scenario())
 
 
-def test_paper_screen_works_the_kill_switch_and_sessions_reads_the_ledger(tmp_path):
+def test_paper_screen_works_the_kill_switch_and_sessions_reads_the_ledger(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(paper, "fetch_snapshots", lambda _tickers: {})
     spec = make_spec(["pead"], "alpha")
     directory = deploy("alpha", spec, ["TEST"], root=paths.PAPER_DIR)
     ledger = Ledger(directory)
@@ -290,9 +373,17 @@ def test_paper_screen_works_the_kill_switch_and_sessions_reads_the_ledger(tmp_pa
             assert "● new" in detail and "mark the book at the latest completed close" in detail
             assert screen.check_action("halt", ()) and not screen.check_action("resume", ())
 
-            await pilot.press("h")  # no prompt: halts at once
+            notified: list[str] = []
+            monkeypatch.setattr(screen, "notify", lambda message, **_kwargs: notified.append(message))
+            await pilot.press("h")  # the kill switch writes the halt lane: denied in the TUI
             await pilot.pause()
             assert app.screen is screen
+            assert notified == ["TUI paper writes are disabled on enrolled roots; use the web desk."]
+            assert ledger.halted() is None and ledger.events() == []
+            # A halt recorded elsewhere (CLI or web desk) is shown on reload.
+            ledger.halt(paper_view.APP_HALT)
+            screen._populate("alpha")
+            await pilot.pause()
             assert ledger.halted() == paper_view.APP_HALT
             assert menu.highlighted == menu.get_option_index("paper:0")  # re-highlighted after the reload
             detail = render(screen.query_one("#detail-body", Static).content)
@@ -301,10 +392,11 @@ def test_paper_screen_works_the_kill_switch_and_sessions_reads_the_ledger(tmp_pa
             await pilot.press("enter")  # halted funds do not run
             await pilot.pause()
             assert app.screen is screen
-            await pilot.press("r")
+            await pilot.press("r")  # resume is reconciliation-bound: denied, still halted
             await pilot.pause()
-            assert ledger.halted() is None
-            assert [e["kind"] for e in ledger.events()] == ["halt", "resume"]
+            assert notified[-1] == "TUI paper writes are disabled on enrolled roots; use the web desk."
+            assert ledger.halted() == paper_view.APP_HALT
+            assert [e["kind"] for e in ledger.events()] == ["halt"]
 
             # Two sessions land in the ledger behind the screen's back; coming
             # back to the screen re-reads them.
@@ -317,14 +409,14 @@ def test_paper_screen_works_the_kill_switch_and_sessions_reads_the_ledger(tmp_pa
             await pilot.press("escape")
             await pilot.pause()
             detail = render(screen.query_one("#detail-body", Static).content)
-            assert "○ idle" in detail and "mark the book" in detail and "2025-01-17 · 2 sessions" in detail
+            assert "■ halted" in detail and "2025-01-17 · 2 sessions" in detail
             assert "SESSIONS" in detail and "2025-01-20" in detail and "1 fill" in detail
-            assert "+1.0%" in render(menu.get_option("paper:0").prompt)
+            assert "■ halted" in render(menu.get_option("paper:0").prompt)  # halted rows show state, not return
 
             await pilot.press("s")
             sessions_screen = app.screen
             assert isinstance(sessions_screen, paper.SessionsScreen)
-            assert "last session 2025-01-20" in render(sessions_screen.query_one("#pf-status", Static).content)
+            assert "HALTED" in render(sessions_screen.query_one("#pf-status", Static).content)
             assert "+1.00%" in render(sessions_screen.query_one("#stat-return", Static).content)
             sessions = sessions_screen.query_one("#pf-sessions", OptionList)
             rows = [render(sessions.get_option_at_index(i).prompt) for i in range(sessions.option_count)]
@@ -339,30 +431,24 @@ def test_paper_screen_works_the_kill_switch_and_sessions_reads_the_ledger(tmp_pa
             await pilot.press("escape")
             assert app.screen is screen
 
-            # d deletes the fund — ledger, book, definition and backtests — after a yes.
+            # d would wipe ledger, book, definition and backtests: denied with no
+            # confirmation modal, and every file stays.
             (paths.MANDATES_DIR / "alpha.yaml").write_text(yaml.safe_dump(spec.model_dump()))
             await pilot.press("d")
-            modal = app.screen
-            assert isinstance(modal, funds.ConfirmWipeScreen)
-            manifest = render(modal.query_one("#confirm-files", Static).content)
-            assert "2 sessions of ledger" in manifest and "alpha.yaml" in manifest and "name is free again" in manifest
-            await pilot.press("escape")  # no
-            assert app.screen is screen and directory.exists()
-            await pilot.press("d")
-            await pilot.press("enter")  # yes
             await pilot.pause()
             assert app.screen is screen
-            assert not directory.exists() and not (paths.MANDATES_DIR / "alpha.yaml").exists()
-            assert [menu.get_option_at_index(i).id for i in range(menu.option_count)] == ["build"]
-            assert not screen.check_action("delete", ()) and not screen.check_action("halt", ())
+            assert notified[-1] == "TUI paper writes are disabled on enrolled roots; use the web desk."
+            assert directory.exists() and (paths.MANDATES_DIR / "alpha.yaml").exists()
+            assert len(ledger.records()) == 2
+            assert [menu.get_option_at_index(i).id for i in range(menu.option_count)] == ["paper:0", "build"]
 
     asyncio.run(scenario())
 
 
-def test_paper_screen_enter_on_a_minute_fund_opens_the_same_approval_step(monkeypatch):
-    """Enter means one thing at every cadence: run the next session, through
-    the modal, onto the board. For a minute fund the session is the current
-    bar, named by its clock time."""
+def test_paper_screen_enter_on_a_minute_fund_reports_execution_unavailable(monkeypatch):
+    """Enter means one thing at every cadence. TUI execution lacks
+    operation-bound authorization, so a minute fund gets the same denial as a
+    daily one: no confirmation modal, no session board, no provider setup."""
     directory = deploy("fast", make_minute_spec(), ["TEST"], root=paths.PAPER_DIR)
     for variable in ("FINANCIAL_DATASETS_API_KEY", "TYPESAFE_API_KEY"):
         monkeypatch.setenv(variable, "x")
@@ -377,73 +463,47 @@ def test_paper_screen_enter_on_a_minute_fund_opens_the_same_approval_step(monkey
         async with app.run_test(size=(140, 50)) as pilot:
             await app.push_screen(paper.PaperScreen())
             screen = app.screen
+            notified: list[str] = []
+            monkeypatch.setattr(screen, "notify", lambda message, **_kwargs: notified.append(message))
             await pilot.press("enter")
             await pilot.pause()
-            modal = app.screen
-            assert isinstance(modal, paper.RunConfirmScreen) and modal.check_action("confirm", ())
-            assert "through 2025-01-21 13:05:00 ET?" in render(modal.query_one("#run-q", Static).content)
-            body = render(modal.query_one("#run-body", Static).content)
-            assert "Mark the book at the 2025-01-21 13:05:00 ET print, taken now" in body
-            assert "first decision" in body
-            await pilot.press("enter")
-            await pilot.pause()
-            assert isinstance(app.screen, paper.RunSessionScreen) and started == [directory]
-            app.screen._phase = "done"
-            await pilot.press("escape")
             assert app.screen is screen
+            assert notified == ["TUI paper execution lacks operation-bound authorization. Use the explicit-root CLI or web desk."]
+            assert started == [] and Ledger(directory).records() == []
 
     asyncio.run(scenario())
 
 
 @pytest.mark.parametrize("cadence", ["daily", "minute"])
-def test_paper_screen_space_starts_and_stops_a_runner_at_any_cadence(monkeypatch, cadence):
+def test_paper_screen_space_reports_runner_controls_disabled(monkeypatch, cadence):
+    from hedge_fund.paper import runner as legacy_runner
+
     spec = make_minute_spec() if cadence == "minute" else make_spec(["pead"], "alpha")
     directory = deploy(spec.name, spec, ["TEST"], root=paths.PAPER_DIR)
-    for variable in ("FINANCIAL_DATASETS_API_KEY", "TYPESAFE_API_KEY"):
-        monkeypatch.setenv(variable, "x")
-    monkeypatch.setenv("HEDGE_FUND_LLM_MODEL", "jev-1.13.0")
-    spawned, stopped = [], []
+    assert directory.is_dir()
+    effects = []
 
-    def spawn(path):
-        spawned.append(path)
-        (path / PID_FILE).write_text(str(os.getpid()))  # what the real runner does on start
-        return os.getpid()
-
-    def stop(path):
-        stopped.append(path)
-        (path / PID_FILE).unlink()
-        return True
-
-    monkeypatch.setattr(paper, "spawn_runner", spawn)
-    monkeypatch.setattr(paper, "stop_runner", stop)
+    def forbidden(*_args, **_kwargs):
+        effects.append(True)
+        pytest.fail("disabled TUI runner reached process control")
 
     async def scenario():
         app = HedgeFundApp()
         async with app.run_test(size=(140, 50)) as pilot:
             await app.push_screen(paper.PaperScreen())
             screen = app.screen
-            menu = screen.query_one("#paper-menu", OptionList)
-            assert "● new" in render(menu.get_option("paper:0").prompt)
+            monkeypatch.setattr(legacy_runner, "spawn_runner", forbidden)
+            monkeypatch.setattr(legacy_runner, "stop_runner", forbidden)
+            monkeypatch.setattr(paper_view, "is_running", forbidden)
+            notified = []
+            monkeypatch.setattr(screen, "notify", lambda message, **_kwargs: notified.append(message))
             await pilot.press("space")
-            await pilot.pause()
-            assert spawned == [directory] and app.screen is screen  # no approval modal for a runner
-            assert "● running" in render(menu.get_option("paper:0").prompt)
-            detail = render(screen.query_one("#detail-body", Static).content)
-            assert "● running · space to stop" in detail
-            await pilot.press("enter")  # the runner owns the ledger while it is up: enter does not run
             await pilot.pause()
             assert app.screen is screen
-            await pilot.press("space")
-            await pilot.pause()
-            assert stopped == [directory] and "● new" in render(menu.get_option("paper:0").prompt)
-            # A halted fund's runner is not started.
-            await pilot.press("h")
-            await pilot.pause()
-            await pilot.press("space")
-            await pilot.pause()
-            assert spawned == [directory]
+            assert notified == ["Unattended paper runners are disabled. Use the explicit-root CLI or web desk for one authorized session."]
 
     asyncio.run(scenario())
+    assert effects == []
 
 
 def test_sessions_screen_groups_a_minute_funds_bars_by_day():

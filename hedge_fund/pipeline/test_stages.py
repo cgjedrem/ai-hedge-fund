@@ -10,7 +10,11 @@ from hedge_fund.data.models import Price
 from hedge_fund.fund.spec import Fund, FundSpec
 from hedge_fund.models import Signal
 from hedge_fund.pipeline.models import CycleRecord
-from hedge_fund.pipeline.stages import assess_fund, execute_decision, mark_lookback_start
+from hedge_fund.pipeline.stages import (
+    assess_fund,
+    execute_decision,
+    mark_lookback_start,
+)
 
 
 def _cycle(fund, as_of, broker, data, universe):
@@ -127,6 +131,30 @@ def test_full_cycle_record_is_consistent():
     )
     # The short strategy's bearish view -> short position
     assert record.positions["MSFT"] < 0
+
+
+def test_assess_fund_reports_each_agent_completion():
+    spec = _spec(strategies=[{"name": "solo", "models": [{"name": "a"}, {"name": "b"}]}])
+    fund = Fund(
+        spec,
+        models={
+            "solo": [
+                FakeAnalyst("a", views={"AAPL": 1.0}),
+                FakeAnalyst("b", views={"MSFT": -1.0}),
+            ]
+        },
+    )
+    progress = []
+
+    assess_fund(
+        fund,
+        "2024-06-03",
+        FakeDataClient(CLOSES),
+        ["AAPL", "MSFT", "NVDA"],
+        on_progress=lambda completed, total: progress.append((completed, total)),
+    )
+
+    assert progress == [(completed, 6) for completed in range(1, 7)]
 
 
 def test_netting_math_two_strategies_unequal_slices():

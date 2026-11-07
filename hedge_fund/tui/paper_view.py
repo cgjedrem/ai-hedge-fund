@@ -68,7 +68,7 @@ class PaperSnapshot:
         self.records: list[SessionRecord] = []
         self.state: FundState | None = None
         self.error: str | None = None
-        self.running = is_running(directory)  # a runner process holds the fund
+        self.running = is_running(directory)  # status only; process control stays disabled
         try:
             self.records = self.ledger.records()
             self.state = self.ledger.replay(self.deployed.spec.capital)
@@ -154,8 +154,7 @@ class PaperSnapshot:
         return performance_metrics(self.spec.capital, dates, nav, bench, cycles, periods_per_year=per_year)
 
     def _state_word(self) -> tuple[str, str, str]:
-        """Glyph, word, tone, the same vocabulary at every cadence: a runner
-        up is running; otherwise new until the first session, then idle."""
+        """Show ledger and PID state; PID never grants control."""
         if self.error:
             return "✗", "ledger error", RED
         if self.halted:
@@ -210,17 +209,24 @@ def paper_slot(index: int, snap: PaperSnapshot) -> Text:
 
 
 def next_run_rows(snap: PaperSnapshot, now: datetime | None = None) -> list[tuple[str, Text | str]]:
-    """What the next run will do, from the ledger alone — no network on a
-    highlight. When the next session arrives and whether a runner will take
-    it; then what happens to the pending decision, then whether a new one is
-    made. The exact session is resolved when the user asks to run."""
+    """Show next session and decision state without provider calls."""
     if snap.halted:
         rows: list[tuple[str, Text | str]] = [("Halted", Text("r to resume before it can run", style=RED))]
         if snap.halted not in (APP_HALT, "halted"):  # a reason given from the CLI
             rows.append(("", Text(snap.halted, style=MUTED)))
         return rows
     moment = now or datetime.now(NEW_YORK)
-    rows: list[tuple[str, Text | str]] = [("Next bar" if snap.intraday else "Next close", Text.assemble((following_session(snap.spec, snap.last_session, moment).removesuffix(" close"), BRIGHT), ("   ● running · space to stop" if snap.running else "   ○ idle · space to start a runner", GREEN if snap.running else MUTED)))]
+    runner_status = "   ● legacy runner active · writes unavailable" if snap.running else "   ○ idle · unattended runner disabled"
+    runner_style = GREEN if snap.running else MUTED
+    rows: list[tuple[str, Text | str]] = [
+        (
+            "Next bar" if snap.intraday else "Next close",
+            Text.assemble(
+                (following_session(snap.spec, snap.last_session, moment).removesuffix(" close"), BRIGHT),
+                (runner_status, runner_style),
+            ),
+        )
+    ]
     if snap.pending is not None:
         if snap.gate:
             approval = snap.approval
@@ -291,7 +297,7 @@ def live_rows(
     today = today or datetime.now(NEW_YORK).date().isoformat()
     stale = newest.date().isoformat() < today
     tone = MUTED if stale else GREEN if change >= 0 else RED
-    when = newest.strftime("%b %-d %H:%M") if stale else newest.strftime("%H:%M")
+    when = f"{newest:%b} {newest.day} {newest:%H:%M}" if stale else newest.strftime("%H:%M")
     return [("Live", Text.assemble((f"${value:,.0f}", MUTED if stale else TEXT), (f"   {change:+.2%}", tone), (f"   as of {when} ET", MUTED)))]
 
 

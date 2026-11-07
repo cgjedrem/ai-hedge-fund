@@ -44,8 +44,12 @@ def assess_fund(
     data_client: DataClient,
     universe: list[str],
     clock: Clock | None = None,
+    *,
+    on_progress: Callable[[int, int], None] | None = None,
 ) -> DecisionRecord:
     """Construct validated target weights using only the assessment cutoff."""
+    if on_progress is not None and not callable(on_progress):
+        raise ValueError("assessment progress callback must be callable")
     clock = clock or clock_for(fund.spec, data_client)
     if not clock.is_complete(as_of):
         raise ValueError(f"assessment {as_of} requires incomplete data")
@@ -64,11 +68,16 @@ def assess_fund(
     total_slice = sum(s.weight for s, _ in fund.strategies)
     strategy_records: list[StrategyRecord] = []
     netted: dict[str, float] = {t: 0.0 for t in tradeable}
+    total_agents = len(tradeable) * sum(len(staff) for _, staff in fund.strategies)
+    completed_agents = 0
     for strategy, staff in fund.strategies:
         signals: list[Signal] = []
         for ticker in tradeable:
             for model in staff:
                 signals.append(model.predict(ticker, as_of, view))
+                completed_agents += 1
+                if on_progress is not None:
+                    on_progress(completed_agents, total_agents)
         blend = blend_signals(
             signals,
             strategy.model_weights,
@@ -126,25 +135,32 @@ def execute_decision(
     clock: Clock | None = None,
     *,
     on_fill: Callable[[Order, Fill], None] | None = None,
+    before_effect: Callable[[], None] | None = None,
+    before_order: Callable[[], None] | None = None,
+    on_progress: Callable[[int, int], None] | None = None,
 ) -> CycleRecord:
     """Refresh views before sizing a complete rebalance at exact session prices."""
+    if on_progress is not None and not callable(on_progress):
+        raise ValueError("execution progress callback must be callable")
     clock = clock or clock_for(fund.spec, data_client)
     if session <= original.as_of or not clock.is_complete(session):
         raise ValueError(f"execution session {session} must follow {original.as_of} and be complete")
     if fund.spec != original.spec:
         raise ValueError("fund mandate changed after assessment; create a new assessment")
     cutoff = clock.previous(session)
-    effective = (
-        original
-        if cutoff == original.as_of
-        else assess_fund(
+    if cutoff == original.as_of:
+        effective = original
+    else:
+        if before_effect is not None:
+            before_effect()
+        effective = assess_fund(
             fund,
             cutoff,
             data_client,
             original.universe,
             clock,
+            on_progress=on_progress,
         )
-    )
     spec = effective.spec
     validate_targets(spec, effective.strategies, effective.final_weights)
     held = broker.positions()
@@ -214,6 +230,10 @@ def execute_decision(
     deferred: list[Order] = []
     deferral_reason = None
     for index, order in enumerate(orders):
+        if before_order is not None:
+            before_order()
+        if before_effect is not None:
+            before_effect()
         try:
             fill = broker.place_order(order)
         except OrderSubmissionDeferred as exc:

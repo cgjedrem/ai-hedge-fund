@@ -1,47 +1,55 @@
-# Linux hosts (e.g. a home server): Docker Desktop's `host.docker.internal`
-# does not exist there. This override puts the containers on the host's own
-# network, so `localhost` inside the container IS the host — Ollama at
-# localhost:11434 needs no extra wiring, and no ports are published.
+# Linux hosts only. This override gives services host networking and preserves
+# literal-loopback Ollama endpoint policy. Requires Compose 2.24.0+ for !reset.
 #
-#   runner:   docker compose -f docker-compose.yml -f docker-compose.linux.yml up -d runner
+#   Set AIHF_DATA_ROOT to an existing absolute root before Compose commands.
+#   Runner:   docker compose -f docker-compose.yml -f docker-compose.linux.yml --profile runner run --rm runner
 #   TUI:      docker compose -f docker-compose.yml -f docker-compose.linux.yml run --rm tui
-#   Web desk: docker compose -f docker-compose.yml -f docker-compose.linux.yml --profile web up -d web
-#             (still published only on 127.0.0.1:8765)
-#   Web TUI:  docker compose -f docker-compose.yml -f docker-compose.linux.yml up -d tui-web
-#             (serves the TUI on 127.0.0.1:7681)
+#   Web inspection: set build identity args, then use --profile web up -d web.
+#   Web operator:   set build identity args, then use --profile web-operator up -d web-operator.
+#                   Starts read-only; explicit trust + SIGHUP activate writes,
+#                   SIGUSR1 downgrades before CLI inspect/revoke.
+# tui-web remains opt-in, but is not approved for use: ttyd has no configured
+# credentials and is downloaded without a pinned checksum. Use TUI CLI only.
 #
-# See the README's "Home server (Linux + Tailscale)" section.
+# Runner dispatch is free Yahoo data + local Ollama only.
 
 services:
   runner:
     network_mode: host
     environment:
-      - OLLAMA_BASE_URL=http://127.0.0.1:11434
+      - HEDGE_FUND_LLM_ENDPOINT=http://127.0.0.1:11434
+    command: ["--enable-network", "--model", "gemma3:4b", "paper", "tick", "demo-alpha"]
 
   runner-weekly:
     network_mode: host
     environment:
-      - OLLAMA_BASE_URL=http://127.0.0.1:11434
+      - HEDGE_FUND_LLM_ENDPOINT=http://127.0.0.1:11434
+    command: ["--enable-network", "--model", "gemma3:4b", "paper", "tick", "demo-weekly"]
 
   tui:
     network_mode: host
-    environment:
-      - OLLAMA_BASE_URL=http://127.0.0.1:11434
 
-  # Browser TUI: the full app in a browser tab, bound to loopback so only
-  # Tailscale (or an SSH tunnel) can reach it.
+  web:
+    network_mode: host
+    ports: !reset []
+    networks: !reset []
+    environment:
+      - HEDGE_FUND_LLM_ENDPOINT=http://127.0.0.1:11434
+
+  web-operator:
+    network_mode: host
+    ports: !reset []
+    networks: !reset []
+
+  # Legacy browser terminal. Explicit profile only; unresolved security review.
   tui-web:
     profiles: ["tui-web"]
     build: .
     stdin_open: true
     tty: true
     network_mode: host
-    environment:
-      - OLLAMA_BASE_URL=http://127.0.0.1:11434
-    entrypoint: ["ttyd", "-W", "-b", "127.0.0.1", "-p", "7681", "aihf"]
-
-  web:
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    environment:
-      - OLLAMA_BASE_URL=http://host.docker.internal:11434
+    volumes:
+      - type: bind
+        source: "${AIHF_DATA_ROOT:?Set AIHF_DATA_ROOT to an existing absolute data root}"
+        target: /data
+    entrypoint: ["ttyd", "-W", "-b", "127.0.0.1", "-p", "7681", "aihf", "--root", "/data"]

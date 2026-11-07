@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import stat
 from pathlib import Path
 
 from hedge_fund.backtesting.fund import FundBacktestResult, performance_metrics
@@ -13,15 +15,39 @@ from hedge_fund.paper.deployed import deploy
 from hedge_fund.paper.ledger import Ledger
 from hedge_fund.pipeline.models import CycleRecord, DecisionRecord, StrategyRecord
 from hedge_fund.pipeline.session import mandate_hash, SessionRecord
+from hedge_fund.runtime.admission import (
+    AdmissionCoordinator,
+    OwnershipUnknown,
+    RootOwnerLease,
+)
+from hedge_fund.runtime.exclusion import out_of_band_exclusion_basis
+from hedge_fund.runtime.handover import enroll_fresh
+from hedge_fund.runtime.root import RootContext
+
+DEMO_SEEDING_UNAVAILABLE = "Demo seeding is unavailable: out-of-band writer exclusion is unproven."
 
 
 def seed_demo(root: str | Path) -> Path:
     """Write deterministic fixtures under an explicit empty root."""
-    data_root = Path(root).expanduser().resolve()
+    data_root = _demo_root(root)
     data_root.mkdir(parents=True, exist_ok=True)
     if any(data_root.iterdir()):
         raise ValueError("demo root must be empty")
+    # Harness-owned roots only.
+    if out_of_band_exclusion_basis(data_root) is None:
+        raise OwnershipUnknown(DEMO_SEEDING_UNAVAILABLE)
 
+    with RootContext.open(data_root) as context:
+        enroll_fresh(context)
+        owner = RootOwnerLease.acquire(context)
+        admission = AdmissionCoordinator(context, owner_lease=owner)
+        try:
+            return _seed_demo_data(data_root, admission, context)
+        finally:
+            owner.close()
+
+
+def _seed_demo_data(data_root: Path, admission: AdmissionCoordinator, context: RootContext) -> Path:
     spec = FundSpec.model_validate(
         {
             "schema_version": 2,
@@ -42,8 +68,9 @@ def seed_demo(root: str | Path) -> Path:
             "approval_required": True,
         }
     )
-    save_spec(spec, data_root / "mandates")
-    paper_dir = deploy("demo-quality", spec, ["AAPL", "MSFT"], root=data_root / "paper")
+    save_spec(spec, data_root / "mandates", admission=admission)
+    with admission.deployment_lock(spec.name, timeout=0):
+        paper_dir = deploy("demo-quality", spec, ["AAPL", "MSFT"], root=data_root / "paper")
     ledger = Ledger(paper_dir)
 
     first = _decision(spec, "2024-06-03", 100.0, 0.8)
@@ -55,8 +82,9 @@ def seed_demo(root: str | Path) -> Path:
     record_two = _record(spec, second, cycle_one, 100_495, 89_995, {"AAPL": 100}, {"AAPL": 105.0}, 505.0, record_one)
     record_three = _record(spec, third, cycle_two, 100_995, 89_995, {"AAPL": 100}, {"AAPL": 110.0}, 502.5, record_two)
     records = [record_one, record_two, record_three]
-    for record in records:
-        ledger.append(record)
+    with admission.manual_session(spec.name, timeout=0):
+        for record in records:
+            ledger.append(record)
 
     dates = [record.session for record in records]
     nav = [record.nav for record in records]
@@ -75,8 +103,56 @@ def seed_demo(root: str | Path) -> Path:
         metrics=performance_metrics(spec.capital, dates, nav, benchmark_nav, [cycle_one, cycle_two]),
         records=records,
     )
-    save_result(result, directory=data_root / "research")
+    save_result(result, directory=data_root / "research", admission=admission)
     return data_root
+
+
+def _demo_root(root: str | Path) -> Path:
+    candidate = Path(root)
+    if os.environ.get("HEDGE_FUND_TEST_MODE") != "1":
+        return candidate.expanduser().resolve()
+
+    test_root_value = os.environ.get("HEDGE_FUND_TEST_ROOT", "")
+    test_root = Path(test_root_value)
+    if not test_root_value or not test_root.is_absolute():
+        raise RuntimeError("test demo requires an absolute test root")
+    if not candidate.is_absolute():
+        raise ValueError("test demo root must be absolute")
+
+    test_root = Path(os.path.abspath(os.fspath(test_root)))
+    data_root = Path(os.path.abspath(os.fspath(candidate)))
+    try:
+        relative = data_root.relative_to(test_root)
+    except ValueError:
+        raise ValueError(
+            "demo root must stay inside test-owned root",
+        ) from None
+
+    current = test_root
+    if is_reparse_point(current):
+        raise ValueError("test root cannot contain reparse points")
+    for part in relative.parts:
+        current = current / part
+        if is_reparse_point(current):
+            raise ValueError("demo root cannot contain reparse points")
+
+    resolved_test_root = test_root.resolve(strict=True)
+    resolved_data_root = data_root.resolve(strict=False)
+    if not resolved_data_root.is_relative_to(resolved_test_root):
+        raise ValueError(
+            "demo root must stay inside test-owned root",
+        )
+    return resolved_data_root
+
+
+def is_reparse_point(path: Path) -> bool:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return False
+    attributes = getattr(info, "st_file_attributes", 0)
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    return stat.S_ISLNK(info.st_mode) or bool(attributes & reparse_flag)
 
 
 def _strategy(spec: FundSpec, session: str, conviction: float) -> StrategyRecord:

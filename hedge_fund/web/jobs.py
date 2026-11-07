@@ -2,11 +2,27 @@
 
 from __future__ import annotations
 
+import logging
+import re
 import threading
+import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Callable, Mapping
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timezone
-from typing import Callable
+from typing import TypeVar
+
+from hedge_fund.runtime.operations import (
+    OperationBusy,
+    OperationRecord,
+    OperationStatus,
+    OperationStore,
+    WorkerFenced,
+)
+
+_LOGGER = logging.getLogger(__name__)
+_BUSY_RETRY_SECONDS = 30.0
+_T = TypeVar("_T")
 
 
 class JobConflict(RuntimeError):
@@ -17,143 +33,480 @@ class JobCancelled(Exception):
     """A research job reached a cooperative cancellation boundary."""
 
 
-class JobRegistry:
-    MAX_JOBS = 20
+class SlotReservation:
+    """Opaque in-process worker slot held from before durable acceptance until submit or release."""
 
-    def __init__(self) -> None:
+    __slots__ = ("_owner", "_settled")
+
+    def __init__(self, owner: "OperationJobRegistry") -> None:
+        self._owner = owner
+        self._settled = False
+
+
+class OperationJobRegistry:
+    """Run accepted operations with durable progress and safe-boundary cancellation.
+
+    Capacity is reserved with :meth:`try_reserve` before a request is durably
+    accepted, so a full worker denies admission instead of failing an accepted
+    operation. Slots bound this process only; callers pair them with a durable
+    root-wide bound in ``OperationStore.accept_request``.
+    """
+
+    MAX_TRACKED = 1000
+
+    def __init__(
+        self,
+        store: OperationStore,
+        *,
+        clock: Callable[[], datetime] | None = None,
+        max_active: int = 1,
+    ) -> None:
+        if not isinstance(store, OperationStore):
+            raise JobConflict("A durable operation store is required.")
+        if type(max_active) is not int or not 1 <= max_active <= 4:
+            raise JobConflict("Worker capacity is invalid.")
+        if clock is not None and not callable(clock):
+            raise JobConflict("Job clock is invalid.")
+        self._store = store
+        self._clock = clock or _now_datetime
         self._lock = threading.RLock()
-        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="aihf-web")
-        self._jobs: dict[str, dict] = {}
-        self._cancel_events: dict[str, threading.Event] = {}
-        self._futures = {}
+        self._executor = ThreadPoolExecutor(max_workers=max_active, thread_name_prefix="aihf-operation")
+        self._submitted: dict[str, Future | None] = {}
+        self._active: set[str] = set()
+        self._reserved = 0
+        self._stranded: set[str] = set()
+        self._max_active = max_active
         self._closed = False
+        self._shutdown_requested = threading.Event()
+
+    @property
+    def max_active(self) -> int:
+        return self._max_active
+
+    def try_reserve(self) -> SlotReservation | None:
+        """Reserve one worker slot before acceptance; ``None`` means capacity is full now."""
+        with self._lock:
+            if self._closed:
+                raise JobConflict("The operation worker is shutting down.")
+            if len(self._active) + self._reserved >= self._max_active:
+                return None
+            if len(self._submitted) + self._reserved >= self.MAX_TRACKED:
+                self._prune()
+                if len(self._submitted) + self._reserved >= self.MAX_TRACKED:
+                    return None
+            self._reserved += 1
+            return SlotReservation(self)
+
+    def release(self, reservation: SlotReservation | None) -> None:
+        """Return an unused reservation; a consumed or foreign reservation is ignored."""
+        if reservation is None:
+            return
+        with self._lock:
+            if reservation._owner is self and not reservation._settled:
+                reservation._settled = True
+                self._reserved -= 1
 
     def submit(
         self,
-        fund: str,
-        provider: str,
-        model: str,
-        work: Callable[[Callable[[int], None], Callable[[], bool]], dict],
-    ) -> dict:
+        operation: OperationRecord,
+        work: Callable[
+            [
+                Callable[[int], None],
+                Callable[[], bool],
+                Callable[[Callable[[], object]], object],
+            ],
+            Mapping[str, object],
+        ],
+        *,
+        reservation: SlotReservation | None = None,
+    ) -> OperationRecord:
+        if not isinstance(operation, OperationRecord) or not callable(work):
+            raise JobConflict("Accepted operation and worker are required.")
+        if reservation is not None and not isinstance(reservation, SlotReservation):
+            raise JobConflict("Worker reservation is invalid.")
+        with self._lock:
+            if reservation is not None and (reservation._owner is not self or reservation._settled):
+                raise JobConflict("Worker reservation is invalid.")
+            if self._closed:
+                raise JobConflict("The operation worker is shutting down.")
+            try:
+                current = self._store.get_operation(operation.operation_id)
+            except Exception:
+                # The accepted record may stay unfinished; reclaim it at the next admission.
+                self._stranded.add(operation.operation_id)
+                raise
+            if current.request_id != operation.request_id or current.request_digest != operation.request_digest:
+                raise JobConflict("Operation identity changed.")
+            if current.status is not OperationStatus.ACCEPTED or current.operation_id in self._submitted:
+                return current
+            held = 1 if reservation is not None else 0
+            if len(self._active) + self._reserved - held >= self._max_active:
+                self._stranded.add(current.operation_id)
+                raise JobConflict("Operation worker capacity is full.")
+            self._prune()
+            if len(self._submitted) + self._reserved - held >= self.MAX_TRACKED:
+                self._stranded.add(current.operation_id)
+                raise JobConflict("Operation history capacity is full.")
+            if reservation is not None:
+                reservation._settled = True
+                self._reserved -= 1
+            self._submitted[current.operation_id] = None
+            self._active.add(current.operation_id)
+            try:
+                future = self._executor.submit(self._run, current.operation_id, work)
+            except Exception as exc:
+                self._active.discard(current.operation_id)
+                try:
+                    self._store.interrupt(current.operation_id, now=self._now())
+                except Exception as interrupt_exc:
+                    self._stranded.add(current.operation_id)
+                    _log_failure("interrupt", interrupt_exc)
+                _log_failure("submit", exc)
+                raise JobConflict("Operation start is uncertain.") from None
+            self._submitted[current.operation_id] = future
+            future.add_done_callback(
+                lambda completed, operation_id=current.operation_id: self._future_done(
+                    operation_id,
+                    completed,
+                )
+            )
+            return current
+
+    def cancel(
+        self,
+        operation_id: str,
+        *,
+        request_id: str,
+        now: datetime | None = None,
+    ) -> OperationRecord:
         with self._lock:
             if self._closed:
-                raise JobConflict("The research worker is shutting down.")
-            if any(job["status"] in {"queued", "running"} for job in self._jobs.values()):
-                raise JobConflict("A research job is already running.")
-            self._prune()
-            job_id = uuid.uuid4().hex
-            job = {
-                "id": job_id,
-                "fund": fund,
-                "provider": provider,
-                "model": model,
-                "status": "queued",
-                "progress": 0,
-                "submitted_at": _now(),
-                "started_at": None,
-                "completed_at": None,
-                "report_id": None,
-                "error": None,
-                "cancel_requested": False,
-            }
-            cancel_event = threading.Event()
-            self._jobs[job_id] = job
-            self._cancel_events[job_id] = cancel_event
-            self._futures[job_id] = self._executor.submit(self._run, job_id, work, cancel_event)
-            return dict(job)
+                raise JobConflict("The operation worker is shutting down.")
+            operation = self._store.request_cancel(
+                operation_id,
+                request_id=request_id,
+                now=self._now() if now is None else now,
+            )
+            if operation.status is not OperationStatus.CANCEL_REQUESTED:
+                return operation
+            future = self._submitted.get(operation_id)
+            if future is None:
+                try:
+                    return self._retry_busy(lambda: self._store.acknowledge_cancel(operation_id, None, now=self._now()))
+                except WorkerFenced:
+                    return self._store.get_operation(operation_id)
+            if future.cancel():
+                return self._store.get_operation(operation_id)
+            return self._store.get_operation(operation_id)
 
-    def cancel(self, job_id: str) -> dict:
-        with self._lock:
-            job = self._jobs.get(job_id)
-            if job is None or job["status"] not in {"queued", "running"}:
-                raise JobConflict("Research job is not active.")
-            event = self._cancel_events[job_id]
-            event.set()
-            job["cancel_requested"] = True
-            future = self._futures.get(job_id)
-            if job["status"] == "queued" and future is not None and future.cancel():
-                self._mark_cancelled(job)
-            return dict(job)
+    def get(self, operation_id: str) -> OperationRecord:
+        return self._store.get_operation(operation_id)
 
-    def get(self, job_id: str) -> dict | None:
-        with self._lock:
-            job = self._jobs.get(job_id)
-            return dict(job) if job is not None else None
-
-    def list(self) -> list[dict]:
-        with self._lock:
-            return [dict(job) for job in sorted(self._jobs.values(), key=lambda item: item["submitted_at"], reverse=True)]
+    def list(self, *, limit: int = 100) -> tuple[OperationRecord, ...]:
+        return self._store.list_operations(limit=limit)
 
     def close(self) -> None:
         with self._lock:
             if self._closed:
                 return
             self._closed = True
-            for job_id, job in self._jobs.items():
-                if job["status"] not in {"queued", "running"}:
-                    continue
-                self._cancel_events[job_id].set()
-                job["cancel_requested"] = True
-                future = self._futures.get(job_id)
-                if job["status"] == "queued" and future is not None and future.cancel():
-                    self._mark_cancelled(job)
+            operation_ids = tuple(self._submitted)
+            futures = tuple(future for future in self._submitted.values() if future is not None)
+        for operation_id in operation_ids:
+            try:
+                operation = self._store.get_operation(operation_id)
+                if operation.status in {
+                    OperationStatus.ACCEPTED,
+                    OperationStatus.RUNNING,
+                }:
+                    self._store.request_cancel(
+                        operation_id,
+                        request_id=f"shutdown-{uuid.uuid4().hex}",
+                        now=self._now(),
+                    )
+            except Exception as exc:
+                _log_failure("shutdown-cancel", exc)
+        self._shutdown_requested.set()
+        for future in futures:
+            future.cancel()
         self._executor.shutdown(wait=True, cancel_futures=True)
+        for operation_id in operation_ids:
+            try:
+                operation = self._store.get_operation(operation_id)
+                if operation.status in {
+                    OperationStatus.ACCEPTED,
+                    OperationStatus.RUNNING,
+                    OperationStatus.CANCEL_REQUESTED,
+                }:
+                    self._store.interrupt(operation_id, now=self._now())
+            except Exception as exc:
+                _log_failure("shutdown-interrupt", exc)
+
+    def recover_unfinished(self) -> tuple[OperationRecord, ...]:
+        with self._lock:
+            if self._active or self._reserved:
+                raise JobConflict("Operation recovery requires an idle worker.")
+        return self._store.recover_unfinished(now=self._now())
 
     def _run(
         self,
-        job_id: str,
-        work: Callable[[Callable[[int], None], Callable[[], bool]], dict],
-        cancel_event: threading.Event,
+        operation_id: str,
+        work: Callable[
+            [
+                Callable[[int], None],
+                Callable[[], bool],
+                Callable[[Callable[[], object]], object],
+            ],
+            Mapping[str, object],
+        ],
     ) -> None:
-        with self._lock:
-            job = self._jobs[job_id]
-            if cancel_event.is_set():
-                self._mark_cancelled(job)
-                return
-            job["status"] = "running"
-            job["started_at"] = _now()
+        fence = None
+        try:
+            fence = self._retry_busy(
+                lambda: self._store.claim_worker(
+                    operation_id,
+                    worker_id=uuid.uuid4().hex,
+                    now=self._now(),
+                )
+            )
+            self._retry_busy(lambda: self._store.mark_running(operation_id, fence, now=self._now()))
+        except WorkerFenced:
+            self._acknowledge_cancellation(operation_id, fence)
+            self._finish_local(operation_id)
+            return
+        except Exception as exc:
+            try:
+                self._retry_busy(lambda: self._store.interrupt(operation_id, now=self._now()))
+            except Exception as interrupt_exc:
+                self._mark_stranded(operation_id)
+                _log_failure("interrupt", interrupt_exc, operation_id=operation_id)
+            self._finish_local(operation_id)
+            _log_failure("claim", exc, operation_id=operation_id)
+            return
 
-        def update(progress: int) -> None:
-            if cancel_event.is_set():
-                raise JobCancelled()
-            with self._lock:
-                current = self._jobs.get(job_id)
-                if current is not None and current["status"] == "running":
-                    current["progress"] = max(current["progress"], min(99, max(0, int(progress))))
+        def report_progress(value: int) -> None:
+            if type(value) is not int:
+                raise ValueError("progress is invalid")
+            bounded = min(99, max(0, value))
+            self._retry_busy(
+                lambda: self._store.update_progress(
+                    operation_id,
+                    fence,
+                    progress=bounded,
+                    now=self._now(),
+                )
+            )
+
+        def cancellation_requested() -> bool:
+            if self._shutdown_requested.is_set():
+                return True
+            try:
+                return self._retry_busy(lambda: self._store.cancellation_requested(operation_id, fence))
+            except WorkerFenced:
+                return True
+
+        def apply_if_current(effect: Callable[[], object]) -> object:
+            effect_started = False
+
+            def guarded_effect() -> object:
+                nonlocal effect_started
+                effect_started = True
+                return effect()
+
+            return self._retry_busy(
+                lambda: self._store.apply_if_current(operation_id, fence, guarded_effect),
+                retry_if=lambda: not effect_started,
+            )
+
+        phase = "work"
+        try:
+            result = work(report_progress, cancellation_requested, apply_if_current)
+            phase = "complete"
+            self._retry_busy(lambda: self._store.complete(operation_id, fence, result=result, now=self._now()))
+        except JobCancelled:
+            self._acknowledge_cancellation(operation_id, fence)
+        except WorkerFenced:
+            self._acknowledge_cancellation(operation_id, fence)
+        except Exception as exc:
+            try:
+                self._retry_busy(
+                    lambda: self._store.fail(
+                        operation_id,
+                        fence,
+                        error_code="worker-failed",
+                        now=self._now(),
+                    )
+                )
+            except WorkerFenced:
+                pass
+            except Exception as failure_exc:
+                self._mark_stranded(operation_id)
+                _log_failure("fail", failure_exc, operation_id=operation_id)
+            _log_failure(phase, exc, operation_id=operation_id)
+        finally:
+            self._finish_local(operation_id)
+
+    def _retry_busy(
+        self,
+        step: Callable[[], _T],
+        *,
+        retry_if: Callable[[], bool] | None = None,
+    ) -> _T:
+        # OperationBusy is raised only when the bounded lock wait expired before any durable change.
+        deadline = time.monotonic() + _BUSY_RETRY_SECONDS
+        delay = 0.05
+        while True:
+            try:
+                return step()
+            except OperationBusy:
+                if retry_if is not None and not retry_if():
+                    raise
+                if self._shutdown_requested.is_set() or time.monotonic() >= deadline:
+                    raise
+                time.sleep(delay)
+                delay = min(delay * 2, 0.5)
+
+    def _acknowledge_cancellation(
+        self,
+        operation_id: str,
+        fence,
+    ) -> None:
+        def acknowledge_if_requested() -> None:
+            operation = self._store.get_operation(operation_id)
+            if operation.status is OperationStatus.CANCEL_REQUESTED:
+                self._store.acknowledge_cancel(operation_id, fence, now=self._now())
 
         try:
-            result = work(update, cancel_event.is_set)
-        except JobCancelled:
-            with self._lock:
-                job = self._jobs[job_id]
-                self._mark_cancelled(job)
-        except Exception as exc:  # noqa: BLE001
-            with self._lock:
-                job = self._jobs[job_id]
-                job["status"] = "failed"
-                job["error"] = f"Research failed ({type(exc).__name__})."
-                job["completed_at"] = _now()
-        else:
-            with self._lock:
-                job = self._jobs[job_id]
-                job["status"] = "succeeded"
-                job["progress"] = 100
-                job["report_id"] = result.get("report_id") if isinstance(result, dict) else None
-                job["completed_at"] = _now()
+            self._retry_busy(acknowledge_if_requested)
+        except WorkerFenced:
+            pass
+        except Exception as exc:
+            self._mark_stranded(operation_id)
+            _log_failure("acknowledge-cancel", exc, operation_id=operation_id)
 
-    @staticmethod
-    def _mark_cancelled(job: dict) -> None:
-        job["status"] = "cancelled"
-        job["completed_at"] = _now()
+    def _mark_stranded(self, operation_id: str) -> None:
+        # The durable record may stay unfinished after this process stops running it.
+        with self._lock:
+            self._stranded.add(operation_id)
+
+    def reclaim_stranded(self) -> int:
+        """Interrupt this process's own records whose finalization failed; return how many settled.
+
+        Such records no longer run here but still count toward the durable
+        root-wide capacity bound, so admission reclaims them before counting.
+        """
+        with self._lock:
+            if self._closed:
+                return 0
+            candidates = tuple(operation_id for operation_id in self._stranded if operation_id not in self._active)
+        settled = 0
+        for operation_id in candidates:
+            try:
+                operation = self._store.get_operation(operation_id)
+                if operation.status in {
+                    OperationStatus.ACCEPTED,
+                    OperationStatus.RUNNING,
+                    OperationStatus.CANCEL_REQUESTED,
+                }:
+                    self._store.interrupt(operation_id, now=self._now())
+            except Exception as exc:
+                _log_failure("reclaim", exc, operation_id=operation_id)
+                continue
+            with self._lock:
+                self._stranded.discard(operation_id)
+            settled += 1
+        return settled
+
+    def _finish_local(self, operation_id: str) -> None:
+        with self._lock:
+            self._active.discard(operation_id)
+
+    def _future_done(self, operation_id: str, future: Future) -> None:
+        try:
+            if future.cancelled():
+                operation = self._store.get_operation(operation_id)
+                if operation.status is OperationStatus.CANCEL_REQUESTED:
+                    self._retry_busy(
+                        lambda: self._store.acknowledge_cancel(
+                            operation_id,
+                            None,
+                            now=self._now(),
+                        )
+                    )
+        except Exception as exc:
+            self._mark_stranded(operation_id)
+            _log_failure("future-cancel", exc, operation_id=operation_id)
+        finally:
+            self._finish_local(operation_id)
 
     def _prune(self) -> None:
-        finished = [job for job in sorted(self._jobs.values(), key=lambda item: item["submitted_at"]) if job["status"] not in {"queued", "running"}]
-        while len(self._jobs) >= self.MAX_JOBS and finished:
-            job_id = finished.pop(0)["id"]
-            self._jobs.pop(job_id, None)
-            self._cancel_events.pop(job_id, None)
-            self._futures.pop(job_id, None)
+        for operation_id in tuple(self._submitted):
+            if operation_id in self._active:
+                continue
+            try:
+                operation = self._store.get_operation(operation_id)
+            except Exception:
+                continue
+            if operation.status not in {
+                OperationStatus.ACCEPTED,
+                OperationStatus.RUNNING,
+                OperationStatus.CANCEL_REQUESTED,
+            }:
+                self._submitted.pop(operation_id, None)
+                if len(self._submitted) < self.MAX_TRACKED:
+                    return
+
+    def _now(self) -> datetime:
+        value = self._clock()
+        if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
+            raise JobConflict("Job clock must return timezone-aware time.")
+        return value
 
 
-def _now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+def _now_datetime() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _log_failure(phase: str, error: Exception, *, operation_id: str | None = None) -> None:
+    """Emit bounded types/codes/source locations; never exception text or frames."""
+    cause = error
+    seen = {id(cause)}
+    for _ in range(3):
+        candidate = cause.__cause__ or cause.__context__
+        if candidate is None or id(candidate) in seen:
+            break
+        seen.add(id(candidate))
+        cause = candidate
+    locations = []
+    trace = cause.__traceback__
+    while trace is not None and len(locations) < 8:
+        module = trace.tb_frame.f_globals.get("__name__", "")
+        function = trace.tb_frame.f_code.co_name
+        if isinstance(module, str) and re.fullmatch(r"hedge_fund\.[A-Za-z0-9_.]{1,120}", module):
+            if re.fullmatch(r"[A-Za-z0-9_]{1,64}", function):
+                locations.append(f"{module}.{function}:{trace.tb_lineno}")
+        trace = trace.tb_next
+
+    def error_type(value: BaseException) -> str:
+        cls = type(value)
+        module = cls.__module__
+        if isinstance(module, str) and (module == "builtins" or module.startswith("hedge_fund.")):
+            if re.fullmatch(r"[A-Za-z0-9_]{1,64}", cls.__name__):
+                return cls.__name__
+        return "ExternalError"
+
+    def error_number(name: str) -> int | None:
+        value = getattr(cause, name, None)
+        return value if type(value) is int else None
+
+    safe_operation_id = operation_id if isinstance(operation_id, str) and re.fullmatch(r"[a-f0-9]{32}", operation_id) else "unavailable"
+    _LOGGER.error(
+        "operation worker failure: operation_id=%s phase=%s type=%s cause_type=%s errno=%s winerror=%s locations=%s",
+        safe_operation_id,
+        phase,
+        error_type(error),
+        error_type(cause),
+        error_number("errno"),
+        error_number("winerror"),
+        ",".join(locations) or "unavailable",
+    )

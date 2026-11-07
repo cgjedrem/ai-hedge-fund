@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import inspect
+import math
+import types
 from pathlib import Path
-from typing import Any, Literal, TypeAlias
+from typing import Any, Callable, get_args, get_origin, Literal, TypeAlias, Union
 
 import yaml
 from pydantic import (
@@ -16,9 +19,11 @@ from pydantic import (
     ValidationError,
 )
 
+from hedge_fund import paths
 from hedge_fund.brokers.costs import TradingCosts
 from hedge_fund.llm.cache import PromptCache
 from hedge_fund.risk.limits import RiskLimits
+from hedge_fund.runtime.dispatch import ProviderDispatch
 from hedge_fund.signals import ALPHA_MODEL_REGISTRY, get_investment_approach, LLMAgent
 from hedge_fund.signals.base import AlphaModel
 
@@ -36,6 +41,85 @@ EARLIEST_WINDOW = "04:00"
 LATEST_WINDOW = "20:00"
 SAXO_REGULAR_OPEN = "09:30"
 SAXO_LAST_BAR = "15:59"
+_RUNTIME_MODEL_PARAMS = frozenset({"breakpoints", "breakpoints_dispatch", "cache", "fail_on_llm_error", "llm"})
+
+
+def _json_value(value: Any) -> bool:
+    if value is None or type(value) in {str, int, bool}:
+        return True
+    if type(value) is float:
+        return math.isfinite(value)
+    if type(value) is list:
+        return all(_json_value(item) for item in value)
+    if type(value) is dict:
+        return all(isinstance(key, str) and _json_value(item) for key, item in value.items())
+    return False
+
+
+def _matches_parameter_type(value: Any, annotation: Any) -> bool:
+    if isinstance(annotation, str):
+        annotation_types = {
+            "Any": Any,
+            "bool": bool,
+            "float": float,
+            "int": int,
+            "None": type(None),
+            "NoneType": type(None),
+            "str": str,
+        }
+        options = [part.strip() for part in annotation.split("|")]
+        if not options or any(option not in annotation_types for option in options):
+            return False
+        return any(_matches_parameter_type(value, annotation_types[option]) for option in options)
+    if annotation is inspect.Parameter.empty or annotation is Any:
+        return _json_value(value)
+    if annotation is type(None):
+        return value is None
+    if annotation is bool:
+        return type(value) is bool
+    if annotation is int:
+        return type(value) is int
+    if annotation is float:
+        if type(value) not in {int, float}:
+            return False
+        try:
+            return math.isfinite(float(value))
+        except (OverflowError, ValueError):
+            return False
+    if annotation is str:
+        return isinstance(value, str)
+    origin = get_origin(annotation)
+    if origin in {types.UnionType, Union}:
+        return any(_matches_parameter_type(value, option) for option in get_args(annotation))
+    return False
+
+
+def _validate_model_params(name: str, params: dict[str, Any]) -> dict[str, Any]:
+    model_type = ALPHA_MODEL_REGISTRY.get(name)
+    if model_type is None or not _json_value(params):
+        raise ValueError("model constructor parameters are invalid")
+    is_llm = issubclass(model_type, LLMAgent)
+    try:
+        constructor = inspect.signature(model_type.__init__)
+    except (TypeError, ValueError):
+        raise ValueError("model constructor parameters are invalid") from None
+    for key, value in params.items():
+        parameter = constructor.parameters.get(key)
+        if (
+            key in _RUNTIME_MODEL_PARAMS
+            or parameter is None
+            or parameter.kind
+            in {
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.VAR_POSITIONAL,
+                inspect.Parameter.VAR_KEYWORD,
+            }
+            or not _matches_parameter_type(value, parameter.annotation)
+        ):
+            raise ValueError("model constructor parameters are invalid")
+        if key == "samples" and is_llm and value < 1:
+            raise ValueError("model constructor parameters are invalid")
+    return params
 
 
 def _clock_seconds(hhmm: str) -> int:
@@ -106,6 +190,14 @@ class ModelSpec(BaseModel):
     def _declared_approach(cls, name: str) -> str:
         get_investment_approach(name)
         return name
+
+    @field_validator("params")
+    @classmethod
+    def _registered_constructor_params(cls, value: dict[str, Any], info) -> dict[str, Any]:
+        name = info.data.get("name")
+        if not isinstance(name, str):
+            raise ValueError("model constructor parameters are invalid")
+        return _validate_model_params(name, value)
 
 
 class BlendPolicy(BaseModel):
@@ -258,6 +350,33 @@ class FundSpec(BaseModel):
         return f"every {format_interval(self.interval_seconds)}"
 
 
+def model_call_bounds(
+    spec: FundSpec,
+    *,
+    local_llm_fallback: bool = False,
+) -> tuple[int, int]:
+    """Maximum model and LLM requests; local fallback reserves one extra request."""
+    if not isinstance(spec, FundSpec) or type(local_llm_fallback) is not bool:
+        raise ValueError("model-call estimate is invalid")
+    model_calls = 0
+    llm_calls = 0
+    multiplier = 2 if local_llm_fallback else 1
+    for strategy in spec.strategies:
+        for model in strategy.models:
+            model_type = ALPHA_MODEL_REGISTRY.get(model.name)
+            if model_type is None:
+                raise ValueError("model-call estimate is invalid")
+            if issubclass(model_type, LLMAgent):
+                samples = model.params.get("samples", 1)
+                if type(samples) is not int or samples < 1:
+                    raise ValueError("model-call estimate is invalid")
+                model_calls += samples * multiplier
+                llm_calls += samples * multiplier
+            else:
+                model_calls += 1
+    return model_calls, llm_calls
+
+
 def format_interval(seconds: int) -> str:
     """`30s`, `5m`, `1h`, `1h30m`, `2m30s` — the shortest honest spelling."""
     hours, rest = divmod(seconds, 3600)
@@ -315,7 +434,7 @@ def _validation_message(path: str | Path, exc: ValidationError) -> str:
 
 def _read_yaml(path: str | Path) -> dict[str, Any]:
     try:
-        data = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+        data = yaml.safe_load(paths.read_text(path, encoding="utf-8"))
     except (OSError, UnicodeError, yaml.YAMLError) as exc:
         raise ValueError(f"{path}: cannot read configuration: {exc}") from exc
     if not isinstance(data, dict):
@@ -353,7 +472,19 @@ class Fund:
         blind: bool = False,
         *,
         cache: PromptCache | None = None,
+        llm_factory: Callable[[ModelSpec], object] | None = None,
+        breakpoints_dispatch: ProviderDispatch | None = None,
+        fail_on_llm_error: bool = False,
     ) -> None:
+        if llm_factory is not None and not callable(llm_factory):
+            raise ValueError("LLM factory must be callable")
+        if breakpoints_dispatch is not None and not isinstance(
+            breakpoints_dispatch,
+            ProviderDispatch,
+        ):
+            raise ValueError("breakpoints provider authorization is invalid")
+        if type(fail_on_llm_error) is not bool:
+            raise ValueError("LLM failure policy must be a boolean")
         self.spec = spec
         self.strategies: list[tuple[StrategySpec, list[AlphaModel]]] = []
         for strategy in spec.strategies:
@@ -369,5 +500,14 @@ class Fund:
                 params = {**m.params, "blind": True} if blind and is_llm else m.params
                 if cache is not None and is_llm:
                     params = {**params, "cache": cache}
+                if llm_factory is not None and is_llm:
+                    params = {**params, "llm": llm_factory(m)}
+                if breakpoints_dispatch is not None and is_llm:
+                    params = {
+                        **params,
+                        "breakpoints_dispatch": breakpoints_dispatch,
+                    }
+                if fail_on_llm_error and is_llm:
+                    params = {**params, "fail_on_llm_error": True}
                 staff.append(cls(**params))
             self.strategies.append((strategy, staff))

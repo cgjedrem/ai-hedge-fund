@@ -1,9 +1,6 @@
-"""yfinance-backed DataClient — the free data provider.
+"""yfinance-backed DataClient — credential-free default.
 
-Selected with ``HEDGE_FUND_DATA_PROVIDER=yfinance`` (see
-``hedge_fund.data.make_data_client``). Uses Yahoo Finance via the optional
-``yfinance`` package (``poetry install -E yfinance``): no API key, no
-credits.
+Uses Yahoo Finance. No API key or credits.
 
 .. warning::
 
@@ -12,9 +9,8 @@ credits.
    filters statement periods by ``end_date``, but a quarter's numbers only
    become public weeks after the period ends, and Yahoo folds restatements
    into history. A backtest on this data leaks the future into the past.
-   Use this client for day-to-day paper trading and iteration; run final
-   backtest validation against the paid Financial Datasets provider
-   (``HEDGE_FUND_DATA_PROVIDER=fd``), which filters on SEC filing dates.
+   Use this client for day-to-day paper trading and iteration. Financial
+   Datasets is an explicit paid provider (``HEDGE_FUND_DATA_PROVIDER=fd``).
 
 Failure semantics follow the DataClient protocol: rate-limit, network and
 server failures RAISE ``DataClientError``; empty is returned only when the
@@ -29,10 +25,12 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 from bisect import bisect_right
 from datetime import date, datetime, timedelta, timezone
 from math import isfinite
 from typing import Callable, TypeVar
+from urllib.parse import urlencode, urlsplit, urlunsplit
 
 import requests
 
@@ -48,18 +46,27 @@ from hedge_fund.data.models import (
     PriceSnapshot,
 )
 from hedge_fund.data.protocol import DataClientError
+from hedge_fund.runtime.dispatch import ProviderDispatch
+from hedge_fund.runtime.policy import AuthorizationDenied, ProviderTarget
 
 try:
     import yfinance as yf
 except ImportError:  # optional dependency — see pyproject [tool.poetry.extras]
     yf = None
 
-try:  # yfinance 1.x transports over curl_cffi; its errors are not requests'
-    from curl_cffi.requests.exceptions import (
-        HTTPError as _CurlHTTPError,
-        RequestException as _CurlRequestException,
-    )
+try:
+    from yfinance.data import YfData as _YfData
 except ImportError:
+    _YfData = None
+
+try:  # yfinance 1.x transports over curl_cffi; its errors are not requests'
+    from curl_cffi import CurlOpt
+    from curl_cffi.requests import Session as _CurlSession
+    from curl_cffi.requests.exceptions import HTTPError as _CurlHTTPError
+    from curl_cffi.requests.exceptions import RequestException as _CurlRequestException
+except ImportError:
+    CurlOpt = None
+    _CurlSession = object
     _CurlHTTPError = None
     _CurlRequestException = None
 
@@ -87,6 +94,79 @@ _YF_INTERVALS = {
 # An earnings announcement lands at most ~10 weeks after its quarter ends;
 # the earliest announcement in that window is the quarter's event.
 _ANNOUNCEMENT_WINDOW_DAYS = 75
+_YFINANCE_LOCK = threading.RLock()
+
+
+class _GuardedYahooSession(_CurlSession):
+    """Pin each Yahoo HTTP attempt; absent authority means deny."""
+
+    def __init__(
+        self,
+        dispatch: ProviderDispatch | None,
+        target: ProviderTarget,
+        timeout: float,
+    ) -> None:
+        if CurlOpt is None:
+            raise ImportError("curl_cffi runtime dependency is missing")
+        if dispatch is not None:
+            dispatch.validate_target(target)
+        super().__init__(
+            timeout=timeout,
+            trust_env=False,
+            allow_redirects=False,
+            max_redirects=0,
+            proxies={},
+            retry=0,
+            verify=True,
+        )
+        self._dispatch = dispatch
+        self._target = target
+        self._attempt_lock = threading.RLock()
+
+    def _request_once(self, method, url, **kwargs):
+        if self._dispatch is None:
+            raise AuthorizationDenied("provider operation authorization is required")
+        request_url = _url_with_params(url, kwargs.get("params"))
+        headers = kwargs.get("headers")
+        host_header = _header_value(headers, "host") or _header_value(self.headers, "host")
+        with self._attempt_lock:
+            pin = self._dispatch.authorize_transport(
+                self._target,
+                url=request_url,
+                method=method,
+                host_header=host_header,
+            )
+            self._dispatch.recheck_transport_fence(self._target)
+            previous_options = self.curl_options
+            address = f"[{pin.address}]" if ":" in pin.address else pin.address
+            self.curl_options = {
+                CurlOpt.RESOLVE: [f"{pin.host}:{pin.port}:{address}"],
+            }
+            request_kwargs = dict(kwargs)
+            for name in (
+                "allow_redirects",
+                "max_redirects",
+                "proxies",
+                "proxy",
+                "proxy_auth",
+                "verify",
+            ):
+                request_kwargs.pop(name, None)
+            request_kwargs.update(
+                allow_redirects=False,
+                max_redirects=0,
+                proxies={},
+                proxy=None,
+                proxy_auth=None,
+                verify=True,
+            )
+            try:
+                response = super()._request_once(method, url, **request_kwargs)
+            finally:
+                self.curl_options = previous_options
+        if 300 <= response.status_code < 400:
+            raise AuthorizationDenied("Yahoo redirects are disabled")
+        return response
 
 
 class YFinanceClient:
@@ -96,17 +176,32 @@ class YFinanceClient:
 
     Usage::
 
-        with YFinanceClient() as yf:
+        with YFinanceClient(dispatch=operation_dispatch) as yf:
             prices = yf.get_prices("AAPL", "2024-01-01", "2024-12-31")
+
+    Direct construction without dispatch has no I/O authority.
     """
 
-    def __init__(self, timeout: float = 30.0) -> None:
+    def __init__(
+        self,
+        timeout: float = 30.0,
+        *,
+        dispatch: ProviderDispatch | None = None,
+    ) -> None:
         if yf is None:
-            raise ImportError(
-                "HEDGE_FUND_DATA_PROVIDER=yfinance needs the optional "
-                "dependency: `poetry install -E yfinance` or `pip install yfinance`"
-            )
+            raise ImportError("yfinance runtime dependency is missing; reinstall application dependencies")
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not isfinite(timeout) or timeout <= 0:
+            raise ValueError("timeout must be a positive finite number")
+        if dispatch is not None and not isinstance(dispatch, ProviderDispatch):
+            raise ValueError("provider dispatch is invalid")
         self._timeout = timeout
+        self._target = ProviderTarget(kind="data", provider="yfinance")
+        self._dispatch = dispatch
+        self._session = _GuardedYahooSession(
+            dispatch,
+            self._target,
+            timeout,
+        )
         # yfinance's default is to log exceptions and return empty frames,
         # which the protocol forbids (empty must mean "no data exists").
         # This flips yfinance into raising. The config is process-global —
@@ -114,6 +209,12 @@ class YFinanceClient:
         config = getattr(yf, "config", None)
         if config is not None:
             config.debug.hide_exceptions = False
+            network = getattr(config, "network", None)
+            if network is not None:
+                network.proxy = None
+        yahoo_logger = getattr(getattr(yf, "utils", None), "get_yf_logger", None)
+        if callable(yahoo_logger):
+            yahoo_logger().setLevel(logging.WARNING)
 
     # ------------------------------------------------------------------
     # Context manager (parity with FDClient)
@@ -126,7 +227,8 @@ class YFinanceClient:
         self.close()
 
     def close(self) -> None:
-        """No resources to release — yfinance owns its own HTTP session."""
+        """Close the guarded curl session."""
+        self._session.close()
 
     # ------------------------------------------------------------------
     # Prices
@@ -466,7 +568,12 @@ class YFinanceClient:
             # market stories).
             items = self._guarded(
                 f"{ticker} news search",
-                lambda: yf.Search(ticker, news_count=min(limit, 100)).news or [],
+                lambda: yf.Search(
+                    ticker,
+                    news_count=min(limit, 100),
+                    session=self._session,
+                ).news
+                or [],
                 empty=[],
             )
             if not items and primary_error is not None:
@@ -643,7 +750,7 @@ class YFinanceClient:
         # A fresh Ticker every call: construction does no I/O, and yfinance
         # memoizes fast_info/news/earnings per Ticker — caching handles here
         # would freeze quotes at their first fetch for the client's lifetime.
-        return yf.Ticker(symbol)
+        return yf.Ticker(symbol, session=self._session)
 
     def _guarded(self, what: str, fn: Callable[[], T], empty: T) -> T:
         """Run a yfinance call under the protocol's failure semantics.
@@ -656,11 +763,17 @@ class YFinanceClient:
         else (a caller bug, a yfinance bug) propagates.
         """
         try:
-            return fn()
-        except yf.exceptions.YFRateLimitError as exc:
-            raise DataClientError(f"yfinance rate limited on {what}") from exc
-        except yf.exceptions.YFDataException as exc:
-            raise DataClientError(f"yfinance data error on {what}: {exc}") from exc
+            with _YFINANCE_LOCK:
+                if _YfData is None:
+                    raise AuthorizationDenied("Yahoo transport is unsupported")
+                _YfData(session=self._session)
+                return fn()
+        except AuthorizationDenied:
+            raise
+        except yf.exceptions.YFRateLimitError:
+            raise DataClientError(f"yfinance rate limited on {what}") from None
+        except yf.exceptions.YFDataException:
+            raise DataClientError(f"yfinance data error on {what}") from None
         except (
             yf.exceptions.YFTickerMissingError,
             yf.exceptions.YFTzMissingError,
@@ -671,15 +784,15 @@ class YFinanceClient:
         except _HTTP_ERRORS as exc:  # before _NETWORK_ERRORS — it subclasses them
             if _http_status(exc) == 404:
                 return empty
-            raise DataClientError(f"yfinance HTTP error on {what}: {exc}") from exc
+            raise DataClientError(f"yfinance HTTP error on {what} ({_http_status(exc)})") from None
         except _NETWORK_ERRORS as exc:
-            raise DataClientError(f"yfinance network error on {what}: {exc}") from exc
-        except json.JSONDecodeError as exc:
-            raise DataClientError(f"yfinance got a malformed response on {what}: {exc}") from exc
+            raise DataClientError(f"yfinance network error on {what} ({type(exc).__name__})") from None
+        except json.JSONDecodeError:
+            raise DataClientError(f"yfinance got a malformed response on {what}") from None
         except yf.exceptions.YFException as exc:
             if "empty" in str(exc).lower() or "no data found" in str(exc).lower():
                 return empty  # yfinance's explicit no-data-on-file signal
-            raise DataClientError(f"yfinance error on {what}: {exc}") from exc
+            raise DataClientError(f"yfinance error on {what} ({type(exc).__name__})") from None
 
     def _statements(self, ticker: str, annual: bool = False):
         """(income, balance sheet, cash flow) frames, columns = period ends
@@ -804,6 +917,33 @@ def _map_interval(interval: str, multiplier: int) -> str:
     if candidate not in _YF_INTERVALS:
         raise ValueError(f"yfinance has no {candidate!r} interval (valid: {sorted(_YF_INTERVALS)})")
     return candidate
+
+
+def _url_with_params(url: str, params) -> str:
+    if not isinstance(url, str):
+        raise AuthorizationDenied("Yahoo destination is invalid")
+    if params is None:
+        return url
+    try:
+        query = urlencode(params, doseq=True)
+        parts = urlsplit(url)
+    except (TypeError, ValueError):
+        raise AuthorizationDenied("Yahoo query parameters are invalid") from None
+    combined = "&".join(part for part in (parts.query, query) if part)
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, combined, parts.fragment))
+
+
+def _header_value(headers, name: str):
+    if headers is None:
+        return None
+    try:
+        items = headers.items()
+    except (AttributeError, TypeError):
+        return None
+    for key, value in items:
+        if isinstance(key, str) and key.casefold() == name:
+            return value
+    return None
 
 
 def _map_news_item(ticker: str, item: dict) -> CompanyNews | None:

@@ -35,7 +35,7 @@ from math import isclose
 from pathlib import Path
 from typing import Callable, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_serializer, SerializerFunctionWrapHandler
 
 from hedge_fund.brokers.models import Fill, format_shares, Order, Shares
 from hedge_fund.brokers.protocol import Broker
@@ -46,6 +46,7 @@ from hedge_fund.llm import DEFAULT_MODEL
 from hedge_fund.pipeline.clock import Clock, clock_for
 from hedge_fund.pipeline.models import CycleRecord, DecisionRecord
 from hedge_fund.pipeline.stages import assess_fund, execute_decision
+from hedge_fund.runtime.build_identity import baked_build_identity
 from hedge_fund.signals import LLMAgent
 
 __all__ = ["Cadence"]  # re-exported for callers that typed against the engine
@@ -105,11 +106,21 @@ class SessionRecord(BaseModel):
     # When the marks are live prints (a minute fund), the moment of each
     # ticker's print — so a name that last traded an hour ago is visible.
     snapshot_times: dict[str, str] | None = None
+    redo_nonce: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler: SerializerFunctionWrapHandler) -> dict:
+        value = handler(self)
+        if self.redo_nonce is None:
+            value.pop("redo_nonce", None)
+        return value
 
     def compute_hash(self) -> str:
         # A record without print times hashes exactly as it did before the
         # field existed: every ledger written until then must still verify.
         exclude = {"hash"} | ({"snapshot_times"} if self.snapshot_times is None else set())
+        if self.redo_nonce is None:
+            exclude.add("redo_nonce")
         payload = self.model_dump_json(exclude=exclude)
         return hashlib.sha256(payload.encode()).hexdigest()
 
@@ -138,6 +149,9 @@ def advance(
     clock: Clock | None = None,
     *,
     on_fill: Callable[[Order, Fill], None] | None = None,
+    before_effect: Callable[[], None] | None = None,
+    before_order: Callable[[], None] | None = None,
+    on_progress: Callable[[int], None] | None = None,
 ) -> SessionRecord:
     """Advance *fund* through one completed *session*: a date (YYYY-MM-DD)
     for a daily/weekly/monthly fund, a bar (YYYY-MM-DDTHH:MM:SS, New York)
@@ -150,20 +164,61 @@ def advance(
     switch is set, BookMismatch if the broker disagrees with the state, and
     ValueError for a session that is out of order or not yet complete.
     """
+    if on_progress is not None and not callable(on_progress):
+        raise ValueError("session progress callback must be callable")
+
+    last_progress = -1
+
+    def report_progress(value: int) -> None:
+        nonlocal last_progress
+        if on_progress is None:
+            return
+        if type(value) is not int or not 0 <= value <= 99:
+            raise ValueError("session progress is invalid")
+        if value > last_progress:
+            on_progress(value)
+            last_progress = value
+
+    def agent_progress(start: int, end: int) -> Callable[[int, int], None] | None:
+        if on_progress is None:
+            return None
+
+        def report(completed: int, total: int) -> None:
+            if type(completed) is not int or type(total) is not int or total < 1 or not 0 <= completed <= total:
+                raise ValueError("agent progress is invalid")
+            report_progress(start + (end - start) * completed // total)
+
+        return report
+
     spec = fund.spec
     clock = clock or clock_for(spec, data_client)
     if state.halted is not None:
         raise FundHalted(f"{spec.name} is halted: {state.halted}")
+    if before_effect is not None:
+        before_effect()
     if state.last_session is not None and session <= state.last_session:
         raise ValueError(f"{spec.name}: session {session} is not after the last recorded " f"session {state.last_session}")
     if not clock.is_complete(session):
         raise ValueError(f"{spec.name}: session {session} is not complete yet")
     universe = normalize_universe(universe)
     reconcile(state, broker, spec.name)
+    report_progress(40)
 
     executed: CycleRecord | None = None
     if state.pending is not None:
-        executed = execute_decision(fund, state.pending, session, broker, data_client, clock, on_fill=on_fill)
+        executed = execute_decision(
+            fund,
+            state.pending,
+            session,
+            broker,
+            data_client,
+            clock,
+            on_fill=on_fill,
+            before_effect=before_effect,
+            before_order=before_order,
+            on_progress=agent_progress(40, 60),
+        )
+    report_progress(65)
 
     held = broker.positions()
     marked = clock.marks([*held, spec.benchmark], session)
@@ -171,9 +226,22 @@ def advance(
     cash = broker.cash()
     positions = {t: p.shares for t, p in sorted(held.items())}
     nav = cash + sum(shares * marks[t] for t, shares in positions.items())
+    report_progress(70)
 
     rebalance = is_rebalance_session(session, state.last_session, spec.rebalance)
-    decision = assess_fund(fund, session, data_client, universe, clock) if rebalance else None
+    decision = None
+    if rebalance:
+        if before_effect is not None:
+            before_effect()
+        decision = assess_fund(
+            fund,
+            session,
+            data_client,
+            universe,
+            clock,
+            on_progress=agent_progress(70, 90),
+        )
+    report_progress(90)
 
     record = SessionRecord(
         fund=spec.name,
@@ -250,11 +318,16 @@ def mandate_hash(spec: FundSpec) -> str:
 
 @lru_cache(maxsize=1)
 def code_version() -> str:
-    """Package version, plus the git commit when running from a checkout."""
+    """Package version with baked identity or short Git HEAD state."""
     try:
         version = _version("aihf")
     except PackageNotFoundError:
         version = "dev"
+    identity = baked_build_identity()
+    if identity is not None:
+        revision, source_hash = identity
+        return f"{version}+g{revision}.sha256.{source_hash}"
+
     root = Path(__file__).resolve().parents[2]
     try:
         sha = subprocess.run(
@@ -264,6 +337,16 @@ def code_version() -> str:
             timeout=2,
             check=True,
         ).stdout.strip()
+        if sha:
+            dirty = subprocess.run(
+                ["git", "-C", str(root), "status", "--porcelain"],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                check=True,
+            ).stdout.strip()
+            if dirty:
+                sha = f"{sha}.dirty"
     except (OSError, subprocess.SubprocessError):
         sha = ""
     return f"{version}+{sha}" if sha else version

@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from hedge_fund.brokers.account_binding import require_sim_account_ownership
 from hedge_fund.brokers.paper import PaperBroker
 from hedge_fund.brokers.saxo import Pacer, SaxoBroker, SaxoClient, TokenManager
 from hedge_fund.secrets.provider import SecretProvider, SecretProviderError
@@ -26,6 +27,7 @@ def build_broker(
     if deployed.broker != "saxo":
         raise ValueError(f"unsupported broker: {deployed.broker}")
 
+    require_sim_account_ownership()
     env = os.environ if environ is None else environ
     requested_currency = env.get("SAXO_BASE_CURRENCY", "USD")
     if not isinstance(requested_currency, str) or requested_currency.upper() != "USD":

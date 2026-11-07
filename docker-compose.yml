@@ -1,62 +1,111 @@
 # The AI hedge fund in Docker.
 #
-#   Headless runner (survives restarts, runs the daily cadence):
-#     docker compose up -d runner
+#   Set an existing absolute data root first:
+#     export AIHF_DATA_ROOT="$PWD/.aihf-demo-data"
+#     mkdir -p "$AIHF_DATA_ROOT"
 #
+#   Runner profiles are opt-in. Base bridge web/web-operator profiles are
+#   unsupported; use the Linux override for the supported host-local topology.
+#
+# The web profile is read-only inspection. The web-operator supervisor starts
+# read-only; offline trust plus SIGHUP may activate paper writes/network.
+# SIGUSR1 downgrades the web child before CLI inspect/revoke.
+# Use web-operator only with the Linux host-network override and approved root.
+# Unconfigured identity keeps runner/TUI profiles independent; Dockerfile rejects image builds without valid inputs.
 #   Interactive TUI:
 #     docker compose run --rm tui
 #
-# One runner per fund: copy the runner service and change the fund name in
-# `command`. Do not run the same fund's runner on the host and in a
-# container at the same time — pid files cannot see across that boundary,
-# so both would believe they own the fund.
+# Provider calls stay disabled by default. `OLLAMA_BASE_URL` is not a setting.
 #
-# On a Linux host (home server), use the docker-compose.linux.yml override
-# instead — see the README's "Home server (Linux + Tailscale)" section.
+# On Linux, use the docker-compose.linux.yml networking override.
 
 services:
   runner:
+    profiles: ["runner"]
     build: .
-    restart: unless-stopped
     environment:
-      # Ollama models (keyless, e.g. kimi-k3:cloud) run on the HOST — inside
-      # the container "localhost" is the container itself, so point this at
-      # the host's Ollama. Harmless when a hosted provider is used instead.
-      - OLLAMA_BASE_URL=http://host.docker.internal:11434
+      - HEDGE_FUND_LLM_MODEL=gemma3:4b
+      - HEDGE_FUND_DATA_PROVIDER=yfinance
     volumes:
-      - ~/.hedge-fund:/root/.hedge-fund
-    command: paper run watchtower
+      - type: bind
+        source: "${AIHF_DATA_ROOT:?Set AIHF_DATA_ROOT to an existing absolute data root}"
+        target: /data
+    entrypoint: ["aihf", "--root", "/data"]
+    command: ["--model", "gemma3:4b", "paper", "tick", "demo-alpha"]
 
-  # The weekly comparison copy of watchtower: same mandate, weekly cadence.
   runner-weekly:
+    profiles: ["runner-weekly"]
     build: .
-    restart: unless-stopped
     environment:
-      - OLLAMA_BASE_URL=http://host.docker.internal:11434
+      - HEDGE_FUND_LLM_MODEL=gemma3:4b
+      - HEDGE_FUND_DATA_PROVIDER=yfinance
     volumes:
-      - ~/.hedge-fund:/root/.hedge-fund
-    command: paper run watchtower-weekly
+      - type: bind
+        source: "${AIHF_DATA_ROOT:?Set AIHF_DATA_ROOT to an existing absolute data root}"
+        target: /data
+    entrypoint: ["aihf", "--root", "/data"]
+    command: ["--model", "gemma3:4b", "paper", "tick", "demo-weekly"]
 
   tui:
     profiles: ["tui"]
     build: .
     stdin_open: true
     tty: true
-    environment:
-      - OLLAMA_BASE_URL=http://host.docker.internal:11434
     volumes:
-      - ~/.hedge-fund:/root/.hedge-fund
+      - type: bind
+        source: "${AIHF_DATA_ROOT:?Set AIHF_DATA_ROOT to an existing absolute data root}"
+        target: /data
+    entrypoint: ["aihf", "--root", "/data"]
 
   web:
     profiles: ["web"]
     build:
       context: .
       dockerfile: Dockerfile.web
+      args:
+        AIHF_SOURCE_REVISION: "${AIHF_SOURCE_REVISION:-unconfigured}"
+        AIHF_SOURCE_SHA256: "${AIHF_SOURCE_SHA256:-unconfigured}"
+    image: "aihf-web:${AIHF_SOURCE_REVISION:-unconfigured}-${AIHF_SOURCE_SHA256:-unconfigured}"
     ports:
-      - "127.0.0.1:8765:8765"
+      - "127.0.0.1:8876:8876"
     volumes:
-      - ~/.hedge-fund:/root/.hedge-fund:ro
-    command: ["aihf-web", "--port", "8765", "--container-bind"]
+      - type: bind
+        source: "${AIHF_DATA_ROOT:?Set AIHF_DATA_ROOT to an existing absolute data root}"
+        target: /data
+        read_only: true
+    entrypoint: ["aihf-web", "--root", "/data"]
+    command: ["--port", "8876"]
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - webdesk
+
+  web-operator:
+    profiles: ["web-operator"]
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+      args:
+        AIHF_SOURCE_REVISION: "${AIHF_SOURCE_REVISION:-unconfigured}"
+        AIHF_SOURCE_SHA256: "${AIHF_SOURCE_SHA256:-unconfigured}"
+    image: "aihf-web:${AIHF_SOURCE_REVISION:-unconfigured}-${AIHF_SOURCE_SHA256:-unconfigured}"
+    environment:
+      - HEDGE_FUND_DATA_PROVIDER=yfinance
+      - HEDGE_FUND_LLM_ENDPOINT=http://127.0.0.1:11434
+    ports:
+      - "127.0.0.1:8876:8876"
+    volumes:
+      - type: bind
+        source: "${AIHF_DATA_ROOT:?Set AIHF_DATA_ROOT to an existing absolute data root}"
+        target: /data
+    entrypoint: ["aihf-web-supervisor", "--root", "/data"]
+    command: ["--port", "8876", "--enable-writes-after-trust", "--enable-network-after-trust"]
+    stop_grace_period: 30s
     read_only: true
     tmpfs:
       - /tmp

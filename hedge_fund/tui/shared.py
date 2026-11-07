@@ -17,6 +17,8 @@ from rich.text import Text
 
 from hedge_fund.data.bars import is_intraday
 from hedge_fund.fund import FundSpec, PortfolioMode, StrategySpec
+from hedge_fund.reporting.names import DISPLAY_NAMES, SHORT_NAMES  # noqa: F401
+from hedge_fund.runtime.defaults import BACKTEST_WEEKS, BOARD_REFRESH, DEFAULT_CAPITAL, DEFAULT_RISK, WARM_CHUNK  # noqa: F401
 from hedge_fund.signals import ALPHA_MODEL_REGISTRY, get_investment_approach, LLMAgent
 
 try:
@@ -24,45 +26,11 @@ try:
 except PackageNotFoundError:  # running from source without an install
     VERSION = "dev"
 
-# Strategy libraries live in hedge_fund/strategies/ (code, inside the package).
-# Mandates, paper funds and backtest results the app writes are user data
-# and live in ~/.hedge-fund/ (see paths.py).
+# Strategy libraries live in the package.
 STRATEGY_DIR = Path(__file__).resolve().parent.parent / "strategies"
 
 UNIVERSE_PRESETS = ["AAPL", "MSFT", "NVDA", "GOOGL", "AMZN",
                     "META", "TSLA", "JPM", "UNH", "XOM"]
-
-DISPLAY_NAMES = {
-    "buffett": "Warren Buffett",
-    "munger": "Charlie Munger",
-    "graham": "Benjamin Graham",
-    "lynch": "Peter Lynch",
-    "druckenmiller": "Stanley Druckenmiller",
-    "damodaran": "Aswath Damodaran",
-    "ackman": "Bill Ackman",
-    "wood": "Cathie Wood",
-    "burry": "Michael Burry",
-    "pabrai": "Mohnish Pabrai",
-    "fisher": "Phil Fisher",
-    "jhunjhunwala": "Rakesh Jhunjhunwala",
-    "pead": "post-earnings drift",
-}
-
-SHORT_NAMES = {
-    "buffett": "Buffett",
-    "munger": "Munger",
-    "graham": "Graham",
-    "lynch": "Lynch",
-    "druckenmiller": "Druckenmiller",
-    "damodaran": "Damodaran",
-    "ackman": "Ackman",
-    "wood": "Wood",
-    "burry": "Burry",
-    "pabrai": "Pabrai",
-    "fisher": "Fisher",
-    "jhunjhunwala": "Jhunjhunwala",
-    "pead": "PEAD",
-}
 
 MODE_LABELS: dict[PortfolioMode, str] = {"long_only": "Long-only", "long_short": "Long/short", "dollar_neutral": "Dollar-neutral"}
 
@@ -72,12 +40,6 @@ MODE_LABELS: dict[PortfolioMode, str] = {"long_only": "Long-only", "long_short":
 # setting that env var steers every agent instance — the warm roster AND the
 # Fund — with no threading. Quant models (PEAD) carry no LLM and ignore it.
 DEFAULT_MODEL_LABEL = "Opus 5.5"
-
-DEFAULT_RISK = {"max_position_pct": 0.25, "max_gross_exposure": 1.0}
-DEFAULT_CAPITAL = 100_000.0
-BACKTEST_WEEKS = 78  # ~18 months of history for the default backtest window
-BOARD_REFRESH = 1 / 12  # seconds between run-board repaints — smooth, not frantic
-WARM_CHUNK = 10      # dates per warm task — small enough that one stock still fans out
 
 _CHART_HEIGHT = 8
 

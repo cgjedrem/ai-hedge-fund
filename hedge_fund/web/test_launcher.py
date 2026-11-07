@@ -56,11 +56,16 @@ def test_main_builds_static_assets_before_seeding_and_serving(tmp_path, monkeypa
     calls = []
     monkeypatch.setattr(launcher, "_build_frontend", lambda: calls.append("build"))
     monkeypatch.setattr(launcher, "_require_static_bundle", lambda: calls.append("static"))
-    monkeypatch.setattr(launcher, "seed_demo", lambda root: calls.append(("seed", root)))
+
+    def fake_seed(root):
+        calls.append(("seed", root))
+        return root
+
+    monkeypatch.setattr(launcher, "seed_demo", fake_seed)
     monkeypatch.setattr(
         launcher,
         "_serve",
-        lambda root, args, host: calls.append(("serve", root, args.port, host)),
+        lambda context, args, host: calls.append(("serve", context.path, args.port, host)),
     )
 
     launcher.main(["--build", "--demo", "--root", str(tmp_path), "--port", "12345"])
