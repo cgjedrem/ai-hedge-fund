@@ -116,6 +116,26 @@ def test_current_authority_failure_is_reported_and_denied(tmp_path, monkeypatch,
     assert "HandoverError" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize(
+    ("authority", "expected"),
+    [
+        ({"authority": "protocol-native", "reason": None}, False),
+        ({"authority": "operator-trusted-single-writer", "reason": None}, True),
+    ],
+)
+def test_current_authority_requires_explicit_single_writer_trust(tmp_path, monkeypatch, authority, expected):
+    from hedge_fund.runtime import handover
+
+    monkeypatch.setattr(
+        handover,
+        "enrollment_status",
+        lambda *_args, **_kwargs: {"state": "enrolled", "reason": None},
+    )
+    monkeypatch.setattr(handover, "write_authority", lambda _root: authority)
+
+    assert supervisor._current_write_authority(tmp_path) is expected
+
+
 def test_network_capability_requires_write_opt_in_and_verified_trust(tmp_path):
     options = _options(tmp_path, enable_writes_after_trust=False)
     command = supervisor._web_command(

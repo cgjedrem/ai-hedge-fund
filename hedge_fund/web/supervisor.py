@@ -70,7 +70,7 @@ def _current_write_authority(root: Path) -> bool:
     from hedge_fund.runtime.handover import (
         enrollment_status,
         HandoverError,
-        has_write_authority,
+        TRUSTED_SINGLE_WRITER_AUTHORITY,
         write_authority,
     )
     from hedge_fund.runtime.root import RootContext, RootPathError
@@ -86,9 +86,12 @@ def _current_write_authority(root: Path) -> bool:
                 )
                 return False
             authority = write_authority(context)
-            if not has_write_authority(authority):
+            if not isinstance(authority, dict) or authority.get("authority") != TRUSTED_SINGLE_WRITER_AUTHORITY:
+                reason = "handover-unavailable"
+                if isinstance(authority, dict):
+                    reason = authority.get("reason") or authority.get("authority") or reason
                 print(
-                    f"web write activation denied ({authority['reason'] or authority['authority']}); child remains read-only",
+                    f"web write activation denied ({reason}); child remains read-only",
                     file=sys.stderr,
                     flush=True,
                 )
