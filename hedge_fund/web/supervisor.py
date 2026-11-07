@@ -17,6 +17,10 @@ _STOP_TIMEOUT_SECONDS = 10.0
 _POLL_SECONDS = 0.1
 
 
+class ChildShutdownTimeout(RuntimeError):
+    pass
+
+
 @dataclass(frozen=True)
 class SupervisorOptions:
     root: Path
@@ -106,6 +110,43 @@ def _current_write_authority(root: Path) -> bool:
         return False
 
 
+def _reap_adopted_children(current_child_pid: int | None = None) -> int:
+    if current_child_pid is not None and (type(current_child_pid) is not int or current_child_pid <= 0):
+        raise ValueError("current child PID must be a positive integer")
+    if os.name != "posix":
+        return 0
+    required = ("P_ALL", "WEXITED", "WNOHANG", "WNOWAIT", "waitid", "waitpid")
+    if any(not hasattr(os, name) for name in required):
+        raise RuntimeError("safe adopted-child reaping requires POSIX waitid(WNOWAIT)")
+
+    options = os.WEXITED | os.WNOHANG | os.WNOWAIT
+    reaped = 0
+    while True:
+        try:
+            # WNOWAIT keeps Popen-owned status available for its next poll or wait.
+            status = os.waitid(os.P_ALL, 0, options)
+        except ChildProcessError:
+            return reaped
+        except InterruptedError:
+            continue
+        if status is None or status.si_pid == 0:
+            return reaped
+        child_pid = status.si_pid
+        if type(child_pid) is not int or child_pid <= 0:
+            return reaped
+        if child_pid == current_child_pid:
+            return reaped
+        try:
+            waited_pid, _ = os.waitpid(child_pid, os.WNOHANG)
+        except ChildProcessError:
+            continue
+        except InterruptedError:
+            continue
+        if waited_pid != child_pid:
+            return reaped
+        reaped += 1
+
+
 def _terminate_child(process: subprocess.Popen, timeout: float) -> None:
     if process.poll() is not None:
         return
@@ -127,7 +168,10 @@ def _terminate_child(process: subprocess.Popen, timeout: float) -> None:
         pass
     except OSError:
         process.kill()
-    process.wait(timeout=timeout)
+    try:
+        process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        raise ChildShutdownTimeout(f"web child PID {process.pid} did not exit within {timeout:g}s after SIGKILL") from exc
 
 
 def _run_supervisor(
@@ -137,27 +181,47 @@ def _run_supervisor(
     signal_api=signal,
     sleep: Callable[[float], None] = time.sleep,
     terminate_child: Callable[[subprocess.Popen, float], None] = _terminate_child,
+    reap_children: Callable[[int | None], int] = _reap_adopted_children,
     authority_check: Callable[[Path], bool] = _current_write_authority,
     executable: str = "aihf-web",
 ) -> int:
     if not isinstance(options, SupervisorOptions):
         raise TypeError("supervisor options are required")
+    if not callable(reap_children):
+        raise TypeError("child reaper must be callable")
 
     stopping = False
-    reload_requested = False
+    requested_activation: bool | None = None
+    child_shutdown_failed = False
     previous_handlers = {}
+    child = None
 
     def handle_signal(signum, _frame) -> None:
-        nonlocal stopping, reload_requested
+        nonlocal stopping, requested_activation
         if signum == signal_api.SIGHUP:
-            reload_requested = True
+            requested_activation = True
+        elif signum == signal_api.SIGUSR1:
+            requested_activation = False
         else:
             stopping = True
 
-    child = None
+    def stop(process: subprocess.Popen) -> None:
+        nonlocal child_shutdown_failed
+        try:
+            terminate_child(process, _STOP_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired as exc:
+            child_shutdown_failed = True
+            raise ChildShutdownTimeout(f"web child PID {process.pid} did not stop within {_STOP_TIMEOUT_SECONDS:g}s after SIGKILL") from exc
+        except ChildShutdownTimeout:
+            child_shutdown_failed = True
+            raise
+        reap_children(None)
 
     def launch(*, activated: bool):
+        nonlocal child
         if stopping:
+            return None
+        if activated and requested_activation is False:
             return None
         command = _web_command(
             options,
@@ -165,7 +229,7 @@ def _run_supervisor(
             authority_check=authority_check,
             executable=executable,
         )
-        if stopping:
+        if stopping or (activated and requested_activation is False):
             return None
         try:
             process = popen_factory(
@@ -177,43 +241,77 @@ def _run_supervisor(
             if not stopping:
                 print(f"web child could not start ({type(exc).__name__})", file=sys.stderr, flush=True)
             return None
-        if stopping:
-            terminate_child(process, _STOP_TIMEOUT_SECONDS)
+        child = process
+        if stopping or (activated and requested_activation is False):
+            stop(process)
+            child = None
             return None
         return process
 
+    result = 127
     try:
-        for signum in (signal_api.SIGHUP, signal_api.SIGINT, signal_api.SIGTERM):
+        for signum in (
+            signal_api.SIGHUP,
+            signal_api.SIGUSR1,
+            signal_api.SIGINT,
+            signal_api.SIGTERM,
+        ):
             previous_handlers[signum] = signal_api.signal(signum, handle_signal)
 
         child = launch(activated=False)
-        if child is None:
-            return 0 if stopping else 127
-
-        activated = False
         while True:
             if stopping:
-                terminate_child(child, _STOP_TIMEOUT_SECONDS)
-                return 0
-            if reload_requested:
-                reload_requested = False
-                terminate_child(child, _STOP_TIMEOUT_SECONDS)
+                if child is not None:
+                    stop(child)
+                    child = None
+                result = 0
+                break
+            if requested_activation is not None:
+                activated = requested_activation
+                requested_activation = None
+                if child is not None:
+                    stop(child)
+                    child = None
                 if stopping:
-                    return 0
-                activated = True
+                    result = 0
+                    break
                 child = launch(activated=activated)
                 if child is None:
-                    return 0 if stopping else 127
+                    if stopping:
+                        result = 0
+                        break
+                    if requested_activation is not None:
+                        continue
+                    result = 127
+                    break
                 continue
+            if child is None:
+                result = 127
+                break
             returncode = child.poll()
             if returncode is not None:
-                return returncode
+                child = None
+                reap_children(None)
+                result = returncode
+                break
+            reap_children(child.pid)
             sleep(_POLL_SECONDS)
+    except ChildShutdownTimeout as exc:
+        print(f"web supervisor shutdown failed: {exc}", file=sys.stderr, flush=True)
+        result = 1
     finally:
-        if child is not None and child.poll() is None:
-            terminate_child(child, _STOP_TIMEOUT_SECONDS)
+        if child is not None and not child_shutdown_failed:
+            if child.poll() is None:
+                try:
+                    stop(child)
+                except ChildShutdownTimeout as exc:
+                    print(f"web supervisor shutdown failed: {exc}", file=sys.stderr, flush=True)
+                    result = 1
+            else:
+                reap_children(None)
         for signum, previous in previous_handlers.items():
             signal_api.signal(signum, previous)
+    return result
 
 
 def _port(value: str) -> int:
@@ -249,7 +347,7 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
-    if os.name != "posix" or not hasattr(signal, "SIGHUP"):
+    if os.name != "posix" or not hasattr(signal, "SIGHUP") or not hasattr(signal, "SIGUSR1"):
         parser.error("PID 1 supervision requires POSIX signals; trusted web mode is disabled")
     try:
         options = SupervisorOptions(

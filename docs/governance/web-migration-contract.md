@@ -85,6 +85,18 @@ On the current Windows Docker Desktop Linux engine, a synthetic Windows bind mou
 Docker Desktop ext4 named-volume validation does not authorize NTFS-to-ext4 migration or a
 production-root cutover.
 
+SIGHUP requests a trust-checked write promotion; SIGUSR1 stops and waits for the web child,
+then launches it read-only without replacing PID 1. Use SIGUSR1 before CLI inspect/revoke.
+Signal delivery is asynchronous; wait for API capabilities `writes=false` before CLI access.
+Revocation persists a `revoked` trust state and removes only a pending review challenge; a
+later SIGHUP stays read-only until fresh explicit trust. TERM/INT takes priority. No API
+promotes the child.
+
+Detached owned-runner sessions survive web-child HUP. They continue only while persisted
+root/build/process identity, finite authorization and canonical runner reservation/admission
+fences remain valid. PID 1 reaps exited adopted children without consuming the active web
+Popen status; it never kills a PID whose ownership is unknown.
+
 The selected R1 names `watchtower` and `watchtower-weekly` remain protected by FR-044.
 Their operation is blocked pending an explicit user decision; do not remove the root or web
 guard and do not substitute a fixture/agent exception. The earlier replacement probe

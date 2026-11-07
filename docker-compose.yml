@@ -9,6 +9,7 @@
 #
 # The web profile is read-only inspection. The web-operator supervisor starts
 # read-only; offline trust plus SIGHUP may activate paper writes/network.
+# SIGUSR1 downgrades the web child before CLI inspect/revoke.
 # Use web-operator only with the Linux host-network override and approved root.
 # Unconfigured identity keeps runner/TUI profiles independent; Dockerfile rejects image builds without valid inputs.
 #   Interactive TUI:
@@ -104,6 +105,7 @@ services:
         target: /data
     entrypoint: ["aihf-web-supervisor", "--root", "/data"]
     command: ["--port", "8876", "--enable-writes-after-trust", "--enable-network-after-trust"]
+    stop_grace_period: 30s
     read_only: true
     tmpfs:
       - /tmp

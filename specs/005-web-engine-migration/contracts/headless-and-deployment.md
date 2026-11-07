@@ -92,8 +92,9 @@ and `relocate-from` results. The offline handover path is:
    --operator-acknowledgement TEXT` accepts only the exact current acknowledgement and
    inventory. It rechecks root identity, enrollment/build, legacy reachability and inventory
    under offline exclusive admission before recording trust.
-4. `aihf --root ROOT handover revoke-single-writer` removes the trust record; absent,
-   invalid, mismatched or revoked trust returns the root to read-only mode.
+4. `aihf --root ROOT handover revoke-single-writer` persists a `revoked` trust
+   state and removes only a pending review challenge; absent, invalid,
+   mismatched or revoked trust returns the root to read-only mode.
 
 No environment default, enrollment, migration attestation, relocation, PID/TTL, marker,
 cooperative lock or web endpoint substitutes for this acknowledgement. The operator's
@@ -130,6 +131,19 @@ is bound to Linux PID 1 creation identity, boot ID, PID namespace and current PI
 namespaces, separate from root enrollment. Container replacement starts read-only; an
 operator may record a new trust only after a fresh challenge and exact inventory review.
 No automatic enrollment, identity rebind, or cross-namespace runner stop/adoption is supported.
+
+For inspect/revoke while the writable child holds the root lease, send SIGUSR1 to PID 1.
+The supervisor waits for that child, starts read-only, and preserves PID 1. Run CLI
+`handover inspect`, then `handover revoke-single-writer` only after API capabilities report
+`writes=false`; signal delivery is asynchronous. The revoked state is persistent. A following
+SIGHUP remains read-only. Fresh explicit trust is required for another promotion. TERM/INT
+takes priority, and no API or browser action promotes the child.
+
+Detached owned-runner sessions are not signalled on web-child HUP. They continue only while
+their persisted root/build/process identity, finite authorization and canonical runner
+reservation/admission fences remain valid. PID 1 reaps exited adopted children without
+consuming the active web Popen status; unknown PIDs are never killed.
+
 Image labels and the package code-version stamp
 contain an operator-supplied revision, format-checked as a full lowercase Git object ID, and
 a package-source SHA-256 recomputed before baking; the revision is not checked against Git.

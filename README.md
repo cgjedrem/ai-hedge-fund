@@ -301,6 +301,25 @@ access to PID 1 procfs metadata; no elevated fallback is attempted. Native
 Windows host trusted-single-writer mode is disabled; a Docker Desktop Linux
 container is a LinuxKit runtime, not native Linux-host evidence.
 
+To inspect or revoke trust while the writable child holds the root lease,
+downgrade it without replacing PID 1:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.linux.yml kill --signal SIGUSR1 web-operator
+# Repeat until writes=false; do not inspect/revoke while the old child remains writable.
+docker compose -f docker-compose.yml -f docker-compose.linux.yml exec -T web-operator python -c 'import json,urllib.request; r=urllib.request.Request("http://127.0.0.1:8876/api/capabilities",headers={"Host":"127.0.0.1"}); c=json.load(urllib.request.urlopen(r)); print("writes="+str(c["writes"])); assert c["writes"] is False'
+docker compose -f docker-compose.yml -f docker-compose.linux.yml exec web-operator aihf --root /data handover inspect
+docker compose -f docker-compose.yml -f docker-compose.linux.yml exec web-operator aihf --root /data handover revoke-single-writer
+docker compose -f docker-compose.yml -f docker-compose.linux.yml kill --signal SIGHUP web-operator
+```
+
+`SIGUSR1` waits for the web child and starts a read-only child; it does not
+revoke trust. Signal delivery is asynchronous; wait for `writes=false` before
+CLI access. Revocation persists a `revoked` trust state and removes only a
+pending review challenge. The final `SIGHUP` remains read-only. A later write
+activation needs a fresh inspect, exact acknowledgement and explicit trust.
+No API or browser action promotes the child.
+
 The operator must exclude every other writer. Never run the TUI CLI or legacy
 runner as a concurrent writer on that root. The TUI CLI fallback starts only
 after the web writer stops and needs its own explicit trust in its own runtime;
