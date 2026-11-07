@@ -1,5 +1,33 @@
 # Spec005 Release 1 implementation manifest
 
+## Latest trust-lifecycle continuation (2026-11-07)
+
+- Source correction: `1846c970acd88d836a84ae03a9699966c31154df`
+  (`fix: require explicit trust for web writes`), parent
+  `c77163e3862410813af5497a82f0ad6a0badda59`.
+- Changed source: `hedge_fund/web/supervisor.py`,
+  `hedge_fund/web/test_supervisor.py`. The supervisor now requires exact
+  `operator-trusted-single-writer`, not generic `protocol-native` write authority.
+- Targeted final-source regressions: supervisor **20 passed**, runtime authority
+  **41 passed**, web authority **3 passed**; Black/isort/Flake8/diff check passed.
+- Final build: clean revision `1846c970acd88d836a84ae03a9699966c31154df`,
+  selected-package SHA-256
+  `415e28b31527c2a10c295ef92d2729c8a60e8d39604d3df26d1dd0fac8ec5cab`,
+  image ID `sha256:a834e17d6b4d627ea4132a3ed223c38c0bf219eb659e41b3ff2faa7af6283713`,
+  Linux/amd64. Final `web-operator` Compose config passed **9/9** assertions; no
+  container started from this image. Full provenance is in `implementation-evidence.md`.
+- The prior `c77163e` artifact's no-trust SIGHUP **FAIL** exposed writes/network after
+  fresh synthetic enrollment classified `protocol-native`. No valid mutation ran; the
+  container stopped before a writable replacement. The corrected image was not started
+  after fail-stop. Final runtime acceptance remains **INCONCLUSIVE / not accepted**;
+  A/B/C runtime checks remain not run and RB-5 remains unchecked.
+- Changed evidence/docs: `specs/005-web-engine-migration/implementation-evidence.md`,
+  `implementation-progress.md`, `change-manifest.md`, `spec.md`, `tasks.md`,
+  `contracts/headless-and-deployment.md`, this manifest, `docs/governance/web-migration-contract.md`,
+  and `memory.md`. Ignored session progress: `outputs/spec005-g5-runtime-c77163e-20261107-0940/progress.log`.
+- No cutover, real-fund writes, provider/LLM/broker calls, public exposure, or Docker
+  prune. Independent QA remains coordinator-owned.
+
 ## Latest runtime evidence and documentation continuation (2026-11-05)
 
 - Source/artifact: clean source revision `7ec7aaa970a1805478940691a948f1b0dbed4649`,

@@ -2366,3 +2366,151 @@ INCONCLUSIVE.
   replacement finding is not yet resolved by runtime evidence. Resume only with the
   approved final image build and synthetic-volume protocol; do not infer acceptance from
   the unit tests or the absent-image inventory. Independent QA remains coordinator-owned.
+
+## 2026-11-07 operator-trust gate and final-image continuation
+
+### Source and artifact identity
+
+- Prior implementation commit: `c77163e3862410813af5497a82f0ad6a0badda59`; package
+  SHA-256 `d02fdc6fd43d9fe22eae4c9410b7adc0e3b2bc6e3ac16b3dda4d6bedb93107a5`;
+  image `aihf-web:c77163e3862410813af5497a82f0ad6a0badda59-d02fdc6fd43d9fe22eae4c9410b7adc0e3b2bc6e3ac16b3dda4d6bedb93107a5`;
+  image ID `sha256:1d075886ed7ba5458cbedda0e8b257d7322b0e4dd32a8efc4f5d3d504be011a2`.
+- Runtime finding below belongs only to that `c77163e` artifact. It caused a focused
+  source correction in commit `1846c970acd88d836a84ae03a9699966c31154df`.
+- Corrected source was clean at build start: full revision
+  `1846c970acd88d836a84ae03a9699966c31154df`; selected-package SHA-256
+  `415e28b31527c2a10c295ef92d2729c8a60e8d39604d3df26d1dd0fac8ec5cab`.
+- Final image: `aihf-web:1846c970acd88d836a84ae03a9699966c31154df-415e28b31527c2a10c295ef92d2729c8a60e8d39604d3df26d1dd0fac8ec5cab`;
+  ID `sha256:a834e17d6b4d627ea4132a3ed223c38c0bf219eb659e41b3ff2faa7af6283713`;
+  `linux/amd64`. Revision and package-digest labels match the build inputs.
+- Environment: Windows 11 Enterprise build 26200, Python 3.11.15, pytest 7.4.4;
+  Docker Desktop client/server 29.9.2, context `desktop-linux`, Linux/amd64 under the
+  Windows Docker Desktop LinuxKit/WSL2 engine. Not a native-Linux observation.
+- Final build command:
+  `docker build --pull=false --file Dockerfile.web --build-arg AIHF_SOURCE_REVISION=1846c970acd88d836a84ae03a9699966c31154df --build-arg AIHF_SOURCE_SHA256=415e28b31527c2a10c295ef92d2729c8a60e8d39604d3df26d1dd0fac8ec5cab --tag aihf-web:1846c970acd88d836a84ae03a9699966c31154df-415e28b31527c2a10c295ef92d2729c8a60e8d39604d3df26d1dd0fac8ec5cab .`
+- Build: `2026-11-07T10:01:43.6594073+01:00` →
+  `2026-11-07T10:02:33.5713712+01:00`; **49.909 s**, exit 0. No network restriction
+  was used. Full captured tool output: temporary host file
+  `C:\Users\ChristianGjedrem\AppData\Local\Temp\1794042115552-copilot-tool-output-47764-aa9bc3cc-8988-4a82-80c6-7a0369c53c79.txt`,
+  27,876 bytes, SHA-256
+  `abf58b89fec29111bd6cde00ba4e10ab35556cf0f484a10c647846df17190a0d`.
+- The prior `c77163e` image build passed in **72.642 s** at
+  `2026-11-07T09:36:38.2482749+01:00`–`09:37:50.8905149+01:00`; that image is
+  superseded for web activation and retained only as historical runtime evidence.
+  Exact command was `docker build --pull=false --file Dockerfile.web --build-arg
+  AIHF_SOURCE_REVISION=c77163e3862410813af5497a82f0ad6a0badda59 --build-arg
+  AIHF_SOURCE_SHA256=d02fdc6fd43d9fe22eae4c9410b7adc0e3b2bc6e3ac16b3dda4d6bedb93107a5
+  --tag
+  aihf-web:c77163e3862410813af5497a82f0ad6a0badda59-d02fdc6fd43d9fe22eae4c9410b7adc0e3b2bc6e3ac16b3dda4d6bedb93107a5 .`.
+  Its raw build log is not retained as a separate task artifact.
+- Two successful normal builds were run, not the single build originally planned: the
+  first image exposed the no-trust activation failure; the source correction invalidated
+  that artifact for final behavior, so the second build maps to corrected commit `1846c97`.
+  No further image build was run.
+
+### Historical runtime result — `c77163e` image
+
+- Scenario: Compose host-network profile, read-only rootfs, `CAP_DROP=ALL`,
+  no-new-privileges, no published ports, test network guard, and one synthetic ext4
+  volume `aihf-spec005-g5-ext4-c77163e-20261107-0940`, mounted at `/data` and
+  `/app/outputs`. Compose configuration passed **16/16** assertions at
+  `2026-11-07T09:43:08+01:00`. Runtime ran on
+  Windows Docker Desktop/LinuxKit, not native Linux.
+- Owned synthetic root:
+  `/app/outputs/spec005-test-g5-c77163e-20261107-0940/recovery-root`.
+  The root had a test-owned marker and was freshly enrolled. `enroll-fresh` returned
+  mode `fresh`, inventory digest
+  `44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a`, and
+  authority `protocol-native`. No `handover inspect` or `trust-single-writer` command ran.
+- Initial API capabilities: `read_only=true`, `writes=false`, `network=false`.
+  After no-trust SIGHUP, the same PID 1 creation time (`103081`) and PID namespace
+  inode (`4026532926`) remained, but capabilities became `read_only=false`,
+  `writes=true`, `network=true`, with `write_authority=protocol-native`.
+  **Result: FAIL** against the no-trust/read-only requirement.
+- An unauthenticated POST returned **403 `capability-denied`**. No valid authenticated
+  mutation was submitted; no state mutation was observed. The exact container
+  `4f2f24871f438e2232a8806a1c9bdf19de8d36a28c5ba2ba8bfef2396c3034e8` was stopped
+  after the failure. No writable replacement, positive trust/HUP, stale-trust B,
+  fresh replacement trust, or C scenario ran.
+- The test network guard was configured, but outbound-denial behavior was not separately
+  probed. Capability `network=true` is an observed exposure, not an observed external
+  request. No market/data, LLM, broker, paid-provider or real-root calls occurred.
+  Host/Origin/CSRF, protected-name (`watchtower`, `watchtower-weekly`, `umbrella`),
+  same-fund, recovery and valid-write runtime cases were not run in this attempt; older
+  `7ec7aaa` checks are not carried forward. Existing source guards were not relaxed.
+- Exact runtime probe timestamps and raw stdout/API logs were not retained in the
+  surviving task artifacts; only this owner-observation summary remains. A read-only
+  Docker event query returned no rows. Do not assign runtime timestamps from the
+  image-build time. The runtime failure is historical to `c77163e`, not a pass for
+  the corrected image.
+- Exact task-owned containers and the synthetic volume were inspected and removed;
+  no project network remained. Final `docker ps -a` and named-volume queries returned
+  no owned resources. No prune ran. Both image artifacts remain. Ignored helper
+  `outputs/spec005-g5-runtime-c77163e-20261107-0940/compose.g5.ext4.yml` remains.
+
+### Correction and focused source evidence
+
+- Source review found `_current_write_authority()` treated generic `has_write_authority()`
+  as sufficient; that predicate accepts both `protocol-native` and
+  `operator-trusted-single-writer`. Commit `1846c97` now admits only the explicit
+  `TRUSTED_SINGLE_WRITER_AUTHORITY` after current enrollment and inventory verification.
+- Final corrected-source tests ran sequentially on Windows 11/NTFS, Python 3.11.15,
+  pytest 7.4.4:
+
+| Timestamp (+01:00) | Exact command | Result |
+|---|---|---|
+| `09:59:58.9377556`–`10:00:01.5579807` | `C:\Users\ChristianGjedrem\AppData\Local\pypoetry\Cache\virtualenvs\aihf-WidgQWGy-py3.11\Scripts\python.exe -m pytest hedge_fund/web/test_supervisor.py -q --tb=short` | **20 passed in 0.11 s**; process elapsed **2.619 s**; exit 0 |
+| `10:00:01.5691374`–`10:00:21.3781487` | `C:\Users\ChristianGjedrem\AppData\Local\pypoetry\Cache\virtualenvs\aihf-WidgQWGy-py3.11\Scripts\python.exe -m pytest hedge_fund/runtime/test_write_authority.py -q --tb=short` | **41 passed in 17.60 s**; process elapsed **19.810 s**; exit 0 |
+| `10:00:21.3781487`–`10:00:33.9508336` | `C:\Users\ChristianGjedrem\AppData\Local\pypoetry\Cache\virtualenvs\aihf-WidgQWGy-py3.11\Scripts\python.exe -m pytest hedge_fund/web/test_write_authority.py -q --tb=short` | **3 passed in 9.77 s**; process elapsed **12.572 s**; exit 0 |
+
+- The new supervisor parameterized regression denies `protocol-native` and admits
+  `operator-trusted-single-writer`. These are fake/unit observations, not final-image
+  runtime behavior.
+- Black (`--check --line-length 420`), isort (`--check-only --profile black`),
+  Flake8 (`--ignore=E203,W503 --max-line-length=420`), and `git diff --check` all
+  passed at `2026-11-07T10:00:39.6311718+01:00`–`10:00:42.0590819+01:00`;
+  **2.426 s**, exit 0. The first Black check at `09:59:40.4681242+01:00`–
+  `09:59:43.1928436+01:00` exited 1 because it would reformat one conditional; the
+  reason assignment was simplified and all tests/static checks reran on the final
+  source before commit.
+- Earlier passing tests against `c77163e` do not transfer to corrected behavior.
+  Final-image runtime A, explicit trust/HUP positive, B stale-trust denial, fresh
+  replacement trust, and C remain **NOT RUN** under the fail-stop rule. Final runtime
+  acceptance is **INCONCLUSIVE / not accepted**; RB-5 stays unchecked. Independent
+  QA remains coordinator-owned.
+
+### Corrected final-image Compose configuration
+
+- Command:
+  `docker compose --profile web-operator --file docker-compose.yml --file docker-compose.linux.yml config --format json`.
+  Build revision and package digest were set to `1846c970acd88d836a84ae03a9699966c31154df`
+  and `415e28b31527c2a10c295ef92d2729c8a60e8d39604d3df26d1dd0fac8ec5cab`.
+  `AIHF_DATA_ROOT` pointed at the existing repository `outputs` directory for config
+  interpolation only; no service or container started.
+- `2026-11-07T10:10:38.4028187+01:00`–`10:10:38.6012255+01:00`, **0.198 s**,
+  **9/9** assertions, exit 0: exact final image tag, host network, read-only rootfs,
+  `CAP_DROP=ALL`, no-new-privileges, no published ports, matching build revision and
+  digest, and service presence.
+- Two config-only harness attempts failed and were corrected without resource changes:
+  missing `AIHF_DATA_ROOT` caused Compose's required-variable error (exit 1); a first
+  PowerShell check treated the empty/null `ports` field as present at
+  `10:10:23.5290529+01:00`–`10:10:23.7573993+01:00` (**8/9**, **0.227 s**, exit 1).
+  The corrected null/empty check passed above. A pre-build Python helper probe imported
+  nonexistent `package_digest` (exit 1); it was corrected to the module's
+  `source_sha256` before computing build args. No incorrect image was built and no
+  config-only attempt started a container or changed a resource.
+
+### Remaining unknowns and smallest falsification experiment
+
+- The failed `c77163e` runtime used a marker-owned fresh synthetic root that classified
+  as `protocol-native`; it did not exercise a trust-required migration-mode root. The
+  CLI trust command was not run. The new unit regression checks the supervisor's two
+  authority classes, not the CLI challenge flow or the final image.
+- Unknown: whether a trust-required synthetic root can complete the intended same-container
+  CLI inspect/trust/HUP lifecycle on the corrected image, and whether replacement identity
+  denies stale trust on that artifact.
+- Smallest next check, only after coordinator authorization: start the corrected image
+  against a uniquely named synthetic ext4 root whose existing test fixture yields
+  trust-required migration authority; verify initial read-only and no-trust HUP remains
+  read-only. Stop on any mismatch. Only after that pass, proceed to explicit trust/HUP
+  and replacement cases under a renewed fail-stop boundary.

@@ -143,3 +143,42 @@
 - React desk remains an additive subset. TUI/Textual and operator recovery paths remain retained. Do not enable production writes, paid/headless dispatch or container execution from this partial candidate.
 - Untracked `pip/` and `pypa/` are preserved, untouched and excluded from this manifest and implementation staging.
 - `outputs/spec005-test-final-closure-20261101-01/session-artifacts/progress.md` contains the exact final command checkpoints; ignored artifact, not staged or included in the PR.
+
+## 2026-11-07 operator trust lifecycle continuation
+
+### Source correction — commit `1846c970acd88d836a84ae03a9699966c31154df`
+
+- `hedge_fund/web/supervisor.py` — permit Docker web writes only for the explicit
+  `operator-trusted-single-writer` authority after current enrollment and inventory checks.
+- `hedge_fund/web/test_supervisor.py` — reject `protocol-native`; retain the explicit-trust
+  positive regression.
+
+### Evidence and documentation
+
+- `specs/005-web-engine-migration/implementation-evidence.md` — record the historical
+  `c77163e` no-trust HUP failure, source correction, exact focused tests, final image build,
+  missing runtime timestamps/logs, fail-stop, and resource cleanup.
+- `specs/005-web-engine-migration/implementation-progress.md` — append test/build/runtime
+  checkpoint and stop condition.
+- `specs/005-web-engine-migration/spec.md` — distinguish 2026-11-05 history, 2026-11-07
+  failure, explicit fresh trust requirement, and unaccepted final runtime.
+- `specs/005-web-engine-migration/tasks.md` — update current continuation, RB-5 row and
+  blocker with the latest fail-stop outcome; RB-5 remains unchecked.
+- `specs/005-web-engine-migration/contracts/headless-and-deployment.md` — record latest
+  trust-gate failure and final-image runtime limit.
+- `docs/governance/web-migration-contract.md` — append the G5 fail-stop disposition.
+- `specs/005-web-engine-migration/r1-implementation-manifest.md` — add current source,
+  artifact, tests, runtime and changed-file map.
+- `memory.md` — append verified authority-gate and runtime-evidence fact.
+- `outputs/spec005-g5-runtime-c77163e-20261107-0940/progress.log` — ignored session artifact
+  with exact retained test/build measurements and unknown runtime timing.
+
+### Result boundary
+
+- Historical runtime on image `c77163e` **FAIL**: no-trust SIGHUP exposed
+  `protocol-native` writes/network. No valid mutation or replacement ran.
+- Corrected source commit `1846c97` passed **64** focused tests and scoped style checks.
+  Final clean-source image built successfully; final image Compose profile passed 9/9
+  config assertions; no container started after fail-stop, so runtime remains **NOT RUN**.
+- No cleanup prune, real roots/funds/cutover, provider/LLM/broker calls, or unauthenticated
+  origin/CSRF/loopback changes.

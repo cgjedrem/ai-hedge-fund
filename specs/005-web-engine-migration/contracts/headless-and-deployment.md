@@ -7,7 +7,7 @@ compose, entrypoints or provider defaults are changed by the planning PR.
 **Release 1 scope (user-directed, 2026-11-04 and 2026-11-05):** Release 1 keeps the TUI
 entrypoint as a fallback and retains all headless commands. The selected Docker path is one
 writable, single-user paper desk, published only on host loopback, reusing canonical root
-trust and cooperating-writer admission. The final image was exercised on disposable
+trust and cooperating-writer admission. The 2026-11-05 image was exercised on disposable
 synthetic ext4 volumes under the documented Linux Compose host-network profile. Current
 commands, timestamps, outcomes and evidence limits are in `implementation-evidence.md`.
 The replacement-container identity gate **FAIL**; overall runtime acceptance remains
@@ -16,6 +16,17 @@ identity args and does not establish that artifact's build provenance. The separ
 observer-snapshot architecture, TUI/ttyd retirement and dual-platform packaged distributions
 remain deferred. The real funds' move from the legacy home root uses the offline handover
 below and is performed only by the operator.
+
+**Latest trust-lifecycle status (2026-11-07):** On the `c77163e` image, SIGHUP without
+`trust-single-writer` activated writes and network after synthetic fresh enrollment returned
+`protocol-native` (**FAIL**). No valid mutation ran; the exact container stopped before any
+replacement, and B/C did not run. Commit `1846c97` makes the supervisor require
+`operator-trusted-single-writer`; 64 focused tests passed and the clean image
+`aihf-web:1846c970acd88d836a84ae03a9699966c31154df-415e28b31527c2a10c295ef92d2729c8a60e8d39604d3df26d1dd0fac8ec5cab`
+was built. The final image has no runtime recheck; historical failure is **FAIL**, current
+runtime acceptance is **INCONCLUSIVE / not accepted**, and RB-5 remains unchecked.
+Automatic trust/rebind remains prohibited. Exact measurements and missing runtime timestamps
+are recorded in `implementation-evidence.md`.
 
 ## Launch and command compatibility
 
@@ -135,12 +146,15 @@ unprivileged processes may lack PID 1 procfs access; no elevated fallback is att
 The Windows Docker Desktop bind filesystem is not currently supported: a synthetic host
 directory mounted at `/data` reports `9p`, and `RootContext.open` rejects it because only
 local NTFS/ext4 are admitted. A Docker Desktop ext4 named volume is permitted for disposable
-synthetic runtime validation only; it does not support NTFS-to-ext4 relocation. The current
-`7ec7aaa` replacement-container observation remains historical: that image retained the
+synthetic runtime validation only; it does not support NTFS-to-ext4 relocation. The
+2026-11-05 `7ec7aaa` replacement-container observation remains historical: that image retained the
 enrolled PID/mount namespace identity and the probe stopped before capability/write-denial
 checks. No write-enabled replacement or re-enrollment ran. The earlier `cad96a` observation
-is also historical. Rework evidence must use a final artifact and cover read-only replacement,
-explicit re-trust, child activation and a second replacement. Cross-filesystem copy remains
+is also historical. On 2026-11-07, no-trust HUP on the `c77163e` artifact exposed
+protocol-native write/network activation; the supervisor gate was corrected in `1846c97`,
+but the final image was not runtime-tested after the fail-stop. No-trust HUP, explicit
+re-trust, child activation and replacement behavior therefore remain unaccepted on the final
+artifact. Cross-filesystem copy remains
 blocked. Windows bridge and host Ollama access remain blocked; browser/Ollama runtime remains
 untested. FR-044 protected names remain globally denied, so the R1 `watchtower` targets are
 blocked pending a user decision. Never

@@ -96,6 +96,20 @@ The TUI CLI remains the sequential fallback; the browser `tui-web` service stays
 explicit profile but is not approved for use. Sequential TUI rendering on a separate
 synthetic volume does not prove same-root trust transfer.
 
+**G5 fail-stop follow-up (2026-11-07).** On the `c77163e` image, a test-owned fresh root
+reported `protocol-native` authority after `enroll-fresh`; no CLI trust command ran. A SIGHUP
+then exposed `read_only=false`, `writes=true`, and `network=true`, contrary to the
+read-only-until-explicit-trust gate. No valid mutation ran; an unauthenticated POST was denied
+with 403, and the exact container stopped before any replacement or B/C check. Source review
+confirmed the supervisor used generic `has_write_authority`, which accepts `protocol-native`.
+Commit `1846c97` now requires the exact `operator-trusted-single-writer` authority before
+launching a writable child. Its focused tests and a clean-source image build passed. No runtime
+was started from that image after the fail-stop, so the historical artifact result is **FAIL**
+and final-image runtime acceptance remains **INCONCLUSIVE / not accepted**. Exact runtime
+observation times and raw logs were not retained; do not infer them from build/test timestamps.
+Automatic trust/rebind remains prohibited. Fresh trust bound to a replacement PID 1 remains
+the only intended activation path; final-artifact runtime proof is still required.
+
 ## 2. Launch, root and exposure boundary
 
 **R1 — LB1.** The writable driver requires an explicit launch root argument fixed before
