@@ -2515,7 +2515,7 @@ INCONCLUSIVE.
   read-only. Stop on any mismatch. Only after that pass, proceed to explicit trust/HUP
   and replacement cases under a renewed fail-stop boundary.
 
-### 2026-11-07 supervisor lifecycle repair, final image, and runtime blocker
+### 2026-11-07 supervisor repair and first helper-fixture attempt
 
 #### Source identity and focused checks
 
@@ -2601,7 +2601,7 @@ INCONCLUSIVE.
   differed: helper container `41f91cc779f6`, service container `docker-desktop`.
   `root_binding()` includes host and namespace. This is a safe enrollment denial;
   no rebind was attempted.
-- **A startup read-only: PASS. Helper-to-service enrollment reuse: FAIL.**
+- **At this checkpoint: A startup read-only: PASS. Helper-to-service enrollment reuse: FAIL.**
   Explicit CLI trust/HUP, no-trust HUP, downgrade/revoke, API boundary probes,
   fake orphan reaping, B replacement, and C replacement are **NOT RUN**.
   No valid write, trust command, or revoke command ran. Overall lifecycle
@@ -2614,12 +2614,99 @@ INCONCLUSIVE.
   `c77163e` no-trust HUP failure remains attributed only to that artifact.
   No provider, market-data, LLM, broker, paid-service, real-root, or real-fund
   action occurred. Independent QA remains coordinator-owned.
-- Manual self-review found no additional in-scope source finding. POSIX reaping,
-  HUP promotion, downgrade/revoke, runtime API negatives, and replacement behavior
-  remain unobserved on this image; the Windows-only test skip does not transfer to
-  Linux runtime. Do not claim those runtime rows passed.
-- Smallest future falsification experiment, not authorized or run here: prepare a
+- Manual self-review at this checkpoint found no additional in-scope source finding.
+  POSIX reaping, HUP promotion, downgrade/revoke, runtime API negatives, and replacement
+  behavior were then unobserved on this image; the Windows-only test skip did not transfer
+  to Linux runtime. The corrected follow-up below supersedes those runtime unknowns.
+- At this checkpoint, the smallest next experiment was to prepare a
   new synthetic migration fixture within the exact target service `RootContext`,
   compare its immutable `root_binding()` before any trust action, and stop on
   mismatch. If replacement changes that immutable binding, record the denial and
-  do not rebind.
+  do not rebind. The corrected same-container follow-up below performed this bounded
+  setup and did not rebind.
+
+### 2026-11-07 corrected same-container runtime follow-up
+
+This follow-up supersedes the preceding section's "not run" lifecycle statements.
+The helper-to-service host mismatch was caused by preparing enrollment in the wrong
+container. It is retained as historical setup evidence, not attributed to the product.
+The corrected run created an empty, uniquely named ext4 volume and performed fixture
+preparation, real CLI inspection/migration, trust, and revoke inside the exact
+host-network supervisor container. No root binding was changed or rebound.
+
+#### Artifact and provenance
+
+- Source remained commit `2b4cbed2a20c6f9877cbbc762e6df378c960d3f8`;
+  committed diff SHA-256
+  `42cff85f38eb517236539f88dd184841ec42577ed42a28e4090e269901c868c4`;
+  package SHA-256
+  `3f1922909961798b36353a9309c4de9ddc6651b031f2ac7c0dd1ff529550cbd5`.
+- No source change or image rebuild occurred. Runtime used image tag
+  `aihf-web:2b4cbed2a20c6f9877cbbc762e6df378c960d3f8-3f1922909961798b36353a9309c4de9ddc6651b031f2ac7c0dd1ff529550cbd5`,
+  ID `sha256:ededc795ef56179fc923a28043a3e00d424558b5f06bc20d0f2e43f0716c430e`,
+  Linux/amd64. Docker Desktop 29.9.2/LinuxKit, kernel
+  `6.6.87.2-microsoft-standard-WSL2`. This is not native-Linux evidence.
+- The dedicated event ledger, source hashes, timestamps, scenario outcomes, setup
+  corrections and cleanup record are in
+  `outputs/spec005-supervisor-lifecycle-20261107-102921/runtime-same-container.log`.
+  Ledger SHA-256:
+  `cd188725370bec16b09be03ee930f94c9c1396907568e5f52d09fdb583714f5b`.
+  The ledger consolidates recorded command-time observations; it is not raw shell
+  stdout. No mutation token is retained.
+
+#### Runtime observations
+
+- A started read-only on the exact image with an unenrolled synthetic ext4 root:
+  `writes=false`, `network=false`. HUP without trust stayed read-only and replaced
+  the web child while PID 1 remained unchanged.
+- The fixture-preparation script left the target unenrolled. Real CLI `handover
+  inspect` reported inventory digest
+  `be0dfde7a94765b90cf25161a34a96b10c69c626f6b37bbc3e021913722d120b`;
+  `migrate-existing` recorded `write_authority=ownership-unknown`. A second inspect
+  showed an enrolled, untrusted root. HUP stayed read-only with
+  `attested-migration-read-only`.
+- Exact CLI trust followed by HUP enabled A writes while `network=false`. A's
+  downgrade via SIGUSR1 stopped/waited the writable child; CLI inspect/revoke then
+  persisted revocation, and HUP remained read-only with
+  `operator-single-writer-acknowledgement-revoked`. A received a new explicit review
+  only to prepare the subsequent B replacement scenario.
+- Runtime API scenarios passed, exit 0 in **11.147 s**: non-loopback resolution/connect
+  blocked; Host/Origin/session/CSRF denials returned 403; web trust activation returned
+  405; credential status remained redacted and a credential-like mandate was rejected;
+  `watchtower`, `watchtower-weekly`, and `umbrella` create/deploy requests were denied;
+  synthetic mandate/deploy returned 201; duplicate same-fund deploy returned 409;
+  stale recovery preview returned 409 without a recovery event or clearing Halt.
+- POSIX `waitid(WNOWAIT)` probe preserved a Popen-owned child status (`exit=37`,
+  adopted reaps `0`). The synthetic detached orphan was observed reparented to PID 1;
+  after exit its `/proc/<pid>` entry was absent. Both probes exited 0 in LinuxKit.
+- Docker restarted the same container for B and C; immutable root binding stayed
+  identical: root path
+  `/app/outputs/spec005-test-supervisor-same-20261107-111015/recovery-root`,
+  ext4 device `2096`, identity `[2096, 867371]`, host `docker-desktop`,
+  PID namespace `4026532926`, mount namespace `4026532923`. PID 1 start times were
+  A `647727`, B `687203`, C `693397`.
+- B denied stale A trust with `operator-single-writer-runtime-scope-changed` and
+  remained read-only after HUP. Because the immutable root binding matched, a fresh
+  exact CLI review/trust on B succeeded; B HUP enabled writes, network remained false.
+  C denied stale B trust and remained read-only after HUP. No automatic trust,
+  enrollment rebind or C review occurred.
+- Runtime interval: `2026-11-07T11:16:49.4978056+01:00` through
+  `2026-11-07T11:25:36.0681763+01:00`. Exact container
+  `e44973929f6762422866f8edf1920009ac5968f1695075fc6448c08eea4568bc` and exact
+  owner-labeled volume `aihf-supervisor-same-20261107-111015` were removed after
+  ownership and attachment checks. Project containers, volume and networks were
+  absent; image retained; no prune ran.
+- Compose static check at `11:27:38.2961711`–`11:27:38.5212795+01:00` passed,
+  **0.225 s**, exit 0: host network, zero published ports/networks, rootfs read-only,
+  all capabilities dropped, no-new-privileges, exact external volume, 30 s grace.
+
+#### Evidence disposition
+
+The corrected same-container synthetic lifecycle, API-denial and Linux child-reaping
+scenarios **PASS on Docker Desktop/LinuxKit**. The earlier helper-container
+enrollment mismatch was a test-fixture placement error; the corrected run avoided it
+without changing immutable binding. Bare-metal/native Linux, Windows bridge, browser
+or Ollama runtime, full-suite disposition, existing-fund cutover, protected-name
+policy decision, T085/T086/T134 completion, and independent QA remain
+**UNTESTED / BLOCKED / INCONCLUSIVE as applicable**. Overall Spec005/RB-5 acceptance
+remains **INCONCLUSIVE / not accepted**; RB-5 stays unchecked.

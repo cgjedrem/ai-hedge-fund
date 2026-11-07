@@ -1,6 +1,33 @@
 # Spec005 Release 1 implementation manifest
 
-## Latest authorized lifecycle continuation (2026-11-07)
+## Final same-container runtime follow-up (2026-11-07)
+
+- Runtime used unchanged source commit `2b4cbed2a20c6f9877cbbc762e6df378c960d3f8`
+  and existing image
+  `aihf-web:2b4cbed2a20c6f9877cbbc762e6df378c960d3f8-3f1922909961798b36353a9309c4de9ddc6651b031f2ac7c0dd1ff529550cbd5`,
+  ID `sha256:ededc795ef56179fc923a28043a3e00d424558b5f06bc20d0f2e43f0716c430e`.
+  Docker Desktop 29.9.2/LinuxKit, Linux/amd64; no rebuild or code change during runtime.
+- The corrected synthetic A/B/C lifecycle passed: same-container root preparation,
+  explicit CLI trust/HUP, SIGUSR1 downgrade/revoke, no-trust read-only HUP, stale-trust
+  denial on B/C, fresh reviewed B trust with unchanged root binding, API boundary and
+  protected-name denials, same-fund exclusion, stale-recovery denial and POSIX orphan
+  reaping. This is not native-Linux or overall Spec005/RB-5 acceptance.
+- Ignored runtime artifacts in `outputs/spec005-supervisor-lifecycle-20261107-102921/`:
+  `runtime-same-container.log`, `compose.same-container.yml`,
+  `prepare_unenrolled_migration_fixture.py`, `runtime_lifecycle_scenarios.py`,
+  `orphan_reap_probe.py`, `popen_status_probe.py`, and `progress.log`.
+  `runtime-same-container.log` records source/image mapping, timestamped outcomes,
+  artifact hashes, setup corrections and exact cleanup; SHA-256
+  `cd188725370bec16b09be03ee930f94c9c1396907568e5f52d09fdb583714f5b`.
+- Evidence docs changed after the runtime: `implementation-evidence.md`,
+  `implementation-progress.md`, `tasks.md`, `spec.md`, this manifest, and `memory.md`.
+  Historical helper-container mismatch remains in evidence as a fixture-placement
+  error; corrected run prepared and enrolled the root only inside the service container.
+- Exact synthetic container and owner-labeled ext4 volume removed; project resources
+  absent; image retained; no prune. RB-5 remains unchecked because broader T085/T086/
+  T134 and product acceptance remain incomplete. Independent QA remains coordinator-owned.
+
+## Source commit and initial helper-fixture runtime attempt (2026-11-07)
 
 - Source/docs commit `2b4cbed2a20c6f9877cbbc762e6df378c960d3f8`, parent
   `66bc100`; committed diff 29,256 bytes, SHA-256
@@ -28,7 +55,7 @@
   Overall acceptance **INCONCLUSIVE / not accepted**, RB-5 unchecked. Full
   evidence is in `implementation-evidence.md`; no independent QA claim.
 
-## Latest trust-lifecycle continuation (2026-11-07)
+## Trust-gate correction before final same-container run (2026-11-07)
 
 - Source correction: `1846c970acd88d836a84ae03a9699966c31154df`
   (`fix: require explicit trust for web writes`), parent
@@ -46,9 +73,9 @@
   container started from this image. Full provenance is in `implementation-evidence.md`.
 - The prior `c77163e` artifact's no-trust SIGHUP **FAIL** exposed writes/network after
   fresh synthetic enrollment classified `protocol-native`. No valid mutation ran; the
-  container stopped before a writable replacement. The corrected image was not started
-  after fail-stop. Final runtime acceptance remains **INCONCLUSIVE / not accepted**;
-  A/B/C runtime checks remain not run and RB-5 remains unchecked.
+  container stopped before a writable replacement. At this checkpoint, the corrected
+  image had not started after fail-stop; A/B/C were not run and runtime acceptance was
+  **INCONCLUSIVE / not accepted**. The later same-container runtime is recorded above.
 - Changed evidence/docs: `specs/005-web-engine-migration/implementation-evidence.md`,
   `implementation-progress.md`, `change-manifest.md`, `spec.md`, `tasks.md`,
   `contracts/headless-and-deployment.md`, this manifest, `docs/governance/web-migration-contract.md`,
@@ -169,5 +196,5 @@
 - RB-3: inspect hash-bound reconciliation receipt checks, Halt/Resume transitions, stale-head rejection, and no retry of ambiguous effects.
 - RB-4: inspect provider defaults, secret handling, and CLI/web SIM denial tests.
 - RB-6: inspect targeted regression tests and the synthetic-root browser lifecycle flow.
-- RB-5: inspect final-image synthetic-root observations and evidence limits. Keep unchecked until formal timestamped runtime provenance and supported existing-fund filesystem, protected-name and identity-lifecycle decisions are resolved.
+- RB-5: inspect final-image synthetic-root observations and evidence limits. Timestamped Docker Desktop/LinuxKit A/B/C lifecycle provenance now exists; keep unchecked until T085/T086/T134, supported existing-fund filesystem, protected-name, native-platform and identity-lifecycle decisions are resolved.
 - Test boundary: synthetic roots and fakes only. No live provider/broker calls, production-root activation, or real-fund writes.

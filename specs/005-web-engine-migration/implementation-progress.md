@@ -212,3 +212,36 @@
   are **NOT RUN**. Exact synthetic A and its labeled ext4 volume were cleaned;
   final image retained. No prune, external provider call, or real-root/fund action.
   RB-5 stays unchecked; independent QA remains coordinator-owned.
+
+## 2026-11-07 corrected same-container runtime follow-up
+
+- Task: finish bounded synthetic trust lifecycle; execution owner=Python Developer.
+  Corrected fixture setup after the earlier helper-to-service host mismatch: create a
+  new empty ext4 volume, then prepare and migrate its root inside the exact running
+  host-network supervisor container. No product code or image changed.
+- Evidence identity: source `2b4cbed2a20c6f9877cbbc762e6df378c960d3f8`,
+  package SHA-256
+  `3f1922909961798b36353a9309c4de9ddc6651b031f2ac7c0dd1ff529550cbd5`,
+  retained image `sha256:ededc795ef56179fc923a28043a3e00d424558b5f06bc20d0f2e43f0716c430e`.
+  Docker Desktop 29.9.2/LinuxKit, Linux/amd64; not native Linux. Full event ledger,
+  timestamped outcomes, artifact hashes and exact synthetic cleanup:
+  `outputs/spec005-supervisor-lifecycle-20261107-102921/runtime-same-container.log`.
+- Automatic/manual checks: no-trust A HUP remained read-only; real CLI migration
+  remained read-only; explicit trust/HUP enabled writes; SIGUSR1 downgrade allowed CLI
+  revoke, and later HUP stayed read-only. API boundary/protected-name/same-fund/stale
+  recovery scenarios passed. Linux Popen-status and adopted-orphan reaping probes
+  passed. B denied stale A trust, fresh explicit review/trust worked only with unchanged
+  immutable root binding; C denied stale B trust and stayed read-only.
+- Exact A/B/C runtime interval
+  `2026-11-07T11:16:49.4978056+01:00`–`11:25:36.0681763+01:00`; runtime scenario
+  script **PASS**, exit 0, **11.147 s**; exact synthetic container/volume removed,
+  project resources absent, image retained, no prune. Compose config recheck at
+  `11:27:38.2961711+01:00`–`11:27:38.5212795+01:00` **PASS**, exit 0, **0.225 s**.
+- Disposition: corrected A/B/C trust lifecycle and bounded runtime scenarios
+  **PASS on Docker Desktop/LinuxKit**. The first helper-container mismatch was a
+  fixture-placement error, not a product failure. Native Linux, broader Spec005/RB-5
+  acceptance, existing-fund cutover, T085/T086/T134 completion, and independent QA
+  remain **INCONCLUSIVE / not accepted**; RB-5 stays unchecked.
+- Next stop condition: no further runtime or build without new coordinator/user scope.
+  Keep native Linux, existing-fund cutover and overall acceptance unclaimed; coordinator
+  owns independent QA and remaining release gates.
