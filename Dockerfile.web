@@ -39,5 +39,5 @@ RUN python -m hedge_fund.runtime.build_identity \
 RUN poetry install -E web --only main
 
 EXPOSE 8876
-ENTRYPOINT ["aihf-web", "--root", "/data"]
+ENTRYPOINT ["aihf-web-supervisor", "--root", "/data"]
 CMD ["--port", "8876"]

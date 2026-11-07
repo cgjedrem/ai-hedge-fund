@@ -46,8 +46,14 @@ Never include credentials, unsafe paths or raw provider errors.
 read-only/writable mode. Operator-trusted mode includes a warning that the operator must
 exclude every other program that can reach the root; it does not claim OS-enforced
 exclusion. No browser route can create, renew or revoke the offline acknowledgement.
-Missing, invalid, stale or revoked acknowledgement leaves production roots read-only.
-Fresh enrollment, existing-data migration and relocation do not grant writes by themselves.
+Missing, invalid, stale, revoked or runtime-mismatched acknowledgement leaves production
+roots read-only. `operator-single-writer-runtime-scope-changed` requires a fresh offline
+challenge, exact current inventory review and explicit trust for the current runtime;
+enrollment/root binding stays unchanged. `operator-single-writer-runtime-scope-unavailable`
+means no challenge or trusted capability is issued. Linux requires readable PID 1 procfs
+identity and current PID/mount namespace links; native Windows trusted-single-writer mode
+is disabled. Fresh enrollment, existing-data migration and relocation do not grant writes
+by themselves.
 
 | HTTP / code | Meaning / effect boundary |
 | --- | --- |

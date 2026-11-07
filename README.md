@@ -233,10 +233,14 @@ report write already in progress.
 The Compose package has separate profiles: `web` is read-only inspection;
 `web-operator` is the explicit writable paper desk. Both use a read-only image
 filesystem, drop all capabilities and enable `no-new-privileges`. Only
-`web-operator` mounts `/data` writable and passes `--allow-writes
---enable-network`. Its free-data and local-model settings remain yfinance and
-literal `http://127.0.0.1:11434`; no credentials are placed in Compose. Paid
-provider approvals remain separate per-operation gates.
+`web-operator` mounts `/data` writable. Its PID 1 supervisor starts the web
+child read-only. After exact offline trust, send `SIGHUP` to PID 1; the
+supervisor rechecks runtime authority and inventory before restarting the child
+with write capability. Network capability also requires the service's explicit
+network opt-in. The child never starts with write or network flags by default.
+Free-data and local-model settings remain yfinance and literal
+`http://127.0.0.1:11434`; no credentials are placed in Compose. Paid provider
+approvals remain separate per-operation gates.
 
 The supported browser topology is a Linux host with local ext4 and the Linux
 host-network overlay. The app binds literal loopback; the overlay removes bridge
@@ -275,17 +279,33 @@ docker compose -f docker-compose.yml -f docker-compose.linux.yml exec web-operat
 docker compose -f docker-compose.yml -f docker-compose.linux.yml exec web-operator aihf --root /data handover inspect
 # After offline writer-exclusion review, supply the exact values printed by inspect:
 docker compose -f docker-compose.yml -f docker-compose.linux.yml exec web-operator aihf --root /data handover trust-single-writer --inventory-digest DIGEST --operator-acknowledgement "EXACT ROOT-SPECIFIC ACKNOWLEDGEMENT"
-docker compose -f docker-compose.yml -f docker-compose.linux.yml restart web-operator
+docker compose -f docker-compose.yml -f docker-compose.linux.yml kill --signal SIGHUP web-operator
 ```
 
 This sequence is operator-only and was not executed against any real root. It
-applies only to a deliberately new empty root in the same container namespace;
-trust is recorded inside that container, and restart must reuse that exact
-container. Never recreate or upgrade it: a changed container namespace/build
-fails closed, and no rebind/upgrade workflow is accepted. The operator must
-exclude every other writer. Never run the TUI CLI or legacy runner as a second
-writer on that root. The TUI CLI fallback starts only after the web writer stops;
-the browser `tui-web` service is not approved for use.
+shows a deliberately new empty root; for an already enrolled root, skip
+`enroll-fresh` and run `inspect` in the current runtime. Trust is recorded
+separately from immutable root enrollment and bound to Linux PID 1 creation
+identity plus boot/PID/mount namespaces. PID 1 stays alive across `SIGHUP`; only
+the web child restarts. The new child starts with writes only after a fresh
+current-runtime authority and exact inventory check.
+
+Container restart/recreation changes PID 1 identity. The replacement child
+starts read-only; run a fresh `inspect`, review its inventory, record a new
+trust, then send `SIGHUP`. Never reuse an earlier acknowledgement or copy a
+trust record. This is an explicit trust update, not auto-enrollment or root
+identity rebind. A runtime that cannot read `/proc/1/stat`, `/proc/1/ns/pid`,
+`/proc/1/exe`, `/proc/sys/kernel/random/boot_id`, and current PID/mount
+namespace links stays read-only. Native Linux unprivileged processes may lack
+access to PID 1 procfs metadata; no elevated fallback is attempted. Native
+Windows host trusted-single-writer mode is disabled; a Docker Desktop Linux
+container is a LinuxKit runtime, not native Linux-host evidence.
+
+The operator must exclude every other writer. Never run the TUI CLI or legacy
+runner as a concurrent writer on that root. The TUI CLI fallback starts only
+after the web writer stops and needs its own explicit trust in its own runtime;
+that trust makes the web runtime stale until separately reviewed again. The
+browser `tui-web` service is not approved for use.
 
 Record container build and runtime evidence against the exact source revision,
 image identity, commands, timestamps and synthetic scenario in
@@ -446,10 +466,11 @@ docker compose -f docker-compose.yml -f docker-compose.linux.yml run --rm tui   
 ```
 
 The writable web path still requires an enrolled, explicitly trusted root and
-single-writer operator review. Protected-name operation, existing-root
-relocation, and container recreation/upgrade remain blocked as described above.
-Remote access, reverse proxies and non-loopback publication remain unsupported.
-Do not start `tui-web`; use the TUI CLI fallback only after the web writer stops.
+single-writer operator review. Protected-name operation and existing-root
+relocation remain blocked. Container replacement starts read-only and requires
+fresh explicit trust before write activation. Remote access, reverse proxies
+and non-loopback publication remain unsupported. Do not start `tui-web`; use
+the TUI CLI fallback only after the web writer stops and has independent trust.
 
 ## Development
 

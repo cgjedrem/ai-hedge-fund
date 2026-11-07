@@ -20,6 +20,9 @@ class ProcessIdentityError(RuntimeError):
     """Process identity could not be verified."""
 
 
+_MAX_LINUX_IDENTITY_COUNTER = 2**64 - 1
+
+
 def process_identity(pid: int) -> dict[str, Any]:
     if type(pid) is not int or pid <= 0:
         raise ProcessIdentityError("process identity input is invalid")
@@ -245,26 +248,38 @@ def _windows_process_identity(pid: int) -> dict[str, Any]:
         kernel32.CloseHandle(handle)
 
 
-def _linux_process_identity(pid: int) -> dict[str, Any]:
-    proc = Path("/proc") / str(pid)
+def _linux_process_stat_creation_time(stat_text: str) -> str:
+    if not isinstance(stat_text, str):
+        raise ProcessIdentityError("process stat record is malformed")
+    closing_parenthesis = stat_text.rfind(")")
+    if closing_parenthesis < 0:
+        raise ProcessIdentityError("process stat record is malformed")
+    tail = stat_text[closing_parenthesis + 2 :].split()
+    if len(tail) <= 19:
+        raise ProcessIdentityError("process stat record is malformed")
+    creation = tail[19]
+    if not creation.isascii() or not creation.isdecimal() or len(creation) > 20 or int(creation) <= 0 or int(creation) > _MAX_LINUX_IDENTITY_COUNTER:
+        raise ProcessIdentityError("process creation time is unavailable")
+    return creation
+
+
+def _linux_process_identity(pid: int, *, proc_root: Path | None = None) -> dict[str, Any]:
+    if type(pid) is not int or pid <= 0:
+        raise ProcessIdentityError("process identity input is invalid")
+    if proc_root is None:
+        proc_root = Path("/proc")
+    if not isinstance(proc_root, Path) or not proc_root.is_absolute():
+        raise ProcessIdentityError("process identity proc root is invalid")
+    proc = proc_root / str(pid)
     try:
         stat_text = (proc / "stat").read_text(encoding="ascii")
-        tail = stat_text[stat_text.rfind(")") + 2 :].split()
-        if len(tail) <= 19:
-            raise ProcessIdentityError("process stat record is malformed")
-        creation = tail[19]
+        creation = _linux_process_stat_creation_time(stat_text)
         namespace = str(os.stat(proc / "ns" / "pid").st_ino)
-        image = os.path.realpath(proc / "exe")
-        boot = (
-            Path("/proc/sys/kernel/random/boot_id")
-            .read_text(
-                encoding="ascii",
-            )
-            .strip()
-        )
+        image = os.readlink(proc / "exe")
+        boot = (proc_root / "sys" / "kernel" / "random" / "boot_id").read_text(encoding="ascii").strip()
     except (OSError, UnicodeError, IndexError) as exc:
         raise ProcessIdentityError("process identity is unavailable") from exc
-    if not creation or not namespace or not boot:
+    if not namespace or not boot or not image or not os.path.isabs(image):
         raise ProcessIdentityError("process identity is incomplete")
     return {
         "pid": pid,

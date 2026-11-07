@@ -97,13 +97,16 @@ deliberately invokes it for the selected root.
 One Windows or Linux host owns local supported root and all writable processes. Host local
 model endpoint is literal loopback. Host desk binds loopback. CLI/runner share the same
 OS/namespace/device/root identity and admission. Process lifetime is detached from server/
-browser; verified graceful stop only. No system/compose auto-restart for upgraded runners.
+browser; verified graceful stop only. Native Windows operator-trusted single-writer scope is
+disabled until a stable boot identity exists. No system/compose auto-restart for upgraded runners.
 
 Selected Release 1 topology is one writable, single-user paper desk in Docker. Mount only the
 selected root at `/data`; that mount is writable for canonical ledger, operation and private
 runtime state. Keep the image filesystem read-only, drop capabilities, and publish only to
-host loopback. The Compose `web` profile is read-only inspection; `web-operator` explicitly
-enables writes and network capability. Supported browser access uses the Linux host-network
+host loopback. The Compose `web` profile is read-only inspection; `web-operator` starts its
+PID 1 supervisor with a read-only child. An explicit offline trust plus SIGHUP restarts only
+the child after current authority and exact inventory checks; network remains separately
+opt-in. Supported browser access uses the Linux host-network
 overlay: app binds literal `127.0.0.1`, and the overlay clears bridge ports/networks. Do not
 accept Docker gateway peers or add a `host.docker.internal` exception. Windows bridge/browser
 and Ollama access remain unsupported. Do not mount the host home or unrelated credential paths. Credentials already
@@ -111,8 +114,12 @@ stored inside the selected root remain private to the service and must never app
 responses, logs or browser state. Root enrollment, offline trust, immutable capabilities and
 the existing RootOwnerLease, operation-service lease and per-fund admission remain mandatory.
 The operator excludes every other writer while trust is enabled. A TUI fallback does not
-permit a second concurrent writer. No cross-namespace runner stop/adoption, automatic
-enrollment or identity rebind is supported. Image labels and the package code-version stamp
+permit a second concurrent writer and needs separate explicit trust in its runtime. Trust
+is bound to Linux PID 1 creation identity, boot ID, PID namespace and current PID/mount
+namespaces, separate from root enrollment. Container replacement starts read-only; an
+operator may record a new trust only after a fresh challenge and exact inventory review.
+No automatic enrollment, identity rebind, or cross-namespace runner stop/adoption is supported.
+Image labels and the package code-version stamp
 contain an operator-supplied revision, format-checked as a full lowercase Git object ID, and
 a package-source SHA-256 recomputed before baking; the revision is not checked against Git.
 The digest covers selected `hedge_fund` package files, excluding generated identity and
@@ -120,26 +127,33 @@ The digest covers selected `hedge_fund` package files, excluding generated ident
 In an unbaked checkout, `code_version()` uses short Git `HEAD` and adds `.dirty` when Git
 reports a changed worktree. Runtime environment values cannot override baked values.
 
+Linux trust requires read access to `/proc/1/stat`, `/proc/1/ns/pid`, `/proc/1/exe`,
+`/proc/sys/kernel/random/boot_id`, and current PID/mount namespace links. If any identity
+input is unavailable, authority and challenge issuance fail closed. Native Linux
+unprivileged processes may lack PID 1 procfs access; no elevated fallback is attempted.
+
 The Windows Docker Desktop bind filesystem is not currently supported: a synthetic host
 directory mounted at `/data` reports `9p`, and `RootContext.open` rejects it because only
 local NTFS/ext4 are admitted. A Docker Desktop ext4 named volume is permitted for disposable
 synthetic runtime validation only; it does not support NTFS-to-ext4 relocation. The current
-`7ec7aaa` image was exercised under host networking. Its replacement container retained the
-enrolled PID/mount namespace identity and readiness reported `enrolled`; the probe failed
-before capability/write-denial checks. No write-enabled replacement or re-enrollment ran.
-The prior `cad96a` observation of namespace change/read-only behavior is historical and does
-not override this failure. These observations do not approve rebind, cross-filesystem copy
-or upgrade. Windows bridge and host Ollama access remain blocked; browser/Ollama runtime
-remains untested. FR-044 protected names remain globally denied, so the R1 `watchtower`
-targets are blocked pending a user decision. Never
+`7ec7aaa` replacement-container observation remains historical: that image retained the
+enrolled PID/mount namespace identity and the probe stopped before capability/write-denial
+checks. No write-enabled replacement or re-enrollment ran. The earlier `cad96a` observation
+is also historical. Rework evidence must use a final artifact and cover read-only replacement,
+explicit re-trust, child activation and a second replacement. Cross-filesystem copy remains
+blocked. Windows bridge and host Ollama access remain blocked; browser/Ollama runtime remains
+untested. FR-044 protected names remain globally denied, so the R1 `watchtower` targets are
+blocked pending a user decision. Never
 remove the protected-name guards or add fixture/agent-specific bypasses.
 
 Keep the TUI CLI fallback. The `tui-web` service remains behind its explicit profile, but is
 not approved for use: Compose config supplies no ttyd credentials, and the Dockerfile downloads
 ttyd without a pinned checksum. Do not start it pending separate review. A sequential TUI CLI
 test on a synthetic root does not establish same-root cross-namespace rebind or writable
-fallback on a trusted Docker root. Disable competing runner/TUI writers during any operator
-session; fallback use begins only after the web writer stops. Compose examples use synthetic
+fallback on a trusted Docker root. TUI trust replaces the shared authority record, so the web
+runtime must be explicitly trusted again before returning. Disable competing runner/TUI
+writers during any operator session; fallback use begins only after the web writer stops.
+Compose examples use synthetic
 names and isolated roots/ports. Do not operate existing compose services or actual funds to
 validate migration. Container/Linux runtime acceptance requires final-image evidence.
 

@@ -39,6 +39,23 @@ from hedge_fund.runtime.ownership import process_identity
 from hedge_fund.runtime.root import PRIVATE_ROOT, RootContext
 
 
+@pytest.fixture(autouse=True)
+def synthetic_runtime_scope(monkeypatch):
+    runtime_scope = {
+        "kind": "linux-pid1",
+        "pid1": {
+            "pid": 1,
+            "creation_time": "987654",
+            "image": "/usr/bin/synthetic-supervisor",
+            "host": "synthetic-boot-id",
+            "namespace": "4026533000",
+        },
+        "namespace": "pid:[4026533000];mnt:[4026533001]",
+    }
+    monkeypatch.setattr(handover, "_runtime_scope_identity", lambda _root: runtime_scope)
+    return runtime_scope
+
+
 def _spec():
     return FundSpec.model_validate(
         {
@@ -78,7 +95,12 @@ def test_fresh_enrollment_requires_empty_root_and_records_fixed_identity(tmp_pat
     assert not (nonempty / PRIVATE_ROOT).exists()
 
 
-def test_child_process_admits_persisted_trust_and_rejects_revocation(tmp_path, monkeypatch, owned_test_process):
+def test_child_process_admits_persisted_trust_and_rejects_revocation(
+    tmp_path,
+    monkeypatch,
+    owned_test_process,
+    synthetic_runtime_scope,
+):
     monkeypatch.setattr(handover, "out_of_band_exclusion_basis", lambda _root: None)
     root_path = tmp_path / "trusted-child"
     root_path.mkdir()
@@ -98,6 +120,7 @@ def test_child_process_admits_persisted_trust_and_rejects_revocation(tmp_path, m
             "from hedge_fund.runtime.admission import RootOwnerLease\n"
             "from hedge_fund.runtime.root import RootContext\n"
             "handover.out_of_band_exclusion_basis = lambda _root: None\n"
+            f"handover._runtime_scope_identity = lambda _root: {synthetic_runtime_scope!r}\n"
             f"with RootContext.open({str(root_path)!r}) as root:\n"
             "    try:\n"
             "        owner = RootOwnerLease.acquire(root, timeout=0)\n"

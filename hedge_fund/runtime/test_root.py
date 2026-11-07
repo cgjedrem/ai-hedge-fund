@@ -7,6 +7,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Event, Thread
+from types import SimpleNamespace
 
 import pytest
 
@@ -554,6 +555,12 @@ def test_private_storage_verifies_native_permissions(tmp_path):
             assert stat.S_IMODE(private_root.stat().st_mode) == 0o700
             private_root.chmod(0o755)
             assert context.private_storage_verified is False
+
+
+def test_windows_boot_identity_fails_closed_without_stable_boot_id(monkeypatch):
+    monkeypatch.setattr(root_module, "sys", SimpleNamespace(platform="win32"))
+
+    assert root_module._boot_identity() == "unknown"
 
 
 def test_lock_file_handle_is_root_relative_and_closed(tmp_path):

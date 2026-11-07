@@ -6,8 +6,8 @@ root; it is not a replacement financial ledger. Authority is the [forward contra
 
 | Entity | Fields / relationships | Validation and immutability |
 | --- | --- | --- |
-| RootContext | canonical path, filesystem/device identity, host/boot/namespace identity, protocol/build, launch capabilities, handover evidence | Explicit launch argument before imports; local supported filesystem, protected/path guards; no env/browser redirection/elevation. |
-| OperatorTrustAcknowledgement | canonical root binding, enrollment identity, protocol/build, reviewed inventory digest, exact operator statement, timestamp | Created/revoked only by offline CLI; missing/invalid/stale means read-only. Records operator responsibility, not OS exclusion. |
+| RootContext | canonical path, filesystem/device identity, host/boot/namespace identity, current runtime scope, protocol/build, launch capabilities, handover evidence | Explicit launch argument before imports; local supported filesystem, protected/path guards; no env/browser redirection/elevation. |
+| OperatorTrustAcknowledgement | canonical root binding, enrollment identity, protocol/build, current runtime scope, reviewed inventory digest, exact operator statement, timestamp | Trusted record schema 2; old trusted records without scope fail closed. Revoked schema 1 remains revoked. Scope mismatch reports `operator-single-writer-runtime-scope-changed`; unavailable scope reports `operator-single-writer-runtime-scope-unavailable`. Both deny writes; only a fresh offline challenge, exact inventory review and trust can restore authority. No auto-enrollment or rebind. |
 | MandateTemplate | canonical name, revision/content digest, validated existing FundSpec | All supported fields/default omissions round-trip; YAML/YML/case collisions reject; edits/clone/rename expect revision. |
 | Deployment | stable ID, root ID, immutable mandate snapshot/digest, universe, broker, ledger head, lifecycle, predecessor/archive links | No snapshot mutation; local-paper web mutations only; halt/replay/quiescence checks. |
 | SIMAccountBinding | SIM environment/account identity, deployment/root owner, status, transfer provenance | Single active binding across deployments/roots; unverifiable exclusivity denies mutation; no real-broker option. |
@@ -57,5 +57,10 @@ interprets an incomplete marker as permission to repeat financial effects.
 Read-only observer cannot create sidecars; paired immutable snapshots either verify or
 return observation conflict. Journal/credential ACL failure blocks privileged capability.
 Fresh enrollment, migration and relocation remain read-only until exact root-specific
-operator acknowledgement. The operator must exclude other programs; shared locks do not
-fence unaware or malicious same-account writers.
+operator acknowledgement. Linux trusted scope binds PID 1 creation identity, boot ID,
+PID namespace and current PID/mount namespaces. Supervisor PID 1 remains stable while
+the web child is restarted after explicit trust and inventory preflight. Container
+replacement starts read-only and permits only fresh trust under the unchanged enrollment;
+old acknowledgements are not reusable. Windows trusted-single-writer mode and Linux
+runtime scopes with unreadable procfs identity remain unavailable. The operator must
+exclude other programs; shared locks do not fence unaware or malicious same-account writers.

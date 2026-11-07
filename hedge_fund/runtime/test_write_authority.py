@@ -9,6 +9,7 @@ import json
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -35,6 +36,8 @@ from hedge_fund.runtime.handover import (
 )
 from hedge_fund.runtime.root import RootContext
 
+_ORIGINAL_RUNTIME_SCOPE_IDENTITY = handover._runtime_scope_identity
+
 
 @pytest.fixture(autouse=True)
 def synthetic_home(tmp_path, monkeypatch):
@@ -45,6 +48,11 @@ def synthetic_home(tmp_path, monkeypatch):
     monkeypatch.delenv("HOMEDRIVE", raising=False)
     monkeypatch.delenv("HOMEPATH", raising=False)
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    monkeypatch.setattr(
+        handover,
+        "_runtime_scope_identity",
+        lambda _root: _synthetic_runtime_scope("100"),
+    )
     return home
 
 
@@ -124,6 +132,103 @@ def _synthetic_runtime_scope(creation_time: str) -> dict[str, object]:
         },
         "namespace": "pid:[4026533000];mnt:[4026533001]",
     }
+
+
+def test_linux_runtime_scope_uses_pid1_identity_and_checks_root_boot_and_namespaces(tmp_path, monkeypatch):
+    root_path = tmp_path / "linux-scope"
+    root_path.mkdir()
+    pid1 = {
+        "pid": 1,
+        "creation_time": "123456",
+        "image": "/usr/bin/aihf-web-supervisor",
+        "host": "synthetic-boot-id",
+        "namespace": "4026533000",
+    }
+    calls = []
+
+    def process_identity(pid):
+        calls.append(pid)
+        return pid1
+
+    fake_os = SimpleNamespace(
+        name="posix",
+        readlink=lambda name: {
+            "/proc/self/ns/pid": "pid:[4026533000]",
+            "/proc/self/ns/mnt": "mnt:[4026533001]",
+        }[name],
+        stat=lambda name: SimpleNamespace(st_ino=4026533000) if name == "/proc/self/ns/pid" else None,
+    )
+    monkeypatch.setattr(handover, "_runtime_scope_identity", _ORIGINAL_RUNTIME_SCOPE_IDENTITY)
+    monkeypatch.setattr(handover, "sys", SimpleNamespace(platform="linux"))
+    monkeypatch.setattr(handover, "os", fake_os)
+    monkeypatch.setattr(handover, "process_identity", process_identity)
+    with RootContext.open(root_path) as root:
+        root.boot_identity = "synthetic-boot-id"
+        root.namespace_identity = "pid:pid:[4026533000];mnt:mnt:[4026533001]"
+        scope = handover._runtime_scope_identity(root)
+        root.boot_identity = "different-boot-id"
+        with pytest.raises(HandoverError, match="incomplete"):
+            handover._runtime_scope_identity(root)
+
+    assert calls == [1, 1]
+    assert scope == {
+        "kind": "linux-pid1",
+        "pid1": pid1,
+        "namespace": "pid:pid:[4026533000];mnt:mnt:[4026533001]",
+    }
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("creation_time", "1" * 21),
+        ("creation_time", "18446744073709551616"),
+        ("namespace", "1" * 21),
+        ("namespace", "18446744073709551616"),
+    ],
+)
+def test_linux_runtime_scope_rejects_unbounded_pid1_numbers(tmp_path, monkeypatch, field, value):
+    root_path = tmp_path / "linux-scope-bounds"
+    root_path.mkdir()
+    pid_namespace = value if field == "namespace" else "4026533000"
+    pid1 = {
+        "pid": 1,
+        "creation_time": "123456",
+        "image": "/usr/bin/aihf-web-supervisor",
+        "host": "synthetic-boot-id",
+        "namespace": pid_namespace,
+    }
+    pid1[field] = value
+    expected_namespace = f"pid:pid:[{pid_namespace}];mnt:mnt:[4026533001]"
+    fake_os = SimpleNamespace(
+        name="posix",
+        readlink=lambda name: {
+            "/proc/self/ns/pid": f"pid:[{pid_namespace}]",
+            "/proc/self/ns/mnt": "mnt:[4026533001]",
+        }[name],
+        stat=lambda name: SimpleNamespace(st_ino=int(pid_namespace)) if name == "/proc/self/ns/pid" else None,
+    )
+    monkeypatch.setattr(handover, "_runtime_scope_identity", _ORIGINAL_RUNTIME_SCOPE_IDENTITY)
+    monkeypatch.setattr(handover, "sys", SimpleNamespace(platform="linux"))
+    monkeypatch.setattr(handover, "os", fake_os)
+    monkeypatch.setattr(handover, "process_identity", lambda _pid: pid1)
+
+    with RootContext.open(root_path) as root:
+        root.boot_identity = "synthetic-boot-id"
+        root.namespace_identity = expected_namespace
+        with pytest.raises(HandoverError, match="incomplete"):
+            handover._runtime_scope_identity(root)
+
+
+def test_windows_runtime_scope_is_unavailable_not_wallclock_derived(tmp_path, monkeypatch):
+    root_path = tmp_path / "windows-scope"
+    root_path.mkdir()
+    monkeypatch.setattr(handover, "_runtime_scope_identity", _ORIGINAL_RUNTIME_SCOPE_IDENTITY)
+    monkeypatch.setattr(handover, "sys", SimpleNamespace(platform="win32"))
+
+    with RootContext.open(root_path) as root:
+        with pytest.raises(HandoverError, match="Windows.*disabled"):
+            handover._runtime_scope_identity(root)
 
 
 def _link_directory(link: Path, target: Path) -> None:
@@ -392,6 +497,57 @@ def test_trusted_authority_fails_closed_when_runtime_identity_is_unavailable(tmp
         with pytest.raises(OwnershipUnknown):
             RootOwnerLease.acquire(root)
         assert _filesystem_snapshot(root_path) == before_denial
+
+
+def test_inspection_reports_unavailable_runtime_without_issuing_challenge(tmp_path, monkeypatch):
+    monkeypatch.setattr(handover, "out_of_band_exclusion_basis", lambda _root: None)
+    monkeypatch.setattr(handover, "_runtime_scope_identity", _ORIGINAL_RUNTIME_SCOPE_IDENTITY)
+    monkeypatch.setattr(handover, "sys", SimpleNamespace(platform="win32"))
+    root_path = _legacy_source(tmp_path / "runtime-scope-unavailable")
+    with RootContext.open(root_path) as root:
+        heads = build_head_inventory(root)
+        migrate_existing(
+            root,
+            expected_inventory_digest=inventory_digest(heads),
+            operator_attestation=OPERATOR_ATTESTATION,
+        )
+
+        before = _filesystem_snapshot(root_path)
+        assert handover.write_authority(root) == {
+            "authority": "ownership-unknown",
+            "reason": "operator-single-writer-runtime-scope-unavailable",
+        }
+        assert _filesystem_snapshot(root_path) == before
+
+        review = handover.prepare_single_writer_acknowledgement(root)
+
+        assert review["write_authority"] == "ownership-unknown"
+        assert review["reason"] == "operator-single-writer-runtime-scope-unavailable"
+        assert review["operator_acknowledgement"] is None
+        assert review["runtime_scope"] is None
+        with pytest.raises(FileNotFoundError):
+            root.file_info(handover.SINGLE_WRITER_CHALLENGE_PATH)
+
+
+def test_unexpected_runtime_scope_errors_are_not_silently_downgraded(tmp_path, monkeypatch):
+    monkeypatch.setattr(handover, "out_of_band_exclusion_basis", lambda _root: None)
+    root_path = _legacy_source(tmp_path / "runtime-scope-error")
+    with RootContext.open(root_path) as root:
+        heads = build_head_inventory(root)
+        migrate_existing(
+            root,
+            expected_inventory_digest=inventory_digest(heads),
+            operator_attestation=OPERATOR_ATTESTATION,
+        )
+
+        def unexpected_error(_root):
+            raise AssertionError("synthetic runtime-scope implementation failure")
+
+        monkeypatch.setattr(handover, "_runtime_scope_identity", unexpected_error)
+        with pytest.raises(AssertionError, match="implementation failure"):
+            write_authority(root)
+        with pytest.raises(AssertionError, match="implementation failure"):
+            handover.prepare_single_writer_acknowledgement(root)
 
 
 def test_legacy_trust_record_without_runtime_scope_fails_closed(tmp_path, monkeypatch):

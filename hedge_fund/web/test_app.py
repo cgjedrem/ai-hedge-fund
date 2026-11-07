@@ -35,6 +35,21 @@ def test_trusted_single_writer_is_explicit_warned_and_not_web_enrollable(tmp_pat
 
     enroll_synthetic_root(tmp_path)
     monkeypatch.setattr(handover, "out_of_band_exclusion_basis", lambda _root: None)
+    monkeypatch.setattr(
+        handover,
+        "_runtime_scope_identity",
+        lambda _root: {
+            "kind": "linux-pid1",
+            "pid1": {
+                "pid": 1,
+                "creation_time": "987654",
+                "image": "/usr/bin/synthetic-supervisor",
+                "host": "synthetic-boot-id",
+                "namespace": "4026533000",
+            },
+            "namespace": "pid:pid:[4026533000];mnt:mnt:[4026533001]",
+        },
+    )
     with RootContext.open(tmp_path) as root:
         review = prepare_single_writer_acknowledgement(root)
         authority = trust_single_writer(

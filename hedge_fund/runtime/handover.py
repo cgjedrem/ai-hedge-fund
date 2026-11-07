@@ -58,6 +58,7 @@ _TRUST_INVALID_REASON = "operator-single-writer-acknowledgement-invalid"
 _TRUST_REVOKED_REASON = "operator-single-writer-acknowledgement-revoked"
 _TRUST_RUNTIME_SCOPE_CHANGED_REASON = "operator-single-writer-runtime-scope-changed"
 _TRUST_RUNTIME_SCOPE_UNAVAILABLE_REASON = "operator-single-writer-runtime-scope-unavailable"
+_MAX_RUNTIME_IDENTITY_COUNTER = 2**64 - 1
 
 
 class HandoverError(RuntimeError):
@@ -219,7 +220,9 @@ def _runtime_scope_identity(root: RootContext) -> dict[str, Any]:
         required_fields = ("creation_time", "image", "host", "namespace")
         if any(not isinstance(pid1.get(key), str) or not pid1[key] for key in required_fields):
             raise HandoverError("Linux runtime scope identity is incomplete")
-        if not pid1["creation_time"].isdecimal() or not pid1["namespace"].isdecimal():
+        if not _valid_runtime_identity_counter(pid1["creation_time"]):
+            raise HandoverError("Linux runtime scope identity is incomplete")
+        if not _valid_runtime_identity_counter(pid1["namespace"]):
             raise HandoverError("Linux runtime scope identity is incomplete")
         if pid1["namespace"] != pid_namespace or pid1["host"] != root.boot_identity or namespace != root.namespace_identity:
             raise HandoverError("Linux runtime scope identity is incomplete")
@@ -228,13 +231,17 @@ def _runtime_scope_identity(root: RootContext) -> dict[str, Any]:
             "pid1": pid1,
             "namespace": namespace,
         }
-    if os.name == "nt":
-        host = root.host_identity.casefold() if isinstance(root.host_identity, str) else ""
-        boot = root.boot_identity
-        if not host or not isinstance(boot, str) or not boot or boot.casefold() == "unknown":
-            raise HandoverError("Windows host boot identity is unavailable")
-        return {"kind": "windows-host-boot", "host": host, "boot": boot}
+    if os.name == "nt" or sys.platform.startswith("win"):
+        raise HandoverError("Windows runtime identity is unavailable; trusted single-writer mode is disabled")
     raise HandoverError("runtime scope identity is unsupported")
+
+
+def _valid_runtime_identity_counter(value: object) -> bool:
+    if not isinstance(value, str) or not value.isascii() or not value.isdecimal():
+        return False
+    if not 1 <= len(value) <= 20 or value[0] == "0":
+        return False
+    return int(value) <= _MAX_RUNTIME_IDENTITY_COUNTER
 
 
 def enrollment_status(root: RootContext, *, verify_inventory: bool = False) -> dict[str, str | None]:
@@ -403,6 +410,10 @@ def _classify_write_authority(root: RootContext, enrollment: dict[str, Any]) -> 
         state = _read_single_writer_state(root, enrollment)
     except FileNotFoundError:
         reason = "attested-migration-read-only" if enrollment["mode"] == "migrate-existing" else _TRUST_REQUIRED_REASON
+        try:
+            _runtime_scope_identity(root)
+        except HandoverError:
+            return {"authority": "ownership-unknown", "reason": _TRUST_RUNTIME_SCOPE_UNAVAILABLE_REASON}
         return {"authority": "ownership-unknown", "reason": reason}
     except Exception:
         return {"authority": "ownership-unknown", "reason": _TRUST_INVALID_REASON}
@@ -410,7 +421,7 @@ def _classify_write_authority(root: RootContext, enrollment: dict[str, Any]) -> 
         return {"authority": "ownership-unknown", "reason": _TRUST_REVOKED_REASON}
     try:
         runtime_scope = _runtime_scope_identity(root)
-    except Exception:
+    except HandoverError:
         return {"authority": "ownership-unknown", "reason": _TRUST_RUNTIME_SCOPE_UNAVAILABLE_REASON}
     if state["runtime_scope"] != runtime_scope:
         return {"authority": "ownership-unknown", "reason": _TRUST_RUNTIME_SCOPE_CHANGED_REASON}
@@ -441,7 +452,18 @@ def prepare_single_writer_acknowledgement(root: RootContext) -> dict[str, Any]:
                     "runtime_scope": None,
                 }
 
-            runtime_scope = _runtime_scope_identity(root)
+            try:
+                runtime_scope = _runtime_scope_identity(root)
+            except HandoverError:
+                return {
+                    "heads": heads,
+                    "inventory_digest": digest,
+                    "write_authority": "ownership-unknown",
+                    "reason": _TRUST_RUNTIME_SCOPE_UNAVAILABLE_REASON,
+                    "operator_acknowledgement": None,
+                    "review_expires_at": None,
+                    "runtime_scope": None,
+                }
             challenge_id = secrets.token_hex(16)
             reviewed_at = datetime.now(timezone.utc)
             body = {

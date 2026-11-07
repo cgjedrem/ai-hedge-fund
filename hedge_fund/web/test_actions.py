@@ -550,13 +550,9 @@ def test_emergency_halt_recovers_an_unreadable_control_file(demo_root):
     assert ledger.halted() == "control recovery"
 
 
-def test_protected_name_guard_runs_before_fund_adapter(tmp_path, monkeypatch):
-    from hedge_fund.runtime.handover import enroll_fresh
-    from hedge_fund.runtime.root import RootContext
-
-    with RootContext.open(tmp_path) as context:
-        enroll_fresh(context)
-    app = create_app(root=tmp_path, allow_writes=True)
+@pytest.mark.parametrize("name", ["WATCHTOWER", "watchtower-weekly", "Umbrella"])
+def test_protected_name_guard_runs_before_fund_adapter(demo_root, monkeypatch, name):
+    app = create_app(root=demo_root, allow_writes=True, demo=True)
     service = app.state.service
     called = False
 
@@ -567,40 +563,30 @@ def test_protected_name_guard_runs_before_fund_adapter(tmp_path, monkeypatch):
 
     monkeypatch.setattr(service, "_paper_control_state", forbidden)
     with TestClient(app, client=("127.0.0.1", 50000)) as client:
-        token = client.get("/api/capabilities", headers={"host": "127.0.0.1"}).json()["mutation_token"]
+        capabilities = client.get("/api/capabilities", headers={"host": "127.0.0.1"})
+        token = capabilities.json()["mutation_token"]
         response = client.post(
-            "/api/paper/WATCHTOWER/halt",
+            f"/api/paper/{name}/halt",
             headers={
                 "host": "127.0.0.1",
                 "origin": "http://127.0.0.1",
                 "x-csrf-token": token,
             },
-            json={"request_id": "halt-protected-001", "reason": "not allowed"},
+            json={"request_id": f"halt-protected-{name.casefold()}", "reason": "not allowed"},
         )
 
+    assert capabilities.status_code == 200
+    assert capabilities.json()["writes"] is True
     assert response.status_code == 403
+    assert response.json()["code"] == "protected-root"
     assert not called
-    assert not (tmp_path / "paper").exists()
+    assert not (demo_root / "paper" / name.casefold()).exists()
 
 
-def test_protected_windows_aliases_are_rejected_before_control_writes(tmp_path, monkeypatch):
-    from hedge_fund.runtime.handover import enroll_fresh
-    from hedge_fund.runtime.root import RootContext
-
-    root = tmp_path / "temporary-root"
-    root.mkdir()
-    with RootContext.open(root) as context:
-        enroll_fresh(context)
-    app = create_app(root=root, allow_writes=True)
+def test_protected_windows_aliases_are_rejected_before_control_writes(demo_root, monkeypatch):
+    root = demo_root
+    app = create_app(root=root, allow_writes=True, demo=True)
     service = app.state.service
-    fund_dir = root / "paper" / "watchtower"
-    fund_dir.mkdir(parents=True)
-    control = fund_dir / "control.json"
-    events = fund_dir / "events.jsonl"
-    control.write_text('{"halted": false}\n', encoding="utf-8")
-    events.write_text("", encoding="utf-8")
-    before_control = control.read_bytes()
-    before_events = events.read_bytes()
     called = False
 
     def forbidden(*_args, **_kwargs):
@@ -610,7 +596,8 @@ def test_protected_windows_aliases_are_rejected_before_control_writes(tmp_path, 
 
     monkeypatch.setattr(service, "_paper_control_state", forbidden)
     with TestClient(app, client=("127.0.0.1", 50000)) as client:
-        token = client.get("/api/capabilities", headers={"host": "127.0.0.1"}).json()["mutation_token"]
+        capabilities = client.get("/api/capabilities", headers={"host": "127.0.0.1"})
+        token = capabilities.json()["mutation_token"]
         headers = {
             "host": "127.0.0.1",
             "origin": "http://127.0.0.1",
@@ -620,13 +607,14 @@ def test_protected_windows_aliases_are_rejected_before_control_writes(tmp_path, 
         trailing_dot = client.post("/api/paper/watchtower./halt", headers=headers, json={"request_id": "halt-protected-003", "reason": "blocked"})
         trailing_space = client.post("/api/paper/watchtower%20/halt", headers=headers, json={"request_id": "halt-protected-004", "reason": "blocked"})
 
+    assert capabilities.status_code == 200
+    assert capabilities.json()["writes"] is True
     assert canonical.status_code == 403
+    assert canonical.json()["code"] == "protected-root"
     assert trailing_dot.status_code == 400
     assert trailing_space.status_code == 400
     assert not called
-    assert control.read_bytes() == before_control
-    assert events.read_bytes() == before_events
-    assert not (fund_dir / "pending-approval.json").exists()
+    assert not (root / "paper" / "watchtower").exists()
 
 
 @pytest.mark.parametrize("action", ["approve", "halt", "resume", "runner-stop"])

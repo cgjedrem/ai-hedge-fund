@@ -4,6 +4,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from hedge_fund.paper.ledger import Ledger
+from hedge_fund.runtime import handover
 from hedge_fund.runtime.handover import (
     build_head_inventory,
     inventory_digest,
@@ -15,11 +16,27 @@ from hedge_fund.web.app import create_app
 from hedge_fund.web.services import DeskService, ServiceError
 
 
-def test_attested_migration_root_is_served_read_only_without_mutation_token(tmp_path):
+def test_attested_migration_root_is_served_read_only_without_mutation_token(tmp_path, monkeypatch):
     root = tmp_path / "attested"
     (root / "mandates").mkdir(parents=True)
     with RootContext.open(root) as context:
         migrate_existing(context, expected_inventory_digest=inventory_digest(build_head_inventory(context)), operator_attestation=OPERATOR_ATTESTATION)
+
+    monkeypatch.setattr(
+        handover,
+        "_runtime_scope_identity",
+        lambda _root: {
+            "kind": "linux-pid1",
+            "pid1": {
+                "pid": 1,
+                "creation_time": "987654",
+                "image": "/usr/bin/synthetic-supervisor",
+                "host": "synthetic-boot-id",
+                "namespace": "4026533000",
+            },
+            "namespace": "pid:[4026533000];mnt:[4026533001]",
+        },
+    )
 
     with TestClient(create_app(root=root, allow_writes=True), client=("127.0.0.1", 50000)) as client:
         capabilities = client.get("/api/capabilities", headers={"host": "127.0.0.1"}).json()

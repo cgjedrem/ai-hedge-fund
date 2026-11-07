@@ -316,6 +316,17 @@ def test_handover_cli_trust_is_root_specific_explicit_and_revocable(tmp_path, mo
     )
     from hedge_fund.runtime.root import RootContext
 
+    runtime_scope = {
+        "kind": "linux-pid1",
+        "pid1": {
+            "pid": 1,
+            "creation_time": "987654",
+            "image": "/usr/bin/synthetic-supervisor",
+            "host": "synthetic-boot-id",
+            "namespace": "4026533000",
+        },
+        "namespace": "pid:[4026533000];mnt:[4026533001]",
+    }
     root = tmp_path / "trusted-root"
     (root / "mandates").mkdir(parents=True)
     with RootContext.open(root) as context:
@@ -327,6 +338,7 @@ def test_handover_cli_trust_is_root_specific_explicit_and_revocable(tmp_path, mo
         )
     monkeypatch.setattr(run, "PAPER_DIR", root / "paper")
     monkeypatch.setattr(handover, "out_of_band_exclusion_basis", lambda _root: None)
+    monkeypatch.setattr(handover, "_runtime_scope_identity", lambda _root: runtime_scope)
 
     _main(monkeypatch, "handover", "inspect")
     inspection = json.loads(capsys.readouterr().out)
@@ -337,7 +349,7 @@ def test_handover_cli_trust_is_root_specific_explicit_and_revocable(tmp_path, mo
     assert inspection["operator_acknowledgement"]
     assert "RESPONSIBILITY" in inspection["operator_acknowledgement"]
     assert inspection["operator_acknowledgement_expires_at"]
-    assert inspection["runtime_scope"]["kind"] in {"linux-pid1", "windows-host-boot"}
+    assert inspection["runtime_scope"] == runtime_scope
     assert "do not fence" in inspection["operator_responsibility"].lower()
 
     with pytest.raises(SystemExit) as invalid:
@@ -380,6 +392,54 @@ def test_handover_cli_trust_is_root_specific_explicit_and_revocable(tmp_path, mo
     assert revoked["write_authority"]["reason"] == "operator-single-writer-acknowledgement-revoked"
 
 
+@pytest.mark.parametrize(
+    ("reason", "remedy"),
+    [
+        (
+            "operator-single-writer-acknowledgement-invalid",
+            "fresh exact inventory and acknowledgement",
+        ),
+        (
+            "operator-single-writer-runtime-scope-unavailable",
+            "runtime scope cannot be verified",
+        ),
+    ],
+)
+def test_paper_writer_remediation_covers_invalid_trust_and_unavailable_runtime(
+    tmp_path,
+    monkeypatch,
+    reason,
+    remedy,
+):
+    from hedge_fund.runtime import handover
+    from hedge_fund.runtime.handover import (
+        build_head_inventory,
+        inventory_digest,
+        migrate_existing,
+        OPERATOR_ATTESTATION,
+    )
+    from hedge_fund.runtime.root import RootContext
+
+    root = tmp_path / "remediation-root"
+    (root / "mandates").mkdir(parents=True)
+    with RootContext.open(root) as context:
+        migrate_existing(
+            context,
+            expected_inventory_digest=inventory_digest(build_head_inventory(context)),
+            operator_attestation=OPERATOR_ATTESTATION,
+        )
+        monkeypatch.setattr(paths, "root_context", lambda: context)
+        monkeypatch.setattr(
+            handover,
+            "write_authority",
+            lambda _root: {"authority": "ownership-unknown", "reason": reason},
+        )
+
+        with pytest.raises(run.PaperWriterDenied, match=remedy):
+            with run._paper_writer_admission():
+                pytest.fail("untrusted root entered writer mode")
+
+
 def test_handover_cli_relocates_legacy_root_without_writing_source(tmp_path, monkeypatch, capsys):
     from hedge_fund.paper.deployed import deploy
 
@@ -413,6 +473,7 @@ def test_handover_cli_relocates_legacy_root_without_writing_source(tmp_path, mon
 
 
 def test_cli_paper_writer_denies_attested_migration_as_ownership_unknown(tmp_path, monkeypatch):
+    from hedge_fund.runtime import handover
     from hedge_fund.runtime.handover import (
         build_head_inventory,
         inventory_digest,
@@ -423,6 +484,21 @@ def test_cli_paper_writer_denies_attested_migration_as_ownership_unknown(tmp_pat
 
     root = tmp_path / "attested-root"
     (root / "mandates").mkdir(parents=True)
+    monkeypatch.setattr(
+        handover,
+        "_runtime_scope_identity",
+        lambda _root: {
+            "kind": "linux-pid1",
+            "pid1": {
+                "pid": 1,
+                "creation_time": "987654",
+                "image": "/usr/bin/synthetic-supervisor",
+                "host": "synthetic-boot-id",
+                "namespace": "4026533000",
+            },
+            "namespace": "pid:pid:[4026533000];mnt:mnt:[4026533001]",
+        },
+    )
     with RootContext.open(root) as context:
         migrate_existing(context, expected_inventory_digest=inventory_digest(build_head_inventory(context)), operator_attestation=OPERATOR_ATTESTATION)
         monkeypatch.setattr(paths, "root_context", lambda: context)
@@ -512,9 +588,11 @@ def test_supported_container_launchers_pass_explicit_root():
 
     dockerfile = (repository / "Dockerfile").read_text(encoding="utf-8")
     web_dockerfile = (repository / "Dockerfile.web").read_text(encoding="utf-8")
+    pyproject = (repository / "pyproject.toml").read_text(encoding="utf-8")
     assert 'ENTRYPOINT ["aihf", "--root", "/data"]' in dockerfile
-    assert 'ENTRYPOINT ["aihf-web", "--root", "/data"]' in web_dockerfile
+    assert 'ENTRYPOINT ["aihf-web-supervisor", "--root", "/data"]' in web_dockerfile
     assert 'CMD ["--port", "8876"]' in web_dockerfile
+    assert 'aihf-web-supervisor = "hedge_fund.web.supervisor:main"' in pyproject
     assert "container-bind" not in web_dockerfile
     assert "AIHF_SOURCE_REVISION" in web_dockerfile
     assert "AIHF_SOURCE_SHA256" in web_dockerfile
@@ -537,8 +615,15 @@ def test_supported_container_launchers_pass_explicit_root():
     assert web_service["build"]["args"]["AIHF_SOURCE_SHA256"] == "${AIHF_SOURCE_SHA256:-unconfigured}"
     assert web_service["image"] == "aihf-web:${AIHF_SOURCE_REVISION:-unconfigured}-${AIHF_SOURCE_SHA256:-unconfigured}"
     web_operator = compose["services"]["web-operator"]
-    assert web_operator["entrypoint"] == ["aihf-web", "--root", "/data"]
-    assert web_operator["command"] == ["--port", "8876", "--allow-writes", "--enable-network"]
+    assert web_operator["entrypoint"] == ["aihf-web-supervisor", "--root", "/data"]
+    assert web_operator["command"] == [
+        "--port",
+        "8876",
+        "--enable-writes-after-trust",
+        "--enable-network-after-trust",
+    ]
+    assert "--allow-writes" not in web_operator["command"]
+    assert "--enable-network" not in web_operator["command"]
     assert web_operator["profiles"] == ["web-operator"]
     assert web_operator["volumes"][0]["target"] == "/data"
     assert not web_operator["volumes"][0].get("read_only", False)

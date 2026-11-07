@@ -323,11 +323,6 @@ def _boot_identity() -> str:
             return Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
         except OSError:
             return "unknown"
-    if os.name == "nt":
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        kernel32.GetTickCount64.restype = ctypes.c_ulonglong
-        boot_epoch = int(__import__("time").time() - kernel32.GetTickCount64() / 1000)
-        return f"{platform.node()}:{boot_epoch}"
     return "unknown"
 
 

@@ -58,32 +58,43 @@ single-user Docker web desk for paper activity, host-loopback-published, with th
 as fallback. This supersedes the read-only-observer deployment choice for R1 only; it does not
 relax root trust, local-paper-only actions, provider authorization, filesystem admission or
 operator-only cutover. The container must reuse the root's enrollment and offline
-trusted-single-writer acknowledgement and the existing cooperating-writer locks. No automatic
-enrollment, cross-namespace adoption, or second writer is allowed. Current final-image
-commands, timestamps and synthetic ext4 runtime observations are in
-`implementation-evidence.md`. The replacement-container identity gate **FAIL**; overall
-runtime acceptance is INCONCLUSIVE. The earlier `cad96a` direct-build record omitted required
-identity args, so that artifact's build provenance is not accepted. The current
-Compose-built `7ec7aaa` image was exercised under the Linux host-network overlay; Windows
-bridge and host Ollama access remain blocked, and browser/Ollama runtime remains untested.
-`web` remains read-only inspection; `web-operator` requires
-explicit `--allow-writes --enable-network`, writable `/data`, and the Linux host-network
-overlay. The host bind and root identity rules do not change. On the current Windows Docker
-Desktop Linux engine, a synthetic Windows bind mounted at `/data` reports `9p` and
-`RootContext.open` denies it; do not widen R3 to make it pass. Docker Desktop ext4
-named-volume validation does not authorize NTFS-to-ext4 migration or a production-root
-cutover.
+trusted-single-writer record and existing cooperating-writer locks. Root enrollment remains
+immutable; runtime trust is a separate authority record. No automatic enrollment,
+cross-namespace adoption, or second writer is allowed. The previous replacement-container
+identity gate **FAIL** remains historical; overall runtime acceptance is INCONCLUSIVE until
+fresh final-artifact evidence. The earlier `cad96a` direct-build record omitted required
+identity args, so that artifact's build provenance is not accepted. The `7ec7aaa` Compose
+image was exercised under the Linux host-network overlay; Windows bridge and host Ollama
+access remain blocked, and browser/Ollama runtime remains untested.
+
+**G5 lifecycle rework (2026-11-06; QA-driven implementation, final runtime evidence pending).**
+`web` remains read-only inspection.
+`web-operator` uses a stable PID 1 supervisor; its web child starts read-only. After an
+operator completes the exact offline inspect/trust flow, SIGHUP restarts only the child.
+The supervisor rechecks current authority and inventory before passing `--allow-writes`;
+network remains a separate explicit opt-in. A replaced/restarted container receives a new
+PID 1 identity and stays read-only until a fresh challenge, exact inventory review and
+explicit trust under that runtime. Never reuse an old acknowledgement or copy trust state.
+This is not auto-enrollment or root identity rebind. Linux trust requires readable PID 1
+procfs identity and current PID/mount namespace links; unavailable access denies challenge
+and writes. Native Windows host trusted-single-writer mode is disabled. A sequential TUI
+fallback needs independent explicit trust in its runtime; it invalidates web trust, and
+concurrent writers remain prohibited. The host bind and root identity rules do not change.
+On the current Windows Docker Desktop Linux engine, a synthetic Windows bind mounted at
+`/data` reports `9p` and `RootContext.open` denies it; do not widen R3 to make it pass.
+Docker Desktop ext4 named-volume validation does not authorize NTFS-to-ext4 migration or a
+production-root cutover.
 
 The selected R1 names `watchtower` and `watchtower-weekly` remain protected by FR-044.
 Their operation is blocked pending an explicit user decision; do not remove the root or web
-guard and do not substitute a fixture/agent exception. On the current image, a replacement
-container retained the enrolled PID/mount namespace identity and readiness reported
-`enrolled`; the probe failed before capability/write-denial checks. No write-enabled
-replacement or re-enrollment ran. An earlier `cad96a` observation of changed namespaces is
-historical, not current acceptance evidence. No rebind, cross-filesystem copy, or upgrade
-workflow is approved. The TUI CLI remains the sequential fallback; the browser `tui-web`
-service stays behind its explicit profile but is not approved for use. Sequential TUI
-rendering on a separate synthetic volume does not prove same-root rebind.
+guard and do not substitute a fixture/agent exception. The earlier replacement probe
+retained the enrolled PID/mount namespace identity and readiness reported `enrolled`; it
+stopped before capability/write-denial checks. No write-enabled replacement or re-enrollment
+ran. The prior `cad96a` changed-namespace observation remains historical. Automatic rebind
+and cross-filesystem copy remain prohibited; explicit current-runtime trust review is allowed.
+The TUI CLI remains the sequential fallback; the browser `tui-web` service stays behind its
+explicit profile but is not approved for use. Sequential TUI rendering on a separate
+synthetic volume does not prove same-root trust transfer.
 
 ## 2. Launch, root and exposure boundary
 

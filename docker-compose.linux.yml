@@ -6,7 +6,7 @@
 #   TUI:      docker compose -f docker-compose.yml -f docker-compose.linux.yml run --rm tui
 #   Web inspection: set build identity args, then use --profile web up -d web.
 #   Web operator:   set build identity args, then use --profile web-operator up -d web-operator.
-#                   Requires explicit offline enrollment and single-writer cutover.
+#                   Starts read-only; explicit offline trust and SIGHUP activate writes.
 # tui-web remains opt-in, but is not approved for use: ttyd has no configured
 # credentials and is downloaded without a pinned checksum. Use TUI CLI only.
 #

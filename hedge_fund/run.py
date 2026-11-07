@@ -720,7 +720,18 @@ def _paper_writer_admission(*, verify_inventory: bool = True) -> Iterator[tuple[
         raise PaperWriterDenied("Paper writes are blocked by root enrollment or ledger drift.")
     authority = write_authority(root)
     if not has_write_authority(authority):
-        remedy = "run the offline handover inspect and provide its exact root-specific acknowledgement" if authority["reason"] in {"operator-single-writer-acknowledgement-required", "operator-single-writer-runtime-scope-changed", "attested-migration-read-only"} else "resolve the reported root or participant issue before retrying"
+        reason = authority["reason"]
+        if reason in {
+            "operator-single-writer-acknowledgement-required",
+            "operator-single-writer-acknowledgement-invalid",
+            "operator-single-writer-runtime-scope-changed",
+            "attested-migration-read-only",
+        }:
+            remedy = "run offline handover inspect and use its fresh exact inventory and acknowledgement for this runtime"
+        elif reason == "operator-single-writer-runtime-scope-unavailable":
+            remedy = "runtime scope cannot be verified; trusted mode stays disabled"
+        else:
+            remedy = "resolve the reported root or participant issue before retrying"
         raise PaperWriterDenied(f"Paper writes are blocked: root write authority is {authority['authority']} ({authority['reason']}); {remedy}.")
 
     owner = None
