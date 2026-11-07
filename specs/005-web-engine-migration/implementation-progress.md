@@ -182,4 +182,33 @@
 - `[2026-11-07T10:01:43.6594073+01:00 → 10:02:33.5713712+01:00]` Task: build corrected committed image; owner=Python Developer; check=automatic; normal `docker build --pull=false` exit 0, **49.909 s**; revision `1846c970acd88d836a84ae03a9699966c31154df`, package SHA-256 `415e28b31527c2a10c295ef92d2729c8a60e8d39604d3df26d1dd0fac8ec5cab`, image ID `sha256:a834e17d6b4d627ea4132a3ed223c38c0bf219eb659e41b3ff2faa7af6283713`.
 - `[2026-11-07T10:10:38.4028187+01:00 → 10:10:38.6012255+01:00]` Task: validate corrected image Compose profile without starting a service; owner=Python Developer; check=automatic; `web-operator` host-network/hardening/image assertions **9/9 passed**, **0.198 s**, exit 0.
 - `[2026-11-07; exact runtime timestamp not retained]` Task: bounded synthetic runtime A; owner=Python Developer; check=manual; old `c77163e` image **FAIL** after no-trust SIGHUP enabled writes/network from `protocol-native` fresh enrollment. Exact container stopped; no valid mutation, no replacement, B/C not run. Raw probe logs/timestamp unavailable; see `implementation-evidence.md`.
-- Current stop condition: corrected final image has no runtime observation. Do not start another container or writable replacement without coordinator authorization and a new approved fail-stop boundary. Overall runtime acceptance **INCONCLUSIVE / not accepted**; RB-5 remains unchecked.
+- Stop condition recorded before the next user authorization: corrected `1846c97` image had no runtime observation; superseded by the authorized continuation below.
+
+## 2026-11-07 authorized lifecycle continuation
+
+- Task: bounded supervisor lifecycle completion; execution owner=Python Developer.
+  Source commit `2b4cbed2a20c6f9877cbbc762e6df378c960d3f8`, parent `66bc100`.
+  Source diff: 29,256 bytes, SHA-256
+  `42cff85f38eb517236539f88dd184841ec42577ed42a28e4090e269901c868c4`.
+- Automatic Windows/Python 3.11.15/pytest 7.4.4 checks at
+  `10:47:13`–`10:48:41+01:00`: supervisor **26 passed, 1 skipped**; process
+  identity **6 passed**; handover/write authority **59 passed**; CLI handover
+  selection **7 passed, 75 deselected**; web app **52 passed**; owned-runner
+  reattach **1 passed**. Black/isort/Flake8/diff/AST and Compose config passed.
+- Automatic final build at `10:51:01.2027564`–`10:51:51.4720774+01:00`:
+  `docker compose ... build --pull=false web-operator` exited 0 in **50.27 s**.
+  Image tag, ID, labels and baked source identity are recorded in
+  `implementation-evidence.md`.
+- Manual runtime: migration-mode root prepared in synthetic ext4 volume by a
+  one-shot helper. A started read-only on Docker Desktop/LinuxKit; capabilities
+  reported `writes=false`, `network=false`, but enrollment was `invalid`.
+  Read-only `require_enrollment` identified `handover root identity does not match`.
+  The recorded `host` value came from the helper container and differed from A;
+  path, filesystem, device/inode and namespace fields matched. No CLI trust,
+  signal, revoke, valid mutation, rebind, or writable replacement was attempted.
+- Stop condition: preserve immutable enrollment. A/B/C acceptance is
+  **INCONCLUSIVE / not accepted**; helper-to-service root reuse is **FAIL**;
+  explicit activation, downgrade/revoke, orphan reaping and replacement scenarios
+  are **NOT RUN**. Exact synthetic A and its labeled ext4 volume were cleaned;
+  final image retained. No prune, external provider call, or real-root/fund action.
+  RB-5 stays unchecked; independent QA remains coordinator-owned.

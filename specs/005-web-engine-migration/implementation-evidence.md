@@ -2514,3 +2514,112 @@ INCONCLUSIVE.
   trust-required migration authority; verify initial read-only and no-trust HUP remains
   read-only. Stop on any mismatch. Only after that pass, proceed to explicit trust/HUP
   and replacement cases under a renewed fail-stop boundary.
+
+### 2026-11-07 supervisor lifecycle repair, final image, and runtime blocker
+
+#### Source identity and focused checks
+
+- Implementation/docs commit `2b4cbed2a20c6f9877cbbc762e6df378c960d3f8`,
+  parent `66bc100`; commit message includes the requested Copilot coauthor.
+  The committed source diff is 29,256 bytes,
+  SHA-256 `42cff85f38eb517236539f88dd184841ec42577ed42a28e4090e269901c868c4`.
+  Package-source SHA-256 is
+  `3f1922909961798b36353a9309c4de9ddc6651b031f2ac7c0dd1ff529550cbd5`.
+- Tests used Python 3.11.15 and pytest 7.4.4 on the Windows host. The test tree
+  matched the implementation diff later committed as `2b4cbed`.
+  Exact executable:
+  `C:\Users\ChristianGjedrem\AppData\Local\pypoetry\Cache\virtualenvs\aihf-WidgQWGy-py3.11\Scripts\python.exe`;
+  table commands use that interpreter for `python -m pytest`.
+
+| Timestamp (+01:00) | Exact command | Result |
+|---|---|---|
+| `10:47:13.3123264`–`10:47:17.1456680` | `python -m pytest hedge_fund/web/test_supervisor.py -q` | **26 passed, 1 skipped**; pytest 0.18 s, process wall 3.83 s, exit 0. POSIX Popen-status test skipped on Windows. |
+| `10:47:17.1537829`–`10:47:20.0517434` | `python -m pytest hedge_fund/runtime/test_process_identity.py -q` | **6 passed**; pytest 0.14 s, process wall 2.90 s, exit 0. |
+| `10:47:20.0529208`–`10:47:54.3545676` | `python -m pytest hedge_fund/runtime/test_handover.py hedge_fund/runtime/test_write_authority.py -q` | **59 passed**; pytest 31.01 s, process wall 34.30 s, exit 0. |
+| `10:47:54.3545676`–`10:48:02.8445110` | `python -m pytest hedge_fund/test_run.py -k handover -q` | **7 passed, 75 deselected**; pytest 4.29 s, process wall 8.49 s, exit 0. |
+| `10:48:02.8445110`–`10:48:19.1453039` | `python -m pytest hedge_fund/web/test_app.py -q` | **52 passed**; pytest 12.42 s, process wall 16.30 s, exit 0. |
+| `10:48:19.1453039`–`10:48:41.6936698` | `python -m pytest hedge_fund/web/test_paper_operations.py::test_owned_runner_reattaches_after_web_restart_and_parallel_manager -q` | **1 passed**; pytest 19.27 s, process wall 22.55 s, exit 0. |
+
+- Black `--check`, isort `--check-only`, Flake8
+  (`--max-line-length=420 --extend-ignore=E203,W503`), `git diff --check`,
+  and AST parsing of the three synthetic runtime scripts passed at
+  `10:49:07.6770590`–`10:49:10.2766657+01:00`, wall 2.60 s, exit 0.
+- Merged Compose configuration passed at
+  `10:49:07.7437494`–`10:49:07.9936840+01:00`, wall 0.25 s: host network,
+  no published ports or Compose networks, 30 s stop grace, read-only rootfs,
+  `cap_drop=ALL`, no-new-privileges, synthetic `/data` volume, and explicit
+  trust-gated writes.
+
+#### Build identity and artifact
+
+- Clean committed source was built with normal dependency-enabled networking;
+  `--network none` was not applied to the build. Exact command:
+
+  ```text
+  docker compose --progress plain --project-name aihf-lifecycle-20261107-102921 \
+    -f docker-compose.yml -f docker-compose.linux.yml \
+    -f outputs/spec005-supervisor-lifecycle-20261107-102921/compose.lifecycle.yml \
+    --profile web-operator build --pull=false web-operator
+  ```
+
+- `AIHF_SOURCE_REVISION=2b4cbed2a20c6f9877cbbc762e6df378c960d3f8`;
+  `AIHF_SOURCE_SHA256=3f1922909961798b36353a9309c4de9ddc6651b031f2ac7c0dd1ff529550cbd5`.
+  Build start/end `2026-11-07T10:51:01.2027564+01:00`–
+  `10:51:51.4720774+01:00`; build subcommand exit 0, **50.27 s**.
+- Environment: Docker Desktop 29.9.2, LinuxKit, kernel
+  `6.6.87.2-microsoft-standard-WSL2`; image OS/architecture `linux/amd64`.
+- Image tag
+  `aihf-web:2b4cbed2a20c6f9877cbbc762e6df378c960d3f8-3f1922909961798b36353a9309c4de9ddc6651b031f2ac7c0dd1ff529550cbd5`;
+  image ID `sha256:ededc795ef56179fc923a28043a3e00d424558b5f06bc20d0f2e43f0716c430e`.
+  OCI revision/package labels and in-image `baked_build_identity()` both matched.
+- The first two post-build Go-template label probes exited 64 due PowerShell
+  quoting; the build itself had already returned 0. Corrected JSON inspection and
+  a `docker run --network none` identity probe passed at
+  `10:52:15.4951821`–`10:52:16.2972948+01:00`, wall 0.80 s. No rebuild followed.
+
+#### Synthetic runtime observation and stop
+
+- One uniquely named local volume was created:
+  `aihf-supervisor-lifecycle-20261107-102921`, owner label
+  `spec005-supervisor-lifecycle-20261107-102921`. The guarded migration fixture
+  verified ext4, enrollment `enrolled`, mode `migrate-existing`, authority
+  `ownership-unknown`, inventory digest
+  `be0dfde7a94765b90cf25161a34a96b10c69c626f6b37bbc3e021913722d120b`.
+- The fixture was prepared by a one-shot helper container, then serviced by
+  Compose container
+  `885eb400a8d8964dd98889151c3468076902cf1a19c94dcda22132584b35e206`.
+  Actual inspection showed host networking, empty `HostConfig.PortBindings`,
+  read-only rootfs, `cap_drop=ALL`, `no-new-privileges:true`, two RW mounts of
+  the exact labeled volume, and no provider credential or proxy environment names.
+- Initial API capabilities were `writes=false`, `network=false`,
+  `enrollment_state=invalid`, `write_authority=unavailable`, and
+  `write_unavailable_reason=handover-unavailable`. Read-only `require_enrollment`
+  raised `EnrollmentInvalid: handover root identity does not match`.
+- A read-only binding comparison showed matching path, ext4 filesystem, device
+  `2096`, root identity `[2096, 867395]`, PID namespace
+  `4026532926`, and mount namespace `4026532923`. The immutable `host` field
+  differed: helper container `41f91cc779f6`, service container `docker-desktop`.
+  `root_binding()` includes host and namespace. This is a safe enrollment denial;
+  no rebind was attempted.
+- **A startup read-only: PASS. Helper-to-service enrollment reuse: FAIL.**
+  Explicit CLI trust/HUP, no-trust HUP, downgrade/revoke, API boundary probes,
+  fake orphan reaping, B replacement, and C replacement are **NOT RUN**.
+  No valid write, trust command, or revoke command ran. Overall lifecycle
+  acceptance is **INCONCLUSIVE / not accepted**; RB-5 remains unchecked.
+- The exact A container stopped with exit 0 and was removed. Its exact owner-labeled
+  volume was removed after checking the project/service labels, full container ID,
+  and absence of other volume users. Image remains available; no prune ran.
+  Runtime interval was Windows Docker Desktop/LinuxKit, not native Linux.
+- This result does not alter historical runtime outcomes: the prior
+  `c77163e` no-trust HUP failure remains attributed only to that artifact.
+  No provider, market-data, LLM, broker, paid-service, real-root, or real-fund
+  action occurred. Independent QA remains coordinator-owned.
+- Manual self-review found no additional in-scope source finding. POSIX reaping,
+  HUP promotion, downgrade/revoke, runtime API negatives, and replacement behavior
+  remain unobserved on this image; the Windows-only test skip does not transfer to
+  Linux runtime. Do not claim those runtime rows passed.
+- Smallest future falsification experiment, not authorized or run here: prepare a
+  new synthetic migration fixture within the exact target service `RootContext`,
+  compare its immutable `root_binding()` before any trust action, and stop on
+  mismatch. If replacement changes that immutable binding, record the denial and
+  do not rebind.

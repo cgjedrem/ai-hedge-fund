@@ -715,3 +715,15 @@ only when its listed checks pass on the final artifact.
 5. RB-5 remains unchecked. The 2026-11-05 `7ec7aaa` replacement result is historical. On the `c77163e` image, no-trust HUP after synthetic fresh enrollment activated protocol-native write/network capability (**FAIL**); no valid mutation or B/C replacement ran. Commit `1846c97` fixes the supervisor gate and a clean final image is built, but no runtime was run on it after fail-stop. Current final-image runtime is **INCONCLUSIVE / not accepted**. Existing `watchtower` targets remain blocked by FR-044; Windows bind `9p`, host Ollama access, NTFS-to-ext4 relocation, browser/Ollama runtime and automatic trust/rebind remain blocked or unverified. The earlier `cad96a` direct-build record omitted required identity args and is not accepted as build provenance.
 6. Owned synthetic-root desk lifecycle browser coverage **15 passed** and report-download browser coverage **2 passed**; both predate only the final import-formatting change. RB-6 remains open for final-artifact evidence review, full-suite disposition and independent QA.
 7. The real funds remain under the legacy home root and read-only. No cutover command is approved: the operator must first resolve FR-044 target-name protection, NTFS-to-ext4 migration and container-identity lifecycle; agents must not perform cutover (RB-5).
+
+**Latest bounded lifecycle result (2026-11-07, source `2b4cbed`):** Targeted
+tests, final style checks, merged Compose configuration, and one normal
+dependency-enabled `--pull=false` image build passed. Authorized synthetic A
+started read-only, but the helper-created migration root was invalid in A:
+`require_enrollment` returned `EnrollmentInvalid: handover root identity does
+not match`. The immutable `host` identity differed between the helper and A.
+No trust, HUP, revoke, valid mutation, rebind, B or C ran. A and its exact
+owner-labeled ext4 volume were removed; the image remains. Treat helper-to-service
+root reuse as **FAIL**, lifecycle acceptance as **INCONCLUSIVE / not accepted**,
+and keep RB-5 unchecked. Historical `c77163e` failure remains separate and
+unattributed to this artifact.

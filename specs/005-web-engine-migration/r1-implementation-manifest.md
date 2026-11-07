@@ -1,5 +1,33 @@
 # Spec005 Release 1 implementation manifest
 
+## Latest authorized lifecycle continuation (2026-11-07)
+
+- Source/docs commit `2b4cbed2a20c6f9877cbbc762e6df378c960d3f8`, parent
+  `66bc100`; committed diff 29,256 bytes, SHA-256
+  `42cff85f38eb517236539f88dd184841ec42577ed42a28e4090e269901c868c4`.
+  Package-source SHA-256:
+  `3f1922909961798b36353a9309c4de9ddc6651b031f2ac7c0dd1ff529550cbd5`.
+- Implementation commit files:
+  `README.md`, `docker-compose.linux.yml`, `docker-compose.yml`,
+  `docs/governance/web-migration-contract.md`,
+  `hedge_fund/web/supervisor.py`, `hedge_fund/web/test_supervisor.py`,
+  `specs/005-web-engine-migration/contracts/headless-and-deployment.md`.
+- Follow-up evidence-only files:
+  `specs/005-web-engine-migration/implementation-evidence.md`,
+  `implementation-progress.md`, this manifest, `spec.md`, `tasks.md`, and
+  `memory.md`.
+- Build artifact: Linux/amd64 image tag
+  `aihf-web:2b4cbed2a20c6f9877cbbc762e6df378c960d3f8-3f1922909961798b36353a9309c4de9ddc6651b031f2ac7c0dd1ff529550cbd5`,
+  ID `sha256:ededc795ef56179fc923a28043a3e00d424558b5f06bc20d0f2e43f0716c430e`.
+- Runtime artifacts in ignored `outputs/spec005-supervisor-lifecycle-20261107-102921/`:
+  `progress.log`, `compose.lifecycle.yml`, `prepare_migration_root.py`,
+  `runtime_lifecycle_scenarios.py`, and `orphan_reap_probe.py`.
+- Synthetic A was read-only, but helper-to-service enrollment failed because
+  immutable root `host` identity differed. No trust, rebind, writable A, B or C
+  ran. Container and exact owner-labeled ext4 volume were removed; image retained.
+  Overall acceptance **INCONCLUSIVE / not accepted**, RB-5 unchecked. Full
+  evidence is in `implementation-evidence.md`; no independent QA claim.
+
 ## Latest trust-lifecycle continuation (2026-11-07)
 
 - Source correction: `1846c970acd88d836a84ae03a9699966c31154df`

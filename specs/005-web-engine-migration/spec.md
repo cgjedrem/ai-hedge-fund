@@ -39,6 +39,21 @@
 
 **Latest trust-lifecycle continuation (2026-11-07):** On the `c77163e3862410813af5497a82f0ad6a0badda59` image, a no-trust SIGHUP after fresh synthetic enrollment exposed `writes=true` and `network=true` with `write_authority=protocol-native`. This **FAILS** the required read-only-until-explicit-trust gate. No trust command or valid mutation ran; the exact container stopped before any replacement. Review found the supervisor accepted generic `has_write_authority`, which includes `protocol-native`. Commit `1846c970acd88d836a84ae03a9699966c31154df` now requires `operator-trusted-single-writer`; 64 focused tests and style checks pass. A clean final image was built, but no runtime check was run on it after fail-stop. Historical failure remains **FAIL**; final-image runtime is **INCONCLUSIVE / not accepted**, B/C are **NOT RUN**, and RB-5 stays unchecked. Exact source, image, test and runtime limits are in `implementation-evidence.md`.
 
+**Latest authorized lifecycle evidence (2026-11-07):** Commit
+`2b4cbed2a20c6f9877cbbc762e6df378c960d3f8` adds safe adopted-child reaping,
+SIGUSR1 read-only downgrade, persistent revocation guidance, and shutdown-timeout
+reporting. Its focused tests/style/Compose checks passed and a clean, identity-bound
+Linux/amd64 image was built. The authorized synthetic A started with
+`writes=false` and `network=false`, but the helper-prepared migration root reported
+`enrollment_state=invalid`; read-only `require_enrollment` reported
+`handover root identity does not match`. The recorded and current root bindings
+differed at `host` (helper container vs Docker Desktop service); no rebind or trust
+was attempted. No HUP, downgrade/revoke, valid mutation, orphan runtime probe, B or
+C ran. Exact synthetic resources were cleaned; image retained. A/B/C runtime
+acceptance remains **INCONCLUSIVE / not accepted** and RB-5 remains unchecked.
+Historical `c77163e` no-trust activation **FAIL** remains limited to that artifact.
+See `implementation-evidence.md`; independent QA remains coordinator-owned.
+
 The 2026-11-05 Compose-built image was `aihf-web:7ec7aaa970a1805478940691a948f1b0dbed4649-152aa83b71b6cab8569aaf270ee7215208444335713bc4887cd17544c9bad263`, ID `sha256:b998cd64d5d28c5853ee36fe88381b3ff4a5b4ea7cabb0f1c7d239d5ba7fd977`, built from clean revision `7ec7aaa970a1805478940691a948f1b0dbed4649`. Exact build and runtime commands, timestamps, logs, and source/artifact mapping are in `implementation-evidence.md`. The package digest is verified over selected `hedge_fund` files; the revision is operator-supplied and format-checked, not Git-verified.
 
 The 2026-11-05 image was exercised on a disposable ext4 named volume under the documented Linux Compose host-network profile. Fresh-root, Host/Origin/CSRF/secret, protected-name, synthetic paper create/deploy, same-fund exclusion, stale-recovery, and sequential TUI CLI checks passed. Its replacement-container identity gate **failed**: the replacement retained the enrolled PID/mount namespace identity and readiness still reported `enrolled`. The probe stopped before testing a write denial; no write-enabled replacement or re-enrollment ran. The earlier `cad96a` build record is historical; its listed direct `docker build` omitted required identity args, so its build provenance is inconclusive.
