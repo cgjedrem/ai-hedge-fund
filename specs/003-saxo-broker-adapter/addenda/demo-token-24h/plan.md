@@ -20,6 +20,18 @@ Add a distinct Saxo SIM credential mode for the vault-held 24-hour token, preser
 
 **Target Platform**: Windows host and supported container deployments
 
+**Docker integration boundary (2026-11-09, revised after explicit user approval)**:
+The dated Spec005 1Password OP-FR-002 amendment now permits exactly the standalone
+demo bearer for in-app GET-only SIM inspection. The nested
+[onepassword-bridge\plan.md](onepassword-bridge/plan.md) defines separate capability,
+private delivery and lease consumer; parent caveman review precedes implementation.
+OP-FR-007 memory-only retention, the application-provider allowlist and SIM ownership
+gate remain unchanged. Host inspection still resolves its own reference; a separate
+`docker exec` CLI cannot consume backend memory. No bridge is implemented by this
+documentation update. Existing eligible Docker topology is network-none without a
+browser port: real in-app platform acceptance remains BLOCKED pending a reviewed
+supported topology, not an allowlist tweak or automatic network change.
+
 **Project Type**: Python application with CLI, TUI, broker adapter, and paper-fund runtime
 
 **Performance Goals**: Connection and account inspection are operator-triggered; individual broker HTTP requests retain the existing 15-second timeout; bounded order-fill inspection retains its existing deadline and stops when the operator's run boundary or interruption is reached.

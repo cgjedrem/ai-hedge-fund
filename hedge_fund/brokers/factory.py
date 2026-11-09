@@ -9,10 +9,15 @@ from hedge_fund.brokers.account_binding import require_sim_account_ownership
 from hedge_fund.brokers.paper import PaperBroker
 from hedge_fund.brokers.saxo import (
     DemoTokenManager,
+    LeaseBackedDemoTokenManager,
     Pacer,
     SaxoBroker,
     SaxoClient,
     TokenManager,
+)
+from hedge_fund.runtime.external_credentials import (
+    RuntimeCredentialHandle,
+    RuntimeCredentialLeaseStore,
 )
 from hedge_fund.secrets.provider import SecretProvider, SecretProviderError
 
@@ -75,6 +80,29 @@ def build_saxo_demo_client(
         raise ValueError(f"{_DEMO_REF_NAME}: required for read-only Saxo SIM inspection")
     provider = secrets_provider or SecretProvider()
     tokens = DemoTokenManager(access_token_ref=refs[_DEMO_REF_NAME], secrets_provider=provider)
+    return SaxoClient(
+        tokens=tokens,
+        transport=transport,
+        pacer=Pacer(clock=clock),
+        clock=clock,
+        base_currency="USD",
+    )
+
+
+def build_saxo_inspection_client(
+    *,
+    lease_store: RuntimeCredentialLeaseStore,
+    handle: RuntimeCredentialHandle,
+    authority_check,
+    transport=None,
+    clock=None,
+) -> SaxoClient:
+    tokens = LeaseBackedDemoTokenManager(
+        lease_store=lease_store,
+        handle=handle,
+        authority_check=authority_check,
+        clock=clock,
+    )
     return SaxoClient(
         tokens=tokens,
         transport=transport,

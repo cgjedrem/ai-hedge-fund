@@ -39,6 +39,48 @@ The explicit key limits inspection to that account; inspection does not persist 
 
 Inspection is read-only: it uses the SIM `/users/me`, `/accounts/me`, `/balances`, and `/positions` endpoints. The demo-token client rejects every non-GET request before token resolution or transport. A rejected demo token is cleared from memory and is not retried. The command does not persist the selected account key.
 
+## Docker credential bridge: narrow scope authorized; implementation pending
+
+On 2026-11-09 the user explicitly authorized a narrow OP-FR-002 supersession for a
+standalone `saxo-demo-token` -> `saxo-sim-readonly` in-app inspection capability.
+See [onepassword-bridge\quickstart.md](onepassword-bridge/quickstart.md) for the
+future operator runbook and [onepassword-bridge\plan.md](onepassword-bridge/plan.md)
+for the design awaiting caveman review. The bridge is not yet implemented.
+The existing Docker delivery profile has no network/browser access and remains a
+platform blocker until a supported topology is reviewed. No real delivery is run
+by this documentation phase.
+
+Do not install `op`, add service-account authority to a container, alias a Saxo token
+as an LLM/data key, create a token file, or change a running operator's allowlist.
+There is still no generic `aihf-op-deliver --provider saxo` authority. The purpose
+mapping is a proposed extension, not currently supported source behavior. The
+application provider catalogs stay unchanged; OP-FR-007 still forbids values in
+files or durable storage. A non-secret mapping alone grants no broker authority.
+
+The supported alternative is host-only inspection from the same attended terminal
+where 1Password authentication succeeds. Replace the placeholder with the exact
+field reference supplied by the operator; no vault/item path is inferred:
+
+```powershell
+$env:SAXO_DEMO_ACCESS_TOKEN_REF = 'op://<vault>/<item>/<field>'
+uv tool run --from poetry poetry run aihf saxo inspect --enable-network
+```
+
+This is an operator-run command, not executed as part of offline verification.
+It resolves one real secret and makes read-only SIM GET requests when explicitly
+run; it does not use either Docker operator or a fund root. The host shell must
+not also configure any of the three Saxo OAuth references. Do not copy identity,
+token or account output into public evidence.
+
+The scope amendment is now recorded; remaining steps are parent review/comment
+resolution, offline implementation/acceptance and a reviewed operational topology.
+The consumer uses an existing eligible backend permission context without creating
+or mutating a fund root for inspection. Memory-only generation pinning, expiry/
+rejection/revoke/restart fences and explicit action consent are mandatory; no
+refresh/write-back or broker mutation. A one-shot CLI process cannot consume the
+backend lease merely through `docker exec`. File-backed delivery remains forbidden,
+not an alternative implicitly permitted by this amendment.
+
 ## Fund deployment and execution status: BLOCKED
 
 PR #8 adds explicit root selection and normal root write-admission controls. Those controls govern local fund files, but do not establish exclusive control of a Saxo SIM account. The separate `require_sim_account_ownership()` gate fails closed with `ownership-unknown` because account-wide custody cannot be verified; Saxo broker construction and SIM mutation are therefore unsupported. The TUI also denies paper writes on enrolled roots. Do not change `HOME`, edit root constants, or call internal deployment/run functions to get around either gate.

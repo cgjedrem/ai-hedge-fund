@@ -1,5 +1,5 @@
 import { AlertCircle, CheckCircle2, KeyRound, LockKeyhole, RadioTower, Settings2 } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { ConfigurationProvenancePanel } from "@/components/configuration-provenance";
 import { MetricCard } from "@/components/metric-card";
@@ -20,7 +20,7 @@ import {
 import { apiDelete, apiPost, apiPut } from "@/lib/api";
 import { toActionableError, type ActionableError } from "@/lib/errors";
 import { useDesk, useResource } from "@/lib/hooks";
-import type { Settings } from "@/lib/types";
+import type { Settings, SaxoSimChoice, SaxoSimDiscovery, SaxoSimInspection, SaxoSimStatus } from "@/lib/types";
 
 export function SettingsPage() {
   const { capabilities, reconnect } = useDesk();
@@ -217,6 +217,7 @@ export function SettingsPage() {
             <MetricCard label="External network" value={settings.network_enabled ? "Enabled" : "Off"} note="Fixed at server startup" tone={settings.network_enabled ? "warning" : "positive"} icon={settings.network_enabled ? RadioTower : LockKeyhole} />
             <MetricCard label="Configured providers" value={`${settings.providers.filter((item) => item.configured).length} / ${settings.providers.length}`} note="Presence flags only · no values exposed" icon={KeyRound} />
           </div>
+          <SaxoInspectionCard canWrite={canWrite} networkEnabled={settings.network_enabled} />
           <div className="mt-5 grid items-start gap-5 xl:grid-cols-2">
             <Card>
               <CardHeader>
@@ -483,5 +484,213 @@ export function SettingsPage() {
         </>
       ) : null}
     </>
+  );
+}
+
+function SaxoInspectionCard({ canWrite, networkEnabled }: { canWrite: boolean; networkEnabled: boolean }) {
+  const { generation: connectionGeneration } = useDesk();
+  const resource = useResource<SaxoSimStatus>("/api/saxo/sim/status");
+  const [choices, setChoices] = useState<SaxoSimChoice[]>([]);
+  const [selectionId, setSelectionId] = useState("");
+  const [result, setResult] = useState<SaxoSimInspection | null>(null);
+  const [consent, setConsent] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<ActionableError | null>(null);
+  const previousGeneration = useRef<string | null>(null);
+  const actionEpoch = useRef(0);
+  const capability = resource.data?.capability;
+  const statusGeneration = capability?.generation ?? null;
+
+  const clearTransient = useCallback((): void => {
+    actionEpoch.current += 1;
+    setChoices([]);
+    setSelectionId("");
+    setResult(null);
+    setConsent(false);
+    setBusy(false);
+  }, []);
+
+  useEffect(() => {
+    const identity = `${connectionGeneration}:${statusGeneration ?? "unknown"}:${capability?.state}:${canWrite}:${networkEnabled}:${Boolean(resource.error)}`;
+    if (previousGeneration.current !== null && previousGeneration.current !== identity) clearTransient();
+    previousGeneration.current = identity;
+  }, [clearTransient, connectionGeneration, statusGeneration, capability?.state, canWrite, networkEnabled, resource.error]);
+
+  useEffect(() => () => { actionEpoch.current += 1; }, []);
+
+  async function discover(): Promise<void> {
+    if (!capability || !consent || busy) return;
+    setBusy(true);
+    setError(null);
+    setResult(null);
+    const epoch = ++actionEpoch.current;
+    try {
+      const response = await apiPost<SaxoSimDiscovery>("/api/saxo/sim/accounts", {
+        authorize_network: true,
+        expected_generation: capability.generation,
+      });
+      if (epoch !== actionEpoch.current) return;
+      setChoices(response.choices);
+      setSelectionId("");
+    } catch (cause) {
+      if (epoch !== actionEpoch.current) return;
+      clearTransient();
+      setError(toActionableError(cause, "Saxo SIM accounts could not be discovered."));
+      resource.refresh();
+    } finally {
+      if (epoch === actionEpoch.current) {
+        setConsent(false);
+        setBusy(false);
+      }
+    }
+  }
+
+  async function inspect(): Promise<void> {
+    if (!capability || !selectionId || !consent || busy) return;
+    setBusy(true);
+    setError(null);
+    setResult(null);
+    const epoch = ++actionEpoch.current;
+    try {
+      const response = await apiPost<SaxoSimInspection>("/api/saxo/sim/inspect", {
+        authorize_network: true,
+        expected_generation: capability.generation,
+        selection_id: selectionId,
+      });
+      if (epoch !== actionEpoch.current) return;
+      setResult(response);
+      setChoices([]);
+      setSelectionId("");
+    } catch (cause) {
+      if (epoch !== actionEpoch.current) return;
+      clearTransient();
+      setError(toActionableError(cause, "Saxo SIM account inspection could not be completed."));
+      resource.refresh();
+    } finally {
+      if (epoch === actionEpoch.current) {
+        setConsent(false);
+        setBusy(false);
+      }
+    }
+  }
+
+  async function revoke(): Promise<void> {
+    if (!capability || !capability.actions.revoke) return;
+    setError(null);
+    clearTransient();
+    setBusy(true);
+    const epoch = actionEpoch.current;
+    try {
+      await apiDelete(`/api/credentials/runtime/saxo-demo-token?expected_generation=${capability.generation}`);
+      if (epoch !== actionEpoch.current) return;
+      resource.refresh();
+    } catch (cause) {
+      if (epoch !== actionEpoch.current) return;
+      setError(toActionableError(cause, "Saxo SIM inspection access could not be revoked."));
+    } finally {
+      if (epoch === actionEpoch.current) setBusy(false);
+    }
+  }
+
+  async function cancel(): Promise<void> {
+    clearTransient();
+    const epoch = actionEpoch.current;
+    try {
+      await apiPost("/api/saxo/sim/cancel", {});
+    } catch (cause) {
+      if (epoch !== actionEpoch.current) return;
+      setError(toActionableError(cause, "The inspection could not be canceled."));
+    }
+  }
+
+  const canAct = Boolean(canWrite && networkEnabled && capability?.actions.discover && !busy);
+  return (
+    <Card className="mt-5">
+      <CardHeader>
+        <div className="flex items-center justify-between gap-3">
+          <div>
+            <p className="text-sm font-semibold text-foreground">Saxo SIM account inspection</p>
+            <p className="mt-1 text-xs text-muted-foreground">Separate read-only capability · does not connect a fund or enable trading</p>
+          </div>
+          <RadioTower className="h-4 w-4 text-accent" />
+        </div>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <div className="flex flex-wrap items-center gap-2 text-xs">
+          <Badge variant={capability?.state === "available" ? "positive" : "muted"}>
+            {resource.loading ? "Checking status…" : capability?.state ?? "Unavailable"}
+          </Badge>
+          <span className="text-muted-foreground">SIM · GET only</span>
+          {capability?.expires_at ? (
+            <span className="text-muted-foreground">Lease expires {new Date(capability.expires_at).toLocaleString()}</span>
+          ) : null}
+        </div>
+        {resource.error ? <ErrorState message={resource.error} error={resource.apiError} onRetry={resource.refresh} /> : null}
+        {error ? <ErrorNotice error={error} onAction={error.action ? () => { setError(null); resource.refresh(); } : undefined} /> : null}
+        {!networkEnabled ? <Alert tone="warning">Network capability is off for this server. No broker request will be sent.</Alert> : null}
+        {capability?.state === "requires-auth" || capability?.state === "expired" || capability?.state === "revoked" ? (
+          <p className="text-xs text-muted-foreground">Deliver a valid, unexpired inspection credential through the approved host-side private channel. This page never accepts or displays a token.</p>
+        ) : null}
+        <label className="flex items-start gap-2 text-xs text-muted-foreground">
+          <input
+            type="checkbox"
+            checked={consent}
+            onChange={(event) => setConsent(event.target.checked)}
+            disabled={!canAct}
+            aria-label="Authorize one explicit Saxo SIM read-only network action"
+          />
+          I authorize this one read-only HTTPS request to Saxo SIM.
+        </label>
+        <div className="flex flex-wrap gap-2">
+          <Button onClick={() => void discover()} disabled={!canAct || !consent}>
+            {busy ? "Working…" : "Discover SIM accounts"}
+          </Button>
+          {busy ? <Button variant="secondary" onClick={() => void cancel()}>Cancel inspection</Button> : null}
+          {capability?.actions.revoke && canWrite ? (
+            <Button variant="secondary" onClick={() => void revoke()}>Revoke inspection access</Button>
+          ) : null}
+        </div>
+        {choices.length ? (
+          <div className="space-y-3 border-t border-border pt-3">
+            <label className="block space-y-2 text-xs text-muted-foreground" htmlFor="saxo-sim-account">
+              Choose one account to inspect
+              <select
+                id="saxo-sim-account"
+                className="block w-full rounded-md border border-border bg-background px-3 py-2 text-foreground"
+                value={selectionId}
+                onChange={(event) => setSelectionId(event.target.value)}
+              >
+                <option value="">Select a SIM account</option>
+                {choices.map((choice) => (
+                  <option key={choice.selection_id} value={choice.selection_id}>
+                    {choice.label} · {choice.currency}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <Button onClick={() => void inspect()} disabled={!canAct || !selectionId || !consent}>
+              Inspect selected account
+            </Button>
+          </div>
+        ) : null}
+        {result ? (
+          <div className="space-y-3 border-t border-border pt-3" aria-live="polite">
+            <p className="text-sm font-medium text-foreground">{result.account.label} · {result.account.currency}</p>
+            <p className="text-xs text-muted-foreground">Cash balance: {result.account.cash_balance}</p>
+            <p className="text-xs text-muted-foreground">Positions: {result.account.positions.length}</p>
+            {result.account.positions.length ? (
+              <ul className="grid gap-2 text-xs sm:grid-cols-2">
+                {result.account.positions.map((position, index) => (
+                  <li key={`${position.uic}-${index}`} className="rounded border border-border p-2">
+                    UIC {position.uic} · amount {position.amount}
+                  </li>
+                ))}
+              </ul>
+            ) : <p className="text-xs text-muted-foreground">No positions were returned for this account.</p>}
+            <p className="text-[10px] text-muted-foreground">SIM · read-only · fund not connected · trading disabled</p>
+          </div>
+        ) : null}
+      </CardContent>
+    </Card>
   );
 }

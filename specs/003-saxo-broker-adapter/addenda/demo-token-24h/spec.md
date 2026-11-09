@@ -8,6 +8,20 @@
 
 > **Spec lineage**: This is a non-numbered addendum to `specs/003-saxo-broker-adapter`. Keep `003` as the parent integration; do not create or select another numbered feature. `.specify/feature.json` continues to track the active web-engine migration. Both the existing OAuth credential path and this token path target Saxo SIM only; no live-account support is present or implied.
 
+## User-authorized in-app inspection extension — 2026-11-09
+
+The user approved extending PR #8's 1Password delivery to the standalone demo
+bearer for attended in-app GET-only SIM inspection, with specification, plan,
+tasks and caveman review before implementation. The scoped design is in
+[onepassword-bridge\spec.md](onepassword-bridge/spec.md) and its companion artifacts.
+The dated OP-FR-002 amendment in
+`specs\005-web-engine-migration\onepassword-docker\spec.md` permits only that purpose;
+it changes neither memory-only retention nor application-provider catalogs.
+This is not authorization for orders, fund deployment, other broker/OAuth secrets,
+live endpoints, admission/ownership bypasses or container/network changes.
+The bridge is not yet implemented and its Docker topology acceptance is unresolved.
+Existing implementation/evidence statements below describe the host inspection path.
+
 ## User Scenarios & Testing *(mandatory)*
 
 ### User Story 1 - Connect to Saxo SIM safely (Priority: P1)

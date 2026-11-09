@@ -27,10 +27,30 @@ availability/status, isolation, revocation and restart policy. Existing TUI/CLI/
 paths must not acquire broad ambient credentials. Legacy TUI remains outside the new delivery
 path; read-only web and free/local scheduled runners must remain credential-free.
 
-Out of scope: Saxo app keys, client secrets, OAuth access/refresh tokens, SIM authentication,
+Out of scope (except the narrow dated amendment below): Saxo app keys, client secrets, OAuth access/refresh tokens, SIM authentication,
 broker orders, unattended/cloud provider loops, 1Password write-back, Connect deployment,
 new provider/model selection, real fund migration, root enrollment and automatic restarts.
 Spec003 broker credential guidance is prior art, not authorization.
+
+### User-authorized scope supersession — 2026-11-09
+
+The user explicitly approved extending this delivery mechanism to the standalone
+Saxo 24-hour demo bearer for **attended in-app GET-only SIM inspection**. This
+amendment narrowly supersedes the blanket broker/SIM exclusion above and OP-FR-002
+only for capability `saxo-demo-token` and destination `saxo-sim-readonly`, as
+specified in
+`specs\003-saxo-broker-adapter\addenda\demo-token-24h\onepassword-bridge\spec.md`
+and its plan/tasks/contracts. It does not assert implementation or acceptance.
+
+All OAuth app keys/client secrets/access/refresh credential delivery, live
+endpoints, other broker credentials and all orders remain disallowed. The
+standalone demo bearer is not an application model/data provider. OP-FR-004--014,
+especially OP-FR-007 memory-only/no-file retention, root-owner admission, immutable
+lease captures, revocation/restart fences and synthetic validation, remain in force.
+No token in browser HTTP, argv, configured environment, files or durable stores.
+No fund deployment, SIM ownership/admission exception, root initialization or
+automatic runtime/container/network mutation is authorized by this amendment.
+Actual in-app Docker use remains gated on a reviewed supported browser/SIM topology.
 
 ## Clarifications
 
@@ -140,7 +160,10 @@ inheritance and error messages containing the sentinel must be covered.
   yfinance and Ollama MUST NOT require or trigger credential resolution.
 - **OP-FR-002**: Each configured mapping MUST identify an allowed application provider,
   exact selected root, eligible backend instance and approved provider destination.
-  Broker credentials, arbitrary vault enumeration and unselected fields MUST be rejected.
+  Broker credentials, arbitrary vault enumeration and unselected fields MUST be rejected,
+  except for the dated 2026-11-09 user-authorized standalone `saxo-demo-token` ->
+  `saxo-sim-readonly` inspection capability above. That capability MUST remain separate
+  from application-provider/model/data catalogs; all other broker credentials stay denied.
 - **OP-FR-003**: Authorization and target eligibility MUST be checked before secret
   resolution and again before publication or dispatch; read-only observers cannot import.
 - **OP-FR-004**: Values and password-manager authority MUST NOT enter image layers,

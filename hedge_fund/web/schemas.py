@@ -42,6 +42,7 @@ ErrorCode = Literal[
     "payload-too-large",
     "observation-conflict",
     "assets-unavailable",
+    "inspection-timeout",
     "internal-error",
 ]
 RetryPolicy = Literal["none", "review-again", "reload", "inspect-status", "retry-later", "retry-read-only"]
@@ -58,6 +59,7 @@ _DEFAULT_ERROR_CODES: dict[int, str] = {
     423: "halted",
     429: "capacity-denied",
     503: "assets-unavailable",
+    504: "inspection-timeout",
 }
 # Contract statuses per code; a code raised with another status is a programming error.
 _ERROR_CODE_STATUSES: dict[str, frozenset[int]] = {
@@ -83,6 +85,7 @@ _ERROR_CODE_STATUSES: dict[str, frozenset[int]] = {
     "payload-too-large": frozenset({413}),
     "observation-conflict": frozenset({503}),
     "assets-unavailable": frozenset({503}),
+    "inspection-timeout": frozenset({504}),
 }
 _ERROR_RETRY_POLICIES: dict[str, str] = {
     "stale-preview": "review-again",
@@ -437,6 +440,70 @@ class CredentialRequest(RequestModel):
     provider: str = Field(min_length=1, max_length=32)
     value: SecretStr = Field(min_length=1, max_length=4096)
     expected_version: int = Field(ge=0, le=2**31 - 1)
+
+
+class SaxoInspectionAuthorizeRequest(RequestModel):
+    authorize_network: StrictBool
+    expected_generation: StrictInt = Field(ge=0, le=2**31 - 1)
+
+
+class SaxoInspectionRequest(SaxoInspectionAuthorizeRequest):
+    selection_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+
+
+class SaxoInspectionActionsResponse(RequestModel):
+    discover: StrictBool
+    inspect: StrictBool
+    revoke: StrictBool
+
+
+class SaxoInspectionCapabilityResponse(RequestModel):
+    enabled: StrictBool
+    state: Literal["disabled", "unavailable", "requires-auth", "available", "expired", "revoked"]
+    generation: StrictInt = Field(ge=0, le=2**31 - 1)
+    expires_at: str | None = Field(default=None, max_length=32)
+    actions: SaxoInspectionActionsResponse
+
+
+class SaxoInspectionStatusResponse(RequestModel):
+    environment: Literal["SIM"]
+    read_only: Literal[True]
+    capability: SaxoInspectionCapabilityResponse
+
+
+class SaxoInspectionChoiceResponse(RequestModel):
+    selection_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    label: str = Field(min_length=1, max_length=32)
+    currency: str = Field(pattern=r"^[A-Z]{3}$")
+
+
+class SaxoInspectionDiscoveryResponse(RequestModel):
+    environment: Literal["SIM"]
+    read_only: Literal[True]
+    generation: StrictInt = Field(ge=1, le=2**31 - 1)
+    selection_required: Literal[True]
+    choices: list[SaxoInspectionChoiceResponse] = Field(min_length=1, max_length=500)
+
+
+class SaxoInspectionPositionResponse(RequestModel):
+    uic: StrictInt = Field(gt=0)
+    amount: StrictFloat
+
+
+class SaxoInspectionAccountResponse(RequestModel):
+    label: str = Field(min_length=1, max_length=32)
+    currency: str = Field(pattern=r"^[A-Z]{3}$")
+    cash_balance: StrictFloat
+    positions: list[SaxoInspectionPositionResponse] = Field(max_length=500)
+
+
+class SaxoInspectionResultResponse(RequestModel):
+    environment: Literal["SIM"]
+    read_only: Literal[True]
+    generation: StrictInt = Field(ge=1, le=2**31 - 1)
+    account: SaxoInspectionAccountResponse
+    fund_connected: Literal[False]
+    trading_enabled: Literal[False]
 
 
 class CapabilitiesResponse(BaseModel):

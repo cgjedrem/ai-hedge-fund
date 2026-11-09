@@ -4,6 +4,9 @@ import os
 import socket
 import subprocess
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
 
@@ -21,6 +24,8 @@ from hedge_fund.runtime.credential_delivery import (
 )
 from hedge_fund.runtime.external_credentials import (
     ExternalCredentialError,
+    INSPECTION_CAPABILITY_DESTINATIONS,
+    runtime_inspection_capability_destinations,
     runtime_provider_destinations,
     RuntimeCredentialLeaseStore,
 )
@@ -59,6 +64,218 @@ def test_external_runtime_allowlist_defaults_empty_and_denies_before_publication
         )
 
     assert store.status() == {}
+
+
+def test_inspection_capability_is_separate_from_application_provider_catalog():
+    assert runtime_inspection_capability_destinations(None) == {}
+    assert runtime_inspection_capability_destinations("") == {}
+    assert runtime_inspection_capability_destinations("SAXO-DEMO-TOKEN") == INSPECTION_CAPABILITY_DESTINATIONS
+    with pytest.raises(ExternalCredentialError, match="provider allowlist is invalid"):
+        runtime_provider_destinations("saxo-demo-token")
+
+
+@pytest.mark.parametrize(
+    "configured",
+    ["saxo", "saxo-sim-readonly", "saxo-demo-token,openai", "saxo-demo-token,saxo-demo-token", " saxo-demo-token", "saxo-demo-token,"],
+    ids=["broker", "destination", "mixed-purpose", "duplicate", "leading-space", "empty-entry"],
+)
+def test_inspection_capability_parser_rejects_non_exact_configuration(configured):
+    with pytest.raises(ExternalCredentialError, match="capability allowlist is invalid"):
+        runtime_inspection_capability_destinations(configured)
+
+
+def _capability_store(now=None):
+    moment = now or datetime(2026, 11, 9, 12, 0, tzinfo=timezone.utc)
+    return RuntimeCredentialLeaseStore(
+        root_id=ROOT_ID,
+        instance_id=INSTANCE_ID,
+        allowed_capabilities=INSPECTION_CAPABILITY_DESTINATIONS,
+        clock=lambda: moment,
+    )
+
+
+def _publish_capability(store, *, value="synthetic-inspection-token", generation=0, delivery_id=DELIVERY_ID, expires_at="2026-11-10T11:59:59Z"):
+    return store.publish_capability(
+        "saxo-demo-token",
+        value,
+        expected_generation=generation,
+        delivery_id=delivery_id,
+        root_id=ROOT_ID,
+        instance_id=INSTANCE_ID,
+        destination="saxo-sim-readonly",
+        expires_at=expires_at,
+    )
+
+
+def test_capability_publication_serializes_validation_and_commit_with_revoke(monkeypatch):
+    store = _capability_store()
+    _publish_capability(store)
+    handle = store.capture_capability("saxo-demo-token", destination="saxo-sim-readonly")
+    checked, release, revoking = threading.Event(), threading.Event(), threading.Event()
+    order = []
+    original = store.assert_capability_dispatch_allowed
+
+    def checked_before_commit(*args, **kwargs):
+        original(*args, **kwargs)
+        checked.set()
+        assert release.wait(timeout=5)
+
+    def commit():
+        order.append("publication")
+        return {"generation": handle.generation}
+
+    def revoke():
+        revoking.set()
+        generation = store.revoke_capability("saxo-demo-token", expected_generation=1)
+        order.append("revoke")
+        return generation
+
+    monkeypatch.setattr(store, "assert_capability_dispatch_allowed", checked_before_commit)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        publication = pool.submit(store.commit_capability_publication, handle, commit, destination="saxo-sim-readonly")
+        try:
+            assert checked.wait(timeout=5)
+            acquired = store._lock.acquire(blocking=False)
+            if acquired:
+                store._lock.release()
+            assert not acquired, "Validation and publication must hold the same revocation lock"
+            revocation = pool.submit(revoke)
+            assert revoking.wait(timeout=5)
+            assert not revocation.done()
+        finally:
+            release.set()
+        assert publication.result(timeout=5) == {"generation": 1}
+        assert revocation.result(timeout=5) == 2
+    assert order == ["publication", "revoke"]
+    assert not store._capability_leases
+    store.release(handle)
+
+
+@pytest.mark.parametrize("loss", ["revoke", "invalidate", "close"])
+def test_capability_publication_never_commits_when_lease_loss_wins(loss):
+    store = _capability_store()
+    _publish_capability(store)
+    handle = store.capture_capability("saxo-demo-token", destination="saxo-sim-readonly")
+    committed = []
+    if loss == "revoke":
+        store.revoke_capability("saxo-demo-token", expected_generation=1)
+    elif loss == "invalidate":
+        store.invalidate_capability(handle)
+    else:
+        store.close()
+    with pytest.raises(ExternalCredentialError):
+        store.commit_capability_publication(handle, lambda: committed.append(True), destination="saxo-sim-readonly")
+    assert committed == []
+
+
+def test_inspection_capability_requires_explicit_purpose_expiry_and_is_not_app_capture():
+    store = _capability_store()
+    with pytest.raises(ExternalCredentialError, match="provider is not allowed"):
+        store.publish(
+            "saxo-demo-token",
+            "synthetic-token",
+            expected_generation=0,
+            delivery_id=DELIVERY_ID,
+            root_id=ROOT_ID,
+            instance_id=INSTANCE_ID,
+            destination="saxo-sim-readonly",
+        )
+
+    handle = _publish_capability(store)
+
+    assert handle.purpose == "saxo-sim-readonly"
+    with pytest.raises(ExternalCredentialError, match="provider is not allowed"):
+        store.current_handle("saxo-demo-token", destination="saxo-sim-readonly")
+    with pytest.raises(ExternalCredentialError, match="purpose is not allowed"):
+        store.acquire(handle)
+    with pytest.raises(ExternalCredentialError, match="purpose is not allowed"):
+        store.capture_capability("saxo-demo-token", destination="saxo-sim-readonly", purpose="application")
+    assert store.capability_status("saxo-demo-token", destination="saxo-sim-readonly") == {
+        "provider_id": "saxo-demo-token",
+        "destination": "saxo-sim-readonly",
+        "root_id": ROOT_ID,
+        "instance_id": INSTANCE_ID,
+        "purpose": "saxo-sim-readonly",
+        "state": "available",
+        "generation": 1,
+        "expires_at": "2026-11-10T11:59:59Z",
+    }
+
+
+@pytest.mark.parametrize(
+    "expires_at",
+    [None, "invalid", "2026-11-09T11:59:59Z", "2026-11-10T12:00:01Z", "2026-11-10T12:00:00+01:00"],
+    ids=["missing", "malformed", "past", "over-24-hours", "non-utc"],
+)
+def test_inspection_capability_rejects_invalid_expiry_without_generation(expires_at):
+    store = _capability_store()
+    with pytest.raises(ExternalCredentialError, match="credential expiry is invalid"):
+        _publish_capability(store, expires_at=expires_at)
+    assert store.capability_status("saxo-demo-token", destination="saxo-sim-readonly")["generation"] == 0
+
+
+def test_capability_expiry_and_generation_local_rejection_fence_captured_work():
+    moment = [datetime(2026, 11, 9, 12, 0, tzinfo=timezone.utc)]
+    store = _capability_store()
+    store._clock = lambda: moment[0]
+    first = _publish_capability(store)
+    captured = store.capture_capability("saxo-demo-token", destination="saxo-sim-readonly", purpose="saxo-sim-readonly")
+    assert captured == first
+
+    second = _publish_capability(store, value="synthetic-B", generation=1, delivery_id="delivery-2")
+    store.invalidate_capability(first)
+    with pytest.raises(ExternalCredentialError, match="credential handle is unavailable"):
+        store.capability_value_for_dispatch(first, destination="saxo-sim-readonly")
+    assert store.capability_status("saxo-demo-token", destination="saxo-sim-readonly")["generation"] == second.generation
+
+    live = store.capture_capability("saxo-demo-token", destination="saxo-sim-readonly", purpose="saxo-sim-readonly")
+    moment[0] += timedelta(days=2)
+    with pytest.raises(ExternalCredentialError, match="credential is expired"):
+        store.capability_value_for_dispatch(live, destination="saxo-sim-readonly")
+    assert store.capability_status("saxo-demo-token", destination="saxo-sim-readonly")["state"] == "expired"
+
+
+def test_capability_rotation_pins_old_value_until_last_capture_releases():
+    store = _capability_store()
+    first = _publish_capability(store, value="synthetic-A")
+    one = store.capture_capability("saxo-demo-token", destination="saxo-sim-readonly")
+    two = store.capture_capability("saxo-demo-token", destination="saxo-sim-readonly")
+    second = _publish_capability(store, value="synthetic-B", generation=1, delivery_id="delivery-B")
+    assert one == two == first and second.generation == 2
+    store.release(one)
+    assert store.capability_value_for_dispatch(two, destination="saxo-sim-readonly") == "synthetic-A"
+    store.release(two)
+    with pytest.raises(ExternalCredentialError, match="handle is unavailable"):
+        store.capability_value_for_dispatch(first, destination="saxo-sim-readonly")
+    current = store.capture_capability("saxo-demo-token", destination="saxo-sim-readonly")
+    assert store.capability_value_for_dispatch(current, destination="saxo-sim-readonly") == "synthetic-B"
+    store.release(current)
+    with pytest.raises(ExternalCredentialError, match="handle is unavailable"):
+        store.assert_capability_dispatch_allowed(current, destination="saxo-sim-readonly")
+
+
+def test_capability_cas_revoke_close_and_restart_never_reuse_stale_pin():
+    store = _capability_store()
+    _publish_capability(store)
+    pinned = store.capture_capability("saxo-demo-token", destination="saxo-sim-readonly")
+    with pytest.raises(ExternalCredentialError, match="generation changed"):
+        store.revoke_capability("saxo-demo-token", expected_generation=0)
+    store.assert_capability_dispatch_allowed(pinned, destination="saxo-sim-readonly")
+    assert store.revoke_capability("saxo-demo-token", expected_generation=1) == 2
+    with pytest.raises(ExternalCredentialError, match="revoked"):
+        store.assert_capability_dispatch_allowed(pinned, destination="saxo-sim-readonly")
+    _publish_capability(store, generation=2, delivery_id="after-revoke")
+    with pytest.raises(ExternalCredentialError, match="handle is unavailable"):
+        store.assert_capability_dispatch_allowed(pinned, destination="saxo-sim-readonly")
+    store.close()
+    store.release(pinned)
+    with pytest.raises(ExternalCredentialError, match="closed"):
+        store.capture_capability("saxo-demo-token", destination="saxo-sim-readonly")
+    restarted = _capability_store()
+    restarted._instance_id = "fresh-boot"
+    assert restarted.capability_status("saxo-demo-token", destination="saxo-sim-readonly")["state"] == "requires-auth"
+    with pytest.raises(ExternalCredentialError, match="instance changed"):
+        restarted.assert_capability_dispatch_allowed(pinned, destination="saxo-sim-readonly")
 
 
 @pytest.mark.parametrize("configured", [None, ""], ids=["unset", "empty"])

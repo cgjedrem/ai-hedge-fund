@@ -9,12 +9,18 @@ import pytest
 
 from hedge_fund.brokers.saxo import (
     DemoTokenManager,
+    LeaseBackedDemoTokenManager,
     SaxoAuthError,
     SaxoClient,
+    SaxoReconcileError,
     TokenManager,
     TokenState,
 )
 from hedge_fund.brokers.test_saxo_doubles import FakeClock, FakeTransport
+from hedge_fund.runtime.external_credentials import (
+    INSPECTION_CAPABILITY_DESTINATIONS,
+    RuntimeCredentialLeaseStore,
+)
 
 
 class SharedSecrets:
@@ -42,6 +48,33 @@ def _manager(transport, secrets, clock, reference="op://vault/item/token", lock_
         clock=clock,
         lock_dir=lock_dir,
         lock_timeout_s=lock_timeout_s,
+    )
+
+
+def _inspection_manager(clock=None):
+    clock = clock or FakeClock()
+    store = RuntimeCredentialLeaseStore(
+        root_id="a" * 64,
+        instance_id="inspection-boot",
+        allowed_capabilities=INSPECTION_CAPABILITY_DESTINATIONS,
+        clock=clock.utcnow,
+    )
+    store.publish_capability(
+        "saxo-demo-token",
+        "synthetic-sim-token",
+        expected_generation=0,
+        delivery_id="inspection-delivery",
+        root_id="a" * 64,
+        instance_id="inspection-boot",
+        destination="saxo-sim-readonly",
+        expires_at="2026-10-31T12:00:00Z",
+    )
+    captured = store.capture_capability("saxo-demo-token", destination="saxo-sim-readonly")
+    return store, LeaseBackedDemoTokenManager(
+        lease_store=store,
+        handle=captured,
+        authority_check=lambda: None,
+        clock=clock,
     )
 
 
@@ -303,6 +336,97 @@ def test_demo_transport_error_does_not_retain_token_in_exception_context():
     assert token not in repr(error.value)
     assert error.value.__context__ is None
     assert transport.calls[0]["url"].startswith("https://gateway.saxobank.com/sim/openapi/")
+
+
+class InspectionTransport:
+    def __init__(self, response):
+        self.response = response
+        self.calls = []
+
+    def request(self, method, url, **kwargs):
+        self.calls.append((method, url, kwargs))
+        return self.response
+
+
+@pytest.mark.parametrize("method,path", [("POST", "/port/v1/users/me"), ("GET", "/trade/v2/orders"), ("GET", "https://example.com/")])
+def test_lease_backed_client_rejects_non_allowlisted_requests_before_transport(method, path):
+    _store, tokens = _inspection_manager()
+    transport = InspectionTransport((200, {"ClientKey": "sim"}))
+    client = SaxoClient(tokens=tokens, transport=transport, clock=FakeClock())
+
+    with pytest.raises(SaxoAuthError, match="read-only"):
+        client.request(method, path)
+
+    assert transport.calls == []
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_lease_backed_client_rejects_without_refresh_and_invalidates_only_captured_generation(status):
+    store, tokens = _inspection_manager()
+    transport = InspectionTransport((status, {"error": "synthetic-sim-token"}))
+    client = SaxoClient(tokens=tokens, transport=transport, clock=FakeClock())
+
+    with pytest.raises(SaxoAuthError, match="rejected") as error:
+        client.request("GET", "/port/v1/users/me")
+
+    assert len(transport.calls) == 1
+    assert transport.calls[0][2]["allow_redirects"] is False
+    assert transport.calls[0][2]["proxies"] == {}
+    assert transport.calls[0][2]["stream"] is True
+    assert "synthetic-sim-token" not in repr(tokens)
+    assert "synthetic-sim-token" not in str(error.value)
+    assert store.capability_status("saxo-demo-token", destination="saxo-sim-readonly")["state"] == "requires-auth"
+
+
+def test_lease_backed_client_invalidates_rejected_status_without_reading_reflected_body():
+    store, tokens = _inspection_manager()
+
+    class RejectedResponse:
+        status_code = 403
+        closed = False
+
+        def iter_content(self, chunk_size):
+            raise AssertionError("rejected response body must not be read")
+
+        def close(self):
+            self.closed = True
+
+    response = RejectedResponse()
+    transport = InspectionTransport(response)
+    client = SaxoClient(tokens=tokens, transport=transport, clock=FakeClock())
+
+    with pytest.raises(SaxoAuthError, match="rejected"):
+        client.request("GET", "/port/v1/users/me")
+
+    assert response.closed is True
+    assert store.capability_status("saxo-demo-token", destination="saxo-sim-readonly")["state"] == "requires-auth"
+
+
+def test_lease_backed_client_uses_fixed_timeout_and_refuses_redirects():
+    _store, tokens = _inspection_manager()
+    assert not hasattr(tokens, "access_token")
+    assert not hasattr(tokens, "access_token_ref")
+    transport = InspectionTransport((302, {"Location": "https://example.com/"}))
+    client = SaxoClient(tokens=tokens, transport=transport, clock=FakeClock())
+
+    with pytest.raises(SaxoAuthError, match="redirected"):
+        client.request("GET", "/port/v1/users/me")
+
+    assert transport.calls[0][2]["timeout"] == 10.0
+    assert len(transport.calls) == 1
+
+
+def test_lease_backed_response_body_is_bounded_and_not_reflected():
+    _store, tokens = _inspection_manager()
+    response_body = {"Data": ["x" * (1024 * 1024)]}
+    transport = InspectionTransport((200, response_body))
+    client = SaxoClient(tokens=tokens, transport=transport, clock=FakeClock())
+
+    with pytest.raises(SaxoReconcileError, match="size limit") as error:
+        client.request("GET", "/port/v1/accounts/me")
+
+    assert "x" * 100 not in str(error.value)
+    assert len(transport.calls) == 1
 
 
 def test_demo_connection_check_uses_only_sim_user_read():

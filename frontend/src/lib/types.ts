@@ -38,6 +38,7 @@ export type ApiErrorCode =
   | "payload-too-large"
   | "observation-conflict"
   | "assets-unavailable"
+  | "inspection-timeout"
   | "internal-error";
 
 export type ApiRetryPolicy =
@@ -630,6 +631,46 @@ export interface Settings {
   configuration?: ConfigurationProvenance;
   endpoint_redacted?: boolean;
   network_enabled: boolean;
+}
+
+export interface SaxoSimStatus {
+  environment: "SIM";
+  read_only: true;
+  capability: {
+    enabled: boolean;
+    state: "disabled" | "unavailable" | "requires-auth" | "available" | "expired" | "revoked";
+    generation: number;
+    expires_at: string | null;
+    actions: { discover: boolean; inspect: boolean; revoke: boolean };
+  };
+}
+
+export interface SaxoSimChoice {
+  selection_id: string;
+  label: string;
+  currency: string;
+}
+
+export interface SaxoSimDiscovery {
+  environment: "SIM";
+  read_only: true;
+  generation: number;
+  selection_required: true;
+  choices: SaxoSimChoice[];
+}
+
+export interface SaxoSimInspection {
+  environment: "SIM";
+  read_only: true;
+  generation: number;
+  account: {
+    label: string;
+    currency: string;
+    cash_balance: number;
+    positions: { uic: number; amount: number }[];
+  };
+  fund_connected: false;
+  trading_enabled: false;
 }
 
 export type SettingsSource = "default" | "persisted" | "environment" | "launch";

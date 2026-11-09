@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import math
 import os
@@ -25,6 +26,11 @@ import requests
 
 from hedge_fund.brokers.models import Fill, Order, Position
 from hedge_fund.brokers.protocol import OrderSubmissionDeferred
+from hedge_fund.runtime.external_credentials import (
+    ExternalCredentialError,
+    RuntimeCredentialHandle,
+    RuntimeCredentialLeaseStore,
+)
 from hedge_fund.secrets.provider import SecretProvider
 
 BASE_URL = "https://gateway.saxobank.com/sim/openapi"
@@ -41,6 +47,13 @@ _DEMO_READ_ONLY_PATHS = frozenset(
         "/port/v1/positions",
     }
 )
+_MAX_INSPECTION_BODY_BYTES = 1024 * 1024
+_MAX_INSPECTION_REQUESTS = 12
+_MAX_INSPECTION_PAGES = 5
+_MAX_INSPECTION_ROWS = 500
+_MAX_INSPECTION_PAGE_ROWS = 100
+_INSPECTION_REQUEST_TIMEOUT_S = 10.0
+_INSPECTION_ACTION_TIMEOUT_S = 30.0
 
 
 class Transport(Protocol):
@@ -219,9 +232,107 @@ class DemoTokenManager:
         self.state = TokenState.AUTHORIZED
         return token
 
+    def check_response_progress(self) -> float:
+        remaining = self.remaining()
+        self.authority_check()
+        try:
+            self.lease_store.assert_capability_dispatch_allowed(self.handle, destination="saxo-sim-readonly")
+        except ExternalCredentialError:
+            raise SaxoAuthError("Saxo SIM inspection credential is unavailable") from None
+        return remaining
+
     def mark_rejected(self) -> None:
         self.access_token = None
         self.state = TokenState.REAUTH_REQUIRED
+
+
+class LeaseBackedDemoTokenManager(DemoTokenManager):
+    """Fetch an authorized SIM bearer from one pinned in-memory capability."""
+
+    def __init__(
+        self,
+        *,
+        lease_store: RuntimeCredentialLeaseStore,
+        handle: RuntimeCredentialHandle,
+        authority_check: Callable[[], None],
+        clock=None,
+        action_timeout_s: float = _INSPECTION_ACTION_TIMEOUT_S,
+    ) -> None:
+        if not isinstance(lease_store, RuntimeCredentialLeaseStore) or not isinstance(handle, RuntimeCredentialHandle):
+            raise ValueError("Saxo inspection lease is unavailable")
+        if handle.provider_id != "saxo-demo-token" or handle.destination != "saxo-sim-readonly" or handle.purpose != "saxo-sim-readonly":
+            raise ValueError("Saxo inspection lease purpose is invalid")
+        if not callable(authority_check) or not math.isfinite(action_timeout_s) or action_timeout_s <= 0 or action_timeout_s > _INSPECTION_ACTION_TIMEOUT_S:
+            raise ValueError("Saxo inspection authority and timeout are required")
+        self.lease_store = lease_store
+        self.handle = handle
+        self.authority_check = authority_check
+        self.clock = clock or SystemClock()
+        self.deadline = self.clock.monotonic() + action_timeout_s
+        self.request_count = 0
+        self.page_counts: dict[str, int] = {}
+        self.row_counts: dict[str, int] = {}
+        self.state = TokenState.UNAUTHENTICATED
+
+    def __repr__(self) -> str:
+        return "LeaseBackedDemoTokenManager(state={!r}, capability=[redacted])".format(self.state.value)
+
+    def remaining(self) -> float:
+        remaining = self.deadline - self.clock.monotonic()
+        if remaining <= 0:
+            raise SaxoAuthError("Saxo SIM inspection timed out")
+        return remaining
+
+    def before_request(self, method: str, path: str) -> float:
+        if not isinstance(method, str) or method.upper() != "GET" or path not in _DEMO_READ_ONLY_PATHS:
+            raise SaxoAuthError("Saxo SIM inspection is read-only")
+        timeout = min(_INSPECTION_REQUEST_TIMEOUT_S, self.remaining())
+        self.authority_check()
+        try:
+            self.lease_store.assert_capability_dispatch_allowed(self.handle, destination="saxo-sim-readonly")
+        except ExternalCredentialError:
+            raise SaxoAuthError("Saxo SIM inspection credential is unavailable") from None
+        self.request_count += 1
+        if self.request_count > _MAX_INSPECTION_REQUESTS:
+            raise SaxoReconcileError("Saxo SIM inspection request limit exceeded")
+        return timeout
+
+    def get_access_token(self) -> str:
+        self.authority_check()
+        try:
+            token = self.lease_store.capability_value_for_dispatch(
+                self.handle,
+                destination="saxo-sim-readonly",
+            )
+        except ExternalCredentialError:
+            raise SaxoAuthError("Saxo SIM inspection credential is unavailable") from None
+        self.state = TokenState.AUTHORIZED
+        return token
+
+    def record_page(self, collection: str, row_count: int) -> None:
+        if collection not in {"accounts", "positions"} or type(row_count) is not int or row_count < 0 or row_count > _MAX_INSPECTION_PAGE_ROWS:
+            raise SaxoReconcileError("Saxo SIM inspection response exceeds a page limit")
+        pages = self.page_counts.get(collection, 0) + 1
+        rows = self.row_counts.get(collection, 0) + row_count
+        if pages > _MAX_INSPECTION_PAGES or rows > _MAX_INSPECTION_ROWS:
+            raise SaxoReconcileError("Saxo SIM inspection response exceeds a collection limit")
+        self.page_counts[collection] = pages
+        self.row_counts[collection] = rows
+
+    def mark_rejected(self) -> None:
+        self.state = TokenState.REAUTH_REQUIRED
+        try:
+            self.lease_store.invalidate_capability(self.handle)
+        except ExternalCredentialError:
+            pass
+
+    def verify_publish(self) -> None:
+        self.remaining()
+        self.authority_check()
+        try:
+            self.lease_store.assert_capability_dispatch_allowed(self.handle, destination="saxo-sim-readonly")
+        except ExternalCredentialError:
+            raise SaxoAuthError("Saxo SIM inspection credential is unavailable") from None
 
 
 class SystemClock:
@@ -237,7 +348,18 @@ class SystemClock:
 
 class RequestsTransport:
     def request(self, method: str, url: str, **kwargs):
+        disable_environment_proxies = kwargs.pop("_disable_environment_proxies", False)
         kwargs["allow_redirects"] = False
+        if disable_environment_proxies:
+            session = requests.Session()
+            session.trust_env = False
+            try:
+                response = session.request(method, url, **kwargs)
+                response._aihf_session = session
+                return response
+            except Exception:
+                session.close()
+                raise
         return requests.request(method, url, **kwargs)
 
 
@@ -313,19 +435,31 @@ class SaxoClient:
             if not isinstance(method, str) or method.upper() != "GET" or order_post or path not in _DEMO_READ_ONLY_PATHS:
                 raise SaxoAuthError("Saxo SIM 24-hour token client is read-only")
         url = f"{BASE_URL}{path}"
+        inspection_tokens = self.tokens if isinstance(self.tokens, LeaseBackedDemoTokenManager) else None
+        timeout = inspection_tokens.before_request(method, path) if inspection_tokens is not None else 15
         token = self.tokens.get_access_token()
         headers = {"Authorization": "Bearer " + token}
         if order_post:
             self._prepare_order_post(headers)
         request_failed = False
         try:
+            request_options = {
+                "headers": headers,
+                "params": params,
+                "json": json_body,
+                "timeout": timeout,
+            }
+            if inspection_tokens is not None:
+                request_options.update(
+                    allow_redirects=False,
+                    proxies={},
+                    stream=True,
+                    _disable_environment_proxies=True,
+                )
             response = self.transport.request(
                 method,
                 url,
-                headers=headers,
-                params=params,
-                json=json_body,
-                timeout=15,
+                **request_options,
             )
         except Exception:
             request_failed = True
@@ -333,9 +467,32 @@ class SaxoClient:
             if order_post:
                 raise SaxoOrderError("Saxo order POST outcome unknown; inspect SIM account") from None
             raise SaxoAuthError("Saxo SIM request failed") from None
-        status, body = _response(response)
+        if inspection_tokens is not None:
+            try:
+                response_status = _response_status(response)
+            except Exception:
+                try:
+                    _close_response(response)
+                except Exception:
+                    pass
+                raise SaxoAuthError("Saxo SIM response status is invalid") from None
+            if response_status in {401, 403}:
+                inspection_tokens.mark_rejected()
+                try:
+                    _close_response(response)
+                except Exception:
+                    pass
+                raise SaxoAuthError("Saxo SIM rejected the inspection credential")
+        status, body = _response(
+            response,
+            max_body_bytes=_MAX_INSPECTION_BODY_BYTES if inspection_tokens is not None else None,
+            deadline_check=inspection_tokens.check_response_progress if inspection_tokens is not None else None,
+        )
         if 300 <= status < 400:
             raise SaxoAuthError("Saxo SIM request redirected; refusing to follow it")
+        if status in {401, 403} and inspection_tokens is not None:
+            inspection_tokens.mark_rejected()
+            raise SaxoAuthError("Saxo SIM rejected the inspection credential")
         if status == 401:
             if isinstance(self.tokens, DemoTokenManager):
                 self.tokens.mark_rejected()
@@ -365,15 +522,20 @@ class SaxoClient:
         client_key = user.get("ClientKey") if isinstance(user, dict) else None
         if status != 200 or not isinstance(client_key, str) or not client_key:
             raise SaxoAuthError("Saxo SIM connection check failed; verify the 24-hour token and SIM access")
+        if isinstance(self.tokens, LeaseBackedDemoTokenManager) and (len(client_key) > 128 or not re.fullmatch(r"[A-Za-z0-9._-]+", client_key)):
+            raise SaxoAuthError("Saxo SIM connection response is invalid")
         self.client_key = client_key
 
     def account_candidates(self) -> list[SaxoAccountCandidate]:
         if self.client_key is None:
             self.check_connection()
-        status, accounts = self.request("GET", "/port/v1/accounts/me")
-        data = accounts.get("Data", []) if isinstance(accounts, dict) else []
-        if status != 200 or not isinstance(data, list):
-            raise SaxoReconcileError("Saxo SIM account discovery failed")
+        if isinstance(self.tokens, LeaseBackedDemoTokenManager):
+            data = self._inspection_collection_rows("/port/v1/accounts/me", {}, "accounts")
+        else:
+            status, accounts = self.request("GET", "/port/v1/accounts/me")
+            data = accounts.get("Data", []) if isinstance(accounts, dict) else []
+            if status != 200 or not isinstance(data, list):
+                raise SaxoReconcileError("Saxo SIM account discovery failed")
         candidates = []
         account_keys = set()
         currencies = set()
@@ -386,10 +548,16 @@ class SaxoClient:
             legal_asset_types = row.get("LegalAssetTypes")
             if not isinstance(account_key, str) or not account_key or account_key.strip() != account_key:
                 raise SaxoReconcileError("Saxo SIM account response has incomplete identity or eligibility data")
+            if isinstance(self.tokens, LeaseBackedDemoTokenManager) and (len(account_key) > 128 or not re.fullmatch(r"[A-Za-z0-9._-]+", account_key)):
+                raise SaxoReconcileError("Saxo SIM account response has invalid identity data")
             if not isinstance(currency, str) or not currency or currency.strip() != currency:
                 raise SaxoReconcileError("Saxo SIM account response has incomplete identity or eligibility data")
+            if isinstance(self.tokens, LeaseBackedDemoTokenManager) and not re.fullmatch(r"[A-Za-z]{3}", currency):
+                raise SaxoReconcileError("Saxo SIM account response has invalid currency data")
             if not isinstance(active, bool) or not isinstance(legal_asset_types, list):
                 raise SaxoReconcileError("Saxo SIM account response has incomplete identity or eligibility data")
+            if isinstance(self.tokens, LeaseBackedDemoTokenManager) and len(legal_asset_types) > 50:
+                raise SaxoReconcileError("Saxo SIM account response exceeds its type limit")
             if any(not isinstance(asset_type, str) for asset_type in legal_asset_types):
                 raise SaxoReconcileError("Saxo SIM account response has incomplete identity or eligibility data")
             if account_key in account_keys:
@@ -425,8 +593,12 @@ class SaxoClient:
         cash_balance = _finite_number(balance.get("CashBalance"), "accounting cash balance", SaxoReconcileError)
         positions = []
         skip = 0
+        page_count = 0
+        row_count = 0
         while True:
             position_params: dict[str, str | int | None] = {"ClientKey": self.client_key, "AccountKey": candidate.account_key}
+            if isinstance(self.tokens, LeaseBackedDemoTokenManager):
+                position_params["$top"] = _MAX_INSPECTION_PAGE_ROWS
             if skip:
                 position_params["$skip"] = skip
             status, result = self.request("GET", "/port/v1/positions", params=position_params)
@@ -435,6 +607,12 @@ class SaxoClient:
             rows = result.get("Data") if isinstance(result, dict) else None
             if not isinstance(rows, list):
                 raise SaxoReconcileError("Saxo SIM positions response has an invalid shape")
+            if isinstance(self.tokens, LeaseBackedDemoTokenManager):
+                self.tokens.record_page("positions", len(rows))
+                page_count += 1
+                row_count += len(rows)
+                if page_count > _MAX_INSPECTION_PAGES or row_count > _MAX_INSPECTION_ROWS:
+                    raise SaxoReconcileError("Saxo SIM positions exceed the inspection limit")
             for row in rows:
                 base = row.get("PositionBase") if isinstance(row, dict) else None
                 uic = base.get("Uic") if isinstance(base, dict) else None
@@ -445,11 +623,47 @@ class SaxoClient:
                 amount = _finite_number(base.get("Amount"), "position amount", SaxoReconcileError)
                 if amount:
                     positions.append(SaxoPositionSummary(uic=uic, amount=amount))
-            next_skip = _next_page_skip(result.get("__next"), skip, SaxoReconcileError, "positions")
+            next_skip = (
+                _inspection_page_skip(
+                    result.get("__next"),
+                    path="/port/v1/positions",
+                    current_skip=skip,
+                    params=position_params,
+                )
+                if isinstance(self.tokens, LeaseBackedDemoTokenManager)
+                else _next_page_skip(result.get("__next"), skip, SaxoReconcileError, "positions")
+            )
             if next_skip is None:
                 break
             skip = next_skip
         return SaxoAccountSummary(candidate.account_key, candidate.currency, cash_balance, tuple(positions))
+
+    def _inspection_collection_rows(self, path: str, params: dict[str, str | int | None], collection: str) -> list:
+        rows: list = []
+        skip = 0
+        while True:
+            page_params = {**params, "$top": _MAX_INSPECTION_PAGE_ROWS}
+            if skip:
+                page_params["$skip"] = skip
+            status, result = self.request("GET", path, params=page_params)
+            if status != 200 or not isinstance(result, dict) or not isinstance(result.get("Data"), list):
+                raise SaxoReconcileError("Saxo SIM account discovery failed")
+            page = result["Data"]
+            if len(page) > _MAX_INSPECTION_PAGE_ROWS:
+                raise SaxoReconcileError("Saxo SIM account discovery exceeds the page limit")
+            self.tokens.record_page(collection, len(page))
+            rows.extend(page)
+            if len(rows) > _MAX_INSPECTION_ROWS:
+                raise SaxoReconcileError("Saxo SIM account discovery exceeds the collection limit")
+            next_skip = _inspection_page_skip(
+                result.get("__next"),
+                path=path,
+                current_skip=skip,
+                params=page_params,
+            )
+            if next_skip is None:
+                return rows
+            skip = next_skip
 
     def discover_account(self, account_key: str | None = None) -> None:
         if account_key is not None and (not isinstance(account_key, str) or not account_key or account_key.strip() != account_key):
@@ -792,6 +1006,47 @@ def _next_page_skip(link: object, skip: int, error_type: type[Exception], contex
     return next_skip
 
 
+def _inspection_page_skip(
+    link: object,
+    *,
+    path: str,
+    current_skip: int,
+    params: dict[str, str | int | None],
+) -> int | None:
+    if link is None:
+        return None
+    if not isinstance(link, str) or not link or len(link) > 4096:
+        raise SaxoReconcileError("Saxo SIM pagination is invalid")
+    parsed = urlparse(link)
+    if parsed.scheme or parsed.netloc:
+        if parsed.scheme != "https" or parsed.hostname != "gateway.saxobank.com" or parsed.port not in (None, 443) or parsed.username is not None or parsed.password is not None or parsed.path not in {path, f"/sim/openapi{path}"}:
+            raise SaxoReconcileError("Saxo SIM pagination origin is invalid")
+    elif parsed.path not in {path, f"/sim/openapi{path}"} or link.startswith("//"):
+        raise SaxoReconcileError("Saxo SIM pagination path is invalid")
+    if parsed.fragment:
+        raise SaxoReconcileError("Saxo SIM pagination is invalid")
+    try:
+        query = parse_qs(parsed.query, keep_blank_values=True, strict_parsing=True)
+    except ValueError:
+        raise SaxoReconcileError("Saxo SIM pagination is invalid") from None
+    expected_params = {key: value for key, value in params.items() if key != "$skip" and value is not None}
+    if any(len(values) != 1 for values in query.values()) or set(query) != set(expected_params) | {"$skip"}:
+        raise SaxoReconcileError("Saxo SIM pagination parameters are invalid")
+    for key, value in expected_params.items():
+        if query.get(key) != [str(value)]:
+            raise SaxoReconcileError("Saxo SIM pagination parameters changed")
+    try:
+        skip_value = query["$skip"][0]
+        if not re.fullmatch(r"(?:0|[1-9][0-9]*)", skip_value):
+            raise ValueError
+        next_skip = int(skip_value)
+    except (KeyError, ValueError):
+        raise SaxoReconcileError("Saxo SIM pagination is invalid") from None
+    if next_skip <= current_skip or next_skip > _MAX_INSPECTION_ROWS:
+        raise SaxoReconcileError("Saxo SIM pagination did not advance within its bound")
+    return next_skip
+
+
 def _error_code(body) -> str | None:
     if not isinstance(body, dict):
         return None
@@ -801,15 +1056,94 @@ def _error_code(body) -> str | None:
     return None
 
 
-def _response(response) -> tuple[int, object]:
+def _response(
+    response,
+    *,
+    max_body_bytes: int | None = None,
+    deadline_check: Callable[[], float] | None = None,
+) -> tuple[int, object]:
     if isinstance(response, tuple) and len(response) == 2:
+        if deadline_check is not None:
+            deadline_check()
+        if max_body_bytes is not None:
+            try:
+                body_size = len(json.dumps(response[1], separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
+            except (TypeError, ValueError, UnicodeEncodeError):
+                raise SaxoReconcileError("Saxo SIM response could not be bounded") from None
+            if body_size > max_body_bytes:
+                raise SaxoReconcileError("Saxo SIM response exceeds the inspection size limit")
+        if deadline_check is not None:
+            deadline_check()
         return int(response[0]), response[1]
     status = int(getattr(response, "status_code", 0))
+    if max_body_bytes is not None:
+        try:
+            content = _bounded_response_content(response, max_body_bytes, deadline_check)
+            body = json.loads(content.decode("utf-8")) if content else {}
+            if deadline_check is not None:
+                deadline_check()
+        except (SaxoAuthError, SaxoReconcileError):
+            raise
+        except Exception:
+            body = {}
+        finally:
+            _close_response(response)
+        return status, body
     try:
         body = response.json()
     except Exception:
         body = {}
     return status, body
+
+
+def _response_status(response) -> int:
+    if isinstance(response, tuple) and len(response) == 2:
+        return int(response[0])
+    return int(getattr(response, "status_code", 0))
+
+
+def _close_response(response) -> None:
+    close = getattr(response, "close", None)
+    try:
+        if callable(close):
+            close()
+    finally:
+        session = getattr(response, "_aihf_session", None)
+        if session is not None:
+            session.close()
+
+
+def _bounded_response_content(
+    response,
+    max_body_bytes: int,
+    deadline_check: Callable[[], float] | None = None,
+) -> bytes:
+    iterator = getattr(response, "iter_content", None)
+    if callable(iterator):
+        chunks = []
+        size = 0
+        for chunk in iterator(chunk_size=64 * 1024):
+            if deadline_check is not None:
+                deadline_check()
+            if not chunk:
+                continue
+            if not isinstance(chunk, bytes):
+                raise SaxoReconcileError("Saxo SIM response could not be bounded")
+            size += len(chunk)
+            if size > max_body_bytes:
+                raise SaxoReconcileError("Saxo SIM response exceeds the inspection size limit")
+            chunks.append(chunk)
+        if deadline_check is not None:
+            deadline_check()
+        return b"".join(chunks)
+    content = getattr(response, "content", None)
+    if deadline_check is not None:
+        deadline_check()
+    if not isinstance(content, bytes):
+        raise SaxoReconcileError("Saxo SIM response could not be bounded")
+    if len(content) > max_body_bytes:
+        raise SaxoReconcileError("Saxo SIM response exceeds the inspection size limit")
+    return content
 
 
 @contextmanager

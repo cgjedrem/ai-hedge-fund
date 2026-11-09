@@ -56,6 +56,8 @@ class DeliveryEnvelope:
     expected_generation: int | None = None
     delivery_id: str | None = None
     value: str | None = field(default=None, repr=False)
+    purpose: str | None = None
+    expires_at: str | None = None
 
     def __post_init__(self) -> None:
         if self.action not in {"status", "publish"}:
@@ -66,8 +68,10 @@ class DeliveryEnvelope:
                 raise DeliveryProtocolError("delivery identity is invalid")
             object.__setattr__(self, field_name, field_value.casefold())
         if self.action == "status":
-            if any(value is not None for value in (self.root_id, self.instance_id, self.expected_generation, self.delivery_id, self.value)):
+            if any(value is not None for value in (self.root_id, self.instance_id, self.expected_generation, self.delivery_id, self.value, self.expires_at)):
                 raise DeliveryProtocolError("status request fields are invalid")
+            if self.purpose is not None and (self.provider_id != "saxo-demo-token" or self.destination != "saxo-sim-readonly" or self.purpose != "saxo-sim-readonly"):
+                raise DeliveryProtocolError("delivery purpose is invalid")
             return
         if not isinstance(self.root_id, str) or not _ROOT_ID.fullmatch(self.root_id):
             raise DeliveryProtocolError("delivery target is invalid")
@@ -78,6 +82,11 @@ class DeliveryEnvelope:
         if not isinstance(self.delivery_id, str) or not _IDENTITY.fullmatch(self.delivery_id):
             raise DeliveryProtocolError("delivery identity is invalid")
         _validate_value(self.value)
+        if self.purpose is None:
+            if self.expires_at is not None:
+                raise DeliveryProtocolError("delivery expiry is invalid")
+        elif self.provider_id != "saxo-demo-token" or self.destination != "saxo-sim-readonly" or self.purpose != "saxo-sim-readonly" or not _valid_expiry(self.expires_at):
+            raise DeliveryProtocolError("delivery purpose is invalid")
         object.__setattr__(self, "root_id", self.root_id.casefold())
 
     @classmethod
@@ -99,6 +108,13 @@ class DeliveryEnvelope:
                 "value",
             }
         )
+        if "purpose" in value or "expires_at" in value:
+            if action == "status":
+                fields |= {"purpose"}
+            else:
+                fields |= {"purpose", "expires_at"}
+        if action == "status" and value.get("purpose") is not None:
+            fields = {"action", "provider_id", "destination", "purpose"}
         if set(value) != fields:
             raise DeliveryProtocolError("delivery request fields are invalid")
         try:
@@ -122,6 +138,10 @@ class DeliveryEnvelope:
                     "value": self.value,
                 }
             )
+        if self.purpose is not None:
+            record["purpose"] = self.purpose
+            if self.action == "publish":
+                record["expires_at"] = self.expires_at
         return record
 
 
@@ -136,9 +156,11 @@ class DeliveryReply:
     root_id: str | None = None
     instance_id: str | None = None
     reason_code: str | None = None
+    purpose: str | None = None
+    expires_at: str | None = None
 
     def __post_init__(self) -> None:
-        if self.state not in {"available", "requires-auth", "revoked", "denied"}:
+        if self.state not in {"available", "requires-auth", "revoked", "expired", "denied"}:
             raise DeliveryProtocolError("delivery status is invalid")
         if type(self.generation) is not int or self.generation < 0:
             raise DeliveryProtocolError("delivery status is invalid")
@@ -152,9 +174,13 @@ class DeliveryReply:
             raise DeliveryProtocolError("delivery status is invalid")
         if self.reason_code is not None and self.reason_code not in _REASONS:
             raise DeliveryProtocolError("delivery status is invalid")
+        if self.purpose is not None and (self.provider_id != "saxo-demo-token" or self.destination != "saxo-sim-readonly" or self.purpose != "saxo-sim-readonly"):
+            raise DeliveryProtocolError("delivery status is invalid")
+        if self.expires_at is not None and not _valid_expiry(self.expires_at):
+            raise DeliveryProtocolError("delivery status is invalid")
 
     def to_mapping(self) -> dict[str, object]:
-        return {
+        record = {
             "state": self.state,
             "generation": self.generation,
             "provider_id": self.provider_id,
@@ -163,6 +189,10 @@ class DeliveryReply:
             "instance_id": self.instance_id,
             "reason_code": self.reason_code,
         }
+        if self.purpose is not None:
+            record["purpose"] = self.purpose
+            record["expires_at"] = self.expires_at
+        return record
 
     @classmethod
     def from_mapping(cls, value: object) -> DeliveryReply:
@@ -175,6 +205,8 @@ class DeliveryReply:
             "instance_id",
             "reason_code",
         }
+        if isinstance(value, dict) and "purpose" in value:
+            fields |= {"purpose", "expires_at"}
         if not isinstance(value, dict) or set(value) != fields:
             raise DeliveryProtocolError("delivery status is malformed")
         try:
@@ -312,20 +344,37 @@ class CredentialDeliveryServer:
             if self._admission_check is not None:
                 self._admission_check()
             if request.action == "status":
-                status = self._lease_store.delivery_status(
+                if request.purpose is not None:
+                    status = self._lease_store.capability_status(
+                        request.provider_id,
+                        destination=request.destination,
+                        purpose=request.purpose,
+                    )
+                else:
+                    status = self._lease_store.delivery_status(request.provider_id, destination=request.destination)
+                return DeliveryReply(**status, reason_code=None)
+            if request.purpose is not None:
+                handle = self._lease_store.publish_capability(
                     request.provider_id,
+                    request.value,
+                    expected_generation=request.expected_generation,
+                    delivery_id=request.delivery_id,
+                    root_id=request.root_id,
+                    instance_id=request.instance_id,
+                    destination=request.destination,
+                    purpose=request.purpose,
+                    expires_at=request.expires_at,
+                )
+            else:
+                handle = self._lease_store.publish(
+                    request.provider_id,
+                    request.value,
+                    expected_generation=request.expected_generation,
+                    delivery_id=request.delivery_id,
+                    root_id=request.root_id,
+                    instance_id=request.instance_id,
                     destination=request.destination,
                 )
-                return DeliveryReply(**status, reason_code=None)
-            handle = self._lease_store.publish(
-                request.provider_id,
-                request.value,
-                expected_generation=request.expected_generation,
-                delivery_id=request.delivery_id,
-                root_id=request.root_id,
-                instance_id=request.instance_id,
-                destination=request.destination,
-            )
             return DeliveryReply(
                 state="available",
                 generation=handle.generation,
@@ -333,6 +382,8 @@ class CredentialDeliveryServer:
                 destination=handle.destination,
                 root_id=handle.root_id,
                 instance_id=handle.instance_id,
+                purpose=handle.purpose if handle.purpose != "application" else None,
+                expires_at=request.expires_at,
             )
         except Exception as exc:
             reason = provider_delivery_error(exc)
@@ -477,7 +528,10 @@ def read_delivery_frame(stream: BinaryIO) -> DeliveryEnvelope:
         raise DeliveryProtocolError("delivery frame is malformed") from None
     if not isinstance(record, dict):
         raise DeliveryProtocolError("delivery frame is malformed")
-    return DeliveryEnvelope.from_mapping(record)
+    try:
+        return DeliveryEnvelope.from_mapping(record)
+    except DeliveryProtocolError:
+        raise DeliveryProtocolError("delivery frame is malformed") from None
 
 
 def _read_exact(stream: BinaryIO, size: int) -> bytes:
@@ -503,6 +557,18 @@ def _validate_value(value: object) -> None:
         raise DeliveryProtocolError("credential value is invalid")
 
 
+def _valid_expiry(value: object) -> bool:
+    if not isinstance(value, str) or not re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,6})?(?:Z|\+00:00)", value):
+        return False
+    try:
+        from datetime import datetime
+
+        parsed = datetime.fromisoformat(value[:-1] + "+00:00" if value.endswith("Z") else value)
+    except ValueError:
+        return False
+    return parsed.tzinfo is not None and parsed.utcoffset().total_seconds() == 0
+
+
 def provider_delivery_error(exc: Exception) -> str:
     """Map private lease errors to a value-free protocol code."""
     if isinstance(exc, ExternalCredentialError):
@@ -511,13 +577,15 @@ def provider_delivery_error(exc: Exception) -> str:
             return "provider-not-allowed"
         if message == "provider destination is not allowed":
             return "destination-not-allowed"
+        if message == "purpose is not allowed":
+            return "provider-not-allowed"
         if message == "credential generation changed":
             return "generation-conflict"
         if message == "delivery was already used":
             return "delivery-replayed"
         if message == "runtime target changed":
             return "target-changed"
-        if message in {"credential value is invalid", "credential value exceeds its bound"}:
+        if message in {"credential value is invalid", "credential value exceeds its bound", "credential expiry is invalid"}:
             return "invalid-value"
     return "delivery-denied"
 

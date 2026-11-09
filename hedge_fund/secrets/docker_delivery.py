@@ -12,6 +12,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Mapping, TextIO
 from urllib.parse import unquote, urlsplit
@@ -72,6 +73,9 @@ _MAPPING_FIELDS = frozenset(
         "volume_name",
     }
 )
+_CAPABILITY_MAPPING_FIELDS = _MAPPING_FIELDS | {"topology_profile", "expires_at"}
+_INSPECTION_PROVIDER = "saxo-demo-token"
+_INSPECTION_DESTINATION = "saxo-sim-readonly"
 _MAX_MAPPING_CONFIG_BYTES = 1024 * 1024
 _MAX_MAPPING_COUNT = 64
 
@@ -105,15 +109,23 @@ class SourceMapping:
     revision: str
     source_sha256: str
     volume_name: str
+    topology_profile: str | None = None
+    expires_at: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.provider_id, str) or not _IDENTIFIER.fullmatch(self.provider_id.casefold()):
             raise DockerCredentialDeliveryError("mapping-invalid")
         provider_id = self.provider_id.casefold()
-        if provider_id not in APPLICATION_PROVIDER_IDS:
+        if provider_id in APPLICATION_PROVIDER_IDS:
+            if self.topology_profile is not None or self.expires_at is not None:
+                raise DockerCredentialDeliveryError("mapping-invalid")
+            if not isinstance(self.destination, str) or self.destination.casefold() != provider_id:
+                raise DockerCredentialDeliveryError("destination-not-allowed")
+        elif provider_id == _INSPECTION_PROVIDER:
+            if self.destination != _INSPECTION_DESTINATION or self.topology_profile != "saxo-inspection" or not _valid_utc_expiry(self.expires_at):
+                raise DockerCredentialDeliveryError("mapping-invalid")
+        else:
             raise DockerCredentialDeliveryError("provider-not-allowed")
-        if not isinstance(self.destination, str) or self.destination.casefold() != provider_id:
-            raise DockerCredentialDeliveryError("destination-not-allowed")
         if not isinstance(self.root_id, str) or not re.fullmatch(r"[a-fA-F0-9]{64}", self.root_id):
             raise DockerCredentialDeliveryError("mapping-invalid")
         if not isinstance(self.container_id, str) or not _CONTAINER_ID.fullmatch(self.container_id):
@@ -128,7 +140,7 @@ class SourceMapping:
             raise DockerCredentialDeliveryError("mapping-invalid")
         _validate_reference(self.reference)
         object.__setattr__(self, "provider_id", provider_id)
-        object.__setattr__(self, "destination", provider_id)
+        object.__setattr__(self, "destination", self.destination.casefold())
         object.__setattr__(self, "root_id", self.root_id.casefold())
         object.__setattr__(self, "container_id", self.container_id.casefold())
         object.__setattr__(self, "image_id", self.image_id.casefold())
@@ -156,6 +168,10 @@ class _TargetIdentity:
     volume_name: str
     volume_created_at: str
     started_at: str
+    topology_profile: str | None = None
+    network_id: str | None = None
+    project_name: str | None = None
+    port_binding: str | None = None
 
 
 class DockerCredentialDelivery:
@@ -170,6 +186,7 @@ class DockerCredentialDelivery:
         environment: Mapping[str, str] | None = None,
         timeout_seconds: float = 60.0,
         clock: Callable[[], float] | None = None,
+        utc_clock: Callable[[], datetime] | None = None,
     ) -> None:
         if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)) or not math.isfinite(timeout_seconds) or not 0 < timeout_seconds <= 60:
             raise DockerCredentialDeliveryError("timeout-invalid")
@@ -178,6 +195,8 @@ class DockerCredentialDelivery:
         if resolver is not None and not callable(resolver):
             raise DockerCredentialDeliveryError("resolver-invalid")
         if clock is not None and not callable(clock):
+            raise DockerCredentialDeliveryError("clock-invalid")
+        if utc_clock is not None and not callable(utc_clock):
             raise DockerCredentialDeliveryError("clock-invalid")
         if source_mappings is None:
             source_mappings = {}
@@ -199,6 +218,7 @@ class DockerCredentialDelivery:
         self._environment = os.environ if environment is None else environment
         self._timeout_seconds = float(timeout_seconds)
         self._clock = clock or time.monotonic
+        self._utc_clock = utc_clock or (lambda: datetime.now(timezone.utc))
 
     def deliver(self, container_id: str, provider: str) -> DockerCredentialDeliveryResult:
         started = self._now()
@@ -207,6 +227,8 @@ class DockerCredentialDelivery:
         mapping = self._source_mappings.get(provider_id)
         if mapping is None:
             raise DockerCredentialDeliveryError("provider-not-allowed")
+        if mapping.provider_id == _INSPECTION_PROVIDER:
+            _validate_mapping_expiry(mapping.expires_at, self._utc_now())
         if any(_is_auth_variable(name) for name in self._environment):
             raise DockerCredentialDeliveryError("ambiguous-authentication")
         if any(isinstance(name, str) and name.upper() in _DOCKER_OVERRIDE_VARIABLES for name in self._environment):
@@ -216,7 +238,7 @@ class DockerCredentialDelivery:
         if mapping.container_id != container_id.casefold():
             raise DockerCredentialDeliveryError("target-not-allowed")
         try:
-            before = self._check_target(container_id, deadline)
+            before = self._check_target(container_id, deadline, mapping)
             if before.image_id != mapping.image_id or before.revision.casefold() != mapping.revision or before.source_sha256 != mapping.source_sha256 or before.volume_name != mapping.volume_name:
                 raise DockerCredentialDeliveryError("target-not-allowed")
             preflight = self._exchange(
@@ -225,6 +247,7 @@ class DockerCredentialDelivery:
                     action="status",
                     provider_id=provider_id,
                     destination=mapping.destination,
+                    purpose=_INSPECTION_DESTINATION if mapping.provider_id == _INSPECTION_PROVIDER else None,
                 ),
                 deadline,
                 publish=False,
@@ -233,7 +256,7 @@ class DockerCredentialDelivery:
                 raise DockerCredentialDeliveryError("target-status-invalid")
             if preflight.state == "denied":
                 raise DockerCredentialDeliveryError(preflight.reason_code or "delivery-denied")
-            if preflight.state not in {"requires-auth", "available", "revoked"} or preflight.root_id is None or preflight.instance_id is None:
+            if preflight.state not in {"requires-auth", "available", "revoked", "expired"} or preflight.root_id is None or preflight.instance_id is None:
                 raise DockerCredentialDeliveryError("target-status-invalid")
 
             secret = self._resolve(mapping.reference, deadline)
@@ -246,9 +269,11 @@ class DockerCredentialDelivery:
                 expected_generation=preflight.generation,
                 delivery_id=uuid4().hex,
                 value=secret,
+                purpose=_INSPECTION_DESTINATION if mapping.provider_id == _INSPECTION_PROVIDER else None,
+                expires_at=mapping.expires_at,
             )
             self._check_local_context(deadline)
-            after = self._inspect_target(container_id, deadline)
+            after = self._inspect_target(container_id, deadline, mapping)
             if after != before:
                 raise DockerCredentialDeliveryError("target-changed")
             remaining = self._remaining(deadline)
@@ -267,6 +292,7 @@ class DockerCredentialDelivery:
                         provider_id,
                         mapping.destination,
                         deadline,
+                        mapping,
                     )
                     raise DockerCredentialDeliveryError(
                         "delivery-outcome-unknown",
@@ -325,6 +351,7 @@ class DockerCredentialDelivery:
         provider_id: str,
         destination: str,
         deadline: float,
+        mapping: SourceMapping,
     ) -> DeliveryReply | None:
         try:
             return self._exchange(
@@ -333,6 +360,7 @@ class DockerCredentialDelivery:
                     action="status",
                     provider_id=provider_id,
                     destination=destination,
+                    purpose=_INSPECTION_DESTINATION if mapping.provider_id == _INSPECTION_PROVIDER else None,
                 ),
                 deadline,
                 publish=False,
@@ -340,7 +368,7 @@ class DockerCredentialDelivery:
         except DockerCredentialDeliveryError:
             return None
 
-    def _check_target(self, container_id: str, deadline: float) -> _TargetIdentity:
+    def _check_target(self, container_id: str, deadline: float, mapping: SourceMapping) -> _TargetIdentity:
         self._check_local_context(deadline)
         info = self._run(
             ["docker", "info", "--format", "{{.OSType}}"],
@@ -349,7 +377,7 @@ class DockerCredentialDelivery:
         )
         if _text(info.stdout).strip().casefold() != "linux":
             raise DockerCredentialDeliveryError("linux-container-engine-required")
-        return self._inspect_target(container_id, deadline)
+        return self._inspect_target(container_id, deadline, mapping)
 
     def _check_local_context(self, deadline: float) -> None:
         result = self._run(
@@ -379,7 +407,7 @@ class DockerCredentialDelivery:
         if not local_endpoint:
             raise DockerCredentialDeliveryError("remote-docker-context-denied")
 
-    def _inspect_target(self, container_id: str, deadline: float) -> _TargetIdentity:
+    def _inspect_target(self, container_id: str, deadline: float, mapping: SourceMapping) -> _TargetIdentity:
         result = self._run(
             ["docker", "inspect", "--type", "container", container_id],
             deadline,
@@ -397,24 +425,42 @@ class DockerCredentialDelivery:
             mounts = container["Mounts"]
             env = config["Env"]
             container_identity = container["Id"]
+            network_settings = container.get("NetworkSettings", {})
             image_id = container["Image"]
             revision = labels["org.opencontainers.image.revision"]
             source_hash = labels["org.opencontainers.image.source-sha256"]
             started_at = state["StartedAt"]
-            volume = self._validate_operator_container(
-                config=config,
-                state=state,
-                host_config=host_config,
-                labels=labels,
-                mounts=mounts,
-                env=env,
-                container_identity=container_identity,
-            )
+            if mapping.provider_id == _INSPECTION_PROVIDER:
+                volume, network_id, project_name, port_binding = self._validate_saxo_inspection_container(
+                    config=config,
+                    state=state,
+                    host_config=host_config,
+                    labels=labels,
+                    mounts=mounts,
+                    env=env,
+                    container_identity=container_identity,
+                    network_settings=network_settings,
+                )
+            else:
+                volume = self._validate_operator_container(
+                    config=config,
+                    state=state,
+                    host_config=host_config,
+                    labels=labels,
+                    mounts=mounts,
+                    env=env,
+                    container_identity=container_identity,
+                )
+                network_id = None
+                project_name = None
+                port_binding = None
         except (KeyError, TypeError, ValueError, AttributeError):
             raise DockerCredentialDeliveryError("target-invalid") from None
         if not isinstance(container_identity, str) or container_identity.casefold() != container_id.casefold() or not isinstance(image_id, str) or not _IMAGE_ID.fullmatch(image_id) or not isinstance(revision, str) or not _REVISION.fullmatch(revision) or not isinstance(source_hash, str) or not _SOURCE_SHA256.fullmatch(source_hash) or not isinstance(started_at, str) or not started_at:
             raise DockerCredentialDeliveryError("target-invalid")
-        volume_created_at = self._inspect_volume(volume, deadline)
+        volume_created_at = self._inspect_volume(volume, deadline, profile=mapping.topology_profile)
+        if network_id is not None:
+            self._inspect_saxo_network(network_id, project_name, container_identity, deadline)
         return _TargetIdentity(
             container_id=container_identity.casefold(),
             image_id=image_id.casefold(),
@@ -423,9 +469,13 @@ class DockerCredentialDelivery:
             volume_name=volume,
             volume_created_at=volume_created_at,
             started_at=started_at,
+            topology_profile=mapping.topology_profile,
+            network_id=network_id,
+            project_name=project_name,
+            port_binding=port_binding,
         )
 
-    def _inspect_volume(self, volume_name: str, deadline: float) -> str:
+    def _inspect_volume(self, volume_name: str, deadline: float, *, profile: str | None = None) -> str:
         result = self._run(
             ["docker", "volume", "inspect", volume_name],
             deadline,
@@ -438,9 +488,105 @@ class DockerCredentialDelivery:
             volume = volumes[0]
             if volume.get("Name") != volume_name or volume.get("Driver") != "local" or volume.get("Scope") != "local" or not isinstance(volume.get("CreatedAt"), str) or not volume["CreatedAt"]:
                 raise ValueError
+            if profile == "saxo-inspection":
+                labels = volume.get("Labels")
+                if not isinstance(labels, dict) or labels.get("aihf.runtime.root-purpose") != "saxo-inspection" or labels.get("com.docker.compose.volume") != "saxo-inspection-data":
+                    raise ValueError
             return volume["CreatedAt"]
         except (ValueError, KeyError, TypeError, AttributeError):
             raise DockerCredentialDeliveryError("target-volume-invalid") from None
+
+    def _inspect_saxo_network(self, network_id: str, project_name: str, container_id: str, deadline: float) -> None:
+        result = self._run(
+            ["docker", "network", "inspect", network_id],
+            deadline,
+            error_code="target-network-invalid",
+        )
+        try:
+            networks = json.loads(_text(result.stdout))
+            if not isinstance(networks, list) or len(networks) != 1:
+                raise ValueError
+            network = networks[0]
+            labels = network["Labels"]
+            containers = network["Containers"]
+            if (
+                network.get("Id") != network_id
+                or network.get("Driver") != "bridge"
+                or network.get("Scope") != "local"
+                or network.get("Internal") is not False
+                or network.get("Attachable") is not False
+                or not isinstance(labels, dict)
+                or labels.get("aihf.runtime.profile") != "saxo-inspection"
+                or labels.get("com.docker.compose.network") != "saxo-inspection"
+                or labels.get("com.docker.compose.project") != project_name
+                or not isinstance(containers, dict)
+                or set(containers) != {container_id}
+            ):
+                raise ValueError
+        except (ValueError, KeyError, TypeError, AttributeError):
+            raise DockerCredentialDeliveryError("target-network-invalid") from None
+
+    @staticmethod
+    def _validate_saxo_inspection_container(*, config, state, host_config, labels, mounts, env, container_identity, network_settings):
+        if not isinstance(container_identity, str) or not _CONTAINER_ID.fullmatch(container_identity):
+            raise ValueError
+        if state.get("Status") != "running":
+            raise ValueError
+        if labels.get("com.docker.compose.service") != "saxo-inspection-operator" or labels.get("aihf.runtime.profile") != "saxo-inspection" or labels.get("aihf.runtime.root-purpose") != "saxo-inspection":
+            raise ValueError
+        project_name = labels.get("com.docker.compose.project")
+        if not isinstance(project_name, str) or not _CONTEXT_NAME.fullmatch(project_name):
+            raise ValueError
+        entrypoint = config.get("Entrypoint")
+        if not isinstance(entrypoint, list) or len(entrypoint) < 3 or Path(entrypoint[0]).name != "aihf-web-supervisor" or entrypoint[1:3] != ["--root", "/data"]:
+            raise ValueError
+        if config.get("User", "") not in {"", "0", "root"}:
+            raise ValueError
+        if not isinstance(host_config.get("Tmpfs"), dict) or "/tmp" not in host_config["Tmpfs"]:
+            raise ValueError
+        if host_config.get("Privileged") is not False or host_config.get("ReadonlyRootfs") is not True:
+            raise ValueError
+        if host_config.get("CapDrop") != ["ALL"] or host_config.get("CapAdd") not in (None, []):
+            raise ValueError
+        if host_config.get("SecurityOpt") != ["no-new-privileges:true"]:
+            raise ValueError
+        if host_config.get("PidMode") not in (None, "") or host_config.get("IpcMode") not in (None, "", "private"):
+            raise ValueError
+        if host_config.get("Devices") not in (None, []):
+            raise ValueError
+        if host_config.get("PublishAllPorts") is not False:
+            raise ValueError
+        ports = config.get("ExposedPorts")
+        if not isinstance(ports, dict) or set(ports) != {"8876/tcp"}:
+            raise ValueError
+        bindings = host_config.get("PortBindings")
+        expected_binding = [{"HostIp": "127.0.0.1", "HostPort": "8877"}]
+        if not isinstance(bindings, dict) or bindings != {"8876/tcp": expected_binding}:
+            raise ValueError
+        networks = network_settings.get("Networks") if isinstance(network_settings, dict) else None
+        if not isinstance(networks, dict) or len(networks) != 1:
+            raise ValueError
+        network_name, network = next(iter(networks.items()))
+        if host_config.get("NetworkMode") != network_name or not isinstance(network, dict):
+            raise ValueError
+        network_id = network.get("NetworkID")
+        if not isinstance(network_id, str) or not _CONTAINER_ID.fullmatch(network_id):
+            raise ValueError
+        if not isinstance(env, list) or any(not isinstance(entry, str) for entry in env):
+            raise ValueError
+        if any(_is_secret_environment_key(entry.split("=", 1)[0]) or entry.split("=", 1)[0].upper().endswith("_PROXY") for entry in env):
+            raise ValueError
+        role = [entry for entry in env if entry.startswith("HEDGE_FUND_RUNTIME_ROLE=")]
+        app_providers = [entry for entry in env if entry.startswith("HEDGE_FUND_RUNTIME_PROVIDERS=")]
+        capability = [entry for entry in env if entry.startswith("HEDGE_FUND_RUNTIME_CAPABILITIES=")]
+        if role != ["HEDGE_FUND_RUNTIME_ROLE=web-operator"] or app_providers != ["HEDGE_FUND_RUNTIME_PROVIDERS="] or capability != ["HEDGE_FUND_RUNTIME_CAPABILITIES=saxo-demo-token"]:
+            raise ValueError
+        if not isinstance(mounts, list) or len(mounts) != 1:
+            raise ValueError
+        root_mount = mounts[0]
+        if not isinstance(root_mount, dict) or root_mount.get("Type") != "volume" or root_mount.get("Destination") != "/data" or root_mount.get("RW") is not True or not isinstance(root_mount.get("Name"), str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", root_mount["Name"]):
+            raise ValueError
+        return root_mount["Name"], network_id, project_name, "127.0.0.1:8877->8876/tcp"
 
     @staticmethod
     def _validate_operator_container(*, config, state, host_config, labels, mounts, env, container_identity) -> str:
@@ -573,6 +719,12 @@ class DockerCredentialDelivery:
             raise DockerCredentialDeliveryError("clock-invalid")
         return float(value)
 
+    def _utc_now(self) -> datetime:
+        value = self._utc_clock()
+        if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() != timedelta(0):
+            raise DockerCredentialDeliveryError("clock-invalid")
+        return value.astimezone(timezone.utc)
+
 
 def default_mapping_config_path() -> Path:
     """Return user-local non-secret mapping metadata path."""
@@ -604,7 +756,10 @@ def load_source_mappings(path: Path | str | None = None) -> dict[str, SourceMapp
             raise ValueError
         mappings: dict[str, SourceMapping] = {}
         for row in rows:
-            if not isinstance(row, dict) or set(row) != _MAPPING_FIELDS:
+            if not isinstance(row, dict):
+                raise ValueError
+            expected_fields = _CAPABILITY_MAPPING_FIELDS if row.get("provider_id") == _INSPECTION_PROVIDER else _MAPPING_FIELDS
+            if set(row) != expected_fields:
                 raise ValueError
             mapping = SourceMapping(**row)
             if mapping.provider_id in mappings:
@@ -628,9 +783,30 @@ def _provider_id(value: str) -> str:
     if not isinstance(value, str) or not _IDENTIFIER.fullmatch(value.casefold()):
         raise DockerCredentialDeliveryError("provider-invalid")
     provider = value.casefold()
-    if provider not in APPLICATION_PROVIDER_IDS:
+    if provider not in APPLICATION_PROVIDER_IDS and provider != _INSPECTION_PROVIDER:
         raise DockerCredentialDeliveryError("provider-not-allowed")
     return provider
+
+
+def _valid_utc_expiry(value: object) -> bool:
+    if not isinstance(value, str) or not re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,6})?(?:Z|\+00:00)", value):
+        return False
+    try:
+        parsed = datetime.fromisoformat(value[:-1] + "+00:00" if value.endswith("Z") else value)
+    except ValueError:
+        return False
+    return parsed.tzinfo is not None and parsed.utcoffset() == timedelta(0)
+
+
+def _validate_mapping_expiry(value: str | None, now: datetime) -> None:
+    if not _valid_utc_expiry(value):
+        raise DockerCredentialDeliveryError("mapping-invalid")
+    try:
+        expiry = datetime.fromisoformat(value[:-1] + "+00:00" if value.endswith("Z") else value)
+    except ValueError:
+        raise DockerCredentialDeliveryError("mapping-invalid") from None
+    if now.tzinfo is None or now.utcoffset() != timedelta(0) or expiry <= now or expiry > now + timedelta(hours=24):
+        raise DockerCredentialDeliveryError("mapping-invalid")
 
 
 def _is_auth_variable(name: object) -> bool:

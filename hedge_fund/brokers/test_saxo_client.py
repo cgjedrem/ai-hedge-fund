@@ -4,7 +4,9 @@ import pytest
 
 from hedge_fund.brokers.protocol import OrderSubmissionDeferred
 from hedge_fund.brokers.saxo import (
+    _inspection_page_skip,
     DemoTokenManager,
+    LeaseBackedDemoTokenManager,
     Pacer,
     RequestsTransport,
     SaxoAuthError,
@@ -17,6 +19,10 @@ from hedge_fund.brokers.saxo import (
 )
 from hedge_fund.brokers.test_saxo_doubles import FakeClock, FakeTransport
 from hedge_fund.data.sessions import NEW_YORK
+from hedge_fund.runtime.external_credentials import (
+    INSPECTION_CAPABILITY_DESTINATIONS,
+    RuntimeCredentialLeaseStore,
+)
 
 
 class Tokens:
@@ -28,6 +34,184 @@ def _client(responses, currency="USD", *, clock=None):
     transport = FakeTransport(responses)
     client = SaxoClient(tokens=Tokens(), transport=transport, base_currency=currency, clock=clock or FakeClock())
     return client, transport
+
+
+def _inspection_client(responses, *, clock=None):
+    clock = clock or FakeClock()
+    store = RuntimeCredentialLeaseStore(
+        root_id="b" * 64,
+        instance_id="inspection-boot",
+        allowed_capabilities=INSPECTION_CAPABILITY_DESTINATIONS,
+        clock=clock.utcnow,
+    )
+    store.publish_capability(
+        "saxo-demo-token",
+        "synthetic-sim-token",
+        expected_generation=0,
+        delivery_id="inspection-delivery",
+        root_id="b" * 64,
+        instance_id="inspection-boot",
+        destination="saxo-sim-readonly",
+        expires_at="2026-10-31T12:00:00Z",
+    )
+    handle = store.capture_capability("saxo-demo-token", destination="saxo-sim-readonly")
+    tokens = LeaseBackedDemoTokenManager(
+        lease_store=store,
+        handle=handle,
+        authority_check=lambda: None,
+        clock=clock,
+    )
+
+    class Transport:
+        def __init__(self, queued):
+            self.responses = list(queued)
+            self.calls = []
+
+        def request(self, method, url, **kwargs):
+            self.calls.append((method, url, kwargs))
+            return self.responses.pop(0)
+
+    transport = Transport(responses)
+    return SaxoClient(tokens=tokens, transport=transport, base_currency="USD", clock=clock), transport, tokens
+
+
+def test_lease_backed_inspection_reads_only_selected_account_with_bounded_paging():
+    client, transport, _tokens = _inspection_client(
+        [
+            (200, {"ClientKey": "sim-client"}),
+            (
+                200,
+                {
+                    "Data": [
+                        {"AccountKey": "account-1", "Currency": "USD", "Active": True, "LegalAssetTypes": ["Stock"]},
+                        {"AccountKey": "account-2", "Currency": "USD", "Active": True, "LegalAssetTypes": ["Stock"]},
+                    ]
+                },
+            ),
+            (200, {"Currency": "USD", "CashBalance": 1250}),
+            (
+                200,
+                {
+                    "Data": [{"PositionBase": {"Uic": 7, "Amount": 2}}],
+                    "__next": "/sim/openapi/port/v1/positions?ClientKey=sim-client&AccountKey=account-1&%24top=100&%24skip=1",
+                },
+            ),
+            (200, {"Data": [{"PositionBase": {"Uic": 8, "Amount": -1}}]}),
+        ]
+    )
+
+    summaries = client.inspect_accounts("account-1")
+
+    assert len(summaries) == 1
+    assert summaries[0].account_key == "account-1"
+    assert summaries[0].cash_balance == 1250
+    assert [(position.uic, position.amount) for position in summaries[0].positions] == [(7, 2), (8, -1)]
+    assert [call[1].split("/sim/openapi", 1)[-1] for call in transport.calls] == [
+        "/port/v1/users/me",
+        "/port/v1/accounts/me",
+        "/port/v1/balances",
+        "/port/v1/positions",
+        "/port/v1/positions",
+    ]
+    assert transport.calls[3][2]["params"] == {
+        "ClientKey": "sim-client",
+        "AccountKey": "account-1",
+        "$top": 100,
+    }
+    assert transport.calls[4][2]["params"]["$skip"] == 1
+    assert all(call[0] == "GET" for call in transport.calls)
+    assert all(call[2]["headers"]["Authorization"] == "Bearer synthetic-sim-token" for call in transport.calls)
+
+
+@pytest.mark.parametrize(
+    "link",
+    [
+        "https://example.com/sim/openapi/port/v1/positions?ClientKey=sim&AccountKey=a&%24top=100&%24skip=1",
+        "https://gateway.saxobank.com:8443/sim/openapi/port/v1/positions?ClientKey=sim&AccountKey=a&%24top=100&%24skip=1",
+        "/port/v1/accounts/me?ClientKey=other&AccountKey=a&%24top=100&%24skip=1",
+        "/port/v1/positions?ClientKey=sim&AccountKey=a&%24top=100&%24skip=0",
+    ],
+)
+def test_inspection_pagination_rejects_foreign_origin_path_params_and_repeated_skip(link):
+    with pytest.raises(SaxoReconcileError, match="pagination"):
+        _inspection_page_skip(
+            link,
+            path="/port/v1/positions",
+            current_skip=0,
+            params={"ClientKey": "sim", "AccountKey": "a", "$top": 100},
+        )
+
+
+def test_lease_backed_manager_still_triggers_demo_order_and_live_endpoint_fences():
+    client, transport, tokens = _inspection_client([])
+    assert isinstance(tokens, DemoTokenManager)
+    with pytest.raises(SaxoAuthError):
+        client.request("POST", "/trade/v2/orders", json_body={"Uic": 7})
+    with pytest.raises(SaxoAuthError):
+        client.request("GET", "https://gateway.saxobank.com/openapi/port/v1/users/me")
+    assert transport.calls == []
+
+
+def test_inspection_pagination_advances_from_a_nonzero_page_without_reusing_old_skip():
+    assert (
+        _inspection_page_skip(
+            "/port/v1/positions?ClientKey=sim&AccountKey=a&%24top=100&%24skip=200",
+            path="/port/v1/positions",
+            current_skip=100,
+            params={"ClientKey": "sim", "AccountKey": "a", "$top": 100, "$skip": 100},
+        )
+        == 200
+    )
+
+
+def test_inspection_requests_disable_environment_proxy_trust_and_close_stream_session(monkeypatch):
+    import requests
+
+    class Response:
+        status_code = 200
+        _aihf_session = None
+
+        def iter_content(self, chunk_size):
+            assert chunk_size == 64 * 1024
+            yield b'{"ClientKey":"synthetic"}'
+
+        def close(self):
+            self.closed = True
+
+    class Session:
+        trust_env = True
+
+        def __init__(self):
+            self.closed = False
+
+        def request(self, method, url, **kwargs):
+            self.trust_env_after_request = self.trust_env
+            self.kwargs = kwargs
+            response = Response()
+            response.closed = False
+            response._aihf_session = self
+            return response
+
+        def close(self):
+            self.closed = True
+
+    session = Session()
+    monkeypatch.setattr(requests, "Session", lambda: session)
+    response = RequestsTransport().request(
+        "GET",
+        "https://gateway.saxobank.com/sim/openapi/port/v1/users/me",
+        timeout=1,
+        stream=True,
+        _disable_environment_proxies=True,
+    )
+    from hedge_fund.brokers.saxo import _response
+
+    status, body = _response(response, max_body_bytes=1024)
+
+    assert status == 200 and body == {"ClientKey": "synthetic"}
+    assert session.trust_env_after_request is False
+    assert session.kwargs["allow_redirects"] is False
+    assert response.closed is True and session.closed is True
 
 
 def test_discovers_active_stock_account_and_scopes_book_reads():

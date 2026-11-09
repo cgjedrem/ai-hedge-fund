@@ -1,6 +1,7 @@
 import io
 import json
 import subprocess
+from datetime import datetime, timezone
 
 import pytest
 
@@ -14,7 +15,11 @@ from hedge_fund.runtime.credential_delivery import (
     read_delivery_frame,
     read_delivery_reply,
 )
-from hedge_fund.runtime.external_credentials import RuntimeCredentialLeaseStore
+from hedge_fund.runtime.external_credentials import (
+    ExternalCredentialError,
+    runtime_provider_destinations,
+    RuntimeCredentialLeaseStore,
+)
 from hedge_fund.secrets import docker_delivery
 from hedge_fund.secrets.docker_delivery import (
     DockerCredentialDelivery,
@@ -228,11 +233,17 @@ class FakeDockerRunner:
         extra_container_env=(),
         runtime_providers="",
         host_config_overrides=None,
+        inspection_profile=False,
+        inspection_overrides=None,
     ):
+        self.inspection_profile = inspection_profile
+        self.inspection_overrides = inspection_overrides or {}
         self.store = RuntimeCredentialLeaseStore(
             root_id=root_id,
             instance_id=INSTANCE_ID,
             allowed_destinations={"openai": "openai"},
+            allowed_capabilities={"saxo-demo-token": "saxo-sim-readonly"} if inspection_profile else {},
+            clock=lambda: datetime(2026, 11, 9, 12, 0, tzinfo=timezone.utc),
         )
         self.server = CredentialDeliveryServer(self.store)
         self.calls = []
@@ -253,6 +264,14 @@ class FakeDockerRunner:
             "IpcMode": "private",
             "Devices": [],
         }
+        if inspection_profile:
+            self.host_config.update(
+                {
+                    "NetworkMode": "synthetic-project_saxo-inspection",
+                    "PublishAllPorts": False,
+                    "PortBindings": {"8876/tcp": [{"HostIp": "127.0.0.1", "HostPort": "8877"}]},
+                }
+            )
         self.host_config.update(host_config_overrides or {})
         self.publish_count = 0
 
@@ -277,40 +296,111 @@ class FakeDockerRunner:
                     "RW": True,
                 }
             )
+            labels = {
+                "com.docker.compose.service": "web-operator",
+                "org.opencontainers.image.revision": "e" * 40,
+                "org.opencontainers.image.source-sha256": SOURCE_SHA256,
+            }
+            environment = [
+                "HEDGE_FUND_DATA_PROVIDER=yfinance",
+                "HEDGE_FUND_RUNTIME_ROLE=web-operator",
+                f"HEDGE_FUND_RUNTIME_PROVIDERS={self.runtime_providers}",
+            ] + self.extra_container_env
+            config = {"Entrypoint": ["aihf-web-supervisor", "--root", "/data"], "Labels": labels, "Env": environment, "User": ""}
+            host_config = self.host_config
+            mount_list = [mount]
+            network_settings = {}
+            if self.inspection_profile:
+                labels.update(
+                    {
+                        "com.docker.compose.service": "saxo-inspection-operator",
+                        "com.docker.compose.project": "synthetic-project",
+                        "aihf.runtime.profile": "saxo-inspection",
+                        "aihf.runtime.root-purpose": "saxo-inspection",
+                        "org.opencontainers.image.revision": "e" * 40,
+                        "org.opencontainers.image.source-sha256": SOURCE_SHA256,
+                    }
+                )
+                environment = [
+                    "HEDGE_FUND_DATA_PROVIDER=yfinance",
+                    "HEDGE_FUND_RUNTIME_ROLE=web-operator",
+                    "HEDGE_FUND_RUNTIME_PROVIDERS=",
+                    "HEDGE_FUND_RUNTIME_CAPABILITIES=saxo-demo-token",
+                ] + self.extra_container_env
+                host_config = dict(self.host_config)
+                config = {
+                    "Entrypoint": ["aihf-web-supervisor", "--root", "/data"],
+                    "Labels": labels,
+                    "Env": environment,
+                    "User": "",
+                    "ExposedPorts": {"8876/tcp": {}},
+                }
+                mount["Name"] = "synthetic-inspection-root"
+                mount_list = [mount]
+                network_settings = {
+                    "Networks": {
+                        "synthetic-project_saxo-inspection": {
+                            "NetworkID": "f" * 64,
+                        }
+                    }
+                }
+                for key, value in self.inspection_overrides.items():
+                    if key == "labels":
+                        labels.update(value)
+                    elif key == "env":
+                        environment[:] = value
+                        config["Env"] = environment
+                    elif key == "mounts":
+                        mount_list = value
+                    elif key == "networks":
+                        network_settings["Networks"] = value
+                    elif key == "host_config":
+                        host_config.update(value)
+                    elif key == "exposed_ports":
+                        config["ExposedPorts"] = value
             body = [
                 {
                     "Id": CONTAINER_ID,
-                    "Image": IMAGE_ID,
+                    "Image": self.inspection_overrides.get("image", IMAGE_ID),
                     "State": {"Status": "running", "StartedAt": "2026-11-09T10:00:00Z"},
-                    "Config": {
-                        "Entrypoint": ["aihf-web-supervisor", "--root", "/data"],
-                        "Labels": {
-                            "com.docker.compose.service": "web-operator",
-                            "org.opencontainers.image.revision": "e" * 40,
-                            "org.opencontainers.image.source-sha256": SOURCE_SHA256,
-                        },
-                        "Env": [
-                            "HEDGE_FUND_DATA_PROVIDER=yfinance",
-                            "HEDGE_FUND_RUNTIME_ROLE=web-operator",
-                            f"HEDGE_FUND_RUNTIME_PROVIDERS={self.runtime_providers}",
-                        ]
-                        + self.extra_container_env,
-                        "User": "",
-                    },
-                    "HostConfig": self.host_config,
-                    "Mounts": [mount],
+                    "Config": config,
+                    "HostConfig": host_config,
+                    "Mounts": mount_list,
+                    "NetworkSettings": network_settings,
                 }
             ]
             return subprocess.CompletedProcess(args, 0, stdout=json.dumps(body).encode(), stderr=b"")
         if args[:3] == ["docker", "volume", "inspect"]:
+            volume_name = "synthetic-inspection-root" if self.inspection_profile else "synthetic-ext4"
             body = [
                 {
-                    "Name": "synthetic-ext4",
+                    "Name": volume_name,
                     "Driver": "local",
                     "Scope": "local",
                     "CreatedAt": "2026-11-09T10:00:00Z",
+                    "Labels": self.inspection_overrides.get(
+                        "volume_labels",
+                        {"aihf.runtime.root-purpose": "saxo-inspection", "com.docker.compose.volume": "saxo-inspection-data"},
+                    ),
                 }
             ]
+            return subprocess.CompletedProcess(args, 0, stdout=json.dumps(body).encode(), stderr=b"")
+        if args[:3] == ["docker", "network", "inspect"]:
+            network = {
+                "Id": "f" * 64,
+                "Driver": "bridge",
+                "Scope": "local",
+                "Internal": False,
+                "Attachable": False,
+                "Labels": {
+                    "aihf.runtime.profile": "saxo-inspection",
+                    "com.docker.compose.network": "saxo-inspection",
+                    "com.docker.compose.project": "synthetic-project",
+                },
+                "Containers": {CONTAINER_ID: {}},
+            }
+            network.update(self.inspection_overrides.get("network", {}))
+            body = [network]
             return subprocess.CompletedProcess(args, 0, stdout=json.dumps(body).encode(), stderr=b"")
         if args[:2] == ["docker", "exec"]:
             request = read_delivery_frame(io.BytesIO(kwargs["input"]))
@@ -356,6 +446,251 @@ def _mapping_config():
             }
         ],
     }
+
+
+def _inspection_mapping():
+    return SourceMapping(
+        "saxo-demo-token",
+        "op://SyntheticVault/SyntheticItem/access-token",
+        "saxo-sim-readonly",
+        ROOT_ID,
+        CONTAINER_ID,
+        IMAGE_ID,
+        "e" * 40,
+        SOURCE_SHA256,
+        "synthetic-inspection-root",
+        "saxo-inspection",
+        "2026-11-10T11:59:59Z",
+    )
+
+
+def test_saxo_inspection_delivery_uses_exact_capability_profile_and_expiry_before_private_publish():
+    runner = FakeDockerRunner(inspection_profile=True)
+    resolver_calls = []
+    delivery = DockerCredentialDelivery(
+        runner=runner,
+        resolver=lambda reference, _timeout: resolver_calls.append(reference) or SENTINEL,
+        source_mappings={"saxo-demo-token": _inspection_mapping()},
+        environment={},
+        utc_clock=lambda: datetime(2026, 11, 9, 12, 0, tzinfo=timezone.utc),
+    )
+
+    result = delivery.deliver(CONTAINER_ID, "saxo-demo-token")
+    handle = runner.store.capture_capability("saxo-demo-token", destination="saxo-sim-readonly")
+
+    assert result.state == "available"
+    assert result.generation == handle.generation == 1
+    assert runner.store.capability_value_for_dispatch(handle, destination="saxo-sim-readonly") == SENTINEL
+    assert resolver_calls == ["op://SyntheticVault/SyntheticItem/access-token"]
+    requests = [read_delivery_frame(io.BytesIO(kwargs["input"])) for args, kwargs in runner.calls if args[:2] == ("docker", "exec")]
+    assert [request.action for request in requests] == ["status", "publish"]
+    assert all(request.purpose == "saxo-sim-readonly" for request in requests)
+    assert requests[1].expires_at == _inspection_mapping().expires_at
+    assert all(SENTINEL not in " ".join(args) for args, _kwargs in runner.calls)
+    assert SENTINEL not in repr(result)
+
+
+@pytest.mark.parametrize(
+    "expiry",
+    ["2026-11-09T11:59:59Z", "2026-11-10T12:00:01Z"],
+    ids=["expired", "over-24-hours"],
+)
+def test_saxo_expiry_is_rejected_before_target_or_resolver(expiry):
+    runner = FakeDockerRunner(inspection_profile=True)
+    resolver_calls = []
+    mapping = _inspection_mapping()
+    mapping = SourceMapping(
+        mapping.provider_id,
+        mapping.reference,
+        mapping.destination,
+        mapping.root_id,
+        mapping.container_id,
+        mapping.image_id,
+        mapping.revision,
+        mapping.source_sha256,
+        mapping.volume_name,
+        mapping.topology_profile,
+        expiry,
+    )
+
+    with pytest.raises(DockerCredentialDeliveryError, match="mapping-invalid"):
+        DockerCredentialDelivery(
+            runner=runner,
+            resolver=lambda *_args: resolver_calls.append(True),
+            source_mappings={"saxo-demo-token": mapping},
+            environment={},
+            utc_clock=lambda: datetime(2026, 11, 9, 12, 0, tzinfo=timezone.utc),
+        ).deliver(CONTAINER_ID, "saxo-demo-token")
+    assert runner.calls == []
+    assert resolver_calls == []
+
+
+def test_saxo_malformed_expiry_is_rejected_when_mapping_is_created():
+    with pytest.raises(DockerCredentialDeliveryError, match="mapping-invalid"):
+        SourceMapping(
+            "saxo-demo-token",
+            "op://SyntheticVault/SyntheticItem/access-token",
+            "saxo-sim-readonly",
+            ROOT_ID,
+            CONTAINER_ID,
+            IMAGE_ID,
+            "e" * 40,
+            SOURCE_SHA256,
+            "synthetic-inspection-root",
+            "saxo-inspection",
+            "invalid",
+        )
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"host_config": {"NetworkMode": "host"}},
+        {"host_config": {"PortBindings": {"8876/tcp": [{"HostIp": "0.0.0.0", "HostPort": "8877"}]}}},
+        {"host_config": {"PortBindings": {"8876/tcp": [{"HostIp": "127.0.0.1", "HostPort": "8878"}]}}},
+        {"host_config": {"PortBindings": {"8876/tcp": [{"HostIp": "127.0.0.1", "HostPort": "8877"}], "9000/tcp": [{"HostIp": "127.0.0.1", "HostPort": "9000"}]}}},
+        {"networks": {"extra": {"NetworkID": "f" * 64}}},
+        {"network": {"Containers": {CONTAINER_ID: {}, "e" * 64: {}}}},
+        {"network": {"Driver": "host"}},
+        {"labels": {"aihf.runtime.root-purpose": "fund"}},
+        {"labels": {"aihf.runtime.profile": "op-runtime"}},
+        {"labels": {"com.docker.compose.service": "web-operator"}},
+        {"labels": {"org.opencontainers.image.revision": "f" * 40}},
+        {"image": "sha256:" + "f" * 64},
+        {"env": ["HEDGE_FUND_RUNTIME_ROLE=observer", "HEDGE_FUND_RUNTIME_PROVIDERS=", "HEDGE_FUND_RUNTIME_CAPABILITIES=saxo-demo-token"]},
+        {"env": ["HEDGE_FUND_RUNTIME_ROLE=web-operator", "HEDGE_FUND_RUNTIME_PROVIDERS=", "HEDGE_FUND_RUNTIME_CAPABILITIES=saxo-demo-token", "HTTPS_PROXY=http://proxy.invalid"]},
+        {"mounts": [{"Type": "volume", "Name": "fund-state", "Destination": "/data", "RW": True}, {"Type": "volume", "Name": "extra", "Destination": "/extra", "RW": True}]},
+    ],
+    ids=["host-network", "wildcard-port", "wrong-port", "extra-port", "extra-network", "extra-network-member", "wrong-network-driver", "fund-root", "wrong-profile", "wrong-service", "source-drift", "image-drift", "wrong-role", "proxy", "extra-volume"],
+)
+def test_saxo_inspection_topology_denial_precedes_secret_resolution(overrides):
+    runner = FakeDockerRunner(inspection_profile=True, inspection_overrides=overrides)
+    resolver_calls = []
+    with pytest.raises(DockerCredentialDeliveryError):
+        DockerCredentialDelivery(
+            runner=runner,
+            resolver=lambda *_args: resolver_calls.append(True),
+            source_mappings={"saxo-demo-token": _inspection_mapping()},
+            environment={},
+            utc_clock=lambda: datetime(2026, 11, 9, 12, 0, tzinfo=timezone.utc),
+        ).deliver(CONTAINER_ID, "saxo-demo-token")
+    assert resolver_calls == []
+    assert runner.publish_count == 0
+
+
+def test_inspection_mapping_requires_exact_profile_and_expiry_metadata(tmp_path):
+    good = _inspection_mapping()
+    config = {
+        "schema": 1,
+        "mappings": [
+            {
+                "provider_id": good.provider_id,
+                "reference": good.reference,
+                "destination": good.destination,
+                "root_id": good.root_id,
+                "container_id": good.container_id,
+                "image_id": good.image_id,
+                "revision": good.revision,
+                "source_sha256": good.source_sha256,
+                "volume_name": good.volume_name,
+                "topology_profile": good.topology_profile,
+                "expires_at": good.expires_at,
+            }
+        ],
+    }
+    mapping_file = tmp_path / "inspection-mapping.json"
+    mapping_file.write_text(json.dumps(config), encoding="utf-8")
+    mappings = load_source_mappings(mapping_file)
+    assert mappings["saxo-demo-token"] == good
+
+    config["mappings"][0]["topology_profile"] = "op-runtime"
+    mapping_file.write_text(json.dumps(config), encoding="utf-8")
+    with pytest.raises(DockerCredentialDeliveryError, match="mapping-config-invalid"):
+        load_source_mappings(mapping_file)
+
+
+def test_saxo_compose_profile_is_separate_and_op_runtime_stays_network_none():
+    import yaml
+
+    with open("docker-compose.op-runtime.yml", encoding="utf-8") as stream:
+        original = yaml.safe_load(stream)
+    with open("docker-compose.saxo-inspection.yml", encoding="utf-8") as stream:
+        inspection = yaml.safe_load(stream)
+
+    original_service = original["services"]["web-operator"]
+    assert original_service["network_mode"] == "none"
+    assert "ports" not in original_service
+    service = inspection["services"]["saxo-inspection-operator"]
+    assert service["profiles"] == ["saxo-inspection"]
+    assert service["ports"] == ["127.0.0.1:8877:8876"]
+    assert service["networks"] == ["saxo-inspection"]
+    assert service["volumes"] == ["saxo-inspection-data:/data"]
+    assert service["environment"]["HEDGE_FUND_RUNTIME_PROVIDERS"] == ""
+    assert service["environment"]["HEDGE_FUND_RUNTIME_CAPABILITIES"] == "${HEDGE_FUND_RUNTIME_CAPABILITIES:-}"
+    assert inspection["volumes"]["saxo-inspection-data"]["external"] is True
+    assert inspection["networks"]["saxo-inspection"]["driver"] == "bridge"
+
+
+@pytest.mark.parametrize("provider", ["saxo"])
+def test_saxo_delivery_cli_denies_before_mapping_docker_or_resolution(monkeypatch, provider):
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("broker delivery must be denied before accessing mappings or external systems")
+
+    monkeypatch.setattr(docker_delivery, "load_source_mappings", forbidden)
+    output = io.StringIO()
+
+    result = delivery_main(
+        ["--provider", provider],
+        runner=forbidden,
+        resolver=forbidden,
+        environment={},
+        stdout=output,
+    )
+
+    assert result == 2
+    assert output.getvalue() == "delivery=denied reason=provider-not-allowed\n"
+
+
+@pytest.mark.parametrize("provider", ["saxo"])
+def test_saxo_delivery_mapping_cannot_grant_broker_authority(provider):
+    row = _mapping_config()["mappings"][0]
+    row.update(provider_id=provider, destination=provider)
+
+    with pytest.raises(DockerCredentialDeliveryError, match="^provider-not-allowed$"):
+        SourceMapping(**row)
+    with pytest.raises(ExternalCredentialError, match="provider allowlist is invalid"):
+        runtime_provider_destinations(provider)
+    with pytest.raises(ExternalCredentialError, match="not an allowed application provider"):
+        RuntimeCredentialLeaseStore(
+            root_id=ROOT_ID,
+            instance_id=INSTANCE_ID,
+            allowed_destinations={provider: provider},
+        )
+
+
+@pytest.mark.parametrize("action", ["status", "publish"])
+def test_saxo_delivery_backend_denies_without_changing_application_lease(action):
+    store = RuntimeCredentialLeaseStore(
+        root_id=ROOT_ID,
+        instance_id=INSTANCE_ID,
+        allowed_destinations={"openai": "openai"},
+    )
+    fields = {}
+    if action == "publish":
+        fields = {
+            "root_id": ROOT_ID,
+            "instance_id": INSTANCE_ID,
+            "expected_generation": 0,
+            "delivery_id": DELIVERY_ID,
+            "value": SENTINEL,
+        }
+
+    reply = CredentialDeliveryServer(store).handle(DeliveryEnvelope(action=action, provider_id="saxo", destination="saxo", **fields))
+
+    assert reply.state == "denied"
+    assert reply.reason_code == "provider-not-allowed"
+    assert SENTINEL not in repr(reply)
+    assert store.status() == {"openai": {"state": "requires-auth", "generation": 0}}
 
 
 def test_missing_host_mapping_config_is_empty_and_never_resolves(tmp_path):

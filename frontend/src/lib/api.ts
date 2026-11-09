@@ -33,6 +33,7 @@ const API_ERROR_CODES: ReadonlySet<string> = new Set<ApiErrorCode>([
   "payload-too-large",
   "observation-conflict",
   "assets-unavailable",
+  "inspection-timeout",
   "internal-error",
 ]);
 const RETRY_POLICIES: ReadonlySet<string> = new Set<ApiRetryPolicy>([

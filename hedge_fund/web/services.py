@@ -117,6 +117,7 @@ from hedge_fund.runtime.credentials import (
 from hedge_fund.runtime.dispatch import make_one_shot_dispatch, ProviderDispatch
 from hedge_fund.runtime.external_credentials import (
     ExternalCredentialError,
+    runtime_inspection_capability_destinations,
     runtime_provider_destinations,
     RuntimeCredentialHandle,
     RuntimeCredentialLeaseStore,
@@ -170,6 +171,10 @@ from hedge_fund.runtime.reconciliation import build_reconciliation_snapshot
 from hedge_fund.runtime.root import RootContext, RootPathError
 from hedge_fund.scorecard import score
 from hedge_fund.web.jobs import JobCancelled, JobConflict, OperationJobRegistry
+from hedge_fund.web.saxo_inspection import (
+    SaxoInspectionCoordinator,
+    SaxoInspectionError,
+)
 from hedge_fund.web.schemas import (
     ApprovalRequest,
     BacktestRequest,
@@ -379,6 +384,7 @@ class DeskService:
         self._external_credential_store: RuntimeCredentialLeaseStore | None = None
         self._credential_delivery_server: CredentialDeliveryServer | None = None
         self._credential_delivery_state = "disabled"
+        self._saxo_capability_configured = False
         self._operation_store: OperationStore | None = None
         self._operation_jobs: OperationJobRegistry | None = None
         self._paper_operation_jobs: OperationJobRegistry | None = None
@@ -443,10 +449,13 @@ class DeskService:
         if self.allow_writes and os.environ.get("HEDGE_FUND_RUNTIME_ROLE") == "web-operator":
             try:
                 allowed_destinations = runtime_provider_destinations(os.environ.get("HEDGE_FUND_RUNTIME_PROVIDERS"))
+                allowed_capabilities = runtime_inspection_capability_destinations(os.environ.get("HEDGE_FUND_RUNTIME_CAPABILITIES"))
+                self._saxo_capability_configured = bool(allowed_capabilities)
                 external_store = RuntimeCredentialLeaseStore(
                     root_id=root_identity_id(root_context),
                     instance_id=uuid4().hex,
                     allowed_destinations=allowed_destinations,
+                    allowed_capabilities=allowed_capabilities,
                 )
                 delivery_server = CredentialDeliveryServer(
                     external_store,
@@ -459,9 +468,17 @@ class DeskService:
                 self._external_credential_store = external_store
                 self._credential_delivery_server = delivery_server
                 self._credential_delivery_state = "unconfigured"
+        self._saxo_inspection = SaxoInspectionCoordinator(
+            self._external_credential_store,
+            enabled=self._saxo_capability_configured,
+            network_enabled=lambda: self.network_enabled,
+            authority_check=self._admit_external_credential_delivery,
+        )
 
     def close(self) -> None:
         try:
+            if self._saxo_inspection is not None:
+                self._saxo_inspection.clear_all()
             if self._credential_delivery_server is not None:
                 self._credential_delivery_server.close()
                 self._credential_delivery_server = None
@@ -2140,6 +2157,63 @@ class DeskService:
             },
         }
 
+    def saxo_sim_status(self, *, operator_session: str | None) -> dict[str, object]:
+        capability = self._saxo_inspection.status(operator=bool(operator_session))
+        return {
+            "environment": "SIM",
+            "read_only": True,
+            "capability": capability,
+        }
+
+    def discover_saxo_sim_accounts(self, request, *, operator_session: str | None) -> dict[str, object]:
+        try:
+            return self._saxo_inspection.discover(
+                operator_session or "",
+                authorize_network=request.authorize_network,
+                expected_generation=request.expected_generation,
+            )
+        except SaxoInspectionError as exc:
+            self._raise_saxo_inspection_error(exc)
+
+    def inspect_saxo_sim_account(self, request, *, operator_session: str | None) -> dict[str, object]:
+        try:
+            return self._saxo_inspection.inspect(
+                operator_session or "",
+                authorize_network=request.authorize_network,
+                expected_generation=request.expected_generation,
+                selection_id=request.selection_id,
+            )
+        except SaxoInspectionError as exc:
+            self._raise_saxo_inspection_error(exc)
+
+    def cancel_saxo_sim_inspection(self, *, operator_session: str | None) -> dict[str, bool]:
+        if not operator_session:
+            raise ServiceError(403, "A server-owned operator session is required.")
+        return self._saxo_inspection.cancel(operator_session)
+
+    @staticmethod
+    def _raise_saxo_inspection_error(error: SaxoInspectionError) -> None:
+        mapped = {
+            "consent-required": "invalid-request",
+            "capability-disabled": "assets-unavailable",
+            "requires-auth": "assets-unavailable",
+            "expired": "assets-unavailable",
+            "revoked": "assets-unavailable",
+            "stale-generation": "stale-preview",
+            "stale-selection": "stale-preview",
+            "inspection-busy": "request-conflict",
+            "inspection-cancelled": "request-conflict",
+            "network-disabled": "capability-denied",
+            "capability-denied": "capability-denied",
+            "invalid-broker-response": "readiness-denied",
+            "inspection-limit": "capacity-denied",
+            "inspection-timeout": "inspection-timeout",
+            "sim-request-failed": "assets-unavailable",
+            "deployment-unavailable": "assets-unavailable",
+        }
+        code = mapped.get(error.reason, "assets-unavailable")
+        raise ServiceError(error.status_code, error.message, code=code) from None
+
     def _admit_external_credential_delivery(self) -> None:
         self._require_writes()
         self.root_context.revalidate()
@@ -3044,6 +3118,30 @@ class DeskService:
         store = self._external_credential_store
         if store is None:
             raise ServiceError(503, "External runtime credential delivery is unavailable.")
+        if provider.casefold() == "saxo-demo-token":
+            try:
+                self.root_context.revalidate()
+                self._admission.require_root_owner()
+                generation = store.revoke_capability(
+                    "saxo-demo-token",
+                    expected_generation=expected_generation,
+                    purpose="saxo-sim-readonly",
+                )
+            except ExternalCredentialError as exc:
+                reason = str(exc)
+                if reason in {"provider identity is invalid", "credential generation is invalid"}:
+                    raise ServiceError(400, "Runtime credential revocation request is invalid.") from None
+                if reason == "provider is not allowed":
+                    raise ServiceError(404, "Runtime credential provider is not configured.") from None
+                if reason == "runtime credential store is closed":
+                    raise ServiceError(503, "External runtime credential delivery is unavailable.") from None
+                if reason == "credential generation changed":
+                    raise ServiceError(409, "Runtime credential generation changed; reload status.", code="stale-preview") from None
+                raise ServiceError(403, "Runtime credential revocation was denied.", code="capability-denied") from None
+            except (AdmissionError, RootPathError):
+                raise ServiceError(422, "Root write authority is unavailable.", code="readiness-denied") from None
+            self._saxo_inspection.clear_all()
+            return {"state": "revoked", "generation": generation}
         try:
             self.root_context.revalidate()
             self._admission.require_root_owner()

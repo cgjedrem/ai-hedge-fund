@@ -1,5 +1,370 @@
 # Acceptance Evidence: Saxo SIM Demo Connection
 
+## Final review and bounded Linux verification (2026-11-09)
+
+**Current result: final parent code/static/focused review PASS**, as confirmed by
+the parent/user after the publication race fix. This supersedes older pending-QA
+statements below without changing their historical test results. T023 is complete.
+T022 remains partial: full Python suite **NOT RUN**; Linux IPC/HTTP execution
+**BLOCKED before collection by normal root admission**, not a test assertion
+failure. T026/SB-A08 actual host/browser/SIM acceptance remains **BLOCKED**:
+exact approved local reference/expiry are missing and no live acceptance was
+authorized. No reference or expiry was inferred.
+
+At `2026-11-09T16:16:28.662945+00:00`, HEAD remains
+`53bb1fcf731cd31fbc476710cef9ced2a2a255f4`. Recomputed using the 21-path
+algorithm below, implementation manifest SHA-256 is
+`4e6f9fc7fa6673d2a9b37c774d2ad832ba9439f8856ab08a46979ca2aa305683`;
+implementation dirty-diff SHA-256 is
+`33b400c3714f0cc0ec41647b27943de3c330b19a87c439e20993c6b2d8fee847`.
+No application/test source changed during this verification.
+
+**Actual platform/image**: Docker Linux/amd64, kernel
+`6.6.87.2-microsoft-standard-WSL2`, glibc 2.41; existing local image
+`aihf-op-cycle2-user-test:dc2bed3`, image ID and reported repository digest
+`sha256:f10303e775fb9f926ebd71bfbc9b321a39024d22752c49516b7772dde4eb06a4`.
+Image CPython **3.11.18**. No image was built or pulled. Presence-only probes
+found pytest missing in this image and in the two existing alternatives
+`aihf-web:2b4cbed2a20c6f9877cbbc762e6df378c960d3f8-3f1922909961798b36353a9309c4de9ddc6651b031f2ac7c0dd1ff529550cbd5`
+and `cgjedrem-legendary-umbrella-runner:latest`.
+
+**Bounded offline bootstrap**: archived only installed host pure-Python sources
+for pytest, `_pytest`, pluggy, iniconfig, packaging, pygments, plus the installed
+`py.py` compatibility shim. The first bootstrap import reported missing `py`;
+adding that existing shim produced successful pytest **9.1.1** imports under
+Linux Python 3.11.18. No package install, dependency/manifest change or network
+access occurred. Application dependencies came from the existing image, not a
+Windows virtual environment.
+
+The named test helper used `docker run --rm --network none --read-only`,
+repository read-only bind at `/workspace`, archive read-only at
+`/verification-tools.zip`, and isolated tmpfs mounts at `/verification-tools`
+(32 MiB), `/workspace/outputs` (128 MiB), `/tmp` (64 MiB).
+`PYTHONDONTWRITEBYTECODE=1`, `PYTHON_DOTENV_DISABLED=1` and
+`PYTEST_DISABLE_PLUGIN_AUTOLOAD=1` were set. Python extracted only the tooling
+archive into its helper tmpfs, added `/verification-tools` and `/workspace` to
+the import path, changed to `/workspace`, then called the exact pytest selection:
+
+```text
+pytest.main([
+  "hedge_fund/runtime/test_credential_delivery.py",
+  "hedge_fund/runtime/test_external_credentials.py",
+  "hedge_fund/web/test_saxo_inspection.py",
+  "-q", "--tb=short", "-r", "s", "-p", "no:cacheprovider"
+])
+```
+
+**Observed result: exit 4, zero tests executed, 0.92 seconds** measured around
+`pytest.main`. Normal `hedge_fund/conftest.py` created its marked synthetic root
+but `RootContext.open` -> `validate_filesystem` rejected tmpfs with
+`UnsupportedFilesystemError: root requires local NTFS or ext4`.
+No `--confcutdir`, `--noconftest`, patched admission, alternative filesystem
+claim or weakened root gate was used. This is a concrete platform/harness
+prerequisite blocker, not evidence of a source bug. Linux deny/revoke/restart
+behavior was **not observed**, and the nine Windows-skipped socket cases remain
+unverified. Their previously passing Windows fake/frame/CAS/revoke/restart and
+HTTP results remain separate evidence (306 passed/9 skips; adjacent 136/1 skip).
+
+**Cleanup confirmed** at the timestamp above: `docker ps -a --filter
+name=aihf-saxo-verify- --format '{{.ID}} {{.Names}} {{.Status}}'` returned no rows.
+Created helper names were `aihf-saxo-verify-probe-bf812617`,
+`aihf-saxo-verify-option-bf812617` (reused sequentially for two probes),
+`aihf-saxo-verify-tooling-bf812617` (sequential bootstrap attempts), and
+`aihf-saxo-verify-linux-bf812617`; all ran with `--rm` and were absent afterward.
+Transient container IDs were not captured; no IDs are invented. The only host
+scratch file, repository-relative `.saxo-linux-pytest-tools.zip` (1,659,722 bytes),
+was explicitly removed and its absence checked. Helper tmpfs contents disappeared
+with their containers; no helper, archive or test output remains on the host.
+No existing user container, volume or network was attached or modified, no user
+container logs or environment were read, and no real credentials, `.env`, `op`,
+vault, Saxo/provider requests, fund/order actions, commit or push were used.
+
+## Final-QA publication race correction (2026-11-09)
+
+**Result: fixed and freshly validated offline; QA recheck remains pending.**
+This follow-up supersedes the earlier bridge source fingerprints and affected
+Python test counts below. The branch/HEAD and existing Poetry Python 3.11
+environment are unchanged. No commit, dependency/configuration change,
+credential access, real network call, Docker operation or shared-root mutation.
+All roots, leases, clocks and broker responses used by tests are synthetic and
+the repository conftest/network guard remained loaded.
+
+**Reproduction / diagnosis**: the prior final-position-GET test revoked before
+the final lease/authority checks, so it did not cover construction/reflection
+work after those checks. New
+`test_http_loss_during_result_redaction_prevents_publication` blocks the
+reflection-check seam after the prepared discovery/inspection projection has
+passed its earlier checks. Complete revoke/cancel/owner/root/permission loss,
+expiry or generation invalidation, then unblock. Before the fix all **14 cases
+failed in 22.08s**: HTTP 200 returned choices or the financial summary. With the
+fix the same targeted command passed **14 cases, 48 deselected in 21.35s** before
+the additional lock-order/boundary tests were added. Failure is now a sanitized
+non-200 response, without choices/account/cash/positions; captures are released.
+
+**Patch manifest / linearization**:
+
+- `hedge_fund\runtime\external_credentials.py`: add
+  `commit_capability_publication`; retain the store's reentrant lock through
+  captured-handle validation and the local publication callback. This is shared
+  with revoke/invalidation/close, not merely an extra unlocked check. Rotation
+  still permits pinned A to complete; late A invalidation never revokes B.
+- `hedge_fund\web\saxo_inspection.py`: discovery and inspection commit their
+  complete reflection-checked projections through `_publish_result`.
+  Coordinator lock first (same order as `_begin`), recheck local authority, then
+  store lock. Commit marks cancellation inactive and returns the prepared result.
+  Cancellation and `clear_all` use the coordinator lock. Revoke releases the
+  store lock before `clear_all`; `_end` releases the store lock before acquiring
+  the coordinator lock. No store-to-coordinator nested acquisition was added.
+  No broker call, projection construction or reflection traversal is performed
+  while holding the publication locks. The store callback performs no I/O,
+  authority check or further lock acquisition.
+- `hedge_fund\runtime\test_external_credentials.py`: four additional cases verify
+  validation/commit share the revocation lock under actual contention and that
+  revoke/invalidate/close winning first never invokes the commit callback.
+- `hedge_fund\web\test_saxo_inspection.py`: 17 additional cases: the 14 red-first
+  post-redaction loss cases; a cancellation-lock contention case; two HTTP
+  publication-wins cases delaying cleanup/transport handoff while revoke/cancel
+  completes. These distinguish a serialized commit from an unchecked extra
+  validation and define the allowed opposite ordering.
+- Related docs: `onepassword-bridge\contracts\inspection.md`, `spec.md`,
+  `tasks.md`, and this evidence section record the scenario, acceptance rows and
+  exact boundary.
+
+The **publication boundary is the local prepared-result commit, before FastAPI
+serialization/HTTP transmission**, not a socket-send gate. Revoke/cancel winning
+before commit suppresses the result; publication winning first may still be
+delivered after revoke. Cancel after commit reports `cancelled: false`.
+Neither committed results nor already sent HTTP bytes can be recalled.
+Root/owner/private-storage/network authority is rechecked at the local boundary,
+not made immutable against external changes through transport. No absolute
+post-revoke transport-suppression claim is made.
+
+**Fresh exact validation commands/results**, with
+`PYTHON_DOTENV_DISABLED=1`, `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1`,
+`PYTHONDONTWRITEBYTECODE=1`:
+
+1. Red-first reproduction:
+   `uv tool run --from poetry poetry run python -m pytest hedge_fund\web\test_saxo_inspection.py -k loss_during_result_redaction -q --tb=short -p no:cacheprovider`
+   — **14 failed, 48 deselected in 22.08s** before implementation, then
+   **14 passed, 48 deselected in 21.35s**.
+2. Fresh complete bridge selection:
+   `uv tool run --from poetry poetry run python -m pytest hedge_fund\runtime\test_credential_delivery.py hedge_fund\runtime\test_external_credentials.py hedge_fund\secrets\test_docker_delivery.py hedge_fund\web\test_saxo_inspection.py hedge_fund\brokers\test_factory.py hedge_fund\brokers\test_saxo_client.py hedge_fund\brokers\test_saxo_tokens.py -q --tb=short -r s -p no:cacheprovider`
+   — **306 passed, 9 skipped in 54.55s**. Includes **65 inspector tests**.
+   The nine skips remain existing Unix-socket/platform tests on Windows.
+   Pinned A/B rotation, late A rejection preserving B, generation-CAS revoke,
+   cancel/authority loss, release and restart cases all pass.
+3. Fresh adjacent HTTP/runtime-authority selection:
+   `uv tool run --from poetry poetry run python -m pytest hedge_fund\web\test_app.py hedge_fund\web\test_services.py hedge_fund\web\test_settings.py hedge_fund\web\test_settings_provenance.py hedge_fund\web\test_write_authority.py hedge_fund\brokers\test_account_binding_guards.py -q --tb=short -p no:cacheprovider`
+   — **136 passed, 1 skipped in 107.78s**.
+4. On exactly the four Python files in this follow-up manifest, the commands
+   below **all passed**; Black reports four files unchanged, no ignored error
+   codes. `git diff --check` passed (existing LF/CRLF advisories only).
+
+   ```powershell
+   $files = @('hedge_fund\runtime\external_credentials.py', 'hedge_fund\runtime\test_external_credentials.py', 'hedge_fund\web\saxo_inspection.py', 'hedge_fund\web\test_saxo_inspection.py')
+   uv tool run --from poetry poetry run black --check @files
+   uv tool run --from poetry poetry run isort --check-only @files
+   uv tool run --from poetry poetry run flake8 --max-line-length=420 @files
+   git diff --check
+   ```
+
+**Updated source fingerprints**, using the same 21 implementation paths and
+NUL-delimited hashing algorithms documented below:
+
+- Manifest SHA-256:
+  `4e6f9fc7fa6673d2a9b37c774d2ad832ba9439f8856ab08a46979ca2aa305683`.
+- Implementation dirty-diff SHA-256:
+  `33b400c3714f0cc0ec41647b27943de3c330b19a87c439e20993c6b2d8fee847`.
+
+The full Python suite, frontend tests/build, credentialed host acceptance and
+Linux/socket smoke were **not rerun** in this follow-up. Earlier frontend
+results are historical and frontend files were not changed by this correction.
+T022 remains partial, T023 requires QA recheck, and T026/SB-A08 remain blocked.
+
+## In-app inspection bridge implementation status (2026-11-09)
+
+**Result: Expanded governed offline validation passed; final QA, full Python suite
+and host acceptance remain outstanding.** Evidence refreshed
+`2026-11-09T16:00:17.9218897Z`. The current working branch
+remains `cgjedrem-verbose-winner` at
+`53bb1fcf731cd31fbc476710cef9ced2a2a255f4`. All changes are local and
+uncommitted. Source-manifest fingerprint (SHA-256, listed implementation files
+only; documentation and ignored build output excluded):
+`81d734eeb65896e8173b0ec59e2c7d2e8b69d7582f76486cbe2a2214bb848846`
+(SHA-256 over sorted repository-relative implementation paths and file bytes,
+with NUL separators; docs excluded).
+
+The implementation adds a distinct `saxo-demo-token` capability namespace and
+purpose-bound in-memory lease; compatible private stdin delivery with explicit
+expiry; strict dedicated host/topology validation and opt-in
+`docker-compose.saxo-inspection.yml`; a lease-backed Saxo SIM GET client with
+proxy/redirect denial, response/paging/request/time bounds and no token cache;
+authenticated, consented, actor/generation-scoped discovery and selected-account
+inspection routes; and a separate transient settings card. The existing
+`op-runtime` network-none profile, application-provider catalog and Saxo
+fund/order ownership gates remain separate. The bridge makes no claim that a
+Docker bridge filters domain egress.
+
+**Recovered environment**: Windows; existing project Poetry environment
+`aihf-4l3vIF0x-py3.11`, CPython **3.11.15**, pytest **7.4.4**, pandas **2.3.3**,
+Black **23.12.1**, isort **5.13.2**, Flake8 **6.1.0**; Node **22.13.1**,
+npm **10.9.2**, Vitest **4.1.12**, Vite **6.4.5**. Poetry was recovered with
+`uv tool run --from poetry poetry env info`; no dependency restoration or manifest
+change was needed. Earlier system-Python-3.13/missing-pandas/style claims are
+superseded, not current blockers.
+
+**Final exact commands/results** (all Python tests loaded the repository conftest,
+marked synthetic-root enrollment and network guard; no `--noconftest`,
+`--confcutdir`, or external `--basetemp`):
+
+- `uv tool run --from poetry poetry run python -m pytest hedge_fund\runtime\test_credential_delivery.py hedge_fund\runtime\test_external_credentials.py hedge_fund\secrets\test_docker_delivery.py hedge_fund\web\test_saxo_inspection.py hedge_fund\brokers\test_factory.py hedge_fund\brokers\test_saxo_client.py hedge_fund\brokers\test_saxo_tokens.py -q --tb=short -r s` — **285 passed, 9 skipped in 27.43s**. All nine skips are existing Unix-socket ownership/server tests on Windows; private stdin/frame and host/topology fakes ran. The web inspection file contains **48 passing tests**, including real FastAPI middleware/routes/services with only synthetic leases, clock and fake Saxo transport injected.
+- `uv tool run --from poetry poetry run python -m pytest hedge_fund\web\test_app.py hedge_fund\web\test_services.py hedge_fund\web\test_settings.py hedge_fund\web\test_settings_provenance.py hedge_fund\web\test_write_authority.py hedge_fund\brokers\test_account_binding_guards.py -q --tb=short` — **136 passed, 1 skipped in 109.29s**. The pre-addition HTTP baseline also passed **52 tests in 8.37s** without fixture exceptions.
+- From `frontend`: `npx vitest run src\pages\settings-saxo.test.tsx --reporter=dot` — **9 passed in 59.30s**; then final `npm test -- --reporter=dot` — **232 passed, 14 files in 45.20s**.
+- From `frontend`: `npm run build` — **TypeScript and Vite build passed**, **2317 modules**, **32.25s** Vite duration. Existing large-chunk advisory remains nonfatal; generated static assets are ignored build output.
+- All **16 changed/new Python files**: `black --check`, `isort --check-only`, `flake8 --max-line-length=420`, each via `uv tool run --from poetry poetry run`, **passed**. No warning-ignore flags were used. Fixed new unused-variable/spacing/import/formatting issues rather than hiding them. `git diff --check` passed.
+- **Full Python suite: NOT RUN** in this bounded specialist phase (the parent reports approximately 40 minutes). No full-suite pass or current environment/fixture blocker is claimed.
+
+**Genuine missing behavior fixed**: a successful late inspect response restored
+the summary after cancellation. New UI tests first reproduced this (**1 failed,
+227 passed** across the then-current frontend suite). A transient action epoch
+now fences publication on cancel, revoke, reconnect, authority/status change and
+unmount; stale completions cannot overwrite a newer action's state. Revoke is
+available while a GET is in flight. Removed discovery's unnecessary status reload,
+which could clear fresh choices when status responses were slow. Added HTTP
+session/origin/token/peer/owner/root/permission/network/consent denial,
+selection scoping, disk-quiet typed inspection, bounded resource limits, busy and
+foreign cancel, final-GET revoke, A/B late rejection and restart tests. These HTTP
+tests extend an already-implemented seam; no retrospective red-first claim is made.
+Runtime tests now explicitly cover multi-capture A/B retention/release, CAS revoke,
+close/restart and stale pins. Broker tests exercise the DemoTokenManager subtype
+fence for lease-backed order and live-path denial.
+
+**Implementation manifest** (all fake/offline source artifacts fingerprinted
+separately from docs): `docker-compose.saxo-inspection.yml`;
+`frontend/src/lib/api.ts`, `frontend/src/lib/types.ts`,
+`frontend/src/pages/settings.tsx`, `frontend/src/pages/settings-saxo.test.tsx`;
+`hedge_fund/brokers/factory.py`, `saxo.py`, `test_factory.py`,
+`test_saxo_client.py`, `test_saxo_tokens.py`;
+`hedge_fund/runtime/credential_delivery.py`, `external_credentials.py`,
+`test_credential_delivery.py`, `test_external_credentials.py`;
+`hedge_fund/secrets/docker_delivery.py`, `test_docker_delivery.py`;
+`hedge_fund/web/app.py`, `schemas.py`, `services.py`, `saxo_inspection.py`,
+`test_saxo_inspection.py`.
+
+**Final implementation diff SHA-256** (`git diff --binary HEAD` for the
+implementation manifest above, followed by the sorted bytes of untracked
+implementation artifacts; documentation and the pre-existing
+`.pytest-saxo-delivery-tests/` directory excluded):
+`d1c8cfd2cf78467f50dffeed11c272ca69b79c50fd054d7aeda7833c794f55b7`.
+
+Both hashes cover exactly the **21 implementation files** listed above. For the
+manifest hash, sort canonical repository-relative paths and append
+`path + NUL + file bytes + NUL` for each. For the dirty diff hash, hash
+`git diff --binary HEAD -- <manifest paths>` followed by those same delimited
+paths/bytes for untracked implementation files only. Documentation, ignored
+build output and task-owned pytest scratch directories are excluded.
+
+**Not performed / blockers**: no 1Password reference or token was read or
+resolved; no Saxo request, Docker command, container/network change, shared-root
+mutation, order or fund operation was performed. No host/browser smoke was run.
+The operator has not supplied the locally approved field reference and expiry,
+so T026 and SB-A08 remain **BLOCKED**. T022 is partial solely because the full
+Python suite has not run; focused validation, frontend and style are complete.
+T023's parent QA review remains pending. Windows cannot exercise the nine
+Unix-socket tests; no Linux/container validation is inferred. No commit, push,
+branch change or PR was made.
+
+At `2026-11-09T16:01:50.1286484Z`, only the inspected synthetic pytest directories
+`.pytest-saxo-delivery-tests` and `.pytest-saxo-validation` were removed. Their
+file-name allowlist and link targets were checked before cleanup; no unknown
+files or other worktree/output directories were deleted. Final `git diff --check`
+passed after documentation updates.
+
+## Documentation-only bridge scope supersession (2026-11-09)
+
+The user subsequently approved the narrow in-app inspection bridge. The dated
+Spec005 OP-FR-002 scope amendment now permits only `saxo-demo-token` ->
+`saxo-sim-readonly`; OP-FR-007 memory-only retention, all other broker/OAuth
+delivery denial, application-provider separation and SIM mutation/ownership
+denial remain intact. Specification, plan, tasks, research, data model, interface
+contract, runbook and author quality checklist are in `onepassword-bridge\`.
+
+This phase performed source/document reads and documentation edits only. No
+source/test script, credentials/configuration/environment/token read, Docker,
+network, broker or order operation occurred. No commit/push/branch/PR change.
+The prior dirty test file is preserved for the parent's later implementation.
+Parent caveman review and comment resolution are pending, not reported as passed.
+No new test or runtime acceptance result is claimed.
+
+The actual eligible `docker-compose.op-runtime.yml` target is network-none with
+no published browser port. Source implementation may proceed offline after review;
+real Docker in-app acceptance stays BLOCKED until a supported source-pinned
+browser/SIM egress topology is reviewed. Exact source reference, expiry and
+eligible target remain operator-local inputs; none were discovered or guessed.
+
+The following policy-denial record remains historical evidence for pre-amendment
+source behavior. It is not the current approved scope or bridge acceptance.
+
+## Docker bridge policy assessment (2026-11-09, baseline `53bb1fc`)
+
+**Result: BLOCKED by the approved architecture; no broker bridge implemented.**
+Read-only source inspection found that the Spec005 1Password extension explicitly
+excludes Saxo tokens and SIM authentication. OP-FR-002 requires broker-credential
+denial; OP-FR-007 prohibits persisted values. Contrary to the proposed file-backed
+premise, its delivery destination is a process-local memory lease, not a secret
+file. `SourceMapping`, `APPLICATION_PROVIDER_IDS`, `runtime_provider_destinations`
+and `RuntimeCredentialLeaseStore` independently enforce this application-provider
+scope. A separate CLI process cannot consume that backend's memory lease.
+
+The user instruction requires stopping rather than overriding deliberate
+governance. No provider registry, allowlist, delivery protocol, token source,
+ownership gate or runtime consumer was changed. The quickstart records the
+specific policy amendment needed and an exact operator-run host inspection command
+requiring the operator's known `op://` field reference and authenticated terminal.
+No actual vault/item path was inferred or written.
+
+**Manifest**:
+
+- `hedge_fund\secrets\test_docker_delivery.py`: six fake-only cases cover Saxo and
+  purpose-named demo destination CLI denial before mapping/Docker/resolver access,
+  mapping/backend-configuration denial, and status/publication denial while
+  leaving an empty application lease store unchanged (`requires-auth`, generation
+  zero). These cases do not establish preservation of an active lease.
+- This addendum's `plan.md`, `quickstart.md`, `tasks.md`, and
+  `acceptance-evidence.md`: architectural stop condition, safe host alternative,
+  proposed policy review and validation evidence.
+
+**Verification**: Windows, existing Poetry Python environment; dotenv loading and
+pytest plugin autoload disabled, bytecode/cache output disabled, existing guarded
+test harness and project-local pytest basetemp used. No dependency change/install.
+
+```powershell
+$env:PYTHON_DOTENV_DISABLED = '1'
+$env:PYTEST_DISABLE_PLUGIN_AUTOLOAD = '1'
+$env:PYTHONDONTWRITEBYTECODE = '1'
+uv tool run --from poetry poetry run python -m pytest hedge_fund\secrets\test_docker_delivery.py hedge_fund\runtime\test_external_credentials.py hedge_fund\brokers\test_saxo_tokens.py hedge_fund\brokers\test_saxo_client.py hedge_fund\brokers\test_factory.py hedge_fund\test_run.py -k '(saxo or demo or delivery or mapping or operator_provider or sim_ownership_denial) and not saxo_demo_execution_refuses_before_ledger_or_execution and not saxo_guard_preserves_nonexecuting_verdicts_and_oauth_paper_approvals' -q --tb=short -p no:cacheprovider --basetemp=.pytest-saxo-delivery-policy-final-20261109
+```
+
+Result: **166 passed, 9 skipped, 111 deselected** (final rerun 1.16 s). Includes new policy
+regressions, allowed fake application delivery, standalone GET-only SIM inspection,
+demo-token rejection/no-write-back and factory SIM ownership denial.
+Black (`--line-length 420`), isort, Flake8 (`--max-line-length=420
+--extend-ignore=E306`) on the changed test file and `git diff --check` all passed.
+
+The initial selection without the two exclusions produced **166 passed, 9 skipped,
+10 failed, 101 deselected** (1.80 s). All ten failures are existing CLI fixture
+patches of removed `run.apply_credentials`, in the two excluded test functions.
+`run.py` and `test_run.py` have no changes against `53bb1fc`; these pre-existing
+rebase-adjacent fixture failures were not repaired or represented as a passing
+suite. No full-suite or credentialed SIM acceptance is claimed.
+
+**Safety**: No Docker command, container inspection/restart/mutation, shared-root
+access, `.env`, raw environment, log or secret-value read, `op` invocation, real
+broker/network call, token mutation, fund deployment, runner or order. Both
+existing containers were left untouched. Production behavior and the
+`require_sim_account_ownership()` denial are unchanged. Changes remain local and
+uncommitted; no push.
+
 ## Rebase integration verification (2026-11-09)
 
 - **Branch/revision**: `cgjedrem-verbose-winner`; rebased onto PR #8 head `ca434fdb91730d036d11da3a91667173bbf90a6a`. Rebase integration commit `99eda23131338cef96468dd1afea6a3a66009700`; lint follow-up `fa5845c` (source revision under test). The rebase also preserves the existing `edc79eb` data-recovery commit. Original checkpoint: `de5884511e36c7979834d8202d1a59bbe1d3604c`.

@@ -38,6 +38,11 @@ from hedge_fund.web.schemas import (
     RunnerPreviewRequest,
     RunnerStartAcceptRequest,
     RuntimeSettingsRequest,
+    SaxoInspectionAuthorizeRequest,
+    SaxoInspectionDiscoveryResponse,
+    SaxoInspectionRequest,
+    SaxoInspectionResultResponse,
+    SaxoInspectionStatusResponse,
     ValuationRefreshRequest,
 )
 from hedge_fund.web.services import DeskService, ServiceError
@@ -470,6 +475,28 @@ def create_app(
     @app.get("/api/credentials/status")
     def credential_status():
         return service.credential_status()
+
+    @app.get("/api/saxo/sim/status", response_model=SaxoInspectionStatusResponse)
+    def saxo_sim_status(request: Request):
+        return service.saxo_sim_status(operator_session=request.state.operator_session)
+
+    @app.post("/api/saxo/sim/accounts", response_model=SaxoInspectionDiscoveryResponse)
+    def saxo_sim_accounts(body: SaxoInspectionAuthorizeRequest, request: Request):
+        return service.discover_saxo_sim_accounts(
+            body,
+            operator_session=request.state.operator_session,
+        )
+
+    @app.post("/api/saxo/sim/inspect", response_model=SaxoInspectionResultResponse)
+    def saxo_sim_inspect(body: SaxoInspectionRequest, request: Request):
+        return service.inspect_saxo_sim_account(
+            body,
+            operator_session=request.state.operator_session,
+        )
+
+    @app.post("/api/saxo/sim/cancel")
+    def saxo_sim_cancel(request: Request):
+        return service.cancel_saxo_sim_inspection(operator_session=request.state.operator_session)
 
     @app.delete("/api/credentials/runtime/{provider}")
     def revoke_runtime_credential(
