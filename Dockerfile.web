@@ -10,6 +10,12 @@ RUN npm run build
 
 FROM python:3.11-slim
 
+ARG AIHF_SOURCE_REVISION
+ARG AIHF_SOURCE_SHA256
+
+LABEL org.opencontainers.image.revision="${AIHF_SOURCE_REVISION}" \
+    org.opencontainers.image.source-sha256="${AIHF_SOURCE_SHA256}"
+
 ENV PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1 \
@@ -17,6 +23,7 @@ ENV PYTHONUNBUFFERED=1 \
     POETRY_NO_INTERACTION=1
 
 WORKDIR /app
+RUN mkdir -p /data
 
 COPY pyproject.toml poetry.lock ./
 RUN pip install poetry==2.5.1 \
@@ -25,7 +32,12 @@ RUN pip install poetry==2.5.1 \
 COPY hedge_fund ./hedge_fund
 COPY README.md ./
 COPY --from=frontend-build /app/hedge_fund/web/static ./hedge_fund/web/static
+RUN python -m hedge_fund.runtime.build_identity \
+    --root /app/hedge_fund \
+    --revision "${AIHF_SOURCE_REVISION}" \
+    --expected-source-sha256 "${AIHF_SOURCE_SHA256}"
 RUN poetry install -E web --only main
 
-EXPOSE 8765
-CMD ["aihf-web", "--port", "8765"]
+EXPOSE 8876
+ENTRYPOINT ["aihf-web-supervisor", "--root", "/data"]
+CMD ["--port", "8876"]

@@ -13,7 +13,7 @@ import { CommandPalette } from "@/components/command-palette";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
-import { useDesk, DeskProvider } from "@/lib/hooks";
+import { useDesk, DeskProvider, type ConnectionState } from "@/lib/hooks";
 import { BacktestsPage } from "@/pages/backtests";
 import { BuilderPage } from "@/pages/builder";
 import { HomePage } from "@/pages/home";
@@ -38,7 +38,7 @@ function isEditable(target: EventTarget | null): boolean {
 }
 
 function DeskFrame() {
-  const { capabilities, capabilityError } = useDesk();
+  const { capabilities, capabilityError, connection, sessionRenewed, reconnect, dismissSessionNotice } = useDesk();
   const [paletteOpen, setPaletteOpen] = useState(false);
   const location = useLocation();
 
@@ -179,6 +179,13 @@ function DeskFrame() {
             </div>
           </header>
 
+          <ConnectionBanner
+            connection={connection}
+            sessionRenewed={sessionRenewed}
+            onReconnect={() => void reconnect()}
+            onDismiss={dismissSessionNotice}
+          />
+
           <nav className="flex gap-1 overflow-x-auto border-b border-border/70 px-3 py-2 lg:hidden" aria-label="Mobile navigation">
             {navigation.map((item) => (
               <NavLink
@@ -225,6 +232,44 @@ function DeskFrame() {
       <CommandPalette open={paletteOpen} onOpenChange={setPaletteOpen} />
     </div>
   );
+}
+
+function ConnectionBanner({
+  connection,
+  sessionRenewed,
+  onReconnect,
+  onDismiss,
+}: {
+  connection: ConnectionState;
+  sessionRenewed: boolean;
+  onReconnect: () => void;
+  onDismiss: () => void;
+}) {
+  if (connection !== "online") {
+    return (
+      <div role="alert" className="flex flex-wrap items-center justify-between gap-3 border-b border-amber-400/30 bg-amber-500/10 px-4 py-2 text-xs text-amber-100 sm:px-7">
+        <span>
+          {connection === "reconnecting"
+            ? "Reconnecting to the local desk…"
+            : "Connection to the local desk was lost. Views may be stale; in-flight requests must be checked from durable status."}
+        </span>
+        <Button size="sm" variant="secondary" onClick={onReconnect} disabled={connection === "reconnecting"}>
+          Reconnect
+        </Button>
+      </div>
+    );
+  }
+  if (sessionRenewed) {
+    return (
+      <div role="status" className="flex flex-wrap items-center justify-between gap-3 border-b border-sky-400/30 bg-sky-500/10 px-4 py-2 text-xs text-sky-100 sm:px-7">
+        <span>Operator session was renewed. The rejected request was not submitted; review and submit it again.</span>
+        <Button size="sm" variant="ghost" onClick={onDismiss}>
+          Dismiss
+        </Button>
+      </div>
+    );
+  }
+  return null;
 }
 
 export default function App() {

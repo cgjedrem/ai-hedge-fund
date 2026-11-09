@@ -1,4 +1,4 @@
-"""Backtesting: pick a mandate and a window, warm the caches, replay with a live board."""
+"""Legacy backtest picker and retained replay board; new starts are disabled."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from pathlib import Path
 from rich.console import Group
 from rich.table import Table
 from rich.text import Text
-from textual import on, work
+from textual import on
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical, VerticalScroll
@@ -28,8 +28,6 @@ from textual.widgets.option_list import Option
 
 from hedge_fund import paths
 from hedge_fund.backtesting import (
-    backtest_fund,
-    build_schedule,
     DailyValuation,
     FundBacktestResult,
     performance_metrics,
@@ -37,34 +35,43 @@ from hedge_fund.backtesting import (
 from hedge_fund.backtesting.research import last_universe, save_result
 from hedge_fund.brokers import Fill
 from hedge_fund.data import CachedDataClient, make_data_client
-from hedge_fund.fund import discover_funds, Fund, FundSpec, normalize_universe
+from hedge_fund.fund import discover_funds, FundSpec
 from hedge_fund.pipeline import CycleRecord, mark_lookback_start
+from hedge_fund.runtime.defaults import BACKTEST_WEEKS, warm_tasks
 from hedge_fund.scorecard import score
 from hedge_fund.signals import ALPHA_MODEL_REGISTRY, LLMAgent
-from hedge_fund.tui.home import demand_run_keys, HomeScreen
+from hedge_fund.tui.home import HomeScreen
 from hedge_fund.tui.palette import BRIGHT, CYAN, GREEN, MUTED, RED, TEXT
 from hedge_fund.tui.report import cost_line, roster_table, tape_table
 from hedge_fund.tui.scorecard_view import analyst_table, strategy_table
 from hedge_fund.tui.shared import (
     agent_names,
-    BACKTEST_WEEKS,
     DISPLAY_NAMES,
     fund_label,
     render_area_chart,
     UNIVERSE_PRESETS,
-    valid_date,
-    WARM_CHUNK,
 )
 from hedge_fund.tui.widgets import first_selectable, StatTiles
 
+BACKTEST_DISABLED_MESSAGE = "Legacy TUI backtesting is temporarily disabled. Use the authorized " "aihf backtest CLI with an explicit --root and --enable-network, or the " "reviewed web desk. No worker or provider request was started."
+
+
+def _save_admitted(result: FundBacktestResult) -> Path:
+    """Save *result* under research admission for the configured root, the
+    same owner lease plus research lane `aihf backtest` takes. Fails closed
+    when another owner holds the root or it is not enrolled."""
+    from hedge_fund.runtime.admission import AdmissionCoordinator, RootOwnerLease
+
+    root = paths.root_context()
+    owner = RootOwnerLease.acquire(root, timeout=0)
+    try:
+        return save_result(result, admission=AdmissionCoordinator(root, owner_lease=owner))
+    finally:
+        owner.close()
+
 
 class BacktestScreen(Screen):
-    """Pick a mandate → pick a window → warm → replay with a live equity curve.
-
-    Warm-then-replay: threads only warm the disk caches (market data first,
-    then every agent across the whole window); the sequential `backtest_fund`
-    afterward is the source of truth.
-    """
+    """Retained backtest screen; starts require the authorized CLI or web desk."""
 
     BINDINGS = [Binding("escape", "back", "back")]
 
@@ -90,6 +97,7 @@ class BacktestScreen(Screen):
                 yield Static("", id="no-funds", classes="hint")
             with Vertical(id="bt-dates", classes="pane"):
                 yield Label("Time-travel window", classes="q")
+                yield Static(Text(BACKTEST_DISABLED_MESSAGE, style=MUTED), id="bt-disabled", classes="hint")
                 yield Static(Text("tickers to trade", style=MUTED))
                 yield Input(
                     placeholder=f"e.g. {', '.join(UNIVERSE_PRESETS[:5])}",
@@ -191,39 +199,10 @@ class BacktestScreen(Screen):
 
     @on(Input.Submitted, "#end-input")
     def _submit_end(self, event: Input.Submitted) -> None:
-        assert self._spec is not None
-        start = self.query_one("#start-input", Input).value.strip()
-        end = event.value.strip()
-        for value in (start, end):
-            ok = valid_date(value)
-            if ok is not True:
-                self.notify(ok, severity="error")
-                return
-        if end <= start:
-            self.notify(f"End must be after {start}.", severity="error")
-            return
-        try:
-            universe = normalize_universe(
-                self.query_one("#bt-tickers", Input).value.replace(",", " ").split())
-        except ValueError:
-            self.notify("Enter at least one ticker.", severity="error")
-            self.query_one("#bt-tickers", Input).focus()
-            return
-        assert self._spec is not None
-
-        def resume() -> None:
-            if demand_run_keys(self.app, resume):
-                self._begin(start, end, universe)
-        resume()
+        self.notify(BACKTEST_DISABLED_MESSAGE, severity="warning")
 
     def _begin(self, start: str, end: str, universe: list[str]) -> None:
-        assert self._spec is not None
-        self._phase = "run"
-        self.query_one("#bt-panes", ContentSwitcher).current = "bt-run"
-        self.query_one("#phase-line", Static).update(
-            Text("Building the trading grid…", style=MUTED)
-        )
-        self._run(self._spec, start, end, universe)
+        self.notify(BACKTEST_DISABLED_MESSAGE, severity="warning")
 
     @on(OptionList.OptionSelected, "#bt-done-menu")
     def _after_done(self, event: OptionList.OptionSelected) -> None:
@@ -231,38 +210,9 @@ class BacktestScreen(Screen):
         while not isinstance(self.app.screen, HomeScreen):
             self.app.pop_screen()
 
-    # ---- the worker (everything below the UI runs off-thread) -------------
-
-    @work(thread=True, exclusive=True)
     def _run(self, spec: FundSpec, start: str, end: str,
              universe: list[str]) -> None:
-        app = self.app
-        try:
-            with make_data_client() as raw:
-                schedule = build_schedule(CachedDataClient(raw), spec.benchmark, start, end, spec.rebalance)
-            grid = schedule.assessment_dates
-            app.call_from_thread(self._begin_warm, spec, universe, len(grid))
-            self._warm_market(spec, universe, grid)
-            app.call_from_thread(self._begin_agents, spec)
-            self._warm_agents(spec, universe, grid)
-            app.call_from_thread(self._begin_replay, spec, schedule.closes, len(schedule.closes))
-
-            fund = Fund(spec, blind=True)  # same prompts _warm_agents cached
-
-            def tick(i: int, n: int, record: CycleRecord) -> None:
-                app.call_from_thread(self._board_tick, record)
-
-            def valuation(i: int, n: int, value: DailyValuation) -> None:
-                app.call_from_thread(self._board_valuation, value)
-
-            with make_data_client() as raw:
-                result = backtest_fund(fund, start, end, CachedDataClient(raw),
-                                       universe, on_cycle=tick, on_valuation=valuation)
-
-            path = save_result(result)  # where `aihf backtest` saves too; the mandate picker reads it
-            app.call_from_thread(self._finish, result, path)
-        except Exception as exc:  # fail loud, in the UI
-            app.call_from_thread(self._fail, exc)
+        self.notify(BACKTEST_DISABLED_MESSAGE, severity="warning")
 
     def _warm_market(self, spec: FundSpec, universe: list[str],
                      grid: list[str]) -> None:
@@ -273,11 +223,7 @@ class BacktestScreen(Screen):
             issubclass(ALPHA_MODEL_REGISTRY[m.name], LLMAgent)
             for s in spec.strategies for m in s.models
         )
-        chunks = [
-            (ticker, grid[j:j + WARM_CHUNK])
-            for ticker in universe
-            for j in range(0, len(grid), WARM_CHUNK)
-        ]
+        chunks = warm_tasks(universe, grid)
         bar = self.query_one("#warm-progress", ProgressBar)
 
         def prefetch(ticker: str, dates: list[str]) -> None:

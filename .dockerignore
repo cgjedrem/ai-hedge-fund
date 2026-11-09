@@ -21,5 +21,6 @@
 pypa/
 pypoetry/
 hedge_fund/web/static
+hedge_fund/_build_identity.py
 docker-compose.yml
 Dockerfile

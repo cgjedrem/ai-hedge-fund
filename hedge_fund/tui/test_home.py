@@ -3,21 +3,31 @@
 import asyncio
 import os
 import stat
+from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
 from textual.widgets import Input, OptionList, Static
 
+from hedge_fund.runtime import credentials
 from hedge_fund.tui import builder, funds, home, keys, paper
 from hedge_fund.tui.app import HedgeFundApp
 from hedge_fund.tui.fixtures import render
 
 
 @pytest.mark.parametrize("save", [True, False])
-def test_picker_and_masked_key_save_or_cancel(save, isolated_configuration):
+def test_picker_and_masked_key_save_or_cancel(save, isolated_configuration, monkeypatch):
     saved = isolated_configuration
     saved.write_text("# keep this comment\nUNRELATED_KEY=untouched\n")
     original = saved.read_text()
+    original_write_atomic = credentials.write_atomic
+    requested_modes = []
+
+    def record_mode(path, text, **kwargs):
+        requested_modes.append(kwargs.get("mode"))
+        return original_write_atomic(path, text, **kwargs)
+
+    monkeypatch.setattr(credentials, "write_atomic", record_mode)
 
     async def scenario():
         app = HedgeFundApp()
@@ -42,10 +52,13 @@ def test_picker_and_masked_key_save_or_cancel(save, isolated_configuration):
             if save:
                 assert os.environ["TYPESAFE_API_KEY"] == entry.value
                 assert saved.read_text() == original + f"TYPESAFE_API_KEY={entry.value}\n"
-                assert stat.S_IMODE(saved.stat().st_mode) == 0o600
+                assert requested_modes == [stat.S_IRUSR | stat.S_IWUSR]
+                if os.name == "posix":
+                    assert stat.S_IMODE(saved.stat().st_mode) == 0o600
             else:
                 assert "TYPESAFE_API_KEY" not in os.environ
                 assert saved.read_text() == original
+                assert requested_modes == []
 
     asyncio.run(scenario())
 
@@ -124,11 +137,25 @@ def test_credential_precedence(exported, local, expected, isolated_configuration
         (tmp_path / ".env").write_text(f"TYPESAFE_API_KEY={local}\n")
     if exported:
         monkeypatch.setenv("TYPESAFE_API_KEY", exported)
+
+    def fake_load_dotenv(path, override=False):
+        path = tmp_path / Path(path).relative_to(tmp_path)
+        if not path.is_file():
+            return False
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if "=" not in line or line.lstrip().startswith("#"):
+                continue
+            key, value = line.split("=", 1)
+            if override or key not in os.environ:
+                os.environ[key] = value
+        return True
+
+    monkeypatch.setattr(keys, "load_dotenv", fake_load_dotenv)
     keys.apply_credentials()
     assert os.environ["TYPESAFE_API_KEY"] == expected
 
 
-def test_home_offers_paper_trading_first_and_an_empty_paper_screen_builds():
+def test_home_offers_paper_trading_first_and_an_empty_paper_screen_denies_builds(monkeypatch):
     async def scenario():
         app = HedgeFundApp()
         async with app.run_test(size=(100, 35)) as pilot:
@@ -140,9 +167,17 @@ def test_home_offers_paper_trading_first_and_an_empty_paper_screen_builds():
             rail = app.screen.query_one("#paper-menu", OptionList)
             assert [rail.get_option_at_index(i).id for i in range(rail.option_count)] == ["build"]
             assert "No funds yet" in render(app.screen.query_one("#detail-body", Static).content)
-            # h/r/s have nothing to act on; enter still opens the builder.
+            # h/r/s have nothing to act on; enter on the build row is denied
+            # because the TUI holds no deployment admission.
             assert not app.screen.check_action("halt", ()) and not app.screen.check_action("sessions", ())
+            paper_screen = app.screen
+            notified: list[str] = []
+            monkeypatch.setattr(paper_screen, "notify", lambda message, **_kwargs: notified.append(message))
             await pilot.press("enter")
+            await pilot.pause()
+            assert app.screen is paper_screen
+            assert notified == ["TUI paper writes are disabled on enrolled roots; use the web desk."]
+            await app.push_screen(builder.BuilderScreen(mode="paper"))
             assert isinstance(app.screen, builder.BuilderScreen) and app.screen.mode == "paper"
             assert "BUILD A FUND" in render(app.screen.query_one(".rail-title", Static).content)
             assert app.screen.STEP_IDS[-1] == "step-tickers"
@@ -153,4 +188,5 @@ def test_home_offers_paper_trading_first_and_an_empty_paper_screen_builds():
             menu.highlighted = menu.get_option_index("backtest")
             await pilot.press("enter")
             assert isinstance(app.screen, funds.FundSelectScreen)
+
     asyncio.run(scenario())

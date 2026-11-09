@@ -1,15 +1,18 @@
 import asyncio
 
-from textual.widgets import ContentSwitcher, Input, OptionList, SelectionList, Static
+from textual.widgets import ContentSwitcher, Input, OptionList, SelectionList
 
 from hedge_fund import paths
-from hedge_fund.paper import load_deployed
 from hedge_fund.tui import builder
 from hedge_fund.tui.app import HedgeFundApp
-from hedge_fund.tui.fixtures import render
 
 
-def test_builder_blocks_daily_saxo_and_deploys_minute_saxo():
+def test_builder_blocks_daily_saxo_and_denies_the_minute_saxo_build(monkeypatch):
+    """Daily Saxo is refused at the broker step; minute Saxo is accepted there,
+    but the TUI holds no deployment admission, so the final step is denied and
+    nothing is written."""
+    notices: list[str] = []
+
     async def scenario():
         app = HedgeFundApp()
         async with app.run_test(size=(120, 45)) as pilot:
@@ -48,12 +51,18 @@ def test_builder_blocks_daily_saxo_and_deploys_minute_saxo():
             broker_options = screen.query_one("#broker-list", OptionList)
             broker_options.highlighted = 1
             await pilot.press("enter")
-            assert screen.query_one("#panes", ContentSwitcher).current == "step-tickers"
-            screen.query_one("#tickers-input", Input).value = "AAPL"
+            assert screen.query_one("#panes", ContentSwitcher).current == "step-saxo-account"
+            screen.query_one("#saxo-account-input", Input).value = "sim-account-1"
             await pilot.press("enter")
-            deployed = load_deployed(paths.PAPER_DIR / "saxo-choice")
-            assert deployed.broker == "saxo" and deployed.spec.broker == "saxo"
-            assert not (paths.PAPER_DIR / "saxo-choice" / "broker.json").exists()
-            assert "broker: saxo" in render(screen.query_one("#done-summary", Static).content)
+            assert screen.query_one("#panes", ContentSwitcher).current == "step-tickers"
+            assert screen._state["broker"] == "saxo"
+            screen.query_one("#tickers-input", Input).value = "AAPL"
+            monkeypatch.setattr(screen, "notify", lambda message, **_kwargs: notices.append(message))
+            await pilot.press("enter")
+            await pilot.pause()
+            assert screen.query_one("#panes", ContentSwitcher).current == "step-tickers"
+            assert notices == ["TUI paper writes are disabled on enrolled roots; use the web desk."]
+            assert not (paths.PAPER_DIR / "saxo-choice").exists()
+            assert not (paths.MANDATES_DIR / "saxo-choice.yaml").exists()
 
     asyncio.run(scenario())

@@ -34,9 +34,9 @@ session, broker, data, universe)`, called once per completed session:
   simulated broker. Produces an equity curve against your benchmark and a
   `SessionRecord` for every session.
 - **Paper** — a *deployed* fund: the mandate snapshotted into
-  `~/.hedge-fund/paper/<name>/` with a universe, a broker book and an
-  append-only, hash-chained ledger. `aihf paper tick` replays the ledger
-  into state and advances exactly the next unrecorded session.
+  the selected root's `paper/<name>/` with a universe, broker book and
+  append-only, hash-chained ledger. `aihf --root "$AIHF_ROOT" paper tick`
+  replays the ledger and advances the next unrecorded session.
 
 Same code path, so the backtest is honest by construction: stepping a paper
 fund through the same sessions produces byte-identical records. A decision
@@ -45,65 +45,74 @@ made at session T's close is executed at T+1's close, in both modes.
 ## Quickstart
 
 ```bash
-poetry install                          # dependencies
+poetry install                          # dependencies and default data provider
+export AIHF_ROOT="$HOME/.aihf-data"
+mkdir -p "$AIHF_ROOT"
 
-# .env needs (at repo root):
-#   FINANCIAL_DATASETS_API_KEY=...      # market/fundamentals data
-#   ANTHROPIC_API_KEY=...               # only for LLM agents (Buffett)
+# Optional non-secret settings may live in the selected root's .env.
+# Never commit provider credentials.
 ```
 
-### Data provider: paid vs free
+### Market data
 
-Market data comes from one of two providers, chosen with
-`HEDGE_FUND_DATA_PROVIDER` (default `fd`):
-
-- **`fd`** — [Financial Datasets](https://financialdatasets.ai), the paid
-  default. Point-in-time fundamentals (filtered on SEC filing dates), so
-  backtests are safe to validate against.
-- **`yfinance`** — free Yahoo Finance via the optional `yfinance` package
-  (`poetry install -E yfinance`). No API key, no credits — use it for
-  day-to-day paper trading and iteration so you don't burn Financial
-  Datasets credits.
-
-  **Caveat:** Yahoo serves fundamentals *as reported now*, not as filed by
-  a date — `get_financial_metrics` is therefore **not point-in-time**, and
-  a backtest on it leaks the future into the past. Run final backtest
-  validation with `HEDGE_FUND_DATA_PROVIDER=fd`; treat yfinance results as
-  iteration signal only.
+Credential-free Yahoo Finance is the default. Install the `yfinance` extra:
 
 ```bash
-poetry install -E yfinance                 # one-time, for the free provider
-HEDGE_FUND_DATA_PROVIDER=yfinance poetry run aihf
+poetry install
 ```
 
+Financial Datasets is an explicit paid provider selected with
+`HEDGE_FUND_DATA_PROVIDER=fd`; selection or saved credentials do not authorize
+dispatch. CLI provider calls require `--enable-network`. A paid CLI one-shot
+also needs explicit provider approval, finite call/cost limits, and a deadline.
+Financial Datasets also needs `--confirm-fd-self-service-pricing`; public
+self-service pricing only, custom Enterprise rates unsupported. Scheduled
+paper operations permit only free data and local models. Yahoo
+fundamentals are reported as of now, not point-in-time; Yahoo backtests can
+leak future data.
+
+Verified paid dispatch covers Financial Datasets self-service data and
+TypeSafe Jev 1.13.0 model calls. Other cloud-model providers lack verified cost
+bounds and fail closed before transport, even when a key is saved.
+Only one paid provider can be authorized per operation; combining paid
+Financial Datasets with TypeSafe in one action is unsupported.
+
 ```bash
-# THE command. No arguments: launch the interactive app (a Textual TUI).
+# No subcommand: launch the interactive app (a Textual TUI; provider dispatch disabled).
 # Two modes: paper trading (your funds — review each run, approve/reject gated
 # decisions with y/n, see history, halt/resume, build a new fund) and
 # backtesting (replay a fund over history).
-poetry run aihf       # or, equivalently: python -m hedge_fund.tui
+poetry run aihf --root "$AIHF_ROOT"
 
 # Backtest a mandate over a window: `advance` looped over every benchmark
 # session, full result JSON (every SessionRecord) on stdout, a copy saved to
-# ~/.hedge-fund/research/. A mandate carries no tickers — --universe says
-# what to point it at.
-poetry run aihf backtest ~/.hedge-fund/mandates/example.yaml \
+# the selected root's research/. A mandate carries no tickers — --universe says
+# what to point it at. Network authority is invocation-local.
+poetry run aihf --root "$AIHF_ROOT" --enable-network backtest "$AIHF_ROOT/mandates/example.yaml" \
     --universe AAPL,MSFT,NVDA --start 2024-01-02 --end 2024-06-28
 
+# Financial Datasets: each run needs deliberate provider, tier, call, cost,
+# and deadline approval. Save the key under Settings > Provider credentials
+# for this root; never put it on the command line.
+HEDGE_FUND_DATA_PROVIDER=fd poetry run aihf --root "$AIHF_ROOT" --enable-network \
+    backtest "$AIHF_ROOT/mandates/example.yaml" --universe AAPL,MSFT \
+    --start 2024-01-02 --end 2024-06-28 --authorize-paid-provider fd \
+    --confirm-fd-self-service-pricing --paid-max-calls 100 \
+    --paid-max-cost-usd 16 --paid-max-attempt-cost-usd 0.16
+
 # Paper trade: deploy the mandate, then advance it one session per tick.
-# tick is idempotent and never skips a session — a scheduler can call it
-# after every close, and a week away takes a week of ticks to catch up.
-poetry run aihf paper create alpha --mandate ~/.hedge-fund/mandates/example.yaml --universe AAPL,MSFT
-poetry run aihf paper tick alpha
-poetry run aihf paper tick alpha --again   # redo the latest session; the old record moves to ledger/superseded/
+# tick is idempotent and never skips a session. Scheduled ticks use free data
+# and local models only; each invocation needs explicit network enablement.
+poetry run aihf --root "$AIHF_ROOT" paper create alpha --mandate "$AIHF_ROOT/mandates/example.yaml" --universe AAPL,MSFT
+poetry run aihf --root "$AIHF_ROOT" --enable-network paper tick alpha
+poetry run aihf --root "$AIHF_ROOT" --enable-network paper tick alpha --again   # redo the latest session; the old record moves to ledger/superseded/
 # Override cadence at deployment without editing the mandate:
-poetry run aihf paper create fast --mandate ~/.hedge-fund/mandates/example.yaml --universe AAPL,MSFT --rebalance minute
-poetry run aihf paper run fast             # a minute fund (`rebalance: minute`): stays up, one bar per interval
-poetry run aihf paper stop fast            #   ...and stops it after the bar in flight
-poetry run aihf paper status alpha
-poetry run aihf paper list
-poetry run aihf paper halt alpha --reason "..."     # the kill switch
-poetry run aihf paper resume alpha
+poetry run aihf --root "$AIHF_ROOT" paper create fast --mandate "$AIHF_ROOT/mandates/example.yaml" --universe AAPL,MSFT --rebalance minute
+poetry run aihf --root "$AIHF_ROOT" --enable-network paper tick fast
+poetry run aihf --root "$AIHF_ROOT" paper status alpha
+poetry run aihf --root "$AIHF_ROOT" paper list
+poetry run aihf --root "$AIHF_ROOT" paper halt alpha --reason "..."     # the kill switch
+poetry run aihf --root "$AIHF_ROOT" paper resume alpha
 
 # Tests
 poetry run pytest hedge_fund/
@@ -116,12 +125,12 @@ The gate defaults off, preserving automatic execution. Set
 `--approval` to `paper create`. The setting is frozen into the deployed fund.
 
 ```bash
-poetry run aihf paper create gated --mandate ~/.hedge-fund/mandates/example.yaml \
+poetry run aihf --root "$AIHF_ROOT" paper create gated --mandate "$AIHF_ROOT/mandates/example.yaml" \
     --universe AAPL,MSFT --approval
 # After a decision is pending:
-poetry run aihf paper approve gated
-poetry run aihf paper approve gated --now   # runs now if a session is due
-poetry run aihf paper reject gated
+poetry run aihf --root "$AIHF_ROOT" paper approve gated
+poetry run aihf --root "$AIHF_ROOT" paper approve gated --now   # runs now if a session is due
+poetry run aihf --root "$AIHF_ROOT" paper reject gated
 ```
 
 In the paper fund screen, `y` approves and `n` rejects while a gated decision
@@ -130,10 +139,10 @@ skips execution; missing/stale verdicts record `expire`. The book is marked,
 the decision lapses, and the fund keeps running. `halt`/`resume` remain an
 independent kill switch.
 
-All API responses cache to disk (`~/.hedge-fund/cache/`), so reruns are fast,
+All API responses cache to disk in the selected root's `cache/`, so reruns are fast,
 free, and work offline once warmed.
 
-### What lives where (`~/.hedge-fund/`)
+### What lives where (selected data root)
 
 ```
 mandates/<name>.yaml            a mandate: strategies, staff, risk, capital, cadence

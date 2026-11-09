@@ -20,6 +20,7 @@ from hedge_fund.data.bars import is_intraday
 from hedge_fund.llm import ThesisStream
 from hedge_fund.models import Signal
 from hedge_fund.pipeline import CycleRecord, DecisionRecord, SessionRecord
+from hedge_fund.reporting.console import cost_line, session_headline  # noqa: F401
 from hedge_fund.tui.palette import BRIGHT, CYAN, GREEN, MUTED, RED, TEXT
 from hedge_fund.tui.shared import DISPLAY_NAMES, SHORT_NAMES
 
@@ -361,21 +362,6 @@ def book_summary(record: CycleRecord | SessionRecord) -> Text:
     return summary
 
 
-def session_headline(name: str, record: SessionRecord) -> Text:
-    """The report header for one session: what happened at this close."""
-    facts = [f"session {record.session}"]
-    if record.executed is not None:
-        x = record.executed
-        refreshed = x.refreshed_assessment.as_of if x.refreshed_assessment else x.as_of
-        facts.append(f"executed the {x.as_of} decision (refreshed {refreshed})")
-    if record.decision is not None:
-        n_signals = sum(len(sr.signals) for sr in record.decision.strategies)
-        facts.append(f"decided · {n_signals} signals · executes next session")
-    if record.executed is None and record.decision is None:
-        facts.append("valuation only")
-    return Text.assemble((name, f"bold {BRIGHT}"), ("  ·  " + "  ·  ".join(facts), MUTED))
-
-
 def session_row(record: SessionRecord, prev_nav: float, *, time_only: bool = False) -> Text:
     """One session in the fund's history rail: date, day change, what happened.
     *time_only* shows a bar as its clock time, for a list already grouped by day."""
@@ -433,15 +419,6 @@ def session_overview(record: SessionRecord) -> Group:
         parts.append(Text(""))
     parts.append(Text("enter for the full report", style=MUTED))
     return Group(*parts)
-
-
-def cost_line(trading_cost: float, traded_notional: float) -> str:
-    """What the fills cost, as a fraction of what was traded: the number a
-    desk compares against its alpha. Shared by the backtest header and CLI."""
-    if traded_notional == 0:
-        return "no trades"
-    bps = trading_cost / traded_notional * 10_000
-    return f"costs ${trading_cost:,.0f} · {bps:.1f} bps of ${traded_notional:,.0f} traded"
 
 
 def tape_table(tape: list[tuple[str, Fill, float]]) -> Table:

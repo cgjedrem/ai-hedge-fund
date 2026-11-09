@@ -1,11 +1,12 @@
-"""run — the loop a paper fund lives in when nobody is watching.
+"""Legacy unattended runner algorithms; public process entrypoints deny use.
 
-    aihf paper run <name>
+    aihf --root <root> paper run <name>  # disabled
 
-Any fund can be advanced a session at a time by hand (the app, `aihf paper
-tick`). This loop does the same thing unattended: it sleeps until the fund's
-next session is due, advances it through `_run` (the path a tick takes),
-and goes back to sleep. The cadence decides what "due" means.
+The web-owned runner permits free data and local models only. Paid dispatch is
+one-shot and never runner authorization.
+
+The internal loop advances through `_run` at each due session. The cadence
+defines "due".
 
 A daily fund's session is a completed close, which under the engine's rule
 is any date before today in New York. The loop wakes just after midnight,
@@ -71,14 +72,9 @@ def run(
     now: Callable[[], datetime] | None = None,
     sleep: Callable[[float], None] | None = None,
 ) -> None:
-    """Advance the fund in *directory* session by session until *stop* is set.
-
-    *now* and *sleep* are the clock and the wait; tests inject both. The
-    default wait is `stop.wait`, so a stop lands within the second. Raises
-    FundHalted when the kill switch is set (on start, or after a session
-    fails).
-    """
+    """Disabled legacy unattended loop."""
     directory = Path(directory)
+    _require_legacy_unenrolled(directory)
     deployed = load_deployed(directory)
     stop = stop or threading.Event()
     now = now or (lambda: datetime.now(NEW_YORK))
@@ -212,9 +208,9 @@ def serve(
     on_record: Callable[[SessionRecord], None] | None = None,
     on_event: Callable[[str, dict], None] | None = None,
 ) -> None:
-    """`run` as a process: one per fund, found by its pid file, stopped by
-    SIGTERM or SIGINT after the bar in flight. Refuses to start twice."""
+    """Disabled legacy runner process entrypoint."""
     directory = Path(directory)
+    _require_legacy_unenrolled(directory)
     # A pid file naming this very process is a stale incarnation: its writer
     # is dead and its pid was reused by us (pid 1 across container restarts).
     if is_running(directory) and _read_pid(directory) != os.getpid():
@@ -231,11 +227,37 @@ def serve(
             (directory / PID_FILE).unlink(missing_ok=True)
 
 
+def _windows_pid_alive(pid: int) -> bool:
+    # os.kill(pid, 0) is CTRL_C_EVENT on Windows and is broadcast to the whole
+    # console, interrupting unrelated processes; query the process instead.
+    import ctypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.GetExitCodeProcess.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong)]
+    kernel32.GetExitCodeProcess.restype = ctypes.c_int
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = ctypes.c_int
+    handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not handle:
+        return ctypes.get_last_error() == 5  # ERROR_ACCESS_DENIED: exists, not ours
+    try:
+        code = ctypes.c_ulong()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+            return True
+        return code.value == 259  # STILL_ACTIVE
+    finally:
+        kernel32.CloseHandle(handle)
+
+
 def is_running(directory: str | Path) -> bool:
-    """Whether a runner holds this fund: its pid file names a live process."""
+    """Whether a legacy runner PID file names a live process."""
     pid = _read_pid(directory)
-    if pid is None:
+    if pid is None or pid <= 0:
         return False
+    if sys.platform == "win32":
+        return _windows_pid_alive(pid)
     try:
         os.kill(pid, 0)
     except PermissionError:
@@ -248,6 +270,7 @@ def is_running(directory: str | Path) -> bool:
 
 def stop_runner(directory: str | Path) -> bool:
     """Ask the fund's runner to stop after its current bar. False if none."""
+    _require_legacy_unenrolled(Path(directory))
     pid = _read_pid(directory)
     if pid is None or not is_running(directory):
         return False
@@ -258,14 +281,28 @@ def stop_runner(directory: str | Path) -> bool:
 _RUNNER_LOG = "runner.log"  # where a runner started from the app writes its console
 
 
-def spawn_runner(directory: Path) -> int:
-    """Start `aihf paper run <name>` as its own session so it survives the
-    app closing; its console goes to runner.log in the fund directory. The
-    runner writes runner.pid itself once it is up. Returns the child's pid."""
+def spawn_runner(directory: Path, *, root: Path) -> int:
+    """Disabled legacy detached runner launch."""
+    if not isinstance(directory, Path) or not isinstance(root, Path):
+        raise TypeError("runner directory and root must be paths")
+    if not directory.is_absolute() or not root.is_absolute():
+        raise ValueError("runner directory and root must be absolute")
+    if directory.parent != root / "paper":
+        raise ValueError("runner directory is outside the configured root")
+    _require_legacy_unenrolled(directory)
     log = (directory / _RUNNER_LOG).open("a")
     with log:
         child = subprocess.Popen(
-            [sys.executable, "-m", "hedge_fund.run", "paper", "run", directory.name],
+            [
+                sys.executable,
+                "-m",
+                "hedge_fund.run",
+                "--root",
+                str(root),
+                "paper",
+                "run",
+                directory.name,
+            ],
             stdin=subprocess.DEVNULL,
             stdout=log,
             stderr=subprocess.STDOUT,
@@ -273,6 +310,10 @@ def spawn_runner(directory: Path) -> int:
             cwd=str(directory),
         )
     return child.pid
+
+
+def _require_legacy_unenrolled(_directory: Path) -> None:
+    raise RuntimeError("Legacy paper runner is disabled; unattended starts and stops are unsupported.")
 
 
 def _read_pid(directory: str | Path) -> int | None:

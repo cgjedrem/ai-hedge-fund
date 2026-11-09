@@ -52,7 +52,7 @@ export function HomePage() {
       <PageHeader
         eyebrow="Desk overview · local workspace"
         title="Research with a clear view of risk."
-        description="Inspect canonical mandates, paper ledgers, and saved research. This desk does not execute orders or fetch live quotes."
+        description="Inspect canonical mandates, paper ledgers, and saved research. No orders; quote refresh requires an explicit network-authorized action."
         actions={
           <>
             <Button asChild variant="secondary">
@@ -68,7 +68,7 @@ export function HomePage() {
       />
 
       {resource.loading ? <div className="mb-6 h-24 animate-pulse rounded-xl border border-border bg-white/[0.025]" /> : null}
-      {resource.error ? <div className="mb-6"><ErrorState message={resource.error} /></div> : null}
+      {resource.error ? <div className="mb-6"><ErrorState message={resource.error} error={resource.apiError} onRetry={resource.refresh} /></div> : null}
 
       {data ? (
         <>

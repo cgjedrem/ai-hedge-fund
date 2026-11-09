@@ -19,22 +19,28 @@ import os
 import re
 import time
 from collections.abc import Callable
-from datetime import datetime, timezone
-from email.utils import parsedate_to_datetime
 from typing import Protocol, runtime_checkable
+from urllib.parse import urlsplit
 
-import requests
+import httpx
 
 from hedge_fund.llm import contract
 from hedge_fund.llm.registry import (
-    KEYLESS_PROVIDERS,
-    env_var_for,
     is_supported,
+    KEYLESS_PROVIDERS,
     provider_for,
     SUPPORTED_PROVIDERS,
 )
+from hedge_fund.runtime.dispatch import (
+    blocked_async_httpx_client,
+    DenyingAsyncHTTPTransport,
+    ProviderDispatch,
+)
+from hedge_fund.runtime.endpoints import provider_base_url, validate_provider_target
+from hedge_fund.runtime.policy import AuthorizationDenied, ProviderTarget
 
-DEFAULT_MODEL = "claude-opus-5-5"
+DEFAULT_MODEL = "gemma3:4b"
+_GUARDED_PROVIDERS = frozenset({"deepseek", "kimi", "ollama", "openai", "typesafe", "xai"})
 
 # Called with each piece of text as it arrives. None means don't stream.
 TokenListener = Callable[[str], None] | None
@@ -66,7 +72,8 @@ class LLMClient(Protocol):
 
     model: str
 
-    def complete(self, system: str, user: str) -> str: ...
+    def complete(self, system: str, user: str) -> str:
+        ...
 
 
 class ChatLLM:
@@ -82,33 +89,53 @@ class ChatLLM:
     the prompt cache, and the parse are untouched by it.
     """
 
-    def __init__(self, model: str, chat, on_token: TokenListener = None) -> None:
+    def __init__(
+        self,
+        model: str,
+        chat,
+        on_token: TokenListener = None,
+        *,
+        dispatch: ProviderDispatch,
+        target: ProviderTarget,
+    ) -> None:
+        if not isinstance(dispatch, ProviderDispatch) or not isinstance(target, ProviderTarget):
+            raise AuthorizationDenied("provider operation authorization is required")
+        dispatch.validate_target(target)
         self.model = model
         self._chat = chat
         self._on_token = on_token
+        self._dispatch = dispatch
+        self._target = target
         self._no_think_chat = None
 
     def complete(self, system: str, user: str) -> str:
         messages = [("system", system), ("human", user)]
-        text = self._generate(self._chat, messages)
-        if text.strip() or not hasattr(self._chat, "reasoning"):
-            return text
-        # Reasoning models whose think-tags Ollama's parser does not recognize
-        # (kimi-k3's <|open|>/<|sep|>/<|close|>) leave content empty with the
-        # whole answer in the thinking field. One retry with thinking off puts
-        # the answer in content; trailing template tokens are harmless because
-        # extract_json() takes the first balanced JSON object.
-        if self._no_think_chat is None:
-            self._no_think_chat = self._chat.model_copy(update={"reasoning": False})
-        return self._generate(self._no_think_chat, messages)
+        with self._dispatch.invocation(self._target):
+            text = self._generate(self._chat, messages)
+            if text.strip() or not hasattr(self._chat, "reasoning"):
+                return text
+            if self._no_think_chat is None:
+                self._no_think_chat = self._chat.model_copy(update={"reasoning": False})
+            return self._generate(self._no_think_chat, messages)
 
     def _generate(self, chat, messages) -> str:
+        try:
+            return self._generate_unchecked(chat, messages)
+        except AuthorizationDenied:
+            raise
+        except Exception as exc:
+            cause = exc
+            seen: set[int] = set()
+            while cause is not None and id(cause) not in seen:
+                if isinstance(cause, AuthorizationDenied):
+                    raise cause from None
+                seen.add(id(cause))
+                cause = cause.__cause__ or cause.__context__
+            raise LLMCallError("LLM provider request failed") from None
+
+    def _generate_unchecked(self, chat, messages) -> str:
         if self._on_token is None:
             return _flatten(chat.invoke(messages).content)
-
-        # Streaming chunks concatenate into the response, so they flatten
-        # without a separator — the "\n" that joins whole-message blocks would
-        # land mid-word here.
         parts: list[str] = []
         for chunk in chat.stream(messages):
             text = _flatten(chunk.content, sep="")
@@ -127,16 +154,31 @@ class JevLLM:
     """
 
     ENDPOINT = "https://api.typesafe.ai/v1/systemone"
-    _RETRY_STATUSES = frozenset({429, 500, 502, 503, 504, 529})
 
-    def __init__(self, api_key: str, model: str = "jev-1.13.0", timeout: float = 60.0) -> None:
+    def __init__(
+        self,
+        api_key: str,
+        model: str = "jev-1.13.0",
+        timeout: float = 60.0,
+        *,
+        dispatch: ProviderDispatch | None = None,
+        target: ProviderTarget | None = None,
+    ) -> None:
         if not isinstance(api_key, str) or not api_key.strip():
             raise ValueError("A non-empty TypeSafe API key is required")
         if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0:
             raise ValueError("timeout must be a positive finite number")
+        if dispatch is None or not isinstance(dispatch, ProviderDispatch) or not isinstance(target, ProviderTarget):
+            raise AuthorizationDenied("TypeSafe operation authorization is required")
+        if target.kind != "llm" or target.provider != "typesafe" or target.model != model:
+            raise AuthorizationDenied("TypeSafe model does not match provider authorization")
+        dispatch.validate_target(target)
         self.model = model
         self._api_key = api_key
         self._timeout = timeout
+        self._dispatch = dispatch
+        self._target = target
+        self._http_client = dispatch.httpx_client(target, timeout=timeout)
 
     def cache_key(self, agent: str, system: str, user: str) -> str:
         """Hash semantic inputs only; do not disturb legacy prompt keys."""
@@ -168,45 +210,37 @@ class JevLLM:
             # credentials. Diagnostics intentionally omit all HTTP headers.
             raise LLMCallError(message, self._redact(diagnostics)) from None
 
-        for attempt in range(1, 3):
-            diagnostics["attempt_count"] = attempt
-            try:
-                with requests.post(
+        diagnostics["attempt_count"] = 1
+        try:
+            with self._dispatch.invocation(self._target):
+                response = self._http_client.post(
                     self.ENDPOINT,
                     json=request,
                     headers={"Authorization": f"Bearer {self._api_key}"},
                     timeout=self._timeout,
-                    allow_redirects=False,
-                ) as response:
-                    status = response.status_code
-                    raw = response.text
-                    retry_after = response.headers.get("Retry-After")
-            except requests.RequestException:
-                fail("transport", "TypeSafe request failed during transport")
+                )
+                status = response.status_code
+                raw = response.text
+        except AuthorizationDenied:
+            raise
+        except httpx.RequestError:
+            fail("transport", "TypeSafe request failed during transport")
 
-            diagnostics.update(status_code=status, raw_response=raw)
-            if status in self._RETRY_STATUSES and attempt == 1:
-                delay = _retry_delay(retry_after)
-                if delay > self._timeout:
-                    fail("http", f"TypeSafe HTTP {status}: retry delay exceeds timeout")
-                time.sleep(delay)
-                continue
-            if not 200 <= status < 300:
-                fail("http", f"TypeSafe returned HTTP {status}")
-            try:
-                native_response = json.loads(raw)
-            except ValueError:
-                fail("json_decode", "TypeSafe returned invalid JSON")
-            try:
-                payload, metadata = contract.normalize_jev_response(native_response)
-            except contract.JevContractError as exc:
-                fail("contract", f"TypeSafe response failed validation: {exc}")
+        diagnostics.update(status_code=status, raw_response=raw)
+        if not 200 <= status < 300:
+            fail("http", f"TypeSafe returned HTTP {status}")
+        try:
+            native_response = json.loads(raw)
+        except ValueError:
+            fail("json_decode", "TypeSafe returned invalid JSON")
+        try:
+            payload, metadata = contract.normalize_jev_response(native_response)
+        except contract.JevContractError as exc:
+            fail("contract", f"TypeSafe response failed validation: {exc}")
 
-            metadata.update(diagnostics, elapsed_seconds=time.monotonic() - started)
-            payload["provider_metadata"] = {"jev": self._redact(metadata)}
-            return json.dumps(payload)
-
-        raise AssertionError("unreachable: every attempt returns, retries, or raises")
+        metadata.update(diagnostics, elapsed_seconds=time.monotonic() - started)
+        payload["provider_metadata"] = {"jev": self._redact(metadata)}
+        return json.dumps(payload)
 
     def _redact(self, value):
         """Protect against a service echoing the API key in an error body."""
@@ -219,111 +253,186 @@ class JevLLM:
         return value
 
 
-def _retry_delay(header: str | None) -> float:
-    """One-second backoff, honoring valid delta-seconds and HTTP-date values."""
-    if header is not None:
-        try:
-            seconds = float(header)
-        except ValueError:
-            try:
-                retry_at = parsedate_to_datetime(header)
-                if retry_at.tzinfo is None:
-                    retry_at = retry_at.replace(tzinfo=timezone.utc)
-                seconds = (retry_at - datetime.now(timezone.utc)).total_seconds()
-            except (ValueError, TypeError, OverflowError):
-                return 1.0
-        if math.isfinite(seconds):
-            return max(1.0, seconds)
-    return 1.0
-
-
 def make_llm(
     model: str | None = None,
     timeout: float = 60.0,
     max_tokens: int = 4096,
     on_token: TokenListener = None,
     temperature: float | None = None,
+    top_p: float | None = None,
+    context_size: int | None = None,
+    *,
+    api_key: str | None = None,
+    endpoint: str | None = None,
+    use_environment: bool = True,
+    dispatch: ProviderDispatch | None = None,
 ) -> LLMClient:
-    """Build the client for a model id, routed by the registry's provider.
-
-    The id comes from the caller, else HEDGE_FUND_LLM_MODEL, else DEFAULT_MODEL — the
-    same seam the TUI's picker writes to. Raises with the name of the missing
-    environment variable, because that is the only thing the user can act on.
-
-    `temperature` (0 = deterministic, up to 2 = creative) is passed to chat
-    providers' constructors; None keeps each provider's default. TypeSafe's
-    typed judgments have no sampling, so it is ignored there.
-    """
-    model = model or os.environ.get("HEDGE_FUND_LLM_MODEL") or DEFAULT_MODEL
+    """Build guarded client; environment resolves only the default model."""
+    if type(use_environment) is not bool:
+        raise ValueError("environment policy is invalid")
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or not 0 < timeout <= 300:
+        raise ValueError("timeout is invalid")
+    if type(max_tokens) is not int or not 1 <= max_tokens <= 131072:
+        raise ValueError("max tokens is invalid")
+    if model is not None and (not isinstance(model, str) or not model or model != model.strip() or any(ord(char) < 32 or ord(char) == 127 for char in model)):
+        raise ValueError("model is invalid")
+    if temperature is not None and (isinstance(temperature, bool) or not isinstance(temperature, (int, float)) or not math.isfinite(temperature) or not 0 <= temperature <= 2):
+        raise ValueError("temperature is invalid")
+    if top_p is not None and (isinstance(top_p, bool) or not isinstance(top_p, (int, float)) or not math.isfinite(top_p) or not 0 <= top_p <= 1):
+        raise ValueError("top-p is invalid")
+    if context_size is not None and (type(context_size) is not int or not 256 <= context_size <= 131072):
+        raise ValueError("context size is invalid")
+    if endpoint is not None:
+        if not isinstance(endpoint, str) or not endpoint or endpoint != endpoint.strip():
+            raise ValueError("endpoint is invalid")
+        try:
+            parts = urlsplit(endpoint)
+            port = parts.port
+        except ValueError:
+            raise ValueError("endpoint is invalid") from None
+        if parts.scheme not in {"http", "https"} or not parts.hostname or parts.username is not None or parts.password is not None or parts.query or parts.fragment or (port is not None and not 1 <= port <= 65535):
+            raise ValueError("endpoint is invalid")
+    model = model or (os.environ.get("HEDGE_FUND_LLM_MODEL") if use_environment else None) or DEFAULT_MODEL
     provider = provider_for(model)
     if provider is None:
-        # Unlisted ids still work: a model newer than the registry should not
-        # need a code change. Anthropic is the default transport.
-        provider = "Anthropic"
+        raise AuthorizationDenied("LLM model provider is unknown")
     if not is_supported(provider):
-        raise ValueError(
-            f"No v2 client for {provider} (model {model}). "
-            f"Supported: {', '.join(sorted(SUPPORTED_PROVIDERS))}."
-        )
+        raise ValueError(f"No v2 client for {provider} (model {model}). " f"Supported: {', '.join(sorted(SUPPORTED_PROVIDERS))}.")
+    target = ProviderTarget(
+        kind="llm",
+        provider=provider.casefold(),
+        model=model,
+        endpoint=endpoint,
+    )
+    validate_llm_transport(target)
+    if not isinstance(dispatch, ProviderDispatch):
+        raise AuthorizationDenied("provider operation authorization is required")
+    dispatch.validate_target(target)
+    if context_size is not None and (provider != "Ollama" or model.casefold().endswith(":cloud")):
+        raise ValueError("context size is supported only by local Ollama.")
 
-    api_key = _require_key(provider)
+    if api_key is None:
+        if provider in KEYLESS_PROVIDERS:
+            api_key = ""
+        else:
+            raise AuthorizationDenied("captured provider credential is required")
+    elif not isinstance(api_key, str) or (provider not in KEYLESS_PROVIDERS and not api_key.strip()) or any(ord(char) < 32 or ord(char) == 127 for char in api_key):
+        raise ValueError("Provider credential is invalid.")
 
     # Only hand providers a temperature when one was asked for: several
     # constructors (Google's pydantic model among them) reject an explicit
     # None, and omitting it keeps each provider's own default.
-    temp = {"temperature": temperature} if temperature is not None else {}
+    sampling = {"temperature": temperature} if temperature is not None else {}
+    if top_p is not None:
+        sampling["top_p"] = top_p
 
     if provider == "TypeSafe":
         # Typed judgments have no generated tokens or output-token budget.
-        return JevLLM(api_key=api_key, model=model, timeout=timeout)
+        return JevLLM(
+            api_key=api_key,
+            model=model,
+            timeout=timeout,
+            dispatch=dispatch,
+            target=target,
+        )
 
-    if provider == "Anthropic":
-        from langchain_anthropic import ChatAnthropic
-        chat = ChatAnthropic(model=model, api_key=api_key, timeout=timeout,
-                             max_retries=1, max_tokens=max_tokens, **temp)
-    elif provider == "OpenAI":
+    if provider == "OpenAI":
         from langchain_openai import ChatOpenAI
-        chat = ChatOpenAI(model=model, api_key=api_key, timeout=timeout,
-                          max_retries=1, base_url=os.getenv("OPENAI_API_BASE"),
-                          **temp)
+
+        chat = ChatOpenAI(
+            model=model,
+            api_key=api_key,
+            timeout=timeout,
+            max_retries=0,
+            max_tokens=max_tokens,
+            base_url=provider_base_url(target),
+            http_client=dispatch.httpx_client(target, timeout=timeout),
+            http_async_client=blocked_async_httpx_client(timeout=timeout),
+            **sampling,
+        )
     elif provider == "DeepSeek":
         from langchain_deepseek import ChatDeepSeek
-        chat = ChatDeepSeek(model=model, api_key=api_key, timeout=timeout,
-                            max_retries=1, **temp)
-    elif provider == "Google":
-        from langchain_google_genai import ChatGoogleGenerativeAI
-        chat = ChatGoogleGenerativeAI(model=model, api_key=api_key,
-                                      timeout=timeout, max_retries=1, **temp)
+
+        chat = ChatDeepSeek(
+            model=model,
+            api_key=api_key,
+            timeout=timeout,
+            max_retries=0,
+            max_tokens=max_tokens,
+            base_url=provider_base_url(target),
+            http_client=dispatch.httpx_client(target, timeout=timeout),
+            http_async_client=blocked_async_httpx_client(timeout=timeout),
+            **sampling,
+        )
     elif provider == "xAI":
         from langchain_xai import ChatXAI
-        chat = ChatXAI(model=model, api_key=api_key, timeout=timeout,
-                       max_retries=1, **temp)
+
+        chat = ChatXAI(
+            model=model,
+            api_key=api_key,
+            timeout=timeout,
+            max_retries=0,
+            max_tokens=max_tokens,
+            xai_api_base=provider_base_url(target),
+            http_client=dispatch.httpx_client(target, timeout=timeout),
+            http_async_client=blocked_async_httpx_client(timeout=timeout),
+            **sampling,
+        )
     elif provider == "Kimi":
-        # Moonshot speaks the OpenAI wire format. Default to the international
-        # host; mainland users override with MOONSHOT_BASE_URL (v1 does the same).
         from langchain_openai import ChatOpenAI
+
         chat = ChatOpenAI(
-            model=model, api_key=api_key, timeout=timeout, max_retries=1,
-            base_url=(os.getenv("MOONSHOT_BASE_URL")
-                      or "https://api.moonshot.ai/v1"),
-            **temp)
+            model=model,
+            api_key=api_key,
+            timeout=timeout,
+            max_retries=0,
+            max_tokens=max_tokens,
+            base_url=provider_base_url(target),
+            http_client=dispatch.httpx_client(target, timeout=timeout),
+            http_async_client=blocked_async_httpx_client(timeout=timeout),
+            **sampling,
+        )
     elif provider == "Ollama":
-        # Local (or self-hosted) Ollama — no API key. OLLAMA_BASE_URL points
-        # at a non-default host. num_ctx is raised above Ollama's small
-        # default so long persona prompts are not silently truncated, and
-        # OLLAMA_TIMEOUT gives slow local hardware a longer leash.
         from langchain_ollama import ChatOllama
+
         chat = ChatOllama(
             model=model,
-            base_url=os.getenv("OLLAMA_BASE_URL") or "http://localhost:11434",
-            num_ctx=int(os.getenv("OLLAMA_NUM_CTX") or 8192),
-            client_kwargs={"timeout": float(os.getenv("OLLAMA_TIMEOUT") or timeout)},
-            **temp,
+            base_url=provider_base_url(target),
+            num_ctx=(context_size if context_size is not None else 8192),
+            num_predict=max_tokens,
+            client_kwargs={
+                "timeout": timeout,
+                "trust_env": False,
+                "transport": dispatch.httpx_transport(target),
+                "headers": {"Authorization": "disabled"},
+            },
+            async_client_kwargs={
+                "timeout": timeout,
+                "trust_env": False,
+                "transport": DenyingAsyncHTTPTransport(),
+                "headers": {"Authorization": "disabled"},
+            },
+            **sampling,
         )
-    else:  # pragma: no cover - SUPPORTED_PROVIDERS is checked above
+    else:  # pragma: no cover - validated provider names cover every branch
         raise ValueError(f"Unhandled provider {provider}")
 
-    return ChatLLM(model, chat, on_token)
+    return ChatLLM(
+        model,
+        chat,
+        on_token,
+        dispatch=dispatch,
+        target=target,
+    )
+
+
+def validate_llm_transport(target: ProviderTarget) -> None:
+    """Reject providers without a guarded synchronous production transport."""
+    if not isinstance(target, ProviderTarget) or target.kind != "llm":
+        raise AuthorizationDenied("LLM provider target is invalid")
+    validate_provider_target(target)
+    if target.provider not in _GUARDED_PROVIDERS:
+        raise AuthorizationDenied("provider transport is unsupported")
 
 
 def AnthropicLLM(model: str | None = None, **kwargs) -> LLMClient:  # noqa: N802
@@ -355,21 +464,6 @@ def _flatten(content, sep: str = "\n") -> str:
                 parts.append(block.get("text", ""))
         return sep.join(parts)
     return "" if content is None else str(content)
-
-
-def _require_key(provider: str) -> str:
-    """The provider's API key, or a failure that names the variable to set."""
-    if provider in KEYLESS_PROVIDERS:
-        return ""
-    env_var = env_var_for(provider)
-    # Kimi accepts either name; v1 reads MOONSHOT_API_KEY first.
-    key = (os.getenv("MOONSHOT_API_KEY") if provider == "Kimi" else None)
-    key = key or (os.getenv(env_var) if env_var else None)
-    if not key:
-        raise ValueError(
-            f"{env_var} not found. Set it in your .env to use {provider} models."
-        )
-    return key
 
 
 def extract_json(text: str) -> dict:

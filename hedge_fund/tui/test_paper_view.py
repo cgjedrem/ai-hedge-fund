@@ -140,9 +140,9 @@ def test_live_rows_value_the_book_at_the_latest_prints():
     record, _ = executed_and_decided()
     ledger.append(make_session("2025-01-20", executed=record, nav=101000, positions={"TEST": 10}, marks={"TEST": 100}))
     snap = paper_view.PaperSnapshot(directory)
-    # A daily fund has the same next-run row as a minute fund: when, and whether a runner will take it.
+    # Daily and minute rows show the same disabled-runner state.
     rows = dict(paper_view.next_run_rows(snap, now=datetime(2025, 1, 21, 12, 0, tzinfo=NEW_YORK)))
-    assert render(rows["Next close"]).strip() == "2025-01-21   ○ idle · space to start a runner"
+    assert render(rows["Next close"]).strip() == "2025-01-21   ○ idle · unattended runner disabled"
     assert "○ idle" in render(snap.badge())  # a session recorded, no runner up
     # Every held name needs a print; cash alone has nothing live to say.
     assert paper_view.live_rows(snap, {}, today="2025-01-21") == []
@@ -164,14 +164,16 @@ def test_minute_fund_rows_are_pure(monkeypatch):
     snap = paper_view.PaperSnapshot(directory)
     assert not snap.running and snap.intraday
     rows = dict(paper_view.next_run_rows(snap, now=noon))
-    assert render(rows["Next bar"]).strip() == "13:00:00 ET   ○ idle · space to start a runner"
+    assert render(rows["Next bar"]).strip() == "13:00:00 ET   ○ idle · unattended runner disabled"
     assert rows["First"] == "mark the book at the first bar's prints" and rows["Then"] == "make the first decision"
     assert paper_view.today_rows(snap, now=noon) == []
     assert "● new" in render(paper_view.paper_slot(0, snap)) and "● new" in render(snap.badge())
     assert render(snap.status()).startswith("● NEW  no sessions yet")
-    snap.deployed = snap.deployed.model_copy(update={"broker": "saxo"})
+    saxo_spec = snap.deployed.spec.model_copy(update={"broker": "saxo", "saxo_account_key": "sim-account-1"})
+    snap.deployed = snap.deployed.model_copy(update={"broker": "saxo", "spec": saxo_spec})
     assert "saxo" in render(paper_view.paper_slot(0, snap))
     assert "broker: saxo" in render(paper_view.paper_detail(snap))
+    assert "Saxo SIM account: sim-account-1" in render(paper_view.paper_detail(snap))
 
     record, decided = executed_and_decided()
     first = make_session("2025-01-21T13:00:00", decision=decided, nav=100000)
@@ -182,7 +184,7 @@ def test_minute_fund_rows_are_pure(monkeypatch):
     snap = paper_view.PaperSnapshot(directory)
     assert snap.running
     rows = dict(paper_view.next_run_rows(snap, now=noon.replace(hour=13, minute=6)))
-    assert render(rows["Next bar"]).strip() == "13:10:00 ET   ● running · space to stop"
+    assert render(rows["Next bar"]).strip() == "13:10:00 ET   ● legacy runner active · writes unavailable"
     assert rows["Then"] == "make a new decision"
     # After the day's last bar the next one is tomorrow's open, named by weekday.
     assert render(dict(paper_view.next_run_rows(snap, now=noon.replace(hour=15)))["Next bar"]).startswith("Wed 13:00:00 ET")

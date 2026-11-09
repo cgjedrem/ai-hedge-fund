@@ -3,6 +3,8 @@ import type { ReactNode } from "react";
 
 import { Alert } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import type { ActionableError, RecoveryAction } from "@/lib/errors";
 
 export function PageHeader({
   eyebrow,
@@ -58,15 +60,63 @@ export function LoadingState({ label = "Loading desk data" }: { label?: string }
   );
 }
 
-export function ErrorState({ message }: { message: string }) {
+export function ErrorState({
+  message,
+  error,
+  onRetry,
+}: {
+  message: string;
+  error?: ActionableError | null;
+  onRetry?: () => void;
+}) {
+  const retryable = Boolean(onRetry) && (error?.action === "retry" || error?.action === "reconnect");
   return (
     <Alert tone="danger" className="flex items-start gap-3">
       <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
       <div>
         <p className="font-medium text-rose-100">Unable to load this view</p>
         <p className="mt-1 break-words text-rose-200/80">{message}</p>
+        {error?.guidance ? <p className="mt-1 text-xs text-rose-200/70">{error.guidance}</p> : null}
+        {retryable ? (
+          <Button className="mt-2" size="sm" variant="secondary" onClick={onRetry}>
+            Retry
+          </Button>
+        ) : null}
       </div>
     </Alert>
+  );
+}
+
+const ACTION_LABELS: Record<Exclude<RecoveryAction, null>, string> = {
+  "review-again": "Review again",
+  reconnect: "Reconnect",
+  "inspect-status": "Inspect status",
+  retry: "Retry",
+};
+
+/** Mutation failure notice: message stays its own node; guidance, identity and one recovery action follow. */
+export function ErrorNotice({
+  error,
+  onAction,
+  actionLabel,
+  className = "",
+}: {
+  error: ActionableError;
+  onAction?: () => void;
+  actionLabel?: string;
+  className?: string;
+}) {
+  return (
+    <div role="alert" className={`rounded-lg border border-rose-400/30 bg-rose-500/10 px-3 py-2 text-xs ${className}`}>
+      <p className="break-words text-rose-100">{error.message}</p>
+      {error.guidance ? <p className="mt-1 text-rose-200/80">{error.guidance}</p> : null}
+      {error.reference ? <p className="mono mt-1 text-[10px] text-rose-200/60">Ref {error.reference}</p> : null}
+      {onAction && error.action ? (
+        <Button className="mt-2" size="sm" variant="secondary" onClick={onAction}>
+          {actionLabel ?? ACTION_LABELS[error.action]}
+        </Button>
+      ) : null}
+    </div>
   );
 }
 

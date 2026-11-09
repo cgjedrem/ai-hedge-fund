@@ -55,6 +55,7 @@ def _broker(
         clock=clock,
         execution_timeout_s=execution_timeout_s,
     )
+    client.discover_account("account")
     broker = SaxoBroker(client, ["ABC"])
     return broker, transport
 

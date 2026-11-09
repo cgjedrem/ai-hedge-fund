@@ -1,8 +1,8 @@
 import { AlertCircle, ArrowRight, Plus, Save, Trash2 } from "lucide-react";
 import { useEffect, useMemo, useState, type ReactNode } from "react";
-import { Link } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 
-import { PageHeader } from "@/components/page";
+import { ErrorNotice, ErrorState, PageHeader } from "@/components/page";
 import { Alert } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -16,7 +16,8 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { apiPost } from "@/lib/api";
+import { apiPost, apiPut } from "@/lib/api";
+import { toActionableError, type ActionableError } from "@/lib/errors";
 import { useDesk, useResource } from "@/lib/hooks";
 import type { AnalystOption, Catalog, StrategyModelOption, StrategyOption } from "@/lib/types";
 
@@ -34,6 +35,7 @@ function copyModels(models: StrategyModelOption[]): StrategyModelOption[] {
 
 interface SaveResult {
   name: string;
+  mandate_hash: string;
   strategies: { name: string; title: string; mode: string; weight: number }[];
   cadence: string;
   capital: number;
@@ -44,8 +46,16 @@ interface SaveResult {
 }
 
 export function BuilderPage() {
-  const { capabilities } = useDesk();
+  const { capabilities, reconnect } = useDesk();
+  const [searchParams] = useSearchParams();
   const catalogResource = useResource<Catalog>("/api/catalog");
+  const editSource = searchParams.get("edit");
+  const cloneSource = searchParams.get("clone");
+  const sourceName = editSource ?? cloneSource;
+  const advancedCreate = searchParams.get("advanced") === "true";
+  const sourceResource = useResource<SaveResult>(
+    sourceName ? `/api/mandates/${encodeURIComponent(sourceName)}` : null,
+  );
   const [name, setName] = useState("");
   const [strategyDrafts, setStrategyDrafts] = useState<StrategyDraft[]>([
     { id: 1, name: "", models: [], weight: "1", kind: "library" },
@@ -57,13 +67,12 @@ export function BuilderPage() {
   const [cadence, setCadence] = useState("weekly");
   const [benchmark, setBenchmark] = useState("SPY");
   const [approvalRequired, setApprovalRequired] = useState(true);
-  const [broker, setBroker] = useState("paper");
   const [interval, setInterval] = useState("5");
   const [windowStart, setWindowStart] = useState("09:30");
   const [windowEnd, setWindowEnd] = useState("16:00");
   const [universeText, setUniverseText] = useState("");
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<string | ActionableError | null>(null);
   const [saved, setSaved] = useState<SaveResult | null>(null);
   const [deployed, setDeployed] = useState(false);
   const [deploymentMessage, setDeploymentMessage] = useState<string | null>(null);
@@ -94,6 +103,37 @@ export function BuilderPage() {
     () => new Map((catalog?.analysts ?? []).map((analyst) => [analyst.name, analyst])),
     [catalog],
   );
+
+  if (editSource && cloneSource) {
+    return <Alert tone="danger">Choose either mandate editing or cloning, not both.</Alert>;
+  }
+  if (sourceName) {
+    if (sourceResource.loading) {
+      return <div className="h-52 animate-pulse rounded-xl border border-border bg-white/[0.025]" />;
+    }
+    if (sourceResource.error || !sourceResource.data?.spec) {
+      return sourceResource.error
+        ? <ErrorState message={sourceResource.error} error={sourceResource.apiError} onRetry={sourceResource.refresh} />
+        : <Alert tone="danger">Mandate specification is unavailable.</Alert>;
+    }
+    const protectedSource = capabilities?.protected_names.some(
+      (entry) => entry.toLowerCase() === sourceName.toLowerCase(),
+    ) ?? false;
+    return (
+      <AdvancedMandateEditor
+        key={`${editSource ? "edit" : "clone"}:${sourceName}:${sourceResource.data.mandate_hash}`}
+        mode={editSource ? "edit" : "clone"}
+        sourceName={sourceName}
+        sourceHash={sourceResource.data.mandate_hash}
+        sourceSpec={sourceResource.data.spec}
+        canWrite={canWrite && !protectedSource}
+        onReloadSource={sourceResource.refresh}
+      />
+    );
+  }
+  if (advancedCreate) {
+    return <AdvancedMandateEditor mode="create" canWrite={canWrite} />;
+  }
 
   function changeStrategy(id: number, strategyName: string): void {
     const option = strategyLookup.get(strategyName);
@@ -182,16 +222,8 @@ export function BuilderPage() {
       setError("Capital and risk limits must be positive; max position cannot exceed 100%.");
       return;
     }
-    if (broker === "saxo" && cadence !== "minute") {
-      setError("Saxo mandates require minute cadence.");
-      return;
-    }
     if (cadence === "minute" && (!Number.isFinite(Number(interval)) || Number(interval) <= 0 || windowStart >= windowEnd)) {
       setError("Minute cadence needs a positive interval and an opening time before its close.");
-      return;
-    }
-    if (broker === "saxo" && (windowStart < "09:30" || windowEnd > "15:59")) {
-      setError("Saxo minute windows must stay between 09:30 and 15:59 New York time.");
       return;
     }
 
@@ -224,7 +256,7 @@ export function BuilderPage() {
       rebalance: cadence,
       benchmark: benchmark.trim().toUpperCase(),
       approval_required: approvalRequired,
-      broker,
+      broker: "paper",
       ...(cadence === "minute"
         ? { interval: Number(interval), window: { start: windowStart, end: windowEnd } }
         : {}),
@@ -235,7 +267,7 @@ export function BuilderPage() {
       const result = await apiPost<SaveResult>("/api/mandates", { spec });
       setSaved(result);
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "Mandate could not be saved.");
+      setError(toActionableError(cause, "Mandate could not be saved."));
     } finally {
       setBusy(false);
     }
@@ -273,11 +305,19 @@ export function BuilderPage() {
         eyebrow="Workspace / mandate builder"
         title="Compose a mandate"
         description="Build a canonical FundSpec from the strategy library. Save and deploy are separate actions; neither starts a runner."
+        actions={
+          <Button asChild variant="outline">
+            <Link to="/builder?advanced=true">Full JSON editor</Link>
+          </Button>
+        }
       />
       {catalogResource.loading ? <div className="mb-5 h-20 animate-pulse rounded-xl border border-border bg-white/[0.025]" /> : null}
       {catalogResource.error ? <Alert tone="danger" className="mb-5">{catalogResource.error}</Alert> : null}
       {!canWrite && capabilities ? <Alert tone="warning" className="mb-5">This server is read-only. Fields remain inspectable; saving and deployment are disabled.</Alert> : null}
-      {error ? <Alert tone="danger" className="mb-5"><AlertCircle className="mr-2 inline h-4 w-4" />{error}</Alert> : null}
+      {typeof error === "string" ? <Alert tone="danger" className="mb-5"><AlertCircle className="mr-2 inline h-4 w-4" />{error}</Alert> : null}
+      {error && typeof error !== "string" ? (
+        <ErrorNotice className="mb-5" error={error} onAction={error.action === "reconnect" ? () => void reconnect() : undefined} />
+      ) : null}
 
       <div className="grid items-start gap-5 xl:grid-cols-[minmax(0,1.45fr)_minmax(300px,0.75fr)]">
         <div className="space-y-5">
@@ -296,26 +336,12 @@ export function BuilderPage() {
               <Field label="Benchmark" htmlFor="benchmark">
                 <Input id="benchmark" value={benchmark} onChange={(event) => setBenchmark(event.target.value)} maxLength={16} disabled={Boolean(saved)} />
               </Field>
-              <Field label="Broker book" htmlFor="broker">
-                <Select
-                  value={broker}
-                  onValueChange={(value) => {
-                    setBroker(value);
-                    if (value === "saxo") {
-                      setCadence("minute");
-                      setWindowStart("09:30");
-                      setWindowEnd("15:59");
-                    }
-                  }}
-                  disabled={Boolean(saved)}
-                >
-                  <SelectTrigger id="broker"><SelectValue /></SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="paper">Paper</SelectItem>
-                    <SelectItem value="saxo">Saxo · minute only</SelectItem>
-                  </SelectContent>
-                </Select>
-              </Field>
+              <div className="space-y-2">
+                <p className="text-xs font-medium text-foreground">Broker book</p>
+                <p className="flex h-10 items-center rounded-md border border-border bg-black/10 px-3 text-sm text-muted-foreground" aria-label="Broker book">
+                  Paper only
+                </p>
+              </div>
               <Field label="Decision cadence" htmlFor="cadence">
                 <Select value={cadence} onValueChange={setCadence} disabled={Boolean(saved)}>
                   <SelectTrigger id="cadence"><SelectValue /></SelectTrigger>
@@ -529,6 +555,165 @@ export function BuilderPage() {
           </Card>
         </div>
       </div>
+    </>
+  );
+}
+
+interface AdvancedMandateEditorProps {
+  mode: "create" | "edit" | "clone";
+  canWrite: boolean;
+  sourceName?: string;
+  sourceHash?: string;
+  sourceSpec?: Record<string, unknown>;
+  onReloadSource?: () => void;
+}
+
+function AdvancedMandateEditor({
+  mode,
+  canWrite,
+  sourceName,
+  sourceHash,
+  sourceSpec,
+  onReloadSource,
+}: AdvancedMandateEditorProps) {
+  const { reconnect } = useDesk();
+  const initialSpec = sourceSpec
+    ? {
+        ...sourceSpec,
+        ...(mode === "clone"
+          ? { name: `${String(sourceSpec.name ?? sourceName ?? "mandate")}-copy` }
+          : {}),
+      }
+    : {
+        schema_version: 2,
+        name: "new-mandate",
+        strategies: [
+          {
+            name: "custom",
+            models: [{ name: "buffett", weight: 1, params: {} }],
+            blend: { method: "conviction_weighted", gross_target: 1, mode: "long_only" },
+          },
+        ],
+        risk: { max_position_pct: 0.25, max_gross_exposure: 1 },
+        capital: 100_000,
+        rebalance: "weekly",
+        benchmark: "SPY",
+        approval_required: true,
+        broker: "paper",
+      };
+  const [json, setJson] = useState(() => JSON.stringify(initialSpec, null, 2));
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | ActionableError | null>(null);
+  const [saved, setSaved] = useState<SaveResult | null>(null);
+
+  async function save(): Promise<void> {
+    setError(null);
+    if (!canWrite) {
+      setError("This server started without write capability.");
+      return;
+    }
+    let spec: unknown;
+    try {
+      spec = JSON.parse(json) as unknown;
+    } catch {
+      setError("FundSpec must be valid JSON.");
+      return;
+    }
+    if (!spec || typeof spec !== "object" || Array.isArray(spec)) {
+      setError("FundSpec must be a JSON object.");
+      return;
+    }
+    setBusy(true);
+    try {
+      let result: SaveResult;
+      if (mode === "edit" && sourceName && sourceHash) {
+        result = await apiPut<SaveResult>(`/api/mandates/${encodeURIComponent(sourceName)}`, {
+          expected_hash: sourceHash,
+          spec,
+        });
+      } else if (mode === "clone" && sourceName && sourceHash) {
+        result = await apiPost<SaveResult>(`/api/mandates/${encodeURIComponent(sourceName)}/clone`, {
+          expected_hash: sourceHash,
+          spec,
+        });
+      } else if (mode === "create") {
+        result = await apiPost<SaveResult>("/api/mandates", { spec });
+      } else {
+        setError("Mandate revision is unavailable; reload before saving.");
+        return;
+      }
+      setSaved(result);
+    } catch (cause) {
+      setError(toActionableError(cause, "Mandate could not be saved."));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const titles = {
+    create: "Create full FundSpec",
+    edit: "Edit mandate revision",
+    clone: "Clone mandate revision",
+  };
+  const descriptions = {
+    create: "Edit every validated FundSpec field. Saving creates a new template only.",
+    edit: "Save against the loaded mandate hash. Existing paper deployments remain unchanged.",
+    clone: "Clone the loaded revision into a distinct mandate identity.",
+  };
+
+  return (
+    <>
+      <PageHeader
+        eyebrow="Workspace / mandate JSON"
+        title={titles[mode]}
+        description={descriptions[mode]}
+        actions={
+          <Button asChild variant="outline">
+            <Link to={saved ? `/mandates/${encodeURIComponent(saved.name)}` : "/mandates"}>Back to mandates</Link>
+          </Button>
+        }
+      />
+      {!canWrite ? <Alert tone="warning" className="mb-5">Saving is disabled because write capability or mandate access is unavailable.</Alert> : null}
+      {typeof error === "string" ? <Alert tone="danger" className="mb-5">{error}</Alert> : null}
+      {error && typeof error !== "string" ? (
+        <ErrorNotice
+          className="mb-5"
+          error={error}
+          actionLabel={error.action === "review-again" ? "Load latest revision" : undefined}
+          onAction={
+            error.action === "reconnect"
+              ? () => void reconnect()
+              : error.action === "review-again" && onReloadSource
+                ? onReloadSource
+                : undefined
+          }
+        />
+      ) : null}
+      {saved ? (
+        <Alert tone="neutral" className="mb-5">
+          Saved revision <span className="mono">{saved.mandate_hash}</span>. Deployments remain separate.
+          <Link to={`/mandates/${encodeURIComponent(saved.name)}`} className="ml-2 text-accent hover:underline">Inspect mandate</Link>
+        </Alert>
+      ) : null}
+      <Card>
+        <CardHeader>
+          <CardTitle>Validated JSON</CardTitle>
+          <p className="text-xs text-muted-foreground">Backend validates model constructors, weights, blends, risk, costs, cadence and omitted defaults. No executable fields accepted.</p>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <textarea
+            aria-label="Full FundSpec JSON"
+            className="mono min-h-[520px] w-full rounded-lg border border-border bg-[#090d11] p-4 text-xs leading-relaxed text-slate-200"
+            spellCheck={false}
+            value={json}
+            onChange={(event) => setJson(event.target.value)}
+            disabled={Boolean(saved)}
+          />
+          <Button onClick={() => void save()} disabled={busy || !canWrite || Boolean(saved)}>
+            {busy ? "Saving…" : mode === "edit" ? "Save revision" : mode === "clone" ? "Create clone" : "Create mandate"}
+          </Button>
+        </CardContent>
+      </Card>
     </>
   );
 }

@@ -1,0 +1,1348 @@
+﻿import os
+import subprocess
+import threading
+import time
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
+from pathlib import Path
+
+import pytest
+
+import hedge_fund.runtime.owned_runner as owned_runner
+import hedge_fund.web.services as web_services
+from hedge_fund.data.models import Price
+from hedge_fund.data.sessions import NEW_YORK
+from hedge_fund.fund import FundSpec, load_spec
+from hedge_fund.models import Signal
+from hedge_fund.paper.deployed import load_deployed
+from hedge_fund.paper.ledger import Ledger
+from hedge_fund.pipeline.session import code_version, mandate_hash, SessionRecord
+from hedge_fund.runtime.configuration import RuntimeSettings
+from hedge_fund.runtime.dispatch import make_one_shot_dispatch
+from hedge_fund.runtime.handover import record_ledger_head
+from hedge_fund.runtime.owned_runner import read_runner_record, runner_key
+from hedge_fund.runtime.policy import AuthorizationDenied, BudgetDenied, ProviderTarget
+from hedge_fund.test_support.handover import enroll_synthetic_root
+from hedge_fund.web.schemas import (
+    DeployRequest,
+    PaperTickAcceptRequest,
+    PaperTickPreviewRequest,
+    RunnerPreviewRequest,
+    RunnerStartAcceptRequest,
+)
+from hedge_fund.web.services import DeskService, ServiceError
+
+
+class _OfflineDataClient:
+    def __init__(self):
+        self.calls = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc_info):
+        return None
+
+    def get_prices(self, ticker, start_date, end_date, **_kwargs):
+        self.calls.append((ticker, start_date, end_date))
+        if start_date <= end_date:
+            return [
+                Price(
+                    open=100,
+                    close=101,
+                    high=102,
+                    low=99,
+                    volume=1000,
+                    time=f"{end_date}T16:00:00-04:00",
+                )
+            ]
+        return []
+
+
+class _OfflineAnalyst:
+    name = "pead"
+
+    def predict(self, ticker, as_of, _view):
+        return Signal(
+            model_name=self.name,
+            ticker=ticker,
+            date=as_of,
+            value=0.1,
+            reasoning="offline test signal",
+            components={},
+        )
+
+
+class _OfflineFund:
+    def __init__(self, spec: FundSpec):
+        self.spec = spec
+        self.strategies = [(spec.strategies[0], [_OfflineAnalyst()])]
+
+
+def _local_settings() -> RuntimeSettings:
+    return RuntimeSettings(
+        data_provider="yfinance",
+        llm_provider="Ollama",
+        model="gemma3:4b",
+        endpoint="http://127.0.0.1:11434",
+        timeout_seconds=1,
+        parameters={"max_tokens": 32},
+        version=0,
+    )
+
+
+def _wait_for_operation(
+    service: DeskService,
+    operation_id: str,
+    *,
+    timeout: float = 60,
+) -> dict:
+    deadline = time.monotonic() + timeout
+    latest = None
+    while time.monotonic() < deadline:
+        try:
+            latest = service.get_operation(operation_id)
+        except ServiceError as exc:
+            if exc.status_code != 503 or exc.code != "observation-conflict":
+                raise
+            time.sleep(0.05)
+            continue
+        if latest["status"] in {"completed", "failed", "cancelled", "interrupted"}:
+            return latest
+        time.sleep(0.05)
+    raise AssertionError(f"paper operation did not reach a terminal state: {latest}")
+
+
+def _wait_for_runner_status(
+    service: DeskService,
+    name: str,
+    expected: str,
+    *,
+    timeout: float = 30,
+) -> dict:
+    deadline = time.monotonic() + timeout
+    latest = None
+    while time.monotonic() < deadline:
+        latest = service.runner_status(name)
+        if latest["status"] == expected:
+            return latest
+        time.sleep(0.02)
+    raise AssertionError(f"runner did not reach {expected!r}: {latest}")
+
+
+def test_reviewed_manual_tick_executes_one_session_with_local_fakes(
+    demo_root,
+    monkeypatch,
+):
+    data_client = _OfflineDataClient()
+
+    def no_provider_client(*_args, **_kwargs):
+        raise AssertionError("manual tick must use the injected offline data client")
+
+    monkeypatch.setattr(web_services, "make_data_client", no_provider_client)
+    service = DeskService(
+        demo_root,
+        allow_writes=True,
+        network_enabled=True,
+        data_client_factory=lambda: data_client,
+        fund_factory=_OfflineFund,
+    )
+    service._runtime_settings = _local_settings()
+    try:
+        spec = load_spec(demo_root / "mandates" / "demo-quality.yaml").model_copy(update={"name": "manual-test"})
+        service.create_mandate(spec.model_dump(mode="python"))
+        service.deploy_mandate("manual-test", DeployRequest(universe=["AAPL", "MSFT"]))
+        ledger = Ledger(demo_root / "paper" / "manual-test")
+        before = ledger.sessions()
+
+        preview = service.create_manual_tick_preview(
+            "manual-test",
+            PaperTickPreviewRequest(expected_head=None),
+            operator_session="offline-test-session",
+        )
+        due_session = preview["due_set"][0]
+        assert preview["reviewed_head"] is None
+        assert preview["estimate"]["maximum_cost_usd"] == 0.0
+        assert preview["capture"]["llm_provider"] == "Ollama"
+
+        request = PaperTickAcceptRequest(
+            request_id="offline-manual-tick-1",
+            preview_id=preview["preview_id"],
+            preview_digest=preview["preview_digest"],
+            confirmation_token=preview["confirmation_token"],
+            expected_head=None,
+            due_set=[due_session],
+        )
+        accepted = service.accept_manual_tick(
+            "manual-test",
+            request,
+            operator_session="offline-test-session",
+        )
+        completed = _wait_for_operation(service, accepted["operation_id"])
+        replayed = service.accept_manual_tick(
+            "manual-test",
+            request,
+            operator_session="offline-test-session",
+        )
+        after = ledger.sessions()
+        snapshot = service.paper_detail("manual-test")
+    finally:
+        service.close()
+
+    assert completed["status"] == "completed"
+    assert completed["result"]["session"] == due_session
+    assert replayed["operation_id"] == accepted["operation_id"]
+    assert after == [*before, due_session]
+    assert snapshot["last_session"] == due_session
+    assert len(data_client.calls) > 0
+
+
+def test_reviewed_manual_tick_persists_agent_progress(
+    demo_root,
+    monkeypatch,
+):
+    data_client = _OfflineDataClient()
+    second_agent_started = threading.Event()
+    release_second_agent = threading.Event()
+    call_count = 0
+
+    class BlockingAnalyst(_OfflineAnalyst):
+        def predict(self, ticker, as_of, view):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 2:
+                second_agent_started.set()
+                if not release_second_agent.wait(timeout=30):
+                    raise TimeoutError("synthetic agent release timed out")
+            return super().predict(ticker, as_of, view)
+
+    class BlockingFund:
+        def __init__(self, spec):
+            self.spec = spec
+            self.strategies = [(spec.strategies[0], [BlockingAnalyst()])]
+
+    def no_provider_client(*_args, **_kwargs):
+        raise AssertionError("manual tick must use the injected offline data client")
+
+    monkeypatch.setattr(web_services, "make_data_client", no_provider_client)
+    service = DeskService(
+        demo_root,
+        allow_writes=True,
+        network_enabled=True,
+        data_client_factory=lambda: data_client,
+        fund_factory=BlockingFund,
+    )
+    service._runtime_settings = _local_settings()
+    try:
+        spec = load_spec(demo_root / "mandates" / "demo-quality.yaml").model_copy(update={"name": "manual-progress-test"})
+        service.create_mandate(spec.model_dump(mode="python"))
+        service.deploy_mandate("manual-progress-test", DeployRequest(universe=["AAPL", "MSFT"]))
+        preview = service.create_manual_tick_preview(
+            "manual-progress-test",
+            PaperTickPreviewRequest(expected_head=None),
+            operator_session="offline-test-session",
+        )
+        request = PaperTickAcceptRequest(
+            request_id="offline-manual-progress",
+            preview_id=preview["preview_id"],
+            preview_digest=preview["preview_digest"],
+            confirmation_token=preview["confirmation_token"],
+            expected_head=None,
+            due_set=preview["due_set"],
+        )
+        accepted = service.accept_manual_tick(
+            "manual-progress-test",
+            request,
+            operator_session="offline-test-session",
+        )
+
+        assert second_agent_started.wait(timeout=30)
+        running = service.get_operation(accepted["operation_id"])
+        assert running["status"] == "running"
+        assert running["progress"] >= 40
+        release_second_agent.set()
+        completed = _wait_for_operation(service, accepted["operation_id"])
+    finally:
+        release_second_agent.set()
+        service.close()
+
+    assert completed["status"] == "completed"
+    assert completed["progress"] == 100
+
+
+def test_reviewed_manual_tick_completes_nothing_due_without_provider_or_session(
+    demo_root,
+    monkeypatch,
+):
+    provider_calls = []
+
+    def forbidden_provider(*_args, **_kwargs):
+        provider_calls.append("called")
+        raise AssertionError("nothing-due manual operation must not construct a provider")
+
+    service = DeskService(
+        demo_root,
+        allow_writes=True,
+        network_enabled=True,
+        data_client_factory=forbidden_provider,
+        fund_factory=_OfflineFund,
+    )
+    service._runtime_settings = _local_settings()
+    try:
+        spec = load_spec(demo_root / "mandates" / "demo-quality.yaml").model_copy(update={"name": "nothing-due-test"})
+        service.create_mandate(spec.model_dump(mode="python"))
+        service.deploy_mandate("nothing-due-test", DeployRequest(universe=["AAPL"]))
+        monkeypatch.setattr(service, "_next_paper_session", lambda *_args, **_kwargs: None)
+        ledger = Ledger(demo_root / "paper" / "nothing-due-test")
+        before = ledger.sessions()
+
+        preview = service.create_manual_tick_preview(
+            "nothing-due-test",
+            PaperTickPreviewRequest(expected_head=None),
+            operator_session="offline-test-session",
+        )
+        request = PaperTickAcceptRequest(
+            request_id="offline-manual-nothing-due",
+            preview_id=preview["preview_id"],
+            preview_digest=preview["preview_digest"],
+            confirmation_token=preview["confirmation_token"],
+            expected_head=None,
+            due_set=[],
+        )
+        accepted = service.accept_manual_tick(
+            "nothing-due-test",
+            request,
+            operator_session="offline-test-session",
+        )
+        completed = _wait_for_operation(service, accepted["operation_id"])
+        replayed = service.accept_manual_tick(
+            "nothing-due-test",
+            request,
+            operator_session="offline-test-session",
+        )
+        after = ledger.sessions()
+    finally:
+        service.close()
+
+    assert preview["due_set"] == []
+    assert preview["outcome"] == "nothing-due"
+    assert accepted["status"] == "accepted"
+    assert completed["status"] == "completed"
+    assert completed["result"]["outcome"] == "nothing-due"
+    assert "session" not in completed["result"]
+    assert replayed["operation_id"] == accepted["operation_id"]
+    assert after == before
+    assert provider_calls == []
+
+
+def test_interrupted_redo_denies_web_preview_before_provider_and_allows_halt(demo_root):
+    calls = []
+
+    def forbidden_factory():
+        calls.append("provider")
+        pytest.fail("interrupted redo reached a data provider")
+
+    service = DeskService(
+        demo_root,
+        allow_writes=True,
+        network_enabled=True,
+        data_client_factory=forbidden_factory,
+        fund_factory=_OfflineFund,
+    )
+    service._runtime_settings = _local_settings()
+    try:
+        name = "reconciliation-test"
+        spec = load_spec(demo_root / "mandates" / "demo-quality.yaml").model_copy(update={"name": name})
+        service.create_mandate(spec.model_dump(mode="python"))
+        service.deploy_mandate(name, DeployRequest(universe=["AAPL"]))
+        ledger = Ledger(demo_root / "paper" / name)
+        record = SessionRecord(
+            fund=name,
+            session="2024-06-07",
+            universe=["AAPL"],
+            nav=spec.capital,
+            cash=spec.capital,
+            positions={},
+            marks={},
+            benchmark=spec.benchmark,
+            benchmark_close=100.0,
+            rebalance=True,
+            code_version=code_version(),
+            mandate_hash=mandate_hash(spec),
+        )
+        record.hash = record.compute_hash()
+        with service._admission.manual_session(name, timeout=0):
+            ledger.append(record)
+            ledger.begin_redo(record)
+        with pytest.raises(ServiceError) as exc:
+            service.create_manual_tick_preview(
+                name,
+                PaperTickPreviewRequest(expected_head=record.hash),
+                operator_session="offline-test-session",
+            )
+        assert exc.value.code == "reconciliation-required"
+        assert calls == []
+        service.halt_fund(name, "emergency", "halt-redo-guard-001")
+        assert ledger.halted() == "emergency"
+    finally:
+        service.close()
+
+
+@pytest.mark.parametrize("journal_state", ["unfinished", "malformed"])
+def test_unfinished_consumption_denies_web_preview_before_provider_and_halts(demo_root, journal_state):
+    from hedge_fund.runtime.admission import paper_approval_transition
+
+    calls = []
+
+    def forbidden_factory():
+        calls.append("provider")
+        pytest.fail("unfinished consumption reached a data provider")
+
+    service = DeskService(
+        demo_root,
+        allow_writes=True,
+        network_enabled=True,
+        data_client_factory=forbidden_factory,
+        fund_factory=_OfflineFund,
+    )
+    service._runtime_settings = _local_settings()
+    try:
+        name = "demo-quality"
+        ledger = Ledger(demo_root / "paper" / name)
+        latest = ledger.latest()
+        assert latest.decision is not None
+        with paper_approval_transition(service._admission, name) as proof:
+            approval = ledger.set_approval("approve", latest.decision.as_of, latest.hash, "web", admission=proof)
+        with service._admission.control_lane(name):
+            if journal_state == "malformed":
+                with ledger.events_path.open("a", encoding="utf-8") as history:
+                    history.write("{invalid\n")
+            else:
+                ledger.log_event(
+                    "consume",
+                    decision_as_of=approval["decision_as_of"],
+                    decision_hash=approval["decision_hash"],
+                    approval_verdict=approval["verdict"],
+                    approval_by=approval["by"],
+                    approval_id=approval["approval_id"],
+                    session="2025-01-07",
+                    durable=True,
+                )
+        with pytest.raises(ServiceError) as exc:
+            service.create_manual_tick_preview(
+                name,
+                PaperTickPreviewRequest(expected_head=latest.hash),
+                operator_session="offline-test-session",
+            )
+        assert exc.value.code == "reconciliation-required"
+        assert calls == []
+        assert ledger.halted() == "approval journal requires reconciliation"
+        service.halt_fund(name, "emergency", f"halt-unfinished-consume-{journal_state}")
+        assert ledger.halted() == "emergency"
+    finally:
+        service.close()
+
+
+def test_injected_data_client_reserves_each_call_before_fake(demo_root):
+    data_client = _OfflineDataClient()
+    factory_calls = []
+    service = DeskService(
+        demo_root,
+        allow_writes=True,
+        network_enabled=True,
+        data_client_factory=lambda: factory_calls.append("factory") or data_client,
+    )
+    target = ProviderTarget(kind="data", provider="yfinance")
+    now = datetime.now(timezone.utc)
+    dispatch = make_one_shot_dispatch(
+        root_id="synthetic-root",
+        subject_id="demo-quality",
+        capture_digest="a" * 64,
+        operation_id="operation-1",
+        operation_digest="b" * 64,
+        expires_at=now + timedelta(minutes=5),
+        targets=(target,),
+        max_calls=1,
+        max_cost=Decimal("0"),
+        max_resources=1,
+        upper_bound_costs={target.identity: Decimal("0")},
+        clock=lambda: now,
+        resolver=lambda _host, _port: ["8.8.8.8"],
+    )
+    try:
+        with pytest.raises(AuthorizationDenied):
+            with service._make_data_client(provider="yfinance"):
+                pytest.fail("fake client factory ran without operation authority")
+        assert factory_calls == []
+
+        with service._make_data_client(
+            provider="yfinance",
+            dispatch=dispatch,
+        ) as guarded:
+            result = guarded.get_prices(
+                "AAPL",
+                "2024-06-03",
+                "2024-06-03",
+            )
+            with pytest.raises(BudgetDenied):
+                guarded.get_prices(
+                    "AAPL",
+                    "2024-06-04",
+                    "2024-06-04",
+                )
+    finally:
+        service.close()
+
+    authorization = dispatch._one_shot[target.identity]
+    assert result
+    assert factory_calls == ["factory"]
+    assert len(data_client.calls) == 1
+    assert authorization.calls_reserved == 1
+
+
+def test_manual_tick_denies_runner_lane_conflict_without_ledger_change(demo_root):
+    data_client = _OfflineDataClient()
+    service = DeskService(
+        demo_root,
+        allow_writes=True,
+        network_enabled=True,
+        data_client_factory=lambda: data_client,
+        fund_factory=_OfflineFund,
+    )
+    service._runtime_settings = _local_settings()
+    ledger = Ledger(demo_root / "paper" / "demo-quality")
+    before = ledger.sessions()
+    head = ledger.latest().hash
+
+    try:
+        with service._admission.runner_reservation("demo-quality", timeout=0):
+            with pytest.raises(ServiceError) as conflict:
+                service.create_manual_tick_preview(
+                    "demo-quality",
+                    PaperTickPreviewRequest(expected_head=head),
+                    operator_session="offline-test-session",
+                )
+        after = ledger.sessions()
+    finally:
+        service.close()
+
+    assert conflict.value.status_code == 409
+    assert conflict.value.code == "writer-conflict"
+    assert after == before
+
+
+def test_manual_tick_maps_lost_ownership_without_provider_effects(demo_root, monkeypatch):
+    from hedge_fund.runtime.admission import OwnershipUnknown
+
+    calls = []
+    service = DeskService(demo_root, allow_writes=True, network_enabled=True, data_client_factory=lambda: calls.append("provider"))
+    ledger = Ledger(demo_root / "paper" / "demo-quality")
+    before = ledger.sessions()
+    head = ledger.latest().hash
+
+    def deny(*_args, **_kwargs):
+        raise OwnershipUnknown("synthetic authority loss")
+
+    monkeypatch.setattr(service._admission, "manual_session", deny)
+    try:
+        with pytest.raises(ServiceError) as rejected:
+            service.create_manual_tick_preview(
+                "demo-quality",
+                PaperTickPreviewRequest(expected_head=head),
+                operator_session="offline-test-session",
+            )
+    finally:
+        service.close()
+
+    assert rejected.value.status_code == 409
+    assert rejected.value.code == "ownership-unknown"
+    assert calls == []
+    assert ledger.sessions() == before
+
+
+def test_web_saxo_deployment_denied_before_deploy_adapter(demo_root, monkeypatch):
+    payload = load_spec(demo_root / "mandates" / "demo-quality.yaml").model_dump(mode="python")
+    payload.update(
+        {
+            "name": "saxo-web-denied",
+            "broker": "saxo",
+            "rebalance": "minute",
+            "interval": 5.0,
+            "window": {"start": "09:30", "end": "15:59"},
+        }
+    )
+    spec = FundSpec.model_validate(payload)
+    service = DeskService(demo_root, allow_writes=True)
+    service.create_mandate(spec.model_dump(mode="python"))
+    calls = []
+
+    def forbidden(*_args, **_kwargs):
+        calls.append(True)
+        raise AssertionError("web SIM deployment reached the deploy adapter")
+
+    monkeypatch.setattr(web_services, "deploy", forbidden)
+    try:
+        with pytest.raises(ServiceError) as rejected:
+            service.deploy_mandate(
+                "saxo-web-denied",
+                DeployRequest(universe=["AAPL"]),
+            )
+    finally:
+        service.close()
+
+    assert rejected.value.status_code == 403
+    assert calls == []
+    assert not (demo_root / "paper" / "saxo-web-denied").exists()
+
+
+def test_manual_tick_rejects_stale_head_before_creating_operation(
+    demo_root,
+    monkeypatch,
+):
+    data_client = _OfflineDataClient()
+
+    def no_provider_client(*_args, **_kwargs):
+        raise AssertionError("manual tick must use the injected offline data client")
+
+    monkeypatch.setattr(web_services, "make_data_client", no_provider_client)
+    service = DeskService(
+        demo_root,
+        allow_writes=True,
+        network_enabled=True,
+        data_client_factory=lambda: data_client,
+        fund_factory=_OfflineFund,
+    )
+    service._runtime_settings = _local_settings()
+    ledger = Ledger(demo_root / "paper" / "demo-quality")
+    try:
+        latest = ledger.latest()
+        preview = service.create_manual_tick_preview(
+            "demo-quality",
+            PaperTickPreviewRequest(expected_head=latest.hash),
+            operator_session="offline-stale-head-session",
+        )
+        due_session = preview["due_set"][0]
+        stale_sessions = ledger.sessions()
+        deployed = load_deployed(demo_root / "paper" / "demo-quality")
+        changed = SessionRecord(
+            fund=deployed.name,
+            session=due_session,
+            universe=list(deployed.universe),
+            nav=latest.nav,
+            cash=latest.cash,
+            positions=dict(latest.positions),
+            marks=dict(latest.marks),
+            benchmark=deployed.spec.benchmark,
+            benchmark_close=latest.benchmark_close,
+            rebalance=False,
+            prev_hash=latest.hash,
+            code_version=code_version(),
+            mandate_hash=mandate_hash(deployed.spec),
+        )
+        changed.hash = changed.compute_hash()
+        with service._admission.runner_reservation("demo-quality", timeout=0):
+            with service._admission.execution_lease("demo-quality", timeout=0):
+                ledger.append(changed)
+        record_ledger_head(
+            service.root_context,
+            "demo-quality",
+            admission=service._admission,
+        )
+        sessions_after_head_change = ledger.sessions()
+        request = PaperTickAcceptRequest(
+            request_id="offline-stale-manual-tick-1",
+            preview_id=preview["preview_id"],
+            preview_digest=preview["preview_digest"],
+            confirmation_token=preview["confirmation_token"],
+            expected_head=latest.hash,
+            due_set=[due_session],
+        )
+
+        with pytest.raises(ServiceError) as conflict:
+            service.accept_manual_tick(
+                "demo-quality",
+                request,
+                operator_session="offline-stale-head-session",
+            )
+        after = ledger.sessions()
+        accepted = service._operation_store.get_by_request(
+            "offline-stale-manual-tick-1",
+        )
+    finally:
+        service.close()
+
+    assert conflict.value.status_code == 409
+    assert sessions_after_head_change == [*stale_sessions, due_session]
+    assert after == sessions_after_head_change
+    assert accepted is None
+
+
+def _start_owned_runner(demo_root, name: str, *, before_accept=None, service: DeskService | None = None):
+    owns_service = service is None
+    if owns_service:
+        root_path = Path(os.environ["HEDGE_FUND_TEST_ROOT"]) / f"{name}-root"
+        root_path.mkdir()
+        enroll_synthetic_root(root_path)
+        service = DeskService(
+            root_path,
+            allow_writes=True,
+            network_enabled=True,
+        )
+    else:
+        root_path = Path(service.root_context.path)
+    service._runtime_settings = _local_settings()
+    try:
+        payload = load_spec(demo_root / "mandates" / "demo-quality.yaml").model_dump(mode="python")
+        payload.update(
+            {
+                "name": name,
+                "rebalance": "minute",
+                "interval": 1.0,
+                "window": {"start": "04:30", "end": "04:35"},
+            }
+        )
+        spec = FundSpec.model_validate(payload)
+        service.create_mandate(spec.model_dump(mode="python"))
+        service.deploy_mandate(name, DeployRequest(universe=["AAPL", "MSFT"]))
+        ledger = Ledger(root_path / "paper" / name)
+        session_record = SessionRecord(
+            fund=name,
+            session=f"{datetime.now(NEW_YORK).date().isoformat()}T04:35:00",
+            universe=["AAPL", "MSFT"],
+            nav=spec.capital,
+            cash=spec.capital,
+            positions={},
+            marks={},
+            benchmark=spec.benchmark,
+            benchmark_close=100.0,
+            rebalance=True,
+            code_version=code_version(),
+            mandate_hash=mandate_hash(spec),
+        )
+        session_record.hash = session_record.compute_hash()
+        with service._admission.manual_session(name, timeout=0):
+            ledger.append(session_record)
+        record_ledger_head(
+            service.root_context,
+            name,
+            admission=service._admission,
+        )
+        head = ledger.latest().hash
+        preview = service.create_runner_preview(
+            name,
+            RunnerPreviewRequest(
+                expected_head=head,
+                max_sessions=1,
+                max_runtime_minutes=1,
+            ),
+            operator_session="owned-runner-test-session",
+        )
+        assert preview["due_set"] == []
+        assert preview["capture"]["llm_provider"] == "Ollama"
+
+        if before_accept is not None:
+            before_accept(root_path)
+        accepted = service.accept_runner_start(
+            name,
+            RunnerStartAcceptRequest(
+                request_id="owned-runner-start-1",
+                preview_id=preview["preview_id"],
+                preview_digest=preview["preview_digest"],
+                confirmation_token=preview["confirmation_token"],
+                expected_head=head,
+                due_set=preview["due_set"],
+                max_sessions=1,
+                max_runtime_minutes=1,
+            ),
+            operator_session="owned-runner-test-session",
+        )
+    except BaseException:
+        if owns_service:
+            service.close()
+        raise
+    return service, root_path, session_record, head, accepted
+
+
+def _stop_owned_runner(service: DeskService, name: str, *, close_service: bool = True) -> None:
+    try:
+        if service.runner_status(name)["status"] in {
+            "starting",
+            "running",
+            "stopping",
+        }:
+            service.stop_runner(name)
+    finally:
+        try:
+            process_ref = service._runner_manager._processes.get(runner_key(name))
+            if process_ref is not None and process_ref.process.poll() is None:
+                process_ref.process.wait(timeout=30)
+        finally:
+            if close_service:
+                service.close()
+
+
+def test_owned_runner_child_starts_and_stops_with_exact_process_identity(
+    demo_root,
+):
+    name = "owned-runner-test"
+    service, root_path, session_record, head, accepted = _start_owned_runner(demo_root, name)
+    process = None
+    try:
+        completed = _wait_for_operation(service, accepted["operation_id"])
+        state = read_runner_record(service.root_context, name, "state")
+        assert completed["status"] == "completed", {
+            "error": completed.get("error"),
+            "runner": service.runner_status(name),
+            "state": state,
+            "control": read_runner_record(service.root_context, name, "control"),
+        }
+        running = service.runner_status(name)
+        key = runner_key(name)
+        process_ref = service._runner_manager._processes[key]
+        process = process_ref.process
+        runner_record = state
+
+        assert completed["status"] == "completed"
+        assert running["status"] == "running"
+        assert running["available"] is True
+        assert runner_record["pid"] == process.pid
+        assert runner_record["process_identity"] == process_ref.identity
+        assert runner_record["sessions_completed"] == 0
+        assert process.poll() is None
+
+        stopping = service.stop_runner(name)
+        stopped = _wait_for_runner_status(service, name, "stopped")
+        assert stopping["status"] == "stopping"
+        assert stopped["available"] is False
+        assert stopped["sessions_completed"] == 0
+        after = Ledger(root_path / "paper" / name)
+        assert after.sessions() == [session_record.session]
+        assert after.latest().hash == head
+        assert process.wait(timeout=30) == 0
+    finally:
+        _stop_owned_runner(service, name)
+
+
+def test_real_cli_and_web_tick_conflict_with_owned_runner(demo_root, tmp_path, owned_test_process):
+    from fastapi.testclient import TestClient
+
+    from hedge_fund.web.app import create_app
+
+    name = "owned-runner-race"
+    service = None
+    children = []
+    factory_calls = []
+    ready = tmp_path / "cli-ready"
+    go = tmp_path / "cli-go"
+    result = tmp_path / "cli-result"
+    startup_error = tmp_path / "cli-startup-error"
+
+    def forbidden_data_client():
+        factory_calls.append(True)
+        raise AssertionError("a denied web preview constructed a data client")
+
+    root_path = Path(os.environ["HEDGE_FUND_TEST_ROOT"]) / f"{name}-root"
+    root_path.mkdir()
+    enroll_synthetic_root(root_path)
+    app = create_app(
+        root=root_path,
+        allow_writes=True,
+        network_enabled=True,
+        data_client_factory=forbidden_data_client,
+    )
+    service = app.state.service
+    client_entered = False
+
+    def stage_cli(root_path):
+        expected_head = Ledger(root_path / "paper" / name).latest().hash
+        script = "\n".join(
+            [
+                "import contextlib, io, sys, time, traceback",
+                "from pathlib import Path",
+                "from hedge_fund import paths, run",
+                f"ready, go, result, startup_error = Path({str(ready)!r}), Path({str(go)!r}), Path({str(result)!r}), Path({str(startup_error)!r})",
+                "original_ensure = paths.ensure_mandates_dir",
+                "def observed_ensure():",
+                "    try:",
+                "        return original_ensure()",
+                "    except Exception as exc:",
+                "        startup_error.write_text(''.join(traceback.format_exception(exc)), encoding='utf-8')",
+                "        raise",
+                "paths.ensure_mandates_dir = observed_ensure",
+                "original_lane = run._paper_lane",
+                "@contextlib.contextmanager",
+                "def gated_lane(participant, fund, lane):",
+                "    if lane == 'manual_session':",
+                "        ready.write_text('ready', encoding='utf-8')",
+                "        deadline = time.monotonic() + 90",
+                "        while not go.exists() and time.monotonic() < deadline: time.sleep(0.01)",
+                "        if not go.exists(): sys.exit(3)",
+                "    with original_lane(participant, fund, lane):",
+                "        yield",
+                "run._paper_lane = gated_lane",
+                f"sys.argv = ['aihf', '--root', {str(root_path)!r}, '--enable-network', 'paper', 'tick', {name!r}, '--expected-head', {expected_head!r}, '--request-id', 'owned-runner-conflict-cli-001']",
+                "stderr = io.StringIO()",
+                "with contextlib.redirect_stderr(stderr):",
+                "    try:",
+                "        run.main()",
+                "    except SystemExit as exc:",
+                "        outcome = str(exc.code)",
+                "    else:",
+                "        outcome = 'returned'",
+                "result.write_text(outcome + '\\n' + stderr.getvalue(), encoding='utf-8')",
+            ]
+        )
+        child = owned_test_process(script)
+        children.append(child)
+        deadline = time.monotonic() + 30
+        while not ready.exists() and child.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        outcome = result.read_text(encoding="utf-8") if result.exists() else "no CLI result"
+        startup = startup_error.read_text(encoding="utf-8") if startup_error.exists() else "no startup exception"
+        assert ready.exists(), f"CLI child failed before manual admission: {child.poll()}; {outcome}; {startup}"
+
+    try:
+        with TestClient(app, client=("127.0.0.1", 50000)) as client:
+            client_entered = True
+            try:
+                capability = client.get("/api/capabilities", headers={"host": "127.0.0.1"}).json()
+                assert capability["mutation_token"]
+                service, root_path, session_record, head, accepted = _start_owned_runner(
+                    demo_root,
+                    name,
+                    before_accept=stage_cli,
+                    service=service,
+                )
+                completed = _wait_for_operation(service, accepted["operation_id"])
+                assert completed["status"] == "completed", completed.get("error")
+                runner = service.runner_status(name)
+                assert runner["status"] == "running"
+                paper_dir = root_path / "paper" / name
+                before = {path.relative_to(paper_dir).as_posix(): path.read_bytes() for path in paper_dir.rglob("*") if path.is_file()}
+                headers = {
+                    "host": "127.0.0.1",
+                    "origin": "http://127.0.0.1",
+                    "x-csrf-token": capability["mutation_token"],
+                }
+                go.write_text("go", encoding="utf-8")
+                response = client.post(f"/api/paper/{name}/tick/preview", headers=headers, json={"expected_head": head})
+                assert children[0].wait(timeout=30) == 0
+                assert response.status_code == 409
+                assert response.json()["code"] == "writer-conflict"
+                cli_outcome = result.read_text(encoding="utf-8")
+                assert cli_outcome.startswith("1\n")
+                assert "manual session is busy or unavailable" in cli_outcome
+                assert factory_calls == []
+                assert service.runner_status(name)["status"] == "running"
+                assert Ledger(paper_dir).sessions() == [session_record.session]
+                assert {path.relative_to(paper_dir).as_posix(): path.read_bytes() for path in paper_dir.rglob("*") if path.is_file()} == before
+            finally:
+                if children and not go.exists():
+                    go.write_text("go", encoding="utf-8")
+                _stop_owned_runner(service, name, close_service=False)
+    finally:
+        if not client_entered:
+            service.close()
+
+
+def test_owned_runner_readiness_timeout_fails_closed_and_stops_child(
+    demo_root,
+    monkeypatch,
+):
+    name = "owned-runner-timeout"
+    monkeypatch.setattr(owned_runner, "_READINESS_TIMEOUT_SECONDS", 0.0)
+    service, root_path, session_record, head, accepted = _start_owned_runner(demo_root, name)
+    try:
+        failed = _wait_for_operation(service, accepted["operation_id"], timeout=60)
+        state = read_runner_record(service.root_context, name, "state")
+        control = read_runner_record(service.root_context, name, "control")
+        process_ref = service._runner_manager._processes[runner_key(name)]
+
+        assert failed["status"] == "failed"
+        assert state["status"] == "failed"
+        assert state["reason"] == "runner-readiness-timeout"
+        assert control["stop_requested"] is True
+        assert process_ref.process.wait(timeout=60) is not None
+        after = Ledger(root_path / "paper" / name)
+        assert after.sessions() == [session_record.session]
+        assert after.latest().hash == head
+    finally:
+        _stop_owned_runner(service, name)
+
+
+def _reopen_service(root_path: Path) -> DeskService:
+    reopened = DeskService(root_path, allow_writes=True, network_enabled=True)
+    reopened._runtime_settings = _local_settings()
+    return reopened
+
+
+def test_owned_runner_reattaches_after_web_restart_and_parallel_manager(demo_root):
+    name = "owned-runner-reattach"
+    service, root_path, session_record, head, accepted = _start_owned_runner(demo_root, name)
+    others: list[DeskService] = []
+    process = None
+    service_open = True
+    try:
+        completed = _wait_for_operation(service, accepted["operation_id"])
+        assert completed["status"] == "completed", completed.get("error")
+        process = service._runner_manager._processes[runner_key(name)].process
+        owner = read_runner_record(service.root_context, name, "owner")
+        state = read_runner_record(service.root_context, name, "state")
+        assert owner["process_identity"] == state["process_identity"]
+        assert owner["process_identity"]["pid"] == process.pid
+        assert owner["nonce_hash"] == state["nonce_hash"]
+
+        parallel = _reopen_service(root_path)
+        others.append(parallel)
+        assert parallel.allow_writes is False
+        assert parallel.write_unavailable_reason == "operation-service-active"
+        observed = parallel.runner_status(name)
+        assert observed["status"] == "running"
+        assert observed["available"] is True
+        assert observed["reason"] == owned_runner.REATTACHED_REASON
+        assert "pid" not in observed
+        assert service.runner_status(name)["reason"] is None
+
+        # Simulated web-service restart: the launching manager and its handle go away.
+        service.close()
+        service_open = False
+        assert process.poll() is None
+        from fastapi.testclient import TestClient
+
+        from hedge_fund.web.app import create_app
+
+        restarted_app = create_app(root=root_path, allow_writes=True, network_enabled=True)
+        with TestClient(restarted_app, client=("127.0.0.1", 50000)) as client:
+            capability = client.get("/api/capabilities", headers={"host": "127.0.0.1"}).json()
+            headers = {
+                "host": "127.0.0.1",
+                "origin": "http://127.0.0.1",
+                "x-csrf-token": capability["mutation_token"],
+            }
+            reattached = client.get(f"/api/paper/{name}/runner", headers={"host": "127.0.0.1"})
+            assert reattached.status_code == 200
+            assert reattached.json()["status"] == "running"
+            assert reattached.json()["reason"] == owned_runner.REATTACHED_REASON
+            assert "pid" not in reattached.json()
+
+            stopping = client.post(f"/api/paper/{name}/runner/stop", headers=headers)
+            assert stopping.status_code == 200, stopping.json()
+            assert stopping.json()["status"] == "stopping"
+            observed = parallel.runner_status(name)
+            assert observed["status"] in {"stopping", "stopped"}, observed
+            deadline = time.monotonic() + 30
+            latest = None
+            while time.monotonic() < deadline:
+                latest = client.get(f"/api/paper/{name}/runner", headers={"host": "127.0.0.1"}).json()
+                if latest["status"] == "stopped":
+                    break
+                time.sleep(0.05)
+            assert latest is not None and latest["status"] == "stopped", latest
+            assert latest["available"] is False
+        assert process.wait(timeout=30) == 0
+        assert parallel.runner_status(name)["status"] == "stopped"
+        after = Ledger(root_path / "paper" / name)
+        assert after.sessions() == [session_record.session]
+        assert after.latest().hash == head
+    finally:
+        try:
+            if process is not None and process.poll() is None:
+                for other in others:
+                    try:
+                        if other.runner_status(name)["status"] in {"running", "stopping"}:
+                            other.stop_runner(name)
+                            break
+                    except Exception:
+                        continue
+                try:
+                    process.wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    # Test-owned handle only; never a PID lookup.
+                    process.kill()
+                    process.wait(timeout=30)
+        finally:
+            for other in others:
+                other.close()
+            if service_open:
+                _stop_owned_runner(service, name)
+
+
+def test_crashed_owned_runner_requires_offline_stale_review_before_restart(demo_root):
+    from hedge_fund.runtime.handover import (
+        read_stale_recovery,
+        recover_stale_reservation,
+        STALE_RECOVERY_ATTESTATION,
+    )
+    from hedge_fund.runtime.root import RootContext
+
+    name = "owned-runner-crash"
+    service, root_path, session_record, head, accepted = _start_owned_runner(demo_root, name)
+    restarted = None
+    service_open = True
+    try:
+        completed = _wait_for_operation(service, accepted["operation_id"])
+        assert completed["status"] == "completed", completed.get("error")
+        process = service._runner_manager._processes[runner_key(name)].process
+        # Crash the test-owned synthetic child through its own handle; never by PID.
+        process.kill()
+        process.wait(timeout=30)
+        service.close()
+        service_open = False
+
+        restarted = _reopen_service(root_path)
+        before = read_runner_record(restarted.root_context, name, "control")
+        status = restarted.runner_status(name)
+        assert status["status"] == "unknown"
+        assert status["available"] is False
+        assert status["reason"] == owned_runner.STALE_OWNER_REASON
+        with pytest.raises(ServiceError) as denied:
+            restarted.stop_runner(name)
+        assert denied.value.status_code == 409
+        assert denied.value.code == "ownership-unknown"
+        assert read_runner_record(restarted.root_context, name, "control") == before
+        restarted.close()
+        restarted = None
+
+        with RootContext.open(root_path) as root:
+            record = recover_stale_reservation(
+                root,
+                name,
+                evidence={
+                    "owner_quiescence": "Synthetic test-owned child was terminated through its handle.",
+                    "legacy_exclusion": "Isolated synthetic root has no legacy launcher or container writers.",
+                },
+                operator_attestation=STALE_RECOVERY_ATTESTATION,
+            )
+            assert read_stale_recovery(root, name) == record
+
+        restarted = _reopen_service(root_path)
+        recovered = restarted.runner_status(name)
+        assert recovered["status"] == "failed"
+        assert recovered["reason"] == "operator-stale-recovery"
+        after = Ledger(root_path / "paper" / name)
+        assert after.sessions() == [session_record.session]
+        assert after.latest().hash == head
+    finally:
+        if restarted is not None:
+            restarted.close()
+        if service_open:
+            _stop_owned_runner(service, name)
+
+
+def test_runner_start_rejects_head_changed_after_acceptance_before_spawn(
+    demo_root,
+    monkeypatch,
+):
+    name = "stale-runner-start"
+    data_client = _OfflineDataClient()
+    service = DeskService(
+        demo_root,
+        allow_writes=True,
+        network_enabled=True,
+        data_client_factory=lambda: data_client,
+        fund_factory=_OfflineFund,
+    )
+    service._runtime_settings = _local_settings()
+    ledger = Ledger(demo_root / "paper" / name)
+    start_entered = threading.Event()
+    release_start = threading.Event()
+    popen_calls = []
+    original_start = service._runner_manager.start
+
+    def delayed_start(*args, **kwargs):
+        start_entered.set()
+        if not release_start.wait(timeout=60):
+            raise TimeoutError("runner start barrier timed out")
+        return original_start(*args, **kwargs)
+
+    def forbidden_spawn(*_args, **_kwargs):
+        popen_calls.append(True)
+        raise OSError("stale runner preview must not spawn")
+
+    monkeypatch.setattr(service._runner_manager, "start", delayed_start)
+    monkeypatch.setattr(owned_runner.subprocess, "Popen", forbidden_spawn)
+    accepted = None
+    completed = None
+    changed = None
+    try:
+        payload = load_spec(demo_root / "mandates" / "demo-quality.yaml").model_dump(mode="python")
+        payload["name"] = name
+        spec = FundSpec.model_validate(payload)
+        service.create_mandate(spec.model_dump(mode="python"))
+        service.deploy_mandate(name, DeployRequest(universe=["AAPL", "MSFT"]))
+        service._runtime_settings = _local_settings()
+        preview = service.create_runner_preview(
+            name,
+            RunnerPreviewRequest(
+                expected_head=None,
+                max_sessions=1,
+                max_runtime_minutes=1,
+            ),
+            operator_session="stale-runner-start-session",
+        )
+        accepted = service.accept_runner_start(
+            name,
+            RunnerStartAcceptRequest(
+                request_id="stale-runner-start-1",
+                preview_id=preview["preview_id"],
+                preview_digest=preview["preview_digest"],
+                confirmation_token=preview["confirmation_token"],
+                expected_head=None,
+                due_set=preview["due_set"],
+                max_sessions=1,
+                max_runtime_minutes=1,
+            ),
+            operator_session="stale-runner-start-session",
+        )
+        assert start_entered.wait(timeout=60)
+
+        deployed = load_deployed(demo_root / "paper" / name)
+        changed = SessionRecord(
+            fund=name,
+            session=(datetime.now().date() + timedelta(days=1)).isoformat(),
+            universe=list(deployed.universe),
+            nav=deployed.spec.capital,
+            cash=deployed.spec.capital,
+            positions={},
+            marks={},
+            benchmark=deployed.spec.benchmark,
+            benchmark_close=100.0,
+            rebalance=False,
+            prev_hash=None,
+            code_version=code_version(),
+            mandate_hash=mandate_hash(deployed.spec),
+        )
+        changed.hash = changed.compute_hash()
+        with service._admission.manual_session(name, timeout=0):
+            ledger.append(changed)
+        record_ledger_head(
+            service.root_context,
+            name,
+            admission=service._admission,
+        )
+        release_start.set()
+        completed = _wait_for_operation(service, accepted["operation_id"])
+    finally:
+        release_start.set()
+        service.close()
+
+    assert completed["status"] == "failed"
+    assert popen_calls == []
+    assert ledger.latest().hash == changed.hash
+
+
+@pytest.mark.parametrize(
+    ("fault", "code", "policy"),
+    [
+        ("busy", "writer-conflict", "retry-later"),
+        ("conflict", "request-conflict", "reload"),
+        ("admission", "writer-conflict", "inspect-status"),
+    ],
+)
+def test_paper_accept_retries_only_busy_storage_and_records_no_effects(demo_root, monkeypatch, fault, code, policy):
+    from hedge_fund.runtime.admission import AdmissionError
+    from hedge_fund.runtime.operations import OperationBusy, OperationConflict
+    from hedge_fund.web.schemas import error_payload
+
+    faults = {
+        "busy": OperationBusy("synthetic busy"),
+        "conflict": OperationConflict("synthetic conflict"),
+        "admission": AdmissionError("synthetic admission"),
+    }
+    data_client = _OfflineDataClient()
+    service = DeskService(
+        demo_root,
+        allow_writes=True,
+        network_enabled=True,
+        data_client_factory=lambda: data_client,
+        fund_factory=_OfflineFund,
+    )
+    service._runtime_settings = _local_settings()
+    try:
+        spec = load_spec(demo_root / "mandates" / "demo-quality.yaml").model_copy(update={"name": "fault-test"})
+        service.create_mandate(spec.model_dump(mode="python"))
+        service.deploy_mandate("fault-test", DeployRequest(universe=["AAPL", "MSFT"]))
+        ledger = Ledger(demo_root / "paper" / "fault-test")
+        before = ledger.sessions()
+        preview = service.create_manual_tick_preview(
+            "fault-test",
+            PaperTickPreviewRequest(expected_head=None),
+            operator_session="offline-test-session",
+        )
+
+        def fail(*_args, **_kwargs):
+            raise faults[fault]
+
+        monkeypatch.setattr(service._operation_store, "accept_request", fail)
+        with pytest.raises(ServiceError) as denied:
+            service.accept_manual_tick(
+                "fault-test",
+                PaperTickAcceptRequest(
+                    request_id=f"offline-fault-{fault}",
+                    preview_id=preview["preview_id"],
+                    preview_digest=preview["preview_digest"],
+                    confirmation_token=preview["confirmation_token"],
+                    expected_head=None,
+                    due_set=preview["due_set"],
+                ),
+                operator_session="offline-test-session",
+            )
+        after = ledger.sessions()
+    finally:
+        service.close()
+
+    body = error_payload(denied.value.status_code, denied.value.detail, code=denied.value.code, retry_policy=denied.value.retry_policy)
+    assert (denied.value.status_code, body["code"], body["retry_policy"]) == (409, code, policy)
+    assert "synthetic" not in denied.value.detail
+    assert after == before
+
+
+def test_full_paper_capacity_denies_429_before_acceptance_and_preview_stays_usable(demo_root, monkeypatch):
+    data_client = _OfflineDataClient()
+    service = DeskService(
+        demo_root,
+        allow_writes=True,
+        network_enabled=True,
+        data_client_factory=lambda: data_client,
+        fund_factory=_OfflineFund,
+    )
+    service._runtime_settings = _local_settings()
+    try:
+        spec = load_spec(demo_root / "mandates" / "demo-quality.yaml").model_copy(update={"name": "capacity-test"})
+        service.create_mandate(spec.model_dump(mode="python"))
+        service.deploy_mandate("capacity-test", DeployRequest(universe=["AAPL", "MSFT"]))
+        ledger = Ledger(demo_root / "paper" / "capacity-test")
+        before = ledger.sessions()
+        preview = service.create_manual_tick_preview(
+            "capacity-test",
+            PaperTickPreviewRequest(expected_head=None),
+            operator_session="offline-test-session",
+        )
+        request = PaperTickAcceptRequest(
+            request_id="offline-capacity",
+            preview_id=preview["preview_id"],
+            preview_digest=preview["preview_digest"],
+            confirmation_token=preview["confirmation_token"],
+            expected_head=None,
+            due_set=preview["due_set"],
+        )
+        worker = service._paper_operation_jobs
+        with monkeypatch.context() as patched:
+            patched.setattr(worker, "try_reserve", lambda: None)
+            with pytest.raises(ServiceError) as denied:
+                service.accept_manual_tick("capacity-test", request, operator_session="offline-test-session")
+        denied_record = service._operation_store.get_by_request("offline-capacity")
+        preview_state = service._operation_store._read_index()["previews"][preview["preview_id"]]["state"]
+        after_denial = ledger.sessions()
+
+        accepted = service.accept_manual_tick("capacity-test", request, operator_session="offline-test-session")
+        completed = _wait_for_operation(service, accepted["operation_id"])
+    finally:
+        service.close()
+
+    assert (denied.value.status_code, denied.value.code, denied.value.retry_policy, denied.value.retry_after_seconds) == (429, "capacity-denied", "retry-later", 30)
+    assert (denied.value.subject_id, denied.value.request_id) == ("capacity-test", "offline-capacity")
+    assert denied_record is None
+    assert preview_state == "issued"
+    assert after_denial == before
+    assert completed["status"] == "completed", completed

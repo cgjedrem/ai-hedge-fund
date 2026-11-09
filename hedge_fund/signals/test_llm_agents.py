@@ -7,9 +7,10 @@ import pytest
 from hedge_fund.data.client import FDClientError
 from hedge_fund.data.models import CompanyNews, FinancialMetrics
 from hedge_fund.features.breakpoints import MEBreakpoints
-from hedge_fund.llm import PromptCache, extract_json
-from hedge_fund.llm.client import LLMParseError
+from hedge_fund.llm import extract_json, PromptCache
+from hedge_fund.llm.client import LLMCallError, LLMParseError
 from hedge_fund.models import Signal
+from hedge_fund.runtime.policy import AuthorizationDenied
 from hedge_fund.signals import (
     AckmanAgent,
     BuffettAgent,
@@ -20,7 +21,6 @@ from hedge_fund.signals import (
     PabraiAgent,
     WoodAgent,
 )
-
 
 # ---------------------------------------------------------------------------
 # Fakes
@@ -130,6 +130,33 @@ def test_llm_error_abstains(tmp_path):
     assert sig.value == 0.0
     assert sig.metadata["abstained"] is True
     assert "timed out" in sig.metadata["abstain_reason"]
+
+
+@pytest.mark.parametrize("error", [LLMCallError("synthetic provider failure"), TimeoutError("synthetic secret")])
+def test_opt_in_transport_failure_stops_before_another_sample(tmp_path, error):
+    llm = FakeLLM(error=error)
+    agent = BuffettAgent(
+        llm=llm,
+        cache=PromptCache(tmp_path / "llm"),
+        samples=3,
+        fail_on_llm_error=True,
+    )
+
+    with pytest.raises(LLMCallError) as failed:
+        agent.predict("TEST", "2025-01-15", MockDataClient(metrics=_history()))
+
+    assert llm.calls == 1
+    assert "synthetic secret" not in str(failed.value)
+
+
+def test_provider_authorization_denial_propagates(tmp_path):
+    agent = _agent(
+        tmp_path,
+        FakeLLM(error=AuthorizationDenied("operation expired")),
+    )
+
+    with pytest.raises(AuthorizationDenied, match="operation expired"):
+        agent.predict("TEST", "2025-01-15", MockDataClient(metrics=_history()))
 
 
 def test_insufficient_data_abstains(tmp_path):

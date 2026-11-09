@@ -3,7 +3,14 @@ import { resolve } from "node:path";
 
 import { expect, test, type Page } from "@playwright/test";
 
-const screenshotDir = resolve(process.cwd(), "../specs/004-react-web-ui/screenshots");
+const port = process.env.AIHF_WEB_PORT;
+if (port !== "8876") {
+  throw new Error("Run browser acceptance through the owned 8876 harness.");
+}
+const origin = `http://127.0.0.1:${port}`;
+const screenshotOutput = process.env.AIHF_PLAYWRIGHT_SCREENSHOT_DIR;
+if (!screenshotOutput) throw new Error("Run browser acceptance through the owned fixture.");
+const screenshotDir = resolve(screenshotOutput);
 const screenRoutes = [
   { path: "/", heading: "Research with a clear view of risk.", screenshot: "overview" },
   { path: "/mandates", heading: "Mandates", screenshot: "mandates" },
@@ -14,12 +21,11 @@ const screenRoutes = [
   { path: "/paper/demo-quality/sessions/2024-06-04", heading: "2024-06-04", screenshot: "session-report" },
   { path: "/paper/demo-quality/scorecard", heading: "demo-quality scorecard", screenshot: "scorecard" },
   { path: "/research", heading: "Research reports", screenshot: "research-list" },
-  { path: "/backtests", heading: "Backtest jobs", screenshot: "backtests" },
+  { path: "/backtests", heading: "Backtest operations", screenshot: "backtests" },
   { path: "/settings", heading: "Settings", screenshot: "settings" },
 ];
 
 test.beforeEach(async ({ page }) => {
-  const origin = `http://127.0.0.1:${process.env.AIHF_WEB_PORT ?? "8765"}`;
   await page.route("**/*", (route) => {
     if (new URL(route.request().url()).origin !== origin) return route.abort();
     return route.continue();
@@ -47,18 +53,49 @@ async function assertCustomMode(page: Page, mode: string): Promise<void> {
   await expect(heading.locator("xpath=..").getByText(mode, { exact: true })).toBeVisible();
 }
 
+async function installSyntheticPaperCapabilities(page: Page): Promise<string> {
+  const [capabilitiesResponse, paperResponse] = await Promise.all([
+    page.request.get("/api/capabilities"),
+    page.request.get("/api/paper/demo-quality"),
+  ]);
+  expect(capabilitiesResponse.ok()).toBe(true);
+  expect(paperResponse.ok()).toBe(true);
+  const capabilities = await capabilitiesResponse.json();
+  const paper = await paperResponse.json();
+  expect(paper.broker).toBe("paper");
+  expect(paper.ledger.ok).toBe(true);
+  expect(paper.halt_state).toBe("clear");
+  const head = paper.last_record_hash as string;
+  expect(head).toMatch(/^[a-f0-9]{64}$/);
+
+  await page.route("**/api/capabilities", (route) =>
+    route.fulfill({
+      json: {
+        ...capabilities,
+        mode: "live",
+        read_only: false,
+        writes: true,
+        network: true,
+        enrollment_state: "enrolled",
+        write_unavailable_reason: null,
+        protected_names: [],
+        mutation_token: "browser-paper-control-token",
+      },
+    }),
+  );
+  return head;
+}
+
 test("production routes render at desktop and narrow widths without external requests", async ({ page }) => {
   mkdirSync(screenshotDir, { recursive: true });
   const externalRequests: string[] = [];
-  const baseOrigin = `http://127.0.0.1:${process.env.AIHF_WEB_PORT ?? "8765"}`;
   page.on("request", (request) => {
-    if (baseOrigin && new URL(request.url()).origin !== baseOrigin) {
+    if (new URL(request.url()).origin !== origin) {
       externalRequests.push(request.url());
     }
   });
 
   await page.setViewportSize({ width: 1440, height: 1000 });
-  await page.goto("/");
 
   for (const route of screenRoutes) {
     await page.goto(route.path);
@@ -149,6 +186,693 @@ test("production routes render at desktop and narrow widths without external req
   expect(externalRequests).toEqual([]);
 });
 
+test("research history search follows stable page cursors", async ({ page }) => {
+  const researchRequests: string[] = [];
+  const summary = {
+    id: "history-001.json",
+    fund: "demo-quality",
+    start: "2024-01-01",
+    end: "2024-01-02",
+    rebalance: "daily",
+    benchmark: "SPY",
+    universe: ["AAPL"],
+    session_count: 2,
+    metrics: { total_return_pct: 1.25, max_drawdown_pct: -0.5 },
+  };
+  await page.route(
+    (url) => url.pathname === "/api/research",
+    async (route) => {
+      const requestUrl = new URL(route.request().url());
+      researchRequests.push(requestUrl.toString());
+      const cursor = requestUrl.searchParams.get("cursor");
+      const search = requestUrl.searchParams.get("search") ?? "";
+      await route.fulfill({
+        json: cursor
+          ? {
+              items: [],
+              errors: [],
+              next_cursor: null,
+              limit: 50,
+              total: 51,
+              search,
+            }
+          : {
+              items: [summary],
+              errors: [],
+              next_cursor: "history-050.json",
+              limit: 50,
+              total: 51,
+              search,
+            },
+      });
+    },
+  );
+
+  await page.goto("/research");
+  await page.getByRole("searchbox", { name: "Search reports or funds" }).fill("demo");
+  await page.getByRole("button", { name: "Search", exact: true }).click();
+  await expect(page.getByRole("link", { name: "demo-quality" })).toBeVisible();
+  const firstPage = new URL(researchRequests.at(-1)!);
+  expect(firstPage.searchParams.get("search")).toBe("demo");
+  expect(firstPage.searchParams.has("cursor")).toBe(false);
+
+  await page.getByRole("button", { name: "Next" }).click();
+  await expect(page.getByText("Page 2")).toBeVisible();
+  await expect(page.getByText("No research reports")).toBeVisible();
+  const secondPage = new URL(researchRequests.at(-1)!);
+  expect(secondPage.searchParams.get("search")).toBe("demo");
+  expect(secondPage.searchParams.get("cursor")).toBe("history-050.json");
+});
+
+test("paper session history search follows verified cursors", async ({ page }) => {
+  const sessionRequests: string[] = [];
+  const summary = {
+    session: "2024-01-02",
+    hash: "a".repeat(64),
+    nav: 100_000,
+    cash: 100_000,
+    rebalance: false,
+    orders: 0,
+    fills: 0,
+    decision_as_of: null,
+  };
+  await page.route(
+    (url) => url.pathname === "/api/paper/demo-quality/sessions",
+    async (route) => {
+      const requestUrl = new URL(route.request().url());
+      sessionRequests.push(requestUrl.toString());
+      const cursor = requestUrl.searchParams.get("cursor");
+      const search = requestUrl.searchParams.get("search") ?? "";
+      await route.fulfill({
+        json: {
+          items: cursor ? [] : [summary],
+          errors: [],
+          next_cursor: cursor ? null : "2024-01-01",
+          limit: 50,
+          total: 1,
+          search,
+          ledger: { ok: true, error: null },
+        },
+      });
+    },
+  );
+
+  await page.goto("/paper/demo-quality");
+  await page.getByRole("searchbox", { name: "Search sessions or hashes" }).fill("2024");
+  await page.getByRole("button", { name: "Search", exact: true }).click();
+  await expect(page.getByRole("link", { name: "2024-01-02" })).toBeVisible();
+  const firstPage = new URL(sessionRequests.at(-1)!);
+  expect(firstPage.searchParams.get("search")).toBe("2024");
+  expect(firstPage.searchParams.has("cursor")).toBe(false);
+
+  await page.getByRole("button", { name: "Next" }).click();
+  await expect(page.getByText("Page 2")).toBeVisible();
+  await expect(page.getByText("No matching verified sessions")).toBeVisible();
+  const secondPage = new URL(sessionRequests.at(-1)!);
+  expect(secondPage.searchParams.get("search")).toBe("2024");
+  expect(secondPage.searchParams.get("cursor")).toBe("2024-01-01");
+});
+
+test("paper valuation requires an explicit quote refresh", async ({ page }) => {
+  const capabilities = await (await page.request.get("/api/capabilities")).json();
+  const paper = await (await page.request.get("/api/paper/demo-quality")).json();
+  const valuationRequests: { body: unknown; token: string | null }[] = [];
+  const estimate = {
+    status: "estimated",
+    value: "123456.789",
+    partial_estimate: null,
+    as_of: "2026-10-29T12:00:00Z",
+    provenance: "yfinance",
+    expected_head: paper.last_record_hash,
+    recorded_nav: String(paper.nav),
+    request_id: "a".repeat(32),
+    deployment: "demo-quality",
+    coverage: { total: 1, quoted: 1, usable: 1, missing: 0, stale: 0, errors: 0 },
+    quotes: [{
+      ticker: "AAPL",
+      shares: "100",
+      price: "1234.56789",
+      quote_time: "2026-10-29T11:59:55Z",
+      observation_age_seconds: 5,
+      status: "quoted",
+      freshness: "unknown",
+      reason: "Observation time is not an exchange print time; freshness is unverified.",
+    }],
+    reason: "Complete symbol coverage; provider print freshness is unverified.",
+  };
+  await page.route("**/api/capabilities", (route) =>
+    route.fulfill({
+      json: {
+        ...capabilities,
+        writes: true,
+        read_only: false,
+        network: true,
+        mutation_token: "browser-valuation-token",
+      },
+    }),
+  );
+  await page.route("**/api/paper/demo-quality/valuation", async (route) => {
+    const request = route.request();
+    if (request.method() !== "POST") {
+      await route.continue();
+      return;
+    }
+    valuationRequests.push({
+      body: request.postDataJSON(),
+      token: request.headers()["x-csrf-token"] ?? null,
+    });
+    await route.fulfill({ json: estimate });
+  });
+  await page.goto("/paper/demo-quality");
+  await expect(page.getByRole("heading", { name: "demo-quality" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Refresh estimate" })).toBeEnabled();
+  expect(valuationRequests).toEqual([]);
+
+  await page.getByRole("button", { name: "Refresh estimate" }).click();
+  await expect(page.getByText("Exact estimate · 123456.789")).toBeVisible();
+  expect(valuationRequests).toEqual([
+    {
+      body: { expected_head: paper.last_record_hash },
+      token: "browser-valuation-token",
+    },
+  ]);
+});
+
+test("manual tick review accepts once and reload restores durable progress", async ({ page }) => {
+  const head = await installSyntheticPaperCapabilities(page);
+  const operationId = "2".repeat(32);
+  const dueSession = "2024-06-06";
+  const stoppedRunner = {
+    status: "stopped",
+    available: false,
+    reason: "No owned runner is active.",
+    started_at: null,
+    expires_at: null,
+    sessions_completed: 0,
+    max_sessions: null,
+    last_session: null,
+  };
+  const preview = {
+    preview_id: "5".repeat(32),
+    preview_digest: "6".repeat(64),
+    confirmation_token: "browser-manual-tick-confirmation",
+    action: "paper-tick",
+    subject_id: "demo-quality",
+    expected_head: head,
+    due_set: [dueSession],
+    capture_id: "3".repeat(32),
+    capture_digest: "4".repeat(64),
+    expires_at: "2026-10-31T12:10:00+00:00",
+    payload: { kind: "manual-tick", session: dueSession, expected_head: head },
+    capture: { data_provider: "yfinance", llm_provider: "Ollama", model: "gemma3:4b" },
+    estimate: {
+      maximum_model_calls_per_session: 4,
+      maximum_calls: 3,
+      maximum_resources: 4,
+      maximum_cost_usd: 0,
+      market_data_provider: "yfinance",
+    },
+    warnings: ["Synthetic browser fixture; no provider call."],
+  };
+  const operation = {
+    operation_id: operationId,
+    request_id: "browser-manual-tick",
+    action: "paper-tick",
+    subject_id: "demo-quality",
+    capture_id: preview.capture_id,
+    capture_digest: preview.capture_digest,
+    status: "running",
+    created_at: "2026-10-31T12:00:00+00:00",
+    updated_at: "2026-10-31T12:00:01+00:00",
+    payload: preview.payload,
+    result: null,
+    progress: 25,
+    id: operationId,
+    fund: "demo-quality",
+    provider: null,
+    model: null,
+    report_id: null,
+    error: null,
+    cancel_requested: false,
+    status_url: `/api/operations/${operationId}`,
+  };
+  let previewCount = 0;
+  let acceptCount = 0;
+
+  await page.route("**/api/paper/demo-quality/runner", (route) =>
+    route.fulfill({ json: stoppedRunner }),
+  );
+  await page.route("**/api/paper/demo-quality/tick/preview", async (route) => {
+    previewCount += 1;
+    expect(route.request().headers()["x-csrf-token"]).toBe("browser-paper-control-token");
+    expect(route.request().postDataJSON()).toEqual({ expected_head: head });
+    await route.fulfill({ status: 201, json: preview });
+  });
+  await page.route("**/api/paper/demo-quality/tick", async (route) => {
+    acceptCount += 1;
+    expect(route.request().headers()["x-csrf-token"]).toBe("browser-paper-control-token");
+    const body = route.request().postDataJSON() as Record<string, unknown>;
+    expect(body).toMatchObject({
+      preview_id: preview.preview_id,
+      preview_digest: preview.preview_digest,
+      confirmation_token: preview.confirmation_token,
+      expected_head: head,
+      due_set: [dueSession],
+    });
+    expect(body.request_id).toMatch(/^[a-f0-9]{32}$/);
+    operation.request_id = String(body.request_id);
+    await route.fulfill({ status: 202, json: operation });
+  });
+  await page.route(`**/api/operations/${operationId}`, (route) =>
+    route.fulfill({ json: operation }),
+  );
+
+  await page.goto("/paper/demo-quality");
+  await expect(page.getByRole("heading", { name: "demo-quality" })).toBeVisible();
+  const review = page.getByRole("button", { name: "Manual one-session tick" });
+  await expect(review).toBeEnabled();
+  await review.click();
+  const dialog = page.getByRole("dialog", { name: "Confirm one-session paper tick" });
+  await expect(dialog).toBeVisible();
+  expect(previewCount).toBe(1);
+  expect(acceptCount).toBe(0);
+
+  const accept = dialog.getByRole("button", { name: "Accept one-session tick" });
+  await accept.evaluate((element) => {
+    const button = element as HTMLButtonElement;
+    button.click();
+    button.click();
+  });
+  await expect(page.getByText("Manual tick · running")).toBeVisible();
+  await expect(page.getByRole("progressbar", { name: "Paper operation progress" })).toHaveAttribute("aria-valuenow", "25");
+  await expect(page.getByText(operationId, { exact: true })).toBeVisible();
+  expect(acceptCount).toBe(1);
+
+  await page.reload();
+  await expect(page.getByText("Manual tick · running")).toBeVisible();
+  await expect(page.getByRole("progressbar", { name: "Paper operation progress" })).toHaveAttribute("aria-valuenow", "25");
+  expect(acceptCount).toBe(1);
+  expect(previewCount).toBe(1);
+  const unchangedPaper = await (await page.request.get("/api/paper/demo-quality")).json();
+  expect(unchangedPaper.last_record_hash).toBe(head);
+});
+
+test("browser verdict binds request identity to the displayed decision", async ({ page }) => {
+  const head = await installSyntheticPaperCapabilities(page);
+  const paperResponse = await page.request.get("/api/paper/demo-quality");
+  const paper = await paperResponse.json();
+  paper.spec.approval_required = true;
+  paper.pending = {
+    decision_as_of: "2024-06-05",
+    source_record_hash: head,
+    universe: ["AAPL"],
+    target_weights: { AAPL: 1 },
+    final_weights: { AAPL: 1 },
+    strategies: ["synthetic"],
+  };
+  const verdicts: Record<string, unknown>[] = [];
+  await page.route("**/api/paper/demo-quality", (route) => route.fulfill({ json: paper }));
+  await page.route("**/api/paper/demo-quality/approval", async (route) => {
+    expect(route.request().headers()["x-csrf-token"]).toBe("browser-paper-control-token");
+    verdicts.push(route.request().postDataJSON() as Record<string, unknown>);
+    await route.fulfill({ json: { saved: true } });
+  });
+
+  await page.goto("/paper/demo-quality");
+  await page.getByRole("button", { name: "Approve" }).click();
+  const dialog = page.getByRole("dialog", { name: "Approve pending decision" });
+  await expect(dialog).toBeVisible();
+  await dialog.getByRole("button", { name: "Approve displayed decision" }).click();
+  await expect(page.getByText("Verdict approve was saved to the local approval mailbox. It does not execute immediately.")).toBeVisible();
+
+  expect(verdicts).toHaveLength(1);
+  expect(verdicts[0]).toMatchObject({
+    verdict: "approve",
+    decision_as_of: "2024-06-05",
+    source_record_hash: head,
+  });
+  expect(verdicts[0].request_id).toMatch(/^[a-f0-9]{32}$/);
+  const unchangedPaper = await (await page.request.get("/api/paper/demo-quality")).json();
+  expect(unchangedPaper.last_record_hash).toBe(head);
+  expect(unchangedPaper.approval).toBeNull();
+});
+
+test("browser Halt and manual Resume send stable control request bodies", async ({ page }) => {
+  const head = await installSyntheticPaperCapabilities(page);
+  const paper = await (await page.request.get("/api/paper/demo-quality")).json();
+  let halted = false;
+  const controls: { action: string; body: Record<string, unknown> }[] = [];
+  const noFailurePreview = {
+    schema_version: 1,
+    required: false,
+    recoverable: true,
+    reason: "no-ambiguous-tick-failure",
+    failure_id: null,
+    failed_request_id: null,
+    operation_id: null,
+    expected_head: null,
+    current_head: null,
+    broker_book_sha256: null,
+    fill_identity_sha256: null,
+    capture_id: null,
+    capture_digest: null,
+    book_matches_ledger: false,
+    head_matches_failure: false,
+    decision: "confirm-paper-book-matches-ledger",
+    residual_uncertainty: "external-broker-state-not-applicable-local-paper-only",
+    preview_digest: null,
+  };
+  await page.route("**/api/paper/demo-quality", (route) => route.fulfill({
+    json: {
+      ...paper,
+      halted: halted ? "synthetic browser pause" : null,
+      halt_state: halted ? "halted" : "clear",
+    },
+  }));
+  await page.route("**/api/paper/demo-quality/reconciliation", (route) => route.fulfill({
+    json: {
+      name: "demo-quality",
+      halted: "synthetic browser pause",
+      resume_allowed: true,
+      preview: noFailurePreview,
+    },
+  }));
+  await page.route("**/api/paper/demo-quality/halt", async (route) => {
+    expect(route.request().headers()["x-csrf-token"]).toBe("browser-paper-control-token");
+    controls.push({ action: "halt", body: route.request().postDataJSON() as Record<string, unknown> });
+    halted = true;
+    await route.fulfill({ json: { name: "demo-quality", halted: true } });
+  });
+  await page.route("**/api/paper/demo-quality/resume", async (route) => {
+    expect(route.request().headers()["x-csrf-token"]).toBe("browser-paper-control-token");
+    controls.push({ action: "resume", body: route.request().postDataJSON() as Record<string, unknown> });
+    halted = false;
+    await route.fulfill({ json: { name: "demo-quality", halted: false, reconciliation_id: null } });
+  });
+
+  await page.goto("/paper/demo-quality");
+  await page.getByRole("button", { name: "Halt" }).click();
+  const haltDialog = page.getByRole("dialog", { name: "Halt demo-quality" });
+  await expect(haltDialog).toBeVisible();
+  await haltDialog.getByLabel("Reason").fill("synthetic browser pause");
+  await haltDialog.getByRole("button", { name: "Record halt" }).click();
+  await expect(page.getByText("Halt state recorded in the ledger. Runner process control is not available here.")).toBeVisible();
+  const resumeButton = page.getByRole("button", { name: "Resume" });
+  await expect(resumeButton).toBeEnabled();
+  await resumeButton.click();
+  const resumeDialog = page.getByRole("dialog", { name: "Resume paper fund" });
+  await expect(resumeDialog).toBeVisible();
+  await resumeDialog.getByRole("button", { name: "Record resume" }).click();
+  await expect(page.getByText("Halt cleared. No paper operation ran and no runner was started.")).toBeVisible();
+
+  expect(controls).toHaveLength(2);
+  expect(controls[0].action).toBe("halt");
+  expect(controls[0].body).toMatchObject({ reason: "synthetic browser pause" });
+  expect(controls[0].body.request_id).toMatch(/^[a-f0-9]{32}$/);
+  expect(controls[1]).toMatchObject({
+    action: "resume",
+    body: { request_id: expect.stringMatching(/^[a-f0-9]{32}$/) },
+  });
+  const unchangedPaper = await (await page.request.get("/api/paper/demo-quality")).json();
+  expect(unchangedPaper.last_record_hash).toBe(head);
+  expect(unchangedPaper.halt_state).toBe("clear");
+});
+
+test("browser recovery confirms hash-bound preview without retrying a tick or starting a runner", async ({ page }) => {
+  const head = await installSyntheticPaperCapabilities(page);
+  const paper = await (await page.request.get("/api/paper/demo-quality")).json();
+  paper.halted = "synthetic tick failure";
+  paper.halt_state = "halted";
+  const preview = {
+    schema_version: 1,
+    required: true,
+    recoverable: true,
+    reason: "ready",
+    failure_id: "a".repeat(64),
+    failed_request_id: "tick-synthetic",
+    operation_id: "b".repeat(32),
+    expected_head: head,
+    current_head: head,
+    broker_book_sha256: "c".repeat(64),
+    fill_identity_sha256: "d".repeat(64),
+    capture_id: "e".repeat(32),
+    capture_digest: "f".repeat(64),
+    book_matches_ledger: true,
+    head_matches_failure: true,
+    decision: "confirm-paper-book-matches-ledger",
+    residual_uncertainty: "external-broker-state-not-applicable-local-paper-only",
+    preview_digest: "1".repeat(64),
+  };
+  const submissions: Record<string, unknown>[] = [];
+  await page.route("**/api/paper/demo-quality", (route) => route.fulfill({ json: paper }));
+  await page.route("**/api/paper/demo-quality/reconciliation", (route) => route.fulfill({
+    json: { name: "demo-quality", halted: "synthetic tick failure", resume_allowed: true, preview },
+  }));
+  await page.route("**/api/paper/demo-quality/resume", async (route) => {
+    submissions.push(route.request().postDataJSON() as Record<string, unknown>);
+    await route.fulfill({
+      json: { name: "demo-quality", halted: false, reconciliation_id: "2".repeat(64) },
+    });
+  });
+
+  await page.goto("/paper/demo-quality");
+  await expect(page.getByText("Ambiguous tick failure")).toBeVisible();
+  await page.getByRole("button", { name: "Review recovery" }).click();
+  const dialog = page.getByRole("dialog", { name: "Reconcile and resume paper fund" });
+  await expect(dialog).toBeVisible();
+  await dialog.getByRole("button", { name: "Confirm recovery and resume" }).click();
+  await expect(page.getByText("Reconciliation receipt recorded. Halt cleared. Failed tick was not retried; no runner was started.")).toBeVisible();
+
+  expect(submissions).toHaveLength(1);
+  expect(submissions[0]).toMatchObject({
+    failure_id: preview.failure_id,
+    preview_digest: preview.preview_digest,
+    decision: preview.decision,
+  });
+  expect(submissions[0].request_id).toMatch(/^[a-f0-9]{32}$/);
+  const unchangedPaper = await (await page.request.get("/api/paper/demo-quality")).json();
+  expect(unchangedPaper.last_record_hash).toBe(head);
+  expect(unchangedPaper.halt_state).toBe("clear");
+});
+
+test("manual tick rejects stale-head acceptance without creating an operation", async ({ page }) => {
+  const head = await installSyntheticPaperCapabilities(page);
+  const dueSession = "2024-06-06";
+  const preview = {
+    preview_id: "5".repeat(32),
+    preview_digest: "6".repeat(64),
+    confirmation_token: "browser-stale-head-confirmation",
+    action: "paper-tick",
+    subject_id: "demo-quality",
+    expected_head: head,
+    due_set: [dueSession],
+    capture_id: "3".repeat(32),
+    capture_digest: "4".repeat(64),
+    expires_at: "2026-10-31T12:10:00+00:00",
+    payload: { kind: "manual-tick", session: dueSession, expected_head: head },
+    capture: { data_provider: "yfinance", llm_provider: "Ollama", model: "gemma3:4b" },
+    estimate: {
+      maximum_model_calls_per_session: 4,
+      maximum_calls: 3,
+      maximum_resources: 4,
+      maximum_cost_usd: 0,
+      market_data_provider: "yfinance",
+    },
+    warnings: ["Synthetic browser fixture; no provider call."],
+  };
+  let acceptCount = 0;
+  await page.route("**/api/paper/demo-quality/runner", (route) =>
+    route.fulfill({
+      json: {
+        status: "stopped",
+        available: false,
+        reason: "No owned runner is active.",
+        started_at: null,
+        expires_at: null,
+        sessions_completed: 0,
+        max_sessions: null,
+        last_session: null,
+      },
+    }),
+  );
+  await page.route("**/api/paper/demo-quality/tick/preview", async (route) => {
+    expect(route.request().postDataJSON()).toEqual({ expected_head: head });
+    await route.fulfill({ status: 201, json: preview });
+  });
+  await page.route("**/api/paper/demo-quality/tick", async (route) => {
+    acceptCount += 1;
+    const body = route.request().postDataJSON() as Record<string, unknown>;
+    expect(body.expected_head).toBe(head);
+    expect(body.due_set).toEqual([dueSession]);
+    await route.fulfill({
+      status: 409,
+      json: { detail: "Ledger head changed; reload before submitting a tick." },
+    });
+  });
+
+  await page.goto("/paper/demo-quality");
+  await expect(page.getByRole("heading", { name: "demo-quality" })).toBeVisible();
+  await page.getByRole("button", { name: "Manual one-session tick" }).click();
+  const dialog = page.getByRole("dialog", { name: "Confirm one-session paper tick" });
+  await expect(dialog).toBeVisible();
+  await dialog.getByRole("button", { name: "Accept one-session tick" }).click();
+  await expect(page.getByText("Ledger head changed; reload before submitting a tick.")).toBeVisible();
+  expect(acceptCount).toBe(1);
+  expect(await page.evaluate(() => localStorage.getItem("aihf.paper.demo-quality.operation"))).toBeNull();
+  await expect(page.getByText(/Manual tick ·/)).toHaveCount(0);
+  const unchangedPaper = await (await page.request.get("/api/paper/demo-quality")).json();
+  expect(unchangedPaper.last_record_hash).toBe(head);
+});
+
+test("runner browser controls accept finite bounds and request cooperative stop", async ({ page }) => {
+  const head = await installSyntheticPaperCapabilities(page);
+  const operationId = "7".repeat(32);
+  const preview = {
+    preview_id: "8".repeat(32),
+    preview_digest: "9".repeat(64),
+    confirmation_token: "browser-runner-confirmation",
+    action: "paper-runner-start",
+    subject_id: "demo-quality",
+    expected_head: head,
+    due_set: [],
+    capture_id: "a".repeat(32),
+    capture_digest: "b".repeat(64),
+    expires_at: "2026-10-31T12:10:00+00:00",
+    payload: {
+      kind: "runner-start",
+      max_sessions: 1,
+      max_runtime_minutes: 60,
+      max_calls: 63,
+      max_resources: 130,
+    },
+    capture: { data_provider: "yfinance", llm_provider: "Ollama", model: "gemma3:4b" },
+    estimate: {
+      maximum_model_calls_per_session: 4,
+      maximum_calls: 63,
+      maximum_resources: 130,
+      maximum_cost_usd: 0,
+      market_data_provider: "yfinance",
+    },
+    warnings: ["Synthetic browser fixture; no provider call."],
+  };
+  const operation = {
+    operation_id: operationId,
+    request_id: "browser-runner-start",
+    action: "paper-runner-start",
+    subject_id: "demo-quality",
+    capture_id: preview.capture_id,
+    capture_digest: preview.capture_digest,
+    status: "completed",
+    created_at: "2026-10-31T12:00:00+00:00",
+    updated_at: "2026-10-31T12:00:01+00:00",
+    payload: preview.payload,
+    result: { runner: { status: "running" } },
+    progress: 100,
+    id: operationId,
+    fund: "demo-quality",
+    provider: null,
+    model: null,
+    report_id: null,
+    error: null,
+    cancel_requested: false,
+    status_url: `/api/operations/${operationId}`,
+  };
+  let currentRunner: Record<string, unknown> = {
+    status: "stopped",
+    available: false,
+    reason: "No owned runner is active.",
+    started_at: null,
+    expires_at: null,
+    sessions_completed: 0,
+    max_sessions: null,
+    last_session: null,
+  };
+  let startCount = 0;
+  let stopCount = 0;
+
+  await page.route("**/api/paper/demo-quality/runner", async (route) => {
+    if (route.request().method() === "GET") {
+      await route.fulfill({ json: currentRunner });
+      return;
+    }
+    if (route.request().method() === "POST") {
+      startCount += 1;
+      expect(route.request().headers()["x-csrf-token"]).toBe("browser-paper-control-token");
+      const body = route.request().postDataJSON() as Record<string, unknown>;
+      expect(body).toMatchObject({
+        preview_id: preview.preview_id,
+        preview_digest: preview.preview_digest,
+        confirmation_token: preview.confirmation_token,
+        expected_head: head,
+        due_set: [],
+        max_sessions: 1,
+        max_runtime_minutes: 60,
+      });
+      expect(body.request_id).toMatch(/^[a-f0-9]{32}$/);
+      operation.request_id = String(body.request_id);
+      currentRunner = {
+        status: "running",
+        available: true,
+        reason: null,
+        started_at: "2026-10-31T12:00:00+00:00",
+        expires_at: "2026-10-31T13:00:00+00:00",
+        sessions_completed: 0,
+        max_sessions: 1,
+        last_session: null,
+      };
+      await route.fulfill({ status: 202, json: operation });
+      return;
+    }
+    await route.continue();
+  });
+  await page.route("**/api/paper/demo-quality/runner/preview", async (route) => {
+    expect(route.request().headers()["x-csrf-token"]).toBe("browser-paper-control-token");
+    expect(route.request().postDataJSON()).toEqual({
+      expected_head: head,
+      max_sessions: 1,
+      max_runtime_minutes: 60,
+    });
+    await route.fulfill({ status: 201, json: preview });
+  });
+  await page.route(`**/api/operations/${operationId}`, (route) =>
+    route.fulfill({ json: operation }),
+  );
+  await page.route("**/api/paper/demo-quality/runner/stop", async (route) => {
+    stopCount += 1;
+    expect(route.request().headers()["x-csrf-token"]).toBe("browser-paper-control-token");
+    const body = route.request().postDataJSON() as Record<string, unknown>;
+    expect(body).toEqual({});
+    expect(JSON.stringify(body)).not.toContain("pid");
+    currentRunner = { ...currentRunner, status: "stopping", reason: "Stop requested." };
+    await route.fulfill({ json: currentRunner });
+  });
+
+  await page.goto("/paper/demo-quality");
+  await expect(page.getByRole("heading", { name: "demo-quality" })).toBeVisible();
+  const start = page.getByRole("button", { name: "Start runner" });
+  await expect(start).toBeEnabled();
+  await start.click();
+  const startDialog = page.getByRole("dialog", { name: "Confirm finite runner start" });
+  await expect(startDialog).toBeVisible();
+  expect(startCount).toBe(0);
+  await startDialog.getByRole("button", { name: "Accept finite runner" }).click();
+  await expect(page.getByRole("button", { name: "Stop runner" })).toBeEnabled();
+  expect(startCount).toBe(1);
+
+  await page.getByRole("button", { name: "Stop runner" }).click();
+  const stopDialog = page.getByRole("dialog", { name: "Stop owned runner for demo-quality" });
+  await expect(stopDialog).toBeVisible();
+  expect(stopCount).toBe(0);
+  await stopDialog.getByRole("button", { name: "Request runner stop" }).click();
+  await expect(page.getByText("Owned runner stop requested. An in-flight session may finish before it exits.")).toBeVisible();
+  expect(stopCount).toBe(1);
+  expect(await page.evaluate(() => localStorage.getItem("aihf.paper.demo-quality.operation"))).toBe(operationId);
+  const unchangedPaper = await (await page.request.get("/api/paper/demo-quality")).json();
+  expect(unchangedPaper.last_record_hash).toBe(head);
+  const realRunner = await (await page.request.get("/api/paper/demo-quality/runner")).json();
+  expect(realRunner.available).toBe(false);
+});
+
 test("builder preserves canonical library models, weights, params, and blend policy", async ({ page }) => {
   const capabilities = await (await page.request.get("/api/capabilities")).json();
   const catalog = await (await page.request.get("/api/catalog")).json();
@@ -214,45 +938,88 @@ test("builder preserves canonical library models, weights, params, and blend pol
   expect(custom?.blend).toMatchObject({ mode: "long_short", method: "conviction_weighted", gross_target: 1 });
 });
 
-test("backtest requires review, captures inputs, and requests cooperative cancellation", async ({ page }) => {
+test("backtest requires a server preview, durable acceptance, and boundary cancellation", async ({ page }) => {
   const capabilities = await (await page.request.get("/api/capabilities")).json();
   const settings = await (await page.request.get("/api/settings")).json();
   const mandates = await (await page.request.get("/api/mandates")).json();
   const mandateHash = mandates.items.find((item: { name: string }) => item.name === "demo-quality").mandate_hash as string;
-  let submitted: Record<string, unknown> | null = null;
+  let previewRequest: Record<string, unknown> | null = null;
+  let acceptedRequest: Record<string, unknown> | null = null;
   let cancelRequested = false;
   let cancelCalls = 0;
-  const jobId = "a".repeat(32);
-  const fakeJob = () => ({
-    id: jobId,
+  let previewCount = 0;
+  const operationId = "a".repeat(32);
+  const previewResponse = () => {
+    previewCount += 1;
+    const body = previewRequest as { payload: Record<string, unknown> };
+    return {
+      preview_id: String(previewCount).padStart(32, "0"),
+      preview_digest: "d".repeat(64),
+      confirmation_token: `synthetic-confirmation-${previewCount}`,
+      action: "backtest",
+      subject_id: "demo-quality",
+      expected_head: mandateHash,
+      due_set: [],
+      capture_id: "c".repeat(32),
+      capture_digest: "e".repeat(64),
+      expires_at: "2026-10-31T12:10:00+00:00",
+      payload: body.payload,
+      capture: { model: settings.model },
+      estimate: {
+        maximum_model_calls: 24,
+        maximum_cost_usd: 0,
+        market_data_provider: settings.data_provider,
+      },
+      warnings: ["Synthetic browser fixture; no provider call."],
+    };
+  };
+  const fakeOperation = () => ({
+    operation_id: operationId,
+    request_id: String(acceptedRequest?.request_id ?? "browser-backtest"),
+    action: "backtest",
+    subject_id: "demo-quality",
+    capture_id: "c".repeat(32),
+    capture_digest: "e".repeat(64),
+    status: cancelRequested ? "cancel-requested" : "running",
+    created_at: "2026-10-31T12:00:00+00:00",
+    updated_at: "2026-10-31T12:00:01+00:00",
+    payload: acceptedRequest?.payload,
+    result: null,
+    progress: 40,
+    id: operationId,
     fund: "demo-quality",
     provider: settings.data_provider,
     model: settings.model,
-    status: "running",
-    progress: 40,
-    submitted_at: "2024-06-01T12:00:00+00:00",
-    started_at: "2024-06-01T12:00:01+00:00",
-    completed_at: null,
     report_id: null,
     error: null,
     cancel_requested: cancelRequested,
+    status_url: `/api/operations/${operationId}`,
   });
   await page.route("**/api/capabilities", (route) =>
     route.fulfill({ json: { ...capabilities, writes: true, read_only: false, network: true, mutation_token: "browser-test-token" } }),
   );
-  await page.route("**/api/backtests", async (route) => {
-    if (route.request().method() !== "POST") {
-      await route.continue();
+  await page.route("**/api/operations/preview", async (route) => {
+    previewRequest = route.request().postDataJSON() as Record<string, unknown>;
+    await route.fulfill({ status: 201, json: previewResponse() });
+  });
+  await page.route("**/api/operations", async (route) => {
+    if (route.request().method() === "POST") {
+      acceptedRequest = route.request().postDataJSON() as Record<string, unknown>;
+      await route.fulfill({ status: 202, json: fakeOperation() });
       return;
     }
-    submitted = route.request().postDataJSON() as Record<string, unknown>;
-    await route.fulfill({ status: 202, json: fakeJob() });
+    await route.fulfill({ json: { items: acceptedRequest ? [fakeOperation()] : [] } });
   });
-  await page.route(`**/api/jobs/${jobId}`, (route) => route.fulfill({ json: fakeJob() }));
-  await page.route(`**/api/jobs/${jobId}/cancel`, async (route) => {
+  await page.route(`**/api/operations/${operationId}`, (route) =>
+    route.fulfill({ json: fakeOperation() }),
+  );
+  await page.route(`**/api/operations/${operationId}/cancel`, async (route) => {
+    expect(route.request().headers()["x-csrf-token"]).toBe("browser-test-token");
+    const body = route.request().postDataJSON() as { request_id?: string };
+    expect(body.request_id).toMatch(/^[a-f0-9]{32}$/);
     cancelCalls += 1;
     cancelRequested = true;
-    await route.fulfill({ json: fakeJob() });
+    await route.fulfill({ json: fakeOperation() });
   });
 
   await page.goto("/backtests");
@@ -263,32 +1030,55 @@ test("backtest requires review, captures inputs, and requests cooperative cancel
   const dialog = page.getByRole("dialog");
   await expect(dialog.getByText("Market-data provider")).toBeVisible();
   await expect(dialog.getByText("LLM model")).toBeVisible();
-  await expect(dialog.getByText("Agents")).toBeVisible();
-  await expect(dialog.getByText("Mandate hash")).toBeVisible();
+  await expect(dialog.getByText("Reviewed head")).toBeVisible();
+  await expect(dialog.getByText("Preview digest")).toBeVisible();
+  await expect(dialog.getByText("Max model calls")).toBeVisible();
   await expect(dialog.getByText(mandateHash, { exact: true })).toBeVisible();
   await expect(dialog.getByText("AAPL, MSFT")).toBeVisible();
   await expect(dialog.getByText("2024-06-03 → 2024-06-07")).toBeVisible();
   await expect(dialog.getByText("Write capability")).toBeVisible();
   await expect(dialog.getByText("Network capability")).toBeVisible();
+  expect(previewRequest).toMatchObject({
+    action: "backtest",
+    subject_id: "demo-quality",
+    expected_head: mandateHash,
+    payload: {
+      fund: "demo-quality",
+      universe: ["AAPL", "MSFT"],
+      provider: settings.data_provider,
+      model: settings.model,
+      mandate_hash: mandateHash,
+    },
+  });
   await page.getByRole("button", { name: "Review later" }).click();
-  expect(submitted).toBeNull();
+  expect(acceptedRequest).toBeNull();
 
   await page.getByRole("button", { name: "Review backtest" }).click();
-  await page.getByRole("button", { name: "Confirm and submit" }).click();
-  await expect(page.getByText("running", { exact: true })).toBeVisible();
-  expect(submitted).toMatchObject({
-    fund: "demo-quality",
-    universe: ["AAPL", "MSFT"],
-    start: "2024-06-03",
-    end: "2024-06-07",
-    provider: settings.data_provider,
-    model: settings.model,
-    mandate_hash: mandateHash,
+  await page.getByRole("button", { name: "Accept reviewed operation" }).click();
+  await expect(
+    page.getByRole("region", { name: "Scrollable data table" }).getByText("running", { exact: true }),
+  ).toBeVisible();
+  expect(acceptedRequest).toMatchObject({
+    action: "backtest",
+    subject_id: "demo-quality",
+    expected_head: mandateHash,
+    payload: {
+      fund: "demo-quality",
+      universe: ["AAPL", "MSFT"],
+      start: "2024-06-03",
+      end: "2024-06-07",
+      provider: settings.data_provider,
+      model: settings.model,
+      mandate_hash: mandateHash,
+    },
   });
+  expect(acceptedRequest?.request_id).toMatch(/^[a-f0-9]{32}$/);
+  expect(acceptedRequest?.preview_id).toBe("00000000000000000000000000000002");
+  expect(acceptedRequest?.confirmation_token).toBe("synthetic-confirmation-2");
 
   await page.getByRole("button", { name: "Request cancellation" }).click();
   await expect(page.getByText("Cancellation requested…")).toBeVisible();
-  await expect(page.getByText(/in-flight provider\/session step cannot be interrupted/)).toBeVisible();
+  await expect(page.getByText(/in-flight model or data step cannot be interrupted/)).toBeVisible();
   expect(cancelCalls).toBe(1);
 });
 
@@ -345,22 +1135,38 @@ test("ungated and halted decisions never present enabled verdict actions", async
   await expect(page.getByRole("button", { name: "Resume" })).toBeDisabled();
 });
 
-test("restores a running job after navigation and reload", async ({ page }) => {
-  const jobId = "c".repeat(32);
+test("restores a running durable operation after navigation and reload", async ({ page }) => {
+  const operationId = "c".repeat(32);
   let cancelRequested = false;
-  const job = () => ({
-    id: jobId,
+  const operation = () => ({
+    operation_id: operationId,
+    request_id: "restored-backtest",
+    action: "backtest",
+    subject_id: "demo-quality",
+    capture_id: "d".repeat(32),
+    capture_digest: "e".repeat(64),
+    status: cancelRequested ? "cancel-requested" : "running",
+    created_at: "2026-10-31T12:00:00+00:00",
+    updated_at: "2026-10-31T12:00:01+00:00",
+    payload: {
+      fund: "demo-quality",
+      universe: ["AAPL"],
+      start: "2026-10-01",
+      end: "2026-10-30",
+      provider: "yfinance",
+      model: "provider/model",
+      mandate_hash: "a".repeat(64),
+    },
+    result: null,
+    progress: 40,
+    id: operationId,
     fund: "demo-quality",
     provider: "yfinance",
     model: "provider/model",
-    status: "running",
-    progress: 40,
-    submitted_at: "2026-10-31T12:00:00+00:00",
-    started_at: "2026-10-31T12:00:01+00:00",
-    completed_at: null,
     report_id: null,
     error: null,
     cancel_requested: cancelRequested,
+    status_url: `/api/operations/${operationId}`,
   });
 
   await page.route("**/api/capabilities", (route) =>
@@ -376,16 +1182,18 @@ test("restores a running job after navigation and reload", async ({ page }) => {
       },
     }),
   );
-  await page.route("**/api/jobs", (route) => route.fulfill({ json: { items: [job()] } }));
-  await page.route(`**/api/jobs/${jobId}`, (route) => route.fulfill({ json: job() }));
-  await page.route(`**/api/jobs/${jobId}/cancel`, async (route) => {
+  await page.route("**/api/operations", (route) => route.fulfill({ json: { items: [operation()] } }));
+  await page.route(`**/api/operations/${operationId}`, (route) => route.fulfill({ json: operation() }));
+  await page.route(`**/api/operations/${operationId}/cancel`, async (route) => {
     expect(route.request().headers()["x-csrf-token"]).toBe("browser-test-token");
+    const body = route.request().postDataJSON() as { request_id?: string };
+    expect(body.request_id).toMatch(/^[a-f0-9]{32}$/);
     cancelRequested = true;
-    await route.fulfill({ json: job() });
+    await route.fulfill({ json: operation() });
   });
 
   await page.goto("/backtests");
-  await expect(page.getByText(jobId)).toBeVisible();
+  await expect(page.getByText(operationId, { exact: true })).toBeVisible();
   await expect(page.getByText("40%", { exact: true }).first()).toBeVisible();
   await page.getByRole("button", { name: "Request cancellation" }).click();
   await expect(page.getByRole("button", { name: "Cancellation requested…" })).toBeVisible();
@@ -394,9 +1202,9 @@ test("restores a running job after navigation and reload", async ({ page }) => {
   await primaryNavigation.getByRole("link", { name: "Research" }).click();
   await expect(page.getByRole("heading", { name: "Research reports" })).toBeVisible();
   await primaryNavigation.getByRole("link", { name: "Backtests" }).click();
-  await expect(page.getByText(jobId)).toBeVisible();
+  await expect(page.getByText(operationId, { exact: true })).toBeVisible();
 
   await page.reload();
-  await expect(page.getByText(jobId)).toBeVisible();
+  await expect(page.getByText(operationId, { exact: true })).toBeVisible();
   await expect(page.getByText("40%", { exact: true }).first()).toBeVisible();
 });

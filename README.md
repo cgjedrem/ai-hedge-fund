@@ -27,36 +27,67 @@ By using this software, you agree to use it solely for learning purposes.
 pipx install aihf
 ```
 
-(or `uv tool install aihf`, or `pip install aihf` into an environment of your choice)
+(or `uv tool install aihf`, or `pip install aihf`)
 
-Then run it from anywhere:
+Choose an absolute data root. The CLI requires it on every launch:
 
 ```bash
-aihf
+export AIHF_ROOT="$HOME/.aihf-data"
+mkdir -p "$AIHF_ROOT"
+aihf --root "$AIHF_ROOT"
+```
+
+PowerShell:
+
+```powershell
+$env:AIHF_ROOT = Join-Path $HOME ".aihf-data"
+New-Item -ItemType Directory -Force $env:AIHF_ROOT | Out-Null
+aihf --root $env:AIHF_ROOT
 ```
 
 ### API keys
 
-The app asks for keys the first time it needs them and saves them to `~/.hedge-fund/.env` — nothing to configure up front. It needs:
+The selected root stores credentials and non-secret settings:
 
-- A [Financial Datasets](https://financialdatasets.ai) API key, for prices, fundamentals, and earnings.
-- One model API key for the investor agents. Supported providers: Anthropic, OpenAI, DeepSeek, Google, xAI, Kimi, TypeSafe (Jev) — or Ollama, which runs locally and needs no key at all.
+- Market data defaults to credential-free Yahoo Finance.
+- Models default to local Ollama. A [Financial Datasets](https://financialdatasets.ai) key or cloud-model key is needed only for a supported paid one-shot.
 
-Keys exported in your shell always win over the saved file.
+Shell API-key variables are not credential inputs. Provider/model settings may
+select a target, but credentials or environment settings never authorize calls.
 
-### Free market data (optional)
+### Market data
 
-Day-to-day paper trading and iteration can run on free Yahoo Finance data
-instead of spending Financial Datasets credits:
+Credential-free Yahoo Finance is the default and part of the base dependency
+set; no provider extra is required.
 
-```bash
-pip install aihf[yfinance]        # or: poetry install -E yfinance
-export HEDGE_FUND_DATA_PROVIDER=yfinance
-```
+Financial Datasets is an explicit paid provider selected with
+`HEDGE_FUND_DATA_PROVIDER=fd`. Yahoo fundamentals are reported as of now,
+not point-in-time; backtests using Yahoo data can leak future information.
 
-One caveat: Yahoo serves fundamentals as reported *now*, not point-in-time
-— so backtests on the free provider leak the future into the past. Keep
-`HEDGE_FUND_DATA_PROVIDER=fd` (the default) for final backtest validation.
+CLI provider calls require `--enable-network` on that invocation. Paid CLI
+one-shots and web backtests also require explicit provider approval, finite
+call/cost limits, and a deadline. Financial Datasets additionally requires
+explicit confirmation of its published self-service pricing; custom Enterprise
+pricing is unsupported. The web desk permits paid providers only for reviewed
+backtests; manual paper actions and scheduled runners are free-data, local-model
+only. The TUI does not dispatch provider calls.
+
+Reviewed web backtests and paper tick/runner starts require browser Web Locks.
+The desk serializes admission across tabs, checks pending requests and saved
+monitors again while holding the surface lock, and refuses submission if
+cross-tab coordination is unavailable. Cancelling while waiting does not save
+a request identity; reloading only inspects saved status and never resubmits.
+
+Verified paid dispatch currently covers Financial Datasets self-service data
+and TypeSafe Jev 1.13.0 model calls. Other cloud-model providers lack verified
+cost bounds and are denied before transport, even when a key is saved.
+Only one paid provider can be authorized per operation; combining paid
+Financial Datasets with TypeSafe in one action is unsupported.
+
+If Yahoo's ticker-news endpoint reports an outage, the provider logs a
+warning and tries Yahoo search news, with the same date filters. If search
+also fails or returns nothing after that outage, the error is preserved;
+the provider never silently switches to paid data.
 
 If Yahoo's ticker-news endpoint reports an outage, the provider logs a
 warning and tries Yahoo search news, with the same date filters. If search
@@ -68,13 +99,40 @@ the provider never silently switches to paid data.
 ### Interactive app
 
 ```bash
-aihf
+aihf --root "$AIHF_ROOT"
 ```
 
 With no arguments, this launches the interactive terminal app. It has two modes:
 
-- **Paper trading** — your funds, each with a ledger of real market days and fake money. Highlight a fund to see what its next run will do; press enter to review and run the next session, `y`/`n` to approve or reject a gated decision, `s` for history, and `h`/`r` for the kill switch. Build a new fund from the same list: strategies, capital, cadence, approval mode, tickers, and it is live. Every session is appended to a hash-chained ledger in `~/.hedge-fund/paper/<name>/`, so NAV is a track record, not a reset.
-- **Backtesting** — replay a fund over history and watch its equity curve draw against its benchmark. Results are saved to `~/.hedge-fund/research/`. Fund definitions live in `~/.hedge-fund/mandates/` and carry no tickers; you pick the universe per backtest.
+- **Paper trading** — your funds, each with a ledger of market days and paper money. Highlight a fund to review its next run; use `y`/`n` for gated decisions, `s` for history, and `h`/`r` for halt/resume. Sessions live in the selected root's `paper/<name>/`.
+- **Backtesting** — the legacy picker remains visible, but starting a backtest is temporarily disabled before credential prompting or worker startup. Use the authorized `aihf backtest` CLI or reviewed web desk instead. Results live in the selected root's `research/`; mandates live in `mandates/` and carry no tickers.
+
+Provider dispatch is disabled in the TUI; use the guarded CLI or web desk for
+provider-backed actions.
+
+### Check one stock
+
+From a source checkout, use an existing enrolled root and explicitly enable
+provider access for the invocation:
+
+```bash
+poetry run python check_stock.py AAPL --root "$AIHF_ROOT" --enable-network
+```
+
+Yahoo data and the local Ollama model are the defaults; the analyst panel needs
+Ollama to be available. `--agents burry,damodaran` selects analysts and
+`--date YYYY-MM-DD` sets the as-of date. Data and prompt caches stay under the
+selected root. Quant-only selections such as `--agents pead` do not authorize
+an unused LLM provider. Individual analyst errors are reported before the
+remaining analysts run; authorization and infrastructure failures stop the
+operation.
+
+Paid providers require a credential saved under that root, the matching
+`--authorize-paid-provider`, and finite `--paid-max-calls`,
+`--paid-max-cost-usd`, and `--paid-max-attempt-cost-usd` limits. Financial
+Datasets also requires `--confirm-fd-self-service-pricing`. Shell credentials
+do not grant consent. `--deadline-minutes` bounds the authorization lifetime
+and defaults to 60 minutes.
 
 ### Local React desk
 
@@ -88,9 +146,15 @@ make web
 ```
 
 `make web` installs frontend build dependencies, creates the static bundle, and
-starts a synthetic demo on `http://127.0.0.1:8765`. Demo files live in a temporary
+starts a synthetic demo on `http://127.0.0.1:8876`. Demo files live in a temporary
 directory and are removed when the server exits. Node is needed for the build,
 not for Python to serve an already-built bundle.
+
+> **Currently disabled outside the test harness.** Seeding the demo writes to its
+> root, and under the Spec005 A3 decision every root stays read-only until
+> out-of-band writer exclusion is proven (OS sandbox, dedicated account or ACL).
+> `--demo` therefore exits with an explanation before writing anything; the
+> commands below describe the intended flow once such proof exists.
 
 On Windows, use the native launcher instead of GNU Make:
 
@@ -104,7 +168,9 @@ bundle, then starts the server. It requires Node.js and npm on `PATH`; a clean
 checkout also needs package-registry access for the initial npm install. The
 server does not need Node after the bundle exists. Running `aihf-web` from a
 source checkout without built assets exits with build instructions. Packaged
-wheels serve their included static bundle without Node.
+wheels serve their included static bundle without Node. Non-demo launches
+require an explicit existing `--root`; demo mode uses an isolated temporary
+root.
 
 #### Frontend development with Vite
 
@@ -130,53 +196,200 @@ loopback and proxies `/api` without changing `Host` or `Origin`. The FastAPI
 loopback, same-origin and CSRF checks remain active; no cross-origin exception
 is added.
 
-To inspect the configured `~/.hedge-fund` root, build the bundle and start the
-read-only, network-off server:
+To inspect an existing root, build the bundle and start the read-only,
+network-off server:
 
 ```bash
 make web-build
-poetry run aihf-web
+poetry run aihf-web --root "$AIHF_ROOT"
 ```
 
-An alternate local data root can be selected explicitly with `--root PATH`.
+For the same launch through Make, pass the selected root explicitly:
+
+```bash
+AIHF_ROOT="$HOME/.aihf-data" make web-local
+```
+
 General writes and external network access are separate, immutable startup
 capabilities. The default has neither. Backtests require both:
 
 ```bash
-poetry run aihf-web --allow-writes --enable-network
+poetry run aihf-web --root "$AIHF_ROOT" --allow-writes --enable-network
 ```
 
 Use those flags only when intentionally submitting local changes or historical
-provider requests. The default Financial Datasets provider is paid; no view
-fetches it automatically. Runner start/stop, manual runs, deletion, ledger redo,
-and live quote fetching remain unavailable in the web desk. See the
+provider requests. Reviewed web backtests permit free Yahoo data and local
+Ollama by default; paid backtests require explicit per-operation approval and
+finite limits. Financial Datasets additionally requires a separate account-tier
+confirmation for public self-service pricing; custom Enterprise pricing is
+unsupported. Explicit valuation refresh also requires both capabilities and
+uses free Yahoo quotes; page loads never fetch. Exchange-print freshness is
+unverified. Manual paper actions and scheduled runners permit only free Yahoo
+data and local Ollama. Paid/cloud runner operations fail closed. Deletion and
+ledger redo remain unavailable in the web desk. See the
 [TUI parity checklist](specs/004-react-web-ui/parity-checklist.md) for all
 supported and deferred workflows.
 
 Backtests show a confirmation of the provider, model, agent count, tickers and
-date range before submission. There are no automatic retries. Cancellation is
-cooperative at valuation boundaries; closing the browser does not cancel a job.
+date range before submission. Provider-level HTTP retries are disabled;
+configured model samples are separate calls and consume the operation's finite
+authorization. Cancellation is cooperative at valuation boundaries; closing
+the browser does not cancel a job.
 Server shutdown requests cancellation and waits for active work, including any
 report write already in progress.
 
 #### Docker Compose web service
 
-The web profile builds local assets in a Node stage and runs a Python-only
-image. Compose publishes the service only on host loopback:
+The Compose package has separate profiles: `web` is read-only inspection;
+`web-operator` is the explicit writable paper desk. Both use a read-only image
+filesystem, drop all capabilities and enable `no-new-privileges`. Only
+`web-operator` mounts `/data` writable. Its PID 1 supervisor starts the web
+child read-only. After exact offline trust, send `SIGHUP` to PID 1; the
+supervisor rechecks runtime authority and inventory before restarting the child
+with write capability. Network capability also requires the service's explicit
+network opt-in. The child never starts with write or network flags by default.
+Free-data and local-model settings remain yfinance and literal
+`http://127.0.0.1:11434`; no credentials are placed in Compose. Paid provider
+approvals remain separate per-operation gates.
+
+#### Optional 1Password runtime-delivery experiment
+
+The runtime-only delivery path now has a host command and strict local JSON mapping loader;
+it remains optional and provider mappings are empty by default. The command is
+`aihf-op-deliver --provider <application-provider> [--config <path>]`. Its default
+non-secret mapping file is `%USERPROFILE%\.hedge-fund\op-runtime-mappings.json`; it may
+contain mapping rows with one `op://` field reference and pinned provider/root/container/
+image/volume metadata per row, never credential values. The backend allowlist uses provider IDs only:
+`HEDGE_FUND_RUNTIME_PROVIDERS` (comma-separated; unset means empty). Run the value-free
+host check `op whoami` from the attended PowerShell/Windows Terminal where sign-in succeeds.
+The user reports this works in that terminal; an agent-run hidden child returned
+`desktop-account-not-signed-in` at 12:35:50 +01:00, in 0.452 seconds, with CLI 2.34.1.
+That check is not evidence that the user's terminal is unauthenticated.
+
+Path of Practice is not dismissed as a Docker issue: the user reports its host-to-Docker
+workflow works. Its checked-in host launcher invokes `op run` before Compose and uses
+environment injection; this project's security contract does not copy that mechanism. The
+supported integration design resolves on the host from the attended terminal and sends the
+value only through private stdin/IPC to the selected backend. `OP_SESSION_*`, Connect and
+service-account tokens are not forwarded; non-secret desktop settings are preserved. Once
+mapping metadata and a provider ID are configured, the value-free host command is
+`aihf-op-deliver --provider <application-provider>` in that same terminal. No mapping is
+configured now, so the default result remains denied before `op read`.
+
+The standalone opt-in `docker-compose.op-runtime.yml` is isolated: unique project/image/
+volume identities, one named `/data` volume, no host port, no network, and writes/network
+still gated on explicit root trust. It does not change or restart existing Compose services.
+The current bind-mounted operator remains ineligible for delivery. The opt-in file received
+a bounded synthetic Docker Desktop/LinuxKit run: the final image used an ext4 named volume,
+a fake in-memory receiver accepted a synthetic value over private IPC, and image, Compose,
+inspect, history, logs, process, tmpfs and volume scans found no sentinel. A restart then
+denied status with `transport-unavailable` and did not invoke the resolver. The fake receiver
+bypassed application root-trust admission. A separate cycle-two Linux test used the approved
+test-owned synthetic root and real receiver subprocess: the service admission callback
+allowed generation 1, then denied publication after the synthetic owner lease closed without
+changing generation. Production `/data` trust, browser/export and trusted-root operation remain
+unverified. Overall acceptance and independent QA remain pending. These experiments do not
+authorize provider calls, Saxo authentication, an existing-fund restart or real-key delivery.
+
+The checked-in base browser profiles use a host bind mount and the Linux
+host-network overlay. A Windows host bind reports `9p`, which `RootContext.open`
+rejects; that result does not test a Docker Desktop ext4 named volume. The
+standalone `docker-compose.op-runtime.yml` models the approved Windows named-volume
+case. The earlier fake-receiver artifact run exercised that topology; a later Linux test-owned
+root exercised the actual application admission callback over private IPC. Production root
+trust and browser/export behavior remain unverified. Keep the existing root and filesystem
+identity checks. Do not accept Docker gateway peers or route Ollama through `host.docker.internal`.
+
+The Linux override removes bridge ports/networks and requires Compose 2.24.0 or
+later for `!reset` tags. The base bridge `web` and `web-operator` profiles remain
+unsupported without that Linux override.
+
+The image revision label and `SessionRecord.code_version` include the
+operator-supplied `AIHF_SOURCE_REVISION`, checked only for full lowercase
+40/64-character Git-object-ID format; it is not verified against Git or the
+checkout's cleanliness. `AIHF_SOURCE_SHA256` is recomputed and verified over
+selected package-relative `hedge_fund` files. That digest excludes
+`hedge_fund/web/static`, `.env`, bytecode/cache files and generated
+`hedge_fund/_build_identity.py`; it does not bind frontend inputs, Dockerfile,
+lockfiles, base images or OS layers. Record those build inputs/artifact identity
+separately. In an unbaked source checkout, `SessionRecord.code_version` uses
+short Git `HEAD` and adds `.dirty` when `git status --porcelain` reports changes.
+Build from a clean committed source tree and set both inputs:
 
 ```bash
-docker compose --profile web up --build web
+export AIHF_SOURCE_REVISION="$(git rev-parse HEAD)"
+export AIHF_SOURCE_SHA256="$(poetry run python -c 'from hedge_fund.runtime.build_identity import source_sha256; print(source_sha256("hedge_fund"))')"
+export AIHF_DATA_ROOT="/absolute/path/to/an/existing/local-ext4-root"
+docker compose -f docker-compose.yml -f docker-compose.linux.yml --profile web-operator build web-operator
 ```
 
-Open `http://127.0.0.1:8765`. The service reads the mounted local data root and
-starts read-only with network access disabled. Do not publish this port on a
-non-loopback interface. On Linux, the override keeps the same loopback port
-mapping and adds an explicit host-gateway alias for an Ollama workflow that a
-user separately enables:
+For a new, empty, local Linux/ext4 root assigned to one container identity, an
+operator-only setup sequence is:
 
 ```bash
-docker compose -f docker-compose.yml -f docker-compose.linux.yml --profile web up --build web
+docker compose -f docker-compose.yml -f docker-compose.linux.yml --profile web-operator up -d web-operator
+docker compose -f docker-compose.yml -f docker-compose.linux.yml exec web-operator aihf --root /data handover enroll-fresh
+docker compose -f docker-compose.yml -f docker-compose.linux.yml exec web-operator aihf --root /data handover inspect
+# After offline writer-exclusion review, supply the exact values printed by inspect:
+docker compose -f docker-compose.yml -f docker-compose.linux.yml exec web-operator aihf --root /data handover trust-single-writer --inventory-digest DIGEST --operator-acknowledgement "EXACT ROOT-SPECIFIC ACKNOWLEDGEMENT"
+docker compose -f docker-compose.yml -f docker-compose.linux.yml kill --signal SIGHUP web-operator
 ```
+
+This sequence is operator-only and was not executed against any real root. It
+shows a deliberately new empty root; for an already enrolled root, skip
+`enroll-fresh` and run `inspect` in the current runtime. Trust is recorded
+separately from immutable root enrollment and bound to Linux PID 1 creation
+identity plus boot/PID/mount namespaces. PID 1 stays alive across `SIGHUP`; only
+the web child restarts. The new child starts with writes only after a fresh
+current-runtime authority and exact inventory check.
+
+Container restart/recreation changes PID 1 identity. The replacement child
+starts read-only; run a fresh `inspect`, review its inventory, record a new
+trust, then send `SIGHUP`. Never reuse an earlier acknowledgement or copy a
+trust record. This is an explicit trust update, not auto-enrollment or root
+identity rebind. A runtime that cannot read `/proc/1/stat`, `/proc/1/ns/pid`,
+`/proc/1/exe`, `/proc/sys/kernel/random/boot_id`, and current PID/mount
+namespace links stays read-only. Native Linux unprivileged processes may lack
+access to PID 1 procfs metadata; no elevated fallback is attempted. Native
+Windows host trusted-single-writer mode is disabled; a Docker Desktop Linux
+container is a LinuxKit runtime, not native Linux-host evidence.
+
+To inspect or revoke trust while the writable child holds the root lease,
+downgrade it without replacing PID 1:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.linux.yml kill --signal SIGUSR1 web-operator
+# Repeat until writes=false; do not inspect/revoke while the old child remains writable.
+docker compose -f docker-compose.yml -f docker-compose.linux.yml exec -T web-operator python -c 'import json,urllib.request; r=urllib.request.Request("http://127.0.0.1:8876/api/capabilities",headers={"Host":"127.0.0.1"}); c=json.load(urllib.request.urlopen(r)); print("writes="+str(c["writes"])); assert c["writes"] is False'
+docker compose -f docker-compose.yml -f docker-compose.linux.yml exec web-operator aihf --root /data handover inspect
+docker compose -f docker-compose.yml -f docker-compose.linux.yml exec web-operator aihf --root /data handover revoke-single-writer
+docker compose -f docker-compose.yml -f docker-compose.linux.yml kill --signal SIGHUP web-operator
+```
+
+`SIGUSR1` waits for the web child and starts a read-only child; it does not
+revoke trust. Signal delivery is asynchronous; wait for `writes=false` before
+CLI access. Revocation persists a `revoked` trust state and removes only a
+pending review challenge. The final `SIGHUP` remains read-only. A later write
+activation needs a fresh inspect, exact acknowledgement and explicit trust.
+No API or browser action promotes the child.
+
+The operator must exclude every other writer. Never run the TUI CLI or legacy
+runner as a concurrent writer on that root. The TUI CLI fallback starts only
+after the web writer stops and needs its own explicit trust in its own runtime;
+that trust makes the web runtime stale until separately reviewed again. The
+browser `tui-web` service is not approved for use.
+
+Record container build and runtime evidence against the exact source revision,
+image identity, commands, timestamps and synthetic scenario in
+`specs/005-web-engine-migration/implementation-evidence.md`. Synthetic checks do
+not authorize existing-fund cutover, root relocation or container recreation.
+Overall acceptance remains INCONCLUSIVE until every required row has current
+evidence and independent review.
+
+This is not a cutover instruction for existing funds. The existing
+`watchtower`/`watchtower-weekly` roots remain denied by protected-name guards;
+Windows NTFS-to-ext4 relocation is unsupported. Do not copy, enroll, trust or
+start a writable desk for those roots.
 
 ### Mandate cadence
 
@@ -189,8 +402,8 @@ Override cadence for a backtest or when creating a paper fund; the mandate
 file stays unchanged:
 
 ```bash
-aihf backtest ~/.hedge-fund/mandates/example.yaml --universe AAPL,MSFT --rebalance monthly
-aihf paper create alpha --mandate ~/.hedge-fund/mandates/example.yaml --universe AAPL,MSFT --rebalance daily
+aihf --root "$AIHF_ROOT" --enable-network backtest "$AIHF_ROOT/mandates/example.yaml" --universe AAPL,MSFT --rebalance monthly
+aihf --root "$AIHF_ROOT" paper create alpha --mandate "$AIHF_ROOT/mandates/example.yaml" --universe AAPL,MSFT --rebalance daily
 ```
 
 ### Per-fund approval gate
@@ -201,70 +414,135 @@ decisions execute as they do today. Enable the gate on a new paper fund with
 builder, or `--approval` at CLI creation:
 
 ```bash
-aihf paper create alpha --mandate ~/.hedge-fund/mandates/example.yaml --universe AAPL,MSFT --approval
-aihf paper approve alpha             # queue approval for the next session
-aihf paper approve alpha --now       # execute now if a session is due
-aihf paper reject alpha
+aihf --root "$AIHF_ROOT" paper create alpha --mandate "$AIHF_ROOT/mandates/example.yaml" --universe AAPL,MSFT --approval
+aihf --root "$AIHF_ROOT" paper approve alpha             # queue approval for the next session
+aihf --root "$AIHF_ROOT" --enable-network paper approve alpha --now  # execute now if a session is due
+aihf --root "$AIHF_ROOT" paper reject alpha
 ```
 
-In the TUI fund screen, `y` approves and `n` rejects a pending decision. A
-matching approval executes at the next session; `--now` executes immediately
-when one is due. If no session is due, `--now` keeps the verdict and reports
-that it will execute at the next close.
+On enrolled roots, use the CLI or web desk to record a verdict; TUI paper
+writes are disabled. A matching approval executes at the next session;
+`--now` executes immediately when one is due. If no session is due, `--now`
+keeps the verdict and reports that it will execute at the next close.
 
 The verdict lives in `pending-approval.json` in the fund directory, keyed to
-the decision. A rejected, missing, or stale verdict skips execution at the
-next session, records an audit event, marks the book, and lets the decision
-lapse. The fund keeps running; weekly/monthly funds remain mark-only until
-their next decision period. The gate is separate from the kill switch:
-`halt`/`resume` behavior is unchanged.
+the decision and its audit entry. A matching verdict is recorded as consumed
+and the event file is synced before execution, so cooperating writers cannot
+change it while that session is starting. An interrupted or uncertain
+consumption requires a Halt and reconciliation rather than an automatic retry.
+Unfinished consumption remains visible even if a later ledger record changed
+the pending decision, and an explicit-session retry cannot bypass it. CLI
+status and paper detail can report unavailable while work is in progress; if
+that state persists, reconciliation is required.
+A rejected, missing, or stale verdict skips execution at the next session,
+records an audit event, marks the book, and lets the decision lapse. Unreadable
+or inconsistent approval history blocks the session and requests a controlled
+Halt instead. The fund keeps
+running after an ordinary lapse; weekly/monthly funds remain mark-only until
+their next decision period. The gate is separate from the kill switch.
+Emergency Halt remains available; Resume is disabled pending a reconciliation
+receipt. Paper execution checks Halt before `advance`, before a refreshed or
+new assessment, and before each order. An effect admitted before Halt may
+still be in flight when Halt is acknowledged and requires reconciliation.
+Halt uses its own per-fund lane, including during long approval scans. A
+concurrent deployment move, initialization, or final verdict commit can make
+that lane temporarily unavailable; retry the Halt rather than assuming it was
+applied. If the switch was written but its audit record could not be saved,
+the response explicitly reports that Halt was applied and reconciliation is
+required.
+
+A redo expires the superseded decision before rewinding. A redone gated
+decision gets a new source-record hash, even when its contents otherwise match,
+so an old verdict cannot be reused and the new decision can be reviewed and
+approved. Existing non-redone ledger records keep their original hashes.
+Redo reuses a consumed verdict only when the audit identifies the session
+being redone; missing evidence blocks the rewind. An interrupted redo leaves a
+recovery marker that blocks subsequent paper work until offline reconciliation.
+An incomplete verdict publication likewise blocks approval resolution. These
+markers guard process interruptions; they do not prove host power-loss or
+directory-entry durability. If a final marker replacement takes effect but
+reports failure, and both compensation and Halt also fail, its outcome remains
+uncertain and must be reconciled before retry.
+
+Standalone direct paper APIs use separate per-fund execution and control
+locks. A competing execution is denied as busy without halting the active
+one, while emergency Halt remains independently available. These locks do not
+enroll a root or exclude older or out-of-band writers; configured roots still
+require their normal admission. After a POSIX fork, a child must start a fresh
+interpreter before using an inherited root context or admission lanes; it may
+close its duplicate handles without unlocking the parent.
+
+On enrolled roots, a paper session reserves the registry before its first local
+paper order and holds it through ledger-head publication. Other registry
+writers can therefore be delayed while the session completes; this avoids
+leaving a simulated fill unrecorded solely because a sibling publication won
+the registry. Read-only intraday quote checks remain coordinated with that
+reservation. A scheduled runner retries a busy control preflight only before
+paper effects, within its existing stop and expiry bounds and without spending
+another session authorization.
 
 ### Docker
 
-The same app in a container. All state — funds, ledgers, caches, and the `.env` key file — stays in `~/.hedge-fund`, which is mounted as a volume; nothing is baked into the image.
+Containers require an explicit host data root. Runner profiles are opt-in.
+Provider calls require explicit CLI network enablement; the base bridge profile
+does not enable it.
 
 ```bash
 docker build -t aihf .
+export AIHF_DATA_ROOT="$PWD/.aihf-demo-data"
+mkdir -p "$AIHF_DATA_ROOT"
 
-# Interactive TUI (needs a terminal):
-docker run -it --rm -v ~/.hedge-fund:/root/.hedge-fund aihf
+# Offline TUI (needs a terminal). Image binds its root to /data:
+docker run -it --rm -v "$AIHF_DATA_ROOT:/data" aihf
 
-# Headless runner for one fund, surviving restarts:
-docker run -d --name aihf-watchtower --restart unless-stopped \
-    -v ~/.hedge-fund:/root/.hedge-fund aihf paper run watchtower
+# Linux only: one bounded free-data/local-model tick for an existing fund.
+docker compose -f docker-compose.yml -f docker-compose.linux.yml --profile runner run --rm runner
 ```
 
-Or with compose (`docker-compose.yml` in this repo): `docker compose up -d runner` for the runner, `docker compose run --rm tui` for the app. One runner per fund — copy the service and change the fund name; the compose file ships a second one, `runner-weekly`, for the `watchtower-weekly` comparison fund (the same mandate as `watchtower` on a weekly cadence). After a code change, rebuild every runner you use: `docker compose up -d --build runner runner-weekly`. Do not run the same fund's runner on the host and in a container at the same time: pid files cannot see across that boundary, so both would believe they own the fund.
-
-#### Using Ollama models in the container
-
-Ollama models (the keyless ones, e.g. `kimi-k3:cloud`) run on the *host's* Ollama — inside a container, `localhost` is the container itself. Before starting any container:
-
-1. **Run Ollama on the host** — install it and keep the daemon up (`ollama serve` or the desktop app; it listens on `localhost:11434`).
-2. **Check the model answers on the host first**: `ollama run kimi-k3:cloud "hi"` (cloud-hosted models may ask you to sign in once).
-3. **Point the container at the host** — compose sets `OLLAMA_BASE_URL=http://host.docker.internal:11434` on both services; with plain `docker run`, add `-e OLLAMA_BASE_URL=http://host.docker.internal:11434`.
-4. **Sanity-check the wiring** — `curl http://localhost:11434/api/version` on the host should return JSON. If a container's LLM calls fail with "Connection refused", this env var is the first thing to check.
-
-On a Linux host, `host.docker.internal` needs one extra flag: `--add-host=host.docker.internal:host-gateway` for `docker run`, or `extra_hosts: ["host.docker.internal:host-gateway"]` on a compose service. For a Linux home server, prefer the `docker-compose.linux.yml` override instead — see the next section.
-
-#### Home server (Linux + Tailscale)
-
-On a Linux host, Docker Desktop's `host.docker.internal` doesn't exist. Use the Linux override, which runs the containers on the host's own network — `localhost` inside the container *is* the host, so Ollama needs no extra wiring:
+The Linux override supplies the supported local endpoint and explicit network
+flag. `host.docker.internal` and `OLLAMA_BASE_URL` are not accepted provider
+configuration. On other Docker hosts, use the native CLI with
+`--enable-network` and a supported literal-loopback local model endpoint.
 
 ```bash
-docker compose -f docker-compose.yml -f docker-compose.linux.yml up -d runner   # headless runner
+docker compose run --rm tui
+```
+
+The `web` profile is read-only inspection; `web-operator` is the explicit
+writable path described above. Use the Linux host-network overlay only. Neither
+profile authorizes protected roots, cross-filesystem relocation, container
+recreation or an upgrade workflow. Do not run one paper fund from multiple
+processes.
+
+The `tui-web` service remains behind its explicit profile but is not approved for
+use: it configures no ttyd credentials and its downloaded binary has no pinned
+checksum. Do not start it. The TUI CLI remains the fallback after the web writer
+has stopped.
+
+#### Local models in containers
+
+The local-model policy accepts literal loopback only. Bridge containers cannot
+reach host Ollama through `host.docker.internal`; the endpoint is denied before
+provider dispatch. `OLLAMA_BASE_URL` is ignored. The Linux override uses host
+networking and `HEDGE_FUND_LLM_ENDPOINT=http://127.0.0.1:11434`.
+
+#### Linux host networking (local-only)
+
+On Linux, use the override for a one-session free-data/local-model run. It
+binds the local endpoint to `127.0.0.1` and supplies `--enable-network` only
+for explicit `runner` and `web-operator` profiles:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.linux.yml --profile runner run --rm runner
 docker compose -f docker-compose.yml -f docker-compose.linux.yml run --rm tui   # terminal TUI
 ```
 
-Moving a fund from another machine: stop the old runner first (one runner per fund, even across machines), copy the state with `rsync -a ~/.hedge-fund/ server:~/.hedge-fund/`, then start the runner on the server. The LLM cache travels with it, so nothing is recomputed.
-
-Remote access over Tailscale:
-
-1. On the server: install Tailscale and run `tailscale up --ssh` (Tailscale SSH is a Linux feature — your tailnet handles auth, no keys to manage).
-2. Terminal TUI from any tailnet device: `ssh <server>`, then `tmux new -s tui` (or `tmux attach -t tui`) and start the TUI with the compose command above. tmux keeps the session alive across disconnects.
-3. Browser TUI: `docker compose -f docker-compose.yml -f docker-compose.linux.yml up -d tui-web` serves the full app on `127.0.0.1:7681`. Publish it to your tailnet with HTTPS: `tailscale serve --bg 7681`, then open `https://<server-name>.<tailnet>.ts.net` from any device. Only devices on your tailnet can reach it.
-
-If Ollama runs on a different machine than the server, point `OLLAMA_BASE_URL` at that machine's tailnet IP (e.g. `http://100.x.y.z:11434`) and run Ollama there with `OLLAMA_HOST=0.0.0.0` so it accepts non-local connections.
+The writable web path still requires an enrolled, explicitly trusted root and
+single-writer operator review. Protected-name operation and existing-root
+relocation remain blocked. Container replacement starts read-only and requires
+fresh explicit trust before write activation. Remote access, reverse proxies
+and non-loopback publication remain unsupported. Do not start `tui-web`; use
+the TUI CLI fallback only after the web writer stops and has independent trust.
 
 ## Development
 
@@ -272,7 +550,9 @@ If Ollama runs on a different machine than the server, point `OLLAMA_BASE_URL` a
 git clone https://github.com/virattt/ai-hedge-fund.git
 cd ai-hedge-fund
 poetry install
-poetry run aihf
+export AIHF_ROOT="$HOME/.aihf-data"
+mkdir -p "$AIHF_ROOT"
+poetry run aihf --root "$AIHF_ROOT"
 poetry run pytest hedge_fund
 ```
 

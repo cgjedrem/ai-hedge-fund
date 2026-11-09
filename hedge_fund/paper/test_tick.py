@@ -2,9 +2,12 @@
 
 import json
 import os
+import time
+from contextlib import contextmanager
 from datetime import datetime
 from importlib import import_module
 from pathlib import Path
+from threading import current_thread, Event, Thread
 
 import pytest
 import yaml
@@ -25,6 +28,7 @@ from hedge_fund.paper import (
     deploy,
     following_session,
     Ledger,
+    LedgerError,
     list_deployed,
     load_deployed,
     next_session,
@@ -37,6 +41,7 @@ from hedge_fund.pipeline import DecisionRecord, FundState
 from hedge_fund.pipeline.session import FundHalted
 
 paper_tick_module = import_module("hedge_fund.paper.tick")
+root_module = import_module("hedge_fund.runtime.root")
 
 LEGACY_FUND_YAML = """schema_version: 2
 name: alpha
@@ -129,6 +134,15 @@ def test_deploy_lays_out_the_fund_directory(tmp_path, SPEC):
     assert list_deployed(tmp_path / "nowhere") == []
     with pytest.raises(FileExistsError, match="already exists"):
         deploy("alpha", SPEC, ["AAPL"], root=tmp_path)
+
+
+def test_legacy_deploy_creates_a_missing_paper_root(tmp_path, SPEC):
+    root = tmp_path / "new-root"
+    directory = deploy("alpha", SPEC, ["AAPL"], root=root / "paper")
+
+    assert directory == root / "paper" / "alpha"
+    assert directory.is_dir()
+    assert not (root / "runtime").exists()
 
 
 def test_default_approval_deploy_yaml_matches_pre_feature_bytes(tmp_path, SPEC):
@@ -232,6 +246,107 @@ def test_ticks_advance_one_session_each_and_match_the_backtest(tmp_path, clock, 
     assert kinds == ["tick", "tick", "tick"]
 
 
+def test_tick_request_id_replays_record_and_conflicts_on_changed_payload(tmp_path, clock, SPEC):
+    from hedge_fund.paper.ledger import PaperRequestConflict
+
+    directory = deploy("alpha", SPEC, ["AAPL"], root=tmp_path)
+    clock("2024-06-04")
+    data_calls = []
+
+    class CountingClient(FakeDataClient):
+        def get_prices(self, ticker, start_date, end_date, **kwargs):
+            data_calls.append((ticker, start_date, end_date))
+            return super().get_prices(ticker, start_date, end_date, **kwargs)
+
+    client = CountingClient(SERIES)
+    record = tick(
+        directory,
+        client,
+        build_fund=build_fund,
+        request_id="cli-tick-alpha-001",
+        expected_head=None,
+    )
+    calls_after_commit = list(data_calls)
+
+    replayed = tick(
+        directory,
+        client,
+        build_fund=build_fund,
+        request_id="cli-tick-alpha-001",
+        expected_head=None,
+    )
+
+    assert replayed.hash == record.hash
+    assert data_calls == calls_after_commit
+    with pytest.raises(PaperRequestConflict, match="request identity conflicts"):
+        tick(
+            directory,
+            client,
+            session=record.session,
+            build_fund=build_fund,
+            request_id="cli-tick-alpha-001",
+            expected_head=None,
+        )
+
+
+def test_uncertain_tick_request_never_repeats_work(tmp_path, clock, SPEC):
+    from hedge_fund.paper.ledger import PaperReconciliationRequired
+
+    directory = deploy("alpha", SPEC, ["AAPL"], root=tmp_path)
+    clock("2024-06-04")
+    build_calls = []
+
+    def failing_build(_spec):
+        build_calls.append(True)
+        raise RuntimeError("synthetic pipeline failure")
+
+    with pytest.raises(RuntimeError, match="synthetic pipeline failure"):
+        tick(
+            directory,
+            FakeDataClient(SERIES),
+            build_fund=failing_build,
+            request_id="cli-tick-alpha-failed",
+            expected_head=None,
+        )
+
+    with pytest.raises(PaperReconciliationRequired, match="reconciliation is required"):
+        tick(
+            directory,
+            FakeDataClient(SERIES),
+            build_fund=failing_build,
+            request_id="cli-tick-alpha-failed",
+            expected_head=None,
+        )
+
+    assert build_calls == [True]
+
+
+def test_tick_request_id_keeps_nothing_due_terminal(tmp_path, clock, SPEC):
+    directory = deploy("alpha", SPEC, ["AAPL"], root=tmp_path)
+    clock("2024-06-04")
+    unavailable = FakeDataClient({})
+
+    with pytest.raises(NothingDue):
+        tick(
+            directory,
+            unavailable,
+            build_fund=build_fund,
+            request_id="cli-tick-alpha-no-work",
+            expected_head=None,
+        )
+
+    with pytest.raises(NothingDue):
+        tick(
+            directory,
+            FakeDataClient(SERIES),
+            build_fund=build_fund,
+            request_id="cli-tick-alpha-no-work",
+            expected_head=None,
+        )
+
+    assert Ledger(directory).sessions() == []
+
+
 def test_gate_expires_unapproved_decision_and_continues(tmp_path, clock, SPEC):
     spec = SPEC.model_copy(update={"approval_required": True, "rebalance": "daily"})
     clock("2024-06-04")
@@ -270,7 +385,7 @@ def test_gate_executes_matching_approval_once(tmp_path, clock, SPEC):
     assert executed.executed.execution_as_of == "2024-06-04"
     assert executed.positions == {"AAPL": 500}
     assert ledger.approval() is None
-    assert [event["kind"] for event in ledger.events()] == ["tick", "approve", "tick"]
+    assert [event["kind"] for event in ledger.events()] == ["tick", "approve", "consume", "tick"]
 
 
 def test_weekly_redo_invalidates_approval_for_changed_decision(tmp_path, clock, SPEC):
@@ -324,7 +439,7 @@ def test_redo_expiry_blocks_mailbox_when_unlink_fails(tmp_path, clock, SPEC, mon
 
     redone = redo(directory, FakeDataClient(SERIES), build_fund=build_fund)
 
-    assert redone.hash == original.hash
+    assert redone.hash != original.hash
     assert ledger.approval() is not None
     assert any(event.get("reason") == "decision redone" for event in ledger.events() if event["kind"] == "expire")
     assert any(event["kind"] == "approval_clear_failed" for event in ledger.events())
@@ -334,6 +449,109 @@ def test_redo_expiry_blocks_mailbox_when_unlink_fails(tmp_path, clock, SPEC, mon
 
     assert skipped.executed is None
     assert ledger.halted() is None
+
+
+def test_redo_rejects_corrupt_history_before_stale_mailbox_can_execute(tmp_path, clock, SPEC, monkeypatch):
+    spec = SPEC.model_copy(update={"approval_required": True})
+    clock("2024-06-04")
+    directory = deploy("alpha", spec, ["AAPL"], root=tmp_path)
+    ledger = Ledger(directory)
+    original = _tick(directory)
+    ledger.set_approval("approve", original.decision.as_of, original.hash, "cli")
+    ledger.events_path.write_text(ledger.events_path.read_text() + "{invalid-json\n")
+    unlink = Path.unlink
+
+    def fail_approval_unlink(path, *args, **kwargs):
+        if path == ledger.approval_path:
+            raise PermissionError("synthetic mailbox unlink failure")
+        return unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_approval_unlink)
+    original_book = (directory / "broker.json").read_bytes()
+
+    with pytest.raises(LedgerError, match="approval history is unavailable"):
+        redo(directory, FakeDataClient(SERIES), build_fund=build_fund)
+
+    assert ledger.latest().hash == original.hash
+    assert (directory / "broker.json").read_bytes() == original_book
+    assert ledger.approval()["decision_hash"] == original.hash
+
+
+@pytest.mark.parametrize("mailbox", ["matching", "stale", "malformed"])
+def test_corrupt_approval_history_stops_a_normal_tick_before_execution(tmp_path, clock, SPEC, mailbox):
+    spec = SPEC.model_copy(update={"approval_required": True})
+    clock("2024-06-04")
+    directory = deploy("alpha", spec, ["AAPL"], root=tmp_path)
+    ledger = Ledger(directory)
+    original = _tick(directory)
+    ledger.set_approval("approve", original.decision.as_of, original.hash, "cli")
+    if mailbox == "stale":
+        value = ledger.approval()
+        value["decision_as_of"] = "2024-06-02"
+        ledger.approval_path.write_text(json.dumps(value), encoding="utf-8")
+    elif mailbox == "malformed":
+        ledger.approval_path.write_text("{invalid", encoding="utf-8")
+    ledger.events_path.write_text(ledger.events_path.read_text() + "{invalid-json\n")
+    original_book = (directory / "broker.json").read_bytes()
+
+    clock("2024-06-05")
+    with pytest.raises(LedgerError, match="approval history is unavailable"):
+        _tick(directory)
+
+    assert ledger.latest().hash == original.hash
+    assert (directory / "broker.json").read_bytes() == original_book
+    assert ledger.halted() == "approval journal requires reconciliation"
+
+
+def test_redo_records_expiry_before_a_failed_rewind(tmp_path, clock, SPEC, monkeypatch):
+    spec = SPEC.model_copy(update={"approval_required": True})
+    clock("2024-06-04")
+    directory = deploy("alpha", spec, ["AAPL"], root=tmp_path)
+    ledger = Ledger(directory)
+    original = _tick(directory)
+    ledger.set_approval("approve", original.decision.as_of, original.hash, "cli")
+    unlink = Path.unlink
+
+    def fail_approval_unlink(path, *args, **kwargs):
+        if path == ledger.approval_path:
+            raise PermissionError("synthetic mailbox unlink failure")
+        return unlink(path, *args, **kwargs)
+
+    def fail_rewind(_self):
+        raise RuntimeError("synthetic interruption")
+
+    monkeypatch.setattr(Path, "unlink", fail_approval_unlink)
+    monkeypatch.setattr(Ledger, "rewind", fail_rewind)
+    with pytest.raises(RuntimeError, match="synthetic interruption"):
+        redo(directory, FakeDataClient(SERIES), build_fund=lambda _spec: pytest.fail("provider work started"))
+
+    resolved, stale = ledger.resolve_approval(original.decision.as_of, original.hash)
+    assert resolved is None and stale is not None
+    assert ledger.latest().hash == original.hash
+    assert ledger._latest_approval_event(original.decision.as_of, original.hash, strict=True)["kind"] == "expire"
+
+
+def test_each_identical_gated_redo_gets_a_new_approval_identity(tmp_path, clock, SPEC):
+    spec = SPEC.model_copy(update={"approval_required": True})
+    clock("2024-06-04")
+    directory = deploy("alpha", spec, ["AAPL"], root=tmp_path)
+    ledger = Ledger(directory)
+    original = _tick(directory)
+    first = redo(directory, FakeDataClient(SERIES), build_fund=build_fund)
+    second = redo(directory, FakeDataClient(SERIES), build_fund=build_fund)
+
+    assert len({original.hash, first.hash, second.hash}) == 3
+    assert original.redo_nonce is None
+    assert first.redo_nonce and second.redo_nonce and first.redo_nonce != second.redo_nonce
+    assert ledger.replay(spec.capital).prev_hash == second.hash
+    with pytest.raises(LedgerError, match="expired"):
+        ledger.set_approval("approve", original.decision.as_of, original.hash, "cli")
+    with pytest.raises(LedgerError, match="expired"):
+        ledger.set_approval("approve", first.decision.as_of, first.hash, "cli")
+    ledger.set_approval("approve", second.decision.as_of, second.hash, "cli")
+
+    clock("2024-06-05")
+    assert _tick(directory).executed is not None
 
 
 def test_redo_replays_consumed_gated_approval_for_same_decision(tmp_path, clock, SPEC):
@@ -370,6 +588,1118 @@ def test_redo_replays_consumed_gated_approval_for_same_decision(tmp_path, clock,
     assert tick_events[-1]["decision_hash"] == monday.hash
 
 
+@pytest.mark.parametrize("verdict", ["approve", "reject"])
+def test_redo_replays_consumed_approval_when_later_mailbox_cannot_be_removed(tmp_path, clock, SPEC, monkeypatch, verdict):
+    spec = SPEC.model_copy(update={"approval_required": True, "rebalance": "daily"})
+    clock("2024-06-04")
+    directory = deploy("alpha", spec, ["AAPL"], root=tmp_path)
+    ledger = Ledger(directory)
+    first = _tick(directory)
+    ledger.set_approval(verdict, first.decision.as_of, first.hash, "cli")
+    clock("2024-06-05")
+    second = _tick(directory)
+    assert (second.executed is not None) is (verdict == "approve")
+    assert second.decision is not None
+    ledger.set_approval("approve", second.decision.as_of, second.hash, "cli")
+    unlink = Path.unlink
+
+    def fail_approval_unlink(path, *args, **kwargs):
+        if path == ledger.approval_path:
+            raise PermissionError("synthetic mailbox unlink failure")
+        return unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_approval_unlink)
+    redone = redo(directory, FakeDataClient(SERIES), build_fund=build_fund)
+
+    assert (redone.executed is not None) is (verdict == "approve")
+    if redone.executed is not None:
+        assert redone.executed.execution_as_of == second.session
+    assert redone.positions == second.positions
+    assert ledger.approval()["decision_hash"] == second.hash
+
+
+def test_redo_requires_consumed_approval_evidence_before_rewinding(tmp_path, clock, SPEC):
+    spec = SPEC.model_copy(update={"approval_required": True, "rebalance": "daily"})
+    clock("2024-06-04")
+    directory = deploy("alpha", spec, ["AAPL"], root=tmp_path)
+    ledger = Ledger(directory)
+    first = _tick(directory)
+    ledger.set_approval("approve", first.decision.as_of, first.hash, "cli")
+    clock("2024-06-05")
+    second = _tick(directory)
+    assert second.executed is not None
+    events = [event for event in ledger.events() if not (event["kind"] == "tick" and event["session"] == second.session)]
+    ledger.events_path.write_text("".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
+    book = (directory / "broker.json").read_bytes()
+
+    with pytest.raises(LedgerError, match="redo consumed approval is unavailable"):
+        redo(directory, FakeDataClient(SERIES), build_fund=lambda _spec: pytest.fail("provider work started"))
+
+    assert ledger.latest().hash == second.hash
+    assert (directory / "broker.json").read_bytes() == book
+    assert not (directory / "ledger" / "superseded").exists()
+
+
+def test_redo_does_not_drop_an_incompletely_audited_consumed_rejection(tmp_path, clock, SPEC):
+    spec = SPEC.model_copy(update={"approval_required": True, "rebalance": "daily"})
+    clock("2024-06-04")
+    directory = deploy("alpha", spec, ["AAPL"], root=tmp_path)
+    ledger = Ledger(directory)
+    first = _tick(directory)
+    ledger.set_approval("reject", first.decision.as_of, first.hash, "cli")
+    clock("2024-06-05")
+    second = _tick(directory)
+    assert second.executed is None
+    events = [event for event in ledger.events() if not (event["kind"] == "tick" and event["session"] == second.session)]
+    ledger.events_path.write_text("".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
+    book = (directory / "broker.json").read_bytes()
+
+    with pytest.raises(LedgerError, match="redo consumed approval is unavailable"):
+        redo(directory, FakeDataClient(SERIES), build_fund=build_fund)
+
+    assert ledger.latest().hash == second.hash
+    assert (directory / "broker.json").read_bytes() == book
+    assert not (directory / "ledger" / "superseded").exists()
+
+
+def test_redo_replays_legacy_consumed_approval_without_an_identifier(tmp_path, clock, SPEC):
+    spec = SPEC.model_copy(update={"approval_required": True, "rebalance": "daily"})
+    clock("2024-06-04")
+    directory = deploy("alpha", spec, ["AAPL"], root=tmp_path)
+    ledger = Ledger(directory)
+    first = _tick(directory)
+    ledger.set_approval("approve", first.decision.as_of, first.hash, "cli")
+    clock("2024-06-05")
+    second = _tick(directory)
+    events = [event for event in ledger.events() if event["kind"] != "consume"]
+    for event in events:
+        event.pop("approval_id", None)
+    ledger.events_path.write_text("".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
+
+    redone = redo(directory, FakeDataClient(SERIES), build_fund=build_fund)
+
+    assert redone.executed is not None
+    assert redone.positions == second.positions
+
+
+@pytest.mark.parametrize("verdict", ["approve", "reject", None])
+def test_consumption_is_synced_before_provider_or_broker_effects(tmp_path, clock, SPEC, monkeypatch, verdict):
+    spec = SPEC.model_copy(update={"approval_required": True})
+    clock("2024-06-04")
+    directory = deploy("alpha", spec, ["AAPL"], root=tmp_path)
+    ledger = Ledger(directory)
+    first = _tick(directory)
+    if verdict is not None:
+        ledger.set_approval(verdict, first.decision.as_of, first.hash, "cli")
+    synced = []
+    advance = paper_tick_module.advance
+
+    if os.name == "nt":
+        append = root_module._windows_append_handle
+
+        def observe_append(handle, data, *, durable):
+            result = append(handle, data, durable=durable)
+            if durable:
+                synced.append(handle)
+            return result
+
+        monkeypatch.setattr(root_module, "_windows_append_handle", observe_append)
+    else:
+        fsync = os.fsync
+
+        def observe_sync(fd):
+            result = fsync(fd)
+            synced.append(fd)
+            return result
+
+        monkeypatch.setattr(os, "fsync", observe_sync)
+
+    def require_sync_before_advance(*args, **kwargs):
+        assert synced, "approval consumption was not synced before effects"
+        assert ledger.events()[-1]["kind"] == ("expire" if verdict is None else "consume")
+        return advance(*args, **kwargs)
+
+    monkeypatch.setattr(paper_tick_module, "advance", require_sync_before_advance)
+    clock("2024-06-05")
+    assert (_tick(directory).executed is not None) is (verdict == "approve")
+
+
+@pytest.mark.parametrize("verdict", ["approve", "reject", None])
+def test_failed_consumption_sync_halts_before_effects(tmp_path, clock, SPEC, monkeypatch, verdict):
+    spec = SPEC.model_copy(update={"approval_required": True})
+    clock("2024-06-04")
+    directory = deploy("alpha", spec, ["AAPL"], root=tmp_path)
+    ledger = Ledger(directory)
+    first = _tick(directory)
+    if verdict is not None:
+        ledger.set_approval(verdict, first.decision.as_of, first.hash, "cli")
+    book = (directory / "broker.json").read_bytes()
+
+    if os.name == "nt":
+        append = root_module._windows_append_handle
+
+        def fail_sync(handle, data, *, durable):
+            if durable:
+                append(handle, data, durable=False)
+                raise OSError("synthetic event sync failure")
+            return append(handle, data, durable=durable)
+
+        monkeypatch.setattr(root_module, "_windows_append_handle", fail_sync)
+    else:
+
+        def fail_sync(_fd):
+            raise OSError("synthetic event sync failure")
+
+        monkeypatch.setattr(os, "fsync", fail_sync)
+    clock("2024-06-05")
+    with pytest.raises(OSError, match="synthetic event sync failure"):
+        tick(directory, FakeDataClient(SERIES), build_fund=lambda _spec: pytest.fail("fund was constructed"))
+
+    assert ledger.halted() == "approval journal requires reconciliation"
+    assert ledger.latest().hash == first.hash
+    assert (directory / "broker.json").read_bytes() == book
+
+
+def test_busy_audit_admission_before_consumption_does_not_halt(tmp_path, clock, SPEC, monkeypatch):
+    from hedge_fund.runtime import admission as admission_module
+
+    spec = SPEC.model_copy(update={"approval_required": True, "rebalance": "daily"})
+    clock("2024-06-04")
+    directory = deploy("alpha", spec, ["AAPL"], root=tmp_path)
+    first = _tick(directory)
+    ledger = Ledger(directory)
+    ledger.set_approval("approve", first.decision.as_of, first.hash, "cli")
+    before_book = (directory / "broker.json").read_bytes()
+    before_events = ledger.events()
+    resolved = Event()
+    continue_tick = Event()
+    errors = []
+    original_resolve = Ledger.resolve_approval
+
+    def pause_after_resolving(self, *args, **kwargs):
+        approval = original_resolve(self, *args, **kwargs)
+        if current_thread().name == "audit-busy-tick":
+            resolved.set()
+            if not continue_tick.wait(timeout=10):
+                raise TimeoutError("test did not release approval resolution")
+        return approval
+
+    def run_tick():
+        try:
+            _tick(directory)
+        except Exception as exc:
+            errors.append(exc)
+
+    monkeypatch.setattr(Ledger, "resolve_approval", pause_after_resolving)
+    monkeypatch.setattr(admission_module, "MAX_CONTROL_WAIT_SECONDS", 0.1)
+    clock("2024-06-05")
+    worker = Thread(target=run_tick, name="audit-busy-tick")
+    worker.start()
+    try:
+        assert resolved.wait(timeout=10), errors
+        with admission_module.paper_audit_transition(directory, "alpha"):
+            continue_tick.set()
+            worker.join(timeout=10)
+            assert not worker.is_alive()
+    finally:
+        continue_tick.set()
+        worker.join(timeout=10)
+
+    assert ledger.halted() is None
+    assert ledger.sessions() == [first.session]
+    assert ledger.events() == before_events
+    assert (directory / "broker.json").read_bytes() == before_book
+    assert len(errors) == 1 and isinstance(errors[0], admission_module.PaperPreflightBusy)
+
+
+def test_audit_failure_after_consumption_admission_still_halts(tmp_path, clock, SPEC, monkeypatch):
+    from hedge_fund.runtime.admission import WriterConflict
+    from hedge_fund.runtime.root import RootContext
+
+    spec = SPEC.model_copy(update={"approval_required": True, "rebalance": "daily"})
+    clock("2024-06-04")
+    directory = deploy("alpha", spec, ["AAPL"], root=tmp_path)
+    first = _tick(directory)
+    ledger = Ledger(directory)
+    ledger.set_approval("approve", first.decision.as_of, first.hash, "cli")
+    original_append = RootContext.append_bytes
+    failed = False
+
+    def fail_inside_audit(root, relative, data, *args, **kwargs):
+        nonlocal failed
+        if Path(relative).name == "events.jsonl" and not failed:
+            failed = True
+            raise WriterConflict("synthetic failure after audit admission")
+        return original_append(root, relative, data, *args, **kwargs)
+
+    monkeypatch.setattr(RootContext, "append_bytes", fail_inside_audit)
+    clock("2024-06-05")
+    with pytest.raises(WriterConflict, match="after audit admission"):
+        _tick(directory)
+
+    assert failed
+    assert ledger.halted() == "approval journal requires reconciliation"
+    assert ledger.sessions() == [first.session]
+
+
+def test_unfinished_consumption_requires_reconciliation_before_retry(tmp_path, clock, SPEC):
+    spec = SPEC.model_copy(update={"approval_required": True})
+    clock("2024-06-04")
+    directory = deploy("alpha", spec, ["AAPL"], root=tmp_path)
+    ledger = Ledger(directory)
+    first = _tick(directory)
+    approval = ledger.set_approval("approve", first.decision.as_of, first.hash, "cli")
+    ledger.log_event(
+        "consume",
+        decision_as_of=first.decision.as_of,
+        decision_hash=first.hash,
+        approval_verdict="approve",
+        approval_by="cli",
+        approval_id=approval["approval_id"],
+        session="2024-06-04",
+        durable=True,
+    )
+    book = (directory / "broker.json").read_bytes()
+    clock("2024-06-05")
+
+    with pytest.raises(LedgerError, match="consumption is incomplete"):
+        tick(directory, FakeDataClient(SERIES), build_fund=lambda _spec: pytest.fail("fund was constructed"))
+
+    assert ledger.halted() == "approval journal requires reconciliation"
+    assert ledger.latest().hash == first.hash
+    assert (directory / "broker.json").read_bytes() == book
+
+
+def test_redo_cannot_expire_an_unfinished_consumption(tmp_path, clock, SPEC):
+    spec = SPEC.model_copy(update={"approval_required": True})
+    clock("2024-06-04")
+    directory = deploy("alpha", spec, ["AAPL"], root=tmp_path)
+    ledger = Ledger(directory)
+    first = _tick(directory)
+    approval = ledger.set_approval("approve", first.decision.as_of, first.hash, "cli")
+    ledger.log_event(
+        "consume",
+        decision_as_of=first.decision.as_of,
+        decision_hash=first.hash,
+        approval_verdict="approve",
+        approval_by="cli",
+        approval_id=approval["approval_id"],
+        session="2024-06-05",
+        durable=True,
+    )
+    book = (directory / "broker.json").read_bytes()
+
+    with pytest.raises(LedgerError, match="consumption is incomplete"):
+        redo(directory, FakeDataClient(SERIES), build_fund=build_fund)
+
+    relevant = [event for event in ledger.events() if event.get("decision_hash") == first.hash]
+    assert relevant[-1]["kind"] == "consume"
+    assert ledger.latest().hash == first.hash
+    assert (directory / "broker.json").read_bytes() == book
+    assert not (directory / "ledger" / "superseded").exists()
+
+
+def test_unfinished_consumption_denies_before_due_session_data(tmp_path, clock, SPEC):
+    spec = SPEC.model_copy(update={"approval_required": True})
+    clock("2024-06-04")
+    directory = deploy("alpha", spec, ["AAPL"], root=tmp_path)
+    ledger = Ledger(directory)
+    first = _tick(directory)
+    approval = ledger.set_approval("approve", first.decision.as_of, first.hash, "cli")
+    ledger.log_event(
+        "consume",
+        decision_as_of=first.decision.as_of,
+        decision_hash=first.hash,
+        approval_verdict="approve",
+        approval_by="cli",
+        approval_id=approval["approval_id"],
+        session="2024-06-05",
+        durable=True,
+    )
+
+    class NoPreflightData(FakeDataClient):
+        def get_prices(self, *_args, **_kwargs):
+            pytest.fail("unfinished consumption reached the data provider")
+
+    clock("2024-06-05")
+    with pytest.raises(LedgerError, match="consumption is incomplete"):
+        tick(directory, NoPreflightData(SERIES), build_fund=build_fund)
+    assert ledger.halted() == "approval journal requires reconciliation"
+
+
+@pytest.mark.parametrize("verdict", ["approve", "reject"])
+@pytest.mark.parametrize("rebalance", ["daily", "weekly"])
+def test_unfinished_consumption_after_ledger_advance_blocks_next_work(tmp_path, clock, SPEC, verdict, rebalance):
+    spec = SPEC.model_copy(update={"approval_required": True, "rebalance": rebalance})
+    clock("2024-06-04")
+    directory = deploy("alpha", spec, ["AAPL"], root=tmp_path)
+    ledger = Ledger(directory)
+    first = _tick(directory)
+    ledger.set_approval(verdict, first.decision.as_of, first.hash, "cli")
+    clock("2024-06-05")
+    second = _tick(directory)
+    assert (second.decision is not None) is (rebalance == "daily")
+    events = [event for event in ledger.events() if not (event["kind"] == "tick" and event["session"] == second.session)]
+    ledger.events_path.write_text("".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
+    assert any(event["kind"] == "consume" and event["session"] == second.session for event in events)
+    book = (directory / "broker.json").read_bytes()
+
+    class NoPreflightData(FakeDataClient):
+        def get_prices(self, *_args, **_kwargs):
+            pytest.fail("unfinished consumption reached the data provider")
+
+    clock("2024-06-06")
+    with pytest.raises(LedgerError, match="consumption is incomplete"):
+        tick(directory, NoPreflightData(SERIES), build_fund=build_fund)
+
+    assert ledger.halted() == "approval journal requires reconciliation"
+    assert ledger.latest().hash == second.hash
+    assert (directory / "broker.json").read_bytes() == book
+
+
+def test_explicit_session_retry_does_not_hide_unfinished_consumption(tmp_path, clock, SPEC):
+    spec = SPEC.model_copy(update={"approval_required": True, "rebalance": "daily"})
+    clock("2024-06-04")
+    directory = deploy("alpha", spec, ["AAPL"], root=tmp_path)
+    ledger = Ledger(directory)
+    first = _tick(directory)
+    ledger.set_approval("approve", first.decision.as_of, first.hash, "cli")
+    clock("2024-06-05")
+    second = _tick(directory)
+    events = [event for event in ledger.events() if not (event["kind"] == "tick" and event["session"] == second.session)]
+    ledger.events_path.write_text("".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
+
+    class NoPreflightData(FakeDataClient):
+        def get_prices(self, *_args, **_kwargs):
+            pytest.fail("explicit retry reached a data provider")
+
+    with pytest.raises(LedgerError, match="consumption is incomplete"):
+        _tick(directory, session=second.session, data=NoPreflightData(SERIES))
+    assert ledger.halted() == "approval journal requires reconciliation"
+    assert ledger.latest().hash == second.hash
+
+
+def test_standalone_retry_does_not_halt_a_live_tick(tmp_path, clock, SPEC, monkeypatch):
+    from hedge_fund.runtime.admission import WriterConflict
+
+    spec = SPEC.model_copy(update={"approval_required": True, "rebalance": "daily"})
+    clock("2024-06-04")
+    directory = deploy("alpha", spec, ["AAPL"], root=tmp_path)
+    ledger = Ledger(directory)
+    first = _tick(directory)
+    ledger.set_approval("approve", first.decision.as_of, first.hash, "cli")
+    clock("2024-06-05")
+    entered = Event()
+    proceed = Event()
+    results = []
+    errors = []
+    advance = paper_tick_module.advance
+
+    def blocked_advance(*args, **kwargs):
+        entered.set()
+        if not proceed.wait(10):
+            raise AssertionError("test did not release the active tick")
+        return advance(*args, **kwargs)
+
+    def run_tick():
+        try:
+            results.append(_tick(directory))
+        except BaseException as exc:
+            errors.append(exc)
+
+    monkeypatch.setattr(paper_tick_module, "advance", blocked_advance)
+    worker = Thread(target=run_tick, daemon=True)
+    worker.start()
+    try:
+        assert entered.wait(10)
+        with pytest.raises(WriterConflict):
+            _tick(directory, session=first.session)
+        assert ledger.halted() is None
+    finally:
+        proceed.set()
+        worker.join(timeout=10)
+    assert not worker.is_alive()
+    assert errors == []
+    assert len(results) == 1
+    assert ledger.halted() is None
+
+
+def test_standalone_execution_lock_blocks_another_process_but_not_halt(tmp_path, clock, SPEC, owned_test_process):
+    from hedge_fund.runtime.admission import paper_execution_transition
+
+    clock("2024-06-04")
+    directory = deploy("alpha", SPEC, ["AAPL"], root=tmp_path)
+    script = f"""
+from pathlib import Path
+from hedge_fund.paper.ledger import Ledger
+from hedge_fund.runtime.admission import WriterConflict, paper_execution_transition
+
+directory = Path({str(directory)!r})
+try:
+    with paper_execution_transition(directory, "alpha"):
+        raise AssertionError("concurrent execution was admitted")
+except WriterConflict:
+    pass
+Ledger(directory).halt("synthetic emergency")
+"""
+    with paper_execution_transition(directory, directory.name):
+        child = owned_test_process(script)
+        assert child.wait(timeout=20) == 0
+        assert Ledger(directory).halted() == "synthetic emergency"
+
+    child = owned_test_process(
+        f"""
+from pathlib import Path
+from hedge_fund.runtime.admission import paper_execution_transition
+with paper_execution_transition(Path({str(directory)!r}), "alpha"):
+    pass
+"""
+    )
+    assert child.wait(timeout=20) == 0
+
+
+@pytest.mark.parametrize("transition", ["publication", "redo"])
+def test_explicit_retry_rechecks_transition_markers_under_control(tmp_path, clock, SPEC, monkeypatch, transition):
+    from hedge_fund.runtime import admission
+
+    spec = SPEC.model_copy(update={"approval_required": True})
+    clock("2024-06-04")
+    directory = deploy("alpha", spec, ["AAPL"], root=tmp_path)
+    ledger = Ledger(directory)
+    first = _tick(directory)
+    control = admission.paper_control_transition
+    injected = False
+
+    @contextmanager
+    def interrupted_before_control(path, identity):
+        nonlocal injected
+        if not injected:
+            injected = True
+            with control(path, identity):
+                if transition == "publication":
+                    ledger._write_approval_publication("a" * 32, "pending")
+                else:
+                    ledger.begin_redo(first)
+        with control(path, identity):
+            yield
+
+    monkeypatch.setattr(admission, "paper_control_transition", interrupted_before_control)
+    expected = "publication is incomplete" if transition == "publication" else "interrupted redo"
+    with pytest.raises(LedgerError, match=expected):
+        _tick(directory, session=first.session)
+    assert injected
+    assert ledger.halted() == "approval journal requires reconciliation"
+
+
+def test_explicit_retry_waits_for_live_publication(tmp_path, clock, SPEC, monkeypatch):
+    from hedge_fund.runtime import admission
+
+    spec = SPEC.model_copy(update={"approval_required": True})
+    clock("2024-06-04")
+    directory = deploy("alpha", spec, ["AAPL"], root=tmp_path)
+    ledger = Ledger(directory)
+    first = _tick(directory)
+    control = admission.paper_control_transition
+    pending = Event()
+    attempting = Event()
+    release = Event()
+    finished = Event()
+    results = []
+    errors = []
+
+    @contextmanager
+    def observe_retry_control(path, identity):
+        if current_thread().name == "explicit-retry":
+            attempting.set()
+        with control(path, identity):
+            yield
+
+    def publish():
+        try:
+            with control(directory, directory.name):
+                ledger._write_approval_publication("a" * 32, "pending")
+                pending.set()
+                if not release.wait(10):
+                    raise TimeoutError("test did not release publication")
+                ledger._write_approval_publication("a" * 32, "committed")
+        except BaseException as exc:
+            errors.append(exc)
+
+    def retry():
+        try:
+            results.append(_tick(directory, session=first.session))
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(admission, "paper_control_transition", observe_retry_control)
+    publisher = Thread(target=publish, daemon=True)
+    retrier = Thread(target=retry, name="explicit-retry", daemon=True)
+    publisher.start()
+    try:
+        assert pending.wait(10)
+        retrier.start()
+        if not attempting.wait(5):
+            assert not finished.is_set(), f"retry exited before control admission: {errors!r}"
+            pytest.fail("retry did not attempt control admission")
+        assert not finished.is_set()
+    finally:
+        release.set()
+        publisher.join(timeout=10)
+        if retrier.ident is not None:
+            retrier.join(timeout=10)
+    assert not publisher.is_alive()
+    assert not retrier.is_alive()
+    assert errors == []
+    assert [record.hash for record in results] == [first.hash]
+    assert ledger.halted() is None
+
+
+@pytest.mark.parametrize("operation", ["tick", "redo", "run"])
+def test_new_work_waits_for_live_approval_publication(tmp_path, clock, SPEC, monkeypatch, operation):
+    from hedge_fund.runtime import admission
+
+    spec = SPEC.model_copy(update={"approval_required": True})
+    clock("2024-06-04")
+    directory = deploy("alpha", spec, ["AAPL"], root=tmp_path)
+    ledger = Ledger(directory)
+    first = _tick(directory)
+    clock("2024-06-05")
+    pending = Event()
+    start_publisher = Event()
+    attempting = Event()
+    release = Event()
+    finished = Event()
+    failures = []
+    records = []
+    control = admission.paper_control_transition
+    next_session = paper_tick_module.next_session
+
+    @contextmanager
+    def observe_control(path, identity):
+        if current_thread().name == "new-paper-work" and pending.is_set():
+            attempting.set()
+        with control(path, identity):
+            yield
+
+    def publish():
+        try:
+            if not start_publisher.wait(timeout=10):
+                raise TimeoutError("test did not start publisher")
+            with control(directory, directory.name):
+                ledger._write_approval_publication("a" * 32, "pending")
+                pending.set()
+                if not release.wait(timeout=10):
+                    raise TimeoutError("test did not release publisher")
+                ledger._write_approval_publication("a" * 32, "committed")
+        except BaseException as exc:
+            failures.append(exc)
+
+    def delayed_due(*args, **kwargs):
+        start_publisher.set()
+        if not pending.wait(timeout=10):
+            raise TimeoutError("publisher did not reach pending state")
+        return next_session(*args, **kwargs)
+
+    def work():
+        try:
+            if operation == "redo":
+                records.append(redo(directory, FakeDataClient(SERIES), build_fund=build_fund))
+            else:
+                records.append(_tick(directory))
+        except BaseException as exc:
+            failures.append(exc)
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(admission, "paper_control_transition", observe_control)
+    if operation == "run":
+        monkeypatch.setattr(paper_tick_module, "next_session", delayed_due)
+    publisher = Thread(target=publish, name="live-publisher")
+    worker = Thread(target=work, name="new-paper-work")
+    publisher.start()
+    try:
+        if operation != "run":
+            start_publisher.set()
+            assert pending.wait(timeout=10), failures
+        worker.start()
+        assert attempting.wait(timeout=3), f"work exited before control admission: {failures!r}"
+        assert not finished.is_set()
+    finally:
+        release.set()
+        publisher.join(timeout=10)
+        if worker.ident is not None:
+            worker.join(timeout=10)
+    assert not publisher.is_alive() and not worker.is_alive()
+    assert failures == []
+    assert len(records) == 1
+    assert ledger.halted() is None
+    if operation == "tick":
+        assert records[0].session > first.session
+
+
+def test_owned_child_exit_after_append_blocks_new_work(tmp_path, clock, SPEC, owned_test_process):
+    spec = SPEC.model_copy(update={"approval_required": True, "rebalance": "daily"})
+    clock("2024-06-04")
+    directory = deploy("alpha", spec, ["AAPL"], root=tmp_path)
+    ledger = Ledger(directory)
+    first = _tick(directory)
+    ledger.set_approval("approve", first.decision.as_of, first.hash, "cli")
+    script = f"""
+import os
+from datetime import datetime
+from pathlib import Path
+from hedge_fund.backtesting.test_fund import FakeAnalyst, FakeDataClient, SERIES
+from hedge_fund.data import sessions
+from hedge_fund.fund import Fund
+from hedge_fund.paper import tick
+from hedge_fund.paper.ledger import Ledger
+from hedge_fund.signals import ALPHA_MODEL_REGISTRY
+
+class Clock:
+    @staticmethod
+    def now(tz):
+        return datetime(2024, 6, 5, 12, tzinfo=tz)
+
+sessions.datetime = Clock
+ALPHA_MODEL_REGISTRY["a"] = FakeAnalyst
+log_event = Ledger.log_event
+def exit_before_tick_audit(self, kind, **fields):
+    if kind == "tick":
+        os._exit(73)
+    return log_event(self, kind, **fields)
+Ledger.log_event = exit_before_tick_audit
+def build_fund(spec):
+    return Fund(spec, models={{"solo": [FakeAnalyst("a", {{"AAPL": 1}})]}})
+try:
+    tick(Path({str(directory)!r}), FakeDataClient(SERIES), build_fund=build_fund)
+except BaseException as exc:
+    Path({str(directory)!r}, "child-error.txt").write_text(f"{{type(exc).__name__}}: {{exc}}", encoding="utf-8")
+    raise
+"""
+    child = owned_test_process(script)
+    result = child.wait(timeout=20)
+    diagnostic = directory / "child-error.txt"
+    assert result == 73, diagnostic.read_text(encoding="utf-8") if diagnostic.exists() else f"child exit {result}"
+    second = ledger.latest()
+    assert second.hash != first.hash
+    assert second.decision is not None
+    assert any(event["kind"] == "consume" and event["session"] == second.session for event in ledger.events())
+    assert not any(event["kind"] == "tick" and event["session"] == second.session for event in ledger.events())
+
+    class NoPreflightData(FakeDataClient):
+        def get_prices(self, *_args, **_kwargs):
+            pytest.fail("unfinished consumption reached the data provider")
+
+    clock("2024-06-06")
+    with pytest.raises(LedgerError, match="consumption is incomplete"):
+        tick(directory, NoPreflightData(SERIES), build_fund=build_fund)
+    assert ledger.halted() == "approval journal requires reconciliation"
+    assert ledger.latest().hash == second.hash
+
+
+def test_interrupted_redo_blocks_new_work_after_owned_child_exit(tmp_path, clock, SPEC, owned_test_process):
+    spec = SPEC.model_copy(update={"approval_required": True})
+    clock("2024-06-04")
+    directory = deploy("alpha", spec, ["AAPL"], root=tmp_path)
+    ledger = Ledger(directory)
+    first = _tick(directory)
+    script = f"""
+import os
+from pathlib import Path
+from hedge_fund.backtesting.test_fund import FakeAnalyst
+from hedge_fund.paper import redo
+from hedge_fund.signals import ALPHA_MODEL_REGISTRY
+ALPHA_MODEL_REGISTRY["a"] = FakeAnalyst
+redo(Path({str(directory)!r}), None, on_rewind=lambda _record: os._exit(73))
+"""
+    child = owned_test_process(script)
+    assert child.wait(timeout=20) == 73
+    assert ledger.latest() is None
+    assert json.loads(ledger.redo_state_path.read_text(encoding="utf-8"))["state"] == "pending"
+
+    class NoPreflightData(FakeDataClient):
+        def get_prices(self, *_args, **_kwargs):
+            pytest.fail("interrupted redo reached the data provider")
+
+    clock("2024-06-05")
+    with pytest.raises(LedgerError, match="interrupted redo"):
+        tick(directory, NoPreflightData(SERIES), build_fund=build_fund)
+    with pytest.raises(LedgerError, match="interrupted redo"):
+        redo(directory, NoPreflightData(SERIES), build_fund=build_fund)
+    assert ledger.latest() is None
+    superseded = list((directory / "ledger" / "superseded").glob(f"{first.session}.{first.hash[:12]}*.json"))
+    assert len(superseded) == 1
+
+
+def test_redo_completion_failure_keeps_recovery_guard(tmp_path, clock, SPEC, monkeypatch):
+    from hedge_fund.paper import ledger as ledger_module
+
+    clock("2024-06-04")
+    directory = deploy("alpha", SPEC, ["AAPL"], root=tmp_path)
+    ledger = Ledger(directory)
+    _tick(directory)
+    write_atomic = ledger_module.write_atomic
+
+    def fail_completion(path, text, **kwargs):
+        if path == ledger.redo_state_path and json.loads(text)["state"] == "completed":
+            raise OSError("synthetic redo completion failure")
+        return write_atomic(path, text, **kwargs)
+
+    monkeypatch.setattr(ledger_module, "write_atomic", fail_completion)
+    with pytest.raises(OSError, match="synthetic redo completion failure"):
+        redo(directory, FakeDataClient(SERIES), build_fund=build_fund)
+
+    assert json.loads(ledger.redo_state_path.read_text(encoding="utf-8"))["state"] == "pending"
+    assert ledger.halted() == "redo failed after rewind"
+    with pytest.raises(LedgerError, match="interrupted redo"):
+        _tick(directory)
+
+
+def test_redo_failure_with_unavailable_halt_requires_reconciliation_and_keeps_cause(tmp_path, clock, SPEC, monkeypatch):
+    from hedge_fund.paper.tick import PaperReconciliationRequired
+
+    clock("2024-06-04")
+    directory = deploy("alpha", SPEC, ["AAPL"], root=tmp_path)
+    _tick(directory)
+    original = OSError("synthetic redo failure after rewind")
+
+    def fail_after_rewind(_record):
+        raise original
+
+    def fail_halt(self, reason):
+        raise OSError("synthetic emergency halt failure")
+
+    monkeypatch.setattr(Ledger, "halt", fail_halt)
+    with pytest.raises(PaperReconciliationRequired, match="offline reconciliation is required") as raised:
+        redo(directory, FakeDataClient(SERIES), build_fund=build_fund, on_rewind=fail_after_rewind)
+
+    assert raised.value.__cause__ is original
+
+
+def test_successful_redo_records_completion_and_allows_next_tick(tmp_path, clock, SPEC):
+    clock("2024-06-04")
+    directory = deploy("alpha", SPEC, ["AAPL"], root=tmp_path)
+    ledger = Ledger(directory)
+    original = _tick(directory)
+
+    redone = redo(directory, FakeDataClient(SERIES), build_fund=build_fund)
+    marker = json.loads(ledger.redo_state_path.read_text(encoding="utf-8"))
+    assert marker["state"] == "completed"
+    assert marker["source_hash"] == original.hash
+    assert marker["result_hash"] == redone.hash
+    clock("2024-06-05")
+    assert _tick(directory).session == "2024-06-04"
+
+
+@pytest.mark.parametrize(
+    "contents",
+    [
+        "{invalid",
+        '{"version": 1, "state": [], "redo_id": "' + "a" * 32 + '", "source_session": "2024-06-03", "source_hash": "' + "b" * 64 + '", "result_hash": null}',
+    ],
+)
+def test_invalid_redo_guard_blocks_new_work(tmp_path, clock, SPEC, contents):
+    clock("2024-06-04")
+    directory = deploy("alpha", SPEC, ["AAPL"], root=tmp_path)
+    ledger = Ledger(directory)
+    _tick(directory)
+    ledger.redo_state_path.write_text(contents, encoding="utf-8")
+
+    with pytest.raises(LedgerError, match="redo state"):
+        _tick(directory)
+    with pytest.raises(LedgerError, match="redo state"):
+        redo(directory, FakeDataClient(SERIES), build_fund=build_fund)
+
+
+def test_halt_after_consumption_stops_execution_before_advance(tmp_path, clock, SPEC, monkeypatch):
+    spec = SPEC.model_copy(update={"approval_required": True})
+    clock("2024-06-04")
+    directory = deploy("alpha", spec, ["AAPL"], root=tmp_path)
+    ledger = Ledger(directory)
+    first = _tick(directory)
+    ledger.set_approval("approve", first.decision.as_of, first.hash, "cli")
+    book = (directory / "broker.json").read_bytes()
+    build_broker = paper_tick_module.build_broker
+
+    def halt_while_initializing(*args, **kwargs):
+        broker = build_broker(*args, **kwargs)
+        ledger.halt("synthetic emergency")
+        return broker
+
+    monkeypatch.setattr(paper_tick_module, "build_broker", halt_while_initializing)
+    clock("2024-06-05")
+    with pytest.raises(FundHalted):
+        _tick(directory)
+
+    assert ledger.halted() == "synthetic emergency"
+    assert ledger.latest().hash == first.hash
+    assert (directory / "broker.json").read_bytes() == book
+
+
+@pytest.mark.parametrize("halt_at", ["advance", "order"])
+def test_halt_before_effect_admission_stops_execution(tmp_path, clock, SPEC, monkeypatch, halt_at):
+    spec = SPEC.model_copy(update={"approval_required": True})
+    clock("2024-06-04")
+    directory = deploy("alpha", spec, ["AAPL"], root=tmp_path)
+    ledger = Ledger(directory)
+    first = _tick(directory)
+    ledger.set_approval("approve", first.decision.as_of, first.hash, "cli")
+    book = (directory / "broker.json").read_bytes()
+    advance = paper_tick_module.advance
+
+    def halt_at_boundary(*args, **kwargs):
+        if halt_at == "advance":
+            ledger.halt("synthetic emergency")
+        else:
+            check = kwargs["before_effect"]
+            calls = 0
+
+            def halt_before_order():
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    ledger.halt("synthetic emergency")
+                check()
+
+            kwargs["before_effect"] = halt_before_order
+        return advance(*args, **kwargs)
+
+    monkeypatch.setattr(paper_tick_module, "advance", halt_at_boundary)
+    clock("2024-06-05")
+    with pytest.raises(FundHalted):
+        _tick(directory)
+    assert ledger.latest().hash == first.hash
+    assert (directory / "broker.json").read_bytes() == book
+
+
+def test_halt_after_first_order_prevents_second_order(tmp_path, clock, SPEC, monkeypatch):
+    spec = SPEC.model_copy(update={"approval_required": True})
+    client = FakeDataClient({**SERIES, "MSFT": SERIES["AAPL"]})
+    directory = deploy("alpha", spec, ["AAPL", "MSFT"], root=tmp_path)
+    ledger = Ledger(directory)
+
+    def build_two_ticker_fund(selected):
+        return Fund(selected, models={"solo": [FakeAnalyst("a", {"AAPL": 0.5, "MSFT": 0.5})]})
+
+    clock("2024-06-04")
+    first = tick(directory, client, build_fund=build_two_ticker_fund)
+    ledger.set_approval("approve", first.decision.as_of, first.hash, "cli")
+    place_order = PaperBroker.place_order
+    submitted = []
+
+    def halt_after_fill(broker, order):
+        fill = place_order(broker, order)
+        submitted.append(order.ticker)
+        ledger.halt("synthetic emergency")
+        return fill
+
+    monkeypatch.setattr(PaperBroker, "place_order", halt_after_fill)
+    clock("2024-06-05")
+    with pytest.raises(FundHalted):
+        tick(directory, client, build_fund=build_two_ticker_fund)
+    assert len(submitted) == 1
+    assert ledger.halted() == "synthetic emergency"
+    assert ledger.latest().hash == first.hash
+    assert ledger._latest_approval_event(first.decision.as_of, first.hash, strict=True)["kind"] == "consume"
+
+
+def test_halt_before_refresh_prevents_new_assessment(tmp_path, clock, SPEC, monkeypatch):
+    from hedge_fund.pipeline import stages
+
+    spec = SPEC.model_copy(update={"approval_required": True})
+    clock("2024-06-08")
+    directory = deploy("alpha", spec, ["AAPL"], root=tmp_path)
+    ledger = Ledger(directory)
+    first = _tick(directory)
+    assert first.session == "2024-06-07"
+    ledger.set_approval("approve", first.decision.as_of, first.hash, "cli")
+    advance = paper_tick_module.advance
+
+    def halt_at_refresh(*args, **kwargs):
+        check = kwargs["before_effect"]
+        calls = 0
+
+        def guarded():
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                ledger.halt("synthetic emergency")
+            check()
+
+        kwargs["before_effect"] = guarded
+        return advance(*args, **kwargs)
+
+    def no_refresh(*_args, **_kwargs):
+        pytest.fail("assessment started after Halt")
+
+    monkeypatch.setattr(paper_tick_module, "advance", halt_at_refresh)
+    monkeypatch.setattr(stages, "assess_fund", no_refresh)
+    clock("2024-06-11")
+    with pytest.raises(FundHalted):
+        _tick(directory)
+    assert ledger.latest().hash == first.hash
+
+
+def test_standalone_verdict_cannot_change_during_consumption(tmp_path, clock, SPEC, monkeypatch):
+    from hedge_fund.runtime.admission import AdmissionError
+
+    spec = SPEC.model_copy(update={"approval_required": True})
+    clock("2024-06-04")
+    directory = deploy("alpha", spec, ["AAPL"], root=tmp_path)
+    ledger = Ledger(directory)
+    first = _tick(directory)
+    ledger.set_approval("approve", first.decision.as_of, first.hash, "cli")
+    read_verdict = Event()
+    release = Event()
+    failures = []
+    records = []
+    resolve = Ledger.resolve_approval
+
+    def pause_after_resolution(current, *args, **kwargs):
+        result = resolve(current, *args, **kwargs)
+        if current.directory == directory and current_thread().name == "standalone-tick":
+            read_verdict.set()
+            if not release.wait(timeout=10):
+                raise TimeoutError("test did not release standalone tick")
+        return result
+
+    def run_tick():
+        try:
+            records.append(_tick(directory))
+        except BaseException as exc:
+            failures.append(exc)
+
+    monkeypatch.setattr(Ledger, "resolve_approval", pause_after_resolution)
+    clock("2024-06-05")
+    worker = Thread(target=run_tick, name="standalone-tick")
+    worker.start()
+    try:
+        assert read_verdict.wait(timeout=10), failures
+        try:
+            ledger.set_approval("reject", first.decision.as_of, first.hash, "cli")
+            rejection_accepted = True
+        except AdmissionError:
+            rejection_accepted = False
+    finally:
+        release.set()
+        worker.join(timeout=15)
+
+    assert not worker.is_alive()
+    assert failures == []
+    assert len(records) == 1
+    assert not rejection_accepted or records[0].executed is None
+
+
+def test_standalone_control_lock_blocks_a_separate_process(tmp_path, clock, SPEC, owned_test_process):
+    from hedge_fund.runtime.admission import WriterConflict
+
+    spec = SPEC.model_copy(update={"approval_required": True})
+    clock("2024-06-04")
+    directory = deploy("alpha", spec, ["AAPL"], root=tmp_path)
+    ledger = Ledger(directory)
+    first = _tick(directory)
+    ledger.set_approval("approve", first.decision.as_of, first.hash, "cli")
+    locked = tmp_path / "child-locked"
+    release = tmp_path / "release-child"
+    failure = tmp_path / "child-failure"
+    script = f"""
+import time
+from pathlib import Path
+from hedge_fund.runtime.admission import paper_control_transition
+
+directory = Path({str(directory)!r})
+locked = Path({str(locked)!r})
+release = Path({str(release)!r})
+failure = Path({str(failure)!r})
+try:
+    with paper_control_transition(directory, "alpha"):
+        locked.write_text("locked", encoding="utf-8")
+        deadline = time.monotonic() + 15
+        while not release.exists():
+            if time.monotonic() >= deadline:
+                raise TimeoutError("parent did not release control")
+            time.sleep(0.01)
+except BaseException as exc:
+    failure.write_text(type(exc).__name__ + ": " + str(exc), encoding="utf-8")
+    raise
+"""
+    child = owned_test_process(script)
+    try:
+        deadline = time.monotonic() + 15
+        while not locked.exists() and child.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert locked.exists(), failure.read_text(encoding="utf-8") if failure.exists() else "child did not lock"
+        with pytest.raises(WriterConflict):
+            ledger.set_approval("reject", first.decision.as_of, first.hash, "cli")
+    finally:
+        release.write_text("release", encoding="utf-8")
+    assert child.wait(timeout=15) == 0, failure.read_text(encoding="utf-8") if failure.exists() else "child failed"
+    assert ledger.approval()["verdict"] == "approve"
+
+
+@pytest.mark.parametrize("failure", ["broker", "fund"])
+def test_initialization_failure_after_consumption_halts_before_retry(tmp_path, clock, SPEC, monkeypatch, failure):
+    spec = SPEC.model_copy(update={"approval_required": True})
+    clock("2024-06-04")
+    directory = deploy("alpha", spec, ["AAPL"], root=tmp_path)
+    ledger = Ledger(directory)
+    first = _tick(directory)
+    ledger.set_approval("approve", first.decision.as_of, first.hash, "cli")
+    book = (directory / "broker.json").read_bytes()
+
+    def fail_initialization(*_args, **_kwargs):
+        raise OSError("synthetic initialization failure")
+
+    if failure == "broker":
+        monkeypatch.setattr(paper_tick_module, "build_broker", fail_initialization)
+    clock("2024-06-05")
+    with pytest.raises(OSError, match="synthetic initialization failure"):
+        tick(
+            directory,
+            FakeDataClient(SERIES),
+            build_fund=fail_initialization if failure == "fund" else build_fund,
+        )
+
+    assert ledger.halted() is not None
+    assert ledger.latest().hash == first.hash
+    assert (directory / "broker.json").read_bytes() == book
+
+
+@pytest.mark.parametrize("failure", ["restore", "redo-event"])
+def test_redo_failure_after_rewind_halts_the_fund(tmp_path, clock, SPEC, monkeypatch, failure):
+    spec = SPEC.model_copy(update={"approval_required": True, "rebalance": "daily"})
+    clock("2024-06-04")
+    directory = deploy("alpha", spec, ["AAPL"], root=tmp_path)
+    ledger = Ledger(directory)
+    first = _tick(directory)
+    ledger.set_approval("approve", first.decision.as_of, first.hash, "cli")
+    clock("2024-06-05")
+    second = _tick(directory)
+    assert second.executed is not None
+    log_event = Ledger.log_event
+
+    def fail_restore(*_args, **_kwargs):
+        raise OSError("synthetic redo failure")
+
+    def fail_redo_event(current, kind, **fields):
+        if kind == "redo":
+            raise OSError("synthetic redo failure")
+        return log_event(current, kind, **fields)
+
+    if failure == "restore":
+        monkeypatch.setattr(PaperBroker, "restore", fail_restore)
+    else:
+        monkeypatch.setattr(Ledger, "log_event", fail_redo_event)
+    with pytest.raises(OSError, match="synthetic redo failure"):
+        redo(directory, FakeDataClient(SERIES), build_fund=build_fund)
+
+    assert ledger.halted() is not None
+    assert ledger.latest().hash == first.hash
+    assert ledger.path(second.session).exists() is False
+
+
 def test_gate_rejects_matching_verdict_without_trading(tmp_path, clock, SPEC):
     spec = SPEC.model_copy(update={"approval_required": True, "rebalance": "daily"})
     clock("2024-06-04")
@@ -386,8 +1716,8 @@ def test_gate_rejects_matching_verdict_without_trading(tmp_path, clock, SPEC):
     assert rejected.decision is not None and rejected.decision.as_of == rejected.session
     assert json.loads((directory / "broker.json").read_text()) == book_before
     assert ledger.approval() is None
-    assert [event["kind"] for event in ledger.events()] == ["tick", "reject", "reject", "tick"]
-    assert ledger.events()[2]["consumed"] is True
+    assert [event["kind"] for event in ledger.events()] == ["tick", "reject", "consume", "reject", "tick"]
+    assert ledger.events()[3]["consumed"] is True
 
 
 def test_gate_ignores_and_clears_stale_approval(tmp_path, clock, SPEC):
@@ -522,12 +1852,42 @@ def test_redo_runs_the_latest_session_again_and_replaces_its_record(tmp_path, cl
     assert ledger.sessions() == ["2024-06-03", "2024-06-04"] and ledger.latest() == bearish
     assert ledger.replay(spec.capital).pending == bearish.decision  # the chain still verifies
     assert [e["kind"] for e in ledger.events()] == ["tick", "tick", "redo", "tick", "redo", "tick"]
-
     # The next real tick still finds 06-05 due and executes the redone decision.
     clock("2024-06-06")
     wednesday = _tick(directory)
     assert wednesday.session == "2024-06-05" and wednesday.executed.as_of == "2024-06-04"
     assert wednesday.positions == {"AAPL": -500}
+
+
+def test_redo_request_id_replays_result_and_conflicts_on_changed_head(tmp_path, clock, SPEC):
+    from hedge_fund.paper.ledger import PaperRequestConflict
+
+    clock("2024-06-04")
+    directory = deploy("alpha", SPEC, ["AAPL"], root=tmp_path)
+    original = _tick(directory)
+    build_calls = []
+
+    def counted_build(spec):
+        build_calls.append(True)
+        return build_fund(spec)
+
+    request = {
+        "request_id": "cli-redo-alpha-001",
+        "expected_head": original.hash,
+    }
+    record = redo(directory, FakeDataClient(SERIES), build_fund=counted_build, **request)
+    replayed = redo(directory, FakeDataClient(SERIES), build_fund=counted_build, **request)
+
+    assert replayed.hash == record.hash
+    assert build_calls == [True]
+    with pytest.raises(PaperRequestConflict, match="request identity conflicts"):
+        redo(
+            directory,
+            FakeDataClient(SERIES),
+            build_fund=counted_build,
+            request_id=request["request_id"],
+            expected_head="0" * 64,
+        )
 
 
 def test_redo_refuses_a_halted_fund_and_leaves_it_untouched(tmp_path, clock, SPEC):
@@ -541,7 +1901,7 @@ def test_redo_refuses_a_halted_fund_and_leaves_it_untouched(tmp_path, clock, SPE
     assert not (directory / "ledger" / "superseded").exists()
 
 
-def test_failure_inside_advance_halts_the_fund_and_a_resume_clears_it(tmp_path, clock, SPEC):
+def test_failure_inside_advance_stays_halted_without_reconciliation_receipt(tmp_path, clock, SPEC):
     clock("2024-06-05")
     directory = deploy("alpha", SPEC, ["AAPL"], root=tmp_path)
     _tick(directory)  # 06-04, decision made
@@ -554,13 +1914,87 @@ def test_failure_inside_advance_halts_the_fund_and_a_resume_clears_it(tmp_path, 
     assert ledger.halted().startswith("tick 2024-06-05 failed: ValueError")
     assert [e["kind"] for e in ledger.events()] == ["tick", "tick_failed", "halt"]
     assert ledger.sessions() == ["2024-06-04"]
+    control_before = ledger.control_path.read_bytes()
+    events_before = ledger.events_path.read_bytes()
+    with pytest.raises(LedgerError, match="verified reconciliation receipt"):
+        ledger.resume(SPEC.capital)
     with pytest.raises(FundHalted):
-        _tick(directory)  # data is fine again, but nobody has looked yet
-    ledger.resume()
-    assert _tick(directory).session == "2024-06-05"
+        _tick(directory)
+    assert ledger.sessions() == ["2024-06-04"]
+    assert ledger.control_path.read_bytes() == control_before
+    assert ledger.events_path.read_bytes() == events_before
 
 
-def test_gated_approval_survives_failed_advance_and_retries(tmp_path, clock, SPEC, monkeypatch):
+def test_tick_failure_event_binds_manual_operation_and_capture(tmp_path, clock, SPEC):
+    clock("2024-06-05")
+    directory = deploy("alpha", SPEC, ["AAPL"], root=tmp_path)
+    first = _tick(directory)
+    clock("2024-06-06")
+    series = {ticker: dict(values) for ticker, values in SERIES.items()}
+    del series["AAPL"]["2024-06-05"]
+
+    with pytest.raises(ValueError, match="AAPL: missing close on 2024-06-05"):
+        tick(
+            directory,
+            FakeDataClient(series),
+            build_fund=build_fund,
+            expected_head=first.hash,
+            operation_id="a" * 32,
+            request_id="web-tick-1",
+            capture_id="b" * 32,
+            capture_digest="c" * 64,
+        )
+
+    failure = next(event for event in Ledger(directory).events() if event["kind"] == "tick_failed")
+    assert failure["expected_head"] == first.hash
+    assert failure["operation_id"] == "a" * 32
+    assert failure["request_id"] == "web-tick-1"
+    assert failure["capture_id"] == "b" * 32
+    assert failure["capture_digest"] == "c" * 64
+
+
+def test_fill_then_append_failure_stays_halted_without_fabricated_ledger_success(tmp_path, clock, SPEC, monkeypatch):
+    from hedge_fund.runtime.reconciliation import (
+        build_reconciliation_snapshot,
+        ReconciliationConfirmation,
+    )
+
+    clock("2024-06-05")
+    directory = deploy("alpha", SPEC, ["AAPL"], root=tmp_path)
+    first = _tick(directory)
+    original_append = Ledger.append
+
+    def fail_append(self, record):
+        raise OSError("synthetic append failure after fill")
+
+    monkeypatch.setattr(Ledger, "append", fail_append)
+    clock("2024-06-06")
+    with pytest.raises(OSError, match="synthetic append failure after fill"):
+        _tick(directory)
+    monkeypatch.setattr(Ledger, "append", original_append)
+
+    ledger = Ledger(directory)
+    assert ledger.latest() == first
+    assert ledger.sessions() == [first.session]
+    assert PaperBroker(directory / "broker.json").positions()
+    state = ledger.replay(SPEC.capital, full=True)
+    preview = build_reconciliation_snapshot(directory, load_deployed(directory), ledger, state, ledger.latest())
+    confirmation = ReconciliationConfirmation(
+        request_id="recover-fill-1",
+        failure_id=preview.preview.failure_id,
+        preview_digest=preview.preview.preview_digest,
+        decision="confirm-paper-book-matches-ledger",
+    )
+
+    with pytest.raises(LedgerError, match="not reconcilable"):
+        ledger.resume(SPEC.capital, reconciliation=confirmation, operator="web")
+
+    assert ledger.halted() is not None
+    assert ledger.sessions() == [first.session]
+    assert not any(event["kind"] in {"reconciliation", "resume"} for event in ledger.events())
+
+
+def test_gated_approval_survives_failed_advance_and_resume_denial(tmp_path, clock, SPEC, monkeypatch):
     spec = SPEC.model_copy(update={"approval_required": True, "rebalance": "daily"})
     clock("2024-06-04")
     directory = deploy("alpha", spec, ["AAPL"], root=tmp_path)
@@ -582,13 +2016,14 @@ def test_gated_approval_survives_failed_advance_and_retries(tmp_path, clock, SPE
     assert ledger.approval() == verdict
     assert ledger.sessions() == ["2024-06-03"]
 
-    ledger.resume()
+    with pytest.raises(LedgerError, match="reconciliation"):
+        ledger.resume(spec.capital, approval_required=True)
     monkeypatch.setattr(paper_tick_module, "advance", real_advance)
-    retried = _tick(directory)
-
-    assert retried.executed is not None
-    assert retried.positions == {"AAPL": 500}
-    assert ledger.approval() is None
+    with pytest.raises(FundHalted):
+        _tick(directory)
+    assert ledger.sessions() == ["2024-06-03"]
+    assert ledger.approval() == verdict
+    assert [event["kind"] for event in ledger.events()][-1] == "halt"
 
 
 def test_broker_drift_between_ticks_is_caught_and_halts(tmp_path, clock, SPEC):
@@ -627,3 +2062,179 @@ def test_assessment_dates_name_the_refresh_and_the_new_decision(SPEC):
     fresh = DecisionRecord.model_construct(as_of="2025-01-21T13:00:00")
     state = FundState(cash=100_000, last_session="2025-01-21T13:00:00", pending=fresh)
     assert assessment_dates(state, "2025-01-21T13:05:00", spec) == ["2025-01-21T13:05:00"]
+
+
+def _enrolled_paper_directory(root: Path, spec: FundSpec) -> Path:
+    from hedge_fund.runtime.admission import AdmissionCoordinator, RootOwnerLease
+    from hedge_fund.runtime.handover import enroll_fresh, record_ledger_head
+    from hedge_fund.runtime.root import RootContext
+
+    root.mkdir()
+    with RootContext.open(root) as context:
+        enroll_fresh(context)
+        owner = RootOwnerLease.acquire(context)
+        admission = AdmissionCoordinator(context, owner_lease=owner)
+        try:
+            with admission.deployment_lock("alpha", timeout=0):
+                directory = deploy(
+                    "alpha",
+                    spec,
+                    ["AAPL"],
+                    root=root / "paper",
+                )
+            record_ledger_head(context, "alpha", admission=admission)
+        finally:
+            owner.close()
+    return directory
+
+
+def test_enrolled_deploy_requires_a_held_deployment_lane(tmp_path, SPEC):
+    from hedge_fund.runtime.admission import AdmissionError
+    from hedge_fund.runtime.handover import enroll_fresh
+    from hedge_fund.runtime.root import RootContext
+
+    root = tmp_path / "enrolled"
+    root.mkdir()
+    with RootContext.open(root) as context:
+        enroll_fresh(context)
+
+    with pytest.raises(AdmissionError, match="admission"):
+        deploy("alpha", SPEC, ["AAPL"], root=root / "paper")
+
+    assert not (root / "paper" / "alpha").exists()
+
+
+def test_enrolled_tick_redo_and_ledger_writes_require_admission(tmp_path, SPEC):
+    from hedge_fund.runtime.admission import AdmissionError
+
+    directory = _enrolled_paper_directory(tmp_path / "enrolled", SPEC)
+    ledger = Ledger(directory)
+    control_before = ledger.control_path.read_bytes()
+
+    with pytest.raises(AdmissionError, match="admission"):
+        tick(directory, object())
+    with pytest.raises(AdmissionError, match="admission"):
+        redo(directory, object())
+    with pytest.raises(LedgerError, match="admission"):
+        ledger.append(object())
+    with pytest.raises(LedgerError, match="admission"):
+        ledger.halt("unadmitted")
+    with pytest.raises(LedgerError, match="admission"):
+        ledger.resume(1.0)
+    with pytest.raises(LedgerError, match="admission"):
+        ledger.set_approval("approve", "2024-06-03", "0" * 64, "cli")
+    with pytest.raises(LedgerError, match="admission"):
+        ledger.clear_approval()
+    with pytest.raises(LedgerError, match="admission"):
+        ledger.log_event("unadmitted")
+
+    assert ledger.sessions() == []
+    assert ledger.control_path.read_bytes() == control_before
+    assert not ledger.events_path.exists()
+
+
+def test_enrolled_tick_rejects_inventory_drift_before_data_access(tmp_path, SPEC):
+    from hedge_fund.runtime.admission import (
+        AdmissionCoordinator,
+        AdmissionError,
+        RootOwnerLease,
+    )
+    from hedge_fund.runtime.root import RootContext
+
+    directory = _enrolled_paper_directory(tmp_path / "enrolled", SPEC)
+    root = RootContext.open(directory.parent.parent)
+    owner = RootOwnerLease.acquire(root)
+    admission = AdmissionCoordinator(root, owner_lease=owner)
+    ledger = Ledger(directory)
+    (directory / "fund.yaml").write_bytes((directory / "fund.yaml").read_bytes() + b"\n")
+    before = {path.relative_to(directory): path.read_bytes() for path in directory.rglob("*") if path.is_file()}
+
+    class UnavailableDataClient:
+        def __getattr__(self, _name):
+            raise AssertionError("tick accessed data before verifying the enrolled inventory")
+
+    try:
+        with admission.manual_session("alpha", timeout=0):
+            with pytest.raises(AdmissionError, match="inventory"):
+                tick(directory, UnavailableDataClient())
+        after = {path.relative_to(directory): path.read_bytes() for path in directory.rglob("*") if path.is_file()}
+        assert after == before
+        assert ledger.sessions() == []
+    finally:
+        owner.close()
+        root.close()
+
+
+# ---------------------------------------------------------------------------
+# cadence regressions (T026)
+# ---------------------------------------------------------------------------
+
+
+def test_weekly_cadence_records_every_session_oldest_first_and_rebalances_once_per_iso_week(tmp_path, clock, SPEC):
+    spec = SPEC.model_copy(update={"rebalance": "weekly"})
+    clock("2024-06-04")
+    directory = deploy("alpha", spec, ["AAPL"], root=tmp_path)
+    assert _tick(directory).session == "2024-06-03"
+
+    clock("2024-06-12")  # a reviewed backlog of six closes, run strictly oldest first
+    backlog = [_tick(directory) for _ in range(6)]
+    with pytest.raises(NothingDue):
+        _tick(directory)
+
+    assert [record.session for record in backlog] == ["2024-06-04", "2024-06-05", "2024-06-06", "2024-06-07", "2024-06-10", "2024-06-11"]
+    assert [record.rebalance for record in backlog] == [False, False, False, False, True, False]
+    assert Ledger(directory).sessions() == WEEKDAYS[:7]
+
+
+def test_monthly_cadence_skips_market_holidays_and_rebalances_at_the_month_open(tmp_path, clock, SPEC):
+    days = ["2024-05-23", "2024-05-24", "2024-05-28", "2024-05-29", "2024-05-30", "2024-05-31", "2024-06-03", "2024-06-04"]  # 05-27 Memorial Day
+    series = {"SPY": {day: 100.0 for day in days}, "AAPL": {day: 200.0 + i for i, day in enumerate(days)}}
+    spec = SPEC.model_copy(update={"rebalance": "monthly"})
+    clock("2024-05-25")  # Saturday: Friday is the latest completed close
+    directory = deploy("alpha", spec, ["AAPL"], root=tmp_path)
+    first = _tick(directory, data=FakeDataClient(series))
+    assert first.session == "2024-05-24" and first.rebalance
+
+    clock("2024-06-05")
+    owed = []
+    while True:
+        try:
+            owed.append(_tick(directory, data=FakeDataClient(series)))
+        except NothingDue:
+            break
+
+    assert [record.session for record in owed] == days[2:]
+    assert [record.session for record in owed if record.rebalance] == ["2024-06-03"]
+    assert "2024-05-27" not in Ledger(directory).sessions()
+
+
+def test_explicit_backfill_cannot_skip_or_reorder_the_owed_backlog_and_recorded_dates_are_idempotent(tmp_path, clock, SPEC):
+    clock("2024-06-04")
+    directory = deploy("alpha", SPEC, ["AAPL"], root=tmp_path)
+    _tick(directory)
+    clock("2024-06-08")
+
+    for skipped in ("2024-06-05", "2024-06-07"):
+        with pytest.raises(ValueError, match="not the next unrecorded session \\(2024-06-04\\)"):
+            _tick(directory, session=skipped)
+    assert Ledger(directory).sessions() == ["2024-06-03"]
+    assert [_tick(directory, session=day).session for day in ("2024-06-04", "2024-06-05")] == ["2024-06-04", "2024-06-05"]
+    recorded = Ledger(directory).read("2024-06-03")
+    assert _tick(directory, session="2024-06-03") == recorded  # recorded history is returned, never re-run
+    assert Ledger(directory).sessions() == ["2024-06-03", "2024-06-04", "2024-06-05"]
+
+
+def test_one_second_minute_cadence_is_keyed_to_the_second_and_late_runs_take_the_latest_bar(SPEC):
+    spec = FundSpec.model_validate({**SPEC.model_dump(mode="json"), "rebalance": "minute", "interval": 1 / 60, "window": {"start": "13:00", "end": "13:01"}})
+    assert spec.interval_seconds == 1
+    at = lambda hhmmss, micro=0: datetime.fromisoformat(f"2024-06-04T{hhmmss}").replace(microsecond=micro, tzinfo=NEW_YORK)  # noqa: E731
+
+    assert next_session(None, spec, None, now=lambda: at("12:59:59", 999_999)) is None
+    assert next_session(None, spec, None, now=lambda: at("13:00:00", 700_000)) == "2024-06-04T13:00:00"
+    assert next_session(None, spec, "2024-06-04T13:00:00", now=lambda: at("13:00:00", 999_999)) is None
+    assert next_session(None, spec, "2024-06-04T13:00:00", now=lambda: at("13:00:01")) == "2024-06-04T13:00:01"
+    assert next_session(None, spec, "2024-06-04T13:00:01", now=lambda: at("13:00:07", 500_000)) == "2024-06-04T13:00:07"
+    assert next_session(None, spec, "2024-06-04T13:00:59", now=lambda: at("13:05:00")) == "2024-06-04T13:01:00"
+    assert next_session(None, spec, "2024-06-04T13:01:00", now=lambda: at("15:00:00")) is None
+    with pytest.raises(ValueError, match="floor is 1 second"):
+        FundSpec.model_validate({**SPEC.model_dump(mode="json"), "rebalance": "minute", "interval": 0.5 / 60, "window": {"start": "13:00", "end": "13:01"}})

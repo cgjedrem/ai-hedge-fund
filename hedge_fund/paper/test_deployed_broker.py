@@ -4,9 +4,14 @@ import pytest
 
 from hedge_fund.brokers.factory import build_broker
 from hedge_fund.brokers.paper import PaperBroker
+from hedge_fund.brokers.test_saxo_doubles import (
+    fake_saxo_broker,
+    write_fake_sim_deployment,
+)
 from hedge_fund.fund.spec import Fund, FundSpec
 from hedge_fund.paper.deployed import deploy, load_deployed
 from hedge_fund.pipeline.session import advance, BookMismatch, FundState, reconcile
+from hedge_fund.runtime.admission import OwnershipUnknown
 
 
 class FakeSecrets:
@@ -59,23 +64,25 @@ class FakeTransport:
         return 200, {"Data": []}
 
 
-def _spec(broker="paper", rebalance="weekly"):
-    return FundSpec(
-        schema_version=2,
-        name="adapter-test",
-        strategies=[{"name": "event", "models": [{"name": "pead"}], "blend": {"mode": "long_short"}}],
-        risk={"max_position_pct": 0.25, "max_gross_exposure": 1.0},
-        broker=broker,
-        rebalance=rebalance,
-    )
+def _spec(broker="paper", rebalance="weekly", account_key="account"):
+    data = {
+        "schema_version": 2,
+        "name": "adapter-test",
+        "strategies": [{"name": "event", "models": [{"name": "pead"}], "blend": {"mode": "long_short"}}],
+        "risk": {"max_position_pct": 0.25, "max_gross_exposure": 1.0},
+        "broker": broker,
+        "rebalance": rebalance,
+    }
+    if broker == "saxo" and account_key is not None:
+        data["saxo_account_key"] = account_key
+    return FundSpec(**data)
 
 
-def test_saxo_deploy_skips_local_broker_book(tmp_path):
+def test_saxo_deploy_denies_unverified_account_without_local_broker_book(tmp_path):
     spec = _spec("saxo", "minute")
-    directory = deploy("external", spec, ["AAPL"], root=tmp_path)
-
-    assert load_deployed(directory).broker == "saxo"
-    assert not (directory / "broker.json").exists()
+    with pytest.raises(OwnershipUnknown, match="ownership-unknown"):
+        deploy("external", spec, ["AAPL"], root=tmp_path)
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_paper_deployment_keeps_default_broker_in_deployment_yaml(tmp_path):
@@ -85,45 +92,40 @@ def test_paper_deployment_keeps_default_broker_in_deployment_yaml(tmp_path):
     assert load_deployed(directory).broker == "paper"
 
 
-def test_factory_routes_paper_and_saxo_and_resolves_credentials(tmp_path):
+def test_factory_routes_paper_and_denies_saxo_before_resolving_credentials(tmp_path):
     paper_dir = deploy("paper", _spec(), ["AAPL"], root=tmp_path)
     paper_fund = load_deployed(paper_dir)
     assert isinstance(build_broker(paper_fund, directory=paper_dir), PaperBroker)
 
-    saxo_dir = deploy("saxo", _spec("saxo", "minute"), ["AAPL"], root=tmp_path)
+    saxo_dir = write_fake_sim_deployment("saxo", _spec("saxo", "minute"), ["AAPL"], root=tmp_path)
     saxo_fund = load_deployed(saxo_dir)
     secrets = FakeSecrets()
     transport = FakeTransport()
-    broker = build_broker(
-        saxo_fund,
-        directory=saxo_dir,
-        secrets_provider=secrets,
-        transport=transport,
-        environ={
-            "SAXO_APP_KEY_REF": "op://vault/item/key",
-            "SAXO_APP_SECRET_REF": "op://vault/item/secret",
-            "SAXO_REFRESH_TOKEN_REF": "op://vault/item/token",
-        },
-    )
-    assert broker.client.account_key == "account"
-    assert [call[0] for call in secrets.calls] == [
-        "SAXO_APP_KEY_REF",
-        "SAXO_APP_SECRET_REF",
-        "SAXO_REFRESH_TOKEN_REF",
-        "write:SAXO_REFRESH_TOKEN_REF",
-    ]
+    with pytest.raises(OwnershipUnknown, match="ownership-unknown"):
+        build_broker(
+            saxo_fund,
+            directory=saxo_dir,
+            secrets_provider=secrets,
+            transport=transport,
+            environ={
+                "SAXO_APP_KEY_REF": "op://vault/item/key",
+                "SAXO_APP_SECRET_REF": "op://vault/item/secret",
+                "SAXO_REFRESH_TOKEN_REF": "op://vault/item/token",
+            },
+        )
+    assert secrets.calls == transport.calls == []
 
 
-def test_factory_rejects_missing_saxo_secret_reference_before_trading(tmp_path):
-    directory = deploy("saxo", _spec("saxo", "minute"), ["AAPL"], root=tmp_path)
-    with pytest.raises(ValueError, match="SAXO_APP_KEY_REF"):
+def test_factory_rejects_unknown_account_before_missing_saxo_secret_reference(tmp_path):
+    directory = write_fake_sim_deployment("saxo", _spec("saxo", "minute"), ["AAPL"], root=tmp_path)
+    with pytest.raises(OwnershipUnknown, match="ownership-unknown"):
         build_broker(load_deployed(directory), directory=directory, environ={})
 
 
-def test_factory_rejects_non_usd_base_currency_override_before_secret_resolution(tmp_path):
-    directory = deploy("saxo", _spec("saxo", "minute"), ["AAPL"], root=tmp_path)
+def test_factory_rejects_unknown_account_before_currency_override_or_secret_resolution(tmp_path):
+    directory = write_fake_sim_deployment("saxo", _spec("saxo", "minute"), ["AAPL"], root=tmp_path)
     secrets = FakeSecrets()
-    with pytest.raises(ValueError, match="base currency is USD"):
+    with pytest.raises(OwnershipUnknown, match="ownership-unknown"):
         build_broker(
             load_deployed(directory),
             directory=directory,
@@ -139,18 +141,13 @@ def test_factory_rejects_non_usd_base_currency_override_before_secret_resolution
 
 
 def test_saxo_reconciliation_uses_accounting_cash_and_refuses_mismatch(tmp_path):
-    directory = deploy("saxo", _spec("saxo", "minute"), ["AAPL"], root=tmp_path)
+    directory = write_fake_sim_deployment("saxo", _spec("saxo", "minute"), ["AAPL"], root=tmp_path)
     deployed = load_deployed(directory)
-    broker = build_broker(
-        deployed,
-        directory=directory,
+    broker = fake_saxo_broker(
+        deployed.universe,
         secrets_provider=FakeSecrets(),
         transport=FakeTransport(),
-        environ={
-            "SAXO_APP_KEY_REF": "op://vault/item/key",
-            "SAXO_APP_SECRET_REF": "op://vault/item/secret",
-            "SAXO_REFRESH_TOKEN_REF": "op://vault/item/token",
-        },
+        lock_dir=tmp_path,
     )
 
     reconcile(FundState.initial(100_000), broker, "saxo")
@@ -174,7 +171,27 @@ def test_saxo_reconciliation_uses_accounting_cash_and_refuses_mismatch(tmp_path)
 def test_redo_refuses_saxo_before_rewinding_ledger(tmp_path):
     from hedge_fund.paper.tick import redo
 
-    directory = deploy("saxo", _spec("saxo", "minute"), ["AAPL"], root=tmp_path)
+    directory = write_fake_sim_deployment("saxo", _spec("saxo", "minute"), ["AAPL"], root=tmp_path)
     with pytest.raises(ValueError, match="redo is only supported for paper"):
         redo(directory, None)
     assert not (directory / "broker.json").exists()
+
+
+def test_tick_refuses_unknown_sim_account_before_ledger_or_provider_access(tmp_path, monkeypatch):
+    from importlib import import_module
+
+    from hedge_fund.runtime.admission import paper_execution_transition
+
+    tick_module = import_module("hedge_fund.paper.tick")
+    directory = write_fake_sim_deployment("saxo", _spec("saxo", "minute"), ["AAPL"], root=tmp_path)
+    with paper_execution_transition(directory, directory.name):
+        pass
+    before = {str(entry.relative_to(directory)): entry.read_bytes() for entry in directory.rglob("*") if entry.is_file()}
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("unknown SIM ownership reached ledger or provider work")
+
+    monkeypatch.setattr(tick_module, "Ledger", forbidden)
+    with pytest.raises(OwnershipUnknown, match="ownership-unknown"):
+        tick_module.tick(directory, None, build_fund=forbidden)
+    assert {str(entry.relative_to(directory)): entry.read_bytes() for entry in directory.rglob("*") if entry.is_file()} == before

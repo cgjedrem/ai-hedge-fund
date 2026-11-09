@@ -1,0 +1,619 @@
+"""Isolate Python test processes from user state and external network."""
+
+from __future__ import annotations
+
+import ipaddress
+import os
+import socket
+import stat
+import sys
+import sysconfig
+import threading
+from pathlib import Path
+from typing import Any
+
+_GUARD = "__hedge_fund_test_network_guard__"
+LOOPBACK_PORTS_ENV = "HEDGE_FUND_TEST_LOOPBACK_PORTS"
+_SOCKETPAIR = threading.local()
+_CHILD_GUARD_PREFLIGHT = """\
+try:
+    import importlib.util
+    import os
+    import socket
+    if os.environ.get("HEDGE_FUND_TEST_MODE") != "1":
+        raise RuntimeError("test mode is unavailable")
+    support = %r
+    repository = %r
+    if os.environ.get("PYTHONPATH") != os.pathsep.join((support, repository)):
+        raise RuntimeError("test child import path mismatch")
+    for module, filename in (("sitecustomize", "sitecustomize.py"),
+                             ("network_guard", "network_guard.py")):
+        spec = importlib.util.find_spec(module)
+        expected = os.path.normcase(os.path.abspath(os.path.join(support, filename)))
+        if spec is None or spec.origin is None or os.path.normcase(os.path.abspath(spec.origin)) != expected:
+            raise RuntimeError("test isolation module is unavailable")
+    import sitecustomize
+    from network_guard import configure_test_child
+    configure_test_child()
+    for owner, names in (
+        (socket.socket, ("connect", "connect_ex", "sendto")),
+        (socket, ("create_connection", "getaddrinfo", "gethostbyname",
+                  "gethostbyname_ex", "gethostbyaddr")),
+    ):
+        for name in names:
+            if not getattr(getattr(owner, name), "__hedge_fund_test_network_guard__", False):
+                raise RuntimeError("test network guard is unavailable")
+    if os.environ.get("PYTHON_DOTENV_DISABLED") != "1":
+        raise RuntimeError("test dotenv guard is unavailable")
+except BaseException:
+    sys.stderr.write("test isolation initialization failed\\n")
+    raise SystemExit(70)
+""" % (str(Path(__file__).resolve().parent), str(Path(__file__).resolve().parents[2]))
+_CHILD_COMMAND_BODY = """\
+arguments = sys.argv[1:]
+if not arguments:
+    raise SystemExit("test child command is missing")
+mode, *arguments = arguments
+if mode == "-c":
+    source, *arguments = arguments
+    sys.argv = ["-c", *arguments]
+    exec(compile(source, "<string>", "exec"), {"__name__": "__main__", "__package__": None})
+elif mode == "-m":
+    import runpy
+    module, *arguments = arguments
+    sys.argv = [module, *arguments]
+    runpy.run_module(module, run_name="__main__", alter_sys=True)
+else:
+    import runpy
+    sys.argv = [mode, *arguments]
+    runpy.run_path(mode, run_name="__main__")
+"""
+CREDENTIAL_ENV_VARS = (
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+    "XAI_API_KEY",
+    "DEEPSEEK_API_KEY",
+    "GOOGLE_API_KEY",
+    "KIMI_API_KEY",
+    "TYPESAFE_API_KEY",
+    "MOONSHOT_API_KEY",
+    "FINANCIAL_DATASETS_API_KEY",
+    "SAXO_API_KEY",
+    "SAXO_CLIENT_ID",
+    "SAXO_CLIENT_SECRET",
+    "SAXO_APP_KEY_REF",
+    "SAXO_APP_SECRET_REF",
+    "SAXO_REFRESH_TOKEN_REF",
+    "HEDGE_FUND_LLM_MODEL",
+    "HEDGE_FUND_DATA_PROVIDER",
+    "HEDGE_FUND_ROOT",
+    "HEDGE_FUND_HOME",
+    "AIHF_ROOT",
+    "OLLAMA_BASE_URL",
+    "OLLAMA_NUM_CTX",
+    "OLLAMA_TIMEOUT",
+    "MOONSHOT_BASE_URL",
+    "OPENAI_API_BASE",
+    "SAXO_REFRESH_LOCK_DIR",
+    "OPENROUTER_API_KEY",
+    "MISTRAL_API_KEY",
+    "COHERE_API_KEY",
+    "GROQ_API_KEY",
+    "HF_TOKEN",
+    "HUGGINGFACEHUB_API_TOKEN",
+    "AZURE_OPENAI_API_KEY",
+)
+PROXY_ENV_VARS = (
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "no_proxy",
+)
+
+
+def prepare_test_output_root(output_root: Path) -> Path:
+    repository = Path(__file__).resolve().parents[2]
+    expected = repository / "outputs"
+    candidate = Path(output_root)
+    if candidate != expected:
+        raise RuntimeError("test output root must be checkout outputs")
+    if _is_reparse_point(expected):
+        raise RuntimeError("test output root cannot be a reparse point")
+    expected.mkdir(exist_ok=True)
+    if _is_reparse_point(expected):
+        raise RuntimeError("test output root cannot be a reparse point")
+    resolved = expected.resolve(strict=True)
+    if resolved.parent != repository or resolved.name.casefold() != "outputs":
+        raise RuntimeError("test output root escaped checkout")
+    return resolved
+
+
+def configure_test_environment(test_root: Path) -> None:
+    root = _validate_test_root(test_root)
+    home = root / "home"
+    temporary = root / "tmp"
+    home.mkdir(parents=True, exist_ok=True)
+    temporary.mkdir(parents=True, exist_ok=True)
+
+    appdata = home / "AppData" / "Roaming"
+    local_appdata = home / "AppData" / "Local"
+    env_values = {
+        "HEDGE_FUND_TEST_MODE": "1",
+        "HEDGE_FUND_TEST_ROOT": str(root),
+        "PYTHON_DOTENV_DISABLED": "1",
+        "HOME": str(home),
+        "USERPROFILE": str(home),
+        "HOMEDRIVE": home.drive,
+        "HOMEPATH": str(home).removeprefix(home.drive),
+        "TEMP": str(temporary),
+        "TMP": str(temporary),
+        "APPDATA": str(appdata),
+        "LOCALAPPDATA": str(local_appdata),
+        "XDG_CACHE_HOME": str(home / ".cache"),
+        "XDG_CONFIG_HOME": str(home / ".config"),
+        "XDG_DATA_HOME": str(home / ".local" / "share"),
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONPATH": str(Path(__file__).resolve().parent),
+    }
+    os.environ.update(env_values)
+    import tempfile
+
+    tempfile.tempdir = str(temporary)
+    _clear_environment()
+    install_network_guard()
+    _disable_dotenv(root)
+
+
+def configure_test_child() -> None:
+    if os.environ.get("HEDGE_FUND_TEST_MODE") != "1":
+        return
+
+    root_value = os.environ.get("HEDGE_FUND_TEST_ROOT", "")
+    root = _validate_test_root(Path(root_value))
+    child_home_value = os.environ.get("HEDGE_FUND_TEST_CHILD_HOME")
+    child_temp_value = os.environ.get("HEDGE_FUND_TEST_CHILD_TMP")
+    if bool(child_home_value) != bool(child_temp_value):
+        raise RuntimeError("test child isolation path mismatch")
+    if child_home_value and child_temp_value:
+        home = _validate_test_child_path(root, Path(child_home_value))
+        temporary = _validate_test_child_path(root, Path(child_temp_value))
+        if home.parent != temporary.parent:
+            raise RuntimeError("test child isolation path mismatch")
+    else:
+        home = root / "home"
+        temporary = root / "tmp"
+    expected_paths = {
+        "HOME": home,
+        "USERPROFILE": home,
+        "TEMP": temporary,
+        "TMP": temporary,
+    }
+    if os.name == "nt":
+        expected_paths.update(
+            {
+                "APPDATA": home / "AppData" / "Roaming",
+                "LOCALAPPDATA": home / "AppData" / "Local",
+            }
+        )
+    else:
+        expected_paths.update(
+            {
+                "XDG_CACHE_HOME": home / ".cache",
+                "XDG_CONFIG_HOME": home / ".config",
+                "XDG_DATA_HOME": home / ".local" / "share",
+            }
+        )
+    for name, path in expected_paths.items():
+        if not _path_matches(os.environ.get(name, ""), path):
+            raise RuntimeError("test child isolation path mismatch")
+    expected_homepath = str(home).removeprefix(home.drive)
+    home_drive = os.path.normcase(home.drive)
+    if os.path.normcase(os.environ.get("HOMEDRIVE", "")) != home_drive:
+        raise RuntimeError("test child isolation path mismatch")
+    home_path = os.path.normcase(expected_homepath)
+    if os.path.normcase(os.environ.get("HOMEPATH", "")) != home_path:
+        raise RuntimeError("test child isolation path mismatch")
+    if os.environ.get("PYTHON_DOTENV_DISABLED") != "1":
+        raise RuntimeError("test child dotenv must be disabled")
+    if os.environ.get("PYTHONDONTWRITEBYTECODE") != "1":
+        raise RuntimeError("test child bytecode writes must be disabled")
+    if os.environ.get("PYTHONPATH", "") != _child_pythonpath():
+        raise RuntimeError("test child import path mismatch")
+    _clear_environment()
+    install_network_guard()
+    _disable_dotenv(root)
+
+
+def child_test_environment(
+    extra: dict[str, str] | None = None,
+) -> dict[str, str]:
+    inherited = (
+        "PATH",
+        "PATHEXT",
+        "SYSTEMROOT",
+        "WINDIR",
+        "HOME",
+        "USERPROFILE",
+        "HOMEDRIVE",
+        "HOMEPATH",
+        "TEMP",
+        "TMP",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "XDG_CACHE_HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "HEDGE_FUND_TEST_MODE",
+        "HEDGE_FUND_TEST_ROOT",
+        "PYTHON_DOTENV_DISABLED",
+        "PYTHONDONTWRITEBYTECODE",
+    )
+    env = {name: os.environ[name] for name in inherited if name in os.environ}
+    env["PYTHONPATH"] = _child_pythonpath()
+    if extra is not None:
+        if not isinstance(extra, dict):
+            raise TypeError("child environment values must be strings")
+        for name, value in extra.items():
+            if not isinstance(name, str) or not isinstance(value, str):
+                raise TypeError("child environment values must be strings")
+        allowed = set(CREDENTIAL_ENV_VARS) | set(PROXY_ENV_VARS)
+        for name in extra:
+            if name in allowed or name.startswith("AIHF_TEST_"):
+                continue
+            raise ValueError("child environment override denied")
+        env.update(extra)
+    return env
+
+
+def guarded_test_python_command(*arguments: str) -> list[str]:
+    """Run a test-owned child only after explicitly checking its startup guard."""
+    if not arguments or any(not isinstance(argument, str) for argument in arguments):
+        raise ValueError("test child command is invalid")
+    paths = sysconfig.get_paths()
+    site_directories = []
+    for key in ("purelib", "platlib"):
+        directory = paths.get(key)
+        if not isinstance(directory, str) or not os.path.isabs(directory) or not os.path.isdir(directory):
+            raise RuntimeError("test child package paths are unavailable")
+        if os.path.normcase(os.path.abspath(directory)) not in {
+            os.path.normcase(os.path.abspath(value)) for value in site_directories
+        }:
+            site_directories.append(directory)
+    command = (
+        "import sys\n"
+        + _CHILD_GUARD_PREFLIGHT
+        + f"_site_count={len(site_directories)}\n"
+        + "import site\n"
+        + "for _path in sys.argv[1:1 + _site_count]:\n site.addsitedir(_path)\n"
+        + "del sys.argv[1:1 + _site_count]\n"
+        + _CHILD_GUARD_PREFLIGHT
+        + _CHILD_COMMAND_BODY
+    )
+    return [sys.executable, "-S", "-c", command, *site_directories, *arguments]
+
+
+def cleanup_test_root(test_root: Path, marker: Path) -> bool:
+    repository = Path(__file__).resolve().parents[2]
+    outputs = repository / "outputs"
+    if _is_reparse_point(outputs):
+        return False
+    try:
+        resolved_outputs = outputs.resolve(strict=True)
+        root_candidate = Path(os.path.abspath(os.fspath(test_root)))
+        marker_candidate = Path(os.path.abspath(os.fspath(marker)))
+    except (OSError, TypeError, ValueError):
+        return False
+    if root_candidate.parent != resolved_outputs:
+        return False
+    if not root_candidate.name.startswith("spec005-test-"):
+        return False
+    if marker_candidate != root_candidate / ".test-owned":
+        return False
+    if _is_reparse_point(root_candidate):
+        return False
+    if _is_reparse_point(marker_candidate):
+        return False
+    try:
+        resolved_root = root_candidate.resolve(strict=True)
+        resolved_marker = marker_candidate.resolve(strict=True)
+    except OSError:
+        return False
+    if resolved_root.parent != resolved_outputs:
+        return False
+    if resolved_marker.parent != resolved_root:
+        return False
+    if marker_candidate.read_text(encoding="utf-8") != "test-owned\n":
+        return False
+    _remove_test_tree(resolved_root)
+    return not resolved_root.exists()
+
+
+def _loopback_port_allowlist() -> frozenset[int] | None:
+    value = os.environ.get(LOOPBACK_PORTS_ENV)
+    if value is None:
+        return None
+    ports = set()
+    for item in value.split(","):
+        if not item.isascii() or not item.isdigit() or not 0 < int(item) < 65536:
+            raise RuntimeError("test loopback port allowlist is invalid")
+        ports.add(int(item))
+    return frozenset(ports)
+
+
+def _loopback_port_allowed(address: Any, ports: frozenset[int] | None) -> bool:
+    if ports is None or getattr(_SOCKETPAIR, "depth", 0):
+        return True
+    return len(address) > 1 and isinstance(address[1], int) and address[1] in ports
+
+
+def install_network_guard() -> None:
+    block_loopback = os.environ.get("HEDGE_FUND_TEST_BLOCK_LOOPBACK") == "1"
+    # When set, loopback connects are limited to these ports (plus the in-process socketpair fallback).
+    loopback_ports = _loopback_port_allowlist()
+    original_socketpair = socket.socketpair
+    if not getattr(original_socketpair, _GUARD, False):
+
+        def socketpair(*args, _original=original_socketpair, **kwargs):
+            _SOCKETPAIR.depth = getattr(_SOCKETPAIR, "depth", 0) + 1
+            try:
+                return _original(*args, **kwargs)
+            finally:
+                _SOCKETPAIR.depth -= 1
+
+        setattr(socketpair, _GUARD, True)
+        socket.socketpair = socketpair
+    for name in ("connect", "connect_ex", "sendto"):
+        original = getattr(socket.socket, name)
+        if getattr(original, _GUARD, False):
+            continue
+
+        def guarded(sock, *args, _original=original, _name=name, **kwargs):
+            address = args[0] if args else kwargs.get("address")
+            if _name == "sendto":
+                address = args[-1] if args else kwargs.get("address")
+            is_unix = getattr(sock, "family", None) == getattr(
+                socket,
+                "AF_UNIX",
+                object(),
+            )
+            if not is_unix and (block_loopback or not _is_loopback_address(address) or not _loopback_port_allowed(address, loopback_ports)):
+                raise AssertionError("external network disabled in tests")
+            return _original(sock, *args, **kwargs)
+
+        setattr(guarded, _GUARD, True)
+        setattr(socket.socket, name, guarded)
+
+    if os.name == "nt":
+        # Windows asyncio connects/sends through IOCP (ConnectEx/WSASendTo), bypassing socket.socket methods.
+        from asyncio import windows_events
+
+        proactor = windows_events.IocpProactor
+        for name in ("connect", "sendto"):
+            original = getattr(proactor, name)
+            if getattr(original, _GUARD, False):
+                continue
+
+            def guarded_proactor(self, conn, *args, _original=original, _name=name, **kwargs):
+                if _name == "connect":
+                    address = args[0] if args else kwargs.get("address")
+                else:
+                    address = args[2] if len(args) > 2 else kwargs.get("addr")
+                is_unix = getattr(conn, "family", None) == getattr(socket, "AF_UNIX", object())
+                connected_send = _name == "sendto" and address is None
+                if not is_unix and not connected_send and (block_loopback or not _is_loopback_address(address) or not _loopback_port_allowed(address, loopback_ports)):
+                    raise AssertionError("external network disabled in tests")
+                return _original(self, conn, *args, **kwargs)
+
+            setattr(guarded_proactor, _GUARD, True)
+            setattr(proactor, name, guarded_proactor)
+
+    module_names = (
+        "create_connection",
+        "getaddrinfo",
+        "gethostbyname",
+        "gethostbyname_ex",
+        "gethostbyaddr",
+    )
+    for module_name in module_names:
+        original = getattr(socket, module_name)
+        if getattr(original, _GUARD, False):
+            continue
+
+        def guarded(*args, _original=original, _name=module_name, **kwargs):
+            host = args[0] if args else kwargs.get("host")
+            if _name == "create_connection":
+                address = host
+                allowed = not block_loopback and _is_loopback_address(address) and _loopback_port_allowed(address, loopback_ports)
+            elif _name == "getaddrinfo":
+                flags = args[5] if len(args) > 5 else kwargs.get("flags", 0)
+                allowed = not block_loopback and host is not None and _is_loopback_host(host)
+                passive_flag = getattr(socket, "AI_PASSIVE", 0)
+                passive = not block_loopback and host is None and bool(flags & passive_flag)
+                allowed = allowed or passive
+            else:
+                allowed = not block_loopback and _is_loopback_host(host)
+            if not allowed:
+                raise AssertionError("external network disabled in tests")
+            return _original(*args, **kwargs)
+
+        setattr(guarded, _GUARD, True)
+        setattr(socket, module_name, guarded)
+
+
+def _validate_test_root(test_root: Path) -> Path:
+    repository = Path(__file__).resolve().parents[2]
+    outputs = repository / "outputs"
+    if _is_reparse_point(outputs):
+        raise RuntimeError("test output root cannot be a symlink")
+    output_root = outputs.resolve(strict=True)
+    candidate = Path(os.path.abspath(os.fspath(test_root)))
+    if candidate.parent != output_root:
+        raise RuntimeError("test root must be inside checkout outputs")
+    if not candidate.name.startswith("spec005-test-"):
+        raise RuntimeError("test root must be inside checkout outputs")
+    if _is_reparse_point(candidate):
+        raise RuntimeError("test root cannot be a symlink")
+    root = candidate.resolve(strict=True)
+    if root.parent != output_root:
+        raise RuntimeError("test root escaped checkout outputs")
+    return root
+
+
+def _validate_test_child_path(test_root: Path, candidate: Path) -> Path:
+    if not candidate.is_absolute():
+        raise RuntimeError("test child isolation path mismatch")
+    candidate = Path(os.path.abspath(os.fspath(candidate)))
+    try:
+        relative = candidate.relative_to(test_root)
+    except ValueError:
+        raise RuntimeError("test child isolation path mismatch") from None
+    if not relative.parts:
+        raise RuntimeError("test child isolation path mismatch")
+    current = test_root
+    for part in relative.parts:
+        current = current / part
+        if _is_reparse_point(current):
+            raise RuntimeError("test child isolation path mismatch")
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError:
+        raise RuntimeError("test child isolation path mismatch") from None
+    if resolved != candidate:
+        raise RuntimeError("test child isolation path mismatch")
+    return resolved
+
+
+def _remove_test_tree(root: Path) -> None:
+    with os.scandir(root) as entries:
+        for entry in entries:
+            path = Path(entry.path)
+            info = entry.stat(follow_symlinks=False)
+            if _is_reparse_point(path):
+                if stat.S_ISDIR(info.st_mode):
+                    os.rmdir(path)
+                else:
+                    os.unlink(path)
+            elif stat.S_ISDIR(info.st_mode):
+                _remove_test_tree(path)
+            else:
+                os.unlink(path)
+    os.rmdir(root)
+
+
+def _is_reparse_point(path: Path) -> bool:
+    try:
+        info = Path(path).lstat()
+    except OSError:
+        return False
+    attributes = getattr(info, "st_file_attributes", 0)
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    return stat.S_ISLNK(info.st_mode) or bool(attributes & reparse_flag)
+
+
+def _clear_environment() -> None:
+    for name in (*CREDENTIAL_ENV_VARS, *PROXY_ENV_VARS):
+        os.environ.pop(name, None)
+
+
+def _disable_dotenv(test_root: Path) -> None:
+    try:
+        import dotenv
+        import dotenv.main
+    except ImportError:
+        return
+
+    root = Path(test_root).resolve(strict=True)
+    original_values = getattr(
+        dotenv.main.dotenv_values,
+        "__hedge_fund_original_values__",
+        dotenv.main.dotenv_values,
+    )
+
+    def disabled(*_args: Any, **_kwargs: Any) -> bool:
+        return False
+
+    def empty_path(*_args: Any, **_kwargs: Any) -> str:
+        return ""
+
+    def isolated_values(
+        dotenv_path: str | os.PathLike[str] | None = None,
+        *args: Any,
+        **kwargs: Any,
+    ) -> dict:
+        if dotenv_path is None:
+            raise AssertionError("implicit dotenv lookup disabled")
+        if args and args[0] is not None:
+            raise AssertionError("dotenv streams disabled in tests")
+        if kwargs.get("stream") is not None:
+            raise AssertionError("implicit dotenv lookup disabled")
+        try:
+            candidate = _isolated_dotenv_path(dotenv_path, root)
+        except (OSError, RuntimeError, TypeError):
+            raise AssertionError("test dotenv path invalid") from None
+        except ValueError:
+            raise AssertionError("test dotenv path denied") from None
+        return original_values(candidate, *args, **kwargs)
+
+    setattr(isolated_values, "__hedge_fund_original_values__", original_values)
+    dotenv.load_dotenv = disabled
+    dotenv.find_dotenv = empty_path
+    dotenv.dotenv_values = isolated_values
+    dotenv.main.load_dotenv = disabled
+    dotenv.main.find_dotenv = empty_path
+    dotenv.main.dotenv_values = isolated_values
+
+
+def _isolated_dotenv_path(
+    dotenv_path: str | os.PathLike[str],
+    root: Path,
+) -> Path:
+    candidate = Path(os.path.abspath(os.fspath(dotenv_path)))
+    relative = candidate.relative_to(root)
+    if not relative.parts:
+        raise ValueError("dotenv path must be inside test root")
+    current = root
+    for part in relative.parts:
+        current = current / part
+        if _is_reparse_point(current):
+            raise ValueError("dotenv path cannot contain a reparse point")
+    return candidate
+
+
+def _child_pythonpath() -> str:
+    support = Path(__file__).resolve().parent
+    repository = Path(__file__).resolve().parents[2]
+    return os.pathsep.join((str(support), str(repository)))
+
+
+def _path_matches(actual: str, expected: Path) -> bool:
+    if not actual:
+        return False
+    actual_path = os.path.normcase(os.path.abspath(actual))
+    expected_path = os.path.normcase(os.path.abspath(expected))
+    return actual_path == expected_path
+
+
+def _is_loopback_address(address: Any) -> bool:
+    if not isinstance(address, tuple) or not address:
+        return False
+    return _is_loopback_host(address[0])
+
+
+def _is_loopback_host(host: Any) -> bool:
+    if isinstance(host, bytes):
+        try:
+            host = host.decode("ascii")
+        except UnicodeDecodeError:
+            return False
+    if not isinstance(host, str):
+        return False
+    if host.casefold() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host.split("%", 1)[0]).is_loopback
+    except ValueError:
+        return False
