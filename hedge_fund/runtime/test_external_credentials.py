@@ -1,11 +1,22 @@
+import io
+import json
 import os
 import socket
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 
+from hedge_fund.runtime import credential_delivery
 from hedge_fund.runtime.credential_delivery import (
     CredentialDeliveryServer,
+    DeliveryEnvelope,
     DeliveryProtocolError,
+    encode_delivery_frame,
+    read_delivery_frame,
+    read_delivery_reply,
+    receive_delivery_request,
 )
 from hedge_fund.runtime.external_credentials import (
     ExternalCredentialError,
@@ -305,3 +316,219 @@ def test_release_discards_rotated_generation_after_last_capture():
 
     with pytest.raises(ExternalCredentialError, match="credential handle is unavailable"):
         store.value_for_dispatch(old, destination=DESTINATION)
+
+
+def test_current_handle_does_not_pin_and_acquire_requires_current_cas_generation():
+    store = _store({PROVIDER: DESTINATION})
+    first = store.publish(
+        PROVIDER,
+        "synthetic-A",
+        expected_generation=0,
+        delivery_id="delivery-current-1",
+        root_id=ROOT_ID,
+        instance_id=INSTANCE_ID,
+        destination=DESTINATION,
+    )
+    reviewed = store.current_handle(PROVIDER, destination=DESTINATION)
+    assert reviewed == first
+    with pytest.raises(ExternalCredentialError, match="credential handle is unavailable"):
+        store.value_for_dispatch(reviewed, destination=DESTINATION)
+
+    store.acquire(reviewed)
+    store.publish(
+        PROVIDER,
+        "synthetic-B",
+        expected_generation=1,
+        delivery_id="delivery-current-2",
+        root_id=ROOT_ID,
+        instance_id=INSTANCE_ID,
+        destination=DESTINATION,
+    )
+    assert store.value_for_dispatch(reviewed, destination=DESTINATION) == "synthetic-A"
+
+    with pytest.raises(ExternalCredentialError, match="credential generation changed"):
+        store.revoke(PROVIDER, expected_generation=1)
+    assert store.status()[PROVIDER] == {"state": "available", "generation": 2}
+    store.release(reviewed)
+    with pytest.raises(ExternalCredentialError, match="credential handle is unavailable"):
+        store.value_for_dispatch(reviewed, destination=DESTINATION)
+
+    assert store.revoke(PROVIDER, expected_generation=2) == 3
+
+
+def test_receive_cli_rejects_empty_stdin_without_process_crash():
+    process = subprocess.run(
+        [sys.executable, "-m", "hedge_fund.runtime.credential_delivery", "--receive"],
+        input=b"",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=5,
+        check=False,
+        env={**os.environ, "HEDGE_FUND_TEST_MODE": ""},
+    )
+
+    assert process.returncode == 2
+    assert not process.stderr
+    frame_size = int.from_bytes(process.stdout[:4], "big")
+    frame_end = 4 + frame_size
+    response = json.loads(process.stdout[4:frame_end])
+    assert frame_size == len(process.stdout) - 4
+    assert response["state"] == "denied"
+    assert response["reason_code"] in {"protocol-error", "transport-unavailable"}
+
+
+def _raw_delivery_frame(payload):
+    return len(payload).to_bytes(4, "big") + payload
+
+
+def test_delivery_frame_converts_deep_json_recursion_to_protocol_error():
+    nested = b'{"x":' + b"[" * 2000 + b"0" + b"]" * 2000 + b"}"
+
+    with pytest.raises(DeliveryProtocolError, match="delivery frame is malformed"):
+        read_delivery_frame(io.BytesIO(_raw_delivery_frame(nested)))
+    with pytest.raises(DeliveryProtocolError, match="delivery status is malformed"):
+        read_delivery_reply(io.BytesIO(_raw_delivery_frame(nested)))
+
+
+def test_receiver_marks_post_send_failure_outcome_unknown(monkeypatch):
+    sent = []
+
+    class NoReplySocket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def settimeout(self, _timeout):
+            pass
+
+        def connect(self, _path):
+            pass
+
+        def sendall(self, frame):
+            sent.append(frame)
+
+        def shutdown(self, _how):
+            pass
+
+        def makefile(self, _mode):
+            return io.BytesIO()
+
+    monkeypatch.setattr(credential_delivery.socket, "AF_UNIX", 1, raising=False)
+    monkeypatch.setattr(credential_delivery.socket, "socket", lambda *_args: NoReplySocket())
+    request = DeliveryEnvelope(
+        action="publish",
+        provider_id=PROVIDER,
+        destination=DESTINATION,
+        root_id=ROOT_ID,
+        instance_id=INSTANCE_ID,
+        expected_generation=0,
+        delivery_id="delivery-no-reply",
+        value="synthetic-runtime-value",
+    )
+    output = io.BytesIO()
+
+    result = receive_delivery_request(
+        stdin=io.BytesIO(encode_delivery_frame(request)),
+        stdout=output,
+        socket_path=Path("/synthetic/credential.sock"),
+    )
+    reply = read_delivery_reply(io.BytesIO(output.getvalue()))
+
+    assert result == 2
+    assert len(sent) == 1
+    assert reply.state == "denied"
+    assert reply.reason_code == "delivery-outcome-unknown"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Unix socket server required")
+def test_delivery_server_survives_deep_frame_and_handles_next_status(tmp_path):
+    socket_path = tmp_path / "ipc" / "credential.sock"
+    server = CredentialDeliveryServer(
+        _store({PROVIDER: DESTINATION}),
+        socket_path=socket_path,
+        peer_validator=lambda _connection: True,
+    )
+    server.start()
+
+    def exchange(frame):
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(3)
+            client.connect(os.fspath(socket_path))
+            client.sendall(frame)
+            client.shutdown(socket.SHUT_WR)
+            return read_delivery_reply(client.makefile("rb"))
+
+    try:
+        nested = b'{"x":' + b"[" * 2000 + b"0" + b"]" * 2000 + b"}"
+        malformed = exchange(_raw_delivery_frame(nested))
+        assert malformed.state == "denied"
+        assert malformed.reason_code == "protocol-error"
+
+        valid = exchange(encode_delivery_frame(DeliveryEnvelope("status", PROVIDER, DESTINATION)))
+        assert valid.state == "requires-auth"
+        assert valid.generation == 0
+    finally:
+        server.close()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Unix socket ownership required")
+def test_delivery_server_recovers_only_owned_stale_socket(tmp_path):
+    parent = tmp_path / "ipc"
+    parent.mkdir(mode=0o700)
+    os.chmod(parent, 0o700)
+    socket_path = parent / "credential.sock"
+    stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    stale.bind(os.fspath(socket_path))
+    stale.close()
+    os.chmod(socket_path, 0o600)
+    server = CredentialDeliveryServer(
+        _store({PROVIDER: DESTINATION}),
+        socket_path=socket_path,
+        peer_validator=lambda _connection: False,
+    )
+
+    server.start()
+    assert socket_path.exists()
+    server.close()
+    assert not socket_path.exists()
+    assert not parent.exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Unix socket ownership required")
+@pytest.mark.parametrize("case", ["active", "wrong-mode", "wrong-socket-mode", "wrong-owner", "extra-entry"])
+def test_delivery_server_preserves_untrusted_existing_socket_directory(tmp_path, monkeypatch, case):
+    parent = tmp_path / "ipc"
+    parent.mkdir(mode=0o700)
+    os.chmod(parent, 0o700)
+    socket_path = parent / "credential.sock"
+    active = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    active.bind(os.fspath(socket_path))
+    active.listen(1)
+    os.chmod(socket_path, 0o600)
+    extra = parent / "unexpected"
+    if case == "wrong-mode":
+        os.chmod(parent, 0o755)
+    elif case == "wrong-socket-mode":
+        os.chmod(socket_path, 0o644)
+    elif case == "wrong-owner":
+        owner = os.geteuid()
+        monkeypatch.setattr(credential_delivery.os, "geteuid", lambda: owner + 1)
+    elif case == "extra-entry":
+        extra.write_text("synthetic", encoding="utf-8")
+    server = CredentialDeliveryServer(
+        _store({PROVIDER: DESTINATION}),
+        socket_path=socket_path,
+        peer_validator=lambda _connection: False,
+    )
+
+    with pytest.raises(DeliveryProtocolError, match="private local IPC is unavailable"):
+        server.start()
+
+    active.close()
+    assert socket_path.exists()
+    if extra.exists():
+        extra.unlink()
+    socket_path.unlink()
+    parent.rmdir()

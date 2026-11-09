@@ -272,6 +272,7 @@ class BacktestRequest(RequestModel):
     model: str = Field(min_length=1, max_length=120)
     mandate_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     authorize_paid_provider: StrictBool = False
+    credential_source: Literal["durable", "external-runtime"] = "durable"
     confirm_fd_self_service_pricing: StrictBool = False
     cost_model_id: str | None = Field(default=None, pattern=r"^[a-z0-9._-]{1,64}$")
     cost_model_version: str | None = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}-v\d+$")
@@ -316,6 +317,8 @@ class BacktestRequest(RequestModel):
                 raise ValueError("paid authorization cost bounds are outside the allowed range")
         elif any(value is not None for value in budget_values):
             raise ValueError("paid cost bounds require explicit paid authorization")
+        if self.credential_source == "external-runtime" and not self.authorize_paid_provider:
+            raise ValueError("external runtime credentials require explicit paid authorization")
         if self.confirm_fd_self_service_pricing and (not self.authorize_paid_provider or self.provider != "fd"):
             raise ValueError("Financial Datasets pricing confirmation does not match the request")
         return self

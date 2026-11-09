@@ -192,6 +192,45 @@ class RuntimeCredentialLeaseStore:
             self._ensure_open()
             return provider_id in self._allowed_destinations
 
+    def current_handle(self, provider: str, *, destination: str) -> RuntimeCredentialHandle:
+        """Return active identity without pinning its value."""
+        provider_id = self._provider(provider)
+        with self._lock:
+            self._ensure_open()
+            expected_destination = self._allowed_destinations.get(provider_id)
+            if expected_destination is None:
+                raise ExternalCredentialError("provider is not allowed")
+            if not isinstance(destination, str) or destination.casefold() != expected_destination:
+                raise ExternalCredentialError("provider destination is not allowed")
+            if provider_id in self._revoked:
+                raise ExternalCredentialError("credential is unavailable")
+            generation = self._generations.get(provider_id, 0)
+            lease = self._leases.get((provider_id, generation))
+            if lease is None:
+                raise ExternalCredentialError("credential is unavailable")
+            return lease.handle
+
+    def acquire(self, handle: RuntimeCredentialHandle) -> None:
+        """Pin the reviewed current generation for admitted work."""
+        if not isinstance(handle, RuntimeCredentialHandle):
+            raise ExternalCredentialError("credential handle is invalid")
+        with self._lock:
+            self._ensure_open()
+            if handle.root_id != self._root_id or handle.instance_id != self._instance_id:
+                raise ExternalCredentialError("runtime instance changed")
+            if handle.provider_id not in self._allowed_destinations:
+                raise ExternalCredentialError("provider is not allowed")
+            if handle.destination != self._allowed_destinations[handle.provider_id]:
+                raise ExternalCredentialError("provider destination is not allowed")
+            if handle.provider_id in self._revoked:
+                raise ExternalCredentialError("credential is revoked")
+            if self._generations.get(handle.provider_id, 0) != handle.generation:
+                raise ExternalCredentialError("credential generation changed")
+            lease = self._leases.get((handle.provider_id, handle.generation))
+            if lease is None or lease.handle != handle:
+                raise ExternalCredentialError("credential handle is unavailable")
+            lease.captures += 1
+
     def is_current(self, handle: RuntimeCredentialHandle, *, destination: str) -> bool:
         if not isinstance(handle, RuntimeCredentialHandle) or handle.root_id != self._root_id or handle.instance_id != self._instance_id:
             return False
@@ -269,13 +308,17 @@ class RuntimeCredentialLeaseStore:
             if handle.generation != self._generations.get(handle.provider_id):
                 self._discard_if_unreferenced(handle.provider_id, handle.generation)
 
-    def revoke(self, provider: str) -> int:
+    def revoke(self, provider: str, *, expected_generation: int | None = None) -> int:
         provider_id = self._provider(provider)
-        if provider_id not in self._allowed_destinations:
-            raise ExternalCredentialError("provider is not allowed")
+        if expected_generation is not None and (type(expected_generation) is not int or expected_generation < 0):
+            raise ExternalCredentialError("credential generation is invalid")
         with self._lock:
             self._ensure_open()
+            if provider_id not in self._allowed_destinations:
+                raise ExternalCredentialError("provider is not allowed")
             generation = self._generations.get(provider_id, 0)
+            if expected_generation is not None and generation != expected_generation:
+                raise ExternalCredentialError("credential generation changed")
             if generation >= _MAX_GENERATION:
                 raise ExternalCredentialError("credential generation exceeds its bound")
             generation += 1

@@ -8,6 +8,7 @@ from hedge_fund.runtime.credential_delivery import (
     CredentialDeliveryServer,
     DeliveryEnvelope,
     DeliveryProtocolError,
+    DeliveryReply,
     encode_delivery_frame,
     encode_delivery_reply,
     read_delivery_frame,
@@ -198,6 +199,7 @@ class FakeDockerRunner:
         root_id=ROOT_ID,
         extra_container_env=(),
         runtime_providers="",
+        host_config_overrides=None,
     ):
         self.store = RuntimeCredentialLeaseStore(
             root_id=root_id,
@@ -211,6 +213,19 @@ class FakeDockerRunner:
         self.lose_publish_ack = lose_publish_ack
         self.extra_container_env = list(extra_container_env)
         self.runtime_providers = runtime_providers
+        self.host_config = {
+            "Tmpfs": {"/tmp": "rw"},
+            "Privileged": False,
+            "ReadonlyRootfs": True,
+            "NetworkMode": "none",
+            "CapDrop": ["ALL"],
+            "CapAdd": [],
+            "SecurityOpt": ["no-new-privileges:true"],
+            "PidMode": "",
+            "IpcMode": "private",
+            "Devices": [],
+        }
+        self.host_config.update(host_config_overrides or {})
         self.publish_count = 0
 
     def __call__(self, args, **kwargs):
@@ -254,7 +269,7 @@ class FakeDockerRunner:
                         + self.extra_container_env,
                         "User": "",
                     },
-                    "HostConfig": {"Tmpfs": {"/tmp": "rw"}},
+                    "HostConfig": self.host_config,
                     "Mounts": [mount],
                 }
             ]
@@ -459,6 +474,38 @@ def test_host_target_denial_precedes_resolver(runner_options):
     assert all(SENTINEL not in " ".join(args) for args, _kwargs in runner.calls)
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("Privileged", True),
+        ("ReadonlyRootfs", False),
+        ("NetworkMode", "bridge"),
+        ("CapDrop", []),
+        ("CapAdd", ["SYS_ADMIN"]),
+        ("SecurityOpt", ["no-new-privileges:false"]),
+        ("PidMode", "host"),
+        ("IpcMode", "host"),
+        ("Devices", [{"PathOnHost": "/dev/synthetic"}]),
+    ],
+)
+def test_host_target_rejects_unapproved_runtime_capabilities_before_resolution(field, value):
+    runner = FakeDockerRunner(host_config_overrides={field: value})
+    resolver_calls = []
+    delivery = DockerCredentialDelivery(
+        runner=runner,
+        resolver=lambda *_args: resolver_calls.append(True),
+        source_mappings=_mapping(),
+        environment={},
+    )
+
+    with pytest.raises(DockerCredentialDeliveryError, match="target-invalid"):
+        delivery.deliver(CONTAINER_ID, "openai")
+
+    assert resolver_calls == []
+    assert runner.publish_count == 0
+    assert not any(args[:2] == ("docker", "exec") for args, _kwargs in runner.calls)
+
+
 def test_host_mapping_binds_exact_root_and_container_before_resolution():
     runner = FakeDockerRunner(root_id="e" * 64)
     resolver_calls = []
@@ -584,11 +631,16 @@ def test_target_rejects_invalid_provider_allowlist_before_resolver():
 
 def test_default_resolver_bounds_stdout_and_filters_child_environment(monkeypatch):
     observed = {}
-    monkeypatch.setattr(docker_delivery.shutil, "which", lambda _name: "C:/op.exe")
+    monkeypatch.setattr(
+        docker_delivery,
+        "_resolve_host_executable",
+        lambda *_args, **_kwargs: "C:/op.exe",
+    )
 
     def run(args, **kwargs):
         observed["args"] = args
         observed["env"] = kwargs["env"]
+        observed["stdin"] = kwargs["stdin"]
         return subprocess.CompletedProcess(args, 0, stdout=b"x" * (16 * 1024 + 1), stderr=b"")
 
     monkeypatch.setattr(docker_delivery.subprocess, "run", run)
@@ -596,11 +648,89 @@ def test_default_resolver_bounds_stdout_and_filters_child_environment(monkeypatc
         docker_delivery._resolve_op_reference(
             "op://SyntheticVault/SyntheticItem/api-key",
             1.0,
-            environment={"OPENAI_API_KEY": "synthetic-key", "SAFE_SETTING": "safe"},
+            environment={
+                "OPENAI_API_KEY": "synthetic-key",
+                "SAFE_SETTING": "safe",
+                "OP_BIOMETRIC_UNLOCK_ENABLED": "true",
+                "OP_SESSION_synthetic": "never-forward",
+            },
         )
 
-    assert observed["env"] == {"SAFE_SETTING": "safe"}
+    assert observed["env"] == {
+        "SAFE_SETTING": "safe",
+        "OP_BIOMETRIC_UNLOCK_ENABLED": "true",
+    }
+    assert observed["stdin"] is None
     assert observed["args"][-1] == "op://SyntheticVault/SyntheticItem/api-key"
+
+
+def test_op_resolution_ignores_working_directory_executable(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    working = tmp_path / "working"
+    trusted = tmp_path / "trusted"
+    working.mkdir()
+    trusted.mkdir()
+    (working / "op.exe").write_bytes(b"not-executable")
+    (trusted / "op.exe").write_bytes(b"not-executable")
+    monkeypatch.chdir(working)
+    monkeypatch.setenv("PATH", str(trusted))
+    observed = {}
+
+    def run(args, **kwargs):
+        observed["args"] = args
+        return subprocess.CompletedProcess(args, 0, stdout=b"synthetic-value", stderr=b"")
+
+    monkeypatch.setattr(docker_delivery.subprocess, "run", run)
+    docker_delivery._resolve_op_reference(
+        "op://SyntheticVault/SyntheticItem/api-key",
+        1.0,
+        environment={"PATH": str(trusted)},
+    )
+
+    assert Path(observed["args"][0]).resolve() == (trusted / "op.exe").resolve()
+
+
+def test_docker_cli_uses_absolute_executable_outside_working_directory(tmp_path, monkeypatch):
+    import os
+    import time
+    from pathlib import Path
+
+    working = tmp_path / "working"
+    trusted = tmp_path / "trusted"
+    working.mkdir()
+    trusted.mkdir()
+    (working / "docker.exe").write_bytes(b"not-executable")
+    (trusted / "docker.exe").write_bytes(b"not-executable")
+    monkeypatch.chdir(working)
+    monkeypatch.setenv("PATH", str(trusted))
+    observed = {}
+
+    def run(args, **kwargs):
+        observed["args"] = args
+        return subprocess.CompletedProcess(args, 0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(docker_delivery.subprocess, "run", run)
+    delivery = DockerCredentialDelivery(environment={"PATH": os.environ["PATH"]})
+    delivery._run(
+        ["docker", "version"],
+        time.monotonic() + 2,
+        error_code="docker-unavailable",
+    )
+
+    assert Path(observed["args"][0]).resolve() == (trusted / "docker.exe").resolve()
+
+
+def test_invalid_container_type_returns_sanitized_delivery_error():
+    delivery = DockerCredentialDelivery(
+        runner=FakeDockerRunner(),
+        resolver=lambda *_args: SENTINEL,
+        source_mappings=_mapping(),
+        environment={},
+    )
+
+    with pytest.raises(DockerCredentialDeliveryError, match="target-invalid"):
+        delivery.deliver(None, "openai")
 
 
 @pytest.mark.parametrize(
@@ -681,14 +811,93 @@ def test_host_rejects_conflicting_auth_and_never_resolves_or_retries_lost_ack():
     assert caught.value.reconciliation_generation == 1
 
 
-def test_docker_cli_overrides_fail_closed_before_any_inspection():
+def test_publish_timeout_reserves_deadline_for_status_reconciliation():
+    clock = [0.0]
+
+    class DeadlineRunner(FakeDockerRunner):
+        def __call__(self, args, **kwargs):
+            if args[:2] == ["docker", "exec"]:
+                request = read_delivery_frame(io.BytesIO(kwargs["input"]))
+                if request.action == "publish":
+                    self.calls.append((tuple(args), dict(kwargs)))
+                    self.server.handle(request)
+                    self.publish_count += 1
+                    clock[0] += kwargs["timeout"]
+                    raise subprocess.TimeoutExpired(args, kwargs["timeout"])
+            return super().__call__(args, **kwargs)
+
+    runner = DeadlineRunner()
+    delivery = DockerCredentialDelivery(
+        runner=runner,
+        resolver=lambda *_args: SENTINEL,
+        source_mappings=_mapping(),
+        environment={},
+        timeout_seconds=60,
+        clock=lambda: clock[0],
+    )
+    with pytest.raises(DockerCredentialDeliveryError, match="delivery-outcome-unknown") as caught:
+        delivery.deliver(CONTAINER_ID, "openai")
+
+    actions = [read_delivery_frame(io.BytesIO(call[1]["input"])).action for call in runner.calls if call[0][:2] == ("docker", "exec")]
+    assert actions.count("publish") == 1
+    assert actions.count("status") == 2
+    assert caught.value.reconciliation_state == "available"
+    assert caught.value.reconciliation_generation == 1
+
+
+def test_receiver_post_send_outcome_unknown_triggers_host_status_reconciliation():
+    class NoReplyRunner(FakeDockerRunner):
+        def __call__(self, args, **kwargs):
+            if args[:2] == ["docker", "exec"]:
+                request = read_delivery_frame(io.BytesIO(kwargs["input"]))
+                if request.action == "publish":
+                    self.calls.append((tuple(args), dict(kwargs)))
+                    self.publish_count += 1
+                    self.server.handle(request)
+                    reply = DeliveryReply(
+                        "denied",
+                        0,
+                        request.provider_id,
+                        request.destination,
+                        reason_code="delivery-outcome-unknown",
+                    )
+                    return subprocess.CompletedProcess(
+                        args,
+                        2,
+                        stdout=encode_delivery_reply(reply),
+                        stderr=b"",
+                    )
+            return super().__call__(args, **kwargs)
+
+    runner = NoReplyRunner()
+    with pytest.raises(DockerCredentialDeliveryError, match="delivery-outcome-unknown") as caught:
+        DockerCredentialDelivery(
+            runner=runner,
+            resolver=lambda *_args: SENTINEL,
+            source_mappings=_mapping(),
+            environment={},
+        ).deliver(CONTAINER_ID, "openai")
+
+    requests = [read_delivery_frame(io.BytesIO(call[1]["input"])) for call in runner.calls if call[0][:2] == ("docker", "exec")]
+    assert [request.action for request in requests].count("publish") == 1
+    assert [request.action for request in requests].count("status") == 2
+    assert runner.publish_count == 1
+    assert caught.value.reconciliation_state == "available"
+    assert caught.value.reconciliation_generation == 1
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_TLS_VERIFY", "DOCKER_CERT_PATH", "DOCKER_CONFIG"],
+)
+def test_docker_cli_overrides_fail_closed_before_any_inspection(name):
     runner = FakeDockerRunner()
     resolver_calls = []
     delivery = DockerCredentialDelivery(
         runner=runner,
         resolver=lambda *_args: resolver_calls.append(True),
         source_mappings=_mapping(),
-        environment={"DOCKER_HOST": "tcp://synthetic.invalid"},
+        environment={name: "synthetic-override"},
     )
 
     with pytest.raises(DockerCredentialDeliveryError, match="ambiguous-docker-configuration"):

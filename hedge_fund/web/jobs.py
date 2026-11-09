@@ -119,8 +119,9 @@ class OperationJobRegistry:
         ],
         *,
         reservation: SlotReservation | None = None,
+        on_terminal: Callable[[], None] | None = None,
     ) -> OperationRecord:
-        if not isinstance(operation, OperationRecord) or not callable(work):
+        if not isinstance(operation, OperationRecord) or not callable(work) or (on_terminal is not None and not callable(on_terminal)):
             raise JobConflict("Accepted operation and worker are required.")
         if reservation is not None and not isinstance(reservation, SlotReservation):
             raise JobConflict("Worker reservation is invalid.")
@@ -165,9 +166,10 @@ class OperationJobRegistry:
                 raise JobConflict("Operation start is uncertain.") from None
             self._submitted[current.operation_id] = future
             future.add_done_callback(
-                lambda completed, operation_id=current.operation_id: self._future_done(
+                lambda completed, operation_id=current.operation_id, terminal=on_terminal: self._future_done(
                     operation_id,
                     completed,
+                    terminal,
                 )
             )
             return current
@@ -421,7 +423,12 @@ class OperationJobRegistry:
         with self._lock:
             self._active.discard(operation_id)
 
-    def _future_done(self, operation_id: str, future: Future) -> None:
+    def _future_done(
+        self,
+        operation_id: str,
+        future: Future,
+        on_terminal: Callable[[], None] | None,
+    ) -> None:
         try:
             if future.cancelled():
                 operation = self._store.get_operation(operation_id)
@@ -437,6 +444,11 @@ class OperationJobRegistry:
             self._mark_stranded(operation_id)
             _log_failure("future-cancel", exc, operation_id=operation_id)
         finally:
+            if on_terminal is not None:
+                try:
+                    on_terminal()
+                except Exception as exc:
+                    _log_failure("terminal-cleanup", exc, operation_id=operation_id)
             self._finish_local(operation_id)
 
     def _prune(self) -> None:

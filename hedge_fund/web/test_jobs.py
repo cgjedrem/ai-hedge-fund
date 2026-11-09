@@ -798,6 +798,540 @@ def test_paid_fd_web_backtest_uses_guarded_real_client_and_fake_transport(
     assert secret not in str(completed.public_view())
 
 
+def test_external_runtime_backtest_captures_fake_value_revoke_and_restart_denial(
+    demo_root,
+    monkeypatch,
+):
+    import hedge_fund.web.services as services
+    from hedge_fund.runtime.capture import root_identity_id
+    from hedge_fund.runtime.credential_delivery import CredentialDeliveryServer
+    from hedge_fund.runtime.operations import OperationStatus
+    from hedge_fund.runtime.policy import AuthorizationDenied
+    from hedge_fund.web.services import OperationError
+
+    monkeypatch.setenv("HEDGE_FUND_RUNTIME_ROLE", "web-operator")
+    monkeypatch.setenv("HEDGE_FUND_RUNTIME_PROVIDERS", "fd")
+    monkeypatch.setattr(CredentialDeliveryServer, "start", lambda self: None)
+    app = create_app(
+        root=demo_root,
+        allow_writes=True,
+        network_enabled=True,
+        demo=True,
+        fund_factory=lambda spec: Fund(
+            spec,
+            models={"earnings-drift": [FakeAnalyst("pead", {"AAPL": 1.0})]},
+        ),
+    )
+    service = app.state.service
+    initial_secret = "synthetic-external-runtime-fd-key-a"
+    secret = "synthetic-external-runtime-fd-key-b"
+    external_store = service._external_credential_store
+    assert external_store is not None
+    identity = external_store.delivery_status("fd", destination="fd")
+    external_store.publish(
+        "fd",
+        initial_secret,
+        expected_generation=0,
+        delivery_id="synthetic-runtime-delivery",
+        root_id=root_identity_id(service.root_context),
+        instance_id=identity["instance_id"],
+        destination="fd",
+    )
+    service.set_credential(
+        CredentialRequest(
+            provider="fd",
+            value=SecretStr("synthetic-durable-must-not-fallback"),
+            expected_version=0,
+        )
+    )
+    local_model = next(model_id for _, model_id, provider in load_api_models() if provider == "Ollama" and not model_id.endswith(":cloud"))
+    service.save_runtime_settings(
+        RuntimeSettingsRequest(
+            data_provider="fd",
+            model=local_model,
+            endpoint=None,
+            timeout_seconds=60.0,
+            parameters={},
+            expected_version=service.settings()["version"],
+        )
+    )
+    http_calls = []
+    dispatches = []
+    revocation_denials = []
+    release_called = threading.Event()
+    release_handles = []
+    original_release = service._release_external_capture
+
+    def track_release(handles):
+        release_handles.append(handles)
+        original_release(handles)
+        release_called.set()
+
+    monkeypatch.setattr(service, "_release_external_capture", track_release)
+
+    def handle(request):
+        http_calls.append(request)
+        assert request.headers.get("x-api-key") == secret
+        if len(http_calls) == 1:
+            service.revoke_external_credential("fd", expected_generation=2)
+            return httpx.Response(
+                200,
+                json={"prices": [], "next_page_url": None},
+                request=request,
+            )
+        return httpx.Response(
+            200,
+            json={"prices": [], "next_page_url": None},
+            request=request,
+        )
+
+    production_factory = make_data_client
+
+    def fake_transport_factory(*, provider, dispatch, api_key):
+        dispatches.append(dispatch)
+        return production_factory(
+            provider=provider,
+            dispatch=dispatch,
+            api_key=api_key,
+            inner_transport=httpx.MockTransport(handle),
+        )
+
+    def fake_backtest(_fund, start, end, data_client, _universe, *, on_valuation):
+        assert data_client.get_prices("AAPL", start, end) == []
+        with pytest.raises(AuthorizationDenied) as denied:
+            data_client.get_prices("MSFT", start, end)
+        revocation_denials.append(denied.value)
+        on_valuation(0, 1, None)
+        return object()
+
+    def fake_save(_result, *, directory, admission):
+        del admission
+        path = Path(directory) / "fake-external-backtest.json"
+        path.write_text("{}", encoding="utf-8")
+        return path
+
+    monkeypatch.setattr(services, "make_data_client", fake_transport_factory)
+    monkeypatch.setattr(services, "backtest_fund", fake_backtest)
+    monkeypatch.setattr(services, "save_result", fake_save)
+    payload_values = {
+        "fund": "demo-quality",
+        "universe": ["AAPL"],
+        "start": "2024-06-03",
+        "end": "2024-06-04",
+        "provider": "fd",
+        "model": local_model,
+        "mandate_hash": _mandate_fingerprint(demo_root),
+        "authorize_paid_provider": True,
+        "confirm_fd_self_service_pricing": True,
+        "paid_max_calls": 1,
+        "paid_max_cost_usd": "1",
+        "paid_max_attempt_cost_usd": "0.25",
+        "credential_source": "external-runtime",
+    }
+
+    try:
+        with TestClient(app, client=("127.0.0.1", 50000)) as client:
+            headers = _write_headers(client)
+            preview_response = client.post(
+                "/api/operations/preview",
+                headers=headers,
+                json={
+                    "action": "backtest",
+                    "subject_id": "demo-quality",
+                    "expected_head": payload_values["mandate_hash"],
+                    "payload": payload_values,
+                },
+            )
+            assert preview_response.status_code == 201, preview_response.text
+            preview = preview_response.json()
+            status = client.get(
+                "/api/credentials/status",
+                headers={"host": "127.0.0.1"},
+            ).json()["external_runtime"]
+            assert status["providers"]["fd"] == {
+                "state": "available",
+                "generation": 1,
+            }
+            assert initial_secret not in json.dumps(preview)
+            assert secret not in json.dumps(preview)
+            assert initial_secret not in json.dumps(status)
+            assert secret not in json.dumps(status)
+            assert "synthetic-durable-must-not-fallback" not in json.dumps(preview)
+            assert "synthetic-durable-must-not-fallback" not in json.dumps(status)
+            external_store.publish(
+                "fd",
+                secret,
+                expected_generation=1,
+                delivery_id="synthetic-runtime-delivery-rotated",
+                root_id=root_identity_id(service.root_context),
+                instance_id=identity["instance_id"],
+                destination="fd",
+            )
+            accepted_payload = {
+                **preview["payload"],
+                "credential_source": "external-runtime",
+            }
+            stale_accept = client.post(
+                "/api/operations",
+                headers=headers,
+                json={
+                    "request_id": "synthetic-stale-external-fd-backtest",
+                    "action": "backtest",
+                    "subject_id": "demo-quality",
+                    "preview_id": preview["preview_id"],
+                    "preview_digest": preview["preview_digest"],
+                    "confirmation_token": preview["confirmation_token"],
+                    "expected_head": payload_values["mandate_hash"],
+                    "due_set": [],
+                    "payload": accepted_payload,
+                },
+            )
+            assert stale_accept.status_code == 409
+            assert stale_accept.json()["code"] == "stale-preview"
+            assert http_calls == []
+            assert dispatches == []
+
+            preview_response = client.post(
+                "/api/operations/preview",
+                headers=headers,
+                json={
+                    "action": "backtest",
+                    "subject_id": "demo-quality",
+                    "expected_head": payload_values["mandate_hash"],
+                    "payload": payload_values,
+                },
+            )
+            assert preview_response.status_code == 201, preview_response.text
+            preview = preview_response.json()
+            capture = service._captures[preview["capture_id"]]
+            capture_bytes = capture.private_bytes()
+            assert initial_secret.encode() not in capture_bytes
+            assert secret.encode() not in capture_bytes
+            assert capture.credential_handles["fd"].source == "external-runtime"
+            assert capture.credential_handles["fd"].version == 2
+            accepted_payload = {
+                **preview["payload"],
+                "credential_source": "external-runtime",
+            }
+            accepted = client.post(
+                "/api/operations",
+                headers=headers,
+                json={
+                    "request_id": "synthetic-external-fd-backtest",
+                    "action": "backtest",
+                    "subject_id": "demo-quality",
+                    "preview_id": preview["preview_id"],
+                    "preview_digest": preview["preview_digest"],
+                    "confirmation_token": preview["confirmation_token"],
+                    "expected_head": payload_values["mandate_hash"],
+                    "due_set": [],
+                    "payload": accepted_payload,
+                },
+            )
+            assert accepted.status_code == 202, accepted.text
+            store = service._operation_store
+            assert store is not None
+            completed = _wait_for_operation(
+                store,
+                accepted.json()["operation_id"],
+                OperationStatus.COMPLETED,
+                timeout=30,
+            )
+            assert release_called.wait(timeout=5)
+            idempotent_retry = client.post(
+                "/api/operations",
+                headers=headers,
+                json={
+                    "request_id": "synthetic-external-fd-backtest",
+                    "action": "backtest",
+                    "subject_id": "demo-quality",
+                    "preview_id": preview["preview_id"],
+                    "preview_digest": preview["preview_digest"],
+                    "confirmation_token": preview["confirmation_token"],
+                    "expected_head": payload_values["mandate_hash"],
+                    "due_set": [],
+                    "payload": accepted_payload,
+                },
+            )
+            assert idempotent_retry.status_code == 202, idempotent_retry.text
+            assert idempotent_retry.json()["operation_id"] == accepted.json()["operation_id"]
+            revoked_status = client.get(
+                "/api/credentials/status",
+                headers={"host": "127.0.0.1"},
+            ).json()["external_runtime"]
+            assert revoked_status["providers"]["fd"] == {
+                "state": "revoked",
+                "generation": 3,
+            }
+            stale_revoke = client.delete(
+                "/api/credentials/runtime/fd?expected_generation=2",
+                headers=headers,
+            )
+            assert stale_revoke.status_code == 409
+            revoked = client.delete(
+                "/api/credentials/runtime/fd?expected_generation=3",
+                headers=headers,
+            )
+            assert revoked.status_code == 200, revoked.text
+            assert revoked.json()["generation"] == 4
+    finally:
+        service.close()
+
+    assert completed.result["report_id"] == "fake-external-backtest.json"
+    assert len(http_calls) == 1
+    assert len(dispatches) == 1
+    assert len(revocation_denials) == 1
+    assert len(release_handles) == 1
+    assert len(release_handles[0]) == 1
+    assert initial_secret not in str(completed.public_view())
+    assert secret not in str(completed.public_view())
+
+    restarted = DeskService(
+        demo_root,
+        allow_writes=True,
+        network_enabled=True,
+    )
+    try:
+        with pytest.raises(OperationError, match="captured runtime credential is unavailable"):
+            restarted._captured_provider_key(capture, "fd")
+    finally:
+        restarted.close()
+
+
+def test_backtest_credential_source_defaults_durable_and_external_requires_paid_authorization():
+    common = {
+        "fund": "demo-quality",
+        "universe": ["AAPL"],
+        "start": "2024-06-03",
+        "end": "2024-06-04",
+        "provider": "fd",
+        "model": "qwen2.5:7b",
+        "mandate_hash": "a" * 64,
+    }
+
+    assert BacktestRequest(**common).credential_source == "durable"
+    with pytest.raises(ValueError, match="external runtime credentials require explicit paid authorization"):
+        BacktestRequest(**{**common, "credential_source": "external-runtime"})
+
+
+def test_external_capture_released_when_worker_submit_fails(demo_root, monkeypatch):
+    from hedge_fund.runtime.capture import root_identity_id
+    from hedge_fund.runtime.credential_delivery import CredentialDeliveryServer
+    from hedge_fund.runtime.external_credentials import ExternalCredentialError
+    from hedge_fund.runtime.operations import OperationStatus
+
+    monkeypatch.setenv("HEDGE_FUND_RUNTIME_ROLE", "web-operator")
+    monkeypatch.setenv("HEDGE_FUND_RUNTIME_PROVIDERS", "fd")
+    monkeypatch.setattr(CredentialDeliveryServer, "start", lambda self: None)
+    app = create_app(
+        root=demo_root,
+        allow_writes=True,
+        network_enabled=True,
+        demo=True,
+        fund_factory=lambda spec: Fund(
+            spec,
+            models={"earnings-drift": [FakeAnalyst("pead", {"AAPL": 1.0})]},
+        ),
+    )
+    service = app.state.service
+    external_store = service._external_credential_store
+    assert external_store is not None
+    identity = external_store.delivery_status("fd", destination="fd")
+    external_store.publish(
+        "fd",
+        "synthetic-submit-failure-secret",
+        expected_generation=0,
+        delivery_id="synthetic-submit-failure",
+        root_id=root_identity_id(service.root_context),
+        instance_id=identity["instance_id"],
+        destination="fd",
+    )
+    local_model = next(model_id for _, model_id, provider in load_api_models() if provider == "Ollama" and not model_id.endswith(":cloud"))
+    service.save_runtime_settings(
+        RuntimeSettingsRequest(
+            data_provider="fd",
+            model=local_model,
+            endpoint=None,
+            timeout_seconds=60.0,
+            parameters={},
+            expected_version=service.settings()["version"],
+        )
+    )
+    payload = BacktestRequest(
+        fund="demo-quality",
+        universe=["AAPL"],
+        start="2024-06-03",
+        end="2024-06-04",
+        provider="fd",
+        model=local_model,
+        mandate_hash=_mandate_fingerprint(demo_root),
+        authorize_paid_provider=True,
+        credential_source="external-runtime",
+        confirm_fd_self_service_pricing=True,
+        paid_max_calls=1,
+        paid_max_cost_usd="1",
+        paid_max_attempt_cost_usd="0.25",
+    )
+    try:
+        preview = service.create_operation_preview(
+            OperationPreviewRequest(
+                action="backtest",
+                subject_id="demo-quality",
+                expected_head=payload.mandate_hash,
+                payload=payload,
+            ),
+            operator_session="synthetic-submit-failure",
+        )
+        capture = service._captures[preview["capture_id"]]
+        runtime_handle = service._runtime_credential_handle(capture.credential_handles["fd"])
+        worker = service._operation_jobs
+        assert worker is not None
+        store = service._operation_store
+        assert store is not None
+        accepted_payload = BacktestRequest(**{**preview["payload"], "credential_source": "external-runtime"})
+        original_submit = worker.submit
+        original_accept = store.accept_request
+
+        def fail_submit(*_args, **_kwargs):
+            raise JobConflict("synthetic worker-start failure")
+
+        monkeypatch.setattr(worker, "submit", fail_submit)
+        with pytest.raises(ServiceError) as uncertain:
+            service.accept_operation(
+                OperationAcceptRequest(
+                    request_id="synthetic-submit-failure",
+                    action="backtest",
+                    subject_id="demo-quality",
+                    preview_id=preview["preview_id"],
+                    preview_digest=preview["preview_digest"],
+                    confirmation_token=preview["confirmation_token"],
+                    expected_head=preview["expected_head"],
+                    due_set=[],
+                    payload=accepted_payload,
+                ),
+                operator_session="synthetic-submit-failure",
+            )
+        assert uncertain.value.code == "ownership-unknown", uncertain.value.detail
+        external_store.publish(
+            "fd",
+            "synthetic-next-generation",
+            expected_generation=1,
+            delivery_id="synthetic-next-generation",
+            root_id=root_identity_id(service.root_context),
+            instance_id=identity["instance_id"],
+            destination="fd",
+        )
+        with pytest.raises(ExternalCredentialError, match="credential handle is unavailable"):
+            external_store.value_for_dispatch(runtime_handle, destination="fd")
+
+        monkeypatch.setattr(worker, "submit", original_submit)
+        race_preview = service.create_operation_preview(
+            OperationPreviewRequest(
+                action="backtest",
+                subject_id="demo-quality",
+                expected_head=payload.mandate_hash,
+                payload=payload,
+            ),
+            operator_session="synthetic-acquire-race",
+        )
+        race_payload = BacktestRequest(**{**race_preview["payload"], "credential_source": "external-runtime"})
+
+        def revoke_before_acquire(**kwargs):
+            external_store.revoke("fd", expected_generation=2)
+            return original_accept(**kwargs)
+
+        monkeypatch.setattr(store, "accept_request", revoke_before_acquire)
+        with pytest.raises(ServiceError) as race:
+            service.accept_operation(
+                OperationAcceptRequest(
+                    request_id="synthetic-acquire-race",
+                    action="backtest",
+                    subject_id="demo-quality",
+                    preview_id=race_preview["preview_id"],
+                    preview_digest=race_preview["preview_digest"],
+                    confirmation_token=race_preview["confirmation_token"],
+                    expected_head=race_preview["expected_head"],
+                    due_set=[],
+                    payload=race_payload,
+                ),
+                operator_session="synthetic-acquire-race",
+            )
+        assert race.value.code == "ownership-unknown"
+        interrupted = store.get_by_request("synthetic-acquire-race")
+        assert interrupted is not None
+        assert interrupted.status is OperationStatus.INTERRUPTED
+        assert external_store.delivery_status("fd", destination="fd")["state"] == "revoked"
+    finally:
+        service.close()
+
+
+def test_external_runtime_selection_fails_closed_with_empty_allowlist_and_durable_key(
+    demo_root,
+    monkeypatch,
+):
+    from hedge_fund.runtime.credential_delivery import CredentialDeliveryServer
+
+    monkeypatch.setenv("HEDGE_FUND_RUNTIME_ROLE", "web-operator")
+    monkeypatch.setenv("HEDGE_FUND_RUNTIME_PROVIDERS", "")
+    monkeypatch.setattr(CredentialDeliveryServer, "start", lambda self: None)
+    service = DeskService(demo_root, allow_writes=True, network_enabled=True)
+    local_model = next(model_id for _, model_id, provider in load_api_models() if provider == "Ollama" and not model_id.endswith(":cloud"))
+    durable_value = "synthetic-durable-must-not-fallback"
+    try:
+        service.save_runtime_settings(
+            RuntimeSettingsRequest(
+                data_provider="fd",
+                model=local_model,
+                endpoint=None,
+                timeout_seconds=60.0,
+                parameters={},
+                expected_version=service.settings()["version"],
+            )
+        )
+        service.set_credential(
+            CredentialRequest(
+                provider="fd",
+                value=SecretStr(durable_value),
+                expected_version=0,
+            )
+        )
+        payload = BacktestRequest(
+            fund="demo-quality",
+            universe=["AAPL"],
+            start="2024-06-03",
+            end="2024-06-04",
+            provider="fd",
+            model=local_model,
+            mandate_hash=_mandate_fingerprint(demo_root),
+            authorize_paid_provider=True,
+            credential_source="external-runtime",
+            confirm_fd_self_service_pricing=True,
+            paid_max_calls=1,
+            paid_max_cost_usd="1",
+            paid_max_attempt_cost_usd="0.25",
+        )
+
+        with pytest.raises(ServiceError) as denied:
+            service.create_operation_preview(
+                OperationPreviewRequest(
+                    action="backtest",
+                    subject_id="demo-quality",
+                    expected_head=payload.mandate_hash,
+                    payload=payload,
+                ),
+                operator_session="synthetic-empty-allowlist",
+            )
+
+        status = service.credential_status()["external_runtime"]
+        assert denied.value.status_code == 422
+        assert "external runtime credential is unavailable" in denied.value.detail
+        assert status["providers"] == {}
+        assert service.list_operations()["items"] == []
+        assert durable_value not in denied.value.detail
+    finally:
+        service.close()
+
+
 def test_cancel_after_effect_returns_preserves_completed_result(durable_job_context):
     _root, store, capture = durable_job_context
     operation = _accepted_operation(store, capture, request_id="cancel-after-effect")
@@ -1081,12 +1615,25 @@ def test_reviewed_backtest_executes_captured_mandate_after_template_edit(demo_ro
     assert worker is not None
     assert store is not None
     original_submit = worker.submit
-    pending_work = []
-    monkeypatch.setattr(
-        worker,
-        "submit",
-        lambda operation, work, reservation=None: pending_work.append((operation, work)) or operation,
-    )
+    start_work = threading.Event()
+    submitted = []
+
+    def defer_submit(operation, work, reservation=None, *, on_terminal=None):
+        submitted.append(operation.operation_id)
+
+        def held_work(*args):
+            if not start_work.wait(timeout=5):
+                raise TimeoutError("test worker was not released")
+            return work(*args)
+
+        return original_submit(
+            operation,
+            held_work,
+            reservation=reservation,
+            on_terminal=on_terminal,
+        )
+
+    monkeypatch.setattr(worker, "submit", defer_submit)
 
     try:
         payload = BacktestRequest(
@@ -1122,14 +1669,14 @@ def test_reviewed_backtest_executes_captured_mandate_after_template_edit(demo_ro
             operator_session="synthetic-server-session",
         )
         assert accepted["status"] == "accepted"
-        assert len(pending_work) == 1
+        assert submitted == [accepted["operation_id"]]
 
         mandate_path = demo_root / "mandates" / "demo-quality.yaml"
         changed = load_spec(mandate_path).model_dump(mode="json")
         changed["risk"]["max_position_pct"] = 0.2
         mandate_path.write_text(yaml.safe_dump(changed, sort_keys=False), encoding="utf-8")
 
-        original_submit(*pending_work[0])
+        start_work.set()
         future = worker._submitted[accepted["operation_id"]]
         assert future is not None
         future.result(timeout=30)

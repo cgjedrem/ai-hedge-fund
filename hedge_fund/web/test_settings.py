@@ -14,7 +14,10 @@ from hedge_fund.runtime.capture import (
     root_identity_id,
 )
 from hedge_fund.runtime.credential_delivery import CredentialDeliveryServer
-from hedge_fund.runtime.external_credentials import RuntimeCredentialLeaseStore
+from hedge_fund.runtime.external_credentials import (
+    ExternalCredentialError,
+    RuntimeCredentialLeaseStore,
+)
 from hedge_fund.runtime.operations import OperationError
 from hedge_fund.test_support.handover import enroll_synthetic_root
 from hedge_fund.web.app import create_app
@@ -82,6 +85,48 @@ def test_operator_delivery_role_keeps_provider_allowlist_empty_by_default(tmp_pa
             "state": "unconfigured",
             "providers": {},
         }
+    finally:
+        service.close()
+
+
+def test_runtime_revoke_maps_invalid_provider_closed_store_and_generation_cas(tmp_path, monkeypatch):
+    enroll_synthetic_root(tmp_path)
+    monkeypatch.setenv("HEDGE_FUND_RUNTIME_ROLE", "web-operator")
+    monkeypatch.setenv("HEDGE_FUND_RUNTIME_PROVIDERS", "openai")
+    monkeypatch.setattr(CredentialDeliveryServer, "start", lambda self: None)
+    service = DeskService(tmp_path, allow_writes=True)
+    store = service._external_credential_store
+    assert store is not None
+    try:
+        with pytest.raises(ServiceError) as invalid:
+            service.revoke_external_credential("not a provider", expected_generation=0)
+        assert invalid.value.status_code == 400
+
+        with pytest.raises(ServiceError) as unconfigured:
+            service.revoke_external_credential("fd", expected_generation=0)
+        assert unconfigured.value.status_code == 404
+
+        with pytest.raises(ServiceError) as stale:
+            service.revoke_external_credential("openai", expected_generation=1)
+        assert stale.value.status_code == 409
+        assert stale.value.code == "stale-preview"
+
+        revoke = store.revoke
+
+        def deny_revoke(*_args, **_kwargs):
+            raise ExternalCredentialError("root identity changed")
+
+        monkeypatch.setattr(store, "revoke", deny_revoke)
+        with pytest.raises(ServiceError) as denied:
+            service.revoke_external_credential("openai", expected_generation=0)
+        assert denied.value.status_code == 403
+        assert denied.value.code == "capability-denied"
+        monkeypatch.setattr(store, "revoke", revoke)
+
+        store.close()
+        with pytest.raises(ServiceError) as closed:
+            service.revoke_external_credential("openai", expected_generation=0)
+        assert closed.value.status_code == 503
     finally:
         service.close()
 

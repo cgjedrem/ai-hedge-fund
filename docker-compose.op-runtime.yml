@@ -1,0 +1,36 @@
+name: ${AIHF_OP_RUNTIME_PROJECT:?Set a unique AIHF_OP_RUNTIME_PROJECT}
+
+services:
+  web-operator:
+    profiles: ["op-runtime"]
+    image: ${AIHF_OP_RUNTIME_IMAGE:?Set a unique AIHF_OP_RUNTIME_IMAGE}
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+      args:
+        AIHF_SOURCE_REVISION: ${AIHF_SOURCE_REVISION:?Set AIHF_SOURCE_REVISION}
+        AIHF_SOURCE_SHA256: ${AIHF_SOURCE_SHA256:?Set AIHF_SOURCE_SHA256}
+    environment:
+      HEDGE_FUND_DATA_PROVIDER: yfinance
+      HEDGE_FUND_LLM_ENDPOINT: http://127.0.0.1:11434
+      HEDGE_FUND_RUNTIME_ROLE: web-operator
+      HEDGE_FUND_RUNTIME_PROVIDERS: ${HEDGE_FUND_RUNTIME_PROVIDERS:-}
+    volumes:
+      - operator-data:/data
+    network_mode: none
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    command:
+      - --port
+      - "8876"
+      - --enable-writes-after-trust
+      - --enable-network-after-trust
+
+volumes:
+  operator-data:
+    name: ${AIHF_OP_RUNTIME_VOLUME:?Set a unique AIHF_OP_RUNTIME_VOLUME}

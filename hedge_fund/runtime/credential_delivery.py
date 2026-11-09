@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import re
 import socket
+import stat
 import struct
 import sys
 import threading
@@ -33,6 +35,7 @@ _REASONS = frozenset(
         "delivery-denied",
         "protocol-error",
         "transport-unavailable",
+        "delivery-outcome-unknown",
     }
 )
 
@@ -199,7 +202,7 @@ def read_delivery_reply(stream: BinaryIO) -> DeliveryReply:
         raise DeliveryProtocolError("delivery status contains trailing data")
     try:
         record = json.loads(payload.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
         raise DeliveryProtocolError("delivery status is malformed") from None
     return DeliveryReply.from_mapping(record)
 
@@ -233,11 +236,7 @@ class CredentialDeliveryServer:
             raise DeliveryProtocolError("private local IPC path is invalid")
         parent = self._socket_path.parent
         try:
-            parent.mkdir(mode=0o700)
-            self._directory_created = True
-            info = parent.stat()
-            if not parent.is_dir() or info.st_uid != os.geteuid() or info.st_mode & 0o077:
-                raise DeliveryProtocolError("private local IPC permissions are invalid")
+            self._prepare_socket_directory(parent)
             server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             self._socket = server
             server.bind(os.fspath(self._socket_path))
@@ -250,6 +249,39 @@ class CredentialDeliveryServer:
             raise DeliveryProtocolError("private local IPC is unavailable") from None
         self._thread = threading.Thread(target=self._serve, name="credential-delivery-ipc", daemon=True)
         self._thread.start()
+
+    def _prepare_socket_directory(self, parent: Path) -> None:
+        try:
+            parent.mkdir(mode=0o700)
+            self._directory_created = True
+        except FileExistsError:
+            self._recover_stale_socket(parent)
+        info = parent.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o700:
+            raise DeliveryProtocolError("private local IPC permissions are invalid")
+        self._directory_created = True
+
+    def _recover_stale_socket(self, parent: Path) -> None:
+        info = parent.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o700 or tuple(entry.name for entry in parent.iterdir()) != (self._socket_path.name,):
+            raise DeliveryProtocolError("private local IPC permissions are invalid")
+        socket_info = self._socket_path.lstat()
+        if not stat.S_ISSOCK(socket_info.st_mode) or socket_info.st_uid != os.geteuid() or stat.S_IMODE(socket_info.st_mode) != 0o600:
+            raise DeliveryProtocolError("private local IPC permissions are invalid")
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+            probe.settimeout(0.25)
+            try:
+                probe.connect(os.fspath(self._socket_path))
+            except OSError as exc:
+                if exc.errno != errno.ECONNREFUSED:
+                    raise DeliveryProtocolError("private local IPC is unavailable") from None
+            else:
+                raise DeliveryProtocolError("private local IPC is active")
+        current_parent = parent.lstat()
+        current_socket = self._socket_path.lstat()
+        if current_parent.st_dev != info.st_dev or current_parent.st_ino != info.st_ino or current_socket.st_dev != socket_info.st_dev or current_socket.st_ino != socket_info.st_ino or not stat.S_ISSOCK(current_socket.st_mode) or current_socket.st_uid != os.geteuid() or stat.S_IMODE(current_socket.st_mode) != 0o600:
+            raise DeliveryProtocolError("private local IPC changed")
+        self._socket_path.unlink()
 
     def close(self) -> None:
         server = self._socket
@@ -332,7 +364,7 @@ class CredentialDeliveryServer:
                     finally:
                         stream.close()
                     connection.sendall(encode_delivery_reply(self.handle(request)))
-                except (DeliveryProtocolError, OSError):
+                except (DeliveryProtocolError, OSError, RecursionError, TimeoutError):
                     try:
                         connection.sendall(
                             encode_delivery_reply(
@@ -357,24 +389,27 @@ def receive_delivery_request(
 ) -> int:
     input_stream = sys.stdin.buffer if stdin is None else stdin
     output_stream = sys.stdout.buffer if stdout is None else stdout
+    publication_possible = False
     try:
         request = read_delivery_frame(input_stream)
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
             client.settimeout(30.0)
             client.connect(os.fspath(socket_path))
+            publication_possible = request.action == "publish"
             client.sendall(encode_delivery_frame(request))
             client.shutdown(socket.SHUT_WR)
             response = read_delivery_reply(client.makefile("rb"))
         output_stream.write(encode_delivery_reply(response))
         output_stream.flush()
         return 0 if response.state != "denied" else 2
-    except (DeliveryProtocolError, OSError, TimeoutError):
+    except (DeliveryProtocolError, OSError, TimeoutError, RecursionError) as exc:
+        reason_code = "delivery-outcome-unknown" if publication_possible else "protocol-error" if isinstance(exc, DeliveryProtocolError) else "transport-unavailable"
         response = DeliveryReply(
             "denied",
             0,
             "openai",
             "openai",
-            reason_code="transport-unavailable",
+            reason_code=reason_code,
         )
         try:
             output_stream.write(encode_delivery_reply(response))
@@ -405,10 +440,6 @@ def main(argv: list[str] | None = None) -> int:
     return receive_delivery_request()
 
 
-if __name__ == "__main__":
-    raise SystemExit(main())
-
-
 def encode_delivery_frame(request: DeliveryEnvelope | Mapping[str, object]) -> bytes:
     if isinstance(request, DeliveryEnvelope):
         envelope = request
@@ -422,7 +453,7 @@ def encode_delivery_frame(request: DeliveryEnvelope | Mapping[str, object]) -> b
             sort_keys=True,
             allow_nan=False,
         ).encode("utf-8")
-    except (TypeError, ValueError, UnicodeEncodeError):
+    except (TypeError, ValueError, UnicodeEncodeError, RecursionError):
         raise DeliveryProtocolError("delivery request is invalid") from None
     frame_size = 4 + len(payload)
     if frame_size > MAX_DELIVERY_FRAME_BYTES:
@@ -442,7 +473,7 @@ def read_delivery_frame(stream: BinaryIO) -> DeliveryEnvelope:
         raise DeliveryProtocolError("delivery stream contains trailing data")
     try:
         record = json.loads(payload.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
         raise DeliveryProtocolError("delivery frame is malformed") from None
     if not isinstance(record, dict):
         raise DeliveryProtocolError("delivery frame is malformed")
@@ -489,3 +520,7 @@ def provider_delivery_error(exc: Exception) -> str:
         if message in {"credential value is invalid", "credential value exceeds its bound"}:
             return "invalid-value"
     return "delivery-denied"
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

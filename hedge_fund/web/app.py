@@ -471,6 +471,16 @@ def create_app(
     def credential_status():
         return service.credential_status()
 
+    @app.delete("/api/credentials/runtime/{provider}")
+    def revoke_runtime_credential(
+        provider: str,
+        expected_generation: int = Query(ge=0, le=2**31 - 1),
+    ):
+        return service.revoke_external_credential(
+            provider,
+            expected_generation=expected_generation,
+        )
+
     @app.post("/api/settings/model")
     def set_model(request: ModelRequest):
         return service.set_model(request)

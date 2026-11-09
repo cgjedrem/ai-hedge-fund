@@ -8,7 +8,6 @@ import json
 import math
 import os
 import re
-import shutil
 import subprocess
 import sys
 import time
@@ -47,7 +46,7 @@ _AUTH_VARIABLES = frozenset(
         "OP_CONNECT_TOKEN_FILE",
     }
 )
-_DOCKER_OVERRIDE_VARIABLES = frozenset({"DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_TLS_VERIFY", "DOCKER_CERT_PATH"})
+_DOCKER_OVERRIDE_VARIABLES = frozenset({"DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_TLS_VERIFY", "DOCKER_CERT_PATH", "DOCKER_CONFIG"})
 _SECRET_VARIABLES = frozenset(PROVIDER_ENV_VARS.values()) | frozenset(DATA_PROVIDER_ENV_VARS.values()) | _AUTH_VARIABLES
 _SECRET_ENV_MARKERS = (
     "API_KEY",
@@ -208,14 +207,14 @@ class DockerCredentialDelivery:
         mapping = self._source_mappings.get(provider_id)
         if mapping is None:
             raise DockerCredentialDeliveryError("provider-not-allowed")
-        if mapping.container_id != container_id.casefold():
-            raise DockerCredentialDeliveryError("target-not-allowed")
         if any(_is_auth_variable(name) for name in self._environment):
             raise DockerCredentialDeliveryError("ambiguous-authentication")
         if any(isinstance(name, str) and name.upper() in _DOCKER_OVERRIDE_VARIABLES for name in self._environment):
             raise DockerCredentialDeliveryError("ambiguous-docker-configuration")
         if not isinstance(container_id, str) or not _CONTAINER_ID.fullmatch(container_id):
             raise DockerCredentialDeliveryError("target-invalid")
+        if mapping.container_id != container_id.casefold():
+            raise DockerCredentialDeliveryError("target-not-allowed")
         try:
             before = self._check_target(container_id, deadline)
             if before.image_id != mapping.image_id or before.revision.casefold() != mapping.revision or before.source_sha256 != mapping.source_sha256 or before.volume_name != mapping.volume_name:
@@ -252,11 +251,13 @@ class DockerCredentialDelivery:
             after = self._inspect_target(container_id, deadline)
             if after != before:
                 raise DockerCredentialDeliveryError("target-changed")
+            remaining = self._remaining(deadline)
+            reconciliation_budget = min(2.0, remaining / 3)
             try:
                 reply = self._exchange(
                     container_id,
                     request,
-                    deadline,
+                    deadline - reconciliation_budget,
                     publish=True,
                 )
             except DockerCredentialDeliveryError as exc:
@@ -456,6 +457,18 @@ class DockerCredentialDelivery:
             raise ValueError
         if not isinstance(host_config.get("Tmpfs"), dict) or "/tmp" not in host_config["Tmpfs"]:
             raise ValueError
+        if host_config.get("Privileged") is not False or host_config.get("ReadonlyRootfs") is not True:
+            raise ValueError
+        if host_config.get("NetworkMode") != "none":
+            raise ValueError
+        if host_config.get("CapDrop") != ["ALL"] or host_config.get("CapAdd") not in (None, []):
+            raise ValueError
+        if host_config.get("SecurityOpt") != ["no-new-privileges:true"]:
+            raise ValueError
+        if host_config.get("PidMode") not in (None, "") or host_config.get("IpcMode") not in (None, "", "private"):
+            raise ValueError
+        if host_config.get("Devices") not in (None, []):
+            raise ValueError
         if not isinstance(env, list) or any(not isinstance(entry, str) for entry in env):
             raise ValueError
         if any(_is_secret_environment_key(entry.split("=", 1)[0]) for entry in env):
@@ -513,6 +526,8 @@ class DockerCredentialDelivery:
             if publish:
                 raise DockerCredentialDeliveryError("delivery-outcome-unknown")
             raise DockerCredentialDeliveryError("delivery-transport-unavailable")
+        if publish and reply.state == "denied" and reply.reason_code == "delivery-outcome-unknown":
+            raise DockerCredentialDeliveryError("delivery-outcome-unknown")
         return reply
 
     def _run(self, args: list[str], deadline: float, *, input_data: bytes | None = None, error_code: str):
@@ -525,15 +540,24 @@ class DockerCredentialDelivery:
         }
         if input_data is not None:
             kwargs["input"] = input_data
+        run_args = args
+        docker_exec = args[:2] == ["docker", "exec"]
+        if args and args[0] == "docker" and self._runner is subprocess.run:
+            executable = _resolve_host_executable(
+                "docker",
+                environment=self._environment,
+                error_code=error_code,
+            )
+            run_args = [executable, *args[1:]]
         try:
-            result = self._runner(args, **kwargs)
+            result = self._runner(run_args, **kwargs)
         except subprocess.TimeoutExpired:
             raise DockerCredentialDeliveryError("timeout" if error_code not in {"delivery-outcome-unknown"} else error_code) from None
         except Exception:
             raise DockerCredentialDeliveryError(error_code) from None
         if not isinstance(result, subprocess.CompletedProcess):
             raise DockerCredentialDeliveryError(error_code)
-        if result.returncode != 0 and not (args[:2] == ["docker", "exec"] and result.returncode == 2):
+        if result.returncode != 0 and not (docker_exec and result.returncode == 2):
             raise DockerCredentialDeliveryError(error_code)
         return result
 
@@ -645,12 +669,15 @@ def _resolve_op_reference(
     *,
     environment: Mapping[str, str],
 ) -> str:
-    executable = shutil.which("op")
-    if executable is None:
-        raise DockerCredentialDeliveryError("cli-missing")
+    executable = _resolve_host_executable(
+        "op",
+        environment=environment,
+        error_code="cli-missing",
+    )
     try:
         result = subprocess.run(
             [executable, "read", "--no-newline", reference],
+            stdin=None,
             capture_output=True,
             timeout=timeout,
             check=False,
@@ -669,6 +696,57 @@ def _resolve_op_reference(
         return result.stdout.decode("utf-8")
     except (AttributeError, UnicodeDecodeError):
         raise DockerCredentialDeliveryError("invalid-value") from None
+
+
+def _resolve_host_executable(
+    name: str,
+    *,
+    environment: Mapping[str, str],
+    error_code: str,
+) -> str:
+    if name not in {"docker", "op"}:
+        raise DockerCredentialDeliveryError("executable-invalid")
+    path_value = next(
+        (value for key, value in environment.items() if isinstance(key, str) and key.casefold() == "path"),
+        "",
+    )
+    if not isinstance(path_value, str):
+        raise DockerCredentialDeliveryError(error_code)
+    try:
+        working_directory = Path.cwd().resolve()
+    except OSError:
+        raise DockerCredentialDeliveryError(error_code) from None
+    suffixes = (".exe",) if os.name == "nt" else ("",)
+    for path_entry in path_value.split(os.pathsep):
+        if not path_entry:
+            continue
+        directory = Path(path_entry)
+        if not directory.is_absolute():
+            directory = working_directory / directory
+        try:
+            resolved_directory = directory.resolve(strict=True)
+            resolved_directory.relative_to(working_directory)
+            continue
+        except ValueError:
+            pass
+        except OSError:
+            continue
+        if not resolved_directory.is_dir():
+            continue
+        for suffix in suffixes:
+            candidate = resolved_directory / f"{name}{suffix}"
+            try:
+                executable = candidate.resolve(strict=True)
+                executable.relative_to(working_directory)
+                continue
+            except ValueError:
+                pass
+            except OSError:
+                continue
+            if not executable.is_file() or (os.name != "nt" and not os.access(executable, os.X_OK)):
+                continue
+            return os.fspath(executable)
+    raise DockerCredentialDeliveryError(error_code)
 
 
 def _bytes(value: bytes | str) -> bytes:
@@ -694,7 +772,10 @@ def main(
     environment: Mapping[str, str] | None = None,
     stdout: TextIO | None = None,
 ) -> int:
-    parser = argparse.ArgumentParser(prog="aihf-op-deliver")
+    parser = argparse.ArgumentParser(
+        prog="aihf-op-deliver",
+        description="Launch from the attended user terminal used for op authentication; resolver output stays private.",
+    )
     parser.add_argument("--config", type=Path, default=None)
     parser.add_argument("--provider", required=True)
     arguments = parser.parse_args(argv)

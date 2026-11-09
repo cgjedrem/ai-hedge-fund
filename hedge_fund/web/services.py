@@ -82,7 +82,12 @@ from hedge_fund.runtime.admission import (
     RootOwnerLease,
     WriterConflict,
 )
-from hedge_fund.runtime.capture import freeze_capture, FrozenCapture, root_identity_id
+from hedge_fund.runtime.capture import (
+    CredentialHandle,
+    freeze_capture,
+    FrozenCapture,
+    root_identity_id,
+)
 from hedge_fund.runtime.configuration import (
     ConfigurationError,
     describe_configuration,
@@ -1672,9 +1677,22 @@ class DeskService:
             if settings.version != capture.settings_version or settings.data_provider != capture.data_provider or settings.llm_provider != capture.llm_provider or settings.model != capture.model or settings.endpoint != capture.endpoint:
                 raise AuthorizationDenied("captured provider settings changed")
         if capture.credential_versions:
-            if self._credential_store is None:
-                raise AuthorizationDenied("captured credentials are unavailable")
             for provider, version in capture.credential_versions.items():
+                handle = capture.credential_handles[provider]
+                if handle.source == "external-runtime":
+                    runtime_store = self._external_credential_store
+                    if runtime_store is None:
+                        raise AuthorizationDenied("captured runtime credentials are unavailable")
+                    try:
+                        runtime_store.assert_dispatch_allowed(
+                            self._runtime_credential_handle(handle),
+                            destination=handle.destination,
+                        )
+                    except ExternalCredentialError:
+                        raise AuthorizationDenied("captured runtime credentials changed") from None
+                    continue
+                if self._credential_store is None:
+                    raise AuthorizationDenied("captured credentials are unavailable")
                 try:
                     current, configured = self._credential_store.version(provider)
                 except CredentialStoreError:
@@ -2754,18 +2772,43 @@ class DeskService:
                 raise ServiceError(403, "Paid model providers require explicit bounded authorization.")
 
             credential_versions = {}
+            credential_handles = {}
             if paid_targets:
                 target = paid_targets[0][0]
                 provider_id = target.provider.casefold()
-                status = next(
-                    (value for name, value in self._credential_status_map().items() if name.casefold() == provider_id),
-                    None,
-                )
-                if not status or not status["configured"]:
-                    raise ServiceError(422, "Selected provider credential is not configured.", code="readiness-denied")
-                credential_versions[provider_id] = status["version"]
+                if payload.credential_source == "external-runtime":
+                    runtime_store = self._external_credential_store
+                    if runtime_store is None:
+                        raise ServiceError(422, "External runtime credential delivery is unavailable.", code="readiness-denied")
+                    try:
+                        runtime_handle = runtime_store.current_handle(provider_id, destination=provider_id)
+                    except ExternalCredentialError:
+                        raise ServiceError(422, "Selected external runtime credential is unavailable.", code="readiness-denied") from None
+                    credential_versions[provider_id] = runtime_handle.generation
+                    credential_handles[provider_id] = CredentialHandle(
+                        root_id=runtime_handle.root_id,
+                        provider_id=runtime_handle.provider_id,
+                        version=runtime_handle.generation,
+                        source="external-runtime",
+                        instance_id=runtime_handle.instance_id,
+                        destination=runtime_handle.destination,
+                    )
+                else:
+                    status = next(
+                        (value for name, value in self._credential_status_map().items() if name.casefold() == provider_id),
+                        None,
+                    )
+                    if not status or not status["configured"]:
+                        raise ServiceError(422, "Selected provider credential is not configured.", code="readiness-denied")
+                    credential_versions[provider_id] = status["version"]
+                    credential_handles[provider_id] = CredentialHandle(
+                        root_id=root_identity_id(self.root_context),
+                        provider_id=provider_id,
+                        version=status["version"],
+                    )
             now = _utcnow()
             operation_payload = payload.model_dump(mode="json")
+            operation_payload.pop("credential_source", None)
             operation_payload["cost_model_id"] = paid_cost_model_id
             operation_payload["cost_model_version"] = COST_MODEL_VERSION if paid_cost_model_id is not None else None
             try:
@@ -2777,6 +2820,7 @@ class DeskService:
                     broker=spec.broker,
                     settings=settings,
                     credential_versions=credential_versions,
+                    credential_handles=credential_handles,
                     code_version=code_version(),
                     mandate_snapshot=spec.model_dump(mode="json"),
                 )
@@ -2838,6 +2882,7 @@ class DeskService:
         if capture is None or capture.subject_id != subject:
             raise ServiceError(409, "Backtest preview is no longer available; review again.", code="stale-preview")
         payload = request.payload.model_dump(mode="json")
+        payload.pop("credential_source", None)
 
         def current_state() -> tuple[str | None, tuple[str, ...]]:
             current = self._load_mandate_by_name(subject)
@@ -2848,6 +2893,8 @@ class DeskService:
             if selected_capture is None or selected_capture.digest != operation.capture_digest:
                 raise OperationError("captured operation inputs are unavailable")
 
+            runtime_handles = self._acquire_external_capture(selected_capture)
+
             def work(progress, cancelled, apply_if_current):
                 return self._execute_captured_backtest(
                     operation,
@@ -2857,7 +2904,16 @@ class DeskService:
                     apply_if_current,
                 )
 
-            worker.submit(operation, work, reservation=reservation)
+            try:
+                worker.submit(
+                    operation,
+                    work,
+                    reservation=reservation,
+                    on_terminal=lambda: self._release_external_capture(runtime_handles),
+                )
+            except Exception:
+                self._release_external_capture(runtime_handles)
+                raise
 
         reservation = self._reserve_operation_slot(worker, subject_id=subject, request_id=request.request_id)
         try:
@@ -2871,7 +2927,33 @@ class DeskService:
             self._ensure_settings_available()
             if self._runtime_settings.version != capture.settings_version or self._runtime_settings.model != capture.model or self._runtime_settings.data_provider != capture.data_provider:
                 raise ServiceError(409, "Runtime settings changed; review the operation again.", code="stale-preview")
+            has_external_credential = any(handle.source == "external-runtime" for handle in capture.credential_handles.values())
+            existing_request = False
+            if has_external_credential:
+                try:
+                    existing_request = store.get_by_request(request.request_id) is not None
+                except OperationBusy:
+                    raise ServiceError(409, "Operation storage is busy; retry the read.", code="writer-conflict", retry_policy="retry-later") from None
+                except OperationError:
+                    raise ServiceError(409, "Operation could not be accepted.") from None
             for provider_id, version in capture.credential_versions.items():
+                handle = capture.credential_handles[provider_id]
+                if handle.source == "external-runtime":
+                    if existing_request:
+                        continue
+                    runtime_store = self._external_credential_store
+                    if runtime_store is None:
+                        raise ServiceError(409, "Captured runtime credential storage is unavailable.")
+                    try:
+                        current_handle = runtime_store.current_handle(
+                            provider_id,
+                            destination=handle.destination,
+                        )
+                    except ExternalCredentialError:
+                        raise ServiceError(409, "Runtime credential generation changed; review the operation again.", code="stale-preview") from None
+                    if current_handle != self._runtime_credential_handle(handle):
+                        raise ServiceError(409, "Runtime credential generation changed; review the operation again.", code="stale-preview")
+                    continue
                 if self._credential_store is None:
                     raise ServiceError(409, "Captured credential storage is unavailable.")
                 try:
@@ -2914,6 +2996,72 @@ class DeskService:
             except OperationError:
                 raise ServiceError(409, "Operation could not be accepted.") from None
         return operation
+
+    def _runtime_credential_handle(self, handle: CredentialHandle) -> RuntimeCredentialHandle:
+        if not isinstance(handle, CredentialHandle) or handle.source != "external-runtime":
+            raise ExternalCredentialError("runtime credential handle is invalid")
+        return RuntimeCredentialHandle(
+            root_id=handle.root_id,
+            instance_id=handle.instance_id,
+            provider_id=handle.provider_id,
+            generation=handle.version,
+            destination=handle.destination,
+        )
+
+    def _acquire_external_capture(self, capture: FrozenCapture) -> tuple[RuntimeCredentialHandle, ...]:
+        external = tuple(handle for handle in capture.credential_handles.values() if handle.source == "external-runtime")
+        if not external:
+            return ()
+        store = self._external_credential_store
+        if store is None:
+            raise OperationError("captured runtime credential is unavailable")
+        acquired = []
+        try:
+            for handle in external:
+                runtime_handle = self._runtime_credential_handle(handle)
+                store.acquire(runtime_handle)
+                acquired.append(runtime_handle)
+        except ExternalCredentialError:
+            for runtime_handle in acquired:
+                store.release(runtime_handle)
+            raise OperationError("captured runtime credential is unavailable") from None
+        return tuple(acquired)
+
+    def _release_external_capture(self, handles: tuple[RuntimeCredentialHandle, ...]) -> None:
+        store = self._external_credential_store
+        if store is None:
+            return
+        for handle in handles:
+            try:
+                store.release(handle)
+            except ExternalCredentialError:
+                continue
+
+    def revoke_external_credential(self, provider: str, *, expected_generation: int) -> dict[str, int | str]:
+        self._require_writes()
+        if not isinstance(provider, str) or type(expected_generation) is not int or expected_generation < 0:
+            raise ServiceError(400, "Runtime credential revocation request is invalid.")
+        store = self._external_credential_store
+        if store is None:
+            raise ServiceError(503, "External runtime credential delivery is unavailable.")
+        try:
+            self.root_context.revalidate()
+            self._admission.require_root_owner()
+            generation = store.revoke(provider, expected_generation=expected_generation)
+        except ExternalCredentialError as exc:
+            reason = str(exc)
+            if reason in {"provider identity is invalid", "credential generation is invalid"}:
+                raise ServiceError(400, "Runtime credential revocation request is invalid.") from None
+            if reason == "provider is not allowed":
+                raise ServiceError(404, "Runtime credential provider is not configured.") from None
+            if reason == "runtime credential store is closed":
+                raise ServiceError(503, "External runtime credential delivery is unavailable.") from None
+            if reason == "credential generation changed":
+                raise ServiceError(409, "Runtime credential generation changed; reload status.", code="stale-preview") from None
+            raise ServiceError(403, "Runtime credential revocation was denied.", code="capability-denied") from None
+        except (AdmissionError, RootPathError):
+            raise ServiceError(422, "Root write authority is unavailable.", code="readiness-denied") from None
+        return {"state": "revoked", "generation": generation}
 
     def get_operation(self, operation_id: str) -> dict:
         store = self._operation_store
