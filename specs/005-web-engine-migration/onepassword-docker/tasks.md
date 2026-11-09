@@ -1,8 +1,8 @@
 # Tasks: 1Password runtime secrets for the Docker desk
 
 **Input**: This directory's spec/plan/research/data-model/contracts/quickstart.
-**State**: Implementation authorized; tasks remain unchecked until evidenced.
-**Count**: 8 remaining tasks; T001-T002 and T005-T006 completed. IDs are local to this unnumbered extension,
+**State**: Runtime delivery implementation committed; artifact evidence partial; independent QA pending.
+**Count**: 5 remaining tasks; T001-T002, T005-T007 and T009-T010 completed. IDs are local to this unnumbered extension,
 not replacements for parent Spec005 T001-T134 or W01-W09.
 **Tests**: Required by OP-FR-014 and OP-SC-005; use red-green slices and fake adapters only.
 Proposed new filenames below are implementation targets, not claims that these files exist.
@@ -32,8 +32,8 @@ bounded failure and zero exposed sentinel occurrences.
 
 - [x] T005 [US2] Add fake-resolver/transport/denial/framing/status tests in `hedge_fund\secrets\test_docker_delivery.py`, `hedge_fund\runtime\test_external_credentials.py` and `hedge_fund\web\test_settings.py`; cover fail-closed initial denial and fake delivery. Full OP-A03/05/06/07 scenarios remain partial.
 - [x] T006 [US2] Implement `hedge_fund\secrets\docker_delivery.py` host launcher, bounded private resolver capture, strict local mapping config/CLI, auth-mode conflict checks, pinned local Docker target and non-TTY stdin framing. No Saxo semantics changed.
-- [ ] T007 [US2] Implement proposed `hedge_fund\runtime\credential_delivery.py` private receiver/helper, atomic memory-lease publication and redacted status; wire explicit-root entry in `hedge_fund\run.py` and explicit captured-key consumption/status in `hedge_fund\web\services.py`/`schemas.py`; forbid raw values in existing job snapshots or child environments and pass T005.
-- [ ] T008 [US2] Package only the eligible operator helper/private IPC in `Dockerfile.web` and `docker-compose.yml`/`docker-compose.linux.yml` as applicable to the reconciled Windows plan; verify peer identity, permissions, immutable instance/image/root checks and ext4 topology on a synthetic Windows Docker Desktop artifact, recording OP-A10 in this directory's `acceptance-evidence.md`; stop for redesign if unsupported.
+- [x] T007 [US2] Wire `aihf-op-deliver` through private stdin/IPC to the operator receiver; publish process-local leases, capture source-typed handles for web operations, expose value-free status/revoke, and deny durable/ambient fallback. Fake public flow and captured-consumer tests pass.
+- [ ] T008 [US2] Package the eligible operator path in `docker-compose.op-runtime.yml`; verify immutable image/container/root checks, owner-only IPC and ext4 topology on a synthetic Windows Docker Desktop artifact. Fake artifact runtime passed; cycle-two Linux test-owned-root integration exercised the actual admission callback and real receiver subprocess. Production `/data` trust/artifact admission remains unverified.
 
 ## Phase 5: US3 - Rotate and restart deliberately (P2)
 
@@ -41,8 +41,8 @@ bounded failure and zero exposed sentinel occurrences.
 **Independent test**: Fake A captured, B refreshed, concurrent revoke, failed refresh, backend
 recreated: correct generation isolation, fenced dispatch and explicit reauthorization.
 
-- [ ] T009 [US3] Add failing refresh/revoke/admission races, stale boot, crash/recreate and lost-ack reconciliation cases in `hedge_fund\runtime\test_external_credentials.py` and `hedge_fund\secrets\test_docker_delivery.py`; assert OP-A08/OP-A09 and no latest-value lookup under an old handle.
-- [ ] T010 [US3] Implement generation CAS, lifetime release, revoke dispatch fencing, explicit refresh/requires-auth and unknown-outcome status in `hedge_fund\runtime\external_credentials.py`, `hedge_fund\runtime\credential_delivery.py` and `hedge_fund\web\services.py`; pass T009 without automatic polling, secret recovery or app/fund restarts.
+- [x] T009 [US3] Add refresh/revoke/admission races, stale boot, restart and lost-ack reconciliation cases; assert fixed captures, no latest-value lookup under old handles and value-free outcome reconciliation. Focused fake tests pass.
+- [x] T010 [US3] Implement generation CAS, lifetime release, revoke dispatch fencing, explicit refresh/requires-auth and unknown-outcome status; no automatic polling, secret recovery or app/fund restart.
 
 ## Phase 6: Cross-cutting acceptance and handoff
 
@@ -99,11 +99,11 @@ rotation/restart (US3); finally one final-artifact exposure/platform/evidence ga
 | OP-FR-014 | T001, T003, T005, T009, T011, T012 | OP-A01 and all validation provenance |
 
 Task count by phase: setup 1, foundation 1, US1 2, US2 4, US3 2, cross-cutting 2.
-Planning completion does not check off implementation tasks. T001-T002 have focused evidence;
-T003-T012 remain unchecked because their full scenarios, race/platform/artifact gates or
-independent QA are incomplete.
+Planning completion does not check off implementation tasks. T003-T004, T008 and T011-T012
+remain incomplete because free/local runner coverage, production-container root trust, final
+artifact/browser/export scans, full-suite evidence or independent QA is pending.
 
-## Implementation checkpoint — 2026-11-09
+## Historical implementation checkpoint — pre-wiring state
 
 - Owner: Python implementation; automatic check: focused pytest in one runner.
 - Implementation commit: `15fc2d9c62c73e5eb40aec3c0a3a46022a82287c` (local only; no push).
@@ -142,5 +142,50 @@ independent QA are incomplete.
   artifact/platform and independent-QA scenarios are incomplete. No task is marked complete
   solely because part of its implementation exists.
 
-Stop condition: do not mark remaining tasks complete until their explicit scenarios pass;
-OP-A02/03/08/10 remain blocked on final artifact and supported synthetic Windows runtime.
+This checkpoint is historical; the following evidence supersedes its statements about
+missing wiring and artifact runtime.
+
+## Implementation and evidence checkpoint — 2026-11-09
+
+- Owner: Python implementation; automatic checks: one bounded pytest process, style gates,
+  isolated Docker Desktop/LinuxKit synthetic runtime. Independent QA remains pending.
+- Code commit: `7bb12216564477068f720598b0eedaf407b3188f`, parent
+  `a3a93531ff6f7f8beac4945a235694d5e80bf294`; patch SHA-256
+  `fabd622fef4c587851931e73b602613c3bc4061cd174788f2c5df9ed026ccf3d`
+  (89,846 bytes). Commit is local only; no push.
+- Final selected pytest command is recorded in `acceptance-evidence.md`: **185 passed,
+  8 skipped in 31.56 s**; process wall time **34.432 s** from
+  `2026-11-09T13:01:27.7092464Z` to `13:02:02.1413475Z` on Windows/Python 3.11.15/
+  pytest 7.4.4. Skips are Unix-socket tests on Windows; Linux equivalents were exercised
+  separately in the synthetic container.
+- W07 dispatch/web-origin subset passed in that same run. A preceding run exposed a new
+  service error-contract mismatch (`409` with `runtime-credential-denied`); the generic
+  revoke-denial mapping now returns `403 capability-denied`, with a regression test.
+- Black 420: 11 changed Python files passed; `web/test_settings.py` retains two formatting
+  differences also present at the pre-task base. isort, flake8 420 and `git diff --check`
+  passed on all 12 changed Python files at `13:02:12Z`-`13:02:15Z`.
+- Final artifact: image `sha256:507c563881cba608dfc0f4c6e614fbc11f0c02a30cef0efe085eecee30feb8b3`,
+  source revision `7bb1221`, package digest
+  `9cb26c1e6d55e053148d65426c6f18336ee66b8e34c5ea68f9514679166b5abc`.
+  Docker 29.9.2, context `desktop-linux`, Linux/amd64, Compose 5.6.1, overlayfs;
+  task-owned named volume reported `ext4` at `/data`. Synthetic Compose had no published
+  port, `network_mode=none`, read-only rootfs, `CapDrop=ALL`, no-new-privileges and no devices.
+- A fake in-memory receiver in the task-owned container accepted a fake resolver value over
+  Docker exec stdin/private Unix IPC. Exact sentinel scan returned clear for rendered
+  Compose, exported image archive/config/layers, history, container inspect config, logs,
+  exec argv/env, `/data`, `/tmp`, and container process argv/env. A malformed deep frame
+  was denied and followed by a valid status; conservative stale-socket recovery succeeded.
+  Container restart then returned `denied:transport-unavailable`; resolver count did not
+  increase. No root enrollment/trust, real `op read`, provider/model/broker call or browser
+  request occurred. The fake receiver bypassed application root admission, so this is not
+  production-ready acceptance.
+- The task-owned container, volume and image tag were removed after the run. Runtime scan
+  timestamps/duration were not measured separately; image creation was
+  `2026-11-09T12:57:15Z`, and the post-restart container start was
+  `2026-11-09T13:00:03Z`. See acceptance evidence for the bounded observation window,
+  failed harness attempt and remaining rows.
+- Full repository suite was not run. Earlier adjacent 194-pass/7-fail evidence remains
+  unverified against the pre-change baseline. T003-T004, T008, T011-T012 stay unchecked.
+
+Stop condition: no real mappings or provider credentials until configured by the operator;
+do not claim release acceptance before final independent QA and the remaining acceptance rows.

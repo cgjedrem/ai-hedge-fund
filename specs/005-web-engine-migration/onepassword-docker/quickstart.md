@@ -1,8 +1,8 @@
 # Validation runbook: proposed 1Password Docker connection
 
-**Validation guide.** Provider mappings remain empty. One bounded host identity check was
-authorized and attempted; no vault/item read, real credential delivery, provider call or
-existing-fund change is authorized by this guide.
+**Validation record and operator guide.** Provider mappings remain empty by user choice.
+A bounded synthetic Docker delivery was executed on the final implementation artifact.
+No vault/item read, real credential delivery, provider call or existing-fund change occurred.
 
 ## Prerequisites for later synthetic validation
 
@@ -63,13 +63,56 @@ parent shell was interactive; 9 1Password processes were in the same Windows ses
 Connect, service-account and session-token variables were absent. Prompt activity is
 unverified. The sanitized reason does not independently prove the desktop app is signed out.
 
-Path of Practice documents `op whoami` from an attached interactive terminal with biometric
-unlock (`docs/secrets.md:33-38`); its backend launcher runs `op` from PowerShell without
-hidden/redirected streams (`scripts/dev-backend.ps1:62-85`). This invocation difference
-could explain absent prompt activity, but is not a confirmed cause. Smallest discriminating
-local action: run `op whoami` directly in an attached PowerShell/Windows Terminal. This
-runbook does not invoke `op read`, configure a Connect/service-account token or promise a
-desktop prompt. Do not paste account/vault details or secrets into chat. Unattended auth remains out of scope.
+The user reports that `op whoami` succeeds in the same visible terminal used for sign-in.
+This is attributed user evidence, not an observed result from this process. A third bounded
+check ran at **2026-11-09 12:35:50 +01:00**, after the user's sign-in report: **unauthenticated**
+in **0.452 seconds**, CLI **2.34.1**, sanitized reason `desktop-account-not-signed-in`.
+That check also used a hidden child with captured streams. No prompt activity was recorded;
+whether a prompt appeared is unverified. No more host-auth checks are authorized by this runbook.
+
+Path of Practice is not dismissed as a Docker limitation: the user reports its host-to-Docker
+flow works. Read-only source confirms the host launcher invokes `op run` before Compose
+(`scripts/dev-backend.ps1:62-85`) and documents attached-terminal biometric auth
+(`docs/secrets.md:33-38`). Its runtime path injects environment values into a container, which
+is not reused. The relevant design distinction is where host resolution runs: launch this
+project's host command from the same attended terminal that succeeds with `op whoami`;
+the agent's hidden auth probe is not a valid proxy for that user-terminal context. This is a
+design hypothesis, not a verified cause or proof our private IPC path works.
+
+The value-free host connection check is the existing command:
+
+```powershell
+op whoami
+```
+
+Run it in the signed-in PowerShell/Windows Terminal. Do not paste its identity output into
+chat. The eventual delivery command, once a non-secret mapping and provider allowlist are
+explicitly configured, is:
+
+```powershell
+aihf-op-deliver --provider <application-provider>
+```
+
+Optional mapping path:
+
+```powershell
+aihf-op-deliver --provider <application-provider> --config <path>
+```
+
+Run delivery from that same attended terminal. Resolver stdout/stderr stay captured privately;
+only the value-free delivery result is printed. The child inherits terminal stdin and
+non-secret desktop settings such as `OP_BIOMETRIC_UNLOCK_ENABLED`; session tokens and
+service-account/Connect auth are never forwarded, and conflicting ambient auth fails closed.
+Mappings and backend provider IDs remain empty by default, so delivery is currently denied
+before `op read`. No vault item, provider value, or real-key Docker delivery was accessed.
+
+The opt-in `docker-compose.op-runtime.yml` uses a unique named volume, no published port,
+`network_mode: none`, and explicit after-trust write/network flags. It does not enroll or trust
+a root. The cycle-one LinuxKit/ext4 artifact run exercised fake private IPC and restart denial.
+Cycle two exercised the real application admission callback over private IPC using a marked
+test-owned root and denied republish after owner-lease closure. Production `/data` trust and
+release acceptance remain unverified. It does not change the existing Compose topology. No
+desktop prompt is promised. Unattended auth remains out of scope.
 
 ## Local mapping metadata and command
 
@@ -89,13 +132,16 @@ allowlist, and target destination must match. A real command invocation with a v
 would call `op read`; that was not run or authorized for this implementation session. Tests
 use fake resolver and fake Docker receiver only.
 
-The CLI/config path is functional under fakes, but live delivery remains unavailable with
-the current Compose bind-mounted root: the launcher denies it before resolution. No
-synthetic Docker artifact/runtime acceptance has been performed. Do not configure real
-mappings, authenticate Saxo, import existing `.env`, restart the current TUI or connect this
-flow to an existing fund.
+The CLI/config path is functional under fakes. The existing Compose operator still uses a
+bind-mounted root and remains rejected by the host target checker. The separate opt-in
+named-volume file built and ran with a task-owned fake receiver on Docker Desktop/LinuxKit;
+`/data` reported `ext4`. That artifact receiver bypassed application root-trust admission.
+The separate cycle-two test-owned-root integration exercises the admission callback, but not
+production trusted-root operation or release acceptance. Do not configure
+real mappings, authenticate Saxo, import existing `.env`, restart current services or
+connect this flow to an existing fund.
 
-## Final fake test selection
+## Historical fake test selection from pre-wiring checkpoint
 
 Python 3.11.15 / pytest 7.4.4 on Windows; selected modules ran sequentially in one pytest
 process. Final command:
@@ -208,3 +254,41 @@ hedge_fund/web/test_settings.py::test_missing_durable_capture_does_not_fall_back
 
 The selection also ran existing credential-store/capture/settings tests plus W07 dispatch
 and web-origin tests; exact totals are in [acceptance-evidence.md](acceptance-evidence.md).
+
+## Final bounded validation — 2026-11-09
+
+Source commit: `7bb12216564477068f720598b0eedaf407b3188f`; package SHA-256:
+`9cb26c1e6d55e053148d65426c6f18336ee66b8e34c5ea68f9514679166b5abc`.
+Final selected pytest command ran **185 passed, 8 skipped in 31.56 s** on Windows 11,
+Python 3.11.15 / pytest 7.4.4. Start/end: `2026-11-09T13:01:27.7092464Z` /
+`13:02:02.1413475Z`; wall time 34.432 s. It includes runtime lease, host delivery,
+Compose assertions, W07 dispatch/web-origin and external-operation lifecycle tests.
+Skips are Unix-domain socket tests on Windows. Black 420 passed on 11 changed Python files;
+two pre-existing Black differences in `web/test_settings.py` were confirmed at base
+`a3a9353`. isort, flake8 420 and `git diff --check` passed on all 12 changed Python files.
+
+Synthetic artifact `sha256:507c563881cba608dfc0f4c6e614fbc11f0c02a30cef0efe085eecee30feb8b3`
+was built from revision `7bb1221`, then run in project
+`aihf-op-cycle1-final-20261109` with task-owned volume
+`aihf-op-cycle1-volume-final-20261109`. Docker Desktop 29.9.2, `desktop-linux`,
+Linux/amd64, Compose 5.6.1; `/data` mount type `ext4`, storage driver `overlayfs`.
+Container admission fields observed: non-privileged, read-only rootfs, `network_mode=none`,
+`CapDrop=ALL`, `no-new-privileges:true`, no devices, only the named `/data` volume.
+
+A test-only in-memory receiver accepted a synthetic value through host Docker exec stdin and
+private Unix IPC; status/replies omitted the value. Final sentinel scan reported zero matches
+in rendered Compose, exported image archive/config/layers, history, container inspect config,
+logs, exec argv/env, `/data`, `/tmp`, and container process argv/env. A deep malformed frame
+was denied; a subsequent valid status succeeded; an owned stale socket was recovered.
+After restarting only the task-owned container, status was
+`denied:transport-unavailable` and resolver call count remained unchanged. This proves
+explicit redelivery was not automatic for that restarted, untrusted operator. It does not
+prove the application-owned lease server's trusted-root startup path: the fake server ran
+without root admission, and no root enrollment/trust was performed.
+
+The fake artifact run and scans occurred after image creation (`2026-11-09T12:57:15Z`) and
+before the post-restart container start (`2026-11-09T13:00:03Z`); exact scan start/end and
+duration were not captured. The task-owned container, volume and image tag were removed.
+Browser traffic/storage and export endpoints were not exercised; the profile had no published
+port and network mode `none`. Overall acceptance remains incomplete. See the current row
+disposition and the bounded failed-harness record in `acceptance-evidence.md`.

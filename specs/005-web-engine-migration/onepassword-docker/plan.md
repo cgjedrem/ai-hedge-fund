@@ -1,8 +1,9 @@
 # Implementation Plan: 1Password runtime secrets for the Docker desk
 
 **Branch**: `cgjedrem-ubiquitous-sniffle` | **Date**: 2026-11-09 | **Spec**: [spec.md](spec.md)
-**State**: Runtime-only scaffolding implemented and fake-tested; operational configuration,
-final artifact acceptance, independent review and platform proof remain pending.
+**State**: Runtime-only host-to-operator flow implemented. Fake artifact runtime and cycle-two
+test-owned-root admission integration passed; production `/data` trust, full acceptance and
+independent review remain pending.
 
 ## Summary
 
@@ -12,8 +13,8 @@ stdin to a target-checked container helper; publish an instance-bound memory lea
 operator backend using private local IPC. No plaintext files, configured container environment,
 vault authority inside the container, browser secret submission or scheduled paid work.
 
-This bridge is application code to design and verify, not a feature supplied by 1Password
-or Docker. Private IPC feasibility, Docker stream confidentiality under the stated local
+This bridge is application code, not a feature supplied by 1Password or Docker. Private IPC
+feasibility and Docker stream confidentiality under the stated local
 administrator trust boundary and same-root admission must be demonstrated before acceptance.
 The host launcher may use the host Docker CLI; the Docker daemon socket must not be mounted
 inside a service.
@@ -40,7 +41,7 @@ named-volume operator root. WSL/native Windows containers/remote Docker are not 
 **Performance Goals**: One credential per delivery; 16 KiB maximum; overall 60-second
 resolution/authentication deadline; no retry or polling.
 
-## Implementation checkpoint — 2026-11-09
+## Historical implementation checkpoint — pre-wiring state
 
 The local pinned Spec005 history is merged at `19b4913`; the main-only Yahoo news fix and
 planning documents are preserved. Runtime implementation was committed locally as
@@ -100,16 +101,16 @@ constitution; its free/local scheduled exception is not imported or used to wide
 | --- | --- | --- |
 | I Ledger integrity | No ledger work | Sidecars/leases only; no serialization/history changes |
 | II Paper/provider safety | Keyless default; no paid calls | Preserved; no credential implies spending authorization |
-| III Tests co-located | Docs-only now | Future code needs targeted then required suite/platform evidence |
+| III Tests co-located | Docs-only now | Targeted Windows and Linux source tests passed; full-suite evidence remains |
 | IV Determinism | Immutable capture required | Generation-bound memory leases; no latest-under-old-handle lookup |
 | V Surface consistency | Existing surfaces traced by specialist | Status only; no new TUI/runner credential path |
-| VI Style | ASCII/no BOM docs | Existing black 420/isort/flake8 for future code |
+| VI Style | ASCII/no BOM docs | Changed-scope black 420/isort/flake8 checks passed |
 | Existing Spec005 contract | Separate divergent history | Runtime-only external-source compatibility approved; preserve durable mode |
 | Plan review / user approval | User authorized autonomous implementation | Provider allowlist intentionally empty; no IDs inferred |
-| Platform/runtime evidence | Not executed | BLOCKED: synthetic Windows artifact evidence required |
+| Platform/runtime evidence | Not executed | Synthetic Windows ext4 delivery and Linux test-owned admission callback observed; production root trust remains blocked |
 
-No constitution waiver or gate bypass is claimed. Phase 0 research and Phase 1 design are
-approved for implementation; source-history reconciliation remains a required first gate.
+No constitution waiver or gate bypass is claimed. Phase 0 research and Phase 1 design were
+approved; source-history reconciliation completed in local commit `19b4913`.
 No target-branch plan-review-gate configuration exists in this checkout; no push is authorized.
 
 ## Project Structure
@@ -160,17 +161,20 @@ Unattended authentication is a separate scope decision, not an unresolved implic
 6. Expose status only. Refresh/revoke serialize with admission and dispatch fencing.
    Process/container restart invalidates all external leases; explicit redelivery is required.
 
-The private IPC transport is a proposed Unix-domain endpoint inside the operator's private
-runtime namespace, not a mounted host/1Password/Docker socket. Its path, peer credentials,
-permissions, framing and ownership must be verified in local task T008. If peer authentication or
-authority cannot be proved, stop and revise this design rather than broaden privileges.
+The private IPC transport is an owner-only Unix-domain endpoint inside the operator's private
+runtime namespace, not a mounted host/1Password/Docker socket. Linux runtime tests exercised
+permissions, framing, peer checks and the application admission callback against a marked
+test-owned root. Production root trust remains for T008.
+If peer authentication or authority cannot be proved, revise this design rather than broaden
+privileges.
 
 ## Compatibility and task gate
 
 Map to Spec005 FR-021-FR-024, FR-058; W05/W06/W08 with W07 adjacency; historical
 T045/T050/T051/T053/T057/T059/T060/T085/T086/T134. Do not mark those tasks complete.
-There are **12 proposed implementation/acceptance tasks**, all unchecked, in [tasks.md](tasks.md).
-They may be refined after user choices; no task is authorized by this count.
+The initial plan proposed **12 implementation/acceptance tasks** in [tasks.md](tasks.md).
+Current completion and blockers are recorded there; these local IDs do not change parent
+Spec005 task status.
 
 Runtime-only external-source mode and attended host auth are approved. No provider IDs were
 provided, so the allowlist starts empty. No actual provider access is needed to implement or
@@ -182,3 +186,28 @@ No constitution violation is proposed. Private IPC and source-typed leases are t
 additional mechanisms suggested to meet the no-persistence/no-Docker-environment boundary.
 If the user instead accepts durable root-store import, revise spec, retention acceptance and
 security disclosure before choosing that smaller but materially different design.
+
+## Historical implementation checkpoint — cycle one
+
+Source commit `7bb12216564477068f720598b0eedaf407b3188f` adds public host delivery,
+external-runtime operation capture, a value-free status/revoke surface, and an opt-in
+named-volume Compose profile. Provider mapping and backend allowlist defaults remain empty.
+The synthetic image reached a fake receiver over private IPC on Docker Desktop/LinuxKit with
+an ext4 named volume; exact sentinel scans passed on the recorded image/runtime surfaces.
+The app's own trusted-root admission was not activated or tested, and browser/export scans
+were not run. Independent QA and the full repository suite remain pending; see
+`acceptance-evidence.md`.
+
+## Cycle-two implementation checkpoint — 2026-11-09
+
+Code commit `9d23a1c79ce40b3e53c4bd495ae8f1b23478e594` adds bounded `ValueError` handling
+for framed JSON, checks closed-store state before provider allowlisting, and tests receiver
+thread survival, host outcome-unknown mapping and admission denial. Windows focused tests:
+111 passed, 10 skipped. Linux test-owned-root receiver/admission selection: 6 passed; exact
+commands, times, image and volume identities are in `acceptance-evidence.md`.
+
+The real service admission callback passed under `HEDGE_FUND_TEST_MODE=1` with a marked,
+task-owned synthetic root on an ext4 volume. Revoke of the owner lease denied republish and
+left generation 1 unchanged. This does not enroll/trust production `/data`, rebuild or scan
+the production artifact, or exercise browser/export. Production trust remains blocked pending
+explicit user authorization; full-suite and independent QA remain pending.

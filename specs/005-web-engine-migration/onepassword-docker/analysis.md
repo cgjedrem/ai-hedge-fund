@@ -1,7 +1,7 @@
 # Specification Analysis Report
 
-Date: 2026-11-09. Read-only consistency pass completed after task generation.
-This file records the report and workflow provenance, not implementation acceptance.
+Date: 2026-11-09. Read-only consistency pass completed after task generation; implementation
+and bounded artifact evidence are appended below. Independent QA remains pending.
 
 ## Findings
 
@@ -12,10 +12,10 @@ This file records the report and workflow provenance, not implementation accepta
 | A3 | Scope approval | RESOLVED WITH EMPTY ALLOWLIST | spec.md:39-47; research.md:119-125 | Attended host auth is the implementation assumption; no provider IDs were supplied | Start with zero allowed providers; do not infer IDs or request key values |
 
 These were planning readiness findings. A1 is addressed by the authorized local
-reconciliation, preserving the main-only Yahoo news fix. Runtime-only lease/transport
-scaffolding now exists and is fake-tested; operational configuration, independent QA and
-Docker runtime acceptance remain open. No source review, independent QA or platform PASS
-is claimed.
+reconciliation, preserving the main-only Yahoo news fix. Runtime configuration, operation
+wiring and synthetic transport are implemented. Cycle-two Linux tests exercised the actual
+service admission callback using a marked test-owned root; production `/data` trust and
+independent QA remain open.
 
 ## Coverage summary
 
@@ -41,12 +41,9 @@ is claimed.
 | OP-SC-004 | Yes | T009, T010, T011 | OP-A08, OP-A09 |
 | OP-SC-005 | Yes | T001, T011, T012 | All source-bound acceptance rows |
 
-**Metrics**: 19 requirements/outcomes (14 functional + 5 measurable); 12 tasks;
-19/19 task traceability (not implementation coverage); T001-T002 and T005-T006 evidenced,
-T003-T004 and T007-T012 incomplete; 0 unmapped tasks;
-0 critical constitution issues; 0 untracked ambiguity placeholders; 0 duplication findings;
-baseline reconciliation completed locally. No acceptance row is PASS; OP-A02/03/08/10 are
-BLOCKED and OP-A01/04/05/06/07/09 are INCONCLUSIVE. Planning checklist: 11/12.
+**Historical planning metrics**: 19 requirements/outcomes (14 functional + 5 measurable);
+12 tasks; 19/19 task traceability (not implementation coverage); no planning checklist
+completion implies runtime acceptance.
 
 ## Clarification coverage
 
@@ -56,7 +53,7 @@ User authorized autonomous implementation on 2026-11-09. No provider IDs were su
 | --- | --- |
 | Goals, journeys, errors, entities and lifecycle | Clear in conditional draft |
 | Security, timeout/size bounds, retention and acceptance | Clear in conditional draft |
-| Auth/product/platform capability | Two bounded `op whoami` checks returned unauthenticated; CLI integration enablement is user-reported. The second CLI child was hidden with redirected streams; Path of Practice documents an attached interactive invocation and biometric unlock. This is a plausible prompt discrepancy, not proof of desktop sign-out. Docker runtime remains unverified. |
+| Auth/product/platform capability | Three bounded agent-process `op whoami` checks returned unauthenticated; user reports visible-terminal success. No further probe or vault read was run. Synthetic Docker runtime and test-owned application admission callback were exercised; production `/data` trust remains unverified. |
 | Provider IDs | Unset by user; allowlist remains empty |
 | Authentication mode | Attended host CLI assumed; unattended support excluded |
 | Existing contract | Runtime-only discriminator approved; pinned history reconciliation remains A1 |
@@ -110,12 +107,17 @@ other branch gates must be rechecked after an authorized reconciliation; absence
 not a waiver. The installed evidence contract was read and its artifact/platform/provenance
 requirements incorporated in acceptance rows.
 
-## Next action and stop condition
+## Implementation checkpoint — 2026-11-09
 
-The host identity results and fake-test evidence are in
-[acceptance-evidence.md](acceptance-evidence.md). Public host CLI and mapping loader now
-exist; operator provider-ID allowlist and host mapping file remain empty by default.
-Continue with capture-source selection/lifetime integration, race/release cases, remaining
-tests and independent QA. Synthetic artifact/runtime acceptance is BLOCKED by current
-bind-mounted Compose topology and absent final image. Real-key delivery, Saxo,
-existing-fund cutover, push and merge-to-main remain outside authorization.
+The local source commit is `7bb12216564477068f720598b0eedaf407b3188f`; its patch digest,
+targeted tests and artifact identity are recorded in `acceptance-evidence.md`. T007/T009/
+T010 source work is complete under focused fake coverage. The separate opt-in Compose file
+was built and tested only with a task-owned synthetic receiver and local ext4 named volume.
+The fake receiver did not use the app's root-admission path. No root trust was enrolled,
+no browser or provider call occurred, and the synthetic image/container/volume were removed.
+
+Next action: independent read-only QA of the committed source/evidence, then decide whether
+additional synthetic root-admission authorization is needed. Full repository tests and
+browser/export validation remain outstanding. Provider mappings remain empty by user choice;
+no user input is required to preserve that default. No real-key delivery, Saxo, existing-fund
+cutover, push or merge-to-main is authorized.

@@ -250,35 +250,49 @@ it remains optional and provider mappings are empty by default. The command is
 non-secret mapping file is `%USERPROFILE%\.hedge-fund\op-runtime-mappings.json`; it may
 contain mapping rows with one `op://` field reference and pinned provider/root/container/
 image/volume metadata per row, never credential values. The backend allowlist uses provider IDs only:
-`HEDGE_FUND_RUNTIME_PROVIDERS` (comma-separated; unset means empty). No vault/item value was read during implementation. The first bounded host `op whoami`
-check on 2026-11-09 returned unauthenticated (CLI 2.34.1; sanitized reason:
-`desktop-integration-unavailable`). A follow-up after the user reported CLI integration on
-returned unauthenticated (sanitized reason: `desktop-account-not-signed-in`). That CLI child
-was hidden with stdout/stderr redirected; Path of Practice documents an attached interactive
-`op whoami` with biometric unlock. This is a plausible prompt discrepancy, not a confirmed
-cause or proof the desktop app is signed out. The smallest discriminating local check is
-`op whoami` directly in PowerShell/Windows Terminal; do not paste account or secret data
-into chat.
+`HEDGE_FUND_RUNTIME_PROVIDERS` (comma-separated; unset means empty). Run the value-free
+host check `op whoami` from the attended PowerShell/Windows Terminal where sign-in succeeds.
+The user reports this works in that terminal; an agent-run hidden child returned
+`desktop-account-not-signed-in` at 12:35:50 +01:00, in 0.452 seconds, with CLI 2.34.1.
+That check is not evidence that the user's terminal is unauthenticated.
 
-The user-reported integration setting was not independently inspected. The parent shell and
-1Password app processes shared a Windows session; Connect/service-account/session-token
-variables were absent. App settings were not read; prompt activity remains unverified.
+Path of Practice is not dismissed as a Docker issue: the user reports its host-to-Docker
+workflow works. Its checked-in host launcher invokes `op run` before Compose and uses
+environment injection; this project's security contract does not copy that mechanism. The
+supported integration design resolves on the host from the attended terminal and sends the
+value only through private stdin/IPC to the selected backend. `OP_SESSION_*`, Connect and
+service-account tokens are not forwarded; non-secret desktop settings are preserved. Once
+mapping metadata and a provider ID are configured, the value-free host command is
+`aihf-op-deliver --provider <application-provider>` in that same terminal. No mapping is
+configured now, so the default result remains denied before `op read`.
 
-The CLI/configuration path is fake-tested only; invoking it with an explicit mapping resolves
-the configured `op read` reference and has not been authorized or run here. No Docker artifact
-or synthetic runtime acceptance has been completed. The current Compose operator uses a
-bind-mounted root and the delivery launcher rejects that topology. This experiment does not
-make the documented Windows Docker Desktop bridge supported, and does not authorize provider
-calls, Saxo authentication, an existing-fund restart or real-key delivery.
+The standalone opt-in `docker-compose.op-runtime.yml` is isolated: unique project/image/
+volume identities, one named `/data` volume, no host port, no network, and writes/network
+still gated on explicit root trust. It does not change or restart existing Compose services.
+The current bind-mounted operator remains ineligible for delivery. The opt-in file received
+a bounded synthetic Docker Desktop/LinuxKit run: the final image used an ext4 named volume,
+a fake in-memory receiver accepted a synthetic value over private IPC, and image, Compose,
+inspect, history, logs, process, tmpfs and volume scans found no sentinel. A restart then
+denied status with `transport-unavailable` and did not invoke the resolver. The fake receiver
+bypassed application root-trust admission. A separate cycle-two Linux test used the approved
+test-owned synthetic root and real receiver subprocess: the service admission callback
+allowed generation 1, then denied publication after the synthetic owner lease closed without
+changing generation. Production `/data` trust, browser/export and trusted-root operation remain
+unverified. Overall acceptance and independent QA remain pending. These experiments do not
+authorize provider calls, Saxo authentication, an existing-fund restart or real-key delivery.
 
-The supported browser topology is a Linux host with local ext4 and the Linux
-host-network overlay. The app binds literal loopback; the overlay removes bridge
-ports/networks. Compose 2.24.0 or later is required for the Linux override's
-`!reset` tags. The base bridge `web` and `web-operator` profiles are unsupported;
-do not use them without the Linux override. The Windows Docker Desktop bridge is
-unsupported: a Windows host bind reports `9p`, which `RootContext.open` rejects.
-Do not accept Docker gateway peers, use `host.docker.internal` for Ollama, or
-weaken root/filesystem identity checks.
+The checked-in base browser profiles use a host bind mount and the Linux
+host-network overlay. A Windows host bind reports `9p`, which `RootContext.open`
+rejects; that result does not test a Docker Desktop ext4 named volume. The
+standalone `docker-compose.op-runtime.yml` models the approved Windows named-volume
+case. The earlier fake-receiver artifact run exercised that topology; a later Linux test-owned
+root exercised the actual application admission callback over private IPC. Production root
+trust and browser/export behavior remain unverified. Keep the existing root and filesystem
+identity checks. Do not accept Docker gateway peers or route Ollama through `host.docker.internal`.
+
+The Linux override removes bridge ports/networks and requires Compose 2.24.0 or
+later for `!reset` tags. The base bridge `web` and `web-operator` profiles remain
+unsupported without that Linux override.
 
 The image revision label and `SessionRecord.code_version` include the
 operator-supplied `AIHF_SOURCE_REVISION`, checked only for full lowercase

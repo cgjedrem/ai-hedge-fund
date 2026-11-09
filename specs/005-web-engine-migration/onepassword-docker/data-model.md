@@ -1,6 +1,8 @@
 # Data model: conditional runtime-only credential source
 
-Status: proposed, not implemented. Existing durable credential records remain unchanged.
+Status: implemented with source-typed captures and process-local leases. Exact field names
+are in `hedge_fund/runtime/external_credentials.py` and `hedge_fund/runtime/capture.py`;
+existing durable credential records remain unchanged.
 
 | Entity | Fields / validation | Retention and ownership |
 | --- | --- | --- |
