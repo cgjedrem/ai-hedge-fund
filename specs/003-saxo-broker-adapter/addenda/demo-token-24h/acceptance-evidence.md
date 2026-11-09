@@ -82,6 +82,67 @@ CSRF/session in process memory with explicit consent/selection/generation/revoke
 That Python example passed syntax parsing only; it was not executed against a
 service. Full Python suite was not rerun or claimed.
 
+### Follow-up: distinguish image filesystem from empty-volume authority
+
+The earlier no-mount failure does **not** establish that Docker named volumes
+have an unsupported filesystem. Two bounded, uncredentialed diagnostics used
+the same immutable image above, `--network none`, a read-only container image,
+all capabilities dropped, no-new-privileges, and newly created empty diagnostic
+volumes mounted read-only at `/data` with `volume-nocopy`. No existing volume
+was mounted or changed, and neither diagnostic published a host port.
+
+- Image metadata confirmed entrypoint
+  `["aihf-web-supervisor", "--root", "/data"]` and default command
+  `["--port", "8876"]`. The dedicated Compose service mounts its external
+  volume at `/data`; there is no `/root/.hedge-fund` root mismatch to fix.
+- Diagnostic container
+  `6dbfee140e7f8ff9aa2e68ef3ee479844dc248223d507de70470106f6c84e4c9`
+  compared native filesystem detection: image `/app` was `overlayfs` and
+  `RootContext.open` rejected it with `UnsupportedFilesystemError`; volume
+  `/data` had `stat -f -c %T` output `ext2/ext3`, while the application's
+  native filesystem identity was **ext4** and `RootContext.open` succeeded.
+  The generic `stat` family label is not an application admission failure.
+  `write_authority` returned `unavailable` / `handover-unavailable`.
+- A separate fresh empty volume in diagnostic container
+  `6f9375bab87cf85f4e936042fe92741eeab539e451fc38d5ca019133686a22f4`
+  also passed ext4 admission. `private_storage_verified` was false;
+  `require_enrollment` raised `EnrollmentInvalid: private storage is not
+  verified`; `enrollment_status` reported `unenrolled` / `handover-required`.
+  This distinguishes filesystem admission from protocol/write authority.
+- The second diagnostic launched the normal
+  `aihf-web-supervisor --root /data --port 8876
+  --enable-writes-after-trust --enable-network-after-trust` child command
+  with the profile's non-secret role/capability settings. A bounded internal
+  loopback GET `/api/capabilities` returned HTTP **200** with
+  `read_only=true`, `writes=false`, `network=false`,
+  `write_authority=unavailable`, `write_unavailable_reason=handover-required`.
+  Thus an empty ext4 root starts a read-only observer, **not** the required
+  inspection operator. The diagnostic parent ran the supervisor as a child;
+  this is not PID-1 deployment, credential-delivery or host-reachability
+  acceptance. No activation signal, enrollment, trust or synthetic owner
+  marker was used.
+- Both diagnostics exited **0** and were removed by their exact IDs. Their
+  dedicated volumes `aihf-pr8-root-diagnosis-bf812617` and
+  `aihf-pr8-observer-diagnosis-bf812617` were removed. No service was left
+  running and no image rebuild was needed: only documentation changed.
+- Verified the scripted quickstart's request fields, response keys, consent,
+  session/CSRF, selection, generation and revoke routes against source and
+  offline fake HTTP tests:
+  `uv tool run --from poetry poetry run python -m pytest
+  hedge_fund\web\test_saxo_inspection.py -q --tb=short -p no:cacheprovider`
+  with dotenv disabled and plugin autoload disabled: **65 passed in 51.84s**,
+  process exit **0**. No real Saxo request or actual token reference was used.
+
+**Disposition:** the original filesystem error was caused by the **unmounted
+image root**, not by a wrong configured root path or an incompatible named
+volume. A fresh ext4 volume resolves that error but does not confer operator
+authority. Creating/enrolling/trusting an operator root is outside this
+inspection-only authorization, so T026/SB-A08 remain **BLOCKED**. Do not retain
+an observer as if the requested inspection service were operational. Host
+browser reachability is still unverified; the launcher binds container
+loopback, so a bridge port mapping alone is not evidence of reachability.
+No proxy, bind-policy override or topology redesign was attempted.
+
 ### Additional isolated Linux/ext4 fake verification
 
 This follow-up used **only a disposable test artifact**, not a production

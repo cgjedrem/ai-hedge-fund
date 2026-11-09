@@ -17,6 +17,12 @@ unreachable. The probe/network were removed and existing containers were not
 changed. This is not a running inspection deployment. See the parent
 [acceptance evidence](..\acceptance-evidence.md) for immutable identities and
 the exact blocker; do not initialize/enroll/trust a root as a workaround.
+Follow-up diagnostics confirmed that a fresh named volume mounted at the
+configured `/data` passes ext4 admission, but normal startup exposes only
+`read_only=true`, `writes=false`, `network=false` with `handover-required`.
+The original error was the unmounted image filesystem, not a root-path mismatch.
+Both read-only, network-isolated diagnostics and their empty volumes were removed;
+no inspection operator or host-reachable service was established.
 An additional Linux/ext4 test-only run collected the three runtime/HTTP modules
 under normal admission: **120 passed, 9 failed**, not a passing IPC selection.
 The nine socket tests hardcode a read-only `/tmp`; no outside scratch path was
