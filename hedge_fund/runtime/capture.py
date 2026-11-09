@@ -20,6 +20,7 @@ from hedge_fund.runtime.root import (
 
 _TICKER = re.compile(r"[A-Z0-9.^=-]{1,15}")
 _PROVIDER_ID = re.compile(r"[a-z][a-z0-9._-]{0,63}")
+_INSTANCE_ID = re.compile(r"[A-Za-z0-9._:-]{1,128}")
 _SHA256 = re.compile(r"[a-fA-F0-9]{64}")
 _MAX_MANDATE_SNAPSHOT_BYTES = 1024 * 1024
 
@@ -31,11 +32,14 @@ def is_capture_ticker(value: object) -> bool:
 
 @dataclass(frozen=True, slots=True)
 class CredentialHandle:
-    """Root/provider/version reference; contains no credential material."""
+    """Source-typed root/provider/version reference; contains no value."""
 
     root_id: str = field(repr=False)
     provider_id: str
     version: int
+    source: str = "durable"
+    instance_id: str | None = field(default=None, repr=False)
+    destination: str | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.root_id, str) or not _SHA256.fullmatch(self.root_id):
@@ -44,8 +48,20 @@ class CredentialHandle:
             raise ConfigurationError("credential reference is invalid")
         if type(self.version) is not int or self.version < 0:
             raise ConfigurationError("credential reference is invalid")
+        if self.source == "durable":
+            if self.instance_id is not None or self.destination is not None:
+                raise ConfigurationError("credential reference is invalid")
+        elif self.source == "external-runtime":
+            if not isinstance(self.instance_id, str) or not _INSTANCE_ID.fullmatch(self.instance_id):
+                raise ConfigurationError("credential reference is invalid")
+            if not isinstance(self.destination, str) or not _PROVIDER_ID.fullmatch(self.destination.casefold()):
+                raise ConfigurationError("credential reference is invalid")
+        else:
+            raise ConfigurationError("credential reference is invalid")
         object.__setattr__(self, "root_id", self.root_id.casefold())
         object.__setattr__(self, "provider_id", self.provider_id.casefold())
+        if self.destination is not None:
+            object.__setattr__(self, "destination", self.destination.casefold())
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,6 +147,17 @@ class FrozenCapture:
             handles[provider_id] = handle
         if handles.keys() != versions.keys() or any(handles[key].version != version for key, version in versions.items()):
             raise ConfigurationError("credential references are invalid")
+        external_handles = {
+            provider: {
+                "provider_id": handle.provider_id,
+                "source": handle.source,
+                "instance_id": handle.instance_id,
+                "destination": handle.destination,
+                "generation": handle.version,
+            }
+            for provider, handle in handles.items()
+            if handle.source == "external-runtime"
+        }
 
         mandate_snapshot, mandate_snapshot_bytes = _validated_mandate_snapshot(
             self.mandate_snapshot,
@@ -138,7 +165,7 @@ class FrozenCapture:
             mandate_digest=mandate_digest,
         )
         payload = {
-            "schema": 2 if mandate_snapshot is not None else 1,
+            "schema": 3 if external_handles else 2 if mandate_snapshot is not None else 1,
             "root_id": root_id,
             "subject_id": subject_id,
             "mandate_digest": mandate_digest,
@@ -150,6 +177,8 @@ class FrozenCapture:
             "credential_versions": versions,
             "code_version": self.code_version,
         }
+        if external_handles:
+            payload["external_credential_handles"] = external_handles
         if mandate_snapshot is not None:
             payload["mandate_snapshot"] = mandate_snapshot
         canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
@@ -199,8 +228,9 @@ class FrozenCapture:
 
     def private_bytes(self) -> bytes:
         """Serialize frozen inputs and version handles; no credential values."""
+        external_handles = any(handle.source == "external-runtime" for handle in self.credential_handles.values())
         record = {
-            "schema": 2 if self.mandate_snapshot is not None else 1,
+            "schema": 3 if external_handles else 2 if self.mandate_snapshot is not None else 1,
             "capture_id": self.capture_id,
             "digest": self.digest,
             "root_id": self.root_id,
@@ -218,13 +248,7 @@ class FrozenCapture:
                 "parameters": dict(self.parameters),
                 "provenance": dict(self.provenance),
             },
-            "credential_handles": [
-                {
-                    "provider_id": handle.provider_id,
-                    "version": handle.version,
-                }
-                for _, handle in sorted(self.credential_handles.items())
-            ],
+            "credential_handles": [_credential_handle_record(handle) for _, handle in sorted(self.credential_handles.items())],
             "code_version": self.code_version,
         }
         if self.mandate_snapshot is not None:
@@ -262,7 +286,7 @@ class FrozenCapture:
             frozenset(fields | {"mandate_snapshot"}),
         }:
             raise ConfigurationError("capture fields are invalid")
-        if type(record["schema"]) is not int or record["schema"] not in {1, 2}:
+        if type(record["schema"]) is not int or record["schema"] not in {1, 2, 3}:
             raise ConfigurationError("capture schema is invalid")
         settings_record = record["settings"]
         if not isinstance(settings_record, dict) or set(settings_record) != {
@@ -288,16 +312,45 @@ class FrozenCapture:
                 raise ConfigurationError("capture credential handles are invalid")
             handles = {}
             versions = {}
+            has_external_handle = False
             for entry in handles_record:
-                if not isinstance(entry, dict) or set(entry) != {"provider_id", "version"}:
+                if not isinstance(entry, dict):
+                    raise ConfigurationError("capture credential handles are invalid")
+                if set(entry) == {"provider_id", "version"}:
+                    source = "durable"
+                    instance_id = None
+                    destination = None
+                elif record["schema"] == 3 and set(entry) == {
+                    "provider_id",
+                    "version",
+                    "source",
+                    "instance_id",
+                    "destination",
+                }:
+                    source = entry["source"]
+                    instance_id = entry["instance_id"]
+                    destination = entry["destination"]
+                    if source != "external-runtime":
+                        raise ConfigurationError("capture credential handles are invalid")
+                    has_external_handle = True
+                else:
                     raise ConfigurationError("capture credential handles are invalid")
                 provider = entry["provider_id"]
                 version = entry["version"]
                 if not isinstance(provider, str) or provider.casefold() in handles:
                     raise ConfigurationError("capture credential handles are invalid")
-                handle = CredentialHandle(root_id, provider, version)
+                handle = CredentialHandle(
+                    root_id,
+                    provider,
+                    version,
+                    source=source,
+                    instance_id=instance_id,
+                    destination=destination,
+                )
                 handles[handle.provider_id] = handle
                 versions[handle.provider_id] = handle.version
+            if (record["schema"] == 3) != has_external_handle:
+                raise ConfigurationError("capture credential handles are invalid")
             snapshot = None
             if "mandate_snapshot" in record:
                 snapshot = json.dumps(
@@ -343,6 +396,7 @@ def freeze_capture(
     settings: RuntimeSettings,
     credential_versions: Mapping[str, int],
     code_version: str,
+    credential_handles: Mapping[str, CredentialHandle] | None = None,
     mandate_snapshot: Mapping[str, object] | None = None,
 ) -> FrozenCapture:
     """Freeze validated execution metadata and root-scoped version handles."""
@@ -386,16 +440,42 @@ def freeze_capture(
         mandate_digest=mandate_digest.lower(),
     )
     versions = {provider.casefold(): version for provider, version in credential_versions.items()}
-    handles = {
-        provider: CredentialHandle(
-            root_id=root_id,
-            provider_id=provider,
-            version=version,
-        )
-        for provider, version in versions.items()
+    if credential_handles is None:
+        supplied_handles: dict[str, CredentialHandle] = {}
+    elif not isinstance(credential_handles, Mapping):
+        raise ConfigurationError("credential references are invalid")
+    else:
+        supplied_handles = {}
+        for provider, handle in credential_handles.items():
+            if not isinstance(provider, str) or not isinstance(handle, CredentialHandle):
+                raise ConfigurationError("credential references are invalid")
+            provider_id = provider.casefold()
+            if provider_id in supplied_handles or handle.provider_id != provider_id:
+                raise ConfigurationError("credential references are invalid")
+            supplied_handles[provider_id] = handle
+    if set(supplied_handles) - set(versions):
+        raise ConfigurationError("credential references are invalid")
+    handles = {}
+    for provider, version in versions.items():
+        handle = supplied_handles.get(provider)
+        if handle is None:
+            handle = CredentialHandle(root_id=root_id, provider_id=provider, version=version)
+        if handle.root_id != root_id or handle.version != version:
+            raise ConfigurationError("credential references are invalid")
+        handles[provider] = handle
+    external_handles = {
+        provider: {
+            "provider_id": handle.provider_id,
+            "source": handle.source,
+            "instance_id": handle.instance_id,
+            "destination": handle.destination,
+            "generation": handle.version,
+        }
+        for provider, handle in handles.items()
+        if handle.source == "external-runtime"
     }
     payload = {
-        "schema": 2 if snapshot_record is not None else 1,
+        "schema": 3 if external_handles else 2 if snapshot_record is not None else 1,
         "root_id": root_id,
         "subject_id": canonical_subject,
         "mandate_digest": mandate_digest.lower(),
@@ -407,6 +487,8 @@ def freeze_capture(
         "credential_versions": versions,
         "code_version": code_version,
     }
+    if external_handles:
+        payload["external_credential_handles"] = external_handles
     if snapshot_record is not None:
         payload["mandate_snapshot"] = snapshot_record
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
@@ -448,6 +530,30 @@ def _root_id(root: RootContext) -> str:
     }
     canonical = json.dumps(identity, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def root_identity_id(root: RootContext) -> str:
+    """Return canonical root identity used by frozen captures."""
+    if not isinstance(root, RootContext):
+        raise ConfigurationError("an explicit root context is required")
+    root.revalidate()
+    return _root_id(root)
+
+
+def _credential_handle_record(handle: CredentialHandle) -> dict[str, object]:
+    record: dict[str, object] = {
+        "provider_id": handle.provider_id,
+        "version": handle.version,
+    }
+    if handle.source == "external-runtime":
+        record.update(
+            {
+                "source": handle.source,
+                "instance_id": handle.instance_id,
+                "destination": handle.destination,
+            }
+        )
+    return record
 
 
 def _validated_mandate_snapshot(

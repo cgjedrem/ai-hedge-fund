@@ -5,7 +5,13 @@ from pathlib import Path
 import pytest
 
 from hedge_fund.runtime.admission import AdmissionCoordinator, RootOwnerLease
-from hedge_fund.runtime.capture import CredentialHandle, freeze_capture, FrozenCapture
+from hedge_fund.runtime.capture import (
+    _root_id,
+    CredentialHandle,
+    freeze_capture,
+    FrozenCapture,
+    root_identity_id,
+)
 from hedge_fund.runtime.configuration import (
     build_child_environment,
     child_root_arguments,
@@ -150,6 +156,47 @@ def test_validated_local_sampling_and_context_settings_are_captured(root_context
         "temperature": 0.4,
         "top_p": 0.8,
     }
+
+
+def test_external_runtime_handle_is_instance_bound_in_capture_and_snapshot(root_context):
+    settings = resolve_settings(
+        root_context,
+        launch={"model": "gpt-6-sol"},
+    )
+    root_id = _root_id(root_context)
+    assert root_identity_id(root_context) == root_id
+    handle = CredentialHandle(
+        root_id,
+        "openai",
+        3,
+        source="external-runtime",
+        instance_id="backend-boot-1",
+        destination="openai",
+    )
+    capture = freeze_capture(
+        root=root_context,
+        subject_id="alpha",
+        mandate_digest="b" * 64,
+        universe=("AAPL",),
+        broker="paper",
+        settings=settings,
+        credential_versions={"openai": 3},
+        credential_handles={"openai": handle},
+        code_version="synthetic-code-stamp",
+    )
+
+    snapshot = capture.private_bytes()
+    restored = FrozenCapture.from_private_bytes(root_context, snapshot)
+
+    assert restored.credential_handles["openai"].source == "external-runtime"
+    assert restored.credential_handles["openai"].instance_id == "backend-boot-1"
+    assert restored.credential_handles["openai"].destination == "openai"
+    assert b"secret" not in snapshot.lower()
+
+
+def test_external_runtime_handle_requires_instance_and_destination(root_context):
+    with pytest.raises(ConfigurationError, match="credential reference is invalid"):
+        CredentialHandle("a" * 64, "openai", 1, source="external-runtime")
 
 
 def test_invalid_mandate_snapshot_is_rejected_before_freezing(root_context):

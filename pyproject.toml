@@ -48,6 +48,7 @@ web = ["fastapi", "uvicorn"]
 aihf = "hedge_fund.run:main"
 aihf-web = "hedge_fund.web.__main__:main"
 aihf-web-supervisor = "hedge_fund.web.supervisor:main"
+aihf-op-deliver = "hedge_fund.secrets.docker_delivery:main"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^7.4.0"

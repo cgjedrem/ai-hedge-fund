@@ -8,7 +8,14 @@ from pydantic import SecretStr
 
 from hedge_fund.llm import DEFAULT_MODEL, load_api_models
 from hedge_fund.llm.registry import is_supported
-from hedge_fund.runtime.capture import freeze_capture
+from hedge_fund.runtime.capture import (
+    CredentialHandle,
+    freeze_capture,
+    root_identity_id,
+)
+from hedge_fund.runtime.credential_delivery import CredentialDeliveryServer
+from hedge_fund.runtime.external_credentials import RuntimeCredentialLeaseStore
+from hedge_fund.runtime.operations import OperationError
 from hedge_fund.test_support.handover import enroll_synthetic_root
 from hedge_fund.web.app import create_app
 from hedge_fund.web.schemas import CredentialRequest, ModelRequest
@@ -31,6 +38,139 @@ def test_settings_expose_presence_not_provider_values(tmp_path, monkeypatch):
     }
     assert sentinel not in json.dumps(result)
     service.close()
+
+
+def test_external_runtime_status_is_disabled_and_never_exposes_mapping(tmp_path, monkeypatch):
+    reference = "op://SyntheticVault/SyntheticItem/api-key"
+    monkeypatch.delenv("HEDGE_FUND_RUNTIME_ROLE", raising=False)
+    service = DeskService(tmp_path)
+
+    status = service.credential_status()["external_runtime"]
+
+    assert status == {"state": "disabled", "providers": {}}
+    assert reference not in json.dumps(status)
+    assert "value" not in json.dumps(status)
+    service.close()
+
+
+def test_operator_allowlist_comes_from_provider_ids_and_stays_value_free(tmp_path, monkeypatch):
+    enroll_synthetic_root(tmp_path)
+    monkeypatch.setenv("HEDGE_FUND_RUNTIME_ROLE", "web-operator")
+    monkeypatch.setenv("HEDGE_FUND_RUNTIME_PROVIDERS", "openai")
+    monkeypatch.setattr(CredentialDeliveryServer, "start", lambda self: None)
+    service = DeskService(tmp_path, allow_writes=True)
+    try:
+        status = service.credential_status()["external_runtime"]
+        assert status == {
+            "state": "configured",
+            "providers": {"openai": {"state": "requires-auth", "generation": 0}},
+        }
+        assert "op://" not in json.dumps(status)
+        assert "secret" not in json.dumps(status).casefold()
+    finally:
+        service.close()
+
+
+def test_operator_delivery_role_keeps_provider_allowlist_empty_by_default(tmp_path, monkeypatch):
+    enroll_synthetic_root(tmp_path)
+    monkeypatch.setenv("HEDGE_FUND_RUNTIME_ROLE", "web-operator")
+    monkeypatch.delenv("HEDGE_FUND_RUNTIME_PROVIDERS", raising=False)
+    monkeypatch.setattr(CredentialDeliveryServer, "start", lambda self: None)
+    service = DeskService(tmp_path, allow_writes=True)
+    try:
+        assert service.credential_status()["external_runtime"] == {
+            "state": "unconfigured",
+            "providers": {},
+        }
+    finally:
+        service.close()
+
+
+def test_external_capture_consumes_only_its_live_process_lease(tmp_path):
+    sentinel = "synthetic-runtime-only-key"
+    service = DeskService(tmp_path)
+    try:
+        root_id = root_identity_id(service.root_context)
+        store = RuntimeCredentialLeaseStore(
+            root_id=root_id,
+            instance_id="operator-instance",
+            allowed_destinations={"openai": "openai"},
+        )
+        store.publish(
+            "openai",
+            sentinel,
+            expected_generation=0,
+            delivery_id="delivery-1",
+            root_id=root_id,
+            instance_id="operator-instance",
+            destination="openai",
+        )
+        store.capture("openai", destination="openai")
+        service._external_credential_store = store
+        handle = CredentialHandle(
+            root_id=root_id,
+            provider_id="openai",
+            version=1,
+            source="external-runtime",
+            instance_id="operator-instance",
+            destination="openai",
+        )
+        capture = freeze_capture(
+            root=service.root_context,
+            subject_id="synthetic-fund",
+            mandate_digest="a" * 64,
+            universe=("AAPL",),
+            broker="paper",
+            settings=service._runtime_settings,
+            credential_versions={"openai": 1},
+            credential_handles={"openai": handle},
+            code_version="test-version",
+        )
+
+        assert service._captured_provider_key(capture, "openai") == sentinel
+
+        class DurableFallbackProbe:
+            def read_version(self, *_args):
+                raise AssertionError("external capture attempted durable fallback")
+
+        service._credential_store = DurableFallbackProbe()
+        store.revoke("openai")
+        with pytest.raises(OperationError, match="captured runtime credential is unavailable"):
+            service._captured_provider_key(capture, "openai")
+    finally:
+        service.close()
+
+
+def test_missing_durable_capture_does_not_fall_back_to_ambient_credentials(tmp_path):
+    service = DeskService(tmp_path)
+    root_id = root_identity_id(service.root_context)
+    handle = CredentialHandle(
+        root_id=root_id,
+        provider_id="openai",
+        version=1,
+    )
+    capture = freeze_capture(
+        root=service.root_context,
+        subject_id="synthetic-fund",
+        mandate_digest="a" * 64,
+        universe=("AAPL",),
+        broker="paper",
+        settings=service._runtime_settings,
+        credential_versions={"openai": 1},
+        credential_handles={"openai": handle},
+        code_version="test-version",
+    )
+
+    class MissingCredentialStore:
+        def read_version(self, *_args):
+            return None
+
+    service._credential_store = MissingCredentialStore()
+    try:
+        with pytest.raises(OperationError, match="captured credential is unavailable"):
+            service._captured_provider_key(capture, "openai")
+    finally:
+        service.close()
 
 
 def test_service_does_not_load_root_environment_implicitly(tmp_path, monkeypatch):

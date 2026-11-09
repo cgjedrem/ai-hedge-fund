@@ -82,7 +82,7 @@ from hedge_fund.runtime.admission import (
     RootOwnerLease,
     WriterConflict,
 )
-from hedge_fund.runtime.capture import freeze_capture, FrozenCapture
+from hedge_fund.runtime.capture import freeze_capture, FrozenCapture, root_identity_id
 from hedge_fund.runtime.configuration import (
     ConfigurationError,
     describe_configuration,
@@ -100,12 +100,22 @@ from hedge_fund.runtime.costs import (
     has_verified_cost_model,
     minimum_attempt_cost,
 )
+from hedge_fund.runtime.credential_delivery import (
+    CredentialDeliveryServer,
+    DeliveryProtocolError,
+)
 from hedge_fund.runtime.credentials import (
     CredentialStore,
     CredentialStoreError,
     CredentialVersionConflict,
 )
 from hedge_fund.runtime.dispatch import make_one_shot_dispatch, ProviderDispatch
+from hedge_fund.runtime.external_credentials import (
+    ExternalCredentialError,
+    runtime_provider_destinations,
+    RuntimeCredentialHandle,
+    RuntimeCredentialLeaseStore,
+)
 from hedge_fund.runtime.handover import (
     enrollment_status,
     HandoverError,
@@ -361,6 +371,9 @@ class DeskService:
         self._runtime_settings = RuntimeSettings()
         self._environment_settings: dict[str, object] = {}
         self._credential_store: CredentialStore | None = None
+        self._external_credential_store: RuntimeCredentialLeaseStore | None = None
+        self._credential_delivery_server: CredentialDeliveryServer | None = None
+        self._credential_delivery_state = "disabled"
         self._operation_store: OperationStore | None = None
         self._operation_jobs: OperationJobRegistry | None = None
         self._paper_operation_jobs: OperationJobRegistry | None = None
@@ -422,9 +435,34 @@ class DeskService:
                         self._admission = AdmissionCoordinator(root_context)
                         self._operation_store = None
         self._runner_manager = OwnedRunnerManager(root_context, self._admission)
+        if self.allow_writes and os.environ.get("HEDGE_FUND_RUNTIME_ROLE") == "web-operator":
+            try:
+                allowed_destinations = runtime_provider_destinations(os.environ.get("HEDGE_FUND_RUNTIME_PROVIDERS"))
+                external_store = RuntimeCredentialLeaseStore(
+                    root_id=root_identity_id(root_context),
+                    instance_id=uuid4().hex,
+                    allowed_destinations=allowed_destinations,
+                )
+                delivery_server = CredentialDeliveryServer(
+                    external_store,
+                    admission_check=self._admit_external_credential_delivery,
+                )
+                delivery_server.start()
+            except (DeliveryProtocolError, ExternalCredentialError, OSError, RootPathError, ValueError):
+                self._credential_delivery_state = "unavailable"
+            else:
+                self._external_credential_store = external_store
+                self._credential_delivery_server = delivery_server
+                self._credential_delivery_state = "unconfigured"
 
     def close(self) -> None:
         try:
+            if self._credential_delivery_server is not None:
+                self._credential_delivery_server.close()
+                self._credential_delivery_server = None
+            if self._external_credential_store is not None:
+                self._external_credential_store.close()
+                self._external_credential_store = None
             if self._paper_operation_jobs is not None:
                 self._paper_operation_jobs.close()
         finally:
@@ -2065,6 +2103,10 @@ class DeskService:
         }
 
     def credential_status(self) -> dict:
+        external_status = self._external_credential_store.status() if self._external_credential_store is not None else {}
+        external_state = self._credential_delivery_state
+        if external_status:
+            external_state = "configured"
         return {
             "items": [
                 {
@@ -2073,8 +2115,17 @@ class DeskService:
                     **value,
                 }
                 for provider, value in self._credential_status_map().items()
-            ]
+            ],
+            "external_runtime": {
+                "state": external_state,
+                "providers": external_status,
+            },
         }
+
+    def _admit_external_credential_delivery(self) -> None:
+        self._require_writes()
+        self.root_context.revalidate()
+        self._admission.require_root_owner()
 
     def set_model(self, request: ModelRequest) -> dict:
         self._require_writes()
@@ -3155,15 +3206,42 @@ class DeskService:
     def _captured_data_key(self, capture: FrozenCapture) -> str | None:
         if capture.data_provider not in {"fd"}:
             return None
-        version = capture.credential_versions.get("fd")
-        if version is None or self._credential_store is None:
+        if capture.credential_versions.get("fd") is None:
             raise OperationError("captured data credential is unavailable")
+        return self._captured_provider_key(capture, "fd")
+
+    def _captured_provider_key(self, capture: FrozenCapture, provider: str) -> str | None:
+        if not isinstance(capture, FrozenCapture) or not isinstance(provider, str):
+            raise OperationError("captured credential is unavailable")
+        handle = capture.credential_handles.get(provider.casefold())
+        if handle is None:
+            raise OperationError("captured credential is unavailable")
+        if handle.source == "external-runtime":
+            store = self._external_credential_store
+            if store is None:
+                raise OperationError("captured runtime credential is unavailable")
+            runtime_handle = RuntimeCredentialHandle(
+                root_id=handle.root_id,
+                instance_id=handle.instance_id,
+                provider_id=handle.provider_id,
+                generation=handle.version,
+                destination=handle.destination,
+            )
+            try:
+                return store.value_for_dispatch(
+                    runtime_handle,
+                    destination=handle.destination,
+                )
+            except ExternalCredentialError:
+                raise OperationError("captured runtime credential is unavailable") from None
+        if handle.source != "durable" or self._credential_store is None:
+            raise OperationError("captured credential is unavailable")
         try:
-            value = self._credential_store.read_version("fd", version)
+            value = self._credential_store.read_version(provider, handle.version)
         except CredentialStoreError:
-            raise OperationError("captured data credential is unavailable") from None
+            raise OperationError("captured credential is unavailable") from None
         if not isinstance(value, str) or not value:
-            raise OperationError("captured data credential is unavailable")
+            raise OperationError("captured credential is unavailable")
         return value
 
     def _cache_preview_capture(
@@ -3856,8 +3934,7 @@ class DeskService:
 
         def llm_factory(_model_spec):
             provider_key = capture.llm_provider.casefold()
-            version = capture.credential_versions.get(provider_key, 0)
-            api_key = self._credential_store.read_version(capture.llm_provider, version) if capture.llm_provider not in KEYLESS_PROVIDERS and self._credential_store is not None else None
+            api_key = self._captured_provider_key(capture, provider_key) if capture.llm_provider not in KEYLESS_PROVIDERS else None
             return make_llm(
                 model=capture.model,
                 timeout=capture.timeout_seconds,

@@ -97,6 +97,8 @@ services:
     environment:
       - HEDGE_FUND_DATA_PROVIDER=yfinance
       - HEDGE_FUND_LLM_ENDPOINT=http://127.0.0.1:11434
+      - HEDGE_FUND_RUNTIME_ROLE=web-operator
+      - HEDGE_FUND_RUNTIME_PROVIDERS=${HEDGE_FUND_RUNTIME_PROVIDERS:-}
     ports:
       - "127.0.0.1:8876:8876"
     volumes:
