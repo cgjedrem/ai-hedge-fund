@@ -2,15 +2,20 @@
 
 ## Rebase integration verification (2026-11-09)
 
-- **Target**: PR #8 head `ca434fdb91730d036d11da3a91667173bbf90a6a`; this session's local rebase also includes the existing `edc79eb` data-recovery commit. The original task checkpoint is `de5884511e36c7979834d8202d1a59bbe1d3604c`; rebase conflict resolution is in progress.
+- **Branch/revision**: `cgjedrem-verbose-winner`; rebased onto PR #8 head `ca434fdb91730d036d11da3a91667173bbf90a6a`. Rebase integration commit `99eda23131338cef96468dd1afea6a3a66009700`; lint follow-up `fa5845c` (source revision under test). The rebase also preserves the existing `edc79eb` data-recovery commit. Original checkpoint: `de5884511e36c7979834d8202d1a59bbe1d3604c`.
+- **Workspace fingerprint**: tracked worktree clean after the source commits; only task-created pytest basetemp directories were removed. The evidence-only documentation update is not included in the tested source revision.
+- **Environment**: Windows, project Poetry environment, Python 3.11. `SAXO_DEMO_ACCESS_TOKEN_REF` absent; `op` CLI installed; `op whoami --format=json` unauthenticated.
 - **Runtime boundary**: no Saxo request, order, fund deployment/mutation, shared-root write, schedule, or container/runner change was made.
 - **Focused offline results**:
-  - `uv tool run --from poetry poetry run pytest hedge_fund/test_run.py -k 'saxo_inspect or cli_requires_explicit_root' -q --basetemp=.pytest-pr8-saxo-cli2` — **7 passed, 91 deselected**.
-  - `uv tool run --from poetry poetry run pytest hedge_fund/brokers/test_saxo_tokens.py hedge_fund/brokers/test_saxo_client.py hedge_fund/brokers/test_factory.py hedge_fund/fund/test_spec.py -k 'saxo or demo or account_key' -q --basetemp=.pytest-pr8-saxo-targeted` — **78 passed, 92 deselected**.
+  - `uv tool run --from poetry poetry run pytest hedge_fund/test_run.py -k 'saxo_inspect or cli_requires_explicit_root' -q --basetemp=.pytest-pr8-saxo-cli-final` — **7 passed, 91 deselected**.
+  - `uv tool run --from poetry poetry run pytest hedge_fund/brokers/test_saxo_tokens.py hedge_fund/brokers/test_saxo_client.py hedge_fund/brokers/test_factory.py hedge_fund/fund/test_spec.py -k 'saxo or demo or account_key' -q --basetemp=.pytest-pr8-saxo-core-final` — **78 passed, 92 deselected**.
+  - `uv tool run --from poetry poetry run pytest hedge_fund/brokers/test_factory.py -k sim_ownership_denial -q --basetemp=.pytest-pr8-saxo-factory` — **2 passed, 4 deselected**.
+  - `uv tool run --from poetry poetry run pytest hedge_fund/tui/test_builder.py hedge_fund/tui/test_builder_broker.py -k saxo -q --basetemp=.pytest-pr8-saxo-tui-final` — **2 passed, 15 deselected**.
   - `uv tool run --from poetry poetry run pytest hedge_fund/test_run.py -k 'cli_sim_create_denies or cli_sim_execution_denies' hedge_fund/brokers/test_factory.py -k sim_ownership_denial hedge_fund/brokers/test_account_binding_guards.py -k sim -q --basetemp=.pytest-pr8-saxo-ownership` — **5 passed, 4 failed, 2 errors, 112 deselected**. The selected CLI synthetic-root tests cannot enroll these pytest temporary roots because they are outside the harness-created `.test-owned` root; this is a fixture/environment boundary, not a bypass or permission to weaken admission. The factory ownership denial itself passed.
+- **Style**: Flake8 (`--max-line-length=420 --extend-ignore=E306`), isort `--check-only`, Black `--check` (22 files unchanged), and `git diff --check` all passed on changed Python/source files after the follow-up fix.
+- **Full suite**: not run; no full-suite pass is claimed.
 - **Credentialed SIM inspection: BLOCKED**. The process has no `SAXO_DEMO_ACCESS_TOKEN_REF`; `op` is installed but `op whoami --format=json` is unauthenticated. No vault item was listed or read, and no token value or `.env` was accessed. The existing 1Password path cannot be used from this process without its authorized local reference and authenticated session; no login/refresh was attempted.
 - **Target behavior**: read-only `aihf saxo inspect --enable-network` runs without opening a fund root and requires explicit network consent. Fund/SIM mutation remains blocked by the separate `require_sim_account_ownership()` gate (`ownership-unknown`) even where local root admission passes. Do not weaken either gate.
-- The full suite and style checks are still pending in this rebase worktree; results must not be inferred from prior baseline evidence below.
 
 ## Historical pre-rebase evidence (baseline `3f7bea8`; superseded where it conflicts with PR #8)
 
