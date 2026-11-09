@@ -45,6 +45,29 @@ the allowlist remains empty until configured locally.
 | Authentication | Attended Windows host CLI with desktop-app approval is the implementation assumption. Unattended service-account operation remains out of scope. |
 | Retention | Runtime-only delivery is approved; values are not copied into the existing durable credential store. |
 | Integration baseline | Local reconciliation of pinned Spec005 history is authorized; preserve the main-only Yahoo news fix. |
+| Host identity diagnostics | Two bounded host `op whoami` checks were explicitly authorized/directed; this does not authorize vault/item reads or credential delivery. |
+
+### Execution observation — bounded host identity check
+
+At 2026-11-09 11:27:18 +01:00, the authorized `op whoami` subprocess returned
+unauthenticated in 0.093 seconds; installed CLI version 2.34.1. Sanitized reason:
+`desktop-integration-unavailable`. Connect/service-account auth variables were absent.
+No prompt activity was recorded. No raw identity metadata or stderr is retained here. No
+vault/item/provider value was read.
+
+The user later reported that desktop CLI integration was on. That report is not proof of
+authentication. A second user-directed `op whoami` ran once at 2026-11-09 12:19:34 +01:00
+and returned unauthenticated in 1.070 seconds; sanitized reason:
+`desktop-account-not-signed-in`. The executable resolved from user-local AppData and had
+valid Authenticode status; file-version metadata was unavailable (earlier CLI version
+reported as 2.34.1). The parent shell was interactive; the CLI child was hidden with
+stdout/stderr redirected. Nine 1Password processes shared its Windows session. Connect,
+service-account and `OP_SESSION_*` variables were absent. No prompt activity was recorded;
+prompt display/interaction remains unverified. The sanitized CLI reason does not prove the
+desktop app is signed out. No raw identity fields/stderr or app settings were retained or
+read. No `op read` or vault/item access occurred. Path of Practice documents an attached
+interactive `op whoami` with biometric unlock; run that command directly in PowerShell/
+Windows Terminal as the smallest local diagnostic. No additional attempt was run.
 
 ## User Scenarios & Testing
 

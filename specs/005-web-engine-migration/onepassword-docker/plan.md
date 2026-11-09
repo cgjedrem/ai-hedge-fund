@@ -1,7 +1,8 @@
 # Implementation Plan: 1Password runtime secrets for the Docker desk
 
 **Branch**: `cgjedrem-ubiquitous-sniffle` | **Date**: 2026-11-09 | **Spec**: [spec.md](spec.md)
-**State**: Implementation authorized; local baseline reconciliation is the first execution gate.
+**State**: Runtime-only scaffolding implemented and fake-tested; operational configuration,
+final artifact acceptance, independent review and platform proof remain pending.
 
 ## Summary
 
@@ -38,6 +39,50 @@ named-volume operator root. WSL/native Windows containers/remote Docker are not 
 **Project Type**: Local single-operator Python backend/CLI and existing React desk.
 **Performance Goals**: One credential per delivery; 16 KiB maximum; overall 60-second
 resolution/authentication deadline; no retry or polling.
+
+## Implementation checkpoint — 2026-11-09
+
+The local pinned Spec005 history is merged at `19b4913`; the main-only Yahoo news fix and
+planning documents are preserved. Runtime implementation was committed locally as
+`15fc2d9c62c73e5eb40aec3c0a3a46022a82287c`; its binary source diff SHA-256 is
+`b9c005969127a269aeb70470cdcab4946f915cf166396817c2863450ec9d58b3`. Runtime work includes
+an empty-by-default lease store,
+source-typed capture metadata, bounded private IPC, a fakeable host Docker target checker,
+a public `aihf-op-deliver` command and a strict local JSON mapping loader. Operator provider
+allowlisting accepts provider IDs only through `HEDGE_FUND_RUNTIME_PROVIDERS`; unset remains
+empty. Durable credential storage remains unchanged. The path is not a supported live
+workflow because the checked-in Compose operator still uses a bind mount rejected by the
+launcher; no ext4 named-volume acceptance has occurred.
+
+The first user-approved `op whoami` check ran at 2026-11-09 11:27:18 +01:00 and returned
+unauthenticated in 0.093 seconds with CLI 2.34.1; sanitized reason:
+`desktop-integration-unavailable`. Connect/service-account auth variables were absent.
+No prompt activity was recorded. No vault/item or provider value was read.
+
+After the user reported desktop CLI integration was on, one more bounded `op whoami` ran
+at 2026-11-09 12:19:34 +01:00. It returned unauthenticated in 1.070 seconds with sanitized
+reason `desktop-account-not-signed-in`. The executable resolved under user-local AppData;
+Authenticode was valid, while file-version metadata was unavailable (earlier CLI report:
+2.34.1). The parent shell was interactive, but the CLI child was hidden with stdout/stderr
+redirected. Nine 1Password processes shared Windows session 5. Connect/service-account/
+session-token presence checks were false. Prompt activity is unverified; no app settings,
+raw identity data, stderr or vault content was read.
+
+Read-only Path of Practice prior art documents `op whoami` with biometric unlock in an
+attached terminal (`docs/secrets.md:33-38`) and host `op run` environment injection
+(`scripts/dev-backend.ps1:62-85`, `docker-compose.yml:1-7,35-41`). Hidden invocation is a
+plausible prompt-related difference, not confirmed cause. Its Compose environment flow
+conflicts with this plan's no-secret-environment boundary and is not reused. Smallest local
+diagnostic: run `op whoami` directly in attached PowerShell/Windows Terminal; no further
+check was run by this implementation.
+
+Final integrated fake selection: 255 passed, 1 skipped in 178.94 seconds, wall time
+181.461 seconds, at 2026-11-09T11:27:31.7859045Z; earlier config/allowlist/status selection:
+83 passed, 1 skipped in 6.81 seconds. Docker
+artifact/runtime acceptance is not run; current Compose uses a bind mount and the host
+launcher fails closed on that topology. Provider mappings stay empty by default. See
+`acceptance-evidence.md` for exact command/evidence, unresolved broad regression failures
+and blocked rows.
 **Constraints**: No secret values in Docker config/environment/argv/logs/images/browser;
 no real providers, vault reads, funds, credential provisioning or container changes now.
 **Scale/Scope**: One selected target instance/root and provider per delivery. Provider

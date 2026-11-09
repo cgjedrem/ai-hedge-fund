@@ -242,6 +242,35 @@ Free-data and local-model settings remain yfinance and literal
 `http://127.0.0.1:11434`; no credentials are placed in Compose. Paid provider
 approvals remain separate per-operation gates.
 
+#### Optional 1Password runtime-delivery experiment
+
+The runtime-only delivery path now has a host command and strict local JSON mapping loader;
+it remains optional and provider mappings are empty by default. The command is
+`aihf-op-deliver --provider <application-provider> [--config <path>]`. Its default
+non-secret mapping file is `%USERPROFILE%\.hedge-fund\op-runtime-mappings.json`; it may
+contain mapping rows with one `op://` field reference and pinned provider/root/container/
+image/volume metadata per row, never credential values. The backend allowlist uses provider IDs only:
+`HEDGE_FUND_RUNTIME_PROVIDERS` (comma-separated; unset means empty). No vault/item value was read during implementation. The first bounded host `op whoami`
+check on 2026-11-09 returned unauthenticated (CLI 2.34.1; sanitized reason:
+`desktop-integration-unavailable`). A follow-up after the user reported CLI integration on
+returned unauthenticated (sanitized reason: `desktop-account-not-signed-in`). That CLI child
+was hidden with stdout/stderr redirected; Path of Practice documents an attached interactive
+`op whoami` with biometric unlock. This is a plausible prompt discrepancy, not a confirmed
+cause or proof the desktop app is signed out. The smallest discriminating local check is
+`op whoami` directly in PowerShell/Windows Terminal; do not paste account or secret data
+into chat.
+
+The user-reported integration setting was not independently inspected. The parent shell and
+1Password app processes shared a Windows session; Connect/service-account/session-token
+variables were absent. App settings were not read; prompt activity remains unverified.
+
+The CLI/configuration path is fake-tested only; invoking it with an explicit mapping resolves
+the configured `op read` reference and has not been authorized or run here. No Docker artifact
+or synthetic runtime acceptance has been completed. The current Compose operator uses a
+bind-mounted root and the delivery launcher rejects that topology. This experiment does not
+make the documented Windows Docker Desktop bridge supported, and does not authorize provider
+calls, Saxo authentication, an existing-fund restart or real-key delivery.
+
 The supported browser topology is a Linux host with local ext4 and the Linux
 host-network overlay. The app binds literal loopback; the overlay removes bridge
 ports/networks. Compose 2.24.0 or later is required for the Linux override's

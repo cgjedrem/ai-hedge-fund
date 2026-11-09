@@ -11,9 +11,10 @@ This file records the report and workflow provenance, not implementation accepta
 | A2 | Contract approval | RESOLVED | spec.md:132-137,189-191; plan.md:19-24,62 | User approved runtime-only external-source compatibility and private delivery seam | Keep durable saved-credential mode unchanged; implementation still requires tests |
 | A3 | Scope approval | RESOLVED WITH EMPTY ALLOWLIST | spec.md:39-47; research.md:119-125 | Attended host auth is the implementation assumption; no provider IDs were supplied | Start with zero allowed providers; do not infer IDs or request key values |
 
-These are readiness findings, not newly discovered vulnerabilities or hidden implementation
-defects. The user closed the runtime-only/auth/implementation approval gates; A1 is now an
-authorized local integration task. No source review, independent QA approval or runtime pass
+These were planning readiness findings. A1 is addressed by the authorized local
+reconciliation, preserving the main-only Yahoo news fix. Runtime-only lease/transport
+scaffolding now exists and is fake-tested; operational configuration, independent QA and
+Docker runtime acceptance remain open. No source review, independent QA or platform PASS
 is claimed.
 
 ## Coverage summary
@@ -41,10 +42,11 @@ is claimed.
 | OP-SC-005 | Yes | T001, T011, T012 | All source-bound acceptance rows |
 
 **Metrics**: 19 requirements/outcomes (14 functional + 5 measurable); 12 tasks;
-19/19 task coverage (100%, not implementation coverage); 0 unmapped tasks;
+19/19 task traceability (not implementation coverage); T001-T002 and T005-T006 evidenced,
+T003-T004 and T007-T012 incomplete; 0 unmapped tasks;
 0 critical constitution issues; 0 untracked ambiguity placeholders; 0 duplication findings;
-1 execution dependency remains: baseline reconciliation. All 12 tasks remain unchecked; all
-10 acceptance rows remain NOT RUN. Planning checklist: 11/12.
+baseline reconciliation completed locally. No acceptance row is PASS; OP-A02/03/08/10 are
+BLOCKED and OP-A01/04/05/06/07/09 are INCONCLUSIVE. Planning checklist: 11/12.
 
 ## Clarification coverage
 
@@ -54,10 +56,27 @@ User authorized autonomous implementation on 2026-11-09. No provider IDs were su
 | --- | --- |
 | Goals, journeys, errors, entities and lifecycle | Clear in conditional draft |
 | Security, timeout/size bounds, retention and acceptance | Clear in conditional draft |
-| Auth/product/platform capability | Documented requirements; local authentication and runtime unverified |
+| Auth/product/platform capability | Two bounded `op whoami` checks returned unauthenticated; CLI integration enablement is user-reported. The second CLI child was hidden with redirected streams; Path of Practice documents an attached interactive invocation and biometric unlock. This is a plausible prompt discrepancy, not proof of desktop sign-out. Docker runtime remains unverified. |
 | Provider IDs | Unset by user; allowlist remains empty |
 | Authentication mode | Attended host CLI assumed; unattended support excluded |
 | Existing contract | Runtime-only discriminator approved; pinned history reconciliation remains A1 |
+
+## Read-only Path of Practice comparison
+
+The inspected source repo documents `op run --env-file=.env.op` as process-start
+environment injection (`docs/secrets.md:6-16`); its Windows backend script invokes it from
+PowerShell (`scripts/dev-backend.ps1:62-85`). Its Docker Compose example forwards those
+values to the backend container environment (`docker-compose.yml:1-7,35-41`; Windows
+quickstart `specs/008-kittentts-docker/quickstart.md:12-27`). The auth docs say to sign in
+to the desktop app, enable CLI integration, then run `op whoami` in an interactive terminal
+for biometric unlock (`docs/secrets.md:33-38`).
+
+This is useful evidence for a host-side Windows CLI flow, not for private host-to-LinuxKit
+IPC. Environment injection into Compose/container configuration conflicts with this feature's
+credential boundary, so no implementation was copied. The hidden redirected `whoami` child
+is a concrete difference from their documented terminal invocation; its causal role remains
+unverified. Discovery searched source/dependency/docs paths only and did not read `.env`,
+`.env.op`, or credential values. No external files were modified.
 
 ## Workflow and hooks
 
@@ -93,7 +112,10 @@ requirements incorporated in acceptance rows.
 
 ## Next action and stop condition
 
-The user approved implementation with runtime-only delivery and the attended host auth
-assumption. The provider allowlist remains empty; exact IDs are not inferred. A1 is addressed
-by the authorized local reconciliation, preserving the main-only Yahoo news fix. Real-key
-smoke, Saxo, existing-fund cutover, push and merge-to-main remain outside authorization.
+The host identity results and fake-test evidence are in
+[acceptance-evidence.md](acceptance-evidence.md). Public host CLI and mapping loader now
+exist; operator provider-ID allowlist and host mapping file remain empty by default.
+Continue with capture-source selection/lifetime integration, race/release cases, remaining
+tests and independent QA. Synthetic artifact/runtime acceptance is BLOCKED by current
+bind-mounted Compose topology and absent final image. Real-key delivery, Saxo,
+existing-fund cutover, push and merge-to-main remain outside authorization.
