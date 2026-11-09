@@ -18,7 +18,6 @@ import yaml
 from hedge_fund import paths, run
 from hedge_fund.data import sessions
 from hedge_fund.fund import custom_strategy, FundSpec
-from hedge_fund.paper import deploy
 
 
 @pytest.fixture
