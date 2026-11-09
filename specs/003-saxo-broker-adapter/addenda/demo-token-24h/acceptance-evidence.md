@@ -1,5 +1,159 @@
 # Acceptance Evidence: Saxo SIM Demo Connection
 
+## User-authorized publication and bounded container start (2026-11-09)
+
+The user subsequently authorized committing/pushing the reviewed changes to
+existing **cgjedrem/ai-hedge-fund PR #8** and starting a new dedicated inspection
+container. This supersedes historical statements below that no commit, push or
+container start was authorized; it does not waive normal root admission or
+authorize initialization/enrollment/trust, shared-root use, orders, live-account
+traffic or changes to existing containers.
+
+- Verified the correct PR was **OPEN**, head
+  `ca434fdb91730d036d11da3a91667173bbf90a6a`, branch
+  `cgjedrem-vigilant-robot`. Explicit `--repo cgjedrem/ai-hedge-fund` is required:
+  unqualified `gh pr view 8` selects the upstream fork's unrelated closed PR.
+- Fetched that branch and verified it is an ancestor of this session's HEAD.
+  Staged only the explicit reviewed file manifest, passed staged `git diff
+  --check`, and committed implementation
+  `499fc83b288d08e2ca2902620ca4d762c7736058` with the required coauthor trailer.
+  Normal `git push origin HEAD:cgjedrem-vigilant-robot` succeeded
+  (`ca434fd..499fc83`); the live PR head matched afterward. No checkout, force
+  push, squash, main merge or other-worktree operation occurred.
+- Built `aihf-saxo-inspection:499fc83` using `Dockerfile.web`, revision
+  `499fc83b288d08e2ca2902620ca4d762c7736058`, package-source SHA-256
+  `397520f03f1bea92c92eb4158fc4b341f9ab4e938f82c5c74f7150fa099827f7`.
+  Build succeeded, immutable image
+  `sha256:204f643d4c21b916cfd93d5d112f90a5ec9edf6f7a161942c3376cdbe2acf459`;
+  both OCI identity labels matched. Build included frontend compilation and
+  source-identity verification; no credentials were supplied to the build.
+- Docker Engine **29.9.2**, Compose **5.6.1**, context **desktop-linux**,
+  Linux/x86_64 kernel **6.6.87.2-microsoft-standard-WSL2**. Compose configuration
+  validation for `docker-compose.saxo-inspection.yml --profile saxo-inspection`
+  passed using non-secret pin values and an explicitly unresolved external-volume
+  placeholder. This was syntax validation, not deployment approval.
+- No approved pre-existing, dedicated, no-fund-state admitted inspection volume
+  was supplied or found in the named-volume metadata. The only AIHF data volume
+  belongs to the existing cycle-two service; it was not mounted, read or changed.
+  The approved plan expressly excludes creating/enrolling/trusting a production
+  root for inspection, so no production inspection volume or counterfeit
+  test-owned production root was created.
+- To test the supported entrypoint without changing any root, started a bounded,
+  uncredentialed **readiness probe**, not an admitted deployment, from that image
+  on its own disposable bridge, published only
+  `127.0.0.1:8877:8876`, read-only filesystem, all capabilities dropped,
+  no-new-privileges, no restart policy and **no data mounts**. Requested role
+  `web-operator`, empty application-provider allowlist and separate
+  `saxo-demo-token` capability; immutable image `/data` was the only root candidate.
+  Probe container:
+  `8db9cf272303d785f620aaaadf7e9a631ccb458c1a65aa3ed6dd2712834c6f0f`.
+  Normal `aihf-web-supervisor`/`aihf-web` startup exited **2** with
+  `aihf-web: error: root requires local NTFS or ext4`. Its unmounted image root
+  is not an eligible ext4 data root. No enrollment/trust was attempted.
+- Bounded host GET of `http://127.0.0.1:8877/api/saxo/sim/status` observed
+  **unreachable**, container **exited**, not running/restarting; the readiness
+  probe took **2.12 seconds**. No health/HTTP response, observer role, available
+  capability, authenticated session or browser reachability was observed.
+  **There is no listening inspection service.** Removed exactly that exited
+  container and its created network
+  `97cc598e65a7eb664c596988bab7c84d9c3640ac2e9540186e5c7c4f6f74405d`;
+  no restart loop or detached helper was left.
+- Presence-only host checks found `op` installed, no
+  `SAXO_DEMO_ACCESS_TOKEN_REF`, no `OP_SERVICE_ACCOUNT_TOKEN` or
+  `OP_CONNECT_TOKEN`; bounded captured `op whoami --format=json` reported
+  authentication unavailable. Raw output was neither emitted nor persisted.
+  No vault reference, item, field, token or `.env` was read or guessed. The
+  ambiguous description of a latest token does not supply an exact field
+  reference or conservative UTC expiry.
+- Existing user containers `bb35e1e52ba8` and `ff767e9ab4cf` remained running;
+  neither was restarted, reconfigured, inspected for secrets or attached to the
+  new network. No real Saxo/provider/model request, OAuth refresh, lease
+  publication, account result, fund mutation or order occurred.
+
+**Disposition:** image build and bounded startup attempt are complete, but
+T026/SB-A08 and credentialed SIM acceptance remain **BLOCKED**. An already
+approved dedicated admitted inspection root/volume is required first; there is
+no supported bootstrap under this inspection-only authorization. An exact
+operator-local `op://...` field reference and conservative UTC expiry, plus
+attended host authentication, are also required before delivery. Ask for these
+non-secret inputs only, never the token value. The runbook now includes a
+token-free status curl and a Python `requests.Session` example retaining
+CSRF/session in process memory with explicit consent/selection/generation/revoke.
+That Python example passed syntax parsing only; it was not executed against a
+service. Full Python suite was not rerun or claimed.
+
+### Additional isolated Linux/ext4 fake verification
+
+This follow-up used **only a disposable test artifact**, not a production
+inspection volume or bootstrap. It supersedes the older "zero tests collected"
+Linux finding below for this exact three-module selection, not the remaining
+deployment/IPC acceptance.
+
+Created named volume `aihf-saxo-linux-tests-bf812617` with labels
+`aihf.runtime.purpose=disposable-test-only` and
+`aihf.runtime.provenance=synthetic-test-harness`. Mounted it only at checkout
+`/workspace/outputs`, with the checkout read-only at `/workspace`, image root
+read-only, network **none**, all capabilities dropped and no-new-privileges.
+Unchanged `hedge_fund/conftest.py` allocated/marked its test-owned root and normal
+`RootContext` admission succeeded on the volume's ext4 filesystem. No admission
+API, test-owned marker, owner authority or environment was fabricated for a
+production service.
+
+Archived only installed existing Poetry-environment Python sources for
+`pytest`, `_pytest`, `pluggy`, `iniconfig`, `packaging`, `pygments` and the `py.py`
+shim into project-relative `.saxo-linux-pytest-tools.zip` (**1,604,788 bytes**).
+Extracted these tooling sources under the disposable volume's
+`/workspace/outputs/verification-tools`. No package install, manifest change,
+internet/provider request or dependency download occurred.
+
+An initial tooling attempt exited before conftest loading because pytest
+capture had no writable default scratch directory. The retry explicitly kept
+pytest's pre-conftest scratch inside `/workspace/outputs`; conftest then
+configured its normal marked test-owned environment. No outside scratch path
+was made writable. Environment:
+`PYTHONDONTWRITEBYTECODE=1`, `PYTHON_DOTENV_DISABLED=1`,
+`PYTEST_DISABLE_PLUGIN_AUTOLOAD=1`; Linux CPython **3.11.18**, pytest **7.4.4**.
+Exact executed pytest selection:
+
+```text
+pytest.main([
+  "hedge_fund/runtime/test_credential_delivery.py",
+  "hedge_fund/runtime/test_external_credentials.py",
+  "hedge_fund/web/test_saxo_inspection.py",
+  "-q", "--tb=short", "-r", "s", "-p", "no:cacheprovider"
+])
+```
+
+**Observed: 120 passed, 9 failed, zero skipped; exit 1; pytest 81.55 seconds,
+90.75 seconds around pytest.main. This selection did not pass.** All HTTP
+inspection tests and other frame/store cases passed. The nine Unix socket
+cases use pre-existing `_short_test_socket_path()` hardcoded to `/tmp`; that path
+remained read-only and was not mounted or made writable. Seven fail at direct
+socket-directory creation with `Errno 30: Read-only file system`, and two fail
+server creation with `private local IPC is unavailable`. Failing cases:
+
+- `test_delivery_server_does_not_unlink_an_unowned_socket`
+- `test_delivery_server_survives_deep_frame_and_handles_next_status`
+- `test_delivery_server_survives_huge_integer_frame_and_handles_next_status`
+- `test_delivery_server_recovers_only_owned_stale_socket`
+- `test_delivery_server_preserves_untrusted_existing_socket_directory` for
+  `active`, `wrong-mode`, `wrong-socket-mode`, `wrong-owner`, `extra-entry`
+
+This identifies a concrete test-path/runtime-boundary mismatch, not successful
+IPC acceptance. No source was changed to suppress failures, patch admission,
+redirect test socket paths, skip tests or weaken the container. The earlier
+Windows skips are no longer the only Linux evidence; these nine actual failures
+must remain visible.
+
+At `2026-11-09T17:25:50+01:00`, cleanup verified: initial helper
+`6d422638d478180067e99f40e4eae8a2610127b615e45358098886704b2f8217`
+and retry helper
+`a03cf1ff0623a30ed486cd1908d7d114a3e499b73e80fd1ed0d0afff0699d60a`
+were removed, only their disposable test volume was removed, tooling archive
+was absent, and no `aihf-saxo` helper container/volume remained. The verified
+source-pinned image was retained. No production-root lifecycle operation,
+real credential or broker traffic occurred.
+
 ## Final review and bounded Linux verification (2026-11-09)
 
 **Current result: final parent code/static/focused review PASS**, as confirmed by

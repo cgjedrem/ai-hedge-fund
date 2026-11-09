@@ -9,6 +9,20 @@ acceptance remains blocked on operator-local inputs and deployment smoke. This r
 is not credentialed or Docker-host acceptance evidence. No real reference or
 account is known, inferred, listed or resolved here.
 
+**Later user-authorized start attempt:** reviewed implementation `499fc83` was
+pushed to existing PR #8 and its pinned image built. No approved pre-existing
+admitted inspection volume was supplied. A separate uncredentialed, no-volume
+readiness probe exited 2 under normal filesystem admission; host port 8877 was
+unreachable. The probe/network were removed and existing containers were not
+changed. This is not a running inspection deployment. See the parent
+[acceptance evidence](..\acceptance-evidence.md) for immutable identities and
+the exact blocker; do not initialize/enroll/trust a root as a workaround.
+An additional Linux/ext4 test-only run collected the three runtime/HTTP modules
+under normal admission: **120 passed, 9 failed**, not a passing IPC selection.
+The nine socket tests hardcode a read-only `/tmp`; no outside scratch path was
+made writable. All disposable test resources were removed. This supersedes the
+earlier no-collection Linux result for that selection only.
+
 ## 1. Preconditions and stop conditions
 
 - Consult [tasks.md](tasks.md): focused tests, static checks and final parent code
@@ -168,7 +182,86 @@ source path described in the parent quickstart. It cannot consume the backend
 lease and is not proof of this in-app bridge. SIM fund deployment/order execution
 remains denied by `require_sim_account_ownership()` regardless of root admission.
 
-## 6. Offline verification after implementation
+## 6. Token-free HTTP checks and Python requests
+
+These are instructions, not a claim that the service is currently listening.
+They require successful dedicated-root admission, host-loopback reachability and
+attended delivery above. Do not initialize/enroll/trust a root to make them pass.
+Use the Settings card preferentially: it handles the server-owned session,
+same-origin CSRF, explicit account choice and generation fencing automatically.
+
+The status endpoint never contacts Saxo or reads 1Password:
+
+```powershell
+curl.exe --fail --max-time 5 http://127.0.0.1:8877/api/saxo/sim/status
+```
+
+For a scripted check, run the following Python locally using the existing
+environment with `requests`. It captures the operator cookie and CSRF token only
+in process memory; do not print `/api/capabilities`, session headers or cookies,
+enable HTTP tracing, or paste a bearer into this script. An observer or an
+unavailable lease stops before any broker request. Do not automatically retry
+after a failure or restart.
+
+```python
+import requests
+
+base = "http://127.0.0.1:8877"
+session = requests.Session()
+session.trust_env = False
+
+def call(method, path, **kwargs):
+    response = session.request(
+        method, base + path, timeout=35, allow_redirects=False, **kwargs
+    )
+    if not 200 <= response.status_code < 300:
+        raise RuntimeError(f"Local inspection request denied: HTTP {response.status_code}")
+    return response.json()
+
+capabilities = call("GET", "/api/capabilities")
+assert capabilities["writes"] and capabilities["network"], "Operator admission required"
+session.headers.update({
+    "Origin": base,
+    "x-csrf-token": capabilities["mutation_token"],
+})
+status = call("GET", "/api/saxo/sim/status")["capability"]
+assert status["state"] == "available" and status["actions"]["discover"], "Deliver first"
+generation = status["generation"]
+assert input("Authorize read-only SIM account discovery? Type yes: ") == "yes"
+discovery = call("POST", "/api/saxo/sim/accounts", json={
+    "authorize_network": True, "expected_generation": generation,
+})
+for index, choice in enumerate(discovery["choices"]):
+    print(index, choice["label"], choice["currency"])
+selected = int(input("Choose the account index explicitly: "))
+assert 0 <= selected < len(discovery["choices"])
+choice = discovery["choices"][selected]
+assert input("Authorize balance/positions GETs for this SIM account? Type yes: ") == "yes"
+result = call("POST", "/api/saxo/sim/inspect", json={
+    "authorize_network": True,
+    "expected_generation": generation,
+    "selection_id": choice["selection_id"],
+})
+assert result["environment"] == "SIM" and result["read_only"]
+assert not result["fund_connected"] and not result["trading_enabled"]
+print("SIM inspection succeeded; positions:", len(result["account"]["positions"]))
+if input("Revoke this inspection lease now? Type yes: ") == "yes":
+    revoked = call("DELETE",
+        f"/api/credentials/runtime/saxo-demo-token?expected_generation={generation}")
+    assert revoked["state"] == "revoked"
+    assert call("GET", "/api/saxo/sim/status")["capability"]["state"] == "revoked"
+session.close()
+```
+
+All HTTP POSTs above are local consent actions; outgoing broker traffic is
+bounded SIM GET only. For denial checks, omit consent, omit CSRF/session, or use
+a stale generation: expect rejection, never a successful inspection. Revoke
+clears choices/results; a new generation requires deliberate rediscovery.
+Use the fake tests below for wrong/expired bearer, 401/403, expiry, rotation,
+in-flight revoke and restart cases rather than overwriting a real vault field
+or publishing synthetic credentials as if they were connected.
+
+## 7. Offline verification after implementation
 
 Use the existing test-owned synthetic-root harness, fakes and project-local
 scratch paths. Do not read any actual local secrets/configuration or run Docker/

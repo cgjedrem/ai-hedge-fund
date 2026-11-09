@@ -3,6 +3,17 @@
 **Status**: Proposed interfaces, not existing endpoint claims.
 **Scope**: SB-FR-001 through SB-FR-015.
 
+**Latest execution evidence (2026-11-09):** implementation `499fc83` is pushed to
+existing PR #8; its pinned image built. A user-authorized isolated uncredentialed
+no-volume readiness probe exited 2 under normal filesystem admission and host
+HTTP was unreachable; it was removed. No approved pre-existing admitted
+inspection volume or exact attended credential mapping is available.
+T026/SB-A08 remain BLOCKED. A separate disposable Linux/ext4 fake test run
+executed normally: 120 passed/9 failed (Unix socket tests hardcode read-only
+`/tmp`), not IPC acceptance; all helper resources were removed. These actual
+observations supersede older table statements that no Docker action or Linux
+test execution occurred. See parent acceptance evidence for exact pins/results.
+
 ## Host delivery
 
 Existing attended command, extended to the one new capability:

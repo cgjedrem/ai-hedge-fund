@@ -2,15 +2,25 @@
 
 **Input**: This directory's `spec.md`, `plan.md`, `research.md`, `data-model.md`,
 `contracts\inspection.md`, `quickstart.md`.
-**Prerequisites**: Parent caveman review with findings resolved before source edits;
-no branch/commit/push/PR/active-feature mutation. Tests explicitly required.
+**Prerequisites**: Parent caveman review with findings resolved before source edits.
+The later user instruction authorized committing/pushing reviewed changes to
+existing PR #8 and a new dedicated container start, not root initialization,
+enrollment/trust or changes to existing containers. Tests explicitly required.
 **Organization**: Setup, foundations, independently testable user stories, acceptance.
 **Status**: Final parent code review PASS (including the publication race fix);
 governed focused Python tests, full frontend tests/build and changed-file style
 validation pass. T022 remains partial: full Python suite NOT RUN; Linux IPC/HTTP
 verification is blocked by normal root admission rejecting helper tmpfs.
-T023 source review is complete; T026 host acceptance is blocked
-on operator-local inputs and is not authorized by this source-only phase.
+T023 source review is complete. Implementation `499fc83` was pushed to PR #8;
+its source-pinned image built successfully. A new isolated uncredentialed
+readiness probe failed normal filesystem admission and was cleaned up.
+T026 host acceptance remains blocked on an already approved dedicated admitted
+root/volume, exact local field reference/expiry and attended host authentication.
+Later isolated Linux/ext4 verification ran the unchanged normal test harness:
+**120 passed, 9 failed**, not a passing IPC selection. Nine Unix socket cases
+hardcode a read-only `/tmp` path; no outside scratch path was made writable.
+Disposable helper/volume/tooling cleanup was verified. See parent acceptance
+evidence; T022 remains partial and the full suite was not run.
 
 ## Format: `[ID] [P?] [Story] Description`
 
@@ -96,7 +106,7 @@ tasks T024-T026 are complete.
 - [x] T023 **FINAL CODE REVIEW PASS** — parent final QA passed on the publication race fix, as confirmed by the parent/user. SB-A01--SB-A08 rows and parent acceptance evidence cite governed tests, exact environment/revision/source hashes and honest host/Linux/full-suite limitations. This is code/static/focused review acceptance only, not full-suite, Linux IPC or real host acceptance. No commit/push/PR or real-secret/network operation.
 - [x] T024 [US2] Add failing offline Compose/host-target tests proving the existing `op-runtime` network-none profile remains accepted unchanged and the new inspection mode rejects arbitrary/host networks, shared or extra volumes, non-loopback/wildcard/extra ports, extra attachments, wrong service/role/root, source/image drift, unexpected proxy configuration and authority loss before secret resolution. Fake-only topology tests passed.
 - [x] T025 [US2] Implement only the dedicated `docker-compose.saxo-inspection.yml` service/profile, isolated bridge, loopback-only browser publish, distinct inspection volume/root target and exact capability-specific host-delivery topology mode; validate all pins and permissions before resolver invocation. Preserve the current network-none profile/validator and do not change or connect a running container. SIM-only egress remains enforced at the application client (fixed TLS origin/path/method, redirects/proxies/custom endpoints denied), not by claiming Docker's bridge filters domains. Compose/host checks passed offline; no Docker command or container change was run.
-- [ ] T026 [US2] **BLOCKED** — operator has not supplied approved local field reference/expiry and no host/browser/SIM smoke was authorized. Do not infer values or attempt this task.
+- [ ] T026 [US2] **BLOCKED** — later user authorization allowed PR #8 publication and a new dedicated container start. Image `sha256:204f643d4c21b916cfd93d5d112f90a5ec9edf6f7a161942c3376cdbe2acf459` built from `499fc83`; bounded uncredentialed readiness probe exited 2 (`root requires local NTFS or ext4`), host HTTP was unreachable, and the created probe/network were removed. No approved pre-existing admitted no-fund-state inspection volume, exact field reference/expiry or authenticated attended `op` context is available. Do not create/enroll/trust a production root, reuse a fund volume, guess metadata or claim a listening service. See parent acceptance evidence for source/image/container pins and the runbook for token-free status/requests examples.
 
 ## Dependencies & Execution Order
 
