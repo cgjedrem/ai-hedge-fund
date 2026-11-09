@@ -13,6 +13,7 @@ import threading
 import time
 import uuid
 from contextlib import AbstractContextManager, contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_DOWN
 from enum import Enum
@@ -32,6 +33,14 @@ _LOG = logging.getLogger(__name__)
 _THREAD_REFRESH_LOCKS: dict[str, threading.Lock] = {}
 _THREAD_REFRESH_LOCKS_GUARD = threading.Lock()
 _US_EXCHANGES = ("NASDAQ", "NYSE", "NYSEARCA", "NYSEAMERICAN", "BATS", "CBOE")
+_DEMO_READ_ONLY_PATHS = frozenset(
+    {
+        "/port/v1/users/me",
+        "/port/v1/accounts/me",
+        "/port/v1/balances",
+        "/port/v1/positions",
+    }
+)
 
 
 class Transport(Protocol):
@@ -61,7 +70,33 @@ class TokenState(str, Enum):
     REAUTH_REQUIRED = "REAUTH_REQUIRED"
 
 
+@dataclass(frozen=True)
+class SaxoAccountCandidate:
+    account_key: str
+    currency: str
+
+
+@dataclass(frozen=True)
+class SaxoPositionSummary:
+    uic: int
+    amount: float
+
+
+@dataclass(frozen=True)
+class SaxoAccountSummary:
+    account_key: str
+    currency: str
+    cash_balance: float
+    positions: tuple[SaxoPositionSummary, ...]
+
+    @property
+    def position_count(self) -> int:
+        return len(self.positions)
+
+
 class TokenManager:
+    auth_mode = "oauth"
+
     def __init__(
         self,
         *,
@@ -147,6 +182,48 @@ class TokenManager:
         self.state = TokenState.AUTHORIZED
 
 
+class DemoTokenManager:
+    auth_mode = "demo-token"
+
+    def __init__(
+        self,
+        *,
+        access_token_ref: str,
+        secrets_provider: SecretProvider,
+    ):
+        if not isinstance(access_token_ref, str) or not access_token_ref.startswith("op://"):
+            raise ValueError("SAXO_DEMO_ACCESS_TOKEN_REF requires an op:// reference")
+        if not callable(getattr(secrets_provider, "resolve", None)):
+            raise ValueError("Saxo demo token provider must support secret resolution")
+        self.access_token_ref = access_token_ref
+        self.secrets_provider = secrets_provider
+        self.access_token: str | None = None
+        self.state = TokenState.UNAUTHENTICATED
+
+    def __repr__(self) -> str:
+        return "DemoTokenManager(state={!r}, access_token=[redacted], access_token_ref=[redacted])".format(self.state.value)
+
+    def get_access_token(self) -> str:
+        if self.state == TokenState.REAUTH_REQUIRED:
+            raise SaxoAuthError("Saxo SIM 24-hour token unavailable; refresh it in 1Password and retry")
+        if self.access_token is not None:
+            return self.access_token
+        try:
+            token = self.secrets_provider.resolve("SAXO_DEMO_ACCESS_TOKEN_REF", self.access_token_ref)
+        except Exception:
+            token = None
+        if not isinstance(token, str) or not token or token.strip() != token or any(char.isspace() or not char.isprintable() for char in token):
+            self.state = TokenState.REAUTH_REQUIRED
+            raise SaxoAuthError("Saxo SIM 24-hour token unavailable; refresh it in 1Password and retry")
+        self.access_token = token
+        self.state = TokenState.AUTHORIZED
+        return token
+
+    def mark_rejected(self) -> None:
+        self.access_token = None
+        self.state = TokenState.REAUTH_REQUIRED
+
+
 class SystemClock:
     def monotonic(self) -> float:
         return time.monotonic()
@@ -160,6 +237,7 @@ class SystemClock:
 
 class RequestsTransport:
     def request(self, method: str, url: str, **kwargs):
+        kwargs["allow_redirects"] = False
         return requests.request(method, url, **kwargs)
 
 
@@ -186,7 +264,7 @@ class SaxoClient:
     def __init__(
         self,
         *,
-        tokens: TokenManager,
+        tokens: TokenManager | DemoTokenManager,
         transport: Transport | None = None,
         pacer: Pacer | None = None,
         base_currency: str = "USD",
@@ -197,7 +275,7 @@ class SaxoClient:
         if not isinstance(base_currency, str) or not base_currency or not math.isfinite(execution_timeout_s) or execution_timeout_s <= 0 or not math.isfinite(poll_interval_s) or poll_interval_s <= 0:
             raise ValueError("currency and positive order polling bounds are required")
         self.tokens = tokens
-        self.transport = transport or tokens.transport
+        self.transport = transport or getattr(tokens, "transport", None) or RequestsTransport()
         self.pacer = pacer or Pacer(clock=clock)
         self.clock = clock or SystemClock()
         self.base_currency = base_currency.upper()
@@ -231,11 +309,15 @@ class SaxoClient:
                 raise OrderSubmissionDeferred("market close reached before order submission")
 
     def request(self, method: str, path: str, *, params=None, json_body=None, order_post=False):
+        if isinstance(self.tokens, DemoTokenManager):
+            if not isinstance(method, str) or method.upper() != "GET" or order_post or path not in _DEMO_READ_ONLY_PATHS:
+                raise SaxoAuthError("Saxo SIM 24-hour token client is read-only")
         url = f"{BASE_URL}{path}"
         token = self.tokens.get_access_token()
         headers = {"Authorization": "Bearer " + token}
         if order_post:
             self._prepare_order_post(headers)
+        request_failed = False
         try:
             response = self.transport.request(
                 method,
@@ -246,40 +328,141 @@ class SaxoClient:
                 timeout=15,
             )
         except Exception:
+            request_failed = True
+        if request_failed:
             if order_post:
                 raise SaxoOrderError("Saxo order POST outcome unknown; inspect SIM account") from None
             raise SaxoAuthError("Saxo SIM request failed") from None
         status, body = _response(response)
+        if 300 <= status < 400:
+            raise SaxoAuthError("Saxo SIM request redirected; refusing to follow it")
         if status == 401:
+            if isinstance(self.tokens, DemoTokenManager):
+                self.tokens.mark_rejected()
+                raise SaxoAuthError("Saxo SIM rejected the 24-hour token; refresh it in 1Password and retry")
             self.tokens.access_expires_at = 0
             token = self.tokens.get_access_token()
             headers["Authorization"] = "Bearer " + token
             if order_post:
                 self._prepare_order_post(headers)
+            retry_failed = False
             try:
                 status, body = _response(self.transport.request(method, url, headers=headers, params=params, json=json_body, timeout=15))
             except Exception:
+                retry_failed = True
+            if retry_failed:
                 if order_post:
                     raise SaxoOrderError("Saxo order POST outcome unknown; inspect SIM account") from None
                 raise SaxoAuthError("Saxo SIM request failed after token refresh") from None
+            if 300 <= status < 400:
+                raise SaxoAuthError("Saxo SIM request redirected; refusing to follow it")
             if status == 401:
                 raise SaxoAuthError("Saxo rejected refreshed authorization; run interactive Saxo login")
         return status, body
 
-    def discover_account(self) -> None:
+    def check_connection(self) -> None:
         status, user = self.request("GET", "/port/v1/users/me")
-        if status != 200 or not isinstance(user, dict) or not user.get("ClientKey"):
-            raise SaxoReconcileError("Saxo SIM user discovery failed")
-        self.client_key = str(user["ClientKey"])
+        client_key = user.get("ClientKey") if isinstance(user, dict) else None
+        if status != 200 or not isinstance(client_key, str) or not client_key:
+            raise SaxoAuthError("Saxo SIM connection check failed; verify the 24-hour token and SIM access")
+        self.client_key = client_key
+
+    def account_candidates(self) -> list[SaxoAccountCandidate]:
+        if self.client_key is None:
+            self.check_connection()
         status, accounts = self.request("GET", "/port/v1/accounts/me")
         data = accounts.get("Data", []) if isinstance(accounts, dict) else []
         if status != 200 or not isinstance(data, list):
             raise SaxoReconcileError("Saxo SIM account discovery failed")
-        compatible = [row for row in data if isinstance(row, dict) and isinstance(row.get("Currency"), str) and row["Currency"].upper() == self.base_currency and row.get("AccountKey") and row.get("Active") is True and isinstance(row.get("LegalAssetTypes"), list) and "Stock" in row["LegalAssetTypes"]]
-        if not compatible:
-            currencies = sorted({str(row.get("Currency", "")) for row in data if isinstance(row, dict)})
-            raise SaxoReconcileError(f"no Saxo trading account matches fund currency {self.base_currency}; available: {', '.join(currencies) or 'none'}")
-        self.account_key = str(compatible[0]["AccountKey"])
+        candidates = []
+        account_keys = set()
+        currencies = set()
+        for row in data:
+            if not isinstance(row, dict):
+                raise SaxoReconcileError("Saxo SIM account response has an invalid row")
+            account_key = row.get("AccountKey")
+            currency = row.get("Currency")
+            active = row.get("Active")
+            legal_asset_types = row.get("LegalAssetTypes")
+            if not isinstance(account_key, str) or not account_key or account_key.strip() != account_key:
+                raise SaxoReconcileError("Saxo SIM account response has incomplete identity or eligibility data")
+            if not isinstance(currency, str) or not currency or currency.strip() != currency:
+                raise SaxoReconcileError("Saxo SIM account response has incomplete identity or eligibility data")
+            if not isinstance(active, bool) or not isinstance(legal_asset_types, list):
+                raise SaxoReconcileError("Saxo SIM account response has incomplete identity or eligibility data")
+            if any(not isinstance(asset_type, str) for asset_type in legal_asset_types):
+                raise SaxoReconcileError("Saxo SIM account response has incomplete identity or eligibility data")
+            if account_key in account_keys:
+                raise SaxoReconcileError("Saxo SIM account response contains a duplicate account identifier")
+            account_keys.add(account_key)
+            normalized_currency = currency.upper()
+            currencies.add(normalized_currency)
+            if active and normalized_currency == self.base_currency and "Stock" in legal_asset_types:
+                candidates.append(SaxoAccountCandidate(account_key, normalized_currency))
+        if not candidates:
+            available = ", ".join(sorted(currencies)) or "none"
+            raise SaxoReconcileError(f"no active Saxo SIM stock account matches fund currency {self.base_currency}; available: {available}")
+        return candidates
+
+    def inspect_accounts(self, account_key: str | None = None) -> list[SaxoAccountSummary]:
+        candidates = self.account_candidates()
+        if account_key is not None:
+            if not isinstance(account_key, str) or not account_key or account_key.strip() != account_key:
+                raise SaxoReconcileError("Saxo SIM account identifier is invalid")
+            candidates = [candidate for candidate in candidates if candidate.account_key == account_key]
+            if not candidates:
+                raise SaxoReconcileError("Saxo SIM account identifier is not an eligible account")
+        return [self._inspect_account(candidate) for candidate in candidates]
+
+    def _inspect_account(self, candidate: SaxoAccountCandidate) -> SaxoAccountSummary:
+        params = {"ClientKey": self.client_key, "AccountKey": candidate.account_key}
+        status, balance = self.request("GET", "/port/v1/balances", params=params)
+        if status != 200 or not isinstance(balance, dict):
+            raise SaxoReconcileError("cannot read Saxo SIM account balance")
+        currency = balance.get("Currency")
+        if not isinstance(currency, str) or currency.upper() != candidate.currency:
+            raise SaxoReconcileError("Saxo SIM account balance currency does not match the account")
+        cash_balance = _finite_number(balance.get("CashBalance"), "accounting cash balance", SaxoReconcileError)
+        positions = []
+        skip = 0
+        while True:
+            position_params: dict[str, str | int | None] = {"ClientKey": self.client_key, "AccountKey": candidate.account_key}
+            if skip:
+                position_params["$skip"] = skip
+            status, result = self.request("GET", "/port/v1/positions", params=position_params)
+            if status != 200:
+                raise SaxoReconcileError("cannot read Saxo SIM account positions")
+            rows = result.get("Data") if isinstance(result, dict) else None
+            if not isinstance(rows, list):
+                raise SaxoReconcileError("Saxo SIM positions response has an invalid shape")
+            for row in rows:
+                base = row.get("PositionBase") if isinstance(row, dict) else None
+                uic = base.get("Uic") if isinstance(base, dict) else None
+                if isinstance(uic, bool) or not isinstance(uic, int) or uic <= 0:
+                    raise SaxoReconcileError("Saxo SIM position response has an invalid instrument identifier")
+                if not isinstance(base, dict):
+                    raise SaxoReconcileError("Saxo SIM position response has an invalid position")
+                amount = _finite_number(base.get("Amount"), "position amount", SaxoReconcileError)
+                if amount:
+                    positions.append(SaxoPositionSummary(uic=uic, amount=amount))
+            next_skip = _next_page_skip(result.get("__next"), skip, SaxoReconcileError, "positions")
+            if next_skip is None:
+                break
+            skip = next_skip
+        return SaxoAccountSummary(candidate.account_key, candidate.currency, cash_balance, tuple(positions))
+
+    def discover_account(self, account_key: str | None = None) -> None:
+        if account_key is not None and (not isinstance(account_key, str) or not account_key or account_key.strip() != account_key):
+            raise SaxoReconcileError("explicit Saxo SIM account identifier is required")
+        if account_key is None and getattr(self.tokens, "auth_mode", "oauth") == "demo-token":
+            raise SaxoReconcileError("explicit Saxo SIM account identifier is required")
+        candidates = self.account_candidates()
+        if account_key is None:
+            self.account_key = candidates[0].account_key
+            return
+        if not any(candidate.account_key == account_key for candidate in candidates):
+            raise SaxoReconcileError("Saxo SIM account identifier is not an eligible account")
+        self.account_key = account_key
 
     def positions(self) -> dict[str, Position]:
         self._require_account()
@@ -476,7 +659,7 @@ class SaxoBroker:
         self.cache_ttl_s = cache_ttl_s
         self._cache: dict[str, tuple[float, int, str, dict]] = {}
         if self.client.account_key is None:
-            self.client.discover_account()
+            raise SaxoReconcileError("Saxo broker requires an explicitly selected account identifier")
 
     def __repr__(self) -> str:
         return f"SaxoBroker(universe={self.universe!r}, credentials=[redacted])"

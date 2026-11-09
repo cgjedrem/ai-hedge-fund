@@ -138,7 +138,7 @@ def test_builder_paper_mode_denies_the_build_and_refuses_taken_names(monkeypatch
             await app.push_screen(builder.BuilderScreen(mode="paper"))
             screen = app.screen
             notices = _capture_notices(monkeypatch, screen)
-            assert screen.STEP_TITLES == ["Name", "Strategies", "Capital", "Cadence", "Approval", "Broker", "Tickers"]
+            assert screen.STEP_TITLES == ["Name", "Strategies", "Capital", "Cadence", "Approval", "Broker", "Saxo account", "Tickers"]
             for taken in ("taken", "saved"):  # paper funds and saved definitions both count
                 screen.query_one("#name-input", Input).value = taken
                 await pilot.press("enter")
@@ -167,6 +167,47 @@ def test_builder_paper_mode_denies_the_build_and_refuses_taken_names(monkeypatch
     asyncio.run(scenario())
     assert _tree(paths.PAPER_DIR) == before_paper
     assert _tree(paths.MANDATES_DIR) == before_mandates
+
+
+def test_saxo_builder_requires_account_key_then_blocks_shared_root_deployment(monkeypatch):
+    monkeypatch.setenv("SAXO_DEMO_ACCESS_TOKEN_REF", "op://vault/item/demo-token")
+
+    async def scenario():
+        app = HedgeFundApp()
+        async with app.run_test(size=(120, 45)) as pilot:
+            await app.push_screen(builder.BuilderScreen(mode="paper"))
+            screen = app.screen
+            screen.query_one("#name-input", Input).value = "saxo-blocked"
+            await pilot.press("enter")
+            screen.query_one("#strategy-list", SelectionList).select(builder.CUSTOM)
+            await pilot.press("enter")
+            screen.query_one("#agent-list", SelectionList).select("pead")
+            await pilot.press("enter", "enter")
+            screen.query_one("#cadence-list", OptionList).highlighted = 0
+            await pilot.press("enter")
+            await pilot.press("enter", "enter")
+            screen.query_one("#window-end-input", Input).value = "15:59"
+            await pilot.press("enter")
+            await pilot.press("enter")
+            await pilot.press("down", "enter")
+            assert screen.query_one("#panes", ContentSwitcher).current == "step-saxo-account"
+
+            await pilot.press("enter")
+            assert screen.query_one("#panes", ContentSwitcher).current == "step-saxo-account"
+            account = screen.query_one("#saxo-account-input", Input)
+            account.value = "sim-account-1"
+            await pilot.press("enter")
+            assert screen.query_one("#panes", ContentSwitcher).current == "step-tickers"
+            screen.query_one("#tickers-input", Input).value = "AAPL"
+            await pilot.press("enter")
+            await pilot.pause()
+
+            assert screen.query_one("#panes", ContentSwitcher).current == "step-tickers"
+            assert screen._state["saxo_account_key"] == "sim-account-1"
+            assert not (paths.MANDATES_DIR / "saxo-blocked.yaml").exists()
+            assert not (paths.PAPER_DIR / "saxo-blocked").exists()
+
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize("approval_required", [False, True])

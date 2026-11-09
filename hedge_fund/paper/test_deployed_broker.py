@@ -64,15 +64,18 @@ class FakeTransport:
         return 200, {"Data": []}
 
 
-def _spec(broker="paper", rebalance="weekly"):
-    return FundSpec(
-        schema_version=2,
-        name="adapter-test",
-        strategies=[{"name": "event", "models": [{"name": "pead"}], "blend": {"mode": "long_short"}}],
-        risk={"max_position_pct": 0.25, "max_gross_exposure": 1.0},
-        broker=broker,
-        rebalance=rebalance,
-    )
+def _spec(broker="paper", rebalance="weekly", account_key="account"):
+    data = {
+        "schema_version": 2,
+        "name": "adapter-test",
+        "strategies": [{"name": "event", "models": [{"name": "pead"}], "blend": {"mode": "long_short"}}],
+        "risk": {"max_position_pct": 0.25, "max_gross_exposure": 1.0},
+        "broker": broker,
+        "rebalance": rebalance,
+    }
+    if broker == "saxo" and account_key is not None:
+        data["saxo_account_key"] = account_key
+    return FundSpec(**data)
 
 
 def test_saxo_deploy_denies_unverified_account_without_local_broker_book(tmp_path):

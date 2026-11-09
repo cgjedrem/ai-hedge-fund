@@ -17,6 +17,7 @@ from textual.widgets import ContentSwitcher, Footer, OptionList, Static
 from textual.widgets.option_list import Option
 
 from hedge_fund import paths
+from hedge_fund.brokers.factory import demo_token_mode_configured
 from hedge_fund.data import CachedDataClient, make_data_client, PriceSnapshot
 from hedge_fund.data.bars import is_intraday
 from hedge_fund.fund import FundSpec
@@ -259,9 +260,11 @@ class PaperScreen(Screen):
         if action == "resume":
             return snap.halted is not None
         if action in ("approve", "reject"):
-            return snap.gate and snap.pending is not None and snap.halted is None
+            blocked_demo = snap.deployed.broker == "saxo" and demo_token_mode_configured()
+            return not blocked_demo and snap.gate and snap.pending is not None and snap.halted is None
         if action == "runner":
-            return snap.halted is None or snap.running  # a halted fund's runner can still be stopped
+            blocked_demo = snap.deployed.broker == "saxo" and demo_token_mode_configured()
+            return snap.running or (not blocked_demo and snap.halted is None)
         return True
 
     def action_back(self) -> None:

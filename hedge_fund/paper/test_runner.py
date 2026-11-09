@@ -30,20 +30,21 @@ def registered_fakes(monkeypatch):
 
 
 def _spec(**overrides):
-    return FundSpec(
-        **{
-            "schema_version": 2,
-            "name": "bars",
-            "strategies": [{"name": "solo", "models": [{"name": "a"}], "blend": {"mode": "long_short"}}],
-            "risk": {"max_position_pct": 1, "max_gross_exposure": 1},
-            "capital": 100_000,
-            "costs": {"spread_bps": 0, "commission_per_share": 0},
-            "rebalance": "minute",
-            "interval": 5,
-            "window": {"start": "13:00", "end": "13:10"},
-            **overrides,
-        }
-    )
+    data = {
+        "schema_version": 2,
+        "name": "bars",
+        "strategies": [{"name": "solo", "models": [{"name": "a"}], "blend": {"mode": "long_short"}}],
+        "risk": {"max_position_pct": 1, "max_gross_exposure": 1},
+        "capital": 100_000,
+        "costs": {"spread_bps": 0, "commission_per_share": 0},
+        "rebalance": "minute",
+        "interval": 5,
+        "window": {"start": "13:00", "end": "13:10"},
+        **overrides,
+    }
+    if data.get("broker") == "saxo":
+        data.setdefault("saxo_account_key", "sim-account-1")
+    return FundSpec(**data)
 
 
 def _at(day, hhmmss):
@@ -507,7 +508,10 @@ def test_is_running_never_sends_console_control_events(tmp_path, monkeypatch):
     import sys
 
     from hedge_fund.paper import runner as runner_module
-    from hedge_fund.test_support.network_guard import child_test_environment, guarded_test_python_command
+    from hedge_fund.test_support.network_guard import (
+        child_test_environment,
+        guarded_test_python_command,
+    )
 
     def forbidden(*_args):
         raise AssertionError("os.kill(pid, 0) is CTRL_C_EVENT on Windows and interrupts the whole console")

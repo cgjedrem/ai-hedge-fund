@@ -51,6 +51,9 @@ def test_builder_blocks_daily_saxo_and_denies_the_minute_saxo_build(monkeypatch)
             broker_options = screen.query_one("#broker-list", OptionList)
             broker_options.highlighted = 1
             await pilot.press("enter")
+            assert screen.query_one("#panes", ContentSwitcher).current == "step-saxo-account"
+            screen.query_one("#saxo-account-input", Input).value = "sim-account-1"
+            await pilot.press("enter")
             assert screen.query_one("#panes", ContentSwitcher).current == "step-tickers"
             assert screen._state["broker"] == "saxo"
             screen.query_one("#tickers-input", Input).value = "AAPL"

@@ -26,6 +26,7 @@ from textual.widgets.option_list import Option
 from textual.widgets.selection_list import Selection
 
 from hedge_fund import paths
+from hedge_fund.brokers.factory import demo_token_mode_configured
 from hedge_fund.fund import (
     custom_strategy,
     format_interval,
@@ -110,8 +111,8 @@ class BuilderScreen(Screen):
         self.STEP_IDS = ["step-name", "step-strategies", "step-capital", "step-cadence"]
         self.STEP_TITLES = ["Name", "Strategies", "Capital", "Cadence"]
         if mode == "paper":
-            self.STEP_IDS.extend(["step-approval", "step-broker", "step-tickers"])
-            self.STEP_TITLES.extend(["Approval", "Broker", "Tickers"])
+            self.STEP_IDS.extend(["step-approval", "step-broker", "step-saxo-account", "step-tickers"])
+            self.STEP_TITLES.extend(["Approval", "Broker", "Saxo account", "Tickers"])
         # Library sorted like the CLI: discretionary pods first, then by name.
         self._library = sorted(
             (load_strategy(p) for p in STRATEGY_DIR.glob("*.yaml")),
@@ -197,6 +198,16 @@ class BuilderScreen(Screen):
                             Option("Saxo SIM — external simulated book", id="broker-saxo"),
                             id="broker-list",
                         )
+                    with Vertical(id="step-saxo-account", classes="pane"):
+                        yield Label("Verified Saxo SIM account key (optional for legacy OAuth)", classes="q")
+                        yield Input(
+                            placeholder="account key from `aihf saxo inspect` (leave blank for legacy OAuth)",
+                            id="saxo-account-input",
+                        )
+                        yield Static(
+                            Text("Demo-token deployment stays blocked until an isolated root passes write admission.", style=MUTED),
+                            classes="hint",
+                        )
                 with VerticalScroll(id="step-interval", classes="pane"):
                     yield Label("Interval between sessions (minutes)", classes="q")
                     yield Input(value="1", id="interval-input")
@@ -264,6 +275,7 @@ class BuilderScreen(Screen):
             "step-cadence": "#cadence-list",
             "step-approval": "#approval-list",
             "step-broker": "#broker-list",
+            "step-saxo-account": "#saxo-account-input",
             "step-interval": "#interval-input",
             "step-window": "#window-start-input",
             "step-tickers": "#tickers-input",
@@ -314,6 +326,8 @@ class BuilderScreen(Screen):
         elif pane == "step-window":
             self._goto("step-interval")
         elif pane == "step-tickers":
+            self._goto("step-saxo-account" if self._state.get("broker") == "saxo" else "step-broker")
+        elif pane == "step-saxo-account":
             self._goto("step-broker")
         elif pane == "step-broker":
             self._goto("step-approval")
@@ -430,6 +444,23 @@ class BuilderScreen(Screen):
                 self.query_one("#broker-list", OptionList).highlighted = 0
                 return
         self._state["broker"] = broker
+        if broker == "saxo":
+            self._goto("step-saxo-account")
+        else:
+            self._state.pop("saxo_account_key", None)
+            self._goto("step-tickers")
+
+    @on(Input.Submitted, "#saxo-account-input")
+    def _submit_saxo_account(self, event: Input.Submitted) -> None:
+        account_key = event.value.strip()
+        if not account_key and not demo_token_mode_configured():
+            self._state.pop("saxo_account_key", None)
+            self._goto("step-tickers")
+            return
+        if not account_key or any(char.isspace() or not char.isprintable() for char in account_key):
+            self.notify("Enter an eligible account key from `aihf saxo inspect`.", severity="error")
+            return
+        self._state["saxo_account_key"] = account_key
         self._goto("step-tickers")
 
     # ---- the minute sub-steps: interval, then window ------------------------
@@ -522,8 +553,28 @@ class BuilderScreen(Screen):
             rebalance=self._state["rebalance"],
             approval_required=self._state.get("approval_required", False),
             broker=self._state.get("broker", "paper"),
+            saxo_account_key=self._state.get("saxo_account_key"),
             **({"interval": self._state["interval"], "window": self._state["window"]} if intraday else {}),
         )
+        if self.mode == "paper" and spec.broker == "saxo" and demo_token_mode_configured():
+            menu = self.query_one("#done-menu", OptionList)
+            menu.clear_options()
+            menu.add_option(Option("Back", id="go-back"))
+            menu.highlighted = 0
+            self.query_one("#done-summary", Static).update(
+                Group(
+                    Text.assemble((spec.name, f"bold {BRIGHT}"), (" was not saved.", f"bold {RED}")),
+                    Text(""),
+                    Text(f"Saxo SIM account: {spec.saxo_account_key}", style=MUTED),
+                    Text(""),
+                    Text("Fund deployment is blocked until an isolated root passes write admission.", style=RED),
+                    Text("No mandate or paper-fund files were written.", style=MUTED),
+                    Text("Use `aihf saxo inspect` for read-only account verification.", style=MUTED),
+                )
+            )
+            self._goto("step-done")
+            self.notify("Saxo SIM deployment is blocked pending isolated-root admission.", severity="warning")
+            return
         # The user said yes to replacing the fund that held this name: clear
         # it now, at the last moment, so an abandoned wizard costs nothing.
         replaced = self._state.get("replace") == spec.name
@@ -553,9 +604,10 @@ class BuilderScreen(Screen):
         self._built = (spec, path)
 
         staff = ", ".join(s.title for s in self._state["strategies"])
+        account = f"  ·  account: {spec.saxo_account_key}" if spec.saxo_account_key else ""
         identity = Text.assemble(
             (spec.name, f"bold {BRIGHT}"),
-            (f"  ·  {staff}  ·  ${spec.capital:,.0f}  ·  {cadence_identity(spec)}  ·  broker: {spec.broker}", MUTED),
+            (f"  ·  {staff}  ·  ${spec.capital:,.0f}  ·  {cadence_identity(spec)}  ·  broker: {spec.broker}{account}", MUTED),
         )
         if replaced:
             self.notify(f"Replaced the previous {spec.name}.", severity="warning")
@@ -610,7 +662,9 @@ class BuilderScreen(Screen):
     @on(OptionList.OptionSelected, "#done-menu")
     def _after_build(self, event: OptionList.OptionSelected) -> None:
         # Imported here, not at the top: the paper screen opens this builder.
-        assert self._built is not None
+        if self._built is None:
+            self.app.pop_screen()
+            return
         spec = self._built[0]
         if event.option.id == "go-backtest":
             self.app.switch_screen(BacktestScreen(spec))
@@ -627,7 +681,8 @@ class BuilderScreen(Screen):
             3: self._short_cadence(),
             4: ("approval required" if self._state.get("approval_required") else "automatic execution" if "approval_required" in self._state else None),
             5: {"paper": "Paper", "saxo": "Saxo SIM"}.get(self._state.get("broker")),
-            6: (short_tickers(self._state["universe"], 3) if "universe" in self._state else None),
+            6: ("not used" if self._state.get("broker") == "paper" else self._state.get("saxo_account_key")),
+            7: (short_tickers(self._state["universe"], 3) if "universe" in self._state else None),
         }
         active = self._step if self._pane() != "step-done" else -1
         for i, title in enumerate(self.STEP_TITLES):

@@ -280,6 +280,10 @@ class FundSpec(BaseModel):
         description="what the fund measures itself against; also the source " "of the backtest's trading-day grid",
     )
     broker: Literal["paper", "saxo"] = Field(default="paper", description="broker book used by deployed paper funds")
+    saxo_account_key: str | None = Field(
+        default=None,
+        description="explicit Saxo account identifier bound to this fund",
+    )
 
     @field_validator("benchmark")
     @classmethod
@@ -295,10 +299,26 @@ class FundSpec(BaseModel):
             raise ValueError(f"duplicate strategy names: {sorted(duplicates)}")
         return strategies
 
+    @field_validator("saxo_account_key")
+    @classmethod
+    def _valid_saxo_account_key(cls, account_key: str | None) -> str | None:
+        if account_key is None:
+            return None
+        invalid = not account_key or account_key.strip() != account_key
+        invalid = invalid or any(char.isspace() for char in account_key)
+        invalid = invalid or not account_key.isprintable()
+        if invalid:
+            message = "Invalid Saxo account identifier"
+            reason = "empty, whitespace, or non-printable"
+            raise ValueError(f"{message}: {reason}")
+        return account_key
+
     @model_validator(mode="after")
     def _interval_and_window_belong_to_minute_funds(self) -> FundSpec:
         if self.broker == "saxo" and "costs" not in self.model_fields_set:
             self.costs = TradingCosts(spread_bps=0, commission_per_share=0)
+        if self.saxo_account_key is not None and self.broker != "saxo":
+            raise ValueError("saxo_account_key is only valid for a Saxo mandate")
         if self.broker == "saxo" and self.rebalance != "minute":
             raise ValueError("Saxo mandates require an in-market intraday cadence; choose minute")
         if self.broker == "saxo":
@@ -329,6 +349,8 @@ class FundSpec(BaseModel):
             data.pop("min_order_pct_of_equity", None)
         if not self.approval_required:
             data.pop("approval_required", None)
+        if self.saxo_account_key is None:
+            data.pop("saxo_account_key", None)
         if self.broker == "paper":
             data.pop("broker", None)
         return data

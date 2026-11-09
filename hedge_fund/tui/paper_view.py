@@ -320,6 +320,16 @@ def paper_detail(
             f"{staff} · {cadence_identity(spec)} · ${spec.capital:,.0f} · broker: {snap.deployed.broker} · " f"{' '.join(snap.deployed.universe)}",
             style=MUTED,
         ),
+        *(
+            [
+                Text(
+                    f"Saxo SIM account: {spec.saxo_account_key or 'unbound — execution blocked'}",
+                    style=MUTED,
+                )
+            ]
+            if snap.deployed.broker == "saxo"
+            else []
+        ),
         Text(""),
     ]
     if snap.error:

@@ -121,6 +121,11 @@ def main(argv: list[str] | None = None) -> None:
             stream.reconfigure(encoding="utf-8", errors="replace")
     parser = _parser()
     args = parser.parse_args(argv)
+    if args.command == "saxo":
+        _saxo_inspect(args, parser)
+        return
+    if args.root is None:
+        parser.error("--root is required for this command")
     try:
         context = RootContext.open(args.root)
     except RootPathError as exc:
@@ -178,6 +183,45 @@ def main(argv: list[str] | None = None) -> None:
                 sys.exit(1)
     finally:
         context.close()
+
+
+def _saxo_inspect(args, parser: argparse.ArgumentParser) -> None:
+    if not args.enable_network and not args.saxo_enable_network:
+        parser.error("Saxo SIM inspection requires explicit --enable-network consent")
+    from hedge_fund.brokers.factory import build_saxo_demo_client
+    from hedge_fund.brokers.saxo import SaxoAuthError, SaxoReconcileError
+
+    try:
+        client = build_saxo_demo_client()
+        client.check_connection()
+        accounts = client.inspect_accounts(args.account_key)
+    except (SaxoAuthError, SaxoReconcileError, ValueError) as exc:
+        parser.error(str(exc))
+    except Exception:
+        parser.error("Saxo SIM inspection failed; no order was submitted")
+
+    summaries = []
+    for account in accounts:
+        summaries.append(
+            {
+                "account_key": account.account_key,
+                "currency": account.currency,
+                "cash_balance": account.cash_balance,
+                "position_count": len(account.positions),
+                "positions": [{"uic": position.uic, "amount": position.amount} for position in account.positions],
+            }
+        )
+    print(
+        json.dumps(
+            {
+                "environment": "SIM",
+                "status": "connected",
+                "accounts": summaries,
+                "selected_account_key": args.account_key,
+                "selection_required": args.account_key is None,
+            }
+        )
+    )
 
 
 def _load_runtime() -> None:
@@ -277,7 +321,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--root",
         type=Path,
-        required=True,
+        default=None,
         help="existing absolute NTFS or ext4 data root",
     )
     parser.add_argument(
@@ -295,6 +339,17 @@ def _parser() -> argparse.ArgumentParser:
         help="enable bounded provider requests for this invocation; no paid call is implied",
     )
     commands = parser.add_subparsers(dest="command")
+
+    saxo = commands.add_parser("saxo", help="read-only Saxo SIM inspection")
+    saxo_actions = saxo.add_subparsers(dest="saxo_action", required=True)
+    inspect = saxo_actions.add_parser("inspect", help="check the demo-token connection and inspect accounts")
+    inspect.add_argument("--account-key", help="inspect and explicitly verify one eligible SIM account")
+    inspect.add_argument(
+        "--enable-network",
+        dest="saxo_enable_network",
+        action="store_true",
+        help="authorize this bounded read-only Saxo SIM request",
+    )
 
     backtest = commands.add_parser(
         "backtest",

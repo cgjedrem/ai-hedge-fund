@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, model_validator, ValidationError
 
 from hedge_fund.brokers.account_binding import require_sim_account_ownership
 from hedge_fund.brokers.paper import PaperBroker
@@ -43,6 +43,12 @@ class DeployedFund(BaseModel):
     universe: list[str]
     broker: Literal["paper", "saxo"] = "paper"
     created: str  # YYYY-MM-DD
+
+    @model_validator(mode="after")
+    def _broker_matches_snapshot(self) -> DeployedFund:
+        if self.broker != self.spec.broker:
+            raise ValueError("deployed broker does not match the mandate snapshot")
+        return self
 
 
 def validate_fund_name(name: str) -> str:

@@ -8,6 +8,7 @@ import sys
 from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock
 from uuid import uuid4
 
@@ -17,11 +18,14 @@ import yaml
 from hedge_fund import paths, run
 from hedge_fund.data import sessions
 from hedge_fund.fund import custom_strategy, FundSpec
+from hedge_fund.paper import deploy
 
 
 @pytest.fixture
 def offline(tmp_path, monkeypatch):
     """No credentials, no HTTP, user dirs under tmp, fakes for the engine."""
+    import importlib
+
     from hedge_fund.backtesting.test_fund import FakeAnalyst, FakeDataClient
     from hedge_fund.fund import Fund
 
@@ -112,6 +116,11 @@ def _main(monkeypatch, *argv):
         if action == "approve" and "--now" in argv and "--tick-request-id" not in argv:
             argv.extend(("--tick-request-id", f"test-cli-tick-{uuid4().hex}"))
     monkeypatch.setattr(sys, "argv", ["aihf", "--root", str(root), *argv])
+    run.main()
+
+
+def _saxo_main(monkeypatch, *args):
+    monkeypatch.setattr(sys, "argv", ["aihf", "saxo", "inspect", "--enable-network", *args])
     run.main()
 
 
@@ -960,6 +969,188 @@ def test_no_arguments_launches_the_app(monkeypatch):
     monkeypatch.setitem(sys.modules, "hedge_fund.tui.app", Mock(HedgeFundApp=lambda: launched))
     _main(monkeypatch)
     launched.run.assert_called_once()
+
+
+def test_saxo_inspect_reports_sim_connection_without_root_initialization(monkeypatch, capsys):
+    class FakeConnectionCheck:
+        def __init__(self):
+            self.calls = []
+            self.account = type(
+                "Account",
+                (),
+                {
+                    "account_key": "sim-account-1",
+                    "currency": "USD",
+                    "cash_balance": 100_000.0,
+                    "positions": (),
+                },
+            )()
+
+        def check_connection(self):
+            self.calls.append("check_connection")
+
+        def inspect_accounts(self, account_key=None):
+            self.calls.append(("inspect_accounts", account_key))
+            return [self.account]
+
+    client = FakeConnectionCheck()
+    root_open = Mock(side_effect=AssertionError("read-only Saxo inspection opened a fund root"))
+    dotenv_load = Mock(side_effect=AssertionError("read-only Saxo inspection loaded a root .env"))
+    runtime_load = Mock(side_effect=AssertionError("read-only Saxo inspection initialized the app runtime"))
+    monkeypatch.setattr(run.RootContext, "open", root_open)
+    monkeypatch.setattr(paths, "load_root_dotenv", dotenv_load)
+    monkeypatch.setattr(run, "_load_runtime", runtime_load)
+    monkeypatch.setattr(
+        "hedge_fund.brokers.factory.build_saxo_demo_client",
+        lambda: client,
+    )
+
+    _saxo_main(monkeypatch)
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["environment"] == "SIM"
+    assert payload["status"] == "connected"
+    assert payload["accounts"][0]["account_key"] == "sim-account-1"
+    assert client.calls == ["check_connection", ("inspect_accounts", None)]
+    root_open.assert_not_called()
+    dotenv_load.assert_not_called()
+    runtime_load.assert_not_called()
+
+
+def test_saxo_inspect_requires_explicit_network_consent_before_secret_resolution(monkeypatch):
+    build_client = Mock(side_effect=AssertionError("missing-consent command resolved credentials"))
+    monkeypatch.setattr("hedge_fund.brokers.factory.build_saxo_demo_client", build_client)
+
+    with pytest.raises(SystemExit) as error:
+        run.main(["saxo", "inspect"])
+
+    assert error.value.code == 2
+    build_client.assert_not_called()
+
+
+def test_saxo_inspect_reports_safe_failure_and_never_uses_oauth_or_orders(monkeypatch, capsys):
+    from hedge_fund.brokers.saxo import SaxoAuthError
+
+    token = "demo-token-private"
+
+    class RejectedConnectionCheck:
+        def check_connection(self):
+            raise SaxoAuthError("Saxo SIM rejected the 24-hour token; refresh it in 1Password")
+
+    monkeypatch.setattr(
+        "hedge_fund.brokers.factory.build_saxo_demo_client",
+        lambda: RejectedConnectionCheck(),
+    )
+
+    with pytest.raises(SystemExit) as error:
+        _saxo_main(monkeypatch)
+
+    output = capsys.readouterr()
+    assert error.value.code == 2
+    assert "24-hour token" in output.err
+    assert token not in output.out + output.err
+
+
+def test_saxo_inspect_outputs_only_sanitized_account_summary(monkeypatch, capsys):
+    class Position:
+        uic = 44
+        amount = 2.5
+
+    class Account:
+        account_key = "sim-account-1"
+        currency = "USD"
+        cash_balance = 100_000.0
+        positions = (Position(),)
+
+    class Inspector:
+        def check_connection(self):
+            pass
+
+        def inspect_accounts(self, account_key=None):
+            assert account_key is None
+            return [Account()]
+
+    monkeypatch.setattr(
+        "hedge_fund.brokers.factory.build_saxo_demo_client",
+        lambda: Inspector(),
+    )
+
+    _saxo_main(monkeypatch)
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["accounts"] == [
+        {
+            "account_key": "sim-account-1",
+            "currency": "USD",
+            "cash_balance": 100_000.0,
+            "position_count": 1,
+            "positions": [{"uic": 44, "amount": 2.5}],
+        }
+    ]
+    assert "authorization" not in json.dumps(payload).lower()
+    assert "raw_response" not in json.dumps(payload).lower()
+
+
+def test_saxo_inspect_requires_explicit_choice_without_silent_first_match(monkeypatch, capsys):
+    class Account:
+        def __init__(self, account_key):
+            self.account_key = account_key
+            self.currency = "USD"
+            self.cash_balance = 100.0
+            self.positions = ()
+
+    class Inspector:
+        def check_connection(self):
+            pass
+
+        def inspect_accounts(self, account_key=None):
+            accounts = [Account("sim-one"), Account("sim-two")]
+            return accounts if account_key is None else [account for account in accounts if account.account_key == account_key]
+
+    monkeypatch.setattr(
+        "hedge_fund.brokers.factory.build_saxo_demo_client",
+        lambda: Inspector(),
+    )
+
+    _saxo_main(monkeypatch)
+
+    payload = json.loads(capsys.readouterr().out)
+    assert [row["account_key"] for row in payload["accounts"]] == ["sim-one", "sim-two"]
+    assert payload["selected_account_key"] is None
+    assert payload["selection_required"] is True
+
+
+def test_saxo_inspect_passes_explicit_account_key_without_persisting_selection(monkeypatch, capsys):
+    account_key = "sim-two"
+
+    class Account:
+        account_key = "sim-two"
+        currency = "USD"
+        cash_balance = 200.0
+        positions = ()
+
+    class Inspector:
+        selected = None
+
+        def check_connection(self):
+            pass
+
+        def inspect_accounts(self, account_key=None):
+            self.selected = account_key
+            return [Account()]
+
+    client = Inspector()
+    monkeypatch.setattr(
+        "hedge_fund.brokers.factory.build_saxo_demo_client",
+        lambda: client,
+    )
+
+    _saxo_main(monkeypatch, "--account-key", account_key)
+
+    payload = json.loads(capsys.readouterr().out)
+    assert client.selected == account_key
+    assert payload["selected_account_key"] == account_key
+    assert payload["selection_required"] is False
 
 
 @pytest.mark.parametrize("mode", ["long_only", "long_short", "dollar_neutral"])
@@ -1931,6 +2122,84 @@ def test_paper_create_approval_and_approve_commands_show_status(tmp_path, monkey
     assert mailbox["verdict"] == "approve" and mailbox["by"] == "cli"
     assert [event["kind"] for event in events] == ["tick", "approve", "approval_commit"]
     assert "approved" in approved.err.lower()
+
+
+@pytest.mark.parametrize("argv", [("approve", "--now"), ("tick",), ("tick", "--again"), ("run",)])
+def test_saxo_demo_execution_refuses_before_ledger_or_execution(tmp_path, monkeypatch, capsys, argv):
+    directory = tmp_path / "synthetic-fund"
+    deployed = SimpleNamespace(broker="saxo")
+    forbidden = Mock(side_effect=AssertionError("refused command reached ledger or execution"))
+    monkeypatch.setattr(run, "apply_credentials", lambda: None)
+    monkeypatch.setattr(run, "ensure_mandates_dir", lambda: None)
+    monkeypatch.setattr(run, "_fund_dir", lambda name, parser: directory)
+    monkeypatch.setattr(run, "load_deployed", lambda path: deployed)
+    monkeypatch.setenv("SAXO_DEMO_ACCESS_TOKEN_REF", "op://synthetic-vault/demo-token")
+    for name in ("Ledger", "make_data_client", "tick", "redo", "serve"):
+        monkeypatch.setattr(run, name, forbidden)
+
+    with pytest.raises(SystemExit) as error:
+        _main(monkeypatch, "paper", argv[0], "synthetic-fund", *argv[1:])
+
+    output = capsys.readouterr()
+    assert error.value.code == 2
+    assert "Saxo SIM execution is blocked until an isolated root passes write admission" in output.err
+    assert output.out == ""
+    assert "op://" not in output.err
+    assert "approved decision" not in output.err
+    forbidden.assert_not_called()
+    assert not directory.exists()  # No approval mailbox, event, or halt/control writes.
+
+
+@pytest.mark.parametrize(
+    "broker,token_mode,action,now",
+    [
+        ("saxo", False, "approve", True),
+        ("saxo", False, "approve", False),
+        ("saxo", True, "approve", False),
+        ("saxo", True, "reject", False),
+        ("paper", True, "approve", True),
+        ("paper", False, "approve", True),
+    ],
+)
+def test_saxo_guard_preserves_nonexecuting_verdicts_and_oauth_paper_approvals(tmp_path, monkeypatch, capsys, broker, token_mode, action, now):
+    directory = tmp_path / "synthetic-fund"
+    deployed = SimpleNamespace(broker=broker, name="synthetic-fund", spec=SimpleNamespace(capital=100_000, approval_required=True, is_intraday=False))
+    state = SimpleNamespace(halted=None, pending=SimpleNamespace(as_of="2025-01-06"), prev_hash="a" * 64)
+    ledger = Mock()
+    ledger.replay.return_value = state
+    data = object()
+    data_client = Mock(return_value=nullcontext(data))
+    advance = Mock(return_value=Mock(model_dump_json=Mock(return_value="{}")))
+    monkeypatch.setattr(run, "apply_credentials", lambda: None)
+    monkeypatch.setattr(run, "ensure_mandates_dir", lambda: None)
+    monkeypatch.setattr(run, "_fund_dir", lambda name, parser: directory)
+    monkeypatch.setattr(run, "load_deployed", lambda path: deployed)
+    monkeypatch.setattr(run, "Ledger", lambda path: ledger)
+    monkeypatch.setattr(run, "make_data_client", data_client)
+    monkeypatch.setattr(run, "CachedDataClient", lambda raw, **kwargs: raw)
+    monkeypatch.setattr(run, "tick", advance)
+    monkeypatch.setattr(run, "_tick_summary", lambda name, record: "synthetic session")
+    if token_mode:
+        monkeypatch.setenv("SAXO_DEMO_ACCESS_TOKEN_REF", "op://synthetic-vault/demo-token")
+    else:
+        monkeypatch.delenv("SAXO_DEMO_ACCESS_TOKEN_REF", raising=False)
+    _disable_status_animation(monkeypatch)
+
+    _main(monkeypatch, "paper", action, "synthetic-fund", *(("--now",) if now else ()))
+
+    ledger.set_approval.assert_called_once_with(action, "2025-01-06", "a" * 64, "cli")
+    ledger.halt.assert_not_called()
+    output = capsys.readouterr()
+    assert ("approved decision" if action == "approve" else "rejected decision") in output.err
+    if now:
+        advance.assert_called_once_with(directory, data)
+        data_client.assert_called_once_with()
+        assert json.loads(output.out) == {}
+    else:
+        advance.assert_not_called()
+        data_client.assert_not_called()
+        assert output.out == ""
+    assert not directory.exists()
 
 
 def test_paper_approve_now_executes_when_a_session_is_due(tmp_path, monkeypatch, capsys, offline):

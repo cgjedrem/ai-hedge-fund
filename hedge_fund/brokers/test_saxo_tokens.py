@@ -7,16 +7,24 @@ from pathlib import Path
 
 import pytest
 
-from hedge_fund.brokers.saxo import SaxoAuthError, TokenManager, TokenState
+from hedge_fund.brokers.saxo import (
+    DemoTokenManager,
+    SaxoAuthError,
+    SaxoClient,
+    TokenManager,
+    TokenState,
+)
 from hedge_fund.brokers.test_saxo_doubles import FakeClock, FakeTransport
 
 
 class SharedSecrets:
     def __init__(self):
         self.value = "refresh-old"
+        self.resolves = []
         self.writes = []
 
     def resolve(self, variable, reference):
+        self.resolves.append((variable, reference))
         return self.value
 
     def write_back(self, variable, reference, value):
@@ -203,3 +211,165 @@ def test_refresh_lock_cleanup_failure_does_not_discard_persisted_token(tmp_path,
     assert secrets.value == "refresh-1"
     assert "lock cleanup failed" in caplog.text.lower()
     assert list((tmp_path / "locks").glob("*.lockdir/owner"))
+
+
+def test_demo_token_is_resolved_once_without_refresh_or_writeback():
+    secrets = SharedSecrets()
+    secrets.value = "demo-token-private"
+    manager = DemoTokenManager(
+        access_token_ref="op://vault/item/demo-token",
+        secrets_provider=secrets,
+    )
+
+    assert manager.state == TokenState.UNAUTHENTICATED
+    assert manager.get_access_token() == "demo-token-private"
+    assert manager.get_access_token() == "demo-token-private"
+    assert secrets.resolves == [("SAXO_DEMO_ACCESS_TOKEN_REF", "op://vault/item/demo-token")]
+    assert secrets.writes == []
+    assert not hasattr(manager, "expires_at")
+    assert "demo-token-private" not in repr(manager)
+    assert "demo-token" not in repr(manager)
+
+
+def test_demo_token_requires_an_op_reference():
+    with pytest.raises(ValueError, match="op://"):
+        DemoTokenManager(
+            access_token_ref="not-a-reference",
+            secrets_provider=SharedSecrets(),
+        )
+
+
+def test_demo_token_lookup_failure_does_not_expose_secret(caplog):
+    class BrokenSecrets:
+        def resolve(self, variable, reference):
+            raise RuntimeError("demo-token-private")
+
+        def write_back(self, variable, reference, value):
+            raise AssertionError
+
+    manager = DemoTokenManager(
+        access_token_ref="op://vault/item/demo-token",
+        secrets_provider=BrokenSecrets(),
+    )
+
+    with pytest.raises(SaxoAuthError) as error:
+        manager.get_access_token()
+
+    assert "demo-token-private" not in str(error.value)
+    assert error.value.__context__ is None
+    assert "demo-token-private" not in repr(manager)
+    assert "demo-token-private" not in caplog.text
+
+
+def test_rejected_demo_token_fails_closed_without_retry_or_refresh():
+    secrets = SharedSecrets()
+    secrets.value = "demo-token-private"
+    transport = FakeTransport([(401, {"error": "invalid_token", "description": "demo-token-private"})])
+    manager = DemoTokenManager(
+        access_token_ref="op://vault/item/demo-token",
+        secrets_provider=secrets,
+    )
+    client = SaxoClient(tokens=manager, transport=transport, clock=FakeClock())
+
+    with pytest.raises(SaxoAuthError, match="24-hour") as error:
+        client.request("GET", "/port/v1/users/me")
+
+    assert "demo-token-private" not in str(error.value)
+    assert error.value.__context__ is None
+    assert manager.state == TokenState.REAUTH_REQUIRED
+    assert len(transport.calls) == 1
+    assert transport.calls[0]["method"] == "GET"
+    assert transport.calls[0]["url"].startswith("https://gateway.saxobank.com/sim/openapi/")
+    assert transport.calls[0]["headers"]["Authorization"] == "******"
+    assert not any(call["url"].endswith("/token") for call in transport.calls)
+    assert secrets.writes == []
+
+
+def test_demo_transport_error_does_not_retain_token_in_exception_context():
+    token = "demo-token-private"
+    secrets = SharedSecrets()
+    secrets.value = token
+    transport = FakeTransport([RuntimeError(token)])
+    manager = DemoTokenManager(
+        access_token_ref="op://vault/item/demo-token",
+        secrets_provider=secrets,
+    )
+    client = SaxoClient(tokens=manager, transport=transport, clock=FakeClock())
+
+    with pytest.raises(SaxoAuthError) as error:
+        client.request("GET", "/port/v1/users/me")
+
+    assert token not in str(error.value)
+    assert token not in repr(error.value)
+    assert error.value.__context__ is None
+    assert transport.calls[0]["url"].startswith("https://gateway.saxobank.com/sim/openapi/")
+
+
+def test_demo_connection_check_uses_only_sim_user_read():
+    secrets = SharedSecrets()
+    secrets.value = "demo-token-private"
+    transport = FakeTransport([(200, {"ClientKey": "sim-client"})])
+    manager = DemoTokenManager(
+        access_token_ref="op://vault/item/demo-token",
+        secrets_provider=secrets,
+    )
+    client = SaxoClient(tokens=manager, transport=transport)
+
+    client.check_connection()
+
+    assert len(transport.calls) == 1
+    assert transport.calls[0]["method"] == "GET"
+    assert transport.calls[0]["url"] == "https://gateway.saxobank.com/sim/openapi/port/v1/users/me"
+    assert transport.calls[0]["timeout"] == 15
+    assert transport.calls[0]["headers"]["Authorization"] == "******"
+    assert secrets.writes == []
+
+
+def test_demo_connection_check_rejects_incomplete_user_response():
+    manager = DemoTokenManager(
+        access_token_ref="op://vault/item/demo-token",
+        secrets_provider=SharedSecrets(),
+    )
+    client = SaxoClient(tokens=manager, transport=FakeTransport([(200, {"ClientKey": ""})]))
+
+    with pytest.raises(SaxoAuthError, match="connection check failed"):
+        client.check_connection()
+
+
+@pytest.mark.parametrize(
+    ("method", "order_post"),
+    [("POST", False), ("PUT", False), ("DELETE", False), ("GET", True)],
+)
+def test_demo_token_client_rejects_mutations_before_token_resolution(method, order_post):
+    secrets = SharedSecrets()
+    transport = FakeTransport()
+    manager = DemoTokenManager(
+        access_token_ref="op://vault/item/demo-token",
+        secrets_provider=secrets,
+    )
+    client = SaxoClient(tokens=manager, transport=transport)
+
+    with pytest.raises(SaxoAuthError, match="read-only"):
+        client.request(method, "/trade/v2/orders", order_post=order_post)
+
+    assert manager.state == TokenState.UNAUTHENTICATED
+    assert secrets.resolves == []
+    assert transport.calls == []
+
+
+@pytest.mark.parametrize("path", ["/trade/v2/orders", "/port/v1/users/me/../accounts/me", "/port/v1/clients/me"])
+def test_demo_token_client_rejects_unallowlisted_gets_before_token_resolution(path):
+    secrets = SharedSecrets()
+    transport = FakeTransport()
+    manager = DemoTokenManager(
+        access_token_ref="op://vault/item/demo-token",
+        secrets_provider=secrets,
+    )
+    client = SaxoClient(tokens=manager, transport=transport, clock=FakeClock())
+
+    with pytest.raises(SaxoAuthError, match="read-only"):
+        client.request("GET", path)
+
+    assert manager.state == TokenState.UNAUTHENTICATED
+    assert secrets.resolves == []
+    assert transport.calls == []

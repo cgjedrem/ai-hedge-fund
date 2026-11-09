@@ -113,6 +113,20 @@ def test_llm_samples_must_be_positive():
         FundSpec.model_validate(raw)
 
 
+def test_saxo_account_key_is_validated_and_serialized_only_when_bound():
+    unbound = FundSpec(**{**MINIMAL, "broker": "saxo", "rebalance": "minute"})
+    assert "saxo_account_key" not in unbound.model_dump()
+
+    bound = FundSpec(**{**MINIMAL, "broker": "saxo", "rebalance": "minute", "saxo_account_key": "sim-account-1"})
+    assert bound.model_dump()["saxo_account_key"] == "sim-account-1"
+    assert FundSpec.model_validate(bound.model_dump()) == bound
+
+    with pytest.raises(ValidationError, match="account identifier"):
+        FundSpec(**{**MINIMAL, "broker": "saxo", "rebalance": "minute", "saxo_account_key": " "})
+    with pytest.raises(ValidationError, match="only valid for a Saxo"):
+        FundSpec(**{**MINIMAL, "saxo_account_key": "sim-account-1"})
+
+
 def test_rebalance_cadence_validated():
     assert FundSpec(**{**MINIMAL, "rebalance": "daily"}).rebalance == "daily"
     with pytest.raises(ValidationError):
