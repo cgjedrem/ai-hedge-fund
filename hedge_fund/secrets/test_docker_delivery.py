@@ -189,6 +189,34 @@ def test_backend_authority_denial_precedes_status_or_publication():
     assert store.status()["openai"] == {"state": "requires-auth", "generation": 0}
 
 
+def test_host_maps_huge_integer_reply_to_outcome_unknown():
+    payload = b'{"generation":' + b"9" * 5000 + b"}"
+    malformed_reply = len(payload).to_bytes(4, "big") + payload
+
+    def runner(args, **_kwargs):
+        return subprocess.CompletedProcess(args, 0, stdout=malformed_reply, stderr=b"")
+
+    delivery = DockerCredentialDelivery(runner=runner)
+    request = DeliveryEnvelope(
+        action="publish",
+        provider_id="openai",
+        destination="openai",
+        root_id=ROOT_ID,
+        instance_id=INSTANCE_ID,
+        expected_generation=0,
+        delivery_id=DELIVERY_ID,
+        value=SENTINEL,
+    )
+
+    with pytest.raises(DockerCredentialDeliveryError, match="delivery-outcome-unknown"):
+        delivery._exchange(
+            CONTAINER_ID,
+            request,
+            docker_delivery.time.monotonic() + 5,
+            publish=True,
+        )
+
+
 class FakeDockerRunner:
     def __init__(
         self,

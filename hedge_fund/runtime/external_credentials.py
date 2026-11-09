@@ -168,13 +168,13 @@ class RuntimeCredentialLeaseStore:
 
     def delivery_status(self, provider: str, *, destination: str) -> dict[str, int | str]:
         provider_id = self._provider(provider)
-        expected_destination = self._allowed_destinations.get(provider_id)
-        if expected_destination is None:
-            raise ExternalCredentialError("provider is not allowed")
-        if not isinstance(destination, str) or destination.casefold() != expected_destination:
-            raise ExternalCredentialError("provider destination is not allowed")
         with self._lock:
             self._ensure_open()
+            expected_destination = self._allowed_destinations.get(provider_id)
+            if expected_destination is None:
+                raise ExternalCredentialError("provider is not allowed")
+            if not isinstance(destination, str) or destination.casefold() != expected_destination:
+                raise ExternalCredentialError("provider destination is not allowed")
             generation = self._generations.get(provider_id, 0)
             state = "revoked" if provider_id in self._revoked else "available" if generation else "requires-auth"
             return {

@@ -1,6 +1,9 @@
+import io
 import json
 import logging
 import os
+import subprocess
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -13,13 +16,22 @@ from hedge_fund.runtime.capture import (
     freeze_capture,
     root_identity_id,
 )
-from hedge_fund.runtime.credential_delivery import CredentialDeliveryServer
+from hedge_fund.runtime.credential_delivery import (
+    CredentialDeliveryServer,
+    DeliveryEnvelope,
+    encode_delivery_frame,
+    read_delivery_reply,
+)
 from hedge_fund.runtime.external_credentials import (
     ExternalCredentialError,
     RuntimeCredentialLeaseStore,
 )
 from hedge_fund.runtime.operations import OperationError
 from hedge_fund.test_support.handover import enroll_synthetic_root
+from hedge_fund.test_support.network_guard import (
+    child_test_environment,
+    guarded_test_python_command,
+)
 from hedge_fund.web.app import create_app
 from hedge_fund.web.schemas import CredentialRequest, ModelRequest
 from hedge_fund.web.services import DeskService, ServiceError
@@ -70,6 +82,88 @@ def test_operator_allowlist_comes_from_provider_ids_and_stays_value_free(tmp_pat
         }
         assert "op://" not in json.dumps(status)
         assert "secret" not in json.dumps(status).casefold()
+    finally:
+        service.close()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Unix peer credentials required")
+def test_runtime_delivery_uses_service_admission_and_real_receiver_process(tmp_path, monkeypatch):
+    assert os.environ.get("HEDGE_FUND_TEST_MODE") == "1"
+    enroll_synthetic_root(tmp_path)
+    monkeypatch.setenv("HEDGE_FUND_RUNTIME_ROLE", "web-operator")
+    monkeypatch.setenv("HEDGE_FUND_RUNTIME_PROVIDERS", "fd")
+    service = DeskService(tmp_path, allow_writes=True)
+    store = service._external_credential_store
+    assert store is not None
+    assert service.credential_status()["external_runtime"]["state"] == "configured"
+    root_id = root_identity_id(service.root_context)
+    instance_id = store._instance_id
+    receiver = guarded_test_python_command(
+        "-m",
+        "hedge_fund.runtime.credential_delivery",
+        "--receive",
+    )
+    repository = Path(__file__).resolve().parents[2]
+
+    def exchange(request):
+        result = subprocess.run(
+            receiver,
+            cwd=repository,
+            input=encode_delivery_frame(request),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=5,
+            check=False,
+            env=child_test_environment(),
+        )
+        assert result.stderr == b""
+        reply = read_delivery_reply(io.BytesIO(result.stdout))
+        assert result.returncode == (2 if reply.state == "denied" else 0)
+        return reply
+
+    try:
+        published = exchange(
+            DeliveryEnvelope(
+                action="publish",
+                provider_id="fd",
+                destination="fd",
+                root_id=root_id,
+                instance_id=instance_id,
+                expected_generation=0,
+                delivery_id="synthetic-publish-1",
+                value="synthetic-only-runtime-value",
+            )
+        )
+        assert published.state == "available"
+        assert published.generation == 1
+
+        status = exchange(
+            DeliveryEnvelope(
+                action="status",
+                provider_id="fd",
+                destination="fd",
+            )
+        )
+        assert status.state == "available"
+        assert status.generation == 1
+
+        assert service._owner_lease is not None
+        service._owner_lease.close()
+        denied = exchange(
+            DeliveryEnvelope(
+                action="publish",
+                provider_id="fd",
+                destination="fd",
+                root_id=root_id,
+                instance_id=instance_id,
+                expected_generation=1,
+                delivery_id="synthetic-publish-2",
+                value="synthetic-replacement-value",
+            )
+        )
+        assert denied.state == "denied"
+        assert denied.reason_code == "delivery-denied"
+        assert store.status()["fd"] == {"state": "available", "generation": 1}
     finally:
         service.close()
 

@@ -202,7 +202,7 @@ def read_delivery_reply(stream: BinaryIO) -> DeliveryReply:
         raise DeliveryProtocolError("delivery status contains trailing data")
     try:
         record = json.loads(payload.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+    except (UnicodeDecodeError, ValueError, RecursionError):
         raise DeliveryProtocolError("delivery status is malformed") from None
     return DeliveryReply.from_mapping(record)
 
@@ -364,7 +364,7 @@ class CredentialDeliveryServer:
                     finally:
                         stream.close()
                     connection.sendall(encode_delivery_reply(self.handle(request)))
-                except (DeliveryProtocolError, OSError, RecursionError, TimeoutError):
+                except (DeliveryProtocolError, OSError, RecursionError, TimeoutError, ValueError):
                     try:
                         connection.sendall(
                             encode_delivery_reply(
@@ -473,7 +473,7 @@ def read_delivery_frame(stream: BinaryIO) -> DeliveryEnvelope:
         raise DeliveryProtocolError("delivery stream contains trailing data")
     try:
         record = json.loads(payload.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+    except (UnicodeDecodeError, ValueError, RecursionError):
         raise DeliveryProtocolError("delivery frame is malformed") from None
     if not isinstance(record, dict):
         raise DeliveryProtocolError("delivery frame is malformed")

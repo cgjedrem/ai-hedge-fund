@@ -5,6 +5,7 @@ import socket
 import subprocess
 import sys
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 
@@ -37,6 +38,10 @@ def _store(allowed=None, instance_id=INSTANCE_ID):
         instance_id=instance_id,
         allowed_destinations=allowed or {},
     )
+
+
+def _short_test_socket_path() -> Path:
+    return Path("/tmp") / f"aihf-test-{os.getpid()}-{uuid4().hex[:8]}" / "credential.sock"
 
 
 def test_external_runtime_allowlist_defaults_empty_and_denies_before_publication():
@@ -107,6 +112,14 @@ def test_external_runtime_rejects_invalid_values_without_generation(value):
 
     assert store.status()[PROVIDER]["generation"] == 0
     assert store.status()[PROVIDER]["state"] == "requires-auth"
+
+
+def test_closed_runtime_status_reports_closed_before_provider_allowlist():
+    store = _store({PROVIDER: DESTINATION})
+    store.close()
+
+    with pytest.raises(ExternalCredentialError, match="runtime credential store is closed"):
+        store.delivery_status(PROVIDER, destination=DESTINATION)
 
 
 def test_rotation_keeps_frozen_generation_and_never_exposes_values_in_status():
@@ -255,9 +268,9 @@ def test_closed_runtime_store_drops_generations_and_rejects_reuse():
 
 @pytest.mark.skipif(os.name != "posix", reason="Unix socket ownership check")
 def test_delivery_server_does_not_unlink_an_unowned_socket(tmp_path):
-    socket_dir = tmp_path / "existing"
+    socket_path = _short_test_socket_path()
+    socket_dir = socket_path.parent
     socket_dir.mkdir()
-    socket_path = socket_dir / "credential.sock"
     owner = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     owner.bind(str(socket_path))
     server = CredentialDeliveryServer(
@@ -270,6 +283,8 @@ def test_delivery_server_does_not_unlink_an_unowned_socket(tmp_path):
         assert socket_path.is_socket()
     finally:
         owner.close()
+        socket_path.unlink(missing_ok=True)
+        socket_dir.rmdir()
 
 
 def test_restart_instance_rejects_stale_runtime_handle():
@@ -390,6 +405,15 @@ def test_delivery_frame_converts_deep_json_recursion_to_protocol_error():
         read_delivery_reply(io.BytesIO(_raw_delivery_frame(nested)))
 
 
+def test_delivery_json_converts_integer_limit_value_error_to_protocol_error():
+    huge_integer = b'{"generation":' + b"9" * 5000 + b"}"
+
+    with pytest.raises(DeliveryProtocolError, match="delivery frame is malformed"):
+        read_delivery_frame(io.BytesIO(_raw_delivery_frame(huge_integer)))
+    with pytest.raises(DeliveryProtocolError, match="delivery status is malformed"):
+        read_delivery_reply(io.BytesIO(_raw_delivery_frame(huge_integer)))
+
+
 def test_receiver_marks_post_send_failure_outcome_unknown(monkeypatch):
     sent = []
 
@@ -444,7 +468,7 @@ def test_receiver_marks_post_send_failure_outcome_unknown(monkeypatch):
 
 @pytest.mark.skipif(os.name != "posix", reason="Unix socket server required")
 def test_delivery_server_survives_deep_frame_and_handles_next_status(tmp_path):
-    socket_path = tmp_path / "ipc" / "credential.sock"
+    socket_path = _short_test_socket_path()
     server = CredentialDeliveryServer(
         _store({PROVIDER: DESTINATION}),
         socket_path=socket_path,
@@ -473,12 +497,43 @@ def test_delivery_server_survives_deep_frame_and_handles_next_status(tmp_path):
         server.close()
 
 
+@pytest.mark.skipif(os.name != "posix", reason="Unix socket server required")
+def test_delivery_server_survives_huge_integer_frame_and_handles_next_status(tmp_path):
+    socket_path = _short_test_socket_path()
+    server = CredentialDeliveryServer(
+        _store({PROVIDER: DESTINATION}),
+        socket_path=socket_path,
+        peer_validator=lambda _connection: True,
+    )
+    server.start()
+
+    def exchange(frame):
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(3)
+            client.connect(os.fspath(socket_path))
+            client.sendall(frame)
+            client.shutdown(socket.SHUT_WR)
+            return read_delivery_reply(client.makefile("rb"))
+
+    try:
+        huge_integer = b'{"generation":' + b"9" * 5000 + b"}"
+        malformed = exchange(_raw_delivery_frame(huge_integer))
+        assert malformed.state == "denied"
+        assert malformed.reason_code == "protocol-error"
+
+        valid = exchange(encode_delivery_frame(DeliveryEnvelope("status", PROVIDER, DESTINATION)))
+        assert valid.state == "requires-auth"
+        assert valid.generation == 0
+    finally:
+        server.close()
+
+
 @pytest.mark.skipif(os.name != "posix", reason="Unix socket ownership required")
 def test_delivery_server_recovers_only_owned_stale_socket(tmp_path):
-    parent = tmp_path / "ipc"
+    socket_path = _short_test_socket_path()
+    parent = socket_path.parent
     parent.mkdir(mode=0o700)
     os.chmod(parent, 0o700)
-    socket_path = parent / "credential.sock"
     stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     stale.bind(os.fspath(socket_path))
     stale.close()
@@ -499,10 +554,10 @@ def test_delivery_server_recovers_only_owned_stale_socket(tmp_path):
 @pytest.mark.skipif(os.name != "posix", reason="Unix socket ownership required")
 @pytest.mark.parametrize("case", ["active", "wrong-mode", "wrong-socket-mode", "wrong-owner", "extra-entry"])
 def test_delivery_server_preserves_untrusted_existing_socket_directory(tmp_path, monkeypatch, case):
-    parent = tmp_path / "ipc"
+    socket_path = _short_test_socket_path()
+    parent = socket_path.parent
     parent.mkdir(mode=0o700)
     os.chmod(parent, 0o700)
-    socket_path = parent / "credential.sock"
     active = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     active.bind(os.fspath(socket_path))
     active.listen(1)
@@ -523,12 +578,15 @@ def test_delivery_server_preserves_untrusted_existing_socket_directory(tmp_path,
         peer_validator=lambda _connection: False,
     )
 
-    with pytest.raises(DeliveryProtocolError, match="private local IPC is unavailable"):
-        server.start()
+    try:
+        with pytest.raises(DeliveryProtocolError, match="private local IPC is unavailable"):
+            server.start()
 
-    active.close()
-    assert socket_path.exists()
-    if extra.exists():
-        extra.unlink()
-    socket_path.unlink()
-    parent.rmdir()
+        active.close()
+        assert socket_path.exists()
+        assert extra.exists() == (case == "extra-entry")
+    finally:
+        active.close()
+        socket_path.unlink(missing_ok=True)
+        extra.unlink(missing_ok=True)
+        parent.rmdir()

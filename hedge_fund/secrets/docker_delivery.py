@@ -518,7 +518,7 @@ class DockerCredentialDelivery:
             raise
         try:
             reply = read_delivery_reply(io.BytesIO(_bytes(result.stdout)))
-        except DeliveryProtocolError:
+        except (DeliveryProtocolError, ValueError):
             if publish:
                 raise DockerCredentialDeliveryError("delivery-outcome-unknown") from None
             raise DockerCredentialDeliveryError("delivery-transport-unavailable") from None
