@@ -762,7 +762,7 @@ def test_runner_interrupted_redo_fails_before_provider(tmp_path):
 
 
 def test_runner_duplicate_logical_refusal_is_persisted_as_blocked(tmp_path, monkeypatch):
-    from hedge_fund.brokers.account_binding import RunnerQuiescence, runner_quiescence
+    from hedge_fund.brokers.account_binding import runner_quiescence, RunnerQuiescence
     from hedge_fund.runtime import owned_runner_child
     from hedge_fund.runtime.operations import DuplicateLogicalOperationRefusal
     from hedge_fund.runtime.owned_runner import validate_runner_state

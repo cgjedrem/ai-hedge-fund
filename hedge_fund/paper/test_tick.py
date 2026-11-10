@@ -486,7 +486,9 @@ def test_orphaned_intent_reconciliation_admits_new_tick(tmp_path, clock, SPEC):
 
 
 def test_intent_reconciliation_preview_digest_accepts_nan_event_field(tmp_path, clock, SPEC):
-    from hedge_fund.runtime.reconciliation import build_tick_intent_reconciliation_snapshot
+    from hedge_fund.runtime.reconciliation import (
+        build_tick_intent_reconciliation_snapshot,
+    )
 
     directory = _deploy_owned_paper_test_fund(tmp_path, SPEC)
     clock("2024-06-05")

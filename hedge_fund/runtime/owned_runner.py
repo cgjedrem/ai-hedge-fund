@@ -717,13 +717,7 @@ def validate_runner_state(
                 ):
                     return False
             elif refusal_reason == "duplicate-logical-operation":
-                if (
-                    set(refusal) != {"reason", "existing_operation_id", "logical_key"}
-                    or not isinstance(refusal.get("existing_operation_id"), str)
-                    or not _OPERATION_ID.fullmatch(refusal["existing_operation_id"])
-                    or not isinstance(refusal.get("logical_key"), str)
-                    or not _SHA256.fullmatch(refusal["logical_key"])
-                ):
+                if set(refusal) != {"reason", "existing_operation_id", "logical_key"} or not isinstance(refusal.get("existing_operation_id"), str) or not _OPERATION_ID.fullmatch(refusal["existing_operation_id"]) or not isinstance(refusal.get("logical_key"), str) or not _SHA256.fullmatch(refusal["logical_key"]):
                     return False
             else:
                 return False
