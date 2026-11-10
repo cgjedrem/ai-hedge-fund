@@ -99,3 +99,5 @@ Decisions: (1) fence derives from the ledger's own intent/outcome event stream â
 ## Post-Design Constitution Re-Check
 
 Re-evaluated after Phase 1: no new violations. The fence adds reads plus one refusal path (no new write kind); dedup adds an optional record field written through the existing operation-store code paths (already writer-mapped). Any genuinely new raw write discovered during implementation must be added to `WRITER_MAP` before merge.
+
+**Amendment (QA rework, 2026-11-10)**: the shipped design deviates from the original plan in recorded ways, all mandated by QA findings: (1) two new ledger event kinds (`tick_aborted`, `tick_intent_resolved`) written via the existing `log_event` path â€” still no new raw-write primitive, WRITER_MAP unaffected; (2) a new CLI action and one loopback/CSRF-guarded web POST endpoint for intent reconciliation (original "no new endpoints" contract note superseded); (3) `effects_started` added to new operation records (additive-optional, Constitution I preserved); (4) corrupt intents halt via PaperReconciliationRequired rather than returning the fence refusal. No new violations.

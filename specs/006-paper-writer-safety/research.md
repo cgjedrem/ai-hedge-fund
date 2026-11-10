@@ -33,6 +33,13 @@ All Technical Context items were known; no NEEDS CLARIFICATION remained. The des
 - **Rationale**: "At most once in flight" is the guarantee the operator needs; permanent dedup would forbid legitimate retries (FR-007). Interrupted operations still block because their effects are unresolved — consistent with the P1 fence philosophy.
 - **Alternatives considered**: (a) silently return the existing operation as if accepted (rejected: confuses request-ID replay semantics; refusal-with-reference is explicit); (b) include terminal-succeeded in blocking (rejected: would wedge funds after one successful session).
 
+## Post-implementation amendments (QA rework cycles 1–2, 2026-11-10)
+
+- **Decision 2 amended**: the fence's recovery assumption was false — no production path resolved an orphaned intent (QA C1). Added `Ledger.reconcile_tick_intent` + `tick_intent_resolved` event + CLI/web surfaces as the explicit resolution workflow. Fail-closed parsing retained.
+- **Decision 3 amended**: an *incomplete* intent with a matching outcome now counts as resolved (legacy relaxation); torn/unreadable events remain fail-closed and are resolvable via the explicit operator verdict. Corrupt intents halt (PaperReconciliationRequired) instead of returning the fence refusal.
+- **New**: post-intent exits are classified by effect boundary — pre-effect exits write `tick_aborted(no_effects=True)` without halting (QA R1, preserving "busy does not halt"); post-effect failures write `tick_failed` + halt. Outcome recording never writes a duplicate per attempt (QA R2). `BookMismatch` deliberately remains fail-and-halt.
+- **Decision 5 amended**: `effects_started` was added to new operation records; INTERRUPTED without effects frees the logical key, missing field fails closed (QA I5). Tick-type dedup moved to the shared tick-admission layer so CLI/web/runner all derive the same paper-tick logical key (QA I3); OperationStore-level dedup remains for web non-tick actions.
+
 ## Evidence posture
 
 Historical Spec005 claims were discriminated during discovery: "no durable rewind intent" (T021-era) is **stale** — redo now writes durable pending state (`paper/ledger.py:219-246`). The gaps this feature addresses were classified **MISSING FUNCTIONALITY** at current HEAD, not missing evidence. All validation is synthetic-fixture only; full-suite completion evidence follows Constitution III.

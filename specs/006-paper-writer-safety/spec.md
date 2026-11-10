@@ -4,7 +4,7 @@
 
 **Created**: 2026-11-10
 
-**Status**: Draft
+**Status**: Implemented (QA rework cycles 1–2 incorporated; final QA + full-suite evidence pending)
 
 **Input**: User description: "Writer fencing and duplicate-operation/idempotency safety for a single-user local paper-trading application. Scope is the two paper funds watchtower and watchtower-weekly, with web/CLI/headless-runner overlap despite one human. Bounded feature-by-feature progress."
 
@@ -97,5 +97,6 @@ The operator triggers the same logical action twice in quick succession from dif
 
 - The installation remains single-user and single-account; all writers participate in the existing cooperative admission protocol. Exclusion of unaware or malicious programs writing the same files remains the operator's acknowledged responsibility (unchanged from Spec005).
 - The protected production fund identities `watchtower` and `watchtower-weekly` stay blocked; the user did not request unblocking them, and Gate 1 approval proceeded on that basis. Any future unblocking is a separate explicit decision.
-- The existing reconciliation path (recorded-failure selection and operator-approved resolution) is the designated way to clear an unresolved intent; this feature adds the fence, not a new resolution workflow.
+- The pre-existing reconciliation path (recorded-failure selection and operator-approved resolution) did NOT cover orphaned session intents (QA cycle 1, finding C1). This feature therefore also added an explicit, audited intent-resolution action (`reconcile-tick-request` on CLI, an equivalent loopback/CSRF-guarded web endpoint, receipt bound to the intent's request identity and digest, admitted only when the local paper book matches verified ledger state). This is a recorded deviation from the original Gate-1 plan, mandated by QA to satisfy US1 scenario 2.
+- Non-paper brokers (Saxo) have no intent- or failure-reconciliation path: an orphaned intent on a Saxo fund remains fenced without an operator exit. Saxo is out of scope; this residual limitation is documented here rather than fixed (QA cycle 2, R3).
 - "Entry points" means the web desk, the CLI, and the headless owned runner; browser-level coordination (Web Locks, pending-operation storage) remains a convenience, not part of the safety guarantee.

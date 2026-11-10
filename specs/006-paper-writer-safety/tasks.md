@@ -8,6 +8,8 @@
 
 **Organization**: Tasks grouped by user story for independent implementation and testing.
 
+**Status (2026-11-10)**: T001–T026 executed across implementation + 2 QA rework cycles (HEAD `1d2e3ac`); T027 full suite and the 36-ID class-parity runs deferred to final-evidence phase after QA cycle 3; T028 in progress. Deviations from the original task texts were QA-mandated and are recorded in research.md "Post-implementation amendments" and implementation-evidence.md.
+
 ## Format: `[ID] [P?] [Story] Description`
 
 - **[P]**: Can run in parallel (different files, no dependencies)

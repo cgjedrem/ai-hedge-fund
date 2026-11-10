@@ -1,6 +1,6 @@
 # Contract: Shared Refusal Reasons (CLI / Web / Runner)
 
-**Date**: 2026-11-10 · Both new refusals are surfaced through one shared reason vocabulary so all entry points agree (Constitution V). No new endpoints; existing error channels carry these reasons.
+**Date**: 2026-11-10 (amended post-QA) · Both new refusals are surfaced through one shared reason vocabulary so all entry points agree (Constitution V). **Amendment (QA cycle 1/2)**: the recovery opcode `reconcile-tick-request` is now backed by a real surface — a CLI action and a loopback/CSRF/origin-guarded web POST endpoint (`Ledger.reconcile_tick_intent` writing a `tick_intent_resolved` event; receipt bound to intent request identity + digests; admitted only when the local paper book matches verified ledger state). Additionally: torn or identity-less intents raise `PaperReconciliationRequired` (halt + explicit reconcile) rather than the `unresolved-tick-intent` refusal — fail-closed is preserved, the exit differs. New ledger event kinds `tick_aborted` (requires `no_effects=True` and an error; pre-effect exits) and `tick_intent_resolved` (operator reconciliation verdict) were added. Exception: `BookMismatch` remains fail-and-halt even pre-effect, since broker drift may reflect untracked external effects.
 
 ## Reason: `unresolved-tick-intent`
 

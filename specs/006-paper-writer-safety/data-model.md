@@ -15,7 +15,9 @@ A durable ledger event recorded by the tick path **before** session effects. Exi
 | `recorded_at` | intent event | ordering/diagnostics |
 | `metadata_complete` | derived | false when surrounding records are torn → fence still fails closed |
 
-**Lifecycle / state transitions**:
+**Amended lifecycle (post-QA)**: resolution events now also include `tick_aborted` (pre-effect exit, `no_effects=True`) and `tick_intent_resolved` (explicit operator reconciliation verdict, receipt bound to intent request identity + digests, requires local book to match verified ledger state). Corrupt/torn intents are fail-closed and resolvable only via the explicit verdict. An incomplete (legacy-shaped) intent with a matching outcome counts as resolved. `BookMismatch` remains fail-and-halt even pre-effect.
+
+**Lifecycle / state transitions (original)**:
 
 ```text
 (none) --tick admission--> RECORDED(intent)
