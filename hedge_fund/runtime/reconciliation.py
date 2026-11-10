@@ -650,6 +650,6 @@ def _canonical_json(value: dict) -> bytes:
     if not isinstance(value, dict):
         raise ValueError("canonical identity must be an object")
     try:
-        return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")
+        return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=True).encode("utf-8")
     except (TypeError, ValueError) as exc:
         raise ValueError("canonical identity is invalid") from exc

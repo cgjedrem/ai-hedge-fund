@@ -485,6 +485,45 @@ def test_orphaned_intent_reconciliation_admits_new_tick(tmp_path, clock, SPEC):
     assert record.session == "2024-06-04"
 
 
+def test_intent_reconciliation_preview_digest_accepts_nan_event_field(tmp_path, clock, SPEC):
+    from hedge_fund.runtime.reconciliation import build_tick_intent_reconciliation_snapshot
+
+    directory = _deploy_owned_paper_test_fund(tmp_path, SPEC)
+    clock("2024-06-05")
+    ledger = Ledger(directory)
+    request_id = "nan-intent-event"
+    request_digest = ledger.tick_request_digest(
+        request_id,
+        expected_head=None,
+        session=None,
+    )
+    with _owned_paper_lane(directory, "alpha"):
+        ledger.log_event(
+            "tick_intent",
+            request_id=request_id,
+            request_action="tick",
+            request_digest=request_digest,
+            expected_head=None,
+            requested_session=None,
+            session="2024-06-04",
+            diagnostic=float("nan"),
+            durable=True,
+        )
+
+        state = ledger.replay(SPEC.capital, full=True)
+        snapshot = build_tick_intent_reconciliation_snapshot(
+            directory,
+            load_deployed(directory),
+            ledger,
+            state,
+            ledger.latest(),
+            intent_request_id=request_id,
+        )
+
+    assert snapshot.preview.intent_request_id == request_id
+    assert snapshot.preview.preview_digest
+
+
 @pytest.mark.parametrize("corruption", ["torn-line", "kindless-event"])
 def test_corrupt_intent_history_reconciliation_preserves_prefix_and_admits_tick(tmp_path, clock, SPEC, corruption):
     from hedge_fund.runtime.reconciliation import (
