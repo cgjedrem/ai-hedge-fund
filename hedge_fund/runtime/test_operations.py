@@ -14,6 +14,8 @@ from hedge_fund.runtime.operations import (
     CAPTURE_ROOT,
     ConfirmationExpired,
     ConfirmationRejected,
+    DUPLICATE_LOGICAL_OPERATION_REASON,
+    DuplicateLogicalOperationRefusal,
     INDEX_PATH,
     OperationCapacityExceeded,
     OperationConflict,
@@ -115,6 +117,18 @@ def _accept(
         current_state_resolver=current_state_resolver,
         capacity=capacity,
     )
+
+
+def test_duplicate_logical_operation_refusal_contract_fields():
+    logical_key = hashlib.sha256(b"logical-operation").hexdigest()
+    refusal = DuplicateLogicalOperationRefusal("a" * 32, logical_key)
+
+    assert refusal.reason == DUPLICATE_LOGICAL_OPERATION_REASON
+    assert refusal.fields == {
+        "reason": "duplicate-logical-operation",
+        "existing_operation_id": "a" * 32,
+        "logical_key": logical_key,
+    }
 
 
 def test_preview_digest_canonicalizes_payload_and_binds_exact_due_order(operation_store, frozen_capture):

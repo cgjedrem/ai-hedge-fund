@@ -66,6 +66,8 @@ _DEPLOYMENT_LANES = (("deployment",),)
 _EXECUTION_LANES = (("runner", "execution"),)
 _CONTROL_LANES = (("control",), ("runner", "execution"))
 _HALT_LANES = (("halt",),) + _CONTROL_LANES
+UNRESOLVED_TICK_INTENT_REASON = "unresolved-tick-intent"
+TICK_INTENT_RECOVERY = "reconcile-tick-request"
 
 
 class LedgerError(RuntimeError):
@@ -94,6 +96,35 @@ class PaperRequestConflict(LedgerError):
 
 class PaperTickNoWork(LedgerError):
     """A tick request completed without a due session."""
+
+
+class UnresolvedTickIntentRefusal(LedgerError):
+    """New tick request blocked by unresolved intent."""
+
+    reason = UNRESOLVED_TICK_INTENT_REASON
+    recovery = TICK_INTENT_RECOVERY
+
+    def __init__(self, fund: str, intent_request_id: str, intent_session: str) -> None:
+        if not isinstance(fund, str) or not fund.strip() or len(fund) > 180 or any(ord(char) < 32 or ord(char) == 127 for char in fund):
+            raise ValueError("unresolved intent fund is invalid")
+        if not isinstance(intent_request_id, str) or not _REQUEST_ID.fullmatch(intent_request_id):
+            raise ValueError("unresolved intent request identity is invalid")
+        if not isinstance(intent_session, str) or not intent_session.strip() or len(intent_session) > 256 or any(ord(char) < 32 or ord(char) == 127 for char in intent_session):
+            raise ValueError("unresolved intent session is invalid")
+        self.fund = fund
+        self.intent_request_id = intent_request_id
+        self.intent_session = intent_session
+        super().__init__(f"Unresolved tick intent blocks new sessions for {fund}: request {intent_request_id}, session {intent_session}.")
+
+    @property
+    def fields(self) -> dict[str, str]:
+        return {
+            "reason": self.reason,
+            "fund": self.fund,
+            "intent_request_id": self.intent_request_id,
+            "intent_session": self.intent_session,
+            "recovery": self.recovery,
+        }
 
 
 class HaltAuditUnavailable(LedgerError):

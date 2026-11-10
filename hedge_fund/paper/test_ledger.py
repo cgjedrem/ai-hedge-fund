@@ -13,10 +13,29 @@ from hedge_fund.backtesting.test_fund import (
     WEEKDAYS,
 )
 from hedge_fund.fund import Fund, FundSpec
-from hedge_fund.paper.ledger import Ledger, LedgerError
+from hedge_fund.paper.ledger import (
+    TICK_INTENT_RECOVERY,
+    UNRESOLVED_TICK_INTENT_REASON,
+    Ledger,
+    LedgerError,
+    UnresolvedTickIntentRefusal,
+)
 from hedge_fund.pipeline.session import FundState, SessionRecord
 
 _DECISION_HASH = "0" * 64
+
+
+def test_unresolved_intent_refusal_contract_fields():
+    refusal = UnresolvedTickIntentRefusal("alpha", "tick-001", "2026-10-31")
+
+    assert refusal.reason == UNRESOLVED_TICK_INTENT_REASON
+    assert refusal.fields == {
+        "reason": "unresolved-tick-intent",
+        "fund": "alpha",
+        "intent_request_id": "tick-001",
+        "intent_session": "2026-10-31",
+        "recovery": TICK_INTENT_RECOVERY,
+    }
 
 
 @pytest.fixture(autouse=True)

@@ -49,6 +49,7 @@ _MAX_LOCK_WAIT_SECONDS = 5.0
 _DENIED_FIELDS = ("apikey", "capability", "credential", "environment", "networkauthorized", "password", "pid", "process", "root", "secret", "token", "argv")
 _KEY_FIELDS = {"accesskey", "clientkey", "encryptionkey", "key", "keymaterial", "keyref", "keyvalue", "privatekey", "providerkey", "secretkey", "signingkey"}
 _LOGGER = logging.getLogger(__name__)
+DUPLICATE_LOGICAL_OPERATION_REASON = "duplicate-logical-operation"
 
 
 class OperationError(RuntimeError):
@@ -65,6 +66,27 @@ class ConfirmationRejected(OperationError):
 
 class OperationConflict(OperationError):
     """Request identity conflicts with durable state."""
+
+
+class DuplicateLogicalOperationRefusal(OperationError):
+    """Logical action already has a non-terminal operation."""
+
+    reason = DUPLICATE_LOGICAL_OPERATION_REASON
+
+    def __init__(self, existing_operation_id: str, logical_key: str) -> None:
+        self.existing_operation_id = _validate_operation_id(existing_operation_id)
+        if not isinstance(logical_key, str) or not _SHA256.fullmatch(logical_key):
+            raise OperationError("logical operation identity is invalid")
+        self.logical_key = logical_key
+        super().__init__(f"Logical action already has non-terminal operation {self.existing_operation_id}.")
+
+    @property
+    def fields(self) -> dict[str, str]:
+        return {
+            "reason": self.reason,
+            "existing_operation_id": self.existing_operation_id,
+            "logical_key": self.logical_key,
+        }
 
 
 class OperationStartUncertain(OperationError):
