@@ -516,7 +516,7 @@ def test_owned_runner_intent_refusal_is_durable_and_not_retried(tmp_path, monkey
                 )
 
             final = read_runner_record(root, "alpha", "state")
-            assert final["status"] == "failed"
+            assert final["status"] == "blocked"
             assert final["reason"] == "unresolved-tick-intent"
             assert validate_runner_state(root, "alpha", final)
             assert final["refusal"] == {

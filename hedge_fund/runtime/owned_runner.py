@@ -58,7 +58,7 @@ _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _REQUEST_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _SESSION_KEY = re.compile(r"^\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}:\d{2})?$")
 _ACTIVE_STATES = frozenset({"starting", "running", "stopping"})
-_TERMINAL_STATES = frozenset({"completed", "stopped", "failed"})
+_TERMINAL_STATES = frozenset({"completed", "stopped", "failed", "blocked"})
 _OWNER_FIELDS = frozenset(
     {
         "schema",
@@ -712,7 +712,7 @@ def validate_runner_state(
                 or any(ord(char) < 32 or ord(char) == 127 for char in refusal["intent_session"])
                 or not isinstance(refusal.get("recovery"), str)
                 or refusal["recovery"] != "reconcile-tick-request"
-                or state["status"] != "failed"
+                or state["status"] != "blocked"
                 or state["reason"] != "unresolved-tick-intent"
             ):
                 return False

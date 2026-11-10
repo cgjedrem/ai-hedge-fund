@@ -476,7 +476,7 @@ def _runner_loop(
             if stop_event.is_set():
                 break
     except UnresolvedTickIntentRefusal as exc:
-        status["status"] = "failed"
+        status["status"] = "blocked"
         status["reason"] = exc.reason
         status["refusal"] = exc.fields
         raise
@@ -531,6 +531,9 @@ def _execute_session(
     expires_at: datetime,
 ) -> None:
     due_set = (due,)
+    from hedge_fund.runtime.operations import OperationStore
+
+    operation_store = OperationStore(root, admission=admission)
     authorize_session(
         authorization,
         root_id=capture.root_id,
@@ -574,6 +577,7 @@ def _execute_session(
                     request_id=f"runner:{authorization.operation_id}:{due}",
                     capture_id=capture.capture_id,
                     capture_digest=capture.digest,
+                    operation_store=operation_store,
                 )
                 break
             except PaperPreflightBusy:

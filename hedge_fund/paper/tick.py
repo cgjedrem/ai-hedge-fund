@@ -188,6 +188,7 @@ def tick(
     capture_id: str | None = None,
     capture_digest: str | None = None,
     on_progress: Callable[[int], None] | None = None,
+    operation_store=None,
 ) -> SessionRecord:
     """Advance the paper fund in *directory* by one session and record it.
 
@@ -200,6 +201,11 @@ def tick(
     """
     if on_progress is not None and not callable(on_progress):
         raise ValueError("paper tick progress callback must be callable")
+    if operation_store is not None:
+        from hedge_fund.runtime.operations import OperationStore
+
+        if not isinstance(operation_store, OperationStore):
+            raise ValueError("paper tick operation store is invalid")
     directory = Path(directory)
     operation_context = None
     if request_id is not None:
@@ -272,12 +278,17 @@ def tick(
                 raise LedgerError("paper ledger head changed before the tick request")
             if session is not None and session in ledger.sessions():
                 record = ledger.read(session)
+                from hedge_fund.runtime.operations import paper_tick_logical_key
+
+                logical_key = paper_tick_logical_key(directory.name, session, expected_head)
                 ledger.log_event(
                     "tick",
                     request_id=request_id,
                     request_action="tick",
                     request_digest=operation_context["request_digest"],
                     expected_head=expected_head,
+                    session=record.session,
+                    logical_key=logical_key,
                     result={"session": record.session, "hash": record.hash},
                     durable=True,
                 )
@@ -291,6 +302,8 @@ def tick(
                 now=now,
                 operation_context=operation_context,
                 on_progress=on_progress,
+                operation_store=operation_store,
+                operation_id=operation_id,
             )
         except NothingDue as exc:
             if operation_context is not None:
@@ -334,6 +347,8 @@ def _tick(
     now: Callable[[], datetime] | None,
     operation_context: dict | None,
     on_progress: Callable[[int], None] | None,
+    operation_store=None,
+    operation_id: str | None = None,
 ) -> SessionRecord:
     deployed = load_deployed(directory)
     if deployed.broker == "saxo":
@@ -379,32 +394,104 @@ def _tick(
         benchmark = clock.observe([spec.benchmark], due)[spec.benchmark]
         if print_day(benchmark.time) < session_date(due):
             raise NothingDue(f"{deployed.name}: {spec.benchmark} has not printed today (market closed); " f"next {following_session(spec, state.last_session, now())}")
+    from hedge_fund.runtime.operations import (
+        DuplicateLogicalOperationRefusal,
+        OperationError,
+        paper_tick_logical_key,
+    )
+
+    logical_key = paper_tick_logical_key(deployed.name, due, state.prev_hash)
+    if operation_store is not None:
+        from hedge_fund.runtime.admission import PaperPreflightBusy
+
+        try:
+            active = operation_store.find_active_logical_operation(
+                logical_key,
+                exclude_operation_id=operation_id,
+            )
+        except OperationError as exc:
+            raise PaperPreflightBusy("Paper logical-operation state is unavailable.") from exc
+        if active is not None:
+            raise DuplicateLogicalOperationRefusal(active.operation_id, logical_key)
+
+    attempt_context = None
     if operation_context is not None:
+        attempt_context = {
+            **operation_context,
+            "expected_head": state.prev_hash,
+            "attempt_id": uuid4().hex,
+            "logical_key": logical_key,
+        }
         ledger.log_event(
             "tick_intent",
-            request_id=operation_context["request_id"],
-            request_action=operation_context["request_action"],
-            request_digest=operation_context["request_digest"],
+            request_id=attempt_context["request_id"],
+            request_action=attempt_context["request_action"],
+            request_digest=attempt_context["request_digest"],
             expected_head=state.prev_hash,
             requested_session=session,
             session=due,
-            **{key: operation_context[key] for key in ("operation_id", "capture_id", "capture_digest") if key in operation_context},
+            attempt_id=attempt_context["attempt_id"],
+            logical_key=logical_key,
+            **{key: attempt_context[key] for key in ("operation_id", "capture_id", "capture_digest") if key in attempt_context},
             durable=True,
         )
     if on_progress is not None:
-        on_progress(35)
-    return _run(
-        directory,
-        deployed,
-        ledger,
-        state,
-        due,
-        data_client,
-        build_fund,
-        clock=clock,
-        operation_context=operation_context,
-        on_progress=on_progress,
-    )
+        try:
+            on_progress(35)
+        except Exception as exc:
+            if attempt_context is not None:
+                ledger.log_event(
+                    "tick_aborted",
+                    **attempt_context,
+                    session=due,
+                    no_effects=True,
+                    error=f"{type(exc).__name__}: {exc}",
+                    durable=True,
+                )
+            raise
+    try:
+        return _run(
+            directory,
+            deployed,
+            ledger,
+            state,
+            due,
+            data_client,
+            build_fund,
+            clock=clock,
+            operation_context=attempt_context,
+            on_progress=on_progress,
+        )
+    except Exception as exc:
+        if attempt_context is not None:
+            try:
+                events = ledger.events()
+            except Exception:
+                events = []
+            has_outcome = any(event.get("attempt_id") == attempt_context["attempt_id"] and event.get("kind") in {"tick", "tick_failed", "tick_aborted"} for event in events)
+            if not has_outcome:
+                from hedge_fund.runtime.admission import PaperPreflightBusy
+
+                if isinstance(exc, PaperPreflightBusy):
+                    ledger.log_event(
+                        "tick_aborted",
+                        **attempt_context,
+                        session=due,
+                        no_effects=True,
+                        error=f"{type(exc).__name__}: {exc}",
+                        durable=True,
+                    )
+                else:
+                    ledger.log_event(
+                        "tick_failed",
+                        **attempt_context,
+                        session=due,
+                        error=f"{type(exc).__name__}: {exc}",
+                        durable=True,
+                    )
+                    if ledger.halted() is None:
+                        ledger.halt(f"tick {due} failed: {type(exc).__name__}: {exc}")
+        raise
 
 
 def print_day(time: str) -> str:
