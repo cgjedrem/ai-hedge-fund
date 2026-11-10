@@ -77,6 +77,7 @@ hedge_fund/
 │   ├── operations.py        # P2: logical-operation identity derivation, persistence, acceptance dedup
 │   ├── test_operations.py   # P2: dedup acceptance tests
 │   ├── test_writer_races.py # cross-entry-point duplicate-submission race tests
+│   ├── owned_runner_child.py # P1: blocked-skip recorded via existing durable runner-state write path
 │   └── test_writer_map.py   # WRITER_MAP entries for any new raw writes
 ├── web/
 │   └── services.py          # surface shared refusal reasons (no new write paths)

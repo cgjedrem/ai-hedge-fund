@@ -66,7 +66,7 @@ The operator triggers the same logical action twice in quick succession from dif
 
 ### Functional Requirements
 
-- **FR-001**: Before admitting any new trading-session request for a fund, the system MUST check durable records for any unresolved session intent on that fund and MUST refuse the request when one exists, regardless of the request's identity.
+- **FR-001**: Before admitting any new trading-session request for a fund that was not already resolved by same-request-identity replay, the system MUST check durable records for any unresolved session intent on that fund and MUST refuse the request when one exists, whatever new identity the request carries.
 - **FR-002**: The refusal in FR-001 MUST surface a reason that identifies the unresolved intent and directs the operator to the existing reconciliation path.
 - **FR-003**: The unresolved-intent fence MUST NOT alter the existing same-request-identity replay and reconciliation behavior.
 - **FR-004**: The unresolved-intent fence MUST apply uniformly across all supported entry points (web desk, command line, headless runner).

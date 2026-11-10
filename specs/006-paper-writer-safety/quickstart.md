@@ -2,6 +2,8 @@
 
 **Prerequisites**: Poetry env installed (`poetry install`), Windows or Linux. All scenarios use owned synthetic enrolled test roots (`hedge_fund/runtime/test_bootstrap.py` support) and fake market data. **Never** point these at a real fund directory; `watchtower`/`watchtower-weekly` remain protected and untouched.
 
+**Test naming convention (required)**: new fence tests must contain `intent` in the test ID and new dedup tests must contain `logical` or `duplicate`, so the `-k` filters below cannot silently select zero tests; each scenario run must report a non-zero collected count and the evidence note must record it.
+
 ## Scenario A — Unresolved-intent fence (US1 / FR-001..004)
 
 1. Focused test run (after implementation):

@@ -44,7 +44,7 @@
 
 ### Tests for User Story 1 — write FIRST, ensure they FAIL
 
-- [ ] T006 [P] [US1] Add failing fence tests in `hedge_fund/paper/test_ledger.py`: unresolved intent blocks new-identity request; outcome events (completion, `tick_failed`, redo supersession) resolve it; torn intent metadata fails closed; multiple unresolved intents reported oldest-first without auto-resolution
+- [ ] T006 [P] [US1] Add failing fence tests in `hedge_fund/paper/test_ledger.py`: unresolved intent blocks new-identity request; outcome events (completion, `tick_failed`, redo supersession) resolve it; torn intent metadata fails closed; multiple unresolved intents reported oldest-first without auto-resolution; historical pre-feature intent events in old fixture ledgers parse and classify correctly
 - [ ] T007 [P] [US1] Add failing admission-path tests in `hedge_fund/paper/test_tick.py`: manual/CLI tick refused with reason fields populated; no partial session effects written; same-request-ID retry bypasses the fence into the existing replay/reconciliation path (`paper/ledger.py:760-842` behavior preserved); deliberate redo (`tick --again`) not misclassified
 - [ ] T008 [P] [US1] Add failing cross-entry-point test in `hedge_fund/runtime/test_writer_races.py`: owned-runner child session request against a synthetic fund with an unresolved intent is skipped as blocked and the refusal reason is durably recorded (no retry escalation)
 
@@ -53,7 +53,7 @@
 - [ ] T009 [US1] Implement unresolved-intent read model on `Ledger` in `hedge_fund/paper/ledger.py`: derive unresolved intents from the existing event stream (intent without matching outcome for the same request identity), fail closed on torn metadata, oldest-first reporting; reads only — no new write kind
 - [ ] T010 [US1] Implement the admission guard composing with `require_ready_for_work` in `hedge_fund/paper/ledger.py`, raising/carrying the `unresolved-tick-intent` refusal with contract fields (T004, T009)
 - [ ] T011 [US1] Wire the guard into tick admission in `hedge_fund/paper/tick.py` so CLI, web worker, and owned-runner child (all converging on this path per discovery §1) are fenced; verify placement is after same-request-ID replay lookup (FR-003)
-- [ ] T012 [US1] Surface the refusal in `hedge_fund/run.py` (CLI: non-zero exit, reason + fields on stderr) and `hedge_fund/web/services.py` (existing operation-refusal error shape, no worker dispatch); runner child records the blocked skip in durable runner state
+- [ ] T012 [US1] Surface the refusal in `hedge_fund/run.py` (CLI: non-zero exit, reason + fields on stderr), `hedge_fund/web/services.py` (existing operation-refusal error shape, no worker dispatch), and `hedge_fund/runtime/owned_runner_child.py` (session skipped as blocked, refusal reason recorded via the existing durable runner-state write path, no retry escalation)
 - [ ] T013 [US1] If T009–T012 introduced any new raw write, add the `WRITER_MAP` entry in `hedge_fund/runtime/test_writer_map.py` citing the covering tests; otherwise assert no entry needed
 - [ ] T014 [US1] Run `poetry run pytest hedge_fund/paper hedge_fund/runtime/test_writer_races.py hedge_fund/web -q` and confirm green including all US1 tests
 

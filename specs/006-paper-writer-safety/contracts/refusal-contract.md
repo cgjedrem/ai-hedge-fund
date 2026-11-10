@@ -12,7 +12,7 @@ Raised when FR-001's fence refuses a new-identity session request.
 | `fund` | always | fund identity whose ledger holds the intent |
 | `intent_request_id` | always | request identity of the unresolved intent |
 | `intent_session` | always | target session of the interrupted attempt |
-| `recovery` | always | pointer to the existing reconciliation path (the CLI/web wording differs; the reason code and fields do not) |
+| `recovery` | always | stable string opcode naming the existing reconciliation path (e.g. `reconcile-tick-request`); surfaces render their own wording around the opcode and must not match on message text |
 
 - CLI: non-zero exit, reason + fields on stderr; no partial session effects.
 - Web: existing operation-refusal error shape with this reason code; no worker is dispatched.
