@@ -144,6 +144,7 @@ from hedge_fund.runtime.lifecycle import (
 from hedge_fund.runtime.operations import (
     ConfirmationExpired,
     ConfirmationRejected,
+    DuplicateLogicalOperationRefusal,
     OperationBusy,
     OperationCapacityExceeded,
     OperationConflict,
@@ -265,6 +266,21 @@ def _capacity_denied(subject_id: str, request_id: str) -> ServiceError:
         retry_after_seconds=OPERATION_CAPACITY_RETRY_AFTER_SECONDS,
         subject_id=subject_id,
         request_id=request_id,
+    )
+
+
+def _duplicate_logical_operation_denied(
+    subject_id: str,
+    request_id: str,
+    refusal: DuplicateLogicalOperationRefusal,
+) -> ServiceError:
+    return ServiceError(
+        409,
+        str(refusal),
+        code=refusal.reason,
+        subject_id=subject_id,
+        request_id=request_id,
+        refusal=refusal.fields,
     )
 
 
@@ -1227,6 +1243,8 @@ class DeskService:
                     raise ServiceError(410, "Confirmation expired; review the paper operation again.") from None
                 except (ConfirmationRejected, StalePreview):
                     raise ServiceError(409, "Reviewed paper operation is stale or no longer valid.", code="stale-preview") from None
+                except DuplicateLogicalOperationRefusal as exc:
+                    raise _duplicate_logical_operation_denied(normalized, request.request_id, exc) from None
                 except OperationCapacityExceeded:
                     raise _capacity_denied(normalized, request.request_id) from None
                 except OperationStartUncertain:
@@ -2754,6 +2772,8 @@ class DeskService:
             raise ServiceError(410, "Confirmation expired; review lifecycle again.") from None
         except (ConfirmationRejected, StalePreview, ArchiveConflict, ArchiveNotFound):
             raise ServiceError(409, "Lifecycle review is stale or mismatched.", code="stale-preview") from None
+        except DuplicateLogicalOperationRefusal as exc:
+            raise _duplicate_logical_operation_denied(subject, request.request_id, exc) from None
         except OperationStartUncertain:
             raise ServiceError(409, "Lifecycle transition was interrupted; inspect operation and archive journal.", code="ownership-unknown") from None
         except OperationBusy:
@@ -3079,6 +3099,8 @@ class DeskService:
                 raise ServiceError(410, "Confirmation expired; review the operation again.") from None
             except (ConfirmationRejected, StalePreview):
                 raise ServiceError(409, "Reviewed operation is stale or no longer valid.", code="stale-preview") from None
+            except DuplicateLogicalOperationRefusal as exc:
+                raise _duplicate_logical_operation_denied(subject, request.request_id, exc) from None
             except OperationCapacityExceeded:
                 raise _capacity_denied(subject, request.request_id) from None
             except OperationStartUncertain:

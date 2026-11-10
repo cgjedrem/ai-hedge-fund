@@ -572,7 +572,10 @@ def _fund_dir(name: str, parser: argparse.ArgumentParser) -> Path:
 
 def _lifecycle(args, parser: argparse.ArgumentParser, root: RootContext) -> None:
     from hedge_fund.runtime.admission import AdmissionError
-    from hedge_fund.runtime.operations import OperationError
+    from hedge_fund.runtime.operations import (
+        DuplicateLogicalOperationRefusal,
+        OperationError,
+    )
     from hedge_fund.web.schemas import LifecycleAcceptRequest, LifecyclePreviewRequest
     from hedge_fund.web.services import DeskService, ServiceError
 
@@ -629,7 +632,9 @@ def _lifecycle(args, parser: argparse.ArgumentParser, root: RootContext) -> None
                 )
         print(json.dumps(result, sort_keys=True))
     except (ServiceError, AdmissionError, OperationError, RootPathError, ValueError) as exc:
-        parser.error(f"offline lifecycle denied ({type(exc).__name__}): {exc}")
+        refusal = exc.fields if isinstance(exc, DuplicateLogicalOperationRefusal) else exc.refusal if isinstance(exc, ServiceError) else None
+        detail = json.dumps(refusal, sort_keys=True) if refusal is not None else str(exc)
+        parser.error(f"offline lifecycle denied ({type(exc).__name__}): {detail}")
     finally:
         service.close()
 
