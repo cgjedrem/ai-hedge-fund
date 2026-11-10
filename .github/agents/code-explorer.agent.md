@@ -4,6 +4,7 @@ description: Read-only codebase analyst. Use when user wants to understand archi
 tools:
   ["vscode", "execute", "read", "agent", "search", "web", "browser", "todo"]
 user-invocable: true
+model: gpt-6.1-terra
 ---
 
 # Code Explorer

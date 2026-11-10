@@ -14,6 +14,7 @@ tools:
     "todo",
   ]
 user-invocable: true
+model: kimi-k3
 ---
 
 # Editor
