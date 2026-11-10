@@ -126,6 +126,14 @@ _UNFINISHED_STATUSES = frozenset(
         OperationStatus.CANCEL_REQUESTED.value,
     }
 )
+_LOGICAL_DEDUP_STATUSES = frozenset(
+    {
+        OperationStatus.ACCEPTED.value,
+        OperationStatus.RUNNING.value,
+        OperationStatus.CANCEL_REQUESTED.value,
+        OperationStatus.INTERRUPTED.value,
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -219,6 +227,7 @@ class OperationRecord:
     fence_generation: int = 0
     created_at: str = ""
     updated_at: str = ""
+    logical_key: str | None = None
 
     def __post_init__(self) -> None:
         _validate_operation_id(self.operation_id)
@@ -231,6 +240,8 @@ class OperationRecord:
             raise OperationError("operation request digest is invalid")
         if not isinstance(self.capture_digest, str) or not _SHA256.fullmatch(self.capture_digest):
             raise OperationError("operation capture digest is invalid")
+        if self.logical_key is not None and (not isinstance(self.logical_key, str) or not _SHA256.fullmatch(self.logical_key)):
+            raise OperationError("operation logical key is invalid")
         if not isinstance(self.status, OperationStatus):
             raise OperationError("operation status is invalid")
         if type(self.progress) is not int or not 0 <= self.progress <= 100:
@@ -442,6 +453,12 @@ class OperationStore:
             raise OperationError("request head is invalid")
         normalized_payload = _normalize_payload(payload)
         payload_digest = _sha256(_canonical_json(normalized_payload))
+        logical_key = derive_logical_operation_key(
+            subject_id=subject_id,
+            action=action,
+            target=due_set,
+            payload_digest=payload_digest,
+        )
         operator_hash = _sha256(_validate_session(operator_session).encode("utf-8"))
         token_hash = _sha256(confirmation_token.encode("utf-8"))
         request_digest = _sha256(
@@ -531,6 +548,10 @@ class OperationStore:
                     raise StalePreview("reviewed payload changed")
                 if resolved_state is not None and resolved_state != (expected_head, due_set):
                     raise StalePreview("current head or due-set changed")
+                matching_operations = [item for item in index["operations"].values() if item.get("logical_key") == logical_key and item.get("status") in _LOGICAL_DEDUP_STATUSES]
+                if matching_operations:
+                    existing_operation = min(matching_operations, key=lambda item: (item["created_at"], item["operation_id"]))
+                    raise DuplicateLogicalOperationRefusal(existing_operation["operation_id"], logical_key)
                 if capacity is not None:
                     capacity_actions, capacity_limit = capacity
                     unfinished = sum(1 for item in index["operations"].values() if item.get("action") in capacity_actions and item.get("status") in _UNFINISHED_STATUSES)
@@ -547,6 +568,7 @@ class OperationStore:
                     "preview_id": preview_id,
                     "action": action,
                     "subject_id": subject_id,
+                    "logical_key": logical_key,
                     "capture_id": preview["capture_id"],
                     "capture_digest": preview["capture_digest"],
                     "status": OperationStatus.ACCEPTED.value,
@@ -1306,6 +1328,7 @@ class OperationStore:
                 fence_generation=entry["fence_generation"],
                 created_at=entry["created_at"],
                 updated_at=entry["updated_at"],
+                logical_key=entry.get("logical_key"),
             )
         except (KeyError, ValueError, TypeError):
             raise OperationError("operation record is invalid") from None
@@ -1598,7 +1621,7 @@ def _validate_index(index: dict[str, Any]) -> None:
             raise OperationError("preview digest is invalid")
 
     for operation_id, operation in index["operations"].items():
-        if not isinstance(operation_id, str) or not _HEX_ID.fullmatch(operation_id) or set(operation) != operation_fields:
+        if not isinstance(operation_id, str) or not _HEX_ID.fullmatch(operation_id) or not isinstance(operation, dict) or set(operation) not in (operation_fields, operation_fields | {"logical_key"}):
             raise OperationError("operation storage is invalid")
         if type(operation.get("schema")) is not int or operation["schema"] != 1 or operation.get("operation_id") != operation_id:
             raise OperationError("operation storage is invalid")
@@ -1620,6 +1643,8 @@ def _validate_index(index: dict[str, Any]) -> None:
             raise OperationError("operation storage is invalid")
         if not isinstance(operation.get("capture_digest"), str) or not _SHA256.fullmatch(operation["capture_digest"]):
             raise OperationError("operation storage is invalid")
+        if "logical_key" in operation and (not isinstance(operation["logical_key"], str) or not _SHA256.fullmatch(operation["logical_key"])):
+            raise OperationError("operation logical key is invalid")
         if type(operation.get("fence_generation")) is not int or operation["fence_generation"] < 0:
             raise OperationError("operation storage is invalid")
         if type(operation.get("progress")) is not int or not 0 <= operation["progress"] <= 100:
@@ -1729,6 +1754,37 @@ def _validate_due_set(value: object) -> tuple[str, ...]:
     if not isinstance(value, tuple) or len(value) > 10000 or any(not _safe_text(item, maximum=256) for item in value) or len(set(value)) != len(value):
         raise OperationError("operation due-set is invalid")
     return value
+
+
+def derive_logical_operation_key(
+    *,
+    subject_id: object,
+    action: object,
+    target: object,
+    payload_digest: object,
+) -> str:
+    """Return canonical digest for reviewed action identity."""
+    normalized_subject = _validate_subject(subject_id)
+    normalized_action = _validate_action(action)
+    if isinstance(target, str):
+        normalized_target = (target,)
+    elif isinstance(target, (list, tuple)) and len(target) <= 10000:
+        normalized_target = tuple(target)
+    else:
+        raise OperationError("operation target is invalid")
+    normalized_target = _validate_due_set(normalized_target)
+    if not isinstance(payload_digest, str) or not _SHA256.fullmatch(payload_digest):
+        raise OperationError("reviewed payload digest is invalid")
+    return _sha256(
+        _canonical_json(
+            {
+                "subject_id": normalized_subject,
+                "action": normalized_action,
+                "target": list(normalized_target),
+                "payload_digest": payload_digest,
+            }
+        )
+    )
 
 
 def _validate_request_id(value: object) -> str:
