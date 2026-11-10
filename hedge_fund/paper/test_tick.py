@@ -289,6 +289,108 @@ def test_tick_request_id_replays_record_and_conflicts_on_changed_payload(tmp_pat
         )
 
 
+@pytest.mark.parametrize("request_id", ["fresh-tick", None])
+def test_new_identity_intent_fence_refuses_before_tick_effects(tmp_path, clock, SPEC, request_id):
+    from hedge_fund.paper.ledger import UnresolvedTickIntentRefusal
+
+    directory = deploy("alpha", SPEC, ["AAPL"], root=tmp_path)
+    clock("2024-06-04")
+    ledger = Ledger(directory)
+    intent_digest = ledger.tick_request_digest(
+        "interrupted-tick",
+        expected_head=None,
+        session=None,
+    )
+    ledger.log_event(
+        "tick_intent",
+        request_id="interrupted-tick",
+        request_action="tick",
+        request_digest=intent_digest,
+        expected_head=None,
+        requested_session=None,
+        session="2024-06-03",
+        durable=True,
+    )
+    events_before = ledger.events()
+    broker_before = (directory / "broker.json").read_bytes()
+
+    with pytest.raises(UnresolvedTickIntentRefusal) as refused:
+        tick(
+            directory,
+            FakeDataClient(SERIES),
+            build_fund=build_fund,
+            request_id=request_id,
+            expected_head=None,
+        )
+
+    assert refused.value.fields == {
+        "reason": "unresolved-tick-intent",
+        "fund": "alpha",
+        "intent_request_id": "interrupted-tick",
+        "intent_session": "2024-06-03",
+        "recovery": "reconcile-tick-request",
+    }
+    assert ledger.events() == events_before
+    assert ledger.sessions() == []
+    assert (directory / "broker.json").read_bytes() == broker_before
+
+
+def test_same_identity_intent_retry_uses_existing_reconciliation_lookup(tmp_path, clock, SPEC):
+    from hedge_fund.paper.ledger import PaperReconciliationRequired
+
+    directory = deploy("alpha", SPEC, ["AAPL"], root=tmp_path)
+    clock("2024-06-04")
+    ledger = Ledger(directory)
+    request_id = "interrupted-tick"
+    request_digest = ledger.tick_request_digest(request_id, expected_head=None, session=None)
+    ledger.log_event(
+        "tick_intent",
+        request_id=request_id,
+        request_action="tick",
+        request_digest=request_digest,
+        expected_head=None,
+        requested_session=None,
+        session="2024-06-03",
+        durable=True,
+    )
+    events_before = ledger.events()
+    broker_before = (directory / "broker.json").read_bytes()
+
+    with pytest.raises(PaperReconciliationRequired, match="outcome is uncertain"):
+        tick(
+            directory,
+            FakeDataClient(SERIES),
+            build_fund=build_fund,
+            request_id=request_id,
+            expected_head=None,
+        )
+
+    assert ledger.events() == events_before
+    assert (directory / "broker.json").read_bytes() == broker_before
+
+
+def test_redo_supersedes_intent_without_becoming_a_duplicate_request(tmp_path, clock, SPEC):
+    directory = deploy("alpha", SPEC, ["AAPL"], root=tmp_path)
+    clock("2024-06-04")
+    first = _tick(directory)
+    ledger = Ledger(directory)
+    ledger.log_event(
+        "tick_intent",
+        request_id="interrupted-after-append",
+        request_action="tick",
+        request_digest="4" * 64,
+        expected_head=first.prev_hash,
+        requested_session=first.session,
+        session=first.session,
+        durable=True,
+    )
+
+    replayed = redo(directory, FakeDataClient(SERIES), build_fund=build_fund)
+
+    assert replayed.session == first.session
+    assert Ledger(directory).unresolved_tick_intents() == ()
+
+
 def test_uncertain_tick_request_never_repeats_work(tmp_path, clock, SPEC):
     from hedge_fund.paper.ledger import PaperReconciliationRequired
 

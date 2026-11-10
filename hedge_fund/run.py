@@ -1293,6 +1293,8 @@ def _run_cli_tick(
     expected_head: str | None,
     authorization=None,
 ):
+    from hedge_fund.paper.ledger import UnresolvedTickIntentRefusal
+
     _require_cli_sim_account_ownership(deployed.broker, parser)
 
     def execute():
@@ -1332,7 +1334,10 @@ def _run_cli_tick(
                 halted = ledger.halted()
                 if halted is not None:
                     raise FundHalted(f"{name} is halted: {halted}")
-                ledger.require_ready_for_work(state, approval_required=deployed.spec.approval_required)
+                if again:
+                    ledger.require_ready_for_work(state, approval_required=deployed.spec.approval_required)
+                else:
+                    ledger.require_ready_for_tick(state, approval_required=deployed.spec.approval_required)
         except PaperReconciliationRequired:
             ledger.halt("approval journal requires reconciliation")
             raise
@@ -1422,10 +1427,13 @@ def _run_cli_tick(
                     request_id=request_id,
                 )
 
-    if participant is None:
-        return execute()
-    with _paper_lane(participant, name, "manual_session"):
-        return execute()
+    try:
+        if participant is None:
+            return execute()
+        with _paper_lane(participant, name, "manual_session"):
+            return execute()
+    except UnresolvedTickIntentRefusal as exc:
+        parser.error(f"{exc.reason}: {json.dumps(exc.fields, sort_keys=True)}")
 
 
 # ---------------------------------------------------------------------------

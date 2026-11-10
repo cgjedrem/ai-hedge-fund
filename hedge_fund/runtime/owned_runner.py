@@ -55,6 +55,7 @@ _MAX_OPERATION_SECONDS = 24 * 60 * 60
 # Cold interpreter start plus enrollment checks can exceed 8s on loaded Windows hosts.
 _READINESS_TIMEOUT_SECONDS = 30.0
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_REQUEST_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _SESSION_KEY = re.compile(r"^\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}:\d{2})?$")
 _ACTIVE_STATES = frozenset({"starting", "running", "stopping"})
 _TERMINAL_STATES = frozenset({"completed", "stopped", "failed"})
@@ -667,7 +668,7 @@ def validate_runner_state(
         "pid",
         "process_identity",
     }
-    optional = {"started_at", "updated_at"}
+    optional = {"started_at", "updated_at", "refusal"}
     if not required.issubset(state) or set(state) - required - optional:
         return False
     try:
@@ -697,6 +698,24 @@ def validate_runner_state(
         reason = state["reason"]
         if reason is not None and (not isinstance(reason, str) or not 1 <= len(reason) <= 128 or any(not (char.isascii() and (char.isalnum() or char in "._-")) for char in reason)):
             return False
+        if "refusal" in state:
+            refusal = state["refusal"]
+            if (
+                not isinstance(refusal, dict)
+                or set(refusal) != {"reason", "fund", "intent_request_id", "intent_session", "recovery"}
+                or refusal.get("reason") != "unresolved-tick-intent"
+                or refusal.get("fund") != name
+                or not isinstance(refusal.get("intent_request_id"), str)
+                or not _REQUEST_ID.fullmatch(refusal["intent_request_id"])
+                or not isinstance(refusal.get("intent_session"), str)
+                or not 1 <= len(refusal["intent_session"]) <= 256
+                or any(ord(char) < 32 or ord(char) == 127 for char in refusal["intent_session"])
+                or not isinstance(refusal.get("recovery"), str)
+                or refusal["recovery"] != "reconcile-tick-request"
+                or state["status"] != "failed"
+                or state["reason"] != "unresolved-tick-intent"
+            ):
+                return False
         pid = state["pid"]
         identity = state["process_identity"]
         if pid is None:

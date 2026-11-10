@@ -357,7 +357,7 @@ def _tick(
 
     try:
         with _preflight_control(directory, deployed.name):
-            ledger.require_ready_for_work(state, approval_required=spec.approval_required)
+            ledger.require_ready_for_tick(state, approval_required=spec.approval_required)
     except PaperReconciliationRequired:
         ledger.halt("approval journal requires reconciliation")
         raise

@@ -22,6 +22,7 @@ from hedge_fund.paper.ledger import (
     AuditObservationUnavailable,
     Ledger,
     PaperReconciliationRequired,
+    UnresolvedTickIntentRefusal,
 )
 from hedge_fund.paper.tick import next_session, tick
 from hedge_fund.pipeline.session import code_version, mandate_hash
@@ -341,8 +342,8 @@ def _runner_loop(
         boundary_check=dispatch_fence,
         resolver=resolver,
     )
-    last_session = None
-    sessions_completed = 0
+    last_session = status.get("last_session")
+    sessions_completed = status.get("sessions_completed", 0)
     try:
         while not stop_event.is_set():
             moment = _validated_now(now())
@@ -474,6 +475,11 @@ def _runner_loop(
             _write_status(root, fund, nonce_hash, status)
             if stop_event.is_set():
                 break
+    except UnresolvedTickIntentRefusal as exc:
+        status["status"] = "failed"
+        status["reason"] = exc.reason
+        status["refusal"] = exc.fields
+        raise
     except AuthorizationDenied as exc:
         if stop_event.is_set():
             status["status"] = "stopped"

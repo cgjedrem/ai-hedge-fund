@@ -291,7 +291,8 @@ _ENVELOPE_KEYS = {"detail", "code", "message", "refresh_required", "retry_policy
 def _assert_envelope(response, status, code, *, root=None):
     body = response.json()
     assert response.status_code == status
-    assert set(body) - {"retry_after_seconds"} == _ENVELOPE_KEYS
+    optional = {"retry_after_seconds", "refusal"} & set(body)
+    assert set(body) - optional == _ENVELOPE_KEYS
     assert body["code"] == code
     assert isinstance(body["message"], str) and body["message"]
     assert isinstance(body["refresh_required"], bool)
@@ -421,6 +422,34 @@ def test_service_errors_map_to_contract_codes(tmp_path, status, code, refresh, r
     body = _assert_envelope(response, status, code or {410: "expired-confirmation", 422: "readiness-denied", 429: "capacity-denied", 503: "assets-unavailable"}[status])
     assert body["refresh_required"] is refresh
     assert body["retry_policy"] == retry
+
+
+def test_unresolved_intent_refusal_reaches_web_error_envelope(tmp_path):
+    from hedge_fund.web.services import ServiceError
+
+    fields = {
+        "reason": "unresolved-tick-intent",
+        "fund": "alpha",
+        "intent_request_id": "interrupted-web-tick",
+        "intent_session": "2025-01-06",
+        "recovery": "reconcile-tick-request",
+    }
+    app = create_app(root=tmp_path)
+
+    def fail():
+        raise ServiceError(
+            409,
+            "Unresolved tick intent blocks this session.",
+            code="unresolved-tick-intent",
+            refusal=fields,
+        )
+
+    app.state.service.catalog = fail
+    with TestClient(app) as client:
+        response = client.get("/api/catalog", headers=LOOPBACK)
+
+    body = _assert_envelope(response, 409, "unresolved-tick-intent")
+    assert body["refusal"] == fields
 
 
 def test_service_error_rejects_codes_outside_the_contract():

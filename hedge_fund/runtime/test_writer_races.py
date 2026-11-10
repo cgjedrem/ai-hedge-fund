@@ -300,6 +300,130 @@ def _paper_files(root: Path, fund: str) -> dict[str, bytes]:
     return {str(path.relative_to(directory)): path.read_bytes() for path in directory.rglob("*") if path.is_file()}
 
 
+def test_owned_runner_intent_refusal_is_durable_and_not_retried(tmp_path, monkeypatch):
+    from hedge_fund.paper.ledger import UnresolvedTickIntentRefusal
+    from hedge_fund.runtime.capture import freeze_capture
+    from hedge_fund.runtime.configuration import resolve_settings
+    from hedge_fund.runtime.handover import record_ledger_head
+    from hedge_fund.runtime.owned_runner import (
+        read_runner_record,
+        validate_runner_state,
+        write_runner_record,
+    )
+    from hedge_fund.runtime.owned_runner_child import run_owned_runner
+    from hedge_fund.runtime.test_owned_runner_child import (
+        _DUE_SESSION,
+        _fund_spec,
+        _GuardedOfflineDataClient,
+        _INITIAL_SESSION,
+        _install_runner_records,
+        _OfflineDataClient,
+        _OfflineFund,
+        _RUNNER_NOW,
+    )
+
+    root_path = tmp_path / "owned-runner-root"
+    root_path.mkdir()
+    spec = _fund_spec()
+    data_client = _OfflineDataClient()
+    data_client.release.set()
+    with RootContext.open(root_path) as root:
+        enroll_fresh(root)
+        with RootOwnerLease.acquire(root) as owner:
+            admission = AdmissionCoordinator(root, owner_lease=owner)
+            with admission.deployment_lock("alpha", timeout=0):
+                directory = deploy("alpha", spec, ["AAPL"], root=root_path / "paper")
+            initial = _record("alpha", _INITIAL_SESSION)
+            ledger = Ledger(directory)
+            with admission.runner_reservation("alpha", timeout=0):
+                with admission.execution_lease("alpha", timeout=0):
+                    ledger.append(initial)
+            record_ledger_head(root, "alpha", admission=admission)
+            settings = resolve_settings(
+                root,
+                launch={
+                    "data_provider": "yfinance",
+                    "model": "gemma3:4b",
+                    "endpoint": "http://127.0.0.1:11434",
+                },
+            )
+            capture = freeze_capture(
+                root=root,
+                subject_id="alpha",
+                mandate_digest=mandate_hash(spec),
+                universe=("AAPL",),
+                broker="paper",
+                settings=settings,
+                credential_versions={},
+                code_version=code_version(),
+                mandate_snapshot=spec.model_dump(mode="json"),
+            )
+            _install_runner_records(root, "alpha", capture, _INITIAL_SESSION)
+            launch = read_runner_record(root, "alpha", "launch")
+            launch["authorization"]["max_sessions"] = 1
+            write_runner_record(root, "alpha", "launch", launch)
+            state = read_runner_record(root, "alpha", "state")
+            state["max_sessions"] = 1
+            write_runner_record(root, "alpha", "state", state)
+            interrupted_id = "interrupted-runner-tick"
+            interrupted_digest = ledger.tick_request_digest(
+                interrupted_id,
+                expected_head=initial.hash,
+                session=_DUE_SESSION,
+            )
+            with admission.runner_reservation("alpha", timeout=0):
+                with admission.execution_lease("alpha", timeout=0):
+                    ledger.log_event(
+                        "tick_intent",
+                        request_id=interrupted_id,
+                        request_action="tick",
+                        request_digest=interrupted_digest,
+                        expected_head=initial.hash,
+                        requested_session=_DUE_SESSION,
+                        session=_DUE_SESSION,
+                        durable=True,
+                    )
+            events_before = ledger.events()
+            broker_before = (directory / "broker.json").read_bytes()
+            import hedge_fund.runtime.owned_runner_child as owned_runner_child
+
+            original_tick = owned_runner_child.tick
+            attempts = []
+
+            def observed_tick(*args, **kwargs):
+                attempts.append(dict(kwargs))
+                return original_tick(*args, **kwargs)
+
+            monkeypatch.setattr(owned_runner_child, "tick", observed_tick)
+            with pytest.raises(UnresolvedTickIntentRefusal):
+                run_owned_runner(
+                    root,
+                    "alpha",
+                    data_client_factory=lambda _capture, _root, dispatch: _GuardedOfflineDataClient(data_client, dispatch),
+                    build_fund=_OfflineFund,
+                    now=lambda: _RUNNER_NOW,
+                    resolver=lambda _host, _port: ["93.184.216.34"],
+                )
+
+            final = read_runner_record(root, "alpha", "state")
+            assert final["status"] == "failed"
+            assert final["reason"] == "unresolved-tick-intent"
+            assert validate_runner_state(root, "alpha", final)
+            assert final["refusal"] == {
+                "reason": "unresolved-tick-intent",
+                "fund": "alpha",
+                "intent_request_id": interrupted_id,
+                "intent_session": _DUE_SESSION,
+                "recovery": "reconcile-tick-request",
+            }
+            assert final["sessions_completed"] == 0
+            assert final["last_session"] == _INITIAL_SESSION
+            assert len(attempts) == 1
+            assert ledger.sessions() == [_INITIAL_SESSION]
+            assert ledger.events() == events_before
+            assert (directory / "broker.json").read_bytes() == broker_before
+
+
 def test_two_process_audit_appends_are_complete_and_uninterleaved(race_root, tmp_path, owned_test_process):
     root, _admission = race_root
     go = tmp_path / "audit-go"

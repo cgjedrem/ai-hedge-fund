@@ -1462,6 +1462,70 @@ def test_cli_tick_request_replay_skips_provider_and_binds_expected_head(tmp_path
     assert capsys.readouterr().out.strip() == first["hash"]
 
 
+def test_cli_new_tick_identity_surfaces_unresolved_intent_without_effects(tmp_path, monkeypatch, capsys, offline):
+    from hedge_fund.paper.ledger import Ledger
+    from hedge_fund.runtime.admission import AdmissionCoordinator, RootOwnerLease
+    from hedge_fund.runtime.root import RootContext
+
+    path = _mandate(tmp_path)
+    _enroll_test_root(tmp_path)
+    offline("2025-01-07")
+    _main(monkeypatch, "paper", "create", "alpha", "--mandate", str(path), "--universe", "AAPL")
+    capsys.readouterr()
+
+    directory = tmp_path / "paper" / "alpha"
+    ledger = Ledger(directory)
+    interrupted_id = "interrupted-cli-tick"
+    digest = ledger.tick_request_digest(interrupted_id, expected_head=None, session=None)
+    with RootContext.open(tmp_path) as root:
+        owner = RootOwnerLease.acquire(root)
+        try:
+            admission = AdmissionCoordinator(root, owner_lease=owner)
+            with paths.bound_root(root), admission.manual_session("alpha", timeout=0):
+                ledger.log_event(
+                    "tick_intent",
+                    request_id=interrupted_id,
+                    request_action="tick",
+                    request_digest=digest,
+                    expected_head=None,
+                    requested_session=None,
+                    session="2025-01-06",
+                    durable=True,
+                )
+        finally:
+            owner.close()
+
+    events_before = ledger.events()
+    broker_before = (directory / "broker.json").read_bytes()
+
+    def forbidden_provider(*_args, **_kwargs):
+        pytest.fail("unresolved tick intent reached a provider")
+
+    monkeypatch.setattr(run, "make_data_client", forbidden_provider)
+    with pytest.raises(SystemExit) as refused:
+        _main(
+            monkeypatch,
+            "paper",
+            "tick",
+            "alpha",
+            "--expected-head",
+            "none",
+            "--request-id",
+            "new-cli-tick",
+        )
+
+    error = capsys.readouterr().err
+    assert refused.value.code != 0
+    assert "unresolved-tick-intent" in error
+    assert '"fund": "alpha"' in error
+    assert f'"intent_request_id": "{interrupted_id}"' in error
+    assert '"intent_session": "2025-01-06"' in error
+    assert '"recovery": "reconcile-tick-request"' in error
+    assert ledger.events() == events_before
+    assert ledger.sessions() == []
+    assert (directory / "broker.json").read_bytes() == broker_before
+
+
 def test_cli_halt_request_id_replays_and_conflicts_on_reason(tmp_path, monkeypatch, capsys, offline):
     from hedge_fund.paper.ledger import Ledger
 

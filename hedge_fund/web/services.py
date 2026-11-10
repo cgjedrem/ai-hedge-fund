@@ -66,6 +66,7 @@ from hedge_fund.paper.ledger import (
     LedgerError,
     PaperReconciliationRequired,
     PaperRequestConflict,
+    UnresolvedTickIntentRefusal,
 )
 from hedge_fund.paper.tick import following_session, next_session, tick
 from hedge_fund.pipeline.session import (
@@ -195,6 +196,7 @@ from hedge_fund.web.schemas import (
     RunnerStartAcceptRequest,
     RuntimeSettingsRequest,
     valid_retry_after,
+    validate_refusal_payload,
     ValuationRefreshRequest,
 )
 from hedge_fund.web.valuation import estimate_valuation, MAX_VALUATION_POSITIONS
@@ -223,6 +225,7 @@ class ServiceError(RuntimeError):
         subject_id: str | None = None,
         request_id: str | None = None,
         current_head: str | None = None,
+        refusal: dict[str, str] | None = None,
         retry_policy: str | None = None,
         retry_after_seconds: int | None = None,
     ) -> None:
@@ -233,6 +236,9 @@ class ServiceError(RuntimeError):
         self.subject_id = subject_id
         self.request_id = request_id
         self.current_head = current_head
+        self.refusal = validate_refusal_payload(refusal)
+        if self.refusal is not None and self.refusal["reason"] != self.code:
+            raise ValueError("operation refusal code does not match its fields")
         if retry_policy is not None and retry_policy not in RETRY_POLICIES:
             raise ValueError(f"unknown retry policy: {retry_policy}")
         self.retry_policy = retry_policy
@@ -1165,7 +1171,11 @@ class DeskService:
             raise ServiceError(409, "Reviewed ledger head changed; review again.", code="stale-preview")
 
         def current_state() -> tuple[str | None, tuple[str, ...]]:
-            return self._resolve_paper_schedule(normalized, capture)
+            return self._resolve_paper_schedule(
+                normalized,
+                capture,
+                request_id=request.request_id,
+            )
 
         def start_worker(operation: OperationRecord) -> None:
             selected_capture = self._captures.get(operation.capture_id)
@@ -1311,7 +1321,12 @@ class DeskService:
                         raise ServiceError(409, "Paper ledger head changed after review.", code="stale-preview")
                     if state.halted is not None:
                         raise ServiceError(423, "Halted funds cannot run a paper tick.", code="halted")
-                    self._require_paper_work_ready(deployed, ledger, state)
+                    self._require_paper_work_ready(
+                        deployed,
+                        ledger,
+                        state,
+                        request_id=operation.request_id,
+                    )
                     if head != payload["expected_head"]:
                         raise ServiceError(409, "Paper ledger head changed after review.", code="stale-preview")
                     progress(20)
@@ -1448,6 +1463,8 @@ class DeskService:
         self,
         name: str,
         capture: FrozenCapture,
+        *,
+        request_id: str | None = None,
     ) -> tuple[str | None, tuple[str, ...]]:
         self._verify_root_inventory()
         directory, deployed, ledger, state, latest = self._paper_state(
@@ -1458,7 +1475,12 @@ class DeskService:
             raise ServiceError(409, "Paper deployment changed after review.", code="stale-preview")
         if state.halted is not None:
             raise ServiceError(423, "Halted funds cannot accept a paper operation.", code="halted")
-        self._require_paper_work_ready(deployed, ledger, state)
+        self._require_paper_work_ready(
+            deployed,
+            ledger,
+            state,
+            request_id=request_id,
+        )
         head = latest.hash if latest is not None else None
         preview_dispatch = self._authorize_manual_capture(
             capture,
@@ -3973,13 +3995,29 @@ class DeskService:
             raise ServiceError(423, f"Paper state is invalid ({type(exc).__name__}).", code="replay-corrupt") from None
         return state, latest
 
-    def _require_paper_work_ready(self, deployed: DeployedFund, ledger: Ledger, state: FundState) -> None:
+    def _require_paper_work_ready(
+        self,
+        deployed: DeployedFund,
+        ledger: Ledger,
+        state: FundState,
+        *,
+        request_id: str | None = None,
+    ) -> None:
         try:
             with self._paper_control_lane(deployed.name, verify_inventory=False):
                 if ledger.halted() is not None:
                     raise ServiceError(423, "Halted funds cannot accept a paper operation.", code="halted")
                 try:
-                    ledger.require_ready_for_work(state, approval_required=deployed.spec.approval_required)
+                    ledger.require_ready_for_tick(state, approval_required=deployed.spec.approval_required)
+                except UnresolvedTickIntentRefusal as exc:
+                    raise ServiceError(
+                        409,
+                        str(exc),
+                        code=exc.reason,
+                        subject_id=deployed.name,
+                        request_id=request_id,
+                        refusal=exc.fields,
+                    ) from None
                 except PaperReconciliationRequired:
                     if self._admission.lane_is_held("runner", deployed.name) and self._admission.lane_is_held("execution", deployed.name):
                         ledger.halt("approval journal requires reconciliation")

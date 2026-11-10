@@ -35,6 +35,7 @@ import os
 import re
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from math import isfinite
 from pathlib import Path
@@ -62,12 +63,14 @@ _BAR_FILE = re.compile(r"(\d{2})(\d{2})(\d{2})")
 _HASH = re.compile(r"[0-9a-f]{64}")
 _APPROVAL_ID = re.compile(r"[0-9a-f]{32}")
 _REQUEST_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
+_SESSION_KEY = re.compile(r"\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}:\d{2})?")
 _DEPLOYMENT_LANES = (("deployment",),)
 _EXECUTION_LANES = (("runner", "execution"),)
 _CONTROL_LANES = (("control",), ("runner", "execution"))
 _HALT_LANES = (("halt",),) + _CONTROL_LANES
 UNRESOLVED_TICK_INTENT_REASON = "unresolved-tick-intent"
 TICK_INTENT_RECOVERY = "reconcile-tick-request"
+_UNREADABLE_INTENT_FIELD = "unreadable"
 
 
 class LedgerError(RuntimeError):
@@ -133,6 +136,14 @@ class HaltAuditUnavailable(LedgerError):
 
 class AuditObservationUnavailable(LedgerError):
     """A stable paper audit observation could not be obtained."""
+
+
+@dataclass(frozen=True, slots=True)
+class UnresolvedTickIntent:
+    request_id: str
+    session: str
+    recorded_at: str
+    metadata_complete: bool
 
 
 class Ledger:
@@ -346,6 +357,62 @@ class Ledger:
         event = self._latest_approval_event(state.pending.as_of, state.prev_hash, strict=True)
         if event is not None and (event.get("kind") in {"consume", "tick"} or event.get("consumed") is True):
             raise PaperReconciliationRequired("approval consumption is incomplete; reconciliation is required")
+
+    def require_ready_for_tick(self, state: FundState, *, approval_required: bool) -> None:
+        self.require_ready_for_work(state, approval_required=approval_required)
+        unresolved = self.unresolved_tick_intents()
+        if unresolved:
+            intent = unresolved[0]
+            raise UnresolvedTickIntentRefusal(
+                self.directory.name,
+                intent.request_id,
+                intent.session,
+            )
+
+    def unresolved_tick_intents(self) -> tuple[UnresolvedTickIntent, ...]:
+        try:
+            events = self.events()
+        except AuditObservationUnavailable:
+            raise
+        except (LedgerError, OSError, UnicodeError, ValueError):
+            return (_unreadable_tick_intent(),)
+        if not isinstance(events, list):
+            return (_unreadable_tick_intent(),)
+
+        pending: list[tuple[int, dict, UnresolvedTickIntent]] = []
+        outcomes_by_request: dict[str, list[dict]] = {}
+        redo_by_session: dict[str, int] = {}
+        for index, event in enumerate(events):
+            if not isinstance(event, dict) or not isinstance(event.get("kind"), str):
+                return (_unreadable_tick_intent(),)
+            kind = event["kind"]
+            if kind == "tick_intent":
+                pending.append((index, event, _tick_intent_view(event)))
+            elif kind in {"tick", "tick_failed"}:
+                request_id = event.get("request_id")
+                if isinstance(request_id, str):
+                    outcomes_by_request.setdefault(request_id, []).append(event)
+            elif kind == "redo":
+                session = event.get("session")
+                superseded = event.get("superseded")
+                if _valid_session_key(session) and isinstance(superseded, str) and _HASH.fullmatch(superseded) and _valid_recorded_at(event.get("time")):
+                    redo_by_session[session] = index
+
+        unresolved = []
+        for index, event, intent in pending:
+            if not intent.metadata_complete:
+                unresolved.append(intent)
+                continue
+            outcomes = outcomes_by_request.get(intent.request_id, [])
+            if outcomes:
+                if len(outcomes) == 1 and _tick_outcome_matches(event, outcomes[0]):
+                    continue
+                unresolved.append(intent)
+                continue
+            if redo_by_session.get(intent.session, -1) > index:
+                continue
+            unresolved.append(intent)
+        return tuple(unresolved)
 
     def observe_approval_for_display(self, state: FundState, *, approval_required: bool) -> dict[str, str] | None:
         """Observe a stable approval state without granting execution authority."""
@@ -1712,6 +1779,80 @@ class Ledger:
             raise AuditObservationUnavailable("paper audit observation is temporarily unavailable") from exc
         except AdmissionError as exc:
             raise LedgerError("paper audit observation failed") from exc
+
+
+def _unreadable_tick_intent() -> UnresolvedTickIntent:
+    return UnresolvedTickIntent(
+        request_id=_UNREADABLE_INTENT_FIELD,
+        session=_UNREADABLE_INTENT_FIELD,
+        recorded_at=_UNREADABLE_INTENT_FIELD,
+        metadata_complete=False,
+    )
+
+
+def _tick_intent_view(event: dict) -> UnresolvedTickIntent:
+    request_id = event.get("request_id")
+    session = event.get("session")
+    recorded_at = event.get("time")
+    request_id_valid = isinstance(request_id, str) and _REQUEST_ID.fullmatch(request_id) is not None
+    session_valid = _valid_session_key(session)
+    recorded_at_valid = _valid_recorded_at(recorded_at)
+    request_digest = event.get("request_digest")
+    expected_head = event.get("expected_head")
+    requested_session = event.get("requested_session")
+    operation_fields = {"operation_id", "capture_id", "capture_digest"}
+    present_operation_fields = operation_fields.intersection(event)
+    operation_fields_valid = not present_operation_fields or (
+        present_operation_fields == operation_fields and isinstance(event.get("operation_id"), str) and _APPROVAL_ID.fullmatch(event["operation_id"]) is not None and isinstance(event.get("capture_id"), str) and _APPROVAL_ID.fullmatch(event["capture_id"]) is not None and isinstance(event.get("capture_digest"), str) and _HASH.fullmatch(event["capture_digest"]) is not None
+    )
+    metadata_complete = (
+        request_id_valid
+        and session_valid
+        and recorded_at_valid
+        and event.get("request_action") == "tick"
+        and isinstance(request_digest, str)
+        and _HASH.fullmatch(request_digest) is not None
+        and "expected_head" in event
+        and (expected_head is None or isinstance(expected_head, str) and _HASH.fullmatch(expected_head) is not None)
+        and "requested_session" in event
+        and (requested_session is None or _valid_session_key(requested_session))
+        and operation_fields_valid
+    )
+    return UnresolvedTickIntent(
+        request_id=request_id if request_id_valid else _UNREADABLE_INTENT_FIELD,
+        session=session if session_valid else _UNREADABLE_INTENT_FIELD,
+        recorded_at=recorded_at if recorded_at_valid else _UNREADABLE_INTENT_FIELD,
+        metadata_complete=metadata_complete,
+    )
+
+
+def _tick_outcome_matches(intent: dict, outcome: dict) -> bool:
+    if outcome.get("request_id") != intent.get("request_id") or outcome.get("request_action") != "tick" or outcome.get("request_digest") != intent.get("request_digest") or outcome.get("expected_head") != intent.get("expected_head") or outcome.get("session") != intent.get("session"):
+        return False
+    if outcome.get("kind") == "tick_failed":
+        return isinstance(outcome.get("error"), str) and bool(outcome["error"])
+    result = outcome.get("result")
+    return isinstance(result, dict) and set(result) == {"session", "hash"} and result.get("session") == intent.get("session") and isinstance(result.get("hash"), str) and _HASH.fullmatch(result["hash"]) is not None
+
+
+def _valid_session_key(value: object) -> bool:
+    if not isinstance(value, str) or _SESSION_KEY.fullmatch(value) is None:
+        return False
+    try:
+        datetime.strptime(value, "%Y-%m-%dT%H:%M:%S" if len(value) > 10 else "%Y-%m-%d")
+    except ValueError:
+        return False
+    return True
+
+
+def _valid_recorded_at(value: object) -> bool:
+    if not isinstance(value, str) or not value or len(value) > 64:
+        return False
+    try:
+        recorded_at = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return recorded_at.tzinfo is not None and recorded_at.utcoffset() is not None
 
 
 def _now() -> str:

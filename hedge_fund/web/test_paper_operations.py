@@ -197,6 +197,94 @@ def test_reviewed_manual_tick_executes_one_session_with_local_fakes(
     assert len(data_client.calls) > 0
 
 
+def test_manual_tick_accept_refuses_unresolved_intent_before_worker_dispatch(demo_root, monkeypatch):
+    from hedge_fund.web.schemas import error_payload
+
+    data_client = _OfflineDataClient()
+    service = DeskService(
+        demo_root,
+        allow_writes=True,
+        network_enabled=True,
+        data_client_factory=lambda: data_client,
+        fund_factory=_OfflineFund,
+    )
+    service._runtime_settings = _local_settings()
+    dispatched = []
+    monkeypatch.setattr(
+        service._paper_operation_jobs,
+        "submit",
+        lambda operation, _work, reservation=None: dispatched.append(operation.request_id),
+    )
+    name = "intent-fence-test"
+    interrupted_id = "interrupted-web-tick"
+    request_id = "offline-fenced-manual-tick"
+    try:
+        spec = load_spec(demo_root / "mandates" / "demo-quality.yaml").model_copy(update={"name": name})
+        service.create_mandate(spec.model_dump(mode="python"))
+        service.deploy_mandate(name, DeployRequest(universe=["AAPL"]))
+        ledger = Ledger(demo_root / "paper" / name)
+        preview = service.create_manual_tick_preview(
+            name,
+            PaperTickPreviewRequest(expected_head=None),
+            operator_session="offline-test-session",
+        )
+        due_session = preview["due_set"][0]
+        digest = ledger.tick_request_digest(interrupted_id, expected_head=None, session=due_session)
+        with service._admission.manual_session(name, timeout=0):
+            ledger.log_event(
+                "tick_intent",
+                request_id=interrupted_id,
+                request_action="tick",
+                request_digest=digest,
+                expected_head=None,
+                requested_session=due_session,
+                session=due_session,
+                durable=True,
+            )
+        events_before = ledger.events()
+        request = PaperTickAcceptRequest(
+            request_id=request_id,
+            preview_id=preview["preview_id"],
+            preview_digest=preview["preview_digest"],
+            confirmation_token=preview["confirmation_token"],
+            expected_head=None,
+            due_set=[due_session],
+        )
+
+        with pytest.raises(ServiceError) as refused:
+            service.accept_manual_tick(
+                name,
+                request,
+                operator_session="offline-test-session",
+            )
+        body = error_payload(
+            refused.value.status_code,
+            refused.value.detail,
+            code=refused.value.code,
+            subject_id=refused.value.subject_id,
+            request_id=refused.value.request_id,
+            refusal=refused.value.refusal,
+        )
+        operation = service._operation_store.get_by_request(request_id)
+        events_after = ledger.events()
+    finally:
+        service.close()
+
+    assert refused.value.status_code == 409
+    assert refused.value.code == "unresolved-tick-intent"
+    assert body["refusal"] == {
+        "reason": "unresolved-tick-intent",
+        "fund": name,
+        "intent_request_id": interrupted_id,
+        "intent_session": due_session,
+        "recovery": "reconcile-tick-request",
+    }
+    assert operation is None
+    assert dispatched == []
+    assert events_after == events_before
+    assert ledger.sessions() == []
+
+
 def test_reviewed_manual_tick_persists_agent_progress(
     demo_root,
     monkeypatch,

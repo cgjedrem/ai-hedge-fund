@@ -210,6 +210,7 @@ def create_app(
             subject_id=exc.subject_id if exc.subject_id is not None else _path_subject(request),
             request_id=exc.request_id,
             current_head=exc.current_head,
+            refusal=exc.refusal,
             retry_policy=exc.retry_policy,
             retry_after_seconds=exc.retry_after_seconds,
         )
