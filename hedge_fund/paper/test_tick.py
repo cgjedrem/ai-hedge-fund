@@ -986,7 +986,7 @@ def test_redo_supersedes_intent_without_becoming_a_duplicate_request(tmp_path, c
 
 
 def test_pre_effect_intent_failure_aborts_and_same_identity_retries(tmp_path, clock, SPEC):
-    directory = deploy("alpha", SPEC, ["AAPL"], root=tmp_path)
+    directory = _deploy_owned_paper_test_fund(tmp_path, SPEC)
     clock("2024-06-04")
     build_calls = []
     request_id = "cli-tick-alpha-failed"
@@ -995,14 +995,15 @@ def test_pre_effect_intent_failure_aborts_and_same_identity_retries(tmp_path, cl
         build_calls.append(True)
         raise RuntimeError("synthetic pipeline failure")
 
-    with pytest.raises(RuntimeError, match="synthetic pipeline failure"):
-        tick(
-            directory,
-            FakeDataClient(SERIES),
-            build_fund=failing_build,
-            request_id=request_id,
-            expected_head=None,
-        )
+    with _owned_paper_lane(directory, "alpha"):
+        with pytest.raises(RuntimeError, match="synthetic pipeline failure"):
+            tick(
+                directory,
+                FakeDataClient(SERIES),
+                build_fund=failing_build,
+                request_id=request_id,
+                expected_head=None,
+            )
 
     ledger = Ledger(directory)
     abort = next(event for event in ledger.events() if event.get("kind") == "tick_aborted" and event.get("request_id") == request_id)
@@ -1010,13 +1011,14 @@ def test_pre_effect_intent_failure_aborts_and_same_identity_retries(tmp_path, cl
     assert ledger.halted() is None
     assert build_calls == [True]
 
-    record = tick(
-        directory,
-        FakeDataClient(SERIES),
-        build_fund=build_fund,
-        request_id=request_id,
-        expected_head=None,
-    )
+    with _owned_paper_lane(directory, "alpha"):
+        record = tick(
+            directory,
+            FakeDataClient(SERIES),
+            build_fund=build_fund,
+            request_id=request_id,
+            expected_head=None,
+        )
 
     assert record.session == "2024-06-03"
     assert ledger.halted() is None
@@ -2604,8 +2606,9 @@ def test_redo_refuses_a_halted_fund_and_leaves_it_untouched(tmp_path, clock, SPE
 
 def test_failure_inside_advance_stays_halted_without_reconciliation_receipt(tmp_path, clock, SPEC, monkeypatch):
     clock("2024-06-05")
-    directory = deploy("alpha", SPEC, ["AAPL"], root=tmp_path)
-    _tick(directory)  # 06-04, decision made
+    directory = _deploy_owned_paper_test_fund(tmp_path, SPEC)
+    with _owned_paper_lane(directory, "alpha"):
+        _tick(directory)  # 06-04, decision made
     clock("2024-06-06")
 
     def fail_after_effect_boundary(*_args, **kwargs):
@@ -2614,18 +2617,21 @@ def test_failure_inside_advance_stays_halted_without_reconciliation_receipt(tmp_
         raise ValueError("synthetic post-effect failure")
 
     monkeypatch.setattr(paper_tick_module, "advance", fail_after_effect_boundary)
-    with pytest.raises(ValueError, match="synthetic post-effect failure"):
-        _tick(directory)
+    with _owned_paper_lane(directory, "alpha"):
+        with pytest.raises(ValueError, match="synthetic post-effect failure"):
+            _tick(directory)
     ledger = Ledger(directory)
     assert ledger.halted().startswith("tick 2024-06-05 failed: ValueError")
     assert [e["kind"] for e in ledger.events()] == ["tick", "tick_failed", "halt"]
     assert ledger.sessions() == ["2024-06-04"]
     control_before = ledger.control_path.read_bytes()
     events_before = ledger.events_path.read_bytes()
-    with pytest.raises(LedgerError, match="verified reconciliation receipt"):
-        ledger.resume(SPEC.capital)
-    with pytest.raises(FundHalted):
-        _tick(directory)
+    with _owned_paper_lane(directory, "alpha"):
+        with pytest.raises(LedgerError, match="verified reconciliation receipt"):
+            ledger.resume(SPEC.capital)
+    with _owned_paper_lane(directory, "alpha"):
+        with pytest.raises(FundHalted):
+            _tick(directory)
     assert ledger.sessions() == ["2024-06-04"]
     assert ledger.control_path.read_bytes() == control_before
     assert ledger.events_path.read_bytes() == events_before
@@ -2705,8 +2711,9 @@ def test_pre_effect_intent_abort_binds_manual_operation_and_capture(tmp_path, cl
 
 def test_tick_failure_event_binds_manual_operation_and_capture(tmp_path, clock, SPEC, monkeypatch):
     clock("2024-06-05")
-    directory = deploy("alpha", SPEC, ["AAPL"], root=tmp_path)
-    first = _tick(directory)
+    directory = _deploy_owned_paper_test_fund(tmp_path, SPEC)
+    with _owned_paper_lane(directory, "alpha"):
+        first = _tick(directory)
     clock("2024-06-06")
 
     def fail_after_effect_boundary(*_args, **kwargs):
@@ -2716,17 +2723,18 @@ def test_tick_failure_event_binds_manual_operation_and_capture(tmp_path, clock, 
 
     monkeypatch.setattr(paper_tick_module, "advance", fail_after_effect_boundary)
 
-    with pytest.raises(ValueError, match="synthetic failure after effect boundary"):
-        tick(
-            directory,
-            FakeDataClient(SERIES),
-            build_fund=build_fund,
-            expected_head=first.hash,
-            operation_id="a" * 32,
-            request_id="web-tick-1",
-            capture_id="b" * 32,
-            capture_digest="c" * 64,
-        )
+    with _owned_paper_lane(directory, "alpha"):
+        with pytest.raises(ValueError, match="synthetic failure after effect boundary"):
+            tick(
+                directory,
+                FakeDataClient(SERIES),
+                build_fund=build_fund,
+                expected_head=first.hash,
+                operation_id="a" * 32,
+                request_id="web-tick-1",
+                capture_id="b" * 32,
+                capture_digest="c" * 64,
+            )
 
     failure = next(event for event in Ledger(directory).events() if event["kind"] == "tick_failed")
     assert failure["expected_head"] == first.hash
