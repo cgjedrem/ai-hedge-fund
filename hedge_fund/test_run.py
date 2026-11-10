@@ -1526,7 +1526,8 @@ def test_cli_new_tick_identity_surfaces_unresolved_intent_without_effects(tmp_pa
     assert (directory / "broker.json").read_bytes() == broker_before
 
 
-def test_cli_duplicate_logical_refusal_surfaces_contract_fields(tmp_path, monkeypatch, capsys):
+@pytest.mark.parametrize("service_error", [False, True], ids=("raw-operation", "service-envelope"))
+def test_cli_duplicate_logical_refusal_surfaces_contract_fields(tmp_path, monkeypatch, capsys, service_error):
     import argparse
 
     import hedge_fund.web.services as web_services
@@ -1553,6 +1554,19 @@ def test_cli_duplicate_logical_refusal_surfaces_contract_fields(tmp_path, monkey
             }
 
         def accept_lifecycle(self, *_args, **_kwargs):
+            if service_error:
+                from hedge_fund.web.services import ServiceError
+
+                raise ServiceError(
+                    409,
+                    "Lifecycle operation is already in progress.",
+                    code="duplicate-logical-operation",
+                    refusal={
+                        "reason": "duplicate-logical-operation",
+                        "existing_operation_id": "d" * 32,
+                        "logical_key": logical_key,
+                    },
+                )
             raise DuplicateLogicalOperationRefusal("d" * 32, logical_key)
 
         def close(self):
