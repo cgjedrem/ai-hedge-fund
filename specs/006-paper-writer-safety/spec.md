@@ -34,7 +34,7 @@ The operator's machine loses power (or the process is killed) in the middle of a
 1. **Given** a synthetic fund with an unresolved session intent (no failure or completion recorded), **When** any entry point requests a new session for that fund under a new request identity, **Then** the request is refused with a reason identifying the unresolved intent and no session effects occur.
 2. **Given** a synthetic fund with an unresolved session intent, **When** the operator completes the existing reconciliation path for that intent, **Then** subsequent new session requests are admitted normally.
 3. **Given** a synthetic fund with no unresolved intent, **When** a new session is requested, **Then** admission behaves exactly as before this feature (no new friction).
-4. **Given** an unresolved session intent exists, **When** the operator retries with the *same* request identity as the interrupted request, **Then** the existing replay/reconciliation behavior for that identity is preserved (the fence does not break same-identity retry).
+4. **Given** an unresolved session intent exists, **When** the operator retries with the *same* request identity as the interrupted request, **Then** the existing replay/reconciliation behavior for that identity is preserved for attempts with effects or outcomes (the fence does not break same-identity retry); a provably effect-free aborted attempt MAY re-run under the same identity.
 
 ---
 
@@ -68,7 +68,7 @@ The operator triggers the same logical action twice in quick succession from dif
 
 - **FR-001**: Before admitting any new trading-session request for a fund that was not already resolved by same-request-identity replay, the system MUST check durable records for any unresolved session intent on that fund and MUST refuse the request when one exists, whatever new identity the request carries.
 - **FR-002**: The refusal in FR-001 MUST surface a reason that identifies the unresolved intent and directs the operator to the existing reconciliation path.
-- **FR-003**: The unresolved-intent fence MUST NOT alter the existing same-request-identity replay and reconciliation behavior.
+- **FR-003**: The unresolved-intent fence MUST NOT alter the existing same-request-identity replay and reconciliation behavior for attempts that recorded effects or a completed outcome. An attempt aborted before any effect (`tick_aborted`, `no_effects=True`) MAY be retried with the same request identity and runs again — this is a deliberate, QA-reviewed behavior change from the pre-feature "uncertain requests never repeat work" rule, safe because the attempt is provably effect-free.
 - **FR-004**: The unresolved-intent fence MUST apply uniformly across all supported entry points (web desk, command line, headless runner).
 - **FR-005**: The system MUST derive a stable logical-operation identity from the fund, action type, target session, and reviewed payload of each mutating paper request, and MUST persist that identity durably with the operation record.
 - **FR-006**: When a newly submitted request's logical-operation identity matches an existing non-terminal operation, the system MUST NOT execute the action a second time; it MUST either return the existing operation's status/outcome or refuse with an explicit duplicate reason.
@@ -91,7 +91,9 @@ The operator triggers the same logical action twice in quick succession from dif
 - **SC-002**: In synthetic duplicate-submission tests across all pairwise entry-point combinations (web–CLI, web–runner, CLI–runner), exactly one execution occurs per logical operation in 100% of cases.
 - **SC-003**: Zero regressions in the existing test suite: every previously passing test still passes, with any exception individually evidenced as unchanged baseline per project governance.
 - **SC-004**: No interaction with real or protected fund roots occurs during development or validation (verifiable from test fixtures and code review).
-- **SC-005**: Same-identity retry behavior and the deliberate redo path behave byte-for-byte as before for previously recorded scenarios.
+- **SC-005**: Same-identity retry behavior and the deliberate redo path behave as before for all previously recorded scenarios involving effects or recorded outcomes; effect-free aborted attempts are exempt (they may re-run under the same identity, per amended FR-003).
+
+**Known limitations (accepted, QA cycle 3)**: a same-identity CLI retry after operator reconciliation still raises the reconciliation-required halt (`run.py` replay path is not receipt-aware — deferred, deep replay semantics); a tick invoked without any request identity (legacy TUI path only) that fails before any effect leaves no ledger trace and no halt; reconciliation holds the control lane, not the execution lane; Saxo funds cannot reconcile orphaned intents (see Assumptions).
 
 ## Assumptions
 
