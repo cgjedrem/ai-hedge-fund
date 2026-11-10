@@ -198,6 +198,97 @@ except BaseException as exc:
 sys.exit(0)
 """
 
+_LOGICAL_OPERATION_SUBMITTER = """
+import json, sys, time
+from datetime import datetime
+from pathlib import Path
+from hedge_fund import paths
+from hedge_fund.brokers.models import Order
+from hedge_fund.brokers.paper import PaperBroker
+from hedge_fund.paper.ledger import Ledger
+from hedge_fund.runtime.admission import AdmissionCoordinator, RootOwnerLease
+from hedge_fund.runtime.operations import DuplicateLogicalOperationRefusal, OperationStore
+from hedge_fund.runtime.root import RootContext
+
+final_path = Path(FINAL)
+try:
+    root_path, request_path, ready_path, go_path, decision_path, fill_go_path = (
+        Path(ROOT),
+        Path(REQUEST),
+        Path(READY),
+        Path(GO),
+        Path(DECISION),
+        Path(FILL_GO),
+    )
+    request = json.loads(request_path.read_text(encoding="utf-8"))
+    now = datetime.fromisoformat(request["now"])
+
+    def wait_for(path):
+        deadline = time.monotonic() + 60
+        while not path.exists():
+            if time.monotonic() > deadline:
+                raise TimeoutError("logical-operation start signal missing")
+            time.sleep(0.01)
+
+    with RootContext.open(root_path) as root, RootOwnerLease.acquire(root) as owner:
+        admission = AdmissionCoordinator(root, owner_lease=owner)
+        store = OperationStore(root, admission=admission)
+        ready_path.write_text("ready", encoding="utf-8")
+        wait_for(go_path)
+
+        def execute_fake_fill(operation):
+            decision_path.write_text("accepted", encoding="utf-8")
+            wait_for(fill_go_path)
+            with paths.bound_root(root):
+                with admission.runner_reservation("alpha", timeout=5):
+                    with admission.execution_lease("alpha", timeout=5):
+                        broker = PaperBroker(root_path / "paper" / "alpha" / "broker.json")
+                        fill = broker.place_order(Order(ticker="AAPL", side="buy", quantity=1, price=100))
+                        Ledger(root_path / "paper" / "alpha").log_event(
+                            "logical-duplicate-fake-fill",
+                            operation_id=operation.operation_id,
+                            ticker=fill.ticker,
+                            side=fill.side,
+                            quantity=fill.quantity,
+                            price=fill.price,
+                            durable=True,
+                        )
+
+        try:
+            operation = store.accept_request(
+                request_id=request["request_id"],
+                action=request["action"],
+                subject_id=request["subject_id"],
+                preview_id=request["preview_id"],
+                preview_digest=request["preview_digest"],
+                confirmation_token=request["confirmation_token"],
+                operator_session=request["operator_session"],
+                expected_head=request["expected_head"],
+                due_set=tuple(request["due_set"]),
+                payload=request["payload"],
+                now=now,
+                start_worker=execute_fake_fill,
+            )
+            outcome = {"outcome": "accepted", "operation_id": operation.operation_id}
+        except DuplicateLogicalOperationRefusal as exc:
+            decision_path.write_text("duplicate", encoding="utf-8")
+            outcome = {"outcome": "duplicate", "refusal": exc.fields}
+
+    final_path.write_text(json.dumps(outcome, sort_keys=True), encoding="utf-8")
+except BaseException as exc:
+    final_path.write_text(
+        json.dumps(
+            {
+                "outcome": "error",
+                "error": f"{type(exc).__name__}: {exc}",
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    raise
+"""
+
 
 def _render(template: str, **values: str) -> str:
     for key, value in values.items():
@@ -503,6 +594,118 @@ def test_concurrent_manual_appends_to_one_fund_admit_exactly_one_writer(race_roo
     assert set(replay_finals) <= {"ledger-error", "conflict"}
     assert "ledger-error" in replay_finals
     assert _recorded(root, "alpha") == [record.session]
+
+
+def test_process_logical_duplicate_submissions_share_durable_key_and_one_fake_fill(
+    race_root,
+    tmp_path,
+    owned_test_process,
+):
+    import json
+    from datetime import datetime, timedelta, timezone
+
+    from hedge_fund.brokers.paper import PaperBroker
+    from hedge_fund.paper.deployed import load_deployed
+    from hedge_fund.runtime.capture import freeze_capture
+    from hedge_fund.runtime.configuration import resolve_settings
+    from hedge_fund.runtime.operations import OperationStore
+
+    root, admission = race_root
+    root_context = admission._root
+    store = OperationStore(root_context, admission=admission)
+    now = datetime(2026, 10, 31, 12, 0, tzinfo=timezone.utc)
+    capture = freeze_capture(
+        root=root_context,
+        subject_id="alpha",
+        mandate_digest="a" * 64,
+        universe=("AAPL",),
+        broker="paper",
+        settings=resolve_settings(root_context),
+        credential_versions={},
+        code_version="synthetic-writer-race",
+    )
+    initial_book = PaperBroker(root / "paper" / "alpha" / "broker.json")
+    initial_cash = initial_book.cash()
+    initial_positions = {ticker: position.shares for ticker, position in initial_book.positions().items()}
+    go = tmp_path / "logical-go"
+    fill_go = tmp_path / "logical-fill-go"
+    children = []
+    for suffix in ("left", "right"):
+        preview = store.create_preview(
+            action="paper-run",
+            subject_id="alpha",
+            expected_head="head-1",
+            due_set=("2024-06-07",),
+            capture=capture,
+            operator_session="synthetic-operator",
+            payload={"mode": "manual"},
+            now=now,
+            expires_at=now + timedelta(minutes=5),
+        )
+        request = {
+            "request_id": f"logical-{suffix}-request",
+            "action": preview.action,
+            "subject_id": preview.subject_id,
+            "preview_id": preview.preview_id,
+            "preview_digest": preview.digest,
+            "confirmation_token": preview.confirmation_token,
+            "operator_session": "synthetic-operator",
+            "expected_head": preview.expected_head,
+            "due_set": list(preview.due_set),
+            "payload": {"mode": "manual"},
+            "now": now.isoformat(),
+        }
+        request_path = tmp_path / f"logical-{suffix}-request.json"
+        ready = tmp_path / f"logical-{suffix}-ready"
+        decision = tmp_path / f"logical-{suffix}-decision"
+        final = tmp_path / f"logical-{suffix}-final.json"
+        request_path.write_text(json.dumps(request), encoding="utf-8")
+        process = owned_test_process(
+            _render(
+                _LOGICAL_OPERATION_SUBMITTER,
+                ROOT=str(root),
+                REQUEST=str(request_path),
+                READY=str(ready),
+                DECISION=str(decision),
+                FILL_GO=str(fill_go),
+                GO=str(go),
+                FINAL=str(final),
+            )
+        )
+        children.append((suffix, ready, decision, final, process))
+
+    try:
+        for suffix, ready, _decision, _final, process in children:
+            assert _wait_file(ready, process, f"logical submitter {suffix}") == "ready"
+        go.write_text("go", encoding="utf-8")
+        for suffix, _ready, decision, _final, process in children:
+            assert _wait_file(decision, process, f"logical submitter {suffix} decision", timeout=60) in {"accepted", "duplicate"}
+        fill_go.write_text("go", encoding="utf-8")
+        outcomes = []
+        for suffix, _ready, _decision, final, process in children:
+            result = json.loads(_wait_file(final, process, f"logical submitter {suffix} result", timeout=60))
+            assert process.wait(timeout=60) == 0, result
+            outcomes.append(result)
+    finally:
+        go.write_text("release", encoding="utf-8")
+        fill_go.write_text("release", encoding="utf-8")
+
+    accepted = [outcome for outcome in outcomes if outcome["outcome"] == "accepted"]
+    refused = [outcome for outcome in outcomes if outcome["outcome"] == "duplicate"]
+    assert len(accepted) == 1
+    assert len(refused) == 1
+    assert refused[0]["refusal"]["reason"] == "duplicate-logical-operation"
+    assert refused[0]["refusal"]["existing_operation_id"] == accepted[0]["operation_id"]
+    fill_events = [event for event in Ledger(root / "paper" / "alpha").events() if event["kind"] == "logical-duplicate-fake-fill"]
+    assert len(fill_events) == 1
+    assert fill_events[0]["operation_id"] == accepted[0]["operation_id"]
+    book = PaperBroker(root / "paper" / "alpha" / "broker.json")
+    positions = {ticker: position.shares for ticker, position in book.positions().items()}
+    assert positions == {**initial_positions, "AAPL": initial_positions.get("AAPL", 0) + 1}
+    costs = load_deployed(root / "paper" / "alpha").spec.costs
+    expected_price = costs.fill_price("buy", 100)
+    expected_cash = initial_cash - expected_price - costs.commission(1, 100)
+    assert book.cash() == pytest.approx(expected_cash)
 
 
 def test_independent_fund_progresses_while_another_fund_session_is_held(race_root, tmp_path, owned_test_process):

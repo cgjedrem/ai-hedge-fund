@@ -285,6 +285,84 @@ def test_manual_tick_accept_refuses_unresolved_intent_before_worker_dispatch(dem
     assert ledger.sessions() == []
 
 
+def test_web_duplicate_logical_tick_refusal_exposes_contract_fields(demo_root, monkeypatch):
+    from hedge_fund.web.schemas import error_payload
+
+    service = DeskService(
+        demo_root,
+        allow_writes=True,
+        network_enabled=True,
+        data_client_factory=_OfflineDataClient,
+        fund_factory=_OfflineFund,
+    )
+    service._runtime_settings = _local_settings()
+    dispatched = []
+    monkeypatch.setattr(
+        service._paper_operation_jobs,
+        "submit",
+        lambda operation, _work, reservation=None: dispatched.append(operation.operation_id),
+    )
+    name = "logical-dedup-test"
+    request_ids = ("logical-first-request", "logical-second-request")
+    try:
+        spec = load_spec(demo_root / "mandates" / "demo-quality.yaml").model_copy(update={"name": name})
+        service.create_mandate(spec.model_dump(mode="python"))
+        service.deploy_mandate(name, DeployRequest(universe=["AAPL"]))
+        previews = [
+            service.create_manual_tick_preview(
+                name,
+                PaperTickPreviewRequest(expected_head=None),
+                operator_session="offline-test-session",
+            )
+            for _ in request_ids
+        ]
+        requests = [
+            PaperTickAcceptRequest(
+                request_id=request_id,
+                preview_id=preview["preview_id"],
+                preview_digest=preview["preview_digest"],
+                confirmation_token=preview["confirmation_token"],
+                expected_head=preview["expected_head"],
+                due_set=preview["due_set"],
+            )
+            for request_id, preview in zip(request_ids, previews)
+        ]
+        first = service.accept_manual_tick(
+            name,
+            requests[0],
+            operator_session="offline-test-session",
+        )
+        with pytest.raises(ServiceError) as refused:
+            service.accept_manual_tick(
+                name,
+                requests[1],
+                operator_session="offline-test-session",
+            )
+        body = error_payload(
+            refused.value.status_code,
+            refused.value.detail,
+            code=refused.value.code,
+            subject_id=refused.value.subject_id,
+            request_id=refused.value.request_id,
+            refusal=refused.value.refusal,
+        )
+        existing = service._operation_store.get_by_request(request_ids[0])
+        rejected = service._operation_store.get_by_request(request_ids[1])
+    finally:
+        service.close()
+
+    assert refused.value.status_code == 409
+    assert body["code"] == "duplicate-logical-operation"
+    assert body["refusal"] == {
+        "reason": "duplicate-logical-operation",
+        "existing_operation_id": first["operation_id"],
+        "logical_key": existing.logical_key,
+    }
+    assert existing.operation_id == first["operation_id"]
+    assert rejected is None
+    assert dispatched == [first["operation_id"]]
+
+
 def test_reviewed_manual_tick_persists_agent_progress(
     demo_root,
     monkeypatch,

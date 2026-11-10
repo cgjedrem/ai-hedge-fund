@@ -70,14 +70,17 @@ def _preview(
     store,
     capture,
     *,
+    action="paper-run",
+    subject_id="alpha",
+    expected_head="head-1",
     payload=None,
     due_set=("2026-10-31", "2026-11-01"),
     expires_at=None,
 ):
     return store.create_preview(
-        action="paper-run",
-        subject_id="alpha",
-        expected_head="head-1",
+        action=action,
+        subject_id=subject_id,
+        expected_head=expected_head,
         due_set=due_set,
         capture=capture,
         operator_session="operator-1",
@@ -129,6 +132,224 @@ def test_duplicate_logical_operation_refusal_contract_fields():
         "existing_operation_id": "a" * 32,
         "logical_key": logical_key,
     }
+
+
+def test_logical_operation_key_normalizes_target_shape_and_payload_order():
+    from hedge_fund.runtime.operations import derive_logical_operation_key
+
+    first_payload = {"mode": "manual", "limits": {"calls": 2, "cost": "0"}}
+    reordered_payload = {"limits": {"cost": "0", "calls": 2}, "mode": "manual"}
+
+    def digest(payload):
+        return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")).hexdigest()
+
+    web_shape = derive_logical_operation_key(
+        subject_id="alpha",
+        action="paper-run",
+        target=("2026-10-31",),
+        payload_digest=digest(first_payload),
+    )
+    cli_shape = derive_logical_operation_key(
+        subject_id="alpha",
+        action="paper-run",
+        target="2026-10-31",
+        payload_digest=digest(reordered_payload),
+    )
+
+    assert web_shape == cli_shape
+
+
+def test_logical_operation_key_separates_fund_action_target_and_payload():
+    from hedge_fund.runtime.operations import derive_logical_operation_key
+
+    payload_digest = hashlib.sha256(b"reviewed-payload").hexdigest()
+    base = derive_logical_operation_key(
+        subject_id="alpha",
+        action="paper-run",
+        target=("2026-10-31",),
+        payload_digest=payload_digest,
+    )
+    variants = {
+        derive_logical_operation_key(
+            subject_id="beta",
+            action="paper-run",
+            target=("2026-10-31",),
+            payload_digest=payload_digest,
+        ),
+        derive_logical_operation_key(
+            subject_id="alpha",
+            action="paper-runner-start",
+            target=("2026-10-31",),
+            payload_digest=payload_digest,
+        ),
+        derive_logical_operation_key(
+            subject_id="alpha",
+            action="paper-run",
+            target=("2026-11-01",),
+            payload_digest=payload_digest,
+        ),
+        derive_logical_operation_key(
+            subject_id="alpha",
+            action="paper-run",
+            target=("2026-10-31",),
+            payload_digest=hashlib.sha256(b"different-reviewed-payload").hexdigest(),
+        ),
+    }
+
+    assert len(variants) == 4
+    assert base not in variants
+
+
+def test_logical_duplicate_nonterminal_operation_refuses_and_links_existing(operation_store, frozen_capture):
+    first_preview = _preview(operation_store, frozen_capture)
+    starts = []
+    first = _accept(operation_store, first_preview, start_worker=starts.append)
+    second_preview = _preview(operation_store, frozen_capture)
+
+    with pytest.raises(DuplicateLogicalOperationRefusal) as refused:
+        _accept(
+            operation_store,
+            second_preview,
+            request_id="request-2",
+            start_worker=lambda operation: starts.append(operation.operation_id),
+        )
+
+    assert refused.value.fields == {
+        "reason": "duplicate-logical-operation",
+        "existing_operation_id": first.operation_id,
+        "logical_key": first.logical_key,
+    }
+    assert operation_store.get_by_request("request-2") is None
+    assert operation_store._read_index()["previews"][second_preview.preview_id]["state"] == "issued"
+    assert [operation.operation_id for operation in starts] == [first.operation_id]
+
+
+def test_logical_duplicate_interrupted_operation_still_blocks_retry(operation_store, frozen_capture):
+    first = _accept(operation_store, _preview(operation_store, frozen_capture))
+    interrupted = operation_store.interrupt(first.operation_id, now=_NOW + timedelta(seconds=1))
+    assert interrupted.status is OperationStatus.INTERRUPTED
+
+    with pytest.raises(DuplicateLogicalOperationRefusal) as refused:
+        _accept(
+            operation_store,
+            _preview(operation_store, frozen_capture),
+            request_id="request-2",
+        )
+
+    assert refused.value.fields["existing_operation_id"] == first.operation_id
+
+
+def test_logical_duplicate_terminal_failure_frees_key(operation_store, frozen_capture):
+    first = _accept(operation_store, _preview(operation_store, frozen_capture))
+    fence = operation_store.claim_worker(first.operation_id, worker_id="synthetic-worker", now=_NOW)
+    operation_store.mark_running(first.operation_id, fence, now=_NOW)
+    failed = operation_store.fail(
+        first.operation_id,
+        fence,
+        error_code="provider-unavailable",
+        now=_NOW + timedelta(seconds=1),
+    )
+    second = _accept(
+        operation_store,
+        _preview(operation_store, frozen_capture),
+        request_id="request-2",
+    )
+
+    assert failed.status is OperationStatus.FAILED
+    assert second.operation_id != first.operation_id
+    assert second.logical_key == first.logical_key
+
+
+def test_logical_duplicate_terminal_success_frees_key(operation_store, frozen_capture):
+    first = _accept(operation_store, _preview(operation_store, frozen_capture))
+    fence = operation_store.claim_worker(first.operation_id, worker_id="synthetic-worker", now=_NOW)
+    operation_store.mark_running(first.operation_id, fence, now=_NOW)
+    completed = operation_store.complete(
+        first.operation_id,
+        fence,
+        result={"sessions": 1},
+        now=_NOW + timedelta(seconds=1),
+    )
+    second = _accept(
+        operation_store,
+        _preview(operation_store, frozen_capture),
+        request_id="request-2",
+    )
+
+    assert completed.status is OperationStatus.COMPLETED
+    assert second.operation_id != first.operation_id
+    assert second.logical_key == first.logical_key
+
+
+def test_logical_dedup_preserves_request_replay_and_changed_payload_conflict(operation_store, frozen_capture):
+    preview = _preview(operation_store, frozen_capture)
+    starts = []
+    first = _accept(operation_store, preview, start_worker=starts.append)
+
+    replay = _accept(
+        operation_store,
+        preview,
+        start_worker=lambda _operation: pytest.fail("same-request replay started another worker"),
+    )
+    with pytest.raises(OperationConflict):
+        _accept(
+            operation_store,
+            preview,
+            payload={"mode": "manual", "limit": 2},
+        )
+
+    assert replay.operation_id == first.operation_id
+    assert [operation.operation_id for operation in starts] == [first.operation_id]
+
+
+def test_pre_feature_logical_record_replays_unchanged_and_never_matches(
+    operation_store,
+    frozen_capture,
+    root_context,
+):
+    first = _accept(operation_store, _preview(operation_store, frozen_capture))
+    logical_key = first.logical_key
+    with operation_store._locked("alpha"):
+        index = operation_store._read_index()
+        index["operations"][first.operation_id].pop("logical_key", None)
+        operation_store._write_index(index)
+    legacy_bytes = root_context.read_bytes(INDEX_PATH)
+
+    replay = operation_store.get_by_request("request-1")
+    assert replay.logical_key is None
+    assert root_context.read_bytes(INDEX_PATH) == legacy_bytes
+
+    second = _accept(
+        operation_store,
+        _preview(operation_store, frozen_capture),
+        request_id="request-2",
+    )
+
+    assert second.operation_id != first.operation_id
+    assert second.logical_key == logical_key
+
+
+def test_logical_duplicate_survives_fresh_store_handle_restart(
+    operation_store,
+    frozen_capture,
+    root_context,
+):
+    first = _accept(operation_store, _preview(operation_store, frozen_capture))
+    with RootContext.open(root_context.path) as restarted_root:
+        with RootOwnerLease.acquire(restarted_root) as owner:
+            restarted_store = OperationStore(
+                restarted_root,
+                admission=AdmissionCoordinator(restarted_root, owner_lease=owner),
+            )
+            preview = _preview(restarted_store, frozen_capture)
+            with pytest.raises(DuplicateLogicalOperationRefusal) as refused:
+                _accept(
+                    restarted_store,
+                    preview,
+                    request_id="request-after-restart",
+                )
+
+    assert refused.value.fields["existing_operation_id"] == first.operation_id
 
 
 def test_preview_digest_canonicalizes_payload_and_binds_exact_due_order(operation_store, frozen_capture):

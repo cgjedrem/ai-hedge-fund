@@ -1526,6 +1526,59 @@ def test_cli_new_tick_identity_surfaces_unresolved_intent_without_effects(tmp_pa
     assert (directory / "broker.json").read_bytes() == broker_before
 
 
+def test_cli_duplicate_logical_refusal_surfaces_contract_fields(tmp_path, monkeypatch, capsys):
+    import argparse
+
+    import hedge_fund.web.services as web_services
+    from hedge_fund.runtime.operations import DuplicateLogicalOperationRefusal
+    from hedge_fund.runtime.root import RootContext
+
+    logical_key = "b" * 64
+    expected_head = "a" * 64
+
+    class OperationLookup:
+        def get_by_request(self, _request_id):
+            return None
+
+    class FakeDeskService:
+        def __init__(self, *_args, **_kwargs):
+            self._operation_store = OperationLookup()
+
+        def create_lifecycle_preview(self, *_args, **_kwargs):
+            return {
+                "expected_head": expected_head,
+                "preview_id": "a" * 32,
+                "preview_digest": "c" * 64,
+                "confirmation_token": "synthetic-confirmation-token-value",
+            }
+
+        def accept_lifecycle(self, *_args, **_kwargs):
+            raise DuplicateLogicalOperationRefusal("d" * 32, logical_key)
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(web_services, "DeskService", FakeDeskService)
+    args = SimpleNamespace(
+        action="archive",
+        lifecycle_action="archive",
+        kind="deployment",
+        identity="alpha",
+        archive_id=None,
+        expected_head=expected_head,
+        request_id="logical-cli-request",
+    )
+    with RootContext.open(tmp_path) as root:
+        with pytest.raises(SystemExit) as refused:
+            run._lifecycle(args, argparse.ArgumentParser(), root)
+
+    error = capsys.readouterr().err
+    assert refused.value.code == 2
+    assert '"reason": "duplicate-logical-operation"' in error
+    assert '"existing_operation_id": "' + "d" * 32 + '"' in error
+    assert '"logical_key": "' + logical_key + '"' in error
+
+
 def test_cli_halt_request_id_replays_and_conflicts_on_reason(tmp_path, monkeypatch, capsys, offline):
     from hedge_fund.paper.ledger import Ledger
 
