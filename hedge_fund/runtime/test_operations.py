@@ -200,6 +200,24 @@ def test_logical_operation_key_separates_fund_action_target_and_payload():
     assert base not in variants
 
 
+@pytest.mark.parametrize("action", ("backtest", "lifecycle-restore"))
+def test_logical_dedup_does_not_block_nonpaper_operations(operation_store, frozen_capture, action):
+    first = _accept(
+        operation_store,
+        _preview(operation_store, frozen_capture, action=action),
+        request_id="backtest-first",
+    )
+    second = _accept(
+        operation_store,
+        _preview(operation_store, frozen_capture, action=action),
+        request_id="backtest-second",
+    )
+
+    assert first.operation_id != second.operation_id
+    assert first.logical_key is None
+    assert second.logical_key is None
+
+
 def test_logical_duplicate_nonterminal_operation_refuses_and_links_existing(operation_store, frozen_capture):
     first_preview = _preview(operation_store, frozen_capture)
     starts = []
@@ -873,7 +891,11 @@ def test_snapshot_worker_cannot_borrow_operation_observation_from_another_root(r
 
 def test_cancel_request_identity_cannot_alias_an_admission_or_other_operation(operation_store, frozen_capture):
     first = _accept(operation_store, _preview(operation_store, frozen_capture), request_id="request-first")
-    second_preview = _preview(operation_store, frozen_capture)
+    second_preview = _preview(
+        operation_store,
+        frozen_capture,
+        payload={"mode": "manual", "limit": 2},
+    )
     second = _accept(operation_store, second_preview, request_id="request-second")
 
     with pytest.raises(OperationConflict):
@@ -1432,7 +1454,11 @@ def _runtime_bytes(root_context):
 
 def test_full_capacity_denies_before_any_durable_change_and_keeps_preview_issued(operation_store, frozen_capture, root_context):
     first = _accept(operation_store, _preview(operation_store, frozen_capture), capacity=_CAPACITY)
-    waiting = _preview(operation_store, frozen_capture)
+    waiting = _preview(
+        operation_store,
+        frozen_capture,
+        payload={"mode": "manual", "limit": 2},
+    )
     before = _runtime_bytes(root_context)
     started = []
 
@@ -1459,7 +1485,7 @@ def test_capacity_counts_only_unfinished_operations_of_the_bounded_actions(opera
 
     other_pool = _accept(
         operation_store,
-        _preview(operation_store, frozen_capture),
+        _preview(operation_store, frozen_capture, action="backtest"),
         request_id="request-2",
         capacity=(frozenset({"backtest"}), 1),
     )
@@ -1475,7 +1501,16 @@ def test_replay_of_admitted_request_is_answered_even_when_no_capacity_is_offered
 
     assert replay.operation_id == first.operation_id
     with pytest.raises(OperationCapacityExceeded):
-        _accept(operation_store, _preview(operation_store, frozen_capture), request_id="request-2", capacity=(_CAPACITY[0], 0))
+        _accept(
+            operation_store,
+            _preview(
+                operation_store,
+                frozen_capture,
+                payload={"mode": "manual", "limit": 2},
+            ),
+            request_id="request-2",
+            capacity=(_CAPACITY[0], 0),
+        )
 
 
 @pytest.mark.parametrize(

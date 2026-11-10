@@ -453,11 +453,15 @@ class OperationStore:
             raise OperationError("request head is invalid")
         normalized_payload = _normalize_payload(payload)
         payload_digest = _sha256(_canonical_json(normalized_payload))
-        logical_key = derive_logical_operation_key(
-            subject_id=subject_id,
-            action=action,
-            target=due_set,
-            payload_digest=payload_digest,
+        logical_key = (
+            derive_logical_operation_key(
+                subject_id=subject_id,
+                action=action,
+                target=due_set,
+                payload_digest=payload_digest,
+            )
+            if action.startswith("paper-")
+            else None
         )
         operator_hash = _sha256(_validate_session(operator_session).encode("utf-8"))
         token_hash = _sha256(confirmation_token.encode("utf-8"))
@@ -548,10 +552,11 @@ class OperationStore:
                     raise StalePreview("reviewed payload changed")
                 if resolved_state is not None and resolved_state != (expected_head, due_set):
                     raise StalePreview("current head or due-set changed")
-                matching_operations = [item for item in index["operations"].values() if item.get("logical_key") == logical_key and item.get("status") in _LOGICAL_DEDUP_STATUSES]
-                if matching_operations:
-                    existing_operation = min(matching_operations, key=lambda item: (item["created_at"], item["operation_id"]))
-                    raise DuplicateLogicalOperationRefusal(existing_operation["operation_id"], logical_key)
+                if logical_key is not None:
+                    matching_operations = [item for item in index["operations"].values() if item.get("logical_key") == logical_key and item.get("status") in _LOGICAL_DEDUP_STATUSES]
+                    if matching_operations:
+                        existing_operation = min(matching_operations, key=lambda item: (item["created_at"], item["operation_id"]))
+                        raise DuplicateLogicalOperationRefusal(existing_operation["operation_id"], logical_key)
                 if capacity is not None:
                     capacity_actions, capacity_limit = capacity
                     unfinished = sum(1 for item in index["operations"].values() if item.get("action") in capacity_actions and item.get("status") in _UNFINISHED_STATUSES)
@@ -568,7 +573,6 @@ class OperationStore:
                     "preview_id": preview_id,
                     "action": action,
                     "subject_id": subject_id,
-                    "logical_key": logical_key,
                     "capture_id": preview["capture_id"],
                     "capture_digest": preview["capture_digest"],
                     "status": OperationStatus.ACCEPTED.value,
@@ -582,6 +586,8 @@ class OperationStore:
                     "events": [{"status": OperationStatus.ACCEPTED.value, "at": timestamp}],
                     "result": None,
                 }
+                if logical_key is not None:
+                    operation_record["logical_key"] = logical_key
                 request_record = {
                     "operation_id": operation_id,
                     "request_digest": request_digest,
