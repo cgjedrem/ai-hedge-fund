@@ -714,6 +714,135 @@ def test_preflight_busy_after_intent_records_abort_and_same_identity_retries(tmp
     assert record.session == "2024-06-03"
 
 
+def test_control_busy_after_intent_records_abort_and_same_identity_retries(tmp_path, clock, SPEC, monkeypatch):
+    from hedge_fund.runtime import admission as admission_module
+
+    directory = _deploy_owned_paper_test_fund(tmp_path, SPEC)
+    clock("2024-06-04")
+    ledger = Ledger(directory)
+    request_id = "control-busy-intent"
+    original_transition = admission_module.paper_control_transition
+    injected = False
+
+    @contextmanager
+    def busy_after_intent(path, identity):
+        nonlocal injected
+        if not injected and any(item.request_id == request_id for item in ledger.unresolved_tick_intents()):
+            injected = True
+            raise admission_module.PaperControlBusy("synthetic control contention")
+        with original_transition(path, identity):
+            yield
+
+    monkeypatch.setattr(admission_module, "paper_control_transition", busy_after_intent)
+    with _owned_paper_lane(directory, "alpha"):
+        with pytest.raises(admission_module.PaperPreflightBusy):
+            tick(
+                directory,
+                FakeDataClient(SERIES),
+                session="2024-06-03",
+                expected_head=None,
+                build_fund=build_fund,
+                request_id=request_id,
+            )
+
+    assert injected
+    assert ledger.halted() is None
+    aborted = [event for event in ledger.events() if event.get("kind") == "tick_aborted" and event.get("request_id") == request_id]
+    assert len(aborted) == 1
+    assert aborted[0]["no_effects"] is True
+
+    monkeypatch.setattr(admission_module, "paper_control_transition", original_transition)
+    with _owned_paper_lane(directory, "alpha"):
+        record = tick(
+            directory,
+            FakeDataClient(SERIES),
+            session="2024-06-03",
+            expected_head=None,
+            build_fund=build_fund,
+            request_id=request_id,
+        )
+    assert record.session == "2024-06-03"
+    assert ledger.halted() is None
+
+
+def test_pre_effect_intent_ledger_guard_failure_records_abort_without_halt(tmp_path, clock, SPEC, monkeypatch):
+    directory = _deploy_owned_paper_test_fund(tmp_path, SPEC)
+    clock("2024-06-04")
+    ledger = Ledger(directory)
+    request_id = "pre-effect-ledger-guard"
+    original_guard = Ledger._require_completed_redo
+    injected = False
+
+    def fail_after_intent(self, *args, **kwargs):
+        nonlocal injected
+        if not injected and any(item.request_id == request_id for item in self.unresolved_tick_intents()):
+            injected = True
+            raise LedgerError("synthetic pre-effect guard failure")
+        return original_guard(self, *args, **kwargs)
+
+    monkeypatch.setattr(Ledger, "_require_completed_redo", fail_after_intent)
+    with _owned_paper_lane(directory, "alpha"):
+        with pytest.raises(LedgerError, match="synthetic pre-effect guard failure"):
+            tick(
+                directory,
+                FakeDataClient(SERIES),
+                session="2024-06-03",
+                expected_head=None,
+                build_fund=build_fund,
+                request_id=request_id,
+            )
+
+    assert injected
+    assert ledger.halted() is None
+    aborted = [event for event in ledger.events() if event.get("kind") == "tick_aborted" and event.get("request_id") == request_id]
+    assert len(aborted) == 1
+    assert aborted[0]["no_effects"] is True
+
+
+def test_intent_halt_in_approval_preflight_aborts_and_allows_same_identity_retry(tmp_path, clock, SPEC):
+    spec = SPEC.model_copy(update={"approval_required": True, "rebalance": "daily"})
+    directory = _deploy_owned_paper_test_fund(tmp_path, spec)
+    clock("2024-06-04")
+    ledger = Ledger(directory)
+    with _owned_paper_lane(directory, "alpha"):
+        first = _tick(directory)
+    clock("2024-06-05")
+    request_id = "approval-preflight-halt"
+
+    def halt_after_intent(progress):
+        if progress == 35:
+            ledger.halt("synthetic approval-preflight halt", request_id="approval-preflight-halt-control")
+
+    with _owned_paper_lane(directory, "alpha"):
+        with pytest.raises(FundHalted):
+            tick(
+                directory,
+                FakeDataClient(SERIES),
+                session="2024-06-04",
+                expected_head=first.hash,
+                build_fund=build_fund,
+                request_id=request_id,
+                on_progress=halt_after_intent,
+            )
+
+    aborted = [event for event in ledger.events() if event.get("kind") == "tick_aborted" and event.get("request_id") == request_id]
+    assert len(aborted) == 1
+    assert aborted[0]["no_effects"] is True
+    assert not any(event.get("kind") == "tick_failed" and event.get("request_id") == request_id for event in ledger.events())
+    with _owned_paper_lane(directory, "alpha"):
+        ledger.resume(spec.capital)
+        record = tick(
+            directory,
+            FakeDataClient(SERIES),
+            session="2024-06-04",
+            expected_head=first.hash,
+            build_fund=build_fund,
+            request_id=request_id,
+        )
+    assert record.session == "2024-06-04"
+    assert ledger.halted() is None
+
+
 def test_cli_shaped_tick_races_web_logical_operation_submission(tmp_path, clock, SPEC):
     from concurrent.futures import ThreadPoolExecutor
     from datetime import timedelta, timezone
@@ -2500,6 +2629,90 @@ def test_tick_failure_event_binds_manual_operation_and_capture(tmp_path, clock, 
     assert failure["request_id"] == "web-tick-1"
     assert failure["capture_id"] == "b" * 32
     assert failure["capture_digest"] == "c" * 64
+
+
+def test_intent_outcome_lookup_failure_does_not_duplicate_tick_failure_or_block_recovery(tmp_path, clock, SPEC, monkeypatch):
+    from hedge_fund.runtime.reconciliation import (
+        build_reconciliation_snapshot,
+        ReconciliationConfirmation,
+    )
+
+    clock("2024-06-04")
+    directory = _deploy_owned_paper_test_fund(tmp_path, SPEC)
+    ledger = Ledger(directory)
+    original_run = paper_tick_module._run
+    original_events = Ledger.events
+    request_id = "single-failure-outcome"
+
+    def write_failure_then_raise(*args, **kwargs):
+        target_ledger = args[2]
+        attempt = kwargs["operation_context"]
+        target_ledger.log_event(
+            "tick_failed",
+            **attempt,
+            session=args[4],
+            error="synthetic failure already recorded",
+            durable=True,
+        )
+        target_ledger.halt("synthetic failure already recorded")
+        raise RuntimeError("synthetic failure already recorded")
+
+    def fail_failure_observation(self):
+        events = original_events(self)
+        if any(event.get("kind") == "tick_failed" and event.get("request_id") == request_id for event in events):
+            raise OSError("synthetic outcome lookup failure")
+        return events
+
+    monkeypatch.setattr(paper_tick_module, "_run", write_failure_then_raise)
+    monkeypatch.setattr(Ledger, "events", fail_failure_observation)
+    with _owned_paper_lane(directory, "alpha"):
+        with pytest.raises(RuntimeError, match="synthetic failure already recorded"):
+            tick(
+                directory,
+                FakeDataClient(SERIES),
+                session="2024-06-03",
+                expected_head=None,
+                build_fund=build_fund,
+                request_id=request_id,
+            )
+    monkeypatch.setattr(paper_tick_module, "_run", original_run)
+    monkeypatch.setattr(Ledger, "events", original_events)
+
+    failures = [event for event in ledger.events() if event.get("kind") == "tick_failed" and event.get("request_id") == request_id]
+    assert len(failures) == 1
+    assert ledger.unresolved_tick_intents() == ()
+    state = ledger.replay(SPEC.capital, full=True)
+    preview = build_reconciliation_snapshot(
+        directory,
+        load_deployed(directory),
+        ledger,
+        state,
+        ledger.latest(),
+    )
+    assert preview.preview.recoverable is True
+    confirmation = ReconciliationConfirmation(
+        request_id="resume-single-failure-outcome",
+        failure_id=preview.preview.failure_id,
+        preview_digest=preview.preview.preview_digest,
+        decision="confirm-paper-book-matches-ledger",
+    )
+    with _owned_paper_lane(directory, "alpha"):
+        ledger.resume(
+            SPEC.capital,
+            reconciliation=confirmation.model_dump(mode="json"),
+            request_id=confirmation.request_id,
+            operator="cli",
+        )
+        record = tick(
+            directory,
+            FakeDataClient(SERIES),
+            session="2024-06-03",
+            expected_head=None,
+            build_fund=build_fund,
+            request_id="new-id-after-outcome-recovery",
+        )
+    assert record.session == "2024-06-03"
+    assert ledger.halted() is None
 
 
 def test_fill_then_append_failure_stays_halted_without_fabricated_ledger_success(tmp_path, clock, SPEC, monkeypatch):
