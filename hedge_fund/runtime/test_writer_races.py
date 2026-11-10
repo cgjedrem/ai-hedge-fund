@@ -301,16 +301,35 @@ def _wait_file(path: Path, process, what: str, timeout: float = 30) -> str:
     last_error = None
     while time.monotonic() < deadline:
         try:
-            return path.read_text(encoding="utf-8")
+            value = path.read_text(encoding="utf-8")
+            if value:
+                return value
         except (FileNotFoundError, PermissionError) as exc:
             last_error = exc
-        if process is not None and process.poll() is not None and not path.exists():
+        if process is not None and process.poll() is not None:
+            if path.exists():
+                raise AssertionError(f"{what} exited without a complete report: {process.returncode}") from last_error
             raise AssertionError(f"{what} exited early: {process.returncode}") from last_error
         time.sleep(0.01)
     detail = f"{what} did not report"
     if last_error is not None:
         detail += f"; last read failed: {type(last_error).__name__}"
     raise AssertionError(detail) from last_error
+
+
+def test_logical_wait_file_retries_empty_handshake():
+    class EmptyThenReady:
+        def __init__(self):
+            self.reads = 0
+
+        def read_text(self, encoding):
+            self.reads += 1
+            return "" if self.reads == 1 else "ready"
+
+    handshake = EmptyThenReady()
+
+    assert _wait_file(handshake, None, "logical start signal", timeout=1) == "ready"
+    assert handshake.reads == 2
 
 
 class _Racer:
