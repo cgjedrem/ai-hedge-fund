@@ -45,6 +45,7 @@ from hedge_fund.runtime.handover import (
     verify_ledger_head,
     verify_root_inventory,
 )
+from hedge_fund.runtime.operations import DuplicateLogicalOperationRefusal
 from hedge_fund.runtime.owned_runner import (
     OwnedRunnerError,
     read_runner_record,
@@ -475,7 +476,7 @@ def _runner_loop(
             _write_status(root, fund, nonce_hash, status)
             if stop_event.is_set():
                 break
-    except UnresolvedTickIntentRefusal as exc:
+    except (UnresolvedTickIntentRefusal, DuplicateLogicalOperationRefusal) as exc:
         status["status"] = "blocked"
         status["reason"] = exc.reason
         status["refusal"] = exc.fields
