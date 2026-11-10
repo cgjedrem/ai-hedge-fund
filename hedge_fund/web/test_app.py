@@ -452,6 +452,31 @@ def test_unresolved_intent_refusal_reaches_web_error_envelope(tmp_path):
     assert body["refusal"] == fields
 
 
+def test_invalid_refusal_fields_still_return_conflict_envelope(tmp_path):
+    from hedge_fund.web.services import ServiceError
+
+    app = create_app(root=tmp_path)
+
+    def fail():
+        raise ServiceError(
+            409,
+            "Duplicate paper operation.",
+            code="duplicate-logical-operation",
+            refusal={
+                "reason": "duplicate-logical-operation",
+                "existing_operation_id": "invalid",
+                "logical_key": "invalid",
+            },
+        )
+
+    app.state.service.catalog = fail
+    with TestClient(app, raise_server_exceptions=False) as client:
+        response = client.get("/api/catalog", headers=LOOPBACK)
+
+    body = _assert_envelope(response, 409, "duplicate-logical-operation")
+    assert "refusal" not in body
+
+
 def test_service_error_rejects_codes_outside_the_contract():
     from hedge_fund.web.services import ServiceError
 

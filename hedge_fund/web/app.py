@@ -34,6 +34,7 @@ from hedge_fund.web.schemas import (
     OperationPreviewRequest,
     PaperResumeRequest,
     PaperTickAcceptRequest,
+    PaperTickIntentReconciliationRequest,
     PaperTickPreviewRequest,
     RunnerPreviewRequest,
     RunnerStartAcceptRequest,
@@ -316,6 +317,14 @@ def create_app(
     @app.get("/api/paper/{name}/reconciliation")
     def paper_reconciliation(name: str):
         return service.paper_reconciliation(name)
+
+    @app.post("/api/paper/{name}/reconcile-tick-request")
+    def reconcile_tick_request(name: str, request: PaperTickIntentReconciliationRequest):
+        return _with_request_identity(
+            lambda: service.reconcile_tick_request(name, request),
+            request_id=request.request_id,
+            subject_id=name,
+        )
 
     @app.post("/api/paper/{name}/tick/preview", status_code=201)
     def paper_tick_preview(name: str, request: PaperTickPreviewRequest, http_request: Request):

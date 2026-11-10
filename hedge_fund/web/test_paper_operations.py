@@ -26,6 +26,7 @@ from hedge_fund.test_support.handover import enroll_synthetic_root
 from hedge_fund.web.schemas import (
     DeployRequest,
     PaperTickAcceptRequest,
+    PaperTickIntentReconciliationRequest,
     PaperTickPreviewRequest,
     RunnerPreviewRequest,
     RunnerStartAcceptRequest,
@@ -283,6 +284,70 @@ def test_manual_tick_accept_refuses_unresolved_intent_before_worker_dispatch(dem
     assert dispatched == []
     assert events_after == events_before
     assert ledger.sessions() == []
+
+
+def test_web_reconciles_incomplete_intent_and_admits_new_tick(demo_root):
+    data_client = _OfflineDataClient()
+    service = DeskService(
+        demo_root,
+        allow_writes=True,
+        network_enabled=True,
+        data_client_factory=lambda: data_client,
+        fund_factory=_OfflineFund,
+    )
+    service._runtime_settings = _local_settings()
+    name = "web-intent-recovery-test"
+    try:
+        spec = load_spec(demo_root / "mandates" / "demo-quality.yaml").model_copy(update={"name": name})
+        service.create_mandate(spec.model_dump(mode="python"))
+        service.deploy_mandate(name, DeployRequest(universe=["AAPL"]))
+        preview = service.create_manual_tick_preview(
+            name,
+            PaperTickPreviewRequest(expected_head=None),
+            operator_session="offline-test-session",
+        )
+        due_session = preview["due_set"][0]
+        ledger = Ledger(demo_root / "paper" / name)
+        with service._admission.manual_session(name, timeout=0):
+            ledger.log_event(
+                "tick_intent",
+                request_id="invalid legacy request id",
+                session=due_session,
+            )
+
+        intent_preview = service.paper_reconciliation(name)["intent_preview"]
+        assert intent_preview["required"] is True
+        assert intent_preview["recoverable"] is True
+        assert intent_preview["intent_request_id"] is None
+        request = PaperTickIntentReconciliationRequest(
+            request_id="web-intent-reconcile-001",
+            intent_digest=intent_preview["intent_digest"],
+            preview_digest=intent_preview["preview_digest"],
+        )
+        receipt = service.reconcile_tick_request(name, request)
+        assert receipt["intent_request_id"] is None
+        assert receipt["reconciliation_id"]
+        assert ledger.unresolved_tick_intents() == ()
+
+        accepted = service.accept_manual_tick(
+            name,
+            PaperTickAcceptRequest(
+                request_id="web-tick-after-intent-recovery",
+                preview_id=preview["preview_id"],
+                preview_digest=preview["preview_digest"],
+                confirmation_token=preview["confirmation_token"],
+                expected_head=None,
+                due_set=[due_session],
+            ),
+            operator_session="offline-test-session",
+        )
+        completed = _wait_for_operation(service, accepted["operation_id"])
+    finally:
+        service.close()
+
+    assert completed["status"] == "completed"
+    assert completed["result"]["session"] == due_session
+    assert Ledger(demo_root / "paper" / name).sessions() == [due_session]
 
 
 def test_web_duplicate_logical_tick_refusal_exposes_contract_fields(demo_root, monkeypatch):

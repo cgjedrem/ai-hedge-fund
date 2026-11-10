@@ -70,7 +70,6 @@ _CONTROL_LANES = (("control",), ("runner", "execution"))
 _HALT_LANES = (("halt",),) + _CONTROL_LANES
 UNRESOLVED_TICK_INTENT_REASON = "unresolved-tick-intent"
 TICK_INTENT_RECOVERY = "reconcile-tick-request"
-_UNREADABLE_INTENT_FIELD = "unreadable"
 
 
 class LedgerError(RuntimeError):
@@ -140,10 +139,14 @@ class AuditObservationUnavailable(LedgerError):
 
 @dataclass(frozen=True, slots=True)
 class UnresolvedTickIntent:
-    request_id: str
-    session: str
-    recorded_at: str
+    request_id: str | None
+    session: str | None
+    recorded_at: str | None
     metadata_complete: bool
+    intent_digest: str | None = None
+    logical_key: str | None = None
+    corrupt_event_digests: tuple[str, ...] = ()
+    is_corrupt: bool = False
 
 
 class Ledger:
@@ -363,6 +366,8 @@ class Ledger:
         unresolved = self.unresolved_tick_intents()
         if unresolved:
             intent = unresolved[0]
+            if intent.is_corrupt or intent.request_id is None or intent.session is None:
+                raise PaperReconciliationRequired("paper audit history is unreadable; reconciliation is required")
             raise UnresolvedTickIntentRefusal(
                 self.directory.name,
                 intent.request_id,
@@ -371,24 +376,25 @@ class Ledger:
 
     def unresolved_tick_intents(self) -> tuple[UnresolvedTickIntent, ...]:
         try:
-            events = self.events()
+            events, corrupt_event_digests = self.recovery_events()
         except AuditObservationUnavailable:
             raise
         except (LedgerError, OSError, UnicodeError, ValueError):
             return (_unreadable_tick_intent(),)
-        if not isinstance(events, list):
+        if not isinstance(events, list) or not isinstance(corrupt_event_digests, tuple):
             return (_unreadable_tick_intent(),)
 
+        resolved_intents, resolved_corrupt = _tick_intent_resolution_state(events, corrupt_event_digests, self.directory.name)
         pending: list[tuple[int, dict, UnresolvedTickIntent]] = []
         outcomes_by_request: dict[str, list[dict]] = {}
         redo_by_session: dict[str, int] = {}
         for index, event in enumerate(events):
             if not isinstance(event, dict) or not isinstance(event.get("kind"), str):
-                return (_unreadable_tick_intent(),)
+                return (_unreadable_tick_intent(corrupt_event_digests),)
             kind = event["kind"]
             if kind == "tick_intent":
-                pending.append((index, event, _tick_intent_view(event)))
-            elif kind in {"tick", "tick_failed"}:
+                pending.append((index, event, _tick_intent_view(event, _event_digest(event))))
+            elif kind in {"tick", "tick_failed", "tick_aborted"}:
                 request_id = event.get("request_id")
                 if isinstance(request_id, str):
                     outcomes_by_request.setdefault(request_id, []).append(event)
@@ -400,18 +406,21 @@ class Ledger:
 
         unresolved = []
         for index, event, intent in pending:
-            if not intent.metadata_complete:
-                unresolved.append(intent)
+            if intent.intent_digest in resolved_intents:
                 continue
             outcomes = outcomes_by_request.get(intent.request_id, [])
             if outcomes:
-                if len(outcomes) == 1 and _tick_outcome_matches(event, outcomes[0]):
+                matches = [outcome for outcome in outcomes if _tick_outcome_matches(event, outcome)]
+                if len(matches) == 1:
                     continue
                 unresolved.append(intent)
                 continue
             if redo_by_session.get(intent.session, -1) > index:
                 continue
             unresolved.append(intent)
+        remaining_corrupt = tuple(digest for digest in corrupt_event_digests if digest not in resolved_corrupt)
+        if remaining_corrupt:
+            unresolved.append(_unreadable_tick_intent(remaining_corrupt))
         return tuple(unresolved)
 
     def observe_approval_for_display(self, state: FundState, *, approval_required: bool) -> dict[str, str] | None:
@@ -913,6 +922,8 @@ class Ledger:
         if no_work:
             if len(no_work) != 1:
                 raise PaperReconciliationRequired("tick no-work result is invalid; reconciliation is required")
+            if not self._tick_intents_have_only_safe_aborts(matches):
+                raise PaperReconciliationRequired("tick request outcome is uncertain; reconciliation is required")
             result = no_work[0].get("result")
             if not isinstance(result, dict) or set(result) != {"outcome", "message"} or result.get("outcome") != "nothing-due" or not isinstance(result.get("message"), str) or not result["message"]:
                 raise PaperReconciliationRequired("tick no-work result is invalid; reconciliation is required")
@@ -936,8 +947,152 @@ class Ledger:
                 raise PaperReconciliationRequired("tick request record changed; reconciliation is required")
             return record
         if any(event.get("kind") == "tick_intent" for event in matches):
+            if self._tick_intents_have_only_safe_aborts(matches):
+                return None
             raise PaperReconciliationRequired("tick request outcome is uncertain; reconciliation is required")
         raise PaperRequestConflict("request identity conflicts with durable paper history")
+
+    @staticmethod
+    def _tick_intents_have_only_safe_aborts(matches: list[dict]) -> bool:
+        intents = [event for event in matches if event.get("kind") == "tick_intent"]
+        if not intents:
+            return not any(event.get("kind") == "tick_aborted" for event in matches)
+        for intent in intents:
+            outcomes = [event for event in matches if event.get("kind") in {"tick", "tick_failed", "tick_aborted"} and _tick_outcome_matches(intent, event)]
+            if len(outcomes) != 1 or outcomes[0].get("kind") != "tick_aborted":
+                return False
+        return True
+
+    def tick_intent_reconciliation_request_result(
+        self,
+        request_id: str,
+        *,
+        intent_request_id: str | None,
+        intent_digest: str | None,
+        preview_digest: str,
+        decision: str,
+    ) -> str | None:
+        _validate_request_id(request_id)
+        if intent_request_id is not None:
+            _validate_request_id(intent_request_id)
+        if intent_digest is not None and (not isinstance(intent_digest, str) or _HASH.fullmatch(intent_digest) is None):
+            raise ValueError("Tick-intent digest is invalid.")
+        if not isinstance(preview_digest, str) or _HASH.fullmatch(preview_digest) is None:
+            raise ValueError("Tick-intent preview digest is invalid.")
+        if decision != "confirm-paper-book-matches-ledger":
+            raise ValueError("Tick-intent reconciliation decision is invalid.")
+        if intent_digest is None and intent_request_id is not None:
+            raise ValueError("Tick-intent request identity requires a digest.")
+        request_digest = _control_request_digest(
+            TICK_INTENT_RECOVERY,
+            self.directory.name,
+            {
+                "intent_request_id": intent_request_id,
+                "intent_digest": intent_digest,
+                "preview_digest": preview_digest,
+                "decision": decision,
+            },
+        )
+        events, corrupt_event_digests = self.recovery_events()
+        resolved_intents, resolved_corrupt = _tick_intent_resolution_state(events, corrupt_event_digests, self.directory.name)
+        matches = [event for event in events if event.get("request_id") == request_id]
+        if not matches:
+            return None
+        if len(matches) == 1:
+            event = matches[0]
+            if event.get("kind") == "tick_intent_resolved" and event.get("request_action") == TICK_INTENT_RECOVERY and event.get("request_digest") == request_digest:
+                try:
+                    from hedge_fund.runtime.reconciliation import (
+                        TickIntentReconciliationReceipt,
+                    )
+
+                    receipt = TickIntentReconciliationReceipt.model_validate(event.get("receipt"))
+                except (TypeError, ValueError):
+                    raise PaperReconciliationRequired("tick-intent reconciliation outcome is invalid") from None
+                if receipt.request_id == request_id and receipt.intent_request_id == intent_request_id and receipt.intent_digest == intent_digest and receipt.preview_digest == preview_digest and receipt.decision == decision:
+                    if (intent_digest is None or intent_digest in resolved_intents) and set(receipt.corrupt_event_digests).issubset(resolved_corrupt):
+                        return receipt.receipt_id
+        raise PaperRequestConflict("request identity conflicts with durable paper history")
+
+    def reconcile_tick_intent(
+        self,
+        capital: float,
+        *,
+        confirmation,
+        operator: str,
+    ) -> str:
+        if isinstance(capital, bool) or not isinstance(capital, (int, float)) or not isfinite(capital) or capital <= 0:
+            raise LedgerError("Tick-intent reconciliation requires valid mandate capital.")
+        if not isinstance(operator, str) or operator not in {"cli", "tui", "web"}:
+            raise LedgerError("Tick-intent reconciliation operator is invalid.")
+        from hedge_fund.runtime.reconciliation import (
+            build_tick_intent_reconciliation_snapshot,
+            TickIntentReconciliationConfirmation,
+            TickIntentReconciliationReceipt,
+        )
+
+        try:
+            reviewed = TickIntentReconciliationConfirmation.model_validate(confirmation)
+        except (TypeError, ValueError):
+            raise LedgerError("Tick-intent reconciliation confirmation is invalid.") from None
+        request_id = reviewed.request_id
+        self._require_write_lanes(_CONTROL_LANES)
+        from hedge_fund.paper.deployed import load_deployed
+        from hedge_fund.runtime.admission import paper_control_transition
+
+        with paper_control_transition(self.directory, self.directory.name):
+            previous = self.tick_intent_reconciliation_request_result(
+                request_id,
+                intent_request_id=reviewed.intent_request_id,
+                intent_digest=reviewed.intent_digest,
+                preview_digest=reviewed.preview_digest,
+                decision=reviewed.decision,
+            )
+            if previous is not None:
+                return previous
+            state = self.replay(capital, full=True)
+            latest = self.latest()
+            snapshot = build_tick_intent_reconciliation_snapshot(
+                self.directory,
+                load_deployed(self.directory),
+                self,
+                state,
+                latest,
+                intent_request_id=reviewed.intent_request_id,
+            )
+            preview = snapshot.preview
+            if not preview.required or not preview.recoverable or preview.intent_request_id != reviewed.intent_request_id or preview.intent_digest != reviewed.intent_digest or preview.preview_digest != reviewed.preview_digest:
+                raise LedgerError("Tick-intent reconciliation confirmation is stale or paper state is not reconcilable.")
+            receipt = TickIntentReconciliationReceipt.create(
+                preview=preview,
+                request_id=request_id,
+                operator=operator,
+                recorded_at=_now(),
+            )
+            request_digest = _control_request_digest(
+                TICK_INTENT_RECOVERY,
+                self.directory.name,
+                {
+                    "intent_request_id": reviewed.intent_request_id,
+                    "intent_digest": reviewed.intent_digest,
+                    "preview_digest": reviewed.preview_digest,
+                    "decision": reviewed.decision,
+                },
+            )
+            self.log_event(
+                "tick_intent_resolved",
+                time=receipt.recorded_at,
+                request_id=request_id,
+                request_action=TICK_INTENT_RECOVERY,
+                request_digest=request_digest,
+                intent_request_id=reviewed.intent_request_id,
+                intent_digest=reviewed.intent_digest,
+                corrupt_event_digests=list(receipt.corrupt_event_digests),
+                decision=receipt.decision,
+                receipt=receipt.model_dump(mode="json"),
+                durable=True,
+            )
+            return receipt.receipt_id
 
     def resume_request_result(
         self,
@@ -1757,21 +1912,28 @@ class Ledger:
             line = json.dumps({"time": _now(), "kind": kind, **fields}, default=str)
             self._require_write_lanes(_HALT_LANES if halt_event else _CONTROL_LANES)
             with RootContext.open(self.directory) as root:
-                root.append_bytes(EVENTS_FILE, (line + "\n").encode("utf-8"), durable=durable)
+                try:
+                    prior = root.read_bytes(EVENTS_FILE)
+                except FileNotFoundError:
+                    prior = b""
+                separator = b"" if not prior or prior.endswith(b"\n") else b"\n"
+                root.append_bytes(EVENTS_FILE, separator + (line + "\n").encode("utf-8"), durable=durable)
 
-    def events(self) -> list[dict]:
+    def recovery_events(self) -> tuple[list[dict], tuple[str, ...]]:
         from hedge_fund.runtime.admission import (
             AdmissionError,
             paper_audit_snapshot,
             PaperAuditObservationBusy,
         )
+        from hedge_fund.runtime.root import RootContext
 
-        def read() -> list[dict]:
+        def read() -> tuple[list[dict], tuple[str, ...]]:
             try:
-                text = self.events_path.read_text(encoding="utf-8")
+                with RootContext.open(self.directory) as root:
+                    raw = root.read_bytes(EVENTS_FILE)
             except FileNotFoundError:
-                return []
-            return [json.loads(line) for line in text.splitlines() if line.strip()]
+                return [], ()
+            return _parse_event_history(raw)
 
         try:
             return paper_audit_snapshot(self.directory, self.directory.name, read)
@@ -1780,17 +1942,27 @@ class Ledger:
         except AdmissionError as exc:
             raise LedgerError("paper audit observation failed") from exc
 
+    def events(self) -> list[dict]:
+        events, corrupt_event_digests = self.recovery_events()
+        if corrupt_event_digests:
+            _resolved_intents, resolved_corrupt = _tick_intent_resolution_state(events, corrupt_event_digests, self.directory.name)
+            if set(corrupt_event_digests) - resolved_corrupt:
+                raise json.JSONDecodeError("paper event history requires reconciliation", "", 0)
+        return events
 
-def _unreadable_tick_intent() -> UnresolvedTickIntent:
+
+def _unreadable_tick_intent(corrupt_event_digests: tuple[str, ...] = ()) -> UnresolvedTickIntent:
     return UnresolvedTickIntent(
-        request_id=_UNREADABLE_INTENT_FIELD,
-        session=_UNREADABLE_INTENT_FIELD,
-        recorded_at=_UNREADABLE_INTENT_FIELD,
+        request_id=None,
+        session=None,
+        recorded_at=None,
         metadata_complete=False,
+        corrupt_event_digests=corrupt_event_digests,
+        is_corrupt=True,
     )
 
 
-def _tick_intent_view(event: dict) -> UnresolvedTickIntent:
+def _tick_intent_view(event: dict, intent_digest: str) -> UnresolvedTickIntent:
     request_id = event.get("request_id")
     session = event.get("session")
     recorded_at = event.get("time")
@@ -1819,18 +1991,97 @@ def _tick_intent_view(event: dict) -> UnresolvedTickIntent:
         and operation_fields_valid
     )
     return UnresolvedTickIntent(
-        request_id=request_id if request_id_valid else _UNREADABLE_INTENT_FIELD,
-        session=session if session_valid else _UNREADABLE_INTENT_FIELD,
-        recorded_at=recorded_at if recorded_at_valid else _UNREADABLE_INTENT_FIELD,
+        request_id=request_id if request_id_valid else None,
+        session=session if session_valid else None,
+        recorded_at=recorded_at if recorded_at_valid else None,
         metadata_complete=metadata_complete,
+        intent_digest=intent_digest,
+        logical_key=event.get("logical_key") if isinstance(event.get("logical_key"), str) and _HASH.fullmatch(event["logical_key"]) else None,
     )
 
 
+def _parse_event_history(raw: bytes) -> tuple[list[dict], tuple[str, ...]]:
+    events = []
+    corrupt_event_digests = []
+    for line in raw.splitlines(keepends=True):
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line.decode("utf-8"))
+        except (UnicodeError, ValueError):
+            event = None
+        if not isinstance(event, dict) or not isinstance(event.get("kind"), str) or not event["kind"]:
+            corrupt_event_digests.append(hashlib.sha256(line.rstrip(b"\r\n")).hexdigest())
+            continue
+        events.append(event)
+    return events, tuple(corrupt_event_digests)
+
+
+def _event_digest(event: dict) -> str:
+    encoded = json.dumps(event, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=True).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _tick_intent_resolution_state(
+    events: list[dict],
+    corrupt_event_digests: tuple[str, ...],
+    fund: str,
+) -> tuple[set[str], set[str]]:
+    from hedge_fund.runtime.reconciliation import TickIntentReconciliationReceipt
+
+    resolved_intents = set()
+    resolved_corrupt = set()
+    raw_corrupt = set(corrupt_event_digests)
+    for index, event in enumerate(events):
+        if event.get("kind") != "tick_intent_resolved":
+            continue
+        try:
+            receipt = TickIntentReconciliationReceipt.model_validate(event.get("receipt"))
+        except (TypeError, ValueError):
+            continue
+        if event.get("request_id") != receipt.request_id or event.get("request_action") != TICK_INTENT_RECOVERY:
+            continue
+        expected_request_digest = _control_request_digest(
+            TICK_INTENT_RECOVERY,
+            fund,
+            {
+                "intent_request_id": receipt.intent_request_id,
+                "intent_digest": receipt.intent_digest,
+                "preview_digest": receipt.preview_digest,
+                "decision": receipt.decision,
+            },
+        )
+        if event.get("request_digest") != expected_request_digest:
+            continue
+        if not set(receipt.corrupt_event_digests).issubset(raw_corrupt):
+            continue
+        if receipt.intent_digest is not None:
+            matching_intents = [prior for prior in events[:index] if prior.get("kind") == "tick_intent" and _event_digest(prior) == receipt.intent_digest and (receipt.intent_request_id is None or prior.get("request_id") == receipt.intent_request_id)]
+            if not matching_intents:
+                continue
+            resolved_intents.add(receipt.intent_digest)
+        elif receipt.intent_request_id is not None:
+            continue
+        if not receipt.intent_digest and not receipt.corrupt_event_digests:
+            continue
+        resolved_corrupt.update(receipt.corrupt_event_digests)
+    return resolved_intents, resolved_corrupt
+
+
 def _tick_outcome_matches(intent: dict, outcome: dict) -> bool:
-    if outcome.get("request_id") != intent.get("request_id") or outcome.get("request_action") != "tick" or outcome.get("request_digest") != intent.get("request_digest") or outcome.get("expected_head") != intent.get("expected_head") or outcome.get("session") != intent.get("session"):
+    if outcome.get("request_id") != intent.get("request_id") or outcome.get("session") != intent.get("session"):
         return False
+    for field in ("request_action", "request_digest", "expected_head", "attempt_id", "logical_key"):
+        if field in intent and outcome.get(field) != intent[field]:
+            return False
+        if field in outcome and outcome[field] not in (None, "tick") and field == "request_action":
+            return False
     if outcome.get("kind") == "tick_failed":
         return isinstance(outcome.get("error"), str) and bool(outcome["error"])
+    if outcome.get("kind") == "tick_aborted":
+        return outcome.get("no_effects") is True and isinstance(outcome.get("error"), str) and bool(outcome["error"])
+    if outcome.get("kind") != "tick":
+        return False
     result = outcome.get("result")
     return isinstance(result, dict) and set(result) == {"session", "hash"} and result.get("session") == intent.get("session") and isinstance(result.get("hash"), str) and _HASH.fullmatch(result["hash"]) is not None
 

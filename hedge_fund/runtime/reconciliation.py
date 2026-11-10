@@ -176,6 +176,165 @@ class ReconciliationReceipt(BaseModel):
         return self.failure_id == failure_digest(failure_event) and self.expected_head == failure_event.get("expected_head") and self.failed_request_id == failure_event.get("request_id") and self.operation_id == failure_event.get("operation_id") and self.capture_id == failure_event.get("capture_id") and self.capture_digest == failure_event.get("capture_digest")
 
 
+class TickIntentReconciliationPreview(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal[1] = 1
+    required: bool
+    recoverable: bool
+    reason: Literal[
+        "no-unresolved-tick-intent",
+        "multiple-unresolved-tick-intents",
+        "intent-not-found",
+        "ledger-head-changed",
+        "broker-not-local-paper",
+        "broker-book-unavailable",
+        "broker-book-invalid",
+        "broker-book-changed",
+        "broker-book-mismatch",
+        "ready",
+    ]
+    intent_request_id: str | None = Field(default=None, pattern=_REQUEST_ID.pattern)
+    intent_session: str | None = Field(default=None, min_length=1, max_length=256)
+    intent_digest: str | None = Field(default=None, pattern=_SHA256.pattern)
+    metadata_complete: bool | None = None
+    corrupt_event_digests: tuple[str, ...] = ()
+    expected_head: str | None = Field(default=None, pattern=_SHA256.pattern)
+    current_head: str | None = Field(default=None, pattern=_SHA256.pattern)
+    broker_book_sha256: str | None = Field(default=None, pattern=_SHA256.pattern)
+    fill_identity_sha256: str = Field(pattern=_SHA256.pattern)
+    book_matches_ledger: bool
+    head_matches_intent: bool
+    decision: Literal["confirm-paper-book-matches-ledger"] = _DECISION
+    residual_uncertainty: Literal["external-broker-state-not-applicable-local-paper-only"] = _RESIDUAL_UNCERTAINTY
+    preview_digest: str | None = Field(default=None, pattern=_SHA256.pattern)
+
+    @model_validator(mode="after")
+    def _validate_digest(self) -> TickIntentReconciliationPreview:
+        if len(set(self.corrupt_event_digests)) != len(self.corrupt_event_digests):
+            raise ValueError("corrupt event identities must be unique")
+        if self.required:
+            if self.preview_digest != self.compute_preview_digest():
+                raise ValueError("preview_digest does not match the preview contents")
+            if (
+                self.intent_digest is None
+                and not self.corrupt_event_digests
+                and self.reason
+                not in {
+                    "intent-not-found",
+                    "multiple-unresolved-tick-intents",
+                }
+            ):
+                raise ValueError("required intent reconciliation has no target")
+        elif self.preview_digest is not None or self.recoverable:
+            raise ValueError("an unrequired intent reconciliation has no digest or recovery")
+        return self
+
+    @classmethod
+    def create(cls, **fields) -> TickIntentReconciliationPreview:
+        payload = {"schema_version": 1, **fields}
+        if payload["required"]:
+            candidate = cls.model_construct(**payload, preview_digest=None)
+            payload["preview_digest"] = candidate.compute_preview_digest()
+        else:
+            payload["preview_digest"] = None
+        return cls.model_validate(payload)
+
+    def compute_preview_digest(self) -> str:
+        return _receipt_digest(self.model_dump(mode="json", exclude={"preview_digest"}))
+
+
+class TickIntentReconciliationConfirmation(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    request_id: str = Field(pattern=_REQUEST_ID.pattern)
+    intent_request_id: str | None = Field(default=None, pattern=_REQUEST_ID.pattern)
+    intent_digest: str | None = Field(default=None, pattern=_SHA256.pattern)
+    preview_digest: str = Field(pattern=_SHA256.pattern)
+    decision: Literal["confirm-paper-book-matches-ledger"] = _DECISION
+
+    @model_validator(mode="after")
+    def _validate_target(self) -> TickIntentReconciliationConfirmation:
+        if self.intent_digest is None and self.intent_request_id is not None:
+            raise ValueError("intent request identity requires an intent digest")
+        return self
+
+
+class TickIntentReconciliationReceipt(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal[1] = 1
+    request_id: str = Field(pattern=_REQUEST_ID.pattern)
+    intent_request_id: str | None = Field(default=None, pattern=_REQUEST_ID.pattern)
+    intent_digest: str | None = Field(default=None, pattern=_SHA256.pattern)
+    preview_digest: str = Field(pattern=_SHA256.pattern)
+    corrupt_event_digests: tuple[str, ...] = ()
+    expected_head: str | None = Field(default=None, pattern=_SHA256.pattern)
+    current_head: str | None = Field(default=None, pattern=_SHA256.pattern)
+    broker_book_sha256: str = Field(pattern=_SHA256.pattern)
+    fill_identity_sha256: str = Field(pattern=_SHA256.pattern)
+    operator: Literal["cli", "tui", "web"]
+    recorded_at: str
+    decision: Literal["confirm-paper-book-matches-ledger"] = _DECISION
+    residual_uncertainty: Literal["external-broker-state-not-applicable-local-paper-only"] = _RESIDUAL_UNCERTAINTY
+    receipt_id: str = Field(pattern=_SHA256.pattern)
+
+    @model_validator(mode="after")
+    def _validate_identity(self) -> TickIntentReconciliationReceipt:
+        if self.intent_digest is None and self.intent_request_id is not None:
+            raise ValueError("intent request identity requires an intent digest")
+        if len(set(self.corrupt_event_digests)) != len(self.corrupt_event_digests):
+            raise ValueError("corrupt event identities must be unique")
+        try:
+            recorded_at = datetime.fromisoformat(self.recorded_at.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError("recorded_at must be an ISO timestamp") from exc
+        if recorded_at.tzinfo is None or recorded_at.utcoffset() is None:
+            raise ValueError("recorded_at must include a timezone")
+        if self.receipt_id != self.compute_receipt_id():
+            raise ValueError("receipt_id does not match the receipt contents")
+        return self
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        preview: TickIntentReconciliationPreview,
+        request_id: str,
+        operator: Literal["cli", "tui", "web"],
+        recorded_at: str,
+    ) -> TickIntentReconciliationReceipt:
+        if not isinstance(preview, TickIntentReconciliationPreview) or not preview.required or not preview.recoverable:
+            raise ValueError("a recoverable tick-intent preview is required")
+        payload = {
+            "schema_version": 1,
+            "request_id": request_id,
+            "intent_request_id": preview.intent_request_id,
+            "intent_digest": preview.intent_digest,
+            "preview_digest": preview.preview_digest,
+            "corrupt_event_digests": preview.corrupt_event_digests,
+            "expected_head": preview.expected_head,
+            "current_head": preview.current_head,
+            "broker_book_sha256": preview.broker_book_sha256,
+            "fill_identity_sha256": preview.fill_identity_sha256,
+            "operator": operator,
+            "recorded_at": recorded_at,
+            "decision": _DECISION,
+            "residual_uncertainty": _RESIDUAL_UNCERTAINTY,
+        }
+        payload["receipt_id"] = _receipt_digest(payload)
+        return cls.model_validate(payload)
+
+    def compute_receipt_id(self) -> str:
+        return _receipt_digest(self.model_dump(mode="json", exclude={"receipt_id"}))
+
+
+@dataclass(frozen=True, slots=True)
+class TickIntentReconciliationSnapshot:
+    preview: TickIntentReconciliationPreview
+    intent_event: dict | None
+
+
 def failure_digest(event: dict) -> str:
     if not isinstance(event, dict) or event.get("kind") != "tick_failed":
         raise ValueError("failure identity requires a tick_failed event")
@@ -216,8 +375,20 @@ def build_reconciliation_snapshot(
     *,
     failure_event: dict | None = None,
 ) -> ReconciliationSnapshot:
-    events = ledger.events()
+    events, corrupt_event_digests = ledger.recovery_events()
     failures = [failure_event] if failure_event is not None else unresolved_tick_failures(events)
+    if not failures and corrupt_event_digests:
+        return ReconciliationSnapshot(
+            preview=ReconciliationPreview.create(
+                required=True,
+                recoverable=False,
+                reason="failure-identity-incomplete",
+                fill_identity_sha256=_fill_identity_sha256(latest),
+                book_matches_ledger=False,
+                head_matches_failure=False,
+            ),
+            failure_event=None,
+        )
     if not failures:
         return ReconciliationSnapshot(
             preview=ReconciliationPreview.create(
@@ -236,7 +407,7 @@ def build_reconciliation_snapshot(
     expected_head = failure.get("expected_head")
     head_matches = "expected_head" in failure and (expected_head == latest_head or (latest is not None and latest.session == failure.get("session") and latest.prev_hash == expected_head))
     failure_identity_complete = "expected_head" in failure
-    if any(failure.get(field) is not None for field in ("operation_id", "request_id", "capture_id", "capture_digest")):
+    if any(failure.get(field) is not None for field in ("operation_id", "capture_id", "capture_digest")):
         try:
             TickOperationIdentity.model_validate(
                 {
@@ -305,6 +476,119 @@ def build_reconciliation_snapshot(
         head_matches_failure=head_matches,
     )
     return ReconciliationSnapshot(preview=preview, failure_event=failure)
+
+
+def build_tick_intent_reconciliation_snapshot(
+    directory: str | Path,
+    deployed,
+    ledger,
+    state,
+    latest,
+    *,
+    intent_request_id: str | None = None,
+) -> TickIntentReconciliationSnapshot:
+    if intent_request_id is not None and (not isinstance(intent_request_id, str) or not _REQUEST_ID.fullmatch(intent_request_id)):
+        raise ValueError("tick-intent request identity is invalid")
+    events, _all_corrupt_digests = ledger.recovery_events()
+    unresolved = ledger.unresolved_tick_intents()
+    intents = [item for item in unresolved if not item.is_corrupt and item.intent_digest is not None]
+    corrupt_digests = tuple(sorted({digest for item in unresolved for digest in item.corrupt_event_digests}))
+    selected = None
+    reason = "ready"
+    if intent_request_id is not None:
+        matches = [item for item in intents if item.request_id == intent_request_id]
+        if len(matches) == 1:
+            selected = matches[0]
+        else:
+            reason = "intent-not-found"
+    elif len(intents) == 1:
+        selected = intents[0]
+    elif len(intents) > 1:
+        reason = "multiple-unresolved-tick-intents"
+
+    if selected is None and not corrupt_digests and reason == "ready":
+        return TickIntentReconciliationSnapshot(
+            preview=TickIntentReconciliationPreview.create(
+                required=False,
+                recoverable=False,
+                reason="no-unresolved-tick-intent",
+                fill_identity_sha256=_fill_identity_sha256(latest),
+                book_matches_ledger=False,
+                head_matches_intent=False,
+            ),
+            intent_event=None,
+        )
+
+    intent_event = None
+    expected_head = None
+    if selected is not None:
+        intent_event = next(
+            (event for event in events if event.get("kind") == "tick_intent" and hashlib.sha256(_canonical_json(event)).hexdigest() == selected.intent_digest),
+            None,
+        )
+        if intent_event is None:
+            reason = "intent-not-found"
+        elif "expected_head" in intent_event:
+            observed_head = intent_event["expected_head"]
+            if observed_head is None or isinstance(observed_head, str) and _SHA256.fullmatch(observed_head):
+                expected_head = observed_head
+
+    current_head = latest.hash if latest is not None else None
+    ledger_head_matches = state.prev_hash == current_head
+    if reason == "ready" and not ledger_head_matches:
+        reason = "ledger-head-changed"
+    head_matches_intent = bool(intent_event is not None and "expected_head" in intent_event and expected_head == current_head)
+    book_digest = None
+    book_matches = False
+    if reason == "ready" and deployed.broker != "paper":
+        reason = "broker-not-local-paper"
+    elif reason == "ready":
+        from hedge_fund.brokers.paper import PaperBroker
+        from hedge_fund.paths import read_bytes
+        from hedge_fund.pipeline.session import BookMismatch, reconcile
+
+        book_path = Path(directory) / "broker.json"
+        try:
+            before = read_bytes(book_path)
+        except OSError:
+            reason = "broker-book-unavailable"
+        else:
+            book_digest = hashlib.sha256(before).hexdigest()
+            try:
+                broker = PaperBroker(book_path, deployed.spec.costs)
+                after = read_bytes(book_path)
+            except (KeyError, OSError, TypeError, ValueError):
+                reason = "broker-book-invalid"
+            else:
+                if before != after:
+                    reason = "broker-book-changed"
+                else:
+                    try:
+                        reconcile(state, broker, deployed.name)
+                    except BookMismatch:
+                        reason = "broker-book-mismatch"
+                    else:
+                        book_matches = True
+
+    return TickIntentReconciliationSnapshot(
+        preview=TickIntentReconciliationPreview.create(
+            required=True,
+            recoverable=reason == "ready" and book_matches and ledger_head_matches,
+            reason=reason,
+            intent_request_id=selected.request_id if selected is not None else intent_request_id,
+            intent_session=selected.session if selected is not None else None,
+            intent_digest=selected.intent_digest if selected is not None else None,
+            metadata_complete=selected.metadata_complete if selected is not None else None,
+            corrupt_event_digests=corrupt_digests,
+            expected_head=expected_head,
+            current_head=current_head,
+            broker_book_sha256=book_digest,
+            fill_identity_sha256=_fill_identity_sha256(latest),
+            book_matches_ledger=book_matches,
+            head_matches_intent=head_matches_intent,
+        ),
+        intent_event=intent_event,
+    )
 
 
 def verify_reconciliation_receipt(

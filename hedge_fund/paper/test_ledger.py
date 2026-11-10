@@ -1,6 +1,7 @@
 """The ledger: append-only, hash-chained, replayable; and the kill switch."""
 
 import json
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -23,6 +24,27 @@ from hedge_fund.paper.ledger import (
 from hedge_fund.pipeline.session import FundState, SessionRecord
 
 _DECISION_HASH = "0" * 64
+
+
+@pytest.fixture
+def owned_ledger(tmp_path):
+    from hedge_fund.runtime.admission import AdmissionCoordinator, RootOwnerLease
+    from hedge_fund.runtime.root import RootContext
+    from hedge_fund.test_support.handover import enroll_synthetic_root
+
+    enroll_synthetic_root(tmp_path)
+    with RootContext.open(tmp_path) as root:
+        root.mkdir("paper")
+        root.mkdir("paper/alpha")
+        with RootOwnerLease.acquire(root) as owner:
+            admission = AdmissionCoordinator(root, owner_lease=owner)
+            yield Ledger(root.path / "paper" / "alpha"), admission
+
+
+@contextmanager
+def _ledger_write_lane(admission):
+    with admission.manual_session("alpha", timeout=0):
+        yield
 
 
 def test_unresolved_intent_refusal_contract_fields():
@@ -141,23 +163,65 @@ def test_multiple_unresolved_intents_are_reported_oldest_first(tmp_path):
     assert [event["kind"] for event in ledger.events()] == ["tick_intent", "tick_intent"]
 
 
-def test_pre_feature_intent_event_without_new_fields_classifies_as_unresolved(tmp_path):
-    ledger = Ledger(tmp_path)
-    ledger.log_event(
-        "tick_intent",
-        request_id="legacy-tick-001",
-        request_action="tick",
-        request_digest="3" * 64,
-        expected_head=None,
-        requested_session="2026-10-31",
-        session="2026-10-31",
-    )
+def test_pre_feature_intent_event_without_new_fields_classifies_as_unresolved(owned_ledger):
+    ledger, admission = owned_ledger
+    with _ledger_write_lane(admission):
+        ledger.log_event(
+            "tick_intent",
+            request_id="legacy-tick-001",
+            session="2026-10-31",
+        )
 
     unresolved = ledger.unresolved_tick_intents()
 
     assert len(unresolved) == 1
     assert unresolved[0].request_id == "legacy-tick-001"
-    assert unresolved[0].metadata_complete is True
+    assert unresolved[0].metadata_complete is False
+    assert unresolved[0].intent_digest
+
+
+def test_matching_outcome_resolves_metadata_incomplete_intent(owned_ledger):
+    ledger, admission = owned_ledger
+    with _ledger_write_lane(admission):
+        ledger.log_event(
+            "tick_intent",
+            request_id="legacy-tick-outcome",
+            session="2026-10-31",
+        )
+        ledger.log_event(
+            "tick",
+            request_id="legacy-tick-outcome",
+            session="2026-10-31",
+            result={"session": "2026-10-31", "hash": "5" * 64},
+        )
+
+    unresolved = ledger.unresolved_tick_intents()
+
+    assert unresolved == ()
+
+
+def test_unreadable_intent_sentinel_cannot_collide_with_request_id(owned_ledger):
+    ledger, admission = owned_ledger
+    with _ledger_write_lane(admission):
+        ledger.log_event(
+            "tick_intent",
+            request_id="unreadable",
+            request_action="tick",
+            request_digest="4" * 64,
+            expected_head=None,
+            requested_session=None,
+            session="2026-10-31",
+        )
+        with ledger.events_path.open("ab") as history:
+            history.write(b'{"kind":\n')
+
+    unresolved = ledger.unresolved_tick_intents()
+
+    assert len(unresolved) == 2
+    assert unresolved[0].request_id == "unreadable"
+    assert unresolved[1].request_id is None
+    assert unresolved[1].is_corrupt is True
+    assert unresolved[1].corrupt_event_digests
 
 
 @pytest.fixture(autouse=True)

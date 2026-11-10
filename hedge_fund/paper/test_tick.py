@@ -115,6 +115,36 @@ def _tick(directory, session=None, data=None):
     return tick(directory, data or FakeDataClient(SERIES), session=session, build_fund=build_fund)
 
 
+def _deploy_owned_paper_test_fund(root, spec):
+    from hedge_fund.runtime.admission import AdmissionCoordinator, RootOwnerLease
+    from hedge_fund.runtime.handover import record_ledger_head
+    from hedge_fund.runtime.root import RootContext
+    from hedge_fund.test_support.handover import enroll_synthetic_root
+
+    enroll_synthetic_root(root)
+    with RootContext.open(root) as context:
+        context.mkdir("paper")
+        with RootOwnerLease.acquire(context) as owner:
+            admission = AdmissionCoordinator(context, owner_lease=owner)
+            with admission.deployment_lock("alpha", timeout=0):
+                directory = deploy("alpha", spec, ["AAPL"], root=context.path / "paper")
+            record_ledger_head(context, "alpha", admission=admission)
+    return directory
+
+
+@contextmanager
+def _owned_paper_lane(directory, fund):
+    from hedge_fund.runtime.admission import AdmissionCoordinator, RootOwnerLease
+    from hedge_fund.runtime.root import RootContext
+
+    root_path = Path(directory).parents[1]
+    with RootContext.open(root_path) as root:
+        with RootOwnerLease.acquire(root) as owner:
+            admission = AdmissionCoordinator(root, owner_lease=owner)
+            with admission.manual_session(fund, timeout=0):
+                yield admission
+
+
 # ---------------------------------------------------------------------------
 # deploy
 # ---------------------------------------------------------------------------
@@ -289,6 +319,28 @@ def test_tick_request_id_replays_record_and_conflicts_on_changed_payload(tmp_pat
         )
 
 
+def test_tick_fast_path_outcome_includes_session(tmp_path, clock, SPEC):
+    directory = _deploy_owned_paper_test_fund(tmp_path, SPEC)
+
+    clock("2024-06-04")
+
+    with _owned_paper_lane(directory, "alpha"):
+        record = _tick(directory)
+        replayed = tick(
+            directory,
+            FakeDataClient(SERIES),
+            session=record.session,
+            expected_head=record.hash,
+            build_fund=build_fund,
+            request_id="tick-fast-path-replay",
+        )
+
+    event = next(event for event in Ledger(directory).events() if event.get("request_id") == "tick-fast-path-replay")
+    assert replayed.hash == record.hash
+    assert event["kind"] == "tick"
+    assert event["session"] == record.session
+
+
 @pytest.mark.parametrize("request_id", ["fresh-tick", None])
 def test_new_identity_intent_fence_refuses_before_tick_effects(tmp_path, clock, SPEC, request_id):
     from hedge_fund.paper.ledger import UnresolvedTickIntentRefusal
@@ -367,6 +419,401 @@ def test_same_identity_intent_retry_uses_existing_reconciliation_lookup(tmp_path
 
     assert ledger.events() == events_before
     assert (directory / "broker.json").read_bytes() == broker_before
+
+
+def test_orphaned_intent_reconciliation_admits_new_tick(tmp_path, clock, SPEC):
+    from hedge_fund.runtime.reconciliation import (
+        build_tick_intent_reconciliation_snapshot,
+        TickIntentReconciliationConfirmation,
+    )
+
+    directory = _deploy_owned_paper_test_fund(tmp_path, SPEC)
+    clock("2024-06-05")
+    ledger = Ledger(directory)
+    request_id = "crashed-tick-001"
+    request_digest = ledger.tick_request_digest(
+        request_id,
+        expected_head=None,
+        session=None,
+    )
+    with _owned_paper_lane(directory, "alpha"):
+        ledger.log_event(
+            "tick_intent",
+            request_id=request_id,
+            request_action="tick",
+            request_digest=request_digest,
+            expected_head=None,
+            requested_session=None,
+            session="2024-06-04",
+            durable=True,
+        )
+
+        state = ledger.replay(SPEC.capital, full=True)
+        snapshot = build_tick_intent_reconciliation_snapshot(
+            directory,
+            load_deployed(directory),
+            ledger,
+            state,
+            ledger.latest(),
+            intent_request_id=request_id,
+        )
+        assert snapshot.preview.recoverable is True
+        confirmation = TickIntentReconciliationConfirmation(
+            request_id="reconcile-crashed-tick-001",
+            intent_request_id=request_id,
+            intent_digest=snapshot.preview.intent_digest,
+            preview_digest=snapshot.preview.preview_digest,
+            decision="confirm-paper-book-matches-ledger",
+        )
+        receipt_id = ledger.reconcile_tick_intent(
+            SPEC.capital,
+            confirmation=confirmation,
+            operator="cli",
+        )
+
+    assert receipt_id
+    assert ledger.unresolved_tick_intents() == ()
+    with _owned_paper_lane(directory, "alpha"):
+        record = tick(
+            directory,
+            FakeDataClient(SERIES),
+            session="2024-06-04",
+            expected_head=None,
+            build_fund=build_fund,
+            request_id="tick-after-reconciliation",
+        )
+    assert record.session == "2024-06-04"
+
+
+@pytest.mark.parametrize("corruption", ["torn-line", "kindless-event"])
+def test_corrupt_intent_history_reconciliation_preserves_prefix_and_admits_tick(tmp_path, clock, SPEC, corruption):
+    from hedge_fund.runtime.reconciliation import (
+        build_tick_intent_reconciliation_snapshot,
+        TickIntentReconciliationConfirmation,
+    )
+
+    directory = _deploy_owned_paper_test_fund(tmp_path, SPEC)
+    clock("2024-06-05")
+    ledger = Ledger(directory)
+    request_id = "crashed-tick-corrupt-history"
+    request_digest = ledger.tick_request_digest(
+        request_id,
+        expected_head=None,
+        session=None,
+    )
+    with _owned_paper_lane(directory, "alpha"):
+        ledger.log_event(
+            "tick_intent",
+            request_id=request_id,
+            request_action="tick",
+            request_digest=request_digest,
+            expected_head=None,
+            requested_session=None,
+            session="2024-06-04",
+            durable=True,
+        )
+        with ledger.events_path.open("ab") as history:
+            history.write(b'{"kind":' if corruption == "torn-line" else b'{"missing-kind":true}\n')
+        prefix = ledger.events_path.read_bytes()
+        state = ledger.replay(SPEC.capital, full=True)
+        snapshot = build_tick_intent_reconciliation_snapshot(
+            directory,
+            load_deployed(directory),
+            ledger,
+            state,
+            ledger.latest(),
+            intent_request_id=request_id,
+        )
+        assert snapshot.preview.recoverable is True
+        assert snapshot.preview.corrupt_event_digests
+        confirmation = TickIntentReconciliationConfirmation(
+            request_id="reconcile-corrupt-intent-001",
+            intent_request_id=request_id,
+            intent_digest=snapshot.preview.intent_digest,
+            preview_digest=snapshot.preview.preview_digest,
+            decision="confirm-paper-book-matches-ledger",
+        )
+        ledger.reconcile_tick_intent(
+            SPEC.capital,
+            confirmation=confirmation,
+            operator="cli",
+        )
+
+    assert ledger.events_path.read_bytes().startswith(prefix)
+    assert ledger.unresolved_tick_intents() == ()
+    assert any(event["kind"] == "tick_intent_resolved" for event in ledger.events())
+    with _owned_paper_lane(directory, "alpha"):
+        record = tick(
+            directory,
+            FakeDataClient(SERIES),
+            session="2024-06-04",
+            expected_head=None,
+            build_fund=build_fund,
+            request_id="tick-after-corrupt-reconciliation",
+        )
+    assert record.session == "2024-06-04"
+
+
+def test_legacy_intent_reconciliation_admits_new_tick(tmp_path, clock, SPEC):
+    from hedge_fund.runtime.reconciliation import (
+        build_tick_intent_reconciliation_snapshot,
+        TickIntentReconciliationConfirmation,
+    )
+
+    directory = _deploy_owned_paper_test_fund(tmp_path, SPEC)
+    clock("2024-06-05")
+    ledger = Ledger(directory)
+    request_id = "legacy-crashed-tick"
+    with _owned_paper_lane(directory, "alpha"):
+        ledger.log_event(
+            "tick_intent",
+            request_id=request_id,
+            session="2024-06-04",
+            durable=True,
+        )
+
+        snapshot = build_tick_intent_reconciliation_snapshot(
+            directory,
+            load_deployed(directory),
+            ledger,
+            ledger.replay(SPEC.capital, full=True),
+            ledger.latest(),
+            intent_request_id=request_id,
+        )
+        assert snapshot.preview.recoverable is True
+        confirmation = TickIntentReconciliationConfirmation(
+            request_id="reconcile-legacy-intent-001",
+            intent_request_id=request_id,
+            intent_digest=snapshot.preview.intent_digest,
+            preview_digest=snapshot.preview.preview_digest,
+            decision="confirm-paper-book-matches-ledger",
+        )
+        ledger.reconcile_tick_intent(
+            SPEC.capital,
+            confirmation=confirmation,
+            operator="cli",
+        )
+
+    with _owned_paper_lane(directory, "alpha"):
+        record = tick(
+            directory,
+            FakeDataClient(SERIES),
+            session="2024-06-04",
+            expected_head=None,
+            build_fund=build_fund,
+            request_id="tick-after-legacy-reconciliation",
+        )
+    assert record.session == "2024-06-04"
+
+
+def test_halt_mid_tick_resolves_intent_then_resume_admits_new_tick(tmp_path, clock, SPEC, monkeypatch):
+    from hedge_fund.runtime.reconciliation import (
+        build_reconciliation_snapshot,
+        ReconciliationConfirmation,
+    )
+
+    directory = _deploy_owned_paper_test_fund(tmp_path, SPEC)
+    clock("2024-06-04")
+    ledger = Ledger(directory)
+    original_advance = paper_tick_module.advance
+
+    def halt_before_effect(*_args, **kwargs):
+        ledger.halt("mid-tick halt", request_id="halt-mid-tick-001")
+        kwargs["before_effect"]()
+
+    monkeypatch.setattr(paper_tick_module, "advance", halt_before_effect)
+    with _owned_paper_lane(directory, "alpha"):
+        with pytest.raises(FundHalted):
+            tick(
+                directory,
+                FakeDataClient(SERIES),
+                session="2024-06-03",
+                expected_head=None,
+                build_fund=build_fund,
+                request_id="halted-intent-request",
+            )
+
+    assert any(event.get("kind") == "tick_failed" and event.get("request_id") == "halted-intent-request" for event in ledger.events())
+    assert ledger.unresolved_tick_intents() == ()
+    state = ledger.replay(SPEC.capital, full=True)
+    latest = ledger.latest()
+    snapshot = build_reconciliation_snapshot(
+        directory,
+        load_deployed(directory),
+        ledger,
+        state,
+        latest,
+    )
+    assert snapshot.preview.recoverable is True
+    confirmation = ReconciliationConfirmation(
+        request_id="resume-halt-mid-tick-001",
+        failure_id=snapshot.preview.failure_id,
+        preview_digest=snapshot.preview.preview_digest,
+        decision="confirm-paper-book-matches-ledger",
+    )
+    with _owned_paper_lane(directory, "alpha"):
+        ledger.resume(
+            SPEC.capital,
+            reconciliation=confirmation.model_dump(mode="json"),
+            request_id=confirmation.request_id,
+            operator="cli",
+        )
+    monkeypatch.setattr(paper_tick_module, "advance", original_advance)
+
+    with _owned_paper_lane(directory, "alpha"):
+        record = tick(
+            directory,
+            FakeDataClient(SERIES),
+            session="2024-06-03",
+            expected_head=None,
+            build_fund=build_fund,
+            request_id="tick-after-halt-resume",
+        )
+    assert record.session == "2024-06-03"
+
+
+def test_preflight_busy_after_intent_records_abort_and_same_identity_retries(tmp_path, clock, SPEC, monkeypatch):
+    from hedge_fund.runtime.admission import PaperPreflightBusy
+
+    directory = _deploy_owned_paper_test_fund(tmp_path, SPEC)
+    clock("2024-06-04")
+    ledger = Ledger(directory)
+    original_run = paper_tick_module._run
+    attempts = 0
+
+    def busy_once(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise PaperPreflightBusy("synthetic busy control")
+        return original_run(*args, **kwargs)
+
+    monkeypatch.setattr(paper_tick_module, "_run", busy_once)
+    with _owned_paper_lane(directory, "alpha"):
+        with pytest.raises(PaperPreflightBusy):
+            tick(
+                directory,
+                FakeDataClient(SERIES),
+                session="2024-06-03",
+                expected_head=None,
+                build_fund=build_fund,
+                request_id="retryable-intent-request",
+            )
+
+    assert ledger.unresolved_tick_intents() == ()
+    assert any(event.get("kind") == "tick_aborted" for event in ledger.events())
+    with _owned_paper_lane(directory, "alpha"):
+        record = tick(
+            directory,
+            FakeDataClient(SERIES),
+            session="2024-06-03",
+            expected_head=None,
+            build_fund=build_fund,
+            request_id="retryable-intent-request",
+        )
+    assert record.session == "2024-06-03"
+
+
+def test_cli_shaped_tick_races_web_logical_operation_submission(tmp_path, clock, SPEC):
+    from concurrent.futures import ThreadPoolExecutor
+    from datetime import timedelta, timezone
+    from threading import Barrier
+
+    from hedge_fund.pipeline.session import code_version, mandate_hash
+    from hedge_fund.runtime.admission import AdmissionCoordinator, RootOwnerLease
+    from hedge_fund.runtime.capture import freeze_capture
+    from hedge_fund.runtime.configuration import resolve_settings
+    from hedge_fund.runtime.operations import (
+        DuplicateLogicalOperationRefusal,
+        OperationStore,
+        StalePreview,
+    )
+    from hedge_fund.runtime.root import RootContext
+
+    directory = _deploy_owned_paper_test_fund(tmp_path, SPEC.model_copy(update={"name": "alpha"}))
+    clock("2024-06-04")
+    session = "2024-06-03"
+    barrier = Barrier(2)
+    now = datetime.now(timezone.utc)
+    with RootContext.open(tmp_path) as root:
+        with RootOwnerLease.acquire(root) as owner:
+            admission = AdmissionCoordinator(root, owner_lease=owner)
+            deployed = load_deployed(directory)
+            store = OperationStore(root, admission=admission)
+            capture = freeze_capture(
+                root=root,
+                subject_id="alpha",
+                mandate_digest=mandate_hash(deployed.spec),
+                universe=tuple(deployed.universe),
+                broker="paper",
+                settings=resolve_settings(root),
+                credential_versions={},
+                code_version=code_version(),
+                mandate_snapshot=deployed.spec.model_dump(mode="json"),
+            )
+            preview = store.create_preview(
+                action="paper-tick",
+                subject_id="alpha",
+                expected_head=None,
+                due_set=(session,),
+                capture=capture,
+                operator_session="synthetic-web-operator",
+                payload={"kind": "manual-tick", "session": session, "expected_head": None},
+                now=now,
+                expires_at=now + timedelta(minutes=5),
+            )
+
+            def submit_web_operation():
+                barrier.wait(timeout=5)
+
+                def current_state():
+                    latest = Ledger(directory).latest()
+                    return (latest.hash if latest is not None else None, (session,))
+
+                try:
+                    accepted = store.accept_request(
+                        request_id="web-logical-race",
+                        action="paper-tick",
+                        subject_id="alpha",
+                        preview_id=preview.preview_id,
+                        preview_digest=preview.digest,
+                        confirmation_token=preview.confirmation_token,
+                        operator_session="synthetic-web-operator",
+                        expected_head=None,
+                        due_set=(session,),
+                        payload={"kind": "manual-tick", "session": session, "expected_head": None},
+                        now=now,
+                        current_state_resolver=current_state,
+                    )
+                except StalePreview:
+                    return "stale"
+                return ("accepted", accepted)
+
+            def run_cli_shaped_tick():
+                barrier.wait(timeout=5)
+                try:
+                    with admission.manual_session("alpha", timeout=5):
+                        record = tick(
+                            directory,
+                            FakeDataClient(SERIES),
+                            session=session,
+                            expected_head=None,
+                            build_fund=build_fund,
+                            request_id="cli-logical-race",
+                            operation_store=store,
+                        )
+                except DuplicateLogicalOperationRefusal:
+                    return "duplicate"
+                return ("completed", record)
+
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                web_future = executor.submit(submit_web_operation)
+                cli_future = executor.submit(run_cli_shaped_tick)
+                web_result = web_future.result(timeout=30)
+                cli_result = cli_future.result(timeout=30)
+
+    assert (web_result == "stale" and isinstance(cli_result, tuple) and cli_result[0] == "completed") or (isinstance(web_result, tuple) and web_result[0] == "accepted" and cli_result == "duplicate")
+    assert len(Ledger(directory).sessions()) == (1 if isinstance(cli_result, tuple) else 0)
 
 
 def test_redo_supersedes_intent_without_becoming_a_duplicate_request(tmp_path, clock, SPEC):

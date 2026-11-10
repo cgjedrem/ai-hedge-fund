@@ -218,9 +218,12 @@ def error_payload(
         raise ValueError(f"unknown retry policy: {retry_policy}")
     if retry_after_seconds is not None and not valid_retry_after(status_code, resolved, retry_after_seconds):
         raise ValueError("retry-after is only a bounded hint on 429/503 responses")
-    normalized_refusal = validate_refusal_payload(refusal)
+    try:
+        normalized_refusal = validate_refusal_payload(refusal)
+    except (TypeError, ValueError):
+        normalized_refusal = None
     if normalized_refusal is not None and normalized_refusal["reason"] != resolved:
-        raise ValueError("operation refusal code does not match its fields")
+        normalized_refusal = None
     message = detail if isinstance(detail, str) else "Invalid request."
     payload = ErrorResponse(
         detail=detail,
@@ -302,6 +305,20 @@ class PaperResumeRequest(RequestModel):
         fields = (self.failure_id, self.preview_digest, self.decision)
         if any(value is not None for value in fields) and any(value is None for value in fields):
             raise ValueError("reconciliation confirmation fields must be supplied together")
+        return self
+
+
+class PaperTickIntentReconciliationRequest(RequestModel):
+    request_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+    intent_request_id: str | None = Field(default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+    intent_digest: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+    preview_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+    decision: Literal["confirm-paper-book-matches-ledger"] = "confirm-paper-book-matches-ledger"
+
+    @model_validator(mode="after")
+    def _validate_intent_identity(self) -> PaperTickIntentReconciliationRequest:
+        if self.intent_request_id is not None and self.intent_digest is None:
+            raise ValueError("tick-intent request identity requires a digest")
         return self
 
 
