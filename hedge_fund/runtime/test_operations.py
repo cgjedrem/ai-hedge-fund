@@ -149,14 +149,14 @@ def test_logical_operation_key_normalizes_target_shape_and_payload_order():
         target=("2026-10-31",),
         payload_digest=digest(first_payload),
     )
-    cli_shape = derive_logical_operation_key(
+    shared_entry_point_shape = derive_logical_operation_key(
         subject_id="alpha",
         action="paper-run",
         target="2026-10-31",
         payload_digest=digest(reordered_payload),
     )
 
-    assert web_shape == cli_shape
+    assert web_shape == shared_entry_point_shape
 
 
 def test_logical_operation_key_separates_fund_action_target_and_payload():
@@ -242,8 +242,62 @@ def test_logical_duplicate_nonterminal_operation_refuses_and_links_existing(oper
     assert [operation.operation_id for operation in starts] == [first.operation_id]
 
 
-def test_logical_duplicate_interrupted_operation_still_blocks_retry(operation_store, frozen_capture):
+def test_logical_shared_paper_tick_key_matches_web_operation(operation_store, frozen_capture):
+    from hedge_fund.runtime.operations import paper_tick_logical_key
+
+    session = "2026-10-31"
+    expected_head = "a" * 64
+    preview = _preview(
+        operation_store,
+        frozen_capture,
+        action="paper-tick",
+        expected_head=expected_head,
+        due_set=(session,),
+        payload={"kind": "manual-tick", "session": session, "expected_head": expected_head},
+    )
+    operation = _accept(operation_store, preview)
+
+    assert operation.logical_key == paper_tick_logical_key("alpha", session, expected_head)
+    assert operation_store.find_active_logical_operation(operation.logical_key).operation_id == operation.operation_id
+    assert (
+        operation_store.find_active_logical_operation(
+            operation.logical_key,
+            exclude_operation_id=operation.operation_id,
+        )
+        is None
+    )
+
+
+def test_logical_duplicate_interrupted_without_effects_releases_key(operation_store, frozen_capture):
+    def fail_worker_start(_operation):
+        raise RuntimeError("synthetic worker start failure")
+
+    with pytest.raises(OperationStartUncertain):
+        _accept(
+            operation_store,
+            _preview(operation_store, frozen_capture),
+            start_worker=fail_worker_start,
+        )
+    interrupted = operation_store.get_by_request("request-1")
+
+    assert interrupted.status is OperationStatus.INTERRUPTED
+    assert interrupted.effects_started is False
+
+    second = _accept(
+        operation_store,
+        _preview(operation_store, frozen_capture),
+        request_id="request-2",
+    )
+
+    assert second.operation_id != interrupted.operation_id
+    assert second.logical_key == interrupted.logical_key
+
+
+def test_logical_duplicate_effectful_interrupted_operation_blocks_retry(operation_store, frozen_capture):
     first = _accept(operation_store, _preview(operation_store, frozen_capture))
+    fence = operation_store.claim_worker(first.operation_id, worker_id="synthetic-worker", now=_NOW)
+    operation_store.mark_running(first.operation_id, fence, now=_NOW)
+    operation_store.mark_effect_started(first.operation_id, fence, now=_NOW)
     interrupted = operation_store.interrupt(first.operation_id, now=_NOW + timedelta(seconds=1))
     assert interrupted.status is OperationStatus.INTERRUPTED
 
