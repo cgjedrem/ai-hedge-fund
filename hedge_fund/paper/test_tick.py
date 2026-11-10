@@ -985,12 +985,11 @@ def test_redo_supersedes_intent_without_becoming_a_duplicate_request(tmp_path, c
     assert Ledger(directory).unresolved_tick_intents() == ()
 
 
-def test_uncertain_tick_request_never_repeats_work(tmp_path, clock, SPEC):
-    from hedge_fund.paper.ledger import PaperReconciliationRequired
-
+def test_pre_effect_intent_failure_aborts_and_same_identity_retries(tmp_path, clock, SPEC):
     directory = deploy("alpha", SPEC, ["AAPL"], root=tmp_path)
     clock("2024-06-04")
     build_calls = []
+    request_id = "cli-tick-alpha-failed"
 
     def failing_build(_spec):
         build_calls.append(True)
@@ -1001,20 +1000,26 @@ def test_uncertain_tick_request_never_repeats_work(tmp_path, clock, SPEC):
             directory,
             FakeDataClient(SERIES),
             build_fund=failing_build,
-            request_id="cli-tick-alpha-failed",
+            request_id=request_id,
             expected_head=None,
         )
 
-    with pytest.raises(PaperReconciliationRequired, match="reconciliation is required"):
-        tick(
-            directory,
-            FakeDataClient(SERIES),
-            build_fund=failing_build,
-            request_id="cli-tick-alpha-failed",
-            expected_head=None,
-        )
-
+    ledger = Ledger(directory)
+    abort = next(event for event in ledger.events() if event.get("kind") == "tick_aborted" and event.get("request_id") == request_id)
+    assert abort["no_effects"] is True
+    assert ledger.halted() is None
     assert build_calls == [True]
+
+    record = tick(
+        directory,
+        FakeDataClient(SERIES),
+        build_fund=build_fund,
+        request_id=request_id,
+        expected_head=None,
+    )
+
+    assert record.session == "2024-06-03"
+    assert ledger.halted() is None
 
 
 def test_tick_request_id_keeps_nothing_due_terminal(tmp_path, clock, SPEC):
@@ -2597,15 +2602,20 @@ def test_redo_refuses_a_halted_fund_and_leaves_it_untouched(tmp_path, clock, SPE
     assert not (directory / "ledger" / "superseded").exists()
 
 
-def test_failure_inside_advance_stays_halted_without_reconciliation_receipt(tmp_path, clock, SPEC):
+def test_failure_inside_advance_stays_halted_without_reconciliation_receipt(tmp_path, clock, SPEC, monkeypatch):
     clock("2024-06-05")
     directory = deploy("alpha", SPEC, ["AAPL"], root=tmp_path)
     _tick(directory)  # 06-04, decision made
     clock("2024-06-06")
-    series = {t: dict(v) for t, v in SERIES.items()}
-    del series["AAPL"]["2024-06-05"]  # execution price missing at the next close
-    with pytest.raises(ValueError, match="AAPL: missing close on 2024-06-05"):
-        _tick(directory, data=FakeDataClient(series))
+
+    def fail_after_effect_boundary(*_args, **kwargs):
+        kwargs["before_order"]()
+        kwargs["before_effect"]()
+        raise ValueError("synthetic post-effect failure")
+
+    monkeypatch.setattr(paper_tick_module, "advance", fail_after_effect_boundary)
+    with pytest.raises(ValueError, match="synthetic post-effect failure"):
+        _tick(directory)
     ledger = Ledger(directory)
     assert ledger.halted().startswith("tick 2024-06-05 failed: ValueError")
     assert [e["kind"] for e in ledger.events()] == ["tick", "tick_failed", "halt"]
@@ -2621,18 +2631,95 @@ def test_failure_inside_advance_stays_halted_without_reconciliation_receipt(tmp_
     assert ledger.events_path.read_bytes() == events_before
 
 
-def test_tick_failure_event_binds_manual_operation_and_capture(tmp_path, clock, SPEC):
+def test_pre_effect_intent_execution_error_aborts_and_same_identity_retries(tmp_path, clock, SPEC):
+    directory = _deploy_owned_paper_test_fund(tmp_path, SPEC)
+    clock("2024-06-05")
+    with _owned_paper_lane(directory, "alpha"):
+        first = _tick(directory)
+    clock("2024-06-06")
+    series = {ticker: dict(values) for ticker, values in SERIES.items()}
+    del series["AAPL"]["2024-06-05"]
+    ledger = Ledger(directory)
+    request_id = "pre-effect-missing-price"
+
+    with _owned_paper_lane(directory, "alpha"):
+        with pytest.raises(ValueError, match="AAPL: missing close on 2024-06-05"):
+            tick(
+                directory,
+                FakeDataClient(series),
+                build_fund=build_fund,
+                expected_head=first.hash,
+                request_id=request_id,
+            )
+
+    aborted = [event for event in ledger.events() if event.get("kind") == "tick_aborted" and event.get("request_id") == request_id]
+    assert len(aborted) == 1
+    assert aborted[0]["no_effects"] is True
+    assert not any(event.get("kind") == "tick_failed" and event.get("request_id") == request_id for event in ledger.events())
+    assert ledger.halted() is None
+    assert ledger.sessions() == ["2024-06-04"]
+
+    with _owned_paper_lane(directory, "alpha"):
+        record = tick(
+            directory,
+            FakeDataClient(SERIES),
+            build_fund=build_fund,
+            expected_head=first.hash,
+            request_id=request_id,
+        )
+
+    assert record.session == "2024-06-05"
+    assert ledger.halted() is None
+
+
+def test_pre_effect_intent_abort_binds_manual_operation_and_capture(tmp_path, clock, SPEC):
+    clock("2024-06-05")
+    directory = _deploy_owned_paper_test_fund(tmp_path, SPEC)
+    with _owned_paper_lane(directory, "alpha"):
+        first = _tick(directory)
+    clock("2024-06-06")
+    series = {ticker: dict(values) for ticker, values in SERIES.items()}
+    del series["AAPL"]["2024-06-05"]
+    request_id = "manual-pre-effect-abort"
+
+    with _owned_paper_lane(directory, "alpha"):
+        with pytest.raises(ValueError, match="AAPL: missing close on 2024-06-05"):
+            tick(
+                directory,
+                FakeDataClient(series),
+                build_fund=build_fund,
+                expected_head=first.hash,
+                operation_id="a" * 32,
+                request_id=request_id,
+                capture_id="b" * 32,
+                capture_digest="c" * 64,
+            )
+
+    aborted = next(event for event in Ledger(directory).events() if event.get("kind") == "tick_aborted" and event.get("request_id") == request_id)
+    assert aborted["expected_head"] == first.hash
+    assert aborted["operation_id"] == "a" * 32
+    assert aborted["capture_id"] == "b" * 32
+    assert aborted["capture_digest"] == "c" * 64
+    assert aborted["no_effects"] is True
+
+
+def test_tick_failure_event_binds_manual_operation_and_capture(tmp_path, clock, SPEC, monkeypatch):
     clock("2024-06-05")
     directory = deploy("alpha", SPEC, ["AAPL"], root=tmp_path)
     first = _tick(directory)
     clock("2024-06-06")
-    series = {ticker: dict(values) for ticker, values in SERIES.items()}
-    del series["AAPL"]["2024-06-05"]
 
-    with pytest.raises(ValueError, match="AAPL: missing close on 2024-06-05"):
+    def fail_after_effect_boundary(*_args, **kwargs):
+        kwargs["before_order"]()
+        kwargs["before_effect"]()
+        raise ValueError("synthetic failure after effect boundary")
+
+    monkeypatch.setattr(paper_tick_module, "advance", fail_after_effect_boundary)
+
+    with pytest.raises(ValueError, match="synthetic failure after effect boundary"):
         tick(
             directory,
-            FakeDataClient(series),
+            FakeDataClient(SERIES),
             build_fund=build_fund,
             expected_head=first.hash,
             operation_id="a" * 32,

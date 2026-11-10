@@ -12,8 +12,8 @@ each honest. For a minute fund it is the latest bar boundary that has
 passed, at prints taken now: a bar is never back-filled, so a late tick
 records the print it took and when it took it.
 
-Any failure inside `advance` halts the fund. Cron retrying into a broken
-book is the failure mode this exists to prevent; a human clears the halt.
+Pre-effect failures abort without halt. Book drift and failures after effect
+admission halt the fund.
 """
 
 from __future__ import annotations
@@ -55,6 +55,7 @@ from hedge_fund.paper.ledger import (
 from hedge_fund.pipeline.clock import Clock, LiveClock, Marked
 from hedge_fund.pipeline.session import (
     advance,
+    BookMismatch,
     FundHalted,
     FundState,
     is_rebalance_session,
@@ -472,7 +473,7 @@ def _tick(
                 raise exc from lookup_error
             has_outcome = any(event.get("attempt_id") == attempt_context["attempt_id"] and event.get("kind") in {"tick", "tick_failed", "tick_aborted"} for event in events)
             if not has_outcome:
-                if effect_state["abort"] or not effect_state["started"] and isinstance(exc, (PaperPreflightBusy, LedgerError, FundHalted)):
+                if effect_state["abort"] or not effect_state["started"] and not isinstance(exc, BookMismatch):
                     ledger.log_event(
                         "tick_aborted",
                         **attempt_context,
@@ -924,7 +925,8 @@ def _run(
             effect_state["abort"] = True
         raise
     except Exception as exc:
-        if effect_state is not None and not effect_state["started"] and isinstance(exc, (PaperControlBusy, LedgerError, PaperPreflightBusy)):
+        # Drift proves broker may include untracked effects.
+        if effect_state is not None and not effect_state["started"] and not isinstance(exc, BookMismatch):
             effect_state["abort"] = True
             if isinstance(exc, PaperControlBusy) and not isinstance(exc, PaperPreflightBusy):
                 raise PaperPreflightBusy("Paper preflight control admission is occupied.") from exc
