@@ -255,3 +255,29 @@
   - `hedge_fund/runtime/test_inventory_cache_race.py::test_noncontention_audit_failures_are_not_retryable[read-body]` — pytest `Failed`: expected `LedgerError` or `AdmissionError`, but no exception was raised.
 - **Regression disposition**: 2 new failures; no fixes attempted, per instruction. Full-suite acceptance remains **FAIL**.
 - **Cleanup**: removed detached baseline worktree `%TEMP%\aihf-spec006-baseline-0506f3d-20261110` and the three task-created parity `--basetemp` directories at `2026-11-10T17:32:29.0740466+01:00`; verified all four paths absent and baseline worktree absent from `git worktree list`.
+
+## Discriminating Recheck: Inventory Cache Race
+
+- **Revision identity**: baseline `0506f3d425c6b8c824a065746fe8a868d3d6c306`; feature `4dd2fda3aa2616455ee257979c19be688b1a2672`. The branch tip at recheck start was `274a6918965245a645eff8e4e21809cefc4ec7ba`; `4dd2fda..274a691` changed only this evidence file, with no `hedge_fund` diff. To test the exact requested feature revision without moving the branch, both revisions ran in detached worktrees.
+- **Worktrees**: baseline `%TEMP%\spec006-discriminating-baseline-0506f3d-20261110-1736`; feature `%TEMP%\spec006-discriminating-feature-4dd2fda-20261110-1736`. `hedge_fund.__file__` resolved inside each worktree; both detached HEADs matched the requested full revisions.
+- **Environment/isolation**: Windows 11 Enterprise `10.0.26200`, Python `3.13.7`, pytest `7.4.4`; pytest platform `win32`. Every invocation selected one node ID only, used `-rA --tb=short`, omitted `--basetemp`, and ran sequentially. Each collected one item. Baseline cases passed; feature cases failed inside test bodies at the assertions below, not during fixture setup. No protected root, paid provider, Docker, or brokerage was used.
+- **Exact invocation form**: `& 'C:\Users\ChristianGjedrem\AppData\Local\pypoetry\Cache\virtualenvs\aihf-4KWHP5vi-py3.13\Scripts\python.exe' -m pytest '<one node ID from the table>' -rA --tb=short`. Working directory was the corresponding detached worktree; no `--basetemp` argument or pytest-repeat plugin was used. The four feature results per ID are the initial comparison run plus the three requested repeats.
+
+| Test ID | Revision/run | Start | End | Result and exception class | Pytest duration | Exit |
+|---|---|---|---|---|---:|---:|
+| `hedge_fund/runtime/test_inventory_cache_race.py::test_sibling_registry_contention_before_order_does_not_change_book` | baseline | `2026-11-10T17:37:29.4505280+01:00` | `2026-11-10T17:37:38.9087965+01:00` | PASS; no exception | `6.80s` | `0` |
+| `hedge_fund/runtime/test_inventory_cache_race.py::test_sibling_registry_contention_before_order_does_not_change_book` | feature initial | `2026-11-10T17:37:51.4265369+01:00` | `2026-11-10T17:37:59.2410955+01:00` | FAIL (`AssertionError`, line 362) | `5.53s` | `1` |
+| `hedge_fund/runtime/test_inventory_cache_race.py::test_sibling_registry_contention_before_order_does_not_change_book` | feature repeat 1/3 | `2026-11-10T17:38:11.9040400+01:00` | `2026-11-10T17:38:18.8989168+01:00` | FAIL (`AssertionError`, line 362) | `4.76s` | `1` |
+| `hedge_fund/runtime/test_inventory_cache_race.py::test_sibling_registry_contention_before_order_does_not_change_book` | feature repeat 2/3 | `2026-11-10T17:38:22.2429665+01:00` | `2026-11-10T17:38:29.0584927+01:00` | FAIL (`AssertionError`, line 362) | `4.65s` | `1` |
+| `hedge_fund/runtime/test_inventory_cache_race.py::test_sibling_registry_contention_before_order_does_not_change_book` | feature repeat 3/3 | `2026-11-10T17:38:32.3937783+01:00` | `2026-11-10T17:38:39.4253166+01:00` | FAIL (`AssertionError`, line 362) | `4.93s` | `1` |
+| `hedge_fund/runtime/test_inventory_cache_race.py::test_noncontention_audit_failures_are_not_retryable[read-body]` | baseline | `2026-11-10T17:37:42.5257840+01:00` | `2026-11-10T17:37:47.2734758+01:00` | PASS; no exception | `2.51s` | `0` |
+| `hedge_fund/runtime/test_inventory_cache_race.py::test_noncontention_audit_failures_are_not_retryable[read-body]` | feature initial | `2026-11-10T17:38:02.4964237+01:00` | `2026-11-10T17:38:07.1964521+01:00` | FAIL (`pytest Failed`, line 664; DID NOT RAISE) | `2.47s` | `1` |
+| `hedge_fund/runtime/test_inventory_cache_race.py::test_noncontention_audit_failures_are_not_retryable[read-body]` | feature repeat 1/3 | `2026-11-10T17:38:51.5514128+01:00` | `2026-11-10T17:38:56.1566582+01:00` | FAIL (`pytest Failed`, line 664; DID NOT RAISE) | `2.32s` | `1` |
+| `hedge_fund/runtime/test_inventory_cache_race.py::test_noncontention_audit_failures_are_not_retryable[read-body]` | feature repeat 2/3 | `2026-11-10T17:38:59.3594468+01:00` | `2026-11-10T17:39:03.9359293+01:00` | FAIL (`pytest Failed`, line 664; DID NOT RAISE) | `2.28s` | `1` |
+| `hedge_fund/runtime/test_inventory_cache_race.py::test_noncontention_audit_failures_are_not_retryable[read-body]` | feature repeat 3/3 | `2026-11-10T17:39:07.3326340+01:00` | `2026-11-10T17:39:11.8622201+01:00` | FAIL (`pytest Failed`, line 664; DID NOT RAISE) | `2.35s` | `1` |
+
+- **Per-test verdicts**:
+  - `test_sibling_registry_contention_before_order_does_not_change_book`: baseline PASS; feature failed 4/4 with the same `AssertionError` because `Ledger(directory).halted()` was `None`; **regression**, not flaky in these observations.
+  - `test_noncontention_audit_failures_are_not_retryable[read-body]`: baseline PASS; feature failed 4/4 with the same pytest `Failed` because the expected `LedgerError`/`AdmissionError` was not raised; **regression**, not flaky in these observations.
+- **Disposition**: both full-suite extras are confirmed regressions against the requested baseline, and repeated feature results were stable across four observations per test. No code or test changes were made.
+- **Cleanup**: removed both detached worktrees at `2026-11-10T17:40:14.4712850+01:00`; verified both paths absent and neither worktree listed by Git.
