@@ -645,12 +645,7 @@ def test_legacy_intent_reconciliation_admits_new_tick(tmp_path, clock, SPEC):
     assert record.session == "2024-06-04"
 
 
-def test_halt_mid_tick_resolves_intent_then_resume_admits_new_tick(tmp_path, clock, SPEC, monkeypatch):
-    from hedge_fund.runtime.reconciliation import (
-        build_reconciliation_snapshot,
-        ReconciliationConfirmation,
-    )
-
+def test_halt_before_effect_aborts_intent_then_resume_admits_new_tick(tmp_path, clock, SPEC, monkeypatch):
     directory = _deploy_owned_paper_test_fund(tmp_path, SPEC)
     clock("2024-06-04")
     ledger = Ledger(directory)
@@ -672,31 +667,13 @@ def test_halt_mid_tick_resolves_intent_then_resume_admits_new_tick(tmp_path, clo
                 request_id="halted-intent-request",
             )
 
-    assert any(event.get("kind") == "tick_failed" and event.get("request_id") == "halted-intent-request" for event in ledger.events())
+    aborted = [event for event in ledger.events() if event.get("kind") == "tick_aborted" and event.get("request_id") == "halted-intent-request"]
+    assert len(aborted) == 1
+    assert aborted[0]["no_effects"] is True
+    assert not any(event.get("kind") == "tick_failed" and event.get("request_id") == "halted-intent-request" for event in ledger.events())
     assert ledger.unresolved_tick_intents() == ()
-    state = ledger.replay(SPEC.capital, full=True)
-    latest = ledger.latest()
-    snapshot = build_reconciliation_snapshot(
-        directory,
-        load_deployed(directory),
-        ledger,
-        state,
-        latest,
-    )
-    assert snapshot.preview.recoverable is True
-    confirmation = ReconciliationConfirmation(
-        request_id="resume-halt-mid-tick-001",
-        failure_id=snapshot.preview.failure_id,
-        preview_digest=snapshot.preview.preview_digest,
-        decision="confirm-paper-book-matches-ledger",
-    )
     with _owned_paper_lane(directory, "alpha"):
-        ledger.resume(
-            SPEC.capital,
-            reconciliation=confirmation.model_dump(mode="json"),
-            request_id=confirmation.request_id,
-            operator="cli",
-        )
+        ledger.resume(SPEC.capital)
     monkeypatch.setattr(paper_tick_module, "advance", original_advance)
 
     with _owned_paper_lane(directory, "alpha"):

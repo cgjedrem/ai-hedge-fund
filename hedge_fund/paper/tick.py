@@ -350,6 +350,8 @@ def _tick(
     operation_store=None,
     operation_id: str | None = None,
 ) -> SessionRecord:
+    from hedge_fund.runtime.admission import PaperPreflightBusy
+
     deployed = load_deployed(directory)
     if deployed.broker == "saxo":
         require_sim_account_ownership()
@@ -402,8 +404,6 @@ def _tick(
 
     logical_key = paper_tick_logical_key(deployed.name, due, state.prev_hash)
     if operation_store is not None:
-        from hedge_fund.runtime.admission import PaperPreflightBusy
-
         try:
             active = operation_store.find_active_logical_operation(
                 logical_key,
@@ -472,7 +472,7 @@ def _tick(
                 raise exc from lookup_error
             has_outcome = any(event.get("attempt_id") == attempt_context["attempt_id"] and event.get("kind") in {"tick", "tick_failed", "tick_aborted"} for event in events)
             if not has_outcome:
-                if effect_state["abort"]:
+                if effect_state["abort"] or not effect_state["started"] and isinstance(exc, (PaperPreflightBusy, LedgerError, FundHalted)):
                     ledger.log_event(
                         "tick_aborted",
                         **attempt_context,
