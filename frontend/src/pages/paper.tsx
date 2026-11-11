@@ -765,12 +765,22 @@ export function PaperDetailPage() {
                             </div>
                             {canReconcileTickIntent ? (
                               <>
-                            <Alert tone="warning">
-                              Full ledger replay matches the local paper book. Confirmation records an audited resolution only; it does not retry the tick or create broker effects.
-                            </Alert>
-                            <Button onClick={() => setIntentRecoveryOpen(true)} disabled={busy}>
-                              Review orphaned tick resolution
-                            </Button>
+                                <Alert tone="warning">
+                                  <p>Full ledger replay matches the local paper book. Confirmation records an audited resolution only; it does not retry the tick or create broker effects.</p>
+                                  {intentPreview.approval_journal_event_digests.length > 0 ? (
+                                    <div className="mt-2 space-y-1 text-xs">
+                                      <p>Approval journal events covered by this receipt:</p>
+                                      <ul className="space-y-1">
+                                        {intentPreview.approval_journal_event_digests.map((digest) => (
+                                          <li key={digest} className="break-all mono">{digest}</li>
+                                        ))}
+                                      </ul>
+                                    </div>
+                                  ) : null}
+                                </Alert>
+                                <Button onClick={() => setIntentRecoveryOpen(true)} disabled={busy}>
+                                  Review orphaned tick resolution
+                                </Button>
                               </>
                             ) : (
                               <Alert tone="danger">

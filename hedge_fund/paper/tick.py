@@ -766,7 +766,7 @@ def _run(
                     approval, clear_verdict = ledger.resolve_approval(state.pending.as_of, state.prev_hash)
                     if approval is None:
                         event = ledger._latest_approval_event(state.pending.as_of, state.prev_hash, strict=True)
-                        if event is not None and (event.get("kind") in {"consume", "tick"} or event.get("consumed") is True):
+                        if event is not None and (event.get("kind") in {"consume", "tick"} or event.get("consumed") is True) and not ledger.approval_consumption_is_resolved(event):
                             journal_attempted = True
                             if effect_state is not None:
                                 effect_state["started"] = True

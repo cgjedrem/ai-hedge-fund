@@ -365,7 +365,7 @@ class Ledger:
         if not isinstance(state.prev_hash, str):
             raise PaperReconciliationRequired("pending decision has no source hash")
         event = self._latest_approval_event(state.pending.as_of, state.prev_hash, strict=True)
-        if event is not None and (event.get("kind") in {"consume", "tick"} or event.get("consumed") is True):
+        if event is not None and (event.get("kind") in {"consume", "tick"} or event.get("consumed") is True) and not self.approval_consumption_is_resolved(event):
             raise PaperReconciliationRequired("approval consumption is incomplete; reconciliation is required")
 
     def require_ready_for_tick(self, state: FundState, *, approval_required: bool) -> None:
@@ -392,7 +392,7 @@ class Ledger:
             return (_unreadable_tick_intent(),)
 
         corrupt_event_digests = tuple(item.identity for item in corrupt_occurrences)
-        resolved_intents, resolved_corrupt = _tick_intent_resolution_state(events, corrupt_occurrences, event_offsets, self.directory.name)
+        resolved_intents, resolved_corrupt, _resolved_approval_events = _tick_intent_resolution_state(events, corrupt_occurrences, event_offsets, self.directory.name)
         pending: list[tuple[int, dict, UnresolvedTickIntent]] = []
         outcomes_by_request: dict[str, list[dict]] = {}
         redo_by_session: dict[str, int] = {}
@@ -1002,7 +1002,7 @@ class Ledger:
             },
         )
         events, corrupt_occurrences, event_offsets = self._recovery_events_with_offsets()
-        resolved_intents, resolved_corrupt = _tick_intent_resolution_state(events, corrupt_occurrences, event_offsets, self.directory.name)
+        resolved_intents, resolved_corrupt, _resolved_approval_events = _tick_intent_resolution_state(events, corrupt_occurrences, event_offsets, self.directory.name)
         matches = [event for event in events if event.get("request_id") == request_id]
         if not matches:
             return None
@@ -1476,10 +1476,25 @@ class Ledger:
         return kind == "reject" and event["consumed"] is True and isinstance(event.get("session"), str) and bool(event["session"]) and set(event) == common | {"by", "consumed", "session"}
 
     def _validated_approval_events(self) -> list[dict]:
+        return self._validated_approval_history()[0]
+
+    def _validated_approval_history(self, *, allow_unresolved_corruption: bool = False) -> tuple[list[dict], tuple[int, ...], set[str]]:
+        if type(allow_unresolved_corruption) is not bool:
+            raise PaperReconciliationRequired("approval history is unavailable")
         try:
-            events = self.events()
+            events, corrupt_occurrences, event_offsets = self._recovery_events_with_offsets()
         except (OSError, UnicodeError, ValueError) as exc:
             raise PaperReconciliationRequired("approval history is unavailable") from exc
+        if len(events) != len(event_offsets):
+            raise PaperReconciliationRequired("approval history is unavailable")
+        _resolved_intents, resolved_corrupt, resolved_approval_events = _tick_intent_resolution_state(
+            events,
+            corrupt_occurrences,
+            event_offsets,
+            self.directory.name,
+        )
+        if not allow_unresolved_corruption and any(item.identity not in resolved_corrupt for item in corrupt_occurrences):
+            raise PaperReconciliationRequired("approval history is unavailable")
         identity_bound = False
         for event in events:
             if not isinstance(event, dict) or not isinstance(event.get("kind"), str) or not isinstance(event.get("time"), str):
@@ -1492,19 +1507,36 @@ class Ledger:
                 raise PaperReconciliationRequired("approval history is unavailable")
             if event["kind"] in {"approve", "reject", "expire", "consume"} or (event["kind"] == "tick" and "decision_hash" in event):
                 identity_bound = True
-        return events
+        return events, event_offsets, resolved_approval_events
 
-    def _require_completed_approval_consumptions(self) -> None:
-        pending: dict[tuple[str, str, str, str, str], dict[str | None, list[int]]] = {}
-        legacy: dict[tuple[str, str, str, str, str], int] = {}
-        unbound_rejections: dict[str, int] = {}
-        for event in self._validated_approval_events():
+    def _require_completed_approval_consumptions(self) -> set[str]:
+        events, event_offsets, resolved_approval_events = self._validated_approval_history()
+        issues = self._approval_consumption_issue_ids(events, event_offsets, resolved_approval_events)
+        if issues:
+            raise PaperReconciliationRequired("approval consumption is incomplete; reconciliation is required")
+        return resolved_approval_events
+
+    def _approval_consumption_issue_ids(
+        self,
+        events: list[dict],
+        event_offsets: tuple[int, ...],
+        resolved_approval_events: set[str],
+    ) -> set[str]:
+        if len(events) != len(event_offsets):
+            raise PaperReconciliationRequired("approval history is unavailable")
+        pending: dict[tuple[str, str, str, str, str], dict[str | None, list[dict[str, int | None]]]] = {}
+        legacy: dict[tuple[str, str, str, str, str], list[int]] = {}
+        unbound_rejections: dict[str, list[int]] = {}
+        for index, event in enumerate(events):
             kind = event["kind"]
+            identity = _approval_journal_event_identity(event, event_offsets[index])
+            if identity in resolved_approval_events and (kind == "consume" or (kind == "reject" and event.get("consumed") is True)):
+                continue
             if self._legacy_approval_event(event):
                 if kind == "reject" and event.get("consumed") is True:
                     self._require_legacy_rejection_record(event)
                     session = event["session"]
-                    unbound_rejections[session] = unbound_rejections.get(session, 0) + 1
+                    unbound_rejections.setdefault(session, []).append(index)
                 continue
             if kind == "consume":
                 key = (
@@ -1515,8 +1547,8 @@ class Ledger:
                     event["approval_by"],
                 )
                 approval_id = event.get("approval_id")
-                counts = pending.setdefault(key, {}).setdefault(approval_id, [0, 0])
-                counts[0] += 1
+                attempts = pending.setdefault(key, {}).setdefault(approval_id, [])
+                attempts.append({"consume": index, "reject": None})
             elif kind == "reject" and event.get("consumed") is True:
                 key = (
                     event["decision_as_of"],
@@ -1526,14 +1558,16 @@ class Ledger:
                     event["by"],
                 )
                 matched = False
-                for approval_id, counts in pending.get(key, {}).items():
-                    if counts[0] and ("approval_id" not in event or event["approval_id"] == approval_id):
-                        counts[0] -= 1
-                        counts[1] += 1
+                for approval_id, attempts in pending.get(key, {}).items():
+                    if "approval_id" not in event or event["approval_id"] == approval_id:
+                        attempt = next((value for value in attempts if value["reject"] is None), None)
+                        if attempt is None:
+                            continue
+                        attempt["reject"] = index
                         matched = True
                         break
                 if not matched:
-                    legacy[key] = legacy.get(key, 0) + 1
+                    legacy.setdefault(key, []).append(index)
             elif kind == "tick" and event.get("approval_verdict") in {"approve", "reject"}:
                 key = (
                     event["decision_as_of"],
@@ -1543,26 +1577,55 @@ class Ledger:
                     event["approval_by"],
                 )
                 approval_id = event.get("approval_id")
-                attempts = pending.get(key, {})
-                counts = attempts.get(approval_id)
-                if counts is not None:
-                    counts[1 if counts[1] else 0] -= 1
-                    if not any(counts):
-                        del attempts[approval_id]
+                attempts_by_id = pending.get(key, {})
+                attempts = attempts_by_id.get(approval_id)
+                if attempts:
+                    attempt = next((value for value in attempts if value["reject"] is not None), attempts[0])
+                    attempts.remove(attempt)
                     if not attempts:
+                        del attempts_by_id[approval_id]
+                    if not attempts_by_id:
                         del pending[key]
-                elif legacy.get(key, 0):
-                    legacy[key] -= 1
-                    if legacy[key] == 0:
+                elif legacy.get(key):
+                    legacy[key].pop(0)
+                    if not legacy[key]:
                         del legacy[key]
             elif kind == "tick" and isinstance(event.get("session"), str):
                 session = event["session"]
-                if unbound_rejections.get(session, 0):
-                    unbound_rejections[session] -= 1
-                    if unbound_rejections[session] == 0:
+                if unbound_rejections.get(session):
+                    unbound_rejections[session].pop(0)
+                    if not unbound_rejections[session]:
                         del unbound_rejections[session]
-        if pending or legacy or unbound_rejections:
-            raise PaperReconciliationRequired("approval consumption is incomplete; reconciliation is required")
+        issues = set()
+        for attempts_by_id in pending.values():
+            for attempts in attempts_by_id.values():
+                for attempt in attempts:
+                    issues.add(_approval_journal_event_identity(events[attempt["consume"]], event_offsets[attempt["consume"]]))
+                    if attempt["reject"] is not None:
+                        issues.add(_approval_journal_event_identity(events[attempt["reject"]], event_offsets[attempt["reject"]]))
+        for indices in legacy.values():
+            issues.update(_approval_journal_event_identity(events[index], event_offsets[index]) for index in indices)
+        for indices in unbound_rejections.values():
+            issues.update(_approval_journal_event_identity(events[index], event_offsets[index]) for index in indices)
+        return issues
+
+    def unresolved_approval_consumption_events(self, *, allow_unresolved_corruption: bool = False) -> tuple[tuple[str, dict, int], ...]:
+        events, event_offsets, resolved_approval_events = self._validated_approval_history(allow_unresolved_corruption=allow_unresolved_corruption)
+        issues = self._approval_consumption_issue_ids(events, event_offsets, resolved_approval_events)
+        return tuple((_approval_journal_event_identity(event, offset), event, offset) for event, offset in zip(events, event_offsets) if _approval_journal_event_identity(event, offset) in issues)
+
+    def approval_consumption_is_resolved(self, event: dict) -> bool:
+        if not isinstance(event, dict):
+            return False
+        events, event_offsets, resolved_approval_events = self._validated_approval_history()
+        for candidate, offset in reversed(list(zip(events, event_offsets))):
+            if candidate != event:
+                continue
+            is_consumption_event = candidate.get("kind") == "consume" or (candidate.get("kind") == "reject" and candidate.get("consumed") is True)
+            if not is_consumption_event:
+                return False
+            return _approval_journal_event_identity(candidate, offset) in resolved_approval_events
+        return False
 
     def _require_legacy_rejection_record(self, event: dict) -> None:
         try:
@@ -1934,7 +1997,7 @@ class Ledger:
 
     def recovery_events_with_unresolved_corruption(self) -> tuple[list[dict], tuple[str, ...]]:
         events, corrupt_occurrences, event_offsets = self._recovery_events_with_offsets()
-        _resolved_intents, resolved_corrupt = _tick_intent_resolution_state(events, corrupt_occurrences, event_offsets, self.directory.name)
+        _resolved_intents, resolved_corrupt, _resolved_approval_events = _tick_intent_resolution_state(events, corrupt_occurrences, event_offsets, self.directory.name)
         outstanding = tuple(item.identity for item in corrupt_occurrences if item.identity not in resolved_corrupt)
         return events, outstanding
 
@@ -1966,7 +2029,7 @@ class Ledger:
     def events(self) -> list[dict]:
         events, corrupt_occurrences, event_offsets = self._recovery_events_with_offsets()
         if corrupt_occurrences:
-            _resolved_intents, resolved_corrupt = _tick_intent_resolution_state(events, corrupt_occurrences, event_offsets, self.directory.name)
+            _resolved_intents, resolved_corrupt, _resolved_approval_events = _tick_intent_resolution_state(events, corrupt_occurrences, event_offsets, self.directory.name)
             if any(item.identity not in resolved_corrupt for item in corrupt_occurrences):
                 raise json.JSONDecodeError("paper event history requires reconciliation", "", 0)
         return events
@@ -2057,7 +2120,7 @@ def _parse_event_history_with_offsets(
 
 
 def _corrupt_event_identity(line: bytes, offset: int) -> str:
-    identity = b"paper-corrupt-event\0" + str(offset).encode("ascii") + b"\0" + line
+    identity = b"paper-corrupt-event\0" + str(offset).encode("ascii") + b"\0" + line.rstrip(b"\r\n")
     return hashlib.sha256(identity).hexdigest()
 
 
@@ -2066,18 +2129,33 @@ def _event_digest(event: dict) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _approval_journal_event_identity(event: dict, offset: int) -> str:
+    encoded = json.dumps(event, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=True).encode("utf-8")
+    identity = b"paper-approval-journal-event\0" + str(offset).encode("ascii") + b"\0" + encoded
+    return hashlib.sha256(identity).hexdigest()
+
+
+def _approval_journal_event_matches_intent(event: dict, intent: dict) -> bool:
+    kind = event.get("kind")
+    if kind != "consume" and not (kind == "reject" and event.get("consumed") is True):
+        return False
+    expected_head = intent.get("expected_head")
+    return isinstance(expected_head, str) and event.get("session") == intent.get("session") and event.get("decision_hash") == expected_head
+
+
 def _tick_intent_resolution_state(
     events: list[dict],
     corrupt_occurrences: tuple[_CorruptEventOccurrence, ...],
     event_offsets: tuple[int, ...],
     fund: str,
-) -> tuple[set[str], set[str]]:
+) -> tuple[set[str], set[str], set[str]]:
     from hedge_fund.runtime.reconciliation import TickIntentReconciliationReceipt
 
     if len(events) != len(event_offsets):
-        return set(), set()
+        return set(), set(), set()
     resolved_intents = set()
     resolved_corrupt = set()
+    resolved_approval_events = set()
     for index, event in enumerate(events):
         if event.get("kind") != "tick_intent_resolved":
             continue
@@ -2113,17 +2191,30 @@ def _tick_intent_resolution_state(
         if not valid_corruption_receipt:
             continue
         if receipt.intent_digest is not None:
-            matching_intents = [prior for prior in events[:index] if prior.get("kind") == "tick_intent" and _event_digest(prior) == receipt.intent_digest and (receipt.intent_request_id is None or prior.get("request_id") == receipt.intent_request_id)]
+            matching_intents = [(prior_index, prior) for prior_index, prior in enumerate(events[:index]) if prior.get("kind") == "tick_intent" and _event_digest(prior) == receipt.intent_digest and (receipt.intent_request_id is None or prior.get("request_id") == receipt.intent_request_id)]
             if not matching_intents:
                 continue
+            approval_events_valid = True
+            if receipt.approval_journal_event_digests:
+                if len(matching_intents) != 1:
+                    continue
+                intent_index, intent_event = matching_intents[0]
+                for digest in receipt.approval_journal_event_digests:
+                    matches = [prior_index for prior_index, prior in enumerate(events[:index]) if prior_index > intent_index and _approval_journal_event_identity(prior, event_offsets[prior_index]) == digest and _approval_journal_event_matches_intent(prior, intent_event)]
+                    if len(matches) != 1:
+                        approval_events_valid = False
+                        break
+                if not approval_events_valid:
+                    continue
             resolved_intents.add(receipt.intent_digest)
+            resolved_approval_events.update(receipt.approval_journal_event_digests)
         elif receipt.intent_request_id is not None:
             continue
         if not receipt.intent_digest and not receipt.corrupt_event_digests:
             continue
         resolved_corrupt.update(item.identity for item in covered_corruption)
         resolved_corrupt.update(receipt.corrupt_event_digests)
-    return resolved_intents, resolved_corrupt
+    return resolved_intents, resolved_corrupt, resolved_approval_events
 
 
 def _tick_outcome_matches(intent: dict, outcome: dict) -> bool:

@@ -342,12 +342,14 @@ export interface PaperTickIntentReconciliationPreview {
     | "broker-book-invalid"
     | "broker-book-changed"
     | "broker-book-mismatch"
+    | "approval-journal-incomplete"
     | "ready";
   intent_request_id: string | null;
   intent_session: string | null;
   intent_digest: string | null;
   metadata_complete: boolean | null;
   corrupt_event_digests: string[];
+  approval_journal_event_digests: string[];
   expected_head: string | null;
   current_head: string | null;
   broker_book_sha256: string | null;

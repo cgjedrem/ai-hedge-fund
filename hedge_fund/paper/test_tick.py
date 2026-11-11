@@ -485,6 +485,177 @@ def test_orphaned_intent_reconciliation_admits_new_tick(tmp_path, clock, SPEC):
     assert record.session == "2024-06-04"
 
 
+def test_orphaned_approval_consumption_reconciliation_allows_resume_and_next_tick(tmp_path, clock, SPEC):
+    from hedge_fund.runtime.admission import (
+        AdmissionCoordinator,
+        paper_approval_transition,
+        RootOwnerLease,
+    )
+    from hedge_fund.runtime.reconciliation import (
+        build_tick_intent_reconciliation_snapshot,
+        TickIntentReconciliationConfirmation,
+    )
+    from hedge_fund.runtime.root import RootContext
+
+    spec = SPEC.model_copy(update={"approval_required": True})
+    clock("2024-06-04")
+    directory = _deploy_owned_paper_test_fund(tmp_path, spec)
+    ledger = Ledger(directory)
+    with _owned_paper_lane(directory, "alpha"):
+        first = _tick(directory)
+    assert first.decision is not None
+
+    root_path = Path(directory).parents[1]
+    with RootContext.open(root_path) as root:
+        with RootOwnerLease.acquire(root) as owner:
+            admission = AdmissionCoordinator(root, owner_lease=owner)
+            with paper_approval_transition(admission, "alpha") as proof:
+                approval = ledger.set_approval("approve", first.decision.as_of, first.hash, "cli", admission=proof)
+
+    clock("2024-06-05")
+    request_id = "crashed-after-consume"
+    session = "2024-06-04"
+    request_digest = ledger.tick_request_digest(request_id, expected_head=first.hash, session=session)
+    with _owned_paper_lane(directory, "alpha"):
+        ledger.log_event(
+            "tick_intent",
+            request_id=request_id,
+            request_action="tick",
+            request_digest=request_digest,
+            expected_head=first.hash,
+            requested_session=session,
+            session=session,
+            durable=True,
+        )
+        ledger.log_event(
+            "consume",
+            decision_as_of=approval["decision_as_of"],
+            decision_hash=approval["decision_hash"],
+            approval_verdict=approval["verdict"],
+            approval_by=approval["by"],
+            approval_id=approval["approval_id"],
+            session=session,
+            durable=True,
+        )
+        snapshot = build_tick_intent_reconciliation_snapshot(
+            directory,
+            load_deployed(directory),
+            ledger,
+            ledger.replay(spec.capital, full=True),
+            ledger.latest(),
+            intent_request_id=request_id,
+        )
+        assert snapshot.preview.recoverable is True
+        assert len(snapshot.preview.approval_journal_event_digests) == 1
+        confirmation = TickIntentReconciliationConfirmation(
+            request_id="reconcile-consumed-intent",
+            intent_request_id=request_id,
+            intent_digest=snapshot.preview.intent_digest,
+            preview_digest=snapshot.preview.preview_digest,
+            decision="confirm-paper-book-matches-ledger",
+        )
+        ledger.reconcile_tick_intent(spec.capital, confirmation=confirmation, operator="cli")
+
+    assert ledger.unresolved_tick_intents() == ()
+    resolved = next(event for event in ledger.events() if event.get("kind") == "tick_intent_resolved")
+    assert resolved["receipt"]["approval_journal_event_digests"] == list(snapshot.preview.approval_journal_event_digests)
+    with _owned_paper_lane(directory, "alpha"):
+        ledger.halt("synthetic consumption recovery check")
+        ledger.resume(spec.capital, approval_required=True)
+        record = tick(
+            directory,
+            FakeDataClient(SERIES),
+            session=session,
+            expected_head=first.hash,
+            build_fund=build_fund,
+            request_id="tick-after-consumption-resolution",
+        )
+    assert ledger.halted() is None
+    assert record.session == session
+
+
+@pytest.mark.parametrize("mismatch", ["session", "decision_as_of"])
+def test_tick_intent_reconciliation_preview_blocks_unrelated_orphaned_consumption(tmp_path, clock, SPEC, mismatch):
+    from hedge_fund.runtime.reconciliation import (
+        build_tick_intent_reconciliation_snapshot,
+    )
+
+    clock("2024-06-04")
+    directory = _deploy_owned_paper_test_fund(tmp_path, SPEC)
+    ledger = Ledger(directory)
+    with _owned_paper_lane(directory, "alpha"):
+        first = _tick(directory)
+
+    clock("2024-06-05")
+    request_id = "intent-with-unrelated-consume"
+    session = "2024-06-04"
+    request_digest = ledger.tick_request_digest(request_id, expected_head=first.hash, session=session)
+    with _owned_paper_lane(directory, "alpha"):
+        ledger.log_event(
+            "tick_intent",
+            request_id=request_id,
+            request_action="tick",
+            request_digest=request_digest,
+            expected_head=first.hash,
+            requested_session=session,
+            session=session,
+            durable=True,
+        )
+        ledger.log_event(
+            "consume",
+            decision_as_of=first.decision.as_of if mismatch == "session" else "2024-06-02",
+            decision_hash=first.hash,
+            approval_verdict="approve",
+            approval_by="cli",
+            approval_id="a" * 32,
+            session="2024-06-05" if mismatch == "session" else session,
+            durable=True,
+        )
+        snapshot = build_tick_intent_reconciliation_snapshot(
+            directory,
+            load_deployed(directory),
+            ledger,
+            ledger.replay(SPEC.capital, full=True),
+            ledger.latest(),
+            intent_request_id=request_id,
+        )
+
+    assert snapshot.preview.recoverable is False
+    assert snapshot.preview.reason == "approval-journal-incomplete"
+
+
+def test_approval_consumption_without_intent_has_unrecoverable_preview(tmp_path, clock, SPEC):
+    from hedge_fund.runtime.reconciliation import (
+        build_tick_intent_reconciliation_snapshot,
+    )
+
+    directory = _deploy_owned_paper_test_fund(tmp_path, SPEC)
+    ledger = Ledger(directory)
+    with _owned_paper_lane(directory, "alpha"):
+        ledger.log_event(
+            "consume",
+            decision_as_of="2024-06-03",
+            decision_hash="a" * 64,
+            approval_verdict="approve",
+            approval_by="cli",
+            approval_id="b" * 32,
+            session="2024-06-04",
+            durable=True,
+        )
+        snapshot = build_tick_intent_reconciliation_snapshot(
+            directory,
+            load_deployed(directory),
+            ledger,
+            ledger.replay(SPEC.capital, full=True),
+            ledger.latest(),
+        )
+
+    assert snapshot.preview.required is True
+    assert snapshot.preview.recoverable is False
+    assert snapshot.preview.reason == "approval-journal-incomplete"
+    assert snapshot.preview.intent_digest is None
+
+
 def test_intent_reconciliation_preview_digest_accepts_nan_event_field(tmp_path, clock, SPEC):
     from hedge_fund.runtime.reconciliation import (
         build_tick_intent_reconciliation_snapshot,

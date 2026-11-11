@@ -192,6 +192,7 @@ class TickIntentReconciliationPreview(BaseModel):
         "broker-book-invalid",
         "broker-book-changed",
         "broker-book-mismatch",
+        "approval-journal-incomplete",
         "ready",
     ]
     intent_request_id: str | None = Field(default=None, pattern=_REQUEST_ID.pattern)
@@ -199,6 +200,7 @@ class TickIntentReconciliationPreview(BaseModel):
     intent_digest: str | None = Field(default=None, pattern=_SHA256.pattern)
     metadata_complete: bool | None = None
     corrupt_event_digests: tuple[str, ...] = ()
+    approval_journal_event_digests: tuple[str, ...] = ()
     expected_head: str | None = Field(default=None, pattern=_SHA256.pattern)
     current_head: str | None = Field(default=None, pattern=_SHA256.pattern)
     broker_book_sha256: str | None = Field(default=None, pattern=_SHA256.pattern)
@@ -213,6 +215,8 @@ class TickIntentReconciliationPreview(BaseModel):
     def _validate_digest(self) -> TickIntentReconciliationPreview:
         if len(set(self.corrupt_event_digests)) != len(self.corrupt_event_digests):
             raise ValueError("corrupt event identities must be unique")
+        if len(set(self.approval_journal_event_digests)) != len(self.approval_journal_event_digests) or any(_SHA256.fullmatch(digest) is None for digest in self.approval_journal_event_digests):
+            raise ValueError("approval journal event identities are invalid")
         if self.required:
             if self.preview_digest != self.compute_preview_digest():
                 raise ValueError("preview_digest does not match the preview contents")
@@ -223,6 +227,7 @@ class TickIntentReconciliationPreview(BaseModel):
                 not in {
                     "intent-not-found",
                     "multiple-unresolved-tick-intents",
+                    "approval-journal-incomplete",
                 }
             ):
                 raise ValueError("required intent reconciliation has no target")
@@ -269,6 +274,7 @@ class TickIntentReconciliationReceipt(BaseModel):
     intent_digest: str | None = Field(default=None, pattern=_SHA256.pattern)
     preview_digest: str = Field(pattern=_SHA256.pattern)
     corrupt_event_digests: tuple[str, ...] = ()
+    approval_journal_event_digests: tuple[str, ...] = ()
     expected_head: str | None = Field(default=None, pattern=_SHA256.pattern)
     current_head: str | None = Field(default=None, pattern=_SHA256.pattern)
     broker_book_sha256: str = Field(pattern=_SHA256.pattern)
@@ -285,6 +291,10 @@ class TickIntentReconciliationReceipt(BaseModel):
             raise ValueError("intent request identity requires an intent digest")
         if len(set(self.corrupt_event_digests)) != len(self.corrupt_event_digests):
             raise ValueError("corrupt event identities must be unique")
+        if len(set(self.approval_journal_event_digests)) != len(self.approval_journal_event_digests) or any(_SHA256.fullmatch(digest) is None for digest in self.approval_journal_event_digests):
+            raise ValueError("approval journal event identities are invalid")
+        if self.intent_digest is None and self.approval_journal_event_digests:
+            raise ValueError("approval journal events require a tick-intent target")
         try:
             recorded_at = datetime.fromisoformat(self.recorded_at.replace("Z", "+00:00"))
         except ValueError as exc:
@@ -313,6 +323,7 @@ class TickIntentReconciliationReceipt(BaseModel):
             "intent_digest": preview.intent_digest,
             "preview_digest": preview.preview_digest,
             "corrupt_event_digests": preview.corrupt_event_digests,
+            "approval_journal_event_digests": preview.approval_journal_event_digests,
             "expected_head": preview.expected_head,
             "current_head": preview.current_head,
             "broker_book_sha256": preview.broker_book_sha256,
@@ -322,11 +333,16 @@ class TickIntentReconciliationReceipt(BaseModel):
             "decision": _DECISION,
             "residual_uncertainty": _RESIDUAL_UNCERTAINTY,
         }
+        if not payload["approval_journal_event_digests"]:
+            payload.pop("approval_journal_event_digests")
         payload["receipt_id"] = _receipt_digest(payload)
         return cls.model_validate(payload)
 
     def compute_receipt_id(self) -> str:
-        return _receipt_digest(self.model_dump(mode="json", exclude={"receipt_id"}))
+        payload = self.model_dump(mode="json", exclude={"receipt_id"})
+        if not self.approval_journal_event_digests:
+            payload.pop("approval_journal_event_digests", None)
+        return _receipt_digest(payload)
 
 
 @dataclass(frozen=True, slots=True)
@@ -488,14 +504,22 @@ def build_tick_intent_reconciliation_snapshot(
     intent_request_id: str | None = None,
     intent_digest: str | None = None,
 ) -> TickIntentReconciliationSnapshot:
+    from hedge_fund.paper.ledger import LedgerError
+
     if intent_request_id is not None and (not isinstance(intent_request_id, str) or not _REQUEST_ID.fullmatch(intent_request_id)):
         raise ValueError("tick-intent request identity is invalid")
     if intent_digest is not None and (not isinstance(intent_digest, str) or not _SHA256.fullmatch(intent_digest)):
         raise ValueError("tick-intent digest is invalid")
-    events, _all_corrupt_digests = ledger.recovery_events()
+    events, _corrupt_occurrences, event_offsets = ledger._recovery_events_with_offsets()
     unresolved = ledger.unresolved_tick_intents()
     intents = [item for item in unresolved if not item.is_corrupt and item.intent_digest is not None]
     corrupt_digests = tuple(sorted({digest for item in unresolved for digest in item.corrupt_event_digests}))
+    try:
+        approval_journal_events = ledger.unresolved_approval_consumption_events(allow_unresolved_corruption=True)
+        approval_journal_unavailable = False
+    except (LedgerError, OSError, UnicodeError, ValueError):
+        approval_journal_events = ()
+        approval_journal_unavailable = True
     selected = None
     reason = "ready"
     if intent_request_id is not None or intent_digest is not None:
@@ -511,7 +535,12 @@ def build_tick_intent_reconciliation_snapshot(
     elif len(intents) > 1:
         reason = "multiple-unresolved-tick-intents"
 
-    if selected is None and not corrupt_digests and reason == "ready":
+    if approval_journal_unavailable and reason == "ready":
+        reason = "approval-journal-incomplete"
+    elif approval_journal_events and selected is None and reason == "ready":
+        reason = "approval-journal-incomplete"
+
+    if selected is None and not corrupt_digests and not approval_journal_events and not approval_journal_unavailable and reason == "ready":
         return TickIntentReconciliationSnapshot(
             preview=TickIntentReconciliationPreview.create(
                 required=False,
@@ -525,18 +554,53 @@ def build_tick_intent_reconciliation_snapshot(
         )
 
     intent_event = None
+    intent_event_index = None
     expected_head = None
     if selected is not None:
-        intent_event = next(
-            (event for event in events if event.get("kind") == "tick_intent" and hashlib.sha256(_canonical_json(event)).hexdigest() == selected.intent_digest),
+        intent_event_index = next(
+            (index for index, event in enumerate(events) if event.get("kind") == "tick_intent" and hashlib.sha256(_canonical_json(event)).hexdigest() == selected.intent_digest),
             None,
         )
+        intent_event = events[intent_event_index] if intent_event_index is not None else None
         if intent_event is None:
             reason = "intent-not-found"
         elif "expected_head" in intent_event:
             observed_head = intent_event["expected_head"]
             if observed_head is None or isinstance(observed_head, str) and _SHA256.fullmatch(observed_head):
                 expected_head = observed_head
+
+    approval_journal_event_digests = ()
+    if approval_journal_unavailable and reason == "ready":
+        reason = "approval-journal-incomplete"
+    elif approval_journal_events and selected is not None and intent_event_index is not None:
+        offset_to_index = {offset: index for index, offset in enumerate(event_offsets)}
+        unresolved_intent_events = []
+        intent_digests = {item.intent_digest for item in intents}
+        for index, event in enumerate(events):
+            digest = hashlib.sha256(_canonical_json(event)).hexdigest() if event.get("kind") == "tick_intent" else None
+            if digest in intent_digests:
+                unresolved_intent_events.append((index, event, digest))
+        resolved_journal_digests = []
+        pending_as_of = state.pending.as_of if state.pending is not None else None
+        for event_digest, journal_event, event_offset in approval_journal_events:
+            journal_index = offset_to_index.get(event_offset)
+            if journal_index is None or events[journal_index] != journal_event:
+                reason = "approval-journal-incomplete"
+                break
+            if pending_as_of is None or journal_event.get("decision_as_of") != pending_as_of:
+                reason = "approval-journal-incomplete"
+                break
+            matching_intents = [candidate for candidate in unresolved_intent_events if candidate[0] < journal_index and candidate[1].get("session") == journal_event.get("session") and candidate[1].get("expected_head") == journal_event.get("decision_hash")]
+            if len(matching_intents) != 1 or matching_intents[0][2] != selected.intent_digest:
+                reason = "approval-journal-incomplete"
+                break
+            resolved_journal_digests.append(event_digest)
+        if reason == "ready" and len(resolved_journal_digests) == len(approval_journal_events):
+            approval_journal_event_digests = tuple(sorted(resolved_journal_digests))
+        else:
+            approval_journal_event_digests = ()
+    elif approval_journal_events and reason == "ready":
+        reason = "approval-journal-incomplete"
 
     current_head = latest.hash if latest is not None else None
     ledger_head_matches = state.prev_hash == current_head
@@ -585,6 +649,7 @@ def build_tick_intent_reconciliation_snapshot(
             intent_digest=selected.intent_digest if selected is not None else intent_digest,
             metadata_complete=selected.metadata_complete if selected is not None else None,
             corrupt_event_digests=corrupt_digests,
+            approval_journal_event_digests=approval_journal_event_digests,
             expected_head=expected_head,
             current_head=current_head,
             broker_book_sha256=book_digest,

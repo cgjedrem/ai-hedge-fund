@@ -227,7 +227,10 @@ def test_unreadable_intent_sentinel_cannot_collide_with_request_id(owned_ledger)
 
 def test_corruption_receipt_cannot_resolve_a_later_event_line(tmp_path):
     from hedge_fund.paper.ledger import _control_request_digest
-    from hedge_fund.runtime.reconciliation import TickIntentReconciliationPreview, TickIntentReconciliationReceipt
+    from hedge_fund.runtime.reconciliation import (
+        TickIntentReconciliationPreview,
+        TickIntentReconciliationReceipt,
+    )
 
     ledger = Ledger(tmp_path)
     torn_line = b'{"kind":\n'
@@ -248,6 +251,9 @@ def test_corruption_receipt_cannot_resolve_a_later_event_line(tmp_path):
         operator="web",
         recorded_at="2026-11-11T00:00:00+00:00",
     )
+    legacy_receipt = receipt.model_dump(mode="json")
+    legacy_receipt.pop("approval_journal_event_digests")
+    assert TickIntentReconciliationReceipt.model_validate(legacy_receipt).receipt_id == receipt.receipt_id
     request_digest = _control_request_digest(
         TICK_INTENT_RECOVERY,
         ledger.directory.name,

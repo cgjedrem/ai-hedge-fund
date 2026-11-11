@@ -299,6 +299,7 @@ function paperTickIntentPreview(
     intent_digest: "7".repeat(64),
     metadata_complete: false,
     corrupt_event_digests: [],
+    approval_journal_event_digests: [],
     expected_head: null,
     current_head: HEAD,
     broker_book_sha256: "8".repeat(64),
@@ -837,6 +838,43 @@ it("selects an ID-less tick-intent target by digest before confirming recovery",
     intent_digest: secondDigest,
     preview_digest: selectedPreview.preview_digest,
   });
+});
+
+it("shows approval journal identities covered by tick-intent recovery", async () => {
+  const approvalJournalDigest = "6".repeat(64);
+  const recovery = {
+    name: FUND,
+    halted: null,
+    resume_allowed: false,
+    preview: paperReconciliationPreview({
+      required: false,
+      recoverable: false,
+      reason: "no-ambiguous-tick-failure",
+      failure_id: null,
+      failed_request_id: null,
+      operation_id: null,
+      expected_head: null,
+      current_head: null,
+      broker_book_sha256: null,
+      capture_id: null,
+      capture_digest: null,
+      book_matches_ledger: false,
+      head_matches_failure: false,
+      preview_digest: null,
+    }),
+    intent_preview: paperTickIntentPreview({
+      approval_journal_event_digests: [approvalJournalDigest],
+    }),
+    intent_targets: [],
+  };
+  const calls = renderDesk(stoppedRunner, {
+    [`GET /api/paper/${FUND}/reconciliation`]: () => json(recovery),
+  });
+
+  const section = await screen.findByTestId("tick-intent-reconciliation");
+  expect(section).toHaveTextContent("Approval journal events covered by this receipt");
+  expect(section).toHaveTextContent(approvalJournalDigest);
+  expect(calls.some((call) => call.path === `/api/paper/${FUND}/reconciliation`)).toBe(true);
 });
 
 it.each([
