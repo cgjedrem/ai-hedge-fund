@@ -532,6 +532,90 @@ def test_web_duplicate_logical_tick_refusal_exposes_contract_fields(demo_root, m
     assert dispatched == [first["operation_id"]]
 
 
+def test_interrupted_manual_tick_before_intent_releases_logical_key(demo_root, monkeypatch):
+    tick_started = threading.Event()
+
+    def crash_before_tick_intent(*_args, **_kwargs):
+        tick_started.set()
+        raise SystemExit("synthetic process exit before tick intent")
+
+    monkeypatch.setattr(web_services, "tick", crash_before_tick_intent)
+
+    def make_service():
+        result = DeskService(
+            demo_root,
+            allow_writes=True,
+            network_enabled=True,
+            data_client_factory=_OfflineDataClient,
+            fund_factory=_OfflineFund,
+        )
+        result._runtime_settings = _local_settings()
+        return result
+
+    service = make_service()
+    name = "effect-free-interrupted-tick"
+    try:
+        spec = load_spec(demo_root / "mandates" / "demo-quality.yaml").model_copy(update={"name": name})
+        service.create_mandate(spec.model_dump(mode="python"))
+        service.deploy_mandate(name, DeployRequest(universe=["AAPL"]))
+        preview = service.create_manual_tick_preview(
+            name,
+            PaperTickPreviewRequest(expected_head=None),
+            operator_session="offline-test-session",
+        )
+        request = PaperTickAcceptRequest(
+            request_id="effect-free-first",
+            preview_id=preview["preview_id"],
+            preview_digest=preview["preview_digest"],
+            confirmation_token=preview["confirmation_token"],
+            expected_head=preview["expected_head"],
+            due_set=preview["due_set"],
+        )
+        first = service.accept_manual_tick(
+            name,
+            request,
+            operator_session="offline-test-session",
+        )
+        future = service._paper_operation_jobs._submitted[first["operation_id"]]
+        assert tick_started.wait(timeout=30)
+        with pytest.raises(SystemExit, match="synthetic process exit"):
+            future.result(timeout=30)
+        service.close()
+        service = make_service()
+        interrupted = service._operation_store.get_operation(first["operation_id"])
+        assert interrupted.effects_started is False
+
+        preview = service.create_manual_tick_preview(
+            name,
+            PaperTickPreviewRequest(expected_head=None),
+            operator_session="offline-test-session",
+        )
+        request = PaperTickAcceptRequest(
+            request_id="effect-free-second",
+            preview_id=preview["preview_id"],
+            preview_digest=preview["preview_digest"],
+            confirmation_token=preview["confirmation_token"],
+            expected_head=preview["expected_head"],
+            due_set=preview["due_set"],
+        )
+        dispatched = []
+        monkeypatch.setattr(
+            service._paper_operation_jobs,
+            "submit",
+            lambda operation, _work, reservation=None: dispatched.append(operation.operation_id),
+        )
+        second = service.accept_manual_tick(
+            name,
+            request,
+            operator_session="offline-test-session",
+        )
+    finally:
+        service.close()
+
+    assert second["operation_id"] != first["operation_id"]
+    assert dispatched == [second["operation_id"]]
+
+
 def test_reviewed_manual_tick_persists_agent_progress(
     demo_root,
     monkeypatch,

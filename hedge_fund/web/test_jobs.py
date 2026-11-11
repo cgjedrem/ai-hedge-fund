@@ -2093,6 +2093,31 @@ def test_busy_apply_if_current_retries_before_effect(durable_job_context, monkey
         registry.close()
 
 
+def test_operation_effect_check_and_mark_are_separate(durable_job_context):
+    _root_context, store, capture = durable_job_context
+    registry = OperationJobRegistry(store, clock=lambda: _JOB_NOW)
+    operation = _accepted_operation(store, capture)
+    observed = []
+
+    def work(_progress, _cancelled, apply_if_current):
+        apply_if_current.check_current()
+        observed.append(store.get_operation(operation.operation_id).effects_started)
+        apply_if_current.mark_effect_started()
+        observed.append(store.get_operation(operation.operation_id).effects_started)
+        return {}
+
+    try:
+        registry.submit(operation, work)
+        future = registry._submitted[operation.operation_id]
+        assert future is not None
+        future.result(timeout=5)
+
+        assert observed == [False, True]
+        assert store.get_operation(operation.operation_id).effects_started is True
+    finally:
+        registry.close()
+
+
 def test_busy_from_apply_if_current_effect_is_not_retried(durable_job_context):
     _root_context, store, capture = durable_job_context
     registry = OperationJobRegistry(store, clock=lambda: _JOB_NOW)

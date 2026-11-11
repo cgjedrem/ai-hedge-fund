@@ -10,13 +10,14 @@ import uuid
 from collections.abc import Callable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timezone
-from typing import TypeVar
+from typing import Protocol, TypeVar
 
 from hedge_fund.runtime.operations import (
     OperationBusy,
     OperationRecord,
     OperationStatus,
     OperationStore,
+    WorkerFence,
     WorkerFenced,
 )
 
@@ -41,6 +42,52 @@ class SlotReservation:
     def __init__(self, owner: "OperationJobRegistry") -> None:
         self._owner = owner
         self._settled = False
+
+
+class OperationEffect(Protocol):
+    def __call__(self, effect: Callable[[], object]) -> object:
+        ...
+
+    def check_current(self) -> None:
+        ...
+
+    def mark_effect_started(self) -> None:
+        ...
+
+
+class _FencedEffect:
+    def __init__(
+        self,
+        store: OperationStore,
+        operation_id: str,
+        fence: WorkerFence,
+        now: Callable[[], datetime],
+        retry_busy: Callable[..., object],
+    ) -> None:
+        self._store = store
+        self._operation_id = operation_id
+        self._fence = fence
+        self._now = now
+        self._retry_busy = retry_busy
+
+    def check_current(self) -> None:
+        self._retry_busy(lambda: self._store.check_if_current(self._operation_id, self._fence))
+
+    def mark_effect_started(self) -> None:
+        self._retry_busy(lambda: self._store.mark_effect_started(self._operation_id, self._fence, now=self._now()))
+
+    def __call__(self, effect: Callable[[], object]) -> object:
+        effect_started = False
+
+        def guarded_effect() -> object:
+            nonlocal effect_started
+            effect_started = True
+            return effect()
+
+        return self._retry_busy(
+            lambda: self._store.apply_if_current(self._operation_id, self._fence, guarded_effect),
+            retry_if=lambda: not effect_started,
+        )
 
 
 class OperationJobRegistry:
@@ -113,7 +160,7 @@ class OperationJobRegistry:
             [
                 Callable[[int], None],
                 Callable[[], bool],
-                Callable[[Callable[[], object]], object],
+                OperationEffect,
             ],
             Mapping[str, object],
         ],
@@ -257,7 +304,7 @@ class OperationJobRegistry:
             [
                 Callable[[int], None],
                 Callable[[], bool],
-                Callable[[Callable[[], object]], object],
+                OperationEffect,
             ],
             Mapping[str, object],
         ],
@@ -307,19 +354,7 @@ class OperationJobRegistry:
             except WorkerFenced:
                 return True
 
-        def apply_if_current(effect: Callable[[], object]) -> object:
-            effect_started = False
-
-            def guarded_effect() -> object:
-                nonlocal effect_started
-                effect_started = True
-                return effect()
-
-            return self._retry_busy(
-                lambda: self._store.apply_if_current(operation_id, fence, guarded_effect),
-                retry_if=lambda: not effect_started,
-            )
-
+        apply_if_current = _FencedEffect(self._store, operation_id, fence, self._now, self._retry_busy)
         phase = "work"
         try:
             result = work(report_progress, cancellation_requested, apply_if_current)

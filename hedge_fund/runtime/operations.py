@@ -1032,6 +1032,18 @@ class OperationStore:
             self._mark_effect_started(index, operation, now=datetime.now(timezone.utc))
             return effect()
 
+    def check_if_current(self, operation_id: str, fence: WorkerFence) -> None:
+        self._require_private_storage()
+        _validate_operation_id(operation_id)
+        with self._locked_for_operation(operation_id):
+            index = self._read_index()
+            operation = self._operation_entry(index, operation_id)
+            self._verify_operation_sidecars(operation)
+            self._verify_operation_capture(index, operation)
+            self._require_current_fence(operation, operation_id, fence)
+            if operation["status"] != OperationStatus.RUNNING.value:
+                raise WorkerFenced("worker is not running")
+
     def mark_effect_started(
         self,
         operation_id: str,

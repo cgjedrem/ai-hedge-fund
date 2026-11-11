@@ -176,7 +176,12 @@ from hedge_fund.runtime.reconciliation import (
 )
 from hedge_fund.runtime.root import RootContext, RootPathError
 from hedge_fund.scorecard import score
-from hedge_fund.web.jobs import JobCancelled, JobConflict, OperationJobRegistry
+from hedge_fund.web.jobs import (
+    JobCancelled,
+    JobConflict,
+    OperationEffect,
+    OperationJobRegistry,
+)
 from hedge_fund.web.saxo_inspection import (
     SaxoInspectionCoordinator,
     SaxoInspectionError,
@@ -1394,7 +1399,7 @@ class DeskService:
         capture: FrozenCapture,
         progress: Callable[[int], None],
         cancelled: Callable[[], bool],
-        apply_if_current: Callable[[Callable[[], object]], object],
+        apply_if_current: OperationEffect,
     ) -> dict[str, object]:
         payload = dict(operation.payload)
         kind = payload.get("kind")
@@ -1473,7 +1478,7 @@ class DeskService:
                             store = self._operation_store
                             if store is None:
                                 raise OperationError("paper operation store is unavailable")
-                            apply_if_current(lambda: None)
+                            apply_if_current.check_current()
                             record = tick(
                                 directory,
                                 client,
@@ -1490,6 +1495,7 @@ class DeskService:
                                 capture_digest=capture.digest,
                                 on_progress=progress,
                                 operation_store=store,
+                                on_effect_started=apply_if_current.mark_effect_started,
                             )
         except ServiceError:
             raise
@@ -1517,7 +1523,7 @@ class DeskService:
         capture: FrozenCapture,
         progress: Callable[[int], None],
         cancelled: Callable[[], bool],
-        apply_if_current: Callable[[Callable[[], object]], object],
+        apply_if_current: OperationEffect,
     ) -> dict[str, object]:
         payload = dict(operation.payload)
         expected = {
@@ -1563,8 +1569,9 @@ class DeskService:
         if cancelled():
             raise JobCancelled()
         progress(10)
-        apply_if_current(lambda: None)
+        apply_if_current.check_current()
         try:
+            apply_if_current.mark_effect_started()
             state = self._runner_manager.start(
                 operation.subject_id,
                 capture,

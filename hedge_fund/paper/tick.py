@@ -189,6 +189,7 @@ def tick(
     capture_id: str | None = None,
     capture_digest: str | None = None,
     on_progress: Callable[[int], None] | None = None,
+    on_effect_started: Callable[[], None] | None = None,
     operation_store=None,
 ) -> SessionRecord:
     """Advance the paper fund in *directory* by one session and record it.
@@ -202,6 +203,8 @@ def tick(
     """
     if on_progress is not None and not callable(on_progress):
         raise ValueError("paper tick progress callback must be callable")
+    if on_effect_started is not None and not callable(on_effect_started):
+        raise ValueError("paper tick effect callback must be callable")
     if operation_store is not None:
         from hedge_fund.runtime.operations import OperationStore
 
@@ -303,6 +306,7 @@ def tick(
                 now=now,
                 operation_context=operation_context,
                 on_progress=on_progress,
+                on_effect_started=on_effect_started,
                 operation_store=operation_store,
                 operation_id=operation_id,
             )
@@ -348,6 +352,7 @@ def _tick(
     now: Callable[[], datetime] | None,
     operation_context: dict | None,
     on_progress: Callable[[int], None] | None,
+    on_effect_started: Callable[[], None] | None = None,
     operation_store=None,
     operation_id: str | None = None,
 ) -> SessionRecord:
@@ -463,6 +468,7 @@ def _tick(
             clock=clock,
             operation_context=attempt_context,
             on_progress=on_progress,
+            on_effect_started=on_effect_started,
             effect_state=effect_state,
         )
     except Exception as exc:
@@ -719,6 +725,7 @@ def _run(
     active_redo_id: str | None = None,
     operation_context: dict | None = None,
     on_progress: Callable[[int], None] | None = None,
+    on_effect_started: Callable[[], None] | None = None,
     effect_state: dict[str, bool] | None = None,
 ) -> SessionRecord:
     """Advance one session from *state* and record it, halting on failure.
@@ -733,6 +740,12 @@ def _run(
         PaperPreflightBusy,
         WriterConflict,
     )
+
+    def mark_effect_started() -> None:
+        if on_effect_started is not None:
+            on_effect_started()
+        if effect_state is not None:
+            effect_state["started"] = True
 
     try:
         with paper_control_transition(directory, deployed.name):
@@ -767,9 +780,8 @@ def _run(
                     if approval is None:
                         event = ledger._latest_approval_event(state.pending.as_of, state.prev_hash, strict=True)
                         if event is not None and (event.get("kind") in {"consume", "tick"} or event.get("consumed") is True) and not ledger.approval_consumption_is_resolved(event):
+                            mark_effect_started()
                             journal_attempted = True
-                            if effect_state is not None:
-                                effect_state["started"] = True
                             raise LedgerError("approval consumption is incomplete; reconciliation is required")
                 else:
                     approval = _verified_redo_approval(ledger, state, replay_record)
@@ -785,15 +797,13 @@ def _run(
                     if "approval_id" in approval:
                         fields["approval_id"] = approval["approval_id"]
                     with paper_audit_transition(directory, deployed.name):
+                        mark_effect_started()
                         journal_attempted = True
-                        if effect_state is not None:
-                            effect_state["started"] = True
                         ledger.log_event("consume", durable=True, **fields)
                 if approval is None:
                     with paper_audit_transition(directory, deployed.name):
+                        mark_effect_started()
                         journal_attempted = True
-                        if effect_state is not None:
-                            effect_state["started"] = True
                         ledger.log_event(
                             "expire",
                             decision_as_of=state.pending.as_of,
@@ -845,8 +855,7 @@ def _run(
             ledger._require_completed_redo(active_redo_id=active_redo_id)
             ledger._require_completed_approval_publication()
         if order_pending:
-            if effect_state is not None:
-                effect_state["started"] = True
+            mark_effect_started()
             order_pending = False
 
     try:
@@ -882,13 +891,12 @@ def _run(
                 before_order=reserve_publication,
                 on_progress=on_progress,
             )
-            if effect_state is not None:
-                effect_state["started"] = True
             if registry_observation is not None:
                 registry_observation.close_observations()
             if redo_nonce is not None:
                 record.redo_nonce = redo_nonce
                 record.hash = record.compute_hash()
+            mark_effect_started()
             ledger.append(record)
             if audit is not None:
                 kind, fields = audit

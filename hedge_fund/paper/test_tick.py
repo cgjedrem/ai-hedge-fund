@@ -818,6 +818,32 @@ def test_legacy_intent_reconciliation_admits_new_tick(tmp_path, clock, SPEC):
     assert record.session == "2024-06-04"
 
 
+def test_operation_effect_callback_runs_after_tick_intent(tmp_path, clock, SPEC):
+    clock("2024-06-04")
+    directory = _deploy_owned_paper_test_fund(tmp_path, SPEC)
+    ledger = Ledger(directory)
+    request_id = "effect-boundary-observation"
+    observed = []
+
+    def effect_started():
+        events = ledger.events()
+        assert any(event.get("kind") == "tick_intent" and event.get("request_id") == request_id for event in events)
+        assert not any(event.get("kind") in {"tick", "tick_failed", "tick_aborted"} and event.get("request_id") == request_id for event in events)
+        observed.append(True)
+
+    with _owned_paper_lane(directory, "alpha"):
+        record = tick(
+            directory,
+            FakeDataClient(SERIES),
+            build_fund=build_fund,
+            request_id=request_id,
+            on_effect_started=effect_started,
+        )
+
+    assert record.session
+    assert observed
+
+
 def test_halt_before_effect_aborts_intent_then_resume_admits_new_tick(tmp_path, clock, SPEC, monkeypatch):
     directory = _deploy_owned_paper_test_fund(tmp_path, SPEC)
     clock("2024-06-04")
