@@ -351,6 +351,8 @@ def test_sibling_registry_contention_before_order_does_not_change_book(enrolled_
                     client,
                     now=lambda: datetime(2024, 6, 5, 12, tzinfo=NEW_YORK),
                     build_fund=build_fund,
+                    expected_head=first.hash,
+                    request_id="registry-contention-before-order",
                 )
     finally:
         release.set()
@@ -358,8 +360,13 @@ def test_sibling_registry_contention_before_order_does_not_change_book(enrolled_
     assert not sibling.is_alive()
     assert failures == []
     assert (directory / "broker.json").read_bytes() == book_before
-    assert Ledger(directory).latest().hash == first.hash
-    assert Ledger(directory).halted() is not None
+    ledger = Ledger(directory)
+    assert ledger.latest().hash == first.hash
+    # QA R1: pre-effect contention aborts without halting.
+    aborts = [event for event in ledger.events() if event.get("kind") == "tick_aborted" and event.get("request_id") == "registry-contention-before-order"]
+    assert len(aborts) == 1
+    assert aborts[0]["no_effects"] is True
+    assert ledger.halted() is None
     verify_root_inventory(root)
 
 
