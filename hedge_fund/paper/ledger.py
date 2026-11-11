@@ -1581,9 +1581,11 @@ class Ledger:
                 attempts = attempts_by_id.get(approval_id)
                 if attempts:
                     attempt = next((value for value in attempts if value["reject"] is not None), attempts[0])
-                    attempts.remove(attempt)
+                    attempts = [value for value in attempts if value is not attempt]
                     if not attempts:
                         del attempts_by_id[approval_id]
+                    else:
+                        attempts_by_id[approval_id] = attempts
                     if not attempts_by_id:
                         del pending[key]
                 elif legacy.get(key):
