@@ -1625,6 +1625,34 @@ def _paper(
 
                 deployed = load_deployed(directory)
                 ledger = Ledger(directory)
+                if args.confirm:
+                    try:
+                        confirmation = TickIntentReconciliationConfirmation(
+                            request_id=args.request_id,
+                            intent_request_id=args.intent_request_id,
+                            intent_digest=args.intent_digest,
+                            preview_digest=args.preview_digest,
+                        )
+                        receipt_id = ledger.reconcile_tick_intent(
+                            deployed.spec.capital,
+                            confirmation=confirmation,
+                            operator="cli",
+                        )
+                    except (TypeError, ValueError, LedgerError) as exc:
+                        parser.error(f"Tick-intent reconciliation failed: {type(exc).__name__}")
+                    print(
+                        json.dumps(
+                            {
+                                "name": args.name,
+                                "intent_request_id": args.intent_request_id,
+                                "intent_digest": args.intent_digest,
+                                "reconciliation_id": receipt_id,
+                            },
+                            indent=2,
+                            sort_keys=True,
+                        )
+                    )
+                    return
                 state = ledger.replay(deployed.spec.capital, full=True)
                 latest = ledger.latest()
                 try:
@@ -1639,42 +1667,12 @@ def _paper(
                     )
                 except ValueError as exc:
                     parser.error(f"Tick-intent selector is invalid: {type(exc).__name__}")
-                if not args.confirm:
-                    print(
-                        json.dumps(
-                            {
-                                "name": args.name,
-                                "preview": snapshot.preview.model_dump(mode="json"),
-                                "targets": tick_intent_reconciliation_targets(ledger),
-                            },
-                            indent=2,
-                            sort_keys=True,
-                        )
-                    )
-                    return
-                if not snapshot.preview.required or not snapshot.preview.recoverable:
-                    parser.error(f"Tick intent is not recoverable: {snapshot.preview.reason}")
-                try:
-                    confirmation = TickIntentReconciliationConfirmation(
-                        request_id=args.request_id,
-                        intent_request_id=args.intent_request_id,
-                        intent_digest=args.intent_digest,
-                        preview_digest=args.preview_digest,
-                    )
-                    receipt_id = ledger.reconcile_tick_intent(
-                        deployed.spec.capital,
-                        confirmation=confirmation,
-                        operator="cli",
-                    )
-                except (TypeError, ValueError, LedgerError) as exc:
-                    parser.error(f"Tick-intent reconciliation failed: {type(exc).__name__}")
                 print(
                     json.dumps(
                         {
                             "name": args.name,
-                            "intent_request_id": args.intent_request_id,
-                            "intent_digest": args.intent_digest,
-                            "reconciliation_id": receipt_id,
+                            "preview": snapshot.preview.model_dump(mode="json"),
+                            "targets": tick_intent_reconciliation_targets(ledger),
                         },
                         indent=2,
                         sort_keys=True,

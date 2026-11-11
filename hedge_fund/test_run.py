@@ -1692,6 +1692,10 @@ def test_cli_reconcile_tick_request_resolves_orphan_and_admits_tick(tmp_path, mo
     assert receipt["reconciliation_id"]
     assert ledger.unresolved_tick_intents() == ()
 
+    _main(monkeypatch, *confirmation_args)
+    replayed_receipt = json.loads(capsys.readouterr().out)
+    assert replayed_receipt == receipt
+
     _main(
         monkeypatch,
         "paper",
