@@ -149,6 +149,13 @@ class UnresolvedTickIntent:
     is_corrupt: bool = False
 
 
+@dataclass(frozen=True, slots=True)
+class _CorruptEventOccurrence:
+    identity: str
+    legacy_identity: str
+    offset: int
+
+
 class Ledger:
     def __init__(self, directory: str | Path) -> None:
         self.directory = Path(directory)
@@ -376,15 +383,16 @@ class Ledger:
 
     def unresolved_tick_intents(self) -> tuple[UnresolvedTickIntent, ...]:
         try:
-            events, corrupt_event_digests = self.recovery_events()
+            events, corrupt_occurrences, event_offsets = self._recovery_events_with_offsets()
         except AuditObservationUnavailable:
             raise
         except (LedgerError, OSError, UnicodeError, ValueError):
             return (_unreadable_tick_intent(),)
-        if not isinstance(events, list) or not isinstance(corrupt_event_digests, tuple):
+        if not isinstance(events, list) or not isinstance(corrupt_occurrences, tuple) or not isinstance(event_offsets, tuple):
             return (_unreadable_tick_intent(),)
 
-        resolved_intents, resolved_corrupt = _tick_intent_resolution_state(events, corrupt_event_digests, self.directory.name)
+        corrupt_event_digests = tuple(item.identity for item in corrupt_occurrences)
+        resolved_intents, resolved_corrupt = _tick_intent_resolution_state(events, corrupt_occurrences, event_offsets, self.directory.name)
         pending: list[tuple[int, dict, UnresolvedTickIntent]] = []
         outcomes_by_request: dict[str, list[dict]] = {}
         redo_by_session: dict[str, int] = {}
@@ -418,7 +426,7 @@ class Ledger:
             if redo_by_session.get(intent.session, -1) > index:
                 continue
             unresolved.append(intent)
-        remaining_corrupt = tuple(digest for digest in corrupt_event_digests if digest not in resolved_corrupt)
+        remaining_corrupt = tuple(item.identity for item in corrupt_occurrences if item.identity not in resolved_corrupt)
         if remaining_corrupt:
             unresolved.append(_unreadable_tick_intent(remaining_corrupt))
         return tuple(unresolved)
@@ -993,8 +1001,8 @@ class Ledger:
                 "decision": decision,
             },
         )
-        events, corrupt_event_digests = self.recovery_events()
-        resolved_intents, resolved_corrupt = _tick_intent_resolution_state(events, corrupt_event_digests, self.directory.name)
+        events, corrupt_occurrences, event_offsets = self._recovery_events_with_offsets()
+        resolved_intents, resolved_corrupt = _tick_intent_resolution_state(events, corrupt_occurrences, event_offsets, self.directory.name)
         matches = [event for event in events if event.get("request_id") == request_id]
         if not matches:
             return None
@@ -1920,6 +1928,18 @@ class Ledger:
                 root.append_bytes(EVENTS_FILE, separator + (line + "\n").encode("utf-8"), durable=durable)
 
     def recovery_events(self) -> tuple[list[dict], tuple[str, ...]]:
+        events, corrupt_occurrences, _event_offsets = self._recovery_events_with_offsets()
+        return events, tuple(item.identity for item in corrupt_occurrences)
+
+    def recovery_events_with_unresolved_corruption(self) -> tuple[list[dict], tuple[str, ...]]:
+        events, corrupt_occurrences, event_offsets = self._recovery_events_with_offsets()
+        _resolved_intents, resolved_corrupt = _tick_intent_resolution_state(events, corrupt_occurrences, event_offsets, self.directory.name)
+        outstanding = tuple(item.identity for item in corrupt_occurrences if item.identity not in resolved_corrupt)
+        return events, outstanding
+
+    def _recovery_events_with_offsets(
+        self,
+    ) -> tuple[list[dict], tuple[_CorruptEventOccurrence, ...], tuple[int, ...]]:
         from hedge_fund.runtime.admission import (
             AdmissionError,
             paper_audit_snapshot,
@@ -1927,13 +1947,13 @@ class Ledger:
         )
         from hedge_fund.runtime.root import RootContext
 
-        def read() -> tuple[list[dict], tuple[str, ...]]:
+        def read() -> tuple[list[dict], tuple[_CorruptEventOccurrence, ...], tuple[int, ...]]:
             try:
                 with RootContext.open(self.directory) as root:
                     raw = root.read_bytes(EVENTS_FILE)
             except FileNotFoundError:
-                return [], ()
-            return _parse_event_history(raw)
+                return [], (), ()
+            return _parse_event_history_with_offsets(raw)
 
         try:
             return paper_audit_snapshot(self.directory, self.directory.name, read)
@@ -1943,10 +1963,10 @@ class Ledger:
             raise LedgerError("paper audit observation failed") from exc
 
     def events(self) -> list[dict]:
-        events, corrupt_event_digests = self.recovery_events()
-        if corrupt_event_digests:
-            _resolved_intents, resolved_corrupt = _tick_intent_resolution_state(events, corrupt_event_digests, self.directory.name)
-            if set(corrupt_event_digests) - resolved_corrupt:
+        events, corrupt_occurrences, event_offsets = self._recovery_events_with_offsets()
+        if corrupt_occurrences:
+            _resolved_intents, resolved_corrupt = _tick_intent_resolution_state(events, corrupt_occurrences, event_offsets, self.directory.name)
+            if any(item.identity not in resolved_corrupt for item in corrupt_occurrences):
                 raise json.JSONDecodeError("paper event history requires reconciliation", "", 0)
         return events
 
@@ -2001,9 +2021,20 @@ def _tick_intent_view(event: dict, intent_digest: str) -> UnresolvedTickIntent:
 
 
 def _parse_event_history(raw: bytes) -> tuple[list[dict], tuple[str, ...]]:
+    events, corrupt_occurrences, _event_offsets = _parse_event_history_with_offsets(raw)
+    return events, tuple(item.identity for item in corrupt_occurrences)
+
+
+def _parse_event_history_with_offsets(
+    raw: bytes,
+) -> tuple[list[dict], tuple[_CorruptEventOccurrence, ...], tuple[int, ...]]:
     events = []
-    corrupt_event_digests = []
+    corrupt_occurrences = []
+    event_offsets = []
+    offset = 0
     for line in raw.splitlines(keepends=True):
+        line_offset = offset
+        offset += len(line)
         if not line.strip():
             continue
         try:
@@ -2011,10 +2042,22 @@ def _parse_event_history(raw: bytes) -> tuple[list[dict], tuple[str, ...]]:
         except (UnicodeError, ValueError):
             event = None
         if not isinstance(event, dict) or not isinstance(event.get("kind"), str) or not event["kind"]:
-            corrupt_event_digests.append(hashlib.sha256(line.rstrip(b"\r\n")).hexdigest())
+            corrupt_occurrences.append(
+                _CorruptEventOccurrence(
+                    identity=_corrupt_event_identity(line, line_offset),
+                    legacy_identity=hashlib.sha256(line.rstrip(b"\r\n")).hexdigest(),
+                    offset=line_offset,
+                )
+            )
             continue
         events.append(event)
-    return events, tuple(corrupt_event_digests)
+        event_offsets.append(line_offset)
+    return events, tuple(corrupt_occurrences), tuple(event_offsets)
+
+
+def _corrupt_event_identity(line: bytes, offset: int) -> str:
+    identity = b"paper-corrupt-event\0" + str(offset).encode("ascii") + b"\0" + line
+    return hashlib.sha256(identity).hexdigest()
 
 
 def _event_digest(event: dict) -> str:
@@ -2024,14 +2067,16 @@ def _event_digest(event: dict) -> str:
 
 def _tick_intent_resolution_state(
     events: list[dict],
-    corrupt_event_digests: tuple[str, ...],
+    corrupt_occurrences: tuple[_CorruptEventOccurrence, ...],
+    event_offsets: tuple[int, ...],
     fund: str,
 ) -> tuple[set[str], set[str]]:
     from hedge_fund.runtime.reconciliation import TickIntentReconciliationReceipt
 
+    if len(events) != len(event_offsets):
+        return set(), set()
     resolved_intents = set()
     resolved_corrupt = set()
-    raw_corrupt = set(corrupt_event_digests)
     for index, event in enumerate(events):
         if event.get("kind") != "tick_intent_resolved":
             continue
@@ -2053,7 +2098,18 @@ def _tick_intent_resolution_state(
         )
         if event.get("request_digest") != expected_request_digest:
             continue
-        if not set(receipt.corrupt_event_digests).issubset(raw_corrupt):
+        preceding_corruption = [item for item in corrupt_occurrences if item.offset < event_offsets[index]]
+        covered_corruption = []
+        valid_corruption_receipt = True
+        for digest in receipt.corrupt_event_digests:
+            matches = [item for item in preceding_corruption if item.identity == digest]
+            if not matches:
+                matches = [item for item in preceding_corruption if item.legacy_identity == digest]
+            if not matches:
+                valid_corruption_receipt = False
+                break
+            covered_corruption.extend(matches)
+        if not valid_corruption_receipt:
             continue
         if receipt.intent_digest is not None:
             matching_intents = [prior for prior in events[:index] if prior.get("kind") == "tick_intent" and _event_digest(prior) == receipt.intent_digest and (receipt.intent_request_id is None or prior.get("request_id") == receipt.intent_request_id)]
@@ -2064,6 +2120,7 @@ def _tick_intent_resolution_state(
             continue
         if not receipt.intent_digest and not receipt.corrupt_event_digests:
             continue
+        resolved_corrupt.update(item.identity for item in covered_corruption)
         resolved_corrupt.update(receipt.corrupt_event_digests)
     return resolved_intents, resolved_corrupt
 

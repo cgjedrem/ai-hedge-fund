@@ -350,6 +350,70 @@ def test_web_reconciles_incomplete_intent_and_admits_new_tick(demo_root):
     assert Ledger(demo_root / "paper" / name).sessions() == [due_session]
 
 
+def test_corruption_receipt_does_not_resolve_later_identical_line(demo_root):
+    service = DeskService(demo_root, allow_writes=True)
+    name = "corruption-occurrence-test"
+    try:
+        spec = load_spec(demo_root / "mandates" / "demo-quality.yaml").model_copy(update={"name": name})
+        service.create_mandate(spec.model_dump(mode="python"))
+        service.deploy_mandate(name, DeployRequest(universe=["AAPL"]))
+        ledger = Ledger(demo_root / "paper" / name)
+        torn_line = b'{"kind":\n'
+        with service._admission.manual_session(name, timeout=0):
+            with ledger.events_path.open("ab") as history:
+                history.write(torn_line)
+
+        preview = service.paper_reconciliation(name)["intent_preview"]
+        assert preview["required"] is True
+        assert preview["recoverable"] is True
+        first_identity = preview["corrupt_event_digests"][0]
+        request = PaperTickIntentReconciliationRequest(
+            request_id="corruption-occurrence-reconcile",
+            preview_digest=preview["preview_digest"],
+        )
+        service.reconcile_tick_request(name, request)
+        assert ledger.unresolved_tick_intents() == ()
+
+        with service._admission.manual_session(name, timeout=0):
+            with ledger.events_path.open("ab") as history:
+                history.write(torn_line)
+
+        unresolved = ledger.unresolved_tick_intents()
+    finally:
+        service.close()
+
+    assert len(unresolved) == 1
+    assert unresolved[0].is_corrupt is True
+    assert unresolved[0].corrupt_event_digests[0] != first_identity
+
+
+def test_reconciled_corruption_allows_resume_after_manual_halt(demo_root):
+    service = DeskService(demo_root, allow_writes=True)
+    name = "corruption-resume-test"
+    try:
+        spec = load_spec(demo_root / "mandates" / "demo-quality.yaml").model_copy(update={"name": name})
+        service.create_mandate(spec.model_dump(mode="python"))
+        service.deploy_mandate(name, DeployRequest(universe=["AAPL"]))
+        ledger = Ledger(demo_root / "paper" / name)
+        with service._admission.manual_session(name, timeout=0):
+            with ledger.events_path.open("ab") as history:
+                history.write(b'{"kind":\n')
+
+        preview = service.paper_reconciliation(name)["intent_preview"]
+        request = PaperTickIntentReconciliationRequest(
+            request_id="corruption-resume-reconcile",
+            preview_digest=preview["preview_digest"],
+        )
+        service.reconcile_tick_request(name, request)
+        service.halt_fund(name, "manual review", request_id="corruption-resume-halt")
+
+        assert service.paper_reconciliation(name)["resume_allowed"] is True
+        service.resume_fund(name)
+        assert ledger.halted() is None
+    finally:
+        service.close()
+
+
 def test_web_duplicate_logical_tick_refusal_exposes_contract_fields(demo_root, monkeypatch):
     from hedge_fund.web.schemas import error_payload
 

@@ -375,9 +375,9 @@ def build_reconciliation_snapshot(
     *,
     failure_event: dict | None = None,
 ) -> ReconciliationSnapshot:
-    events, corrupt_event_digests = ledger.recovery_events()
+    events, unresolved_corrupt_event_digests = ledger.recovery_events_with_unresolved_corruption()
     failures = [failure_event] if failure_event is not None else unresolved_tick_failures(events)
-    if not failures and corrupt_event_digests:
+    if not failures and unresolved_corrupt_event_digests:
         return ReconciliationSnapshot(
             preview=ReconciliationPreview.create(
                 required=True,

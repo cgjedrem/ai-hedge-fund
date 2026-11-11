@@ -1,5 +1,6 @@
 """The ledger: append-only, hash-chained, replayable; and the kill switch."""
 
+import hashlib
 import json
 from contextlib import contextmanager
 from pathlib import Path
@@ -222,6 +223,57 @@ def test_unreadable_intent_sentinel_cannot_collide_with_request_id(owned_ledger)
     assert unresolved[1].request_id is None
     assert unresolved[1].is_corrupt is True
     assert unresolved[1].corrupt_event_digests
+
+
+def test_corruption_receipt_cannot_resolve_a_later_event_line(tmp_path):
+    from hedge_fund.paper.ledger import _control_request_digest
+    from hedge_fund.runtime.reconciliation import TickIntentReconciliationPreview, TickIntentReconciliationReceipt
+
+    ledger = Ledger(tmp_path)
+    torn_line = b'{"kind":\n'
+    corruption_digest = hashlib.sha256(torn_line.rstrip(b"\r\n")).hexdigest()
+    preview = TickIntentReconciliationPreview.create(
+        required=True,
+        recoverable=True,
+        reason="ready",
+        corrupt_event_digests=(corruption_digest,),
+        broker_book_sha256="a" * 64,
+        fill_identity_sha256="b" * 64,
+        book_matches_ledger=True,
+        head_matches_intent=True,
+    )
+    receipt = TickIntentReconciliationReceipt.create(
+        preview=preview,
+        request_id="future-corruption-receipt",
+        operator="web",
+        recorded_at="2026-11-11T00:00:00+00:00",
+    )
+    request_digest = _control_request_digest(
+        TICK_INTENT_RECOVERY,
+        ledger.directory.name,
+        {
+            "intent_request_id": None,
+            "intent_digest": None,
+            "preview_digest": preview.preview_digest,
+            "decision": "confirm-paper-book-matches-ledger",
+        },
+    )
+    event = {
+        "time": receipt.recorded_at,
+        "kind": "tick_intent_resolved",
+        "request_id": receipt.request_id,
+        "request_action": TICK_INTENT_RECOVERY,
+        "request_digest": request_digest,
+        "intent_request_id": None,
+        "intent_digest": None,
+        "corrupt_event_digests": [corruption_digest],
+        "decision": receipt.decision,
+        "receipt": receipt.model_dump(mode="json"),
+    }
+    ledger.events_path.write_bytes(json.dumps(event).encode("utf-8") + b"\n" + torn_line)
+
+    with pytest.raises(json.JSONDecodeError):
+        ledger.events()
 
 
 @pytest.fixture(autouse=True)
