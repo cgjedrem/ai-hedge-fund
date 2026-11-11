@@ -438,3 +438,42 @@
 - **E2/E3 anomaly comparison**: the HEAD-only B signature from `test_two_process_audit_appends_are_complete_and_uninterleaved` did not recur in E3. The extra E3 native-lock assertion is a different failure and is not explained by E2 baseline evidence.
 - **Retained artifacts**: full output `outputs/spec006-e3-20261111-c4818ed/pytest-hedge_fund.log`; JUnit XML `outputs/spec006-e3-20261111-c4818ed/pytest-hedge_fund.junit.xml`. The JUnit report independently records 2,988 tests, 2,889 passed, 37 failures, 0 errors, 62 skipped, and `2,766.50s` test time.
 - **Disposition**: no code or test changes were made. Full-suite status remains **FAIL** pending QA review of the unclassified native-lock failure and the HEAD-only E2 file-missing signature.
+
+## Native-Lock Baseline Recheck
+
+- **Target**: `hedge_fund/runtime/test_native_primitives.py::test_native_lock_excludes_owned_cross_process_writer`. E3 at `c4818ed11b8fd320322331007619eb4124f6c9d0` reported `AssertionError` at line 108: expected `"blocked"`, observed `""`.
+- **Revisions/environment**: baseline `0506f3d425c6b8c824a065746fe8a868d3d6c306` in detached worktree `C:\Users\ChristianGjedrem\AppData\Local\Temp\s006-native-baseline-20261111-1450`; branch `cgjedrem-didactic-meme`, HEAD `7880f60fdb21cac22b90f95a95676bec2502e517`. `git diff --binary c4818ed11b8fd320322331007619eb4124f6c9d0..7880f60fdb21cac22b90f95a95676bec2502e517 -- hedge_fund` was 0 bytes (SHA-256 `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`); HEAD change was docs-only. Tests exercised checked-out source; no built/installed artifact. Windows 11 Enterprise `10.0.26200` (build `26200`), Python `3.13.7`, pytest `7.4.4`; shared interpreter `C:\Users\ChristianGjedrem\AppData\Local\pypoetry\Cache\virtualenvs\aihf-4KWHP5vi-py3.13\Scripts\python.exe`.
+- **Invocation/isolation**: 10 HEAD invocations followed by 10 baseline invocations, sequentially; one target per invocation, normal basetemp handling, no `--basetemp` override, no overlapping pytest command. Command: `"<shared python.exe>" -m pytest -rA --tb=short hedge_fund/runtime/test_native_primitives.py::test_native_lock_excludes_owned_cross_process_writer`. All timestamps below are `2026-11-11` local `+01:00`. Per-run full output: `outputs/spec006-native-lock-20261111-1450/head-runs.log` and `outputs/spec006-native-lock-20261111-1450/baseline-runs.log`.
+
+### HEAD Repetitions (`7880f60`)
+
+| Run | Start–end | Target / pytest exit | Pytest / wall s | Signature |
+|---|---|---|---:|---|
+| 1 | `14:50:37.4599789–14:50:42.4038469` | 1 passed / 0 | 2.40 / 4.94 | - |
+| 2 | `14:50:42.4146465–14:50:47.0088320` | 1 passed / 0 | 2.34 / 4.59 | - |
+| 3 | `14:50:47.0088320–14:50:51.5009899` | 1 passed / 0 | 2.29 / 4.49 | - |
+| 4 | `14:50:51.5024979–14:50:55.8770787` | 1 passed / 0 | 2.16 / 4.37 | - |
+| 5 | `14:50:55.8780721–14:51:00.4115004` | 1 passed / 0 | 2.34 / 4.53 | - |
+| 6 | `14:51:00.4124957–14:51:05.4392913` | 1 passed / 0 | 2.89 / 5.03 | - |
+| 7 | `14:51:05.4402902–14:51:10.2293925` | 1 passed / 0 | 2.36 / 4.79 | - |
+| 8 | `14:51:10.2303928–14:51:15.0640005` | 1 passed / 0 | 2.84 / 4.83 | - |
+| 9 | `14:51:15.0640005–14:51:21.9952572` | 1 passed / 0 | 4.49 / 6.93 | - |
+| 10 | `14:51:21.9952572–14:51:27.0437634` | 1 passed / 0 | 2.44 / 5.05 | - |
+
+### Baseline Repetitions (`0506f3d`)
+
+| Run | Start–end | Target / pytest exit | Pytest / wall s | Signature |
+|---|---|---|---:|---|
+| 1 | `14:51:55.8462902–14:52:05.1293812` | test passed (`.`) / 1 | unavailable / 9.28 | Session teardown `PermissionError (WinError 32)` removing synthetic `home`; no target assertion failure |
+| 2 | `14:52:05.1350713–14:52:09.8427087` | 1 passed / 0 | 2.57 / 4.71 | - |
+| 3 | `14:52:09.8427087–14:52:14.1473525` | 1 passed / 0 | 2.24 / 4.30 | - |
+| 4 | `14:52:14.1473525–14:52:18.6336226` | 1 passed / 0 | 2.43 / 4.49 | - |
+| 5 | `14:52:18.6345529–14:52:23.0504614` | 1 passed / 0 | 2.34 / 4.42 | - |
+| 6 | `14:52:23.0504614–14:52:27.7437995` | 1 passed / 0 | 2.37 / 4.69 | - |
+| 7 | `14:52:27.7437995–14:52:32.2010056` | 1 passed / 0 | 2.28 / 4.46 | - |
+| 8 | `14:52:32.2016397–14:52:36.5462191` | 1 passed / 0 | 2.27 / 4.34 | - |
+| 9 | `14:52:36.5472182–14:52:40.9002204` | 1 passed / 0 | 2.31 / 4.35 | - |
+| 10 | `14:52:40.9012205–14:52:45.2821468` | 1 passed / 0 | 2.42 / 4.38 | - |
+
+- **Observed results**: HEAD target assertion passed 10/10; all 10 pytest processes exited `0`. Baseline target assertion passed 10/10; runs 2–10 exited `0`. Baseline run 1 emitted the passing test dot, then pytest exited `1` during teardown with `PermissionError: [WinError 32]` for the synthetic `home` path. The holder was a Git fsmonitor daemon rooted in that task-owned directory; it was stopped after testing, the synthetic root was removed, and the detached baseline worktree was removed.
+- **Constitution III verdict**: **FAIL**. The E3 assertion signature was not reproduced in either 10-run set, but the prior observed failure is HEAD-only: no matching assertion failure occurred at baseline. The distinct baseline teardown error is not a match. No production or test fix was made.
