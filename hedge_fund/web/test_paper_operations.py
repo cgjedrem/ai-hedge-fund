@@ -350,6 +350,46 @@ def test_web_reconciles_incomplete_intent_and_admits_new_tick(demo_root):
     assert Ledger(demo_root / "paper" / name).sessions() == [due_session]
 
 
+def test_web_lists_and_reconciles_idless_intents_by_digest(demo_root):
+    service = DeskService(demo_root, allow_writes=True)
+    name = "multiple-idless-intents-test"
+    try:
+        spec = load_spec(demo_root / "mandates" / "demo-quality.yaml").model_copy(update={"name": name})
+        service.create_mandate(spec.model_dump(mode="python"))
+        service.deploy_mandate(name, DeployRequest(universe=["AAPL"]))
+        ledger = Ledger(demo_root / "paper" / name)
+        with service._admission.manual_session(name, timeout=0):
+            ledger.log_event("tick_intent", session="2026-10-30", durable=True)
+            ledger.log_event("tick_intent", session="2026-10-31", durable=True)
+
+        recovery = service.paper_reconciliation(name)
+        targets = recovery["intent_targets"]
+        assert recovery["intent_preview"]["reason"] == "multiple-unresolved-tick-intents"
+        assert len(targets) == 2
+        assert all(target["intent_request_id"] is None for target in targets)
+
+        target = targets[1]
+        selected = service.paper_reconciliation(name, intent_digest=target["intent_digest"])
+        preview = selected["intent_preview"]
+        assert preview["recoverable"] is True
+        assert preview["intent_digest"] == target["intent_digest"]
+        receipt = service.reconcile_tick_request(
+            name,
+            PaperTickIntentReconciliationRequest(
+                request_id="web-idless-intent-reconcile",
+                intent_digest=target["intent_digest"],
+                preview_digest=preview["preview_digest"],
+            ),
+        )
+        unresolved = ledger.unresolved_tick_intents()
+    finally:
+        service.close()
+
+    assert receipt["reconciliation_id"]
+    assert len(unresolved) == 1
+    assert unresolved[0].intent_digest == targets[0]["intent_digest"]
+
+
 def test_corruption_receipt_does_not_resolve_later_identical_line(demo_root):
     service = DeskService(demo_root, allow_writes=True)
     name = "corruption-occurrence-test"

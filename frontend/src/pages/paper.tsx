@@ -151,10 +151,14 @@ export function PaperDetailPage() {
   const navigate = useNavigate();
   const { capabilities, reconnect } = useDesk();
   const resource = useResource<PaperSnapshot>(name ? `/api/paper/${encodeURIComponent(name)}` : null);
+  const [selectedIntent, setSelectedIntent] = useState<{ fund: string; digest: string } | null>(null);
+  const selectedIntentDigest = selectedIntent?.fund === name ? selectedIntent.digest : null;
+  useEffect(() => setSelectedIntent(null), [name]);
+  const reconciliationPath = name && resource.data?.broker === "paper" && resource.data.ledger.ok
+    ? `/api/paper/${encodeURIComponent(name)}/reconciliation${selectedIntentDigest ? `?intent_digest=${encodeURIComponent(selectedIntentDigest)}` : ""}`
+    : null;
   const reconciliationResource = useResource<PaperReconciliation>(
-    name && resource.data?.broker === "paper" && resource.data.ledger.ok
-      ? `/api/paper/${encodeURIComponent(name)}/reconciliation`
-      : null,
+    reconciliationPath,
   );
   const [sessionSearchText, setSessionSearchText] = useState("");
   const [sessionSearch, setSessionSearch] = useState("");
@@ -217,6 +221,7 @@ export function PaperDetailPage() {
   const canApprove = canWritePaper && approvalRequired && data?.halt_state === "clear" && data?.ledger.ok === true;
   const canResumePaper = Boolean(canWritePaper && data?.halt_state === "halted" && data.ledger.ok && recovery?.resume_allowed === true);
   const intentPreview = recovery?.intent_preview;
+  const intentTargets = recovery?.intent_targets ?? [];
   const canReconcileTickIntent = Boolean(
     canWritePaper
     && intentPreview?.required
@@ -418,6 +423,7 @@ export function PaperDetailPage() {
       });
       intentRecoveryRequest.current = null;
       setIntentRecoveryOpen(false);
+      setSelectedIntent(null);
       setFeedback({ tone: "neutral", message: "Audited tick-intent reconciliation recorded. No tick was retried and no broker effect was created." });
       await Promise.all([resource.refresh(), reconciliationResource.refresh()]);
     } catch (cause) {
@@ -724,27 +730,54 @@ export function PaperDetailPage() {
                     {intentPreview?.required ? (
                       <div className="space-y-3 border-t border-border pt-3" data-testid="tick-intent-reconciliation">
                         <p className="font-medium">Orphaned paper tick intent</p>
-                        <div className="grid gap-2 text-xs sm:grid-cols-2">
-                          <p>Request: <span className="mono">{intentPreview.intent_request_id ?? "unavailable"}</span></p>
-                          <p>Session: <span className="mono">{intentPreview.intent_session ?? "unavailable"}</span></p>
-                          <p>Intent digest: <span className="mono">{shortHash(intentPreview.intent_digest)}</span></p>
-                          <p>Current ledger head: <span className="mono">{shortHash(intentPreview.current_head)}</span></p>
-                          <p>Local paper book digest: <span className="mono">{shortHash(intentPreview.broker_book_sha256)}</span></p>
-                          <p>Recovery preview: <span className="mono">{shortHash(intentPreview.preview_digest)}</span></p>
-                        </div>
-                        {canReconcileTickIntent ? (
+                        {intentPreview.reason === "multiple-unresolved-tick-intents" && !selectedIntentDigest ? (
                           <>
+                            <Alert tone="danger">Multiple unresolved tick intents. Select an individual target by digest before reviewing recovery.</Alert>
+                            <div className="space-y-2">
+                              {intentTargets.map((target) => (
+                                <div key={target.intent_digest} className="space-y-2 rounded-lg border border-border p-3" data-testid="tick-intent-target">
+                                  <div className="grid gap-2 text-xs sm:grid-cols-2">
+                                    <p>Request: <span className="mono">{target.intent_request_id ?? "unavailable"}</span></p>
+                                    <p>Session: <span className="mono">{target.intent_session ?? "unavailable"}</span></p>
+                                    <p className="break-all sm:col-span-2">Intent digest: <span className="mono">{target.intent_digest}</span></p>
+                                  </div>
+                                  <Button onClick={() => setSelectedIntent({ fund: name, digest: target.intent_digest })} disabled={busy}>
+                                    Review intent target
+                                  </Button>
+                                </div>
+                              ))}
+                            </div>
+                          </>
+                        ) : (
+                          <>
+                            {selectedIntentDigest ? (
+                              <Button variant="outline" onClick={() => setSelectedIntent(null)} disabled={busy}>
+                                Back to intent targets
+                              </Button>
+                            ) : null}
+                            <div className="grid gap-2 text-xs sm:grid-cols-2">
+                              <p>Request: <span className="mono">{intentPreview.intent_request_id ?? "unavailable"}</span></p>
+                              <p>Session: <span className="mono">{intentPreview.intent_session ?? "unavailable"}</span></p>
+                              <p>Intent digest: <span className="mono">{shortHash(intentPreview.intent_digest)}</span></p>
+                              <p>Current ledger head: <span className="mono">{shortHash(intentPreview.current_head)}</span></p>
+                              <p>Local paper book digest: <span className="mono">{shortHash(intentPreview.broker_book_sha256)}</span></p>
+                              <p>Recovery preview: <span className="mono">{shortHash(intentPreview.preview_digest)}</span></p>
+                            </div>
+                            {canReconcileTickIntent ? (
+                              <>
                             <Alert tone="warning">
                               Full ledger replay matches the local paper book. Confirmation records an audited resolution only; it does not retry the tick or create broker effects.
                             </Alert>
                             <Button onClick={() => setIntentRecoveryOpen(true)} disabled={busy}>
                               Review orphaned tick resolution
                             </Button>
+                              </>
+                            ) : (
+                              <Alert tone="danger">
+                                Tick admission remains fenced. Recovery check: <span className="mono">{intentPreview.reason}</span>.
+                              </Alert>
+                            )}
                           </>
-                        ) : (
-                          <Alert tone="danger">
-                            Tick admission remains fenced. Recovery check: <span className="mono">{intentPreview.reason}</span>.
-                          </Alert>
                         )}
                       </div>
                     ) : null}

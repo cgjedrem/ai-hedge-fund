@@ -486,19 +486,24 @@ def build_tick_intent_reconciliation_snapshot(
     latest,
     *,
     intent_request_id: str | None = None,
+    intent_digest: str | None = None,
 ) -> TickIntentReconciliationSnapshot:
     if intent_request_id is not None and (not isinstance(intent_request_id, str) or not _REQUEST_ID.fullmatch(intent_request_id)):
         raise ValueError("tick-intent request identity is invalid")
+    if intent_digest is not None and (not isinstance(intent_digest, str) or not _SHA256.fullmatch(intent_digest)):
+        raise ValueError("tick-intent digest is invalid")
     events, _all_corrupt_digests = ledger.recovery_events()
     unresolved = ledger.unresolved_tick_intents()
     intents = [item for item in unresolved if not item.is_corrupt and item.intent_digest is not None]
     corrupt_digests = tuple(sorted({digest for item in unresolved for digest in item.corrupt_event_digests}))
     selected = None
     reason = "ready"
-    if intent_request_id is not None:
-        matches = [item for item in intents if item.request_id == intent_request_id]
+    if intent_request_id is not None or intent_digest is not None:
+        matches = [item for item in intents if (intent_request_id is None or item.request_id == intent_request_id) and (intent_digest is None or item.intent_digest == intent_digest)]
         if len(matches) == 1:
             selected = matches[0]
+        elif matches:
+            reason = "multiple-unresolved-tick-intents"
         else:
             reason = "intent-not-found"
     elif len(intents) == 1:
@@ -577,7 +582,7 @@ def build_tick_intent_reconciliation_snapshot(
             reason=reason,
             intent_request_id=selected.request_id if selected is not None else intent_request_id,
             intent_session=selected.session if selected is not None else None,
-            intent_digest=selected.intent_digest if selected is not None else None,
+            intent_digest=selected.intent_digest if selected is not None else intent_digest,
             metadata_complete=selected.metadata_complete if selected is not None else None,
             corrupt_event_digests=corrupt_digests,
             expected_head=expected_head,
@@ -589,6 +594,20 @@ def build_tick_intent_reconciliation_snapshot(
         ),
         intent_event=intent_event,
     )
+
+
+def tick_intent_reconciliation_targets(ledger) -> list[dict[str, object]]:
+    return [
+        {
+            "intent_request_id": intent.request_id,
+            "intent_session": intent.session,
+            "intent_digest": intent.intent_digest,
+            "recorded_at": intent.recorded_at,
+            "metadata_complete": intent.metadata_complete,
+        }
+        for intent in ledger.unresolved_tick_intents()
+        if not intent.is_corrupt and intent.intent_digest is not None
+    ]
 
 
 def verify_reconciliation_receipt(

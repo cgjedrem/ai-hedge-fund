@@ -172,6 +172,7 @@ from hedge_fund.runtime.policy import (
 from hedge_fund.runtime.reconciliation import (
     build_reconciliation_snapshot,
     build_tick_intent_reconciliation_snapshot,
+    tick_intent_reconciliation_targets,
 )
 from hedge_fund.runtime.root import RootContext, RootPathError
 from hedge_fund.scorecard import score
@@ -801,7 +802,13 @@ class DeskService:
             raise ServiceError(422, f"Paper fund is invalid ({type(exc).__name__}).", code="readiness-denied") from None
         return self._paper_snapshot(deployed, directory, include_records=True)
 
-    def paper_reconciliation(self, name: str) -> dict:
+    def paper_reconciliation(
+        self,
+        name: str,
+        *,
+        intent_request_id: str | None = None,
+        intent_digest: str | None = None,
+    ) -> dict:
         normalized = self._validated_name(name)
         directory, deployed, ledger, state, latest = self._paper_state(
             normalized,
@@ -810,7 +817,16 @@ class DeskService:
         self._safe_child("paper", normalized, "broker.json")
         try:
             snapshot = build_reconciliation_snapshot(directory, deployed, ledger, state, latest)
-            intent_snapshot = build_tick_intent_reconciliation_snapshot(directory, deployed, ledger, state, latest)
+            intent_snapshot = build_tick_intent_reconciliation_snapshot(
+                directory,
+                deployed,
+                ledger,
+                state,
+                latest,
+                intent_request_id=intent_request_id,
+                intent_digest=intent_digest,
+            )
+            intent_targets = tick_intent_reconciliation_targets(ledger)
             halted = ledger.halted()
         except (LedgerError, OSError, ValueError):
             raise ServiceError(423, "Paper state is invalid (LedgerError).", code="replay-corrupt") from None
@@ -822,6 +838,7 @@ class DeskService:
             "resume_allowed": halted is not None and not intent_preview.required and (not preview.required or preview.recoverable),
             "preview": preview.model_dump(mode="json"),
             "intent_preview": intent_preview.model_dump(mode="json"),
+            "intent_targets": intent_targets,
         }
 
     def reconcile_tick_request(
@@ -849,6 +866,7 @@ class DeskService:
                         state,
                         latest,
                         intent_request_id=request.intent_request_id,
+                        intent_digest=request.intent_digest,
                     )
                 except (LedgerError, OSError, ValueError):
                     raise ServiceError(423, "Paper state is invalid (LedgerError).", code="replay-corrupt", request_id=request.request_id) from None

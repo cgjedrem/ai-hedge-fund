@@ -1067,6 +1067,7 @@ class Ledger:
                 state,
                 latest,
                 intent_request_id=reviewed.intent_request_id,
+                intent_digest=reviewed.intent_digest,
             )
             preview = snapshot.preview
             if not preview.required or not preview.recoverable or preview.intent_request_id != reviewed.intent_request_id or preview.intent_digest != reviewed.intent_digest or preview.preview_digest != reviewed.preview_digest:

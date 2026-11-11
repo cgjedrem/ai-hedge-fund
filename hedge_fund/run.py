@@ -1606,7 +1606,7 @@ def _paper(
     directory = _fund_dir(args.name, parser)
 
     if args.action == "reconcile-tick-request":
-        confirmation_values = (args.request_id, args.intent_digest, args.preview_digest)
+        confirmation_values = (args.request_id, args.preview_digest)
         if args.confirm:
             if args.request_id is None or args.preview_digest is None:
                 parser.error("--confirm requires --request-id and --preview-digest")
@@ -1619,6 +1619,7 @@ def _paper(
                 _verify_enrolled_head(participant, args.name)
                 from hedge_fund.runtime.reconciliation import (
                     build_tick_intent_reconciliation_snapshot,
+                    tick_intent_reconciliation_targets,
                     TickIntentReconciliationConfirmation,
                 )
 
@@ -1626,20 +1627,25 @@ def _paper(
                 ledger = Ledger(directory)
                 state = ledger.replay(deployed.spec.capital, full=True)
                 latest = ledger.latest()
-                snapshot = build_tick_intent_reconciliation_snapshot(
-                    directory,
-                    deployed,
-                    ledger,
-                    state,
-                    latest,
-                    intent_request_id=args.intent_request_id,
-                )
+                try:
+                    snapshot = build_tick_intent_reconciliation_snapshot(
+                        directory,
+                        deployed,
+                        ledger,
+                        state,
+                        latest,
+                        intent_request_id=args.intent_request_id,
+                        intent_digest=args.intent_digest,
+                    )
+                except ValueError as exc:
+                    parser.error(f"Tick-intent selector is invalid: {type(exc).__name__}")
                 if not args.confirm:
                     print(
                         json.dumps(
                             {
                                 "name": args.name,
                                 "preview": snapshot.preview.model_dump(mode="json"),
+                                "targets": tick_intent_reconciliation_targets(ledger),
                             },
                             indent=2,
                             sort_keys=True,
@@ -1667,6 +1673,7 @@ def _paper(
                         {
                             "name": args.name,
                             "intent_request_id": args.intent_request_id,
+                            "intent_digest": args.intent_digest,
                             "reconciliation_id": receipt_id,
                         },
                         indent=2,

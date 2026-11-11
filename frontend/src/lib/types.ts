@@ -365,6 +365,15 @@ export interface PaperReconciliation {
   resume_allowed: boolean;
   preview: PaperReconciliationPreview;
   intent_preview: PaperTickIntentReconciliationPreview;
+  intent_targets: PaperTickIntentReconciliationTarget[];
+}
+
+export interface PaperTickIntentReconciliationTarget {
+  intent_request_id: string | null;
+  intent_session: string | null;
+  intent_digest: string;
+  recorded_at: string | null;
+  metadata_complete: boolean;
 }
 
 export interface PaperSessionsCollection {

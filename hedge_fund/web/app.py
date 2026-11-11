@@ -315,8 +315,12 @@ def create_app(
         return service.paper_detail(name)
 
     @app.get("/api/paper/{name}/reconciliation")
-    def paper_reconciliation(name: str):
-        return service.paper_reconciliation(name)
+    def paper_reconciliation(
+        name: str,
+        intent_request_id: str | None = Query(default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"),
+        intent_digest: str | None = Query(default=None, pattern=r"^[a-f0-9]{64}$"),
+    ):
+        return service.paper_reconciliation(name, intent_request_id=intent_request_id, intent_digest=intent_digest)
 
     @app.post("/api/paper/{name}/reconcile-tick-request")
     def reconcile_tick_request(name: str, request: PaperTickIntentReconciliationRequest):

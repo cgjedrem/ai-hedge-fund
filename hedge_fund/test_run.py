@@ -1707,6 +1707,62 @@ def test_cli_reconcile_tick_request_resolves_orphan_and_admits_tick(tmp_path, mo
     assert json.loads(capsys.readouterr().out)["session"] == "2025-01-06"
 
 
+def test_cli_lists_and_reconciles_idless_intents_by_digest(tmp_path, monkeypatch, capsys, offline):
+    from hedge_fund.paper.ledger import Ledger
+    from hedge_fund.runtime.admission import AdmissionCoordinator, RootOwnerLease
+    from hedge_fund.runtime.root import RootContext
+
+    path = _mandate(tmp_path, name="alpha")
+    _enroll_test_root(tmp_path)
+    offline("2025-01-07")
+    _main(monkeypatch, "paper", "create", "alpha", "--mandate", str(path), "--universe", "AAPL")
+    capsys.readouterr()
+    ledger = Ledger(tmp_path / "paper" / "alpha")
+
+    with RootContext.open(tmp_path) as root:
+        with RootOwnerLease.acquire(root) as owner:
+            admission = AdmissionCoordinator(root, owner_lease=owner)
+            with admission.manual_session("alpha", timeout=0):
+                ledger.log_event("tick_intent", session="2025-01-06", durable=True)
+                ledger.log_event("tick_intent", session="2025-01-07", durable=True)
+
+    _main(monkeypatch, "paper", "reconcile-tick-request", "alpha")
+    initial = json.loads(capsys.readouterr().out)
+    targets = initial["targets"]
+    assert initial["preview"]["reason"] == "multiple-unresolved-tick-intents"
+    assert len(targets) == 2
+    assert all(target["intent_request_id"] is None for target in targets)
+
+    for index, target in enumerate(targets):
+        _main(
+            monkeypatch,
+            "paper",
+            "reconcile-tick-request",
+            "alpha",
+            "--intent-digest",
+            target["intent_digest"],
+        )
+        selected = json.loads(capsys.readouterr().out)["preview"]
+        assert selected["recoverable"] is True
+        assert selected["intent_digest"] == target["intent_digest"]
+        _main(
+            monkeypatch,
+            "paper",
+            "reconcile-tick-request",
+            "alpha",
+            "--request-id",
+            f"reconcile-idless-intent-{index}",
+            "--intent-digest",
+            target["intent_digest"],
+            "--preview-digest",
+            selected["preview_digest"],
+            "--confirm",
+        )
+        assert json.loads(capsys.readouterr().out)["reconciliation_id"]
+
+    assert ledger.unresolved_tick_intents() == ()
+
+
 def test_cli_halt_request_id_replays_and_conflicts_on_reason(tmp_path, monkeypatch, capsys, offline):
     from hedge_fund.paper.ledger import Ledger
 
