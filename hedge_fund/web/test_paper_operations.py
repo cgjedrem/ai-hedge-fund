@@ -350,6 +350,64 @@ def test_web_reconciles_incomplete_intent_and_admits_new_tick(demo_root):
     assert Ledger(demo_root / "paper" / name).sessions() == [due_session]
 
 
+def test_web_reconcile_post_replays_receipt_before_preview_validation(demo_root):
+    from fastapi.testclient import TestClient
+
+    from hedge_fund.web.app import create_app
+
+    app = create_app(
+        root=demo_root,
+        allow_writes=True,
+        network_enabled=True,
+        data_client_factory=_OfflineDataClient,
+        fund_factory=_OfflineFund,
+    )
+    service = app.state.service
+    service._runtime_settings = _local_settings()
+    name = "web-reconcile-post-replay"
+    try:
+        spec = load_spec(demo_root / "mandates" / "demo-quality.yaml").model_copy(update={"name": name})
+        service.create_mandate(spec.model_dump(mode="python"))
+        service.deploy_mandate(name, DeployRequest(universe=["AAPL"]))
+        ledger = Ledger(demo_root / "paper" / name)
+        with service._admission.manual_session(name, timeout=0):
+            ledger.log_event(
+                "tick_intent",
+                request_id="invalid legacy request id",
+                session="2025-01-06",
+            )
+        preview = service.paper_reconciliation(name)["intent_preview"]
+        request = PaperTickIntentReconciliationRequest(
+            request_id="web-reconcile-post-request",
+            intent_digest=preview["intent_digest"],
+            preview_digest=preview["preview_digest"],
+        )
+
+        with TestClient(app, client=("127.0.0.1", 50000)) as client:
+            capabilities = client.get("/api/capabilities", headers={"host": "127.0.0.1"}).json()
+            headers = {
+                "host": "127.0.0.1",
+                "origin": "http://127.0.0.1",
+                "x-csrf-token": capabilities["mutation_token"],
+            }
+            url = f"/api/paper/{name}/reconcile-tick-request"
+            first = client.post(url, headers=headers, json=request.model_dump(mode="json"))
+            replayed = client.post(url, headers=headers, json=request.model_dump(mode="json"))
+            changed = client.post(
+                url,
+                headers=headers,
+                json={**request.model_dump(mode="json"), "preview_digest": "f" * 64},
+            )
+    finally:
+        service.close()
+
+    assert first.status_code == 200
+    assert replayed.status_code == 200
+    assert replayed.json() == first.json()
+    assert changed.status_code == 409
+    assert changed.json()["code"] == "request-conflict"
+
+
 def test_web_lists_and_reconciles_idless_intents_by_digest(demo_root):
     service = DeskService(demo_root, allow_writes=True)
     name = "multiple-idless-intents-test"

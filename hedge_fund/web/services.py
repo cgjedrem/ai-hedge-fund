@@ -864,6 +864,36 @@ class DeskService:
                 )
                 self._safe_child("paper", normalized, "broker.json")
                 try:
+                    prior_receipt_id = ledger.tick_intent_reconciliation_request_result(
+                        request.request_id,
+                        intent_request_id=request.intent_request_id,
+                        intent_digest=request.intent_digest,
+                        preview_digest=request.preview_digest,
+                        decision=request.decision,
+                    )
+                except PaperRequestConflict:
+                    raise ServiceError(
+                        409,
+                        "Request ID was already used for a different tick-intent reconciliation.",
+                        code="request-conflict",
+                        request_id=request.request_id,
+                    ) from None
+                except PaperReconciliationRequired:
+                    raise ServiceError(
+                        423,
+                        "Tick-intent reconciliation outcome is uncertain; inspect paper state.",
+                        code="reconciliation-required",
+                        request_id=request.request_id,
+                    ) from None
+                except LedgerError:
+                    raise ServiceError(423, "Paper state is invalid (LedgerError).", code="replay-corrupt", request_id=request.request_id) from None
+                if prior_receipt_id is not None:
+                    return {
+                        "name": normalized,
+                        "intent_request_id": request.intent_request_id,
+                        "reconciliation_id": prior_receipt_id,
+                    }
+                try:
                     snapshot = build_tick_intent_reconciliation_snapshot(
                         directory,
                         deployed,
