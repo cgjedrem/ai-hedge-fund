@@ -307,6 +307,12 @@ def _wait_file(path: Path, process, what: str, timeout: float = 30) -> str:
         except (FileNotFoundError, PermissionError) as exc:
             last_error = exc
         if process is not None and process.poll() is not None:
+            try:
+                value = path.read_text(encoding="utf-8")
+                if value:
+                    return value
+            except (FileNotFoundError, PermissionError) as exc:
+                last_error = exc
             if path.exists():
                 raise AssertionError(f"{what} exited without a complete report: {process.returncode}") from last_error
             raise AssertionError(f"{what} exited early: {process.returncode}") from last_error
@@ -330,6 +336,20 @@ def test_logical_wait_file_retries_empty_handshake():
 
     assert _wait_file(handshake, None, "logical start signal", timeout=1) == "ready"
     assert handshake.reads == 2
+
+
+def test_logical_wait_file_rereads_report_after_process_exit(tmp_path):
+    report = tmp_path / "report"
+
+    class PublishOnPoll:
+        returncode = None
+
+        def poll(self):
+            report.write_text("complete", encoding="utf-8")
+            self.returncode = 0
+            return self.returncode
+
+    assert _wait_file(report, PublishOnPoll(), "logical child report", timeout=1) == "complete"
 
 
 class _Racer:
