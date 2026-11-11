@@ -336,3 +336,105 @@
   - `hedge_fund/runtime/test_inventory_cache_race.py::test_approval_waiting_for_sibling_publication_does_not_block_halt`
   - `hedge_fund/runtime/test_writer_races.py::test_two_process_audit_appends_are_complete_and_uninterleaved`
 - **Run-to-run anomaly**: the first run's extra `test_approval_clear_logs_unlink_error` did not appear in the rerun; the two rerun-only failures above were not in the first run. The observed full-suite failure set therefore varied between runs. The requested pass criterion—exactly the 36 known IDs with no new failures—was **not met**. No fixes were attempted, per instruction.
+
+## User-Authorized Test-Hygiene Cycle (E0-E3)
+
+- **Revision and environment**: baseline `0506f3d425c6b8c824a065746fe8a868d3d6c306` in detached worktree `C:\Users\ChristianGjedrem\AppData\Local\Temp\s006e2b-20261111-1152`; feature branch `cgjedrem-didactic-meme`, HEAD `c4818ed11b8fd320322331007619eb4124f6c9d0`. Windows 11 Enterprise `10.0.26200` (build `26200`), Python `3.13.7`, Poetry `2.5.1`, pytest `7.4.4`. Shared test interpreter: `C:\Users\ChristianGjedrem\AppData\Local\pypoetry\Cache\virtualenvs\aihf-4KWHP5vi-py3.13\Scripts\python.exe`. Source/test diff at HEAD: 0 bytes; SHA-256 `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`. Tests used synthetic roots and fakes only.
+- **E0**: searched retained output/JUnit artifacts, pytest temp files, and this evidence file for run-2 output or verbatim tracebacks. None were retained; old temp logs found were unrelated Spec005 logs from November 1. E2 therefore recorded fresh per-test reports.
+- **E1**: the authorized `_wait_file` change was conditional on the exact message `exited without a complete report` for `test_two_process_audit_appends_are_complete_and_uninterleaved`. That signature did not occur in any valid baseline or HEAD repetition. No code change was made. HEAD runs 1-2 did report a different `FileNotFoundError` signature, defined as B below; it did not match the authorized trigger.
+- **E2 invocation**: each file ran alone and sequentially, with normal pytest basetemp handling and no `--basetemp` override. The pinned interpreter invoked `pytest.main([<file>, "-rA", "--tb=short"], plugins=[Reporter])`; the in-memory hook recorded each call-phase result. `hedge_fund.__file__` resolved inside the baseline and HEAD worktrees, both using the same interpreter. Baseline used five repetitions per file, the user-authorized minimum; HEAD used ten. Some baseline session teardowns raised `PermissionError (WinError 32)` while removing a synthetic `home` held by Git fsmonitor. Those are harness cleanup errors, not test-call reports; call counts below come from the report hook. An earlier baseline `poetry run` attempt created a separate pytest `9.1.1` environment and was excluded. An earlier shared-interpreter attempt whose terminal summary was masked was also excluded.
+- **Failure signatures**:
+  - **A**: writer-authority assertion fails. Baseline `hedge_fund/runtime/test_writer_races.py:462`; HEAD `:808`. Expected reason `operator-single-writer-acknowledgement-required`; observed `operator-single-writer-runtime-scope-unavailable`. Matches the known parity failure.
+  - **B**: `FileNotFoundError` while `_wait_file` reads `audit-final-first` at `hedge_fund/runtime/test_writer_races.py:304`; wrapped as `AssertionError: audit writer first did not report; last read failed: FileNotFoundError; child error: child error unavailable` at `:317` and `:570`. HEAD runs 1-2 only.
+  - **C**: `AssertionError` at `hedge_fund/runtime/test_inventory_cache_race.py:1048`: `assert halt_elapsed < 2.0`; observed `2.040737699950114`.
+- **E2 counts**: `P/F/S` are passed/failed/skipped call reports. All timestamps below are on `2026-11-11`, local `+01:00`. Wall times are seconds.
+
+### Baseline Repetitions
+
+#### `hedge_fund/runtime/test_writer_races.py` (12 calls per run)
+
+| Run | Start | End | Wall s | P/F/S | Signature |
+|---|---|---|---:|---:|---|
+| 1 | `12:01:39.2632735+01:00` | `12:03:28.8449500+01:00` | 109.57 | 11/1/0 | A |
+| 2 | `12:06:30.0452338+01:00` | `12:09:45.1367483+01:00` | 195.09 | 11/1/0 | A |
+| 3 | `12:09:45.1763579+01:00` | `12:13:19.4567588+01:00` | 214.28 | 11/1/0 | A |
+| 4 | `12:13:19.4848441+01:00` | `12:17:06.0992333+01:00` | 226.61 | 11/1/0 | A |
+| 5 | `12:17:06.1143936+01:00` | `12:20:51.9530415+01:00` | 225.84 | 11/1/0 | A |
+
+#### `hedge_fund/runtime/test_inventory_cache_race.py` (46 calls per run)
+
+| Run | Start | End | Wall s | P/F/S | Signature |
+|---|---|---|---:|---:|---|
+| 1 | `12:21:29.1808853+01:00` | `12:27:05.2176811+01:00` | 336.03 | 45/1/0 | C |
+| 2 | `12:27:05.2651483+01:00` | `12:32:40.8619003+01:00` | 335.59 | 46/0/0 | - |
+| 3 | `12:32:40.8960277+01:00` | `12:38:19.4028034+01:00` | 338.50 | 46/0/0 | - |
+| 4 | `12:38:19.4199791+01:00` | `12:43:55.8785726+01:00` | 336.46 | 46/0/0 | - |
+| 5 | `12:43:55.8987129+01:00` | `12:49:33.4930581+01:00` | 337.59 | 46/0/0 | - |
+
+#### `hedge_fund/paper/test_ledger.py` (71 calls per run)
+
+| Run | Start | End | Wall s | P/F/S | Signature |
+|---|---|---|---:|---:|---|
+| 1 | `12:49:59.4626650+01:00` | `12:50:16.7163793+01:00` | 17.25 | 71/0/0 | - |
+| 2 | `12:50:16.7729445+01:00` | `12:50:33.0342250+01:00` | 16.26 | 71/0/0 | - |
+| 3 | `12:50:33.0565648+01:00` | `12:50:49.5445563+01:00` | 16.49 | 71/0/0 | - |
+| 4 | `12:50:49.5688289+01:00` | `12:51:10.3115804+01:00` | 20.74 | 71/0/0 | - |
+| 5 | `12:51:10.3363297+01:00` | `12:51:26.4395102+01:00` | 16.10 | 71/0/0 | - |
+
+### HEAD Repetitions
+
+#### `hedge_fund/runtime/test_writer_races.py` (15 calls per run)
+
+| Run | Start | End | Wall s | P/F/S | Signature |
+|---|---|---|---:|---:|---|
+| 1 | `12:52:18.0894852+01:00` | `12:56:36.0838926+01:00` | 257.99 | 13/2/0 | B, A |
+| 2 | `12:56:36.1631040+01:00` | `12:59:25.9424613+01:00` | 169.78 | 13/2/0 | B, A |
+| 3 | `12:59:25.9641713+01:00` | `13:01:39.7697493+01:00` | 133.81 | 14/1/0 | A |
+| 4 | `13:01:39.7869358+01:00` | `13:04:01.0020435+01:00` | 141.22 | 14/1/0 | A |
+| 5 | `13:04:01.0218633+01:00` | `13:06:29.2545414+01:00` | 148.23 | 14/1/0 | A |
+| 6 | `13:06:29.2670544+01:00` | `13:08:58.6339604+01:00` | 149.37 | 14/1/0 | A |
+| 7 | `13:08:58.6529122+01:00` | `13:11:45.0494733+01:00` | 166.40 | 14/1/0 | A |
+| 8 | `13:11:45.0610112+01:00` | `13:14:47.4336163+01:00` | 182.37 | 14/1/0 | A |
+| 9 | `13:14:47.4477272+01:00` | `13:18:12.7196289+01:00` | 205.27 | 14/1/0 | A |
+| 10 | `13:18:12.7335981+01:00` | `13:20:45.7572568+01:00` | 153.03 | 14/1/0 | A |
+
+#### `hedge_fund/runtime/test_inventory_cache_race.py` (46 calls per run)
+
+| Run | Start | End | Wall s | P/F/S | Signature |
+|---|---|---|---:|---:|---|
+| 1 | `13:21:27.9767478+01:00` | `13:24:20.7031796+01:00` | 172.72 | 46/0/0 | - |
+| 2 | `13:24:20.7414735+01:00` | `13:27:53.2469461+01:00` | 212.52 | 46/0/0 | - |
+| 3 | `13:27:53.2846854+01:00` | `13:31:25.1036147+01:00` | 211.82 | 46/0/0 | - |
+| 4 | `13:31:25.1186177+01:00` | `13:33:57.4203433+01:00` | 152.30 | 46/0/0 | - |
+| 5 | `13:33:57.4328675+01:00` | `13:36:31.7718897+01:00` | 154.34 | 46/0/0 | - |
+| 6 | `13:36:31.7851912+01:00` | `13:39:10.2052308+01:00` | 158.42 | 46/0/0 | - |
+| 7 | `13:39:10.2158212+01:00` | `13:41:36.5106615+01:00` | 146.29 | 46/0/0 | - |
+| 8 | `13:41:36.5204128+01:00` | `13:43:51.7694796+01:00` | 135.24 | 46/0/0 | - |
+| 9 | `13:43:51.7841808+01:00` | `13:46:03.9784104+01:00` | 132.19 | 46/0/0 | - |
+| 10 | `13:46:03.9913914+01:00` | `13:49:01.4893760+01:00` | 177.50 | 46/0/0 | - |
+
+#### `hedge_fund/paper/test_ledger.py` (82 calls per run)
+
+| Run | Start | End | Wall s | P/F/S | Signature |
+|---|---|---|---:|---:|---|
+| 1 | `13:49:15.3787574+01:00` | `13:49:29.0611072+01:00` | 13.68 | 82/0/0 | - |
+| 2 | `13:49:29.1194673+01:00` | `13:49:42.1945602+01:00` | 13.08 | 82/0/0 | - |
+| 3 | `13:49:42.2202924+01:00` | `13:49:55.7467398+01:00` | 13.53 | 82/0/0 | - |
+| 4 | `13:49:55.7641985+01:00` | `13:50:14.3297878+01:00` | 18.57 | 82/0/0 | - |
+| 5 | `13:50:14.3467029+01:00` | `13:50:34.3471458+01:00` | 20.00 | 82/0/0 | - |
+| 6 | `13:50:34.3636442+01:00` | `13:50:53.4535738+01:00` | 19.08 | 82/0/0 | - |
+| 7 | `13:50:53.4744720+01:00` | `13:51:20.4048423+01:00` | 26.94 | 82/0/0 | - |
+| 8 | `13:51:20.4387258+01:00` | `13:51:34.8046963+01:00` | 14.37 | 82/0/0 | - |
+| 9 | `13:51:34.8281342+01:00` | `13:51:47.8189791+01:00` | 12.99 | 82/0/0 | - |
+| 10 | `13:51:47.8363042+01:00` | `13:52:06.2799978+01:00` | 18.44 | 82/0/0 | - |
+
+- **E2 outcome**: A reproduced on baseline 5/5 and HEAD 10/10. C occurred baseline 1/5, HEAD 0/10; the final full-suite run did not reproduce it. The prior isolated `test_approval_clear_logs_unlink_error` did not recur in the paper-ledger repetitions. B occurred only on HEAD runs 1-2 (0/5 baseline) and was absent from the final full-suite run; this HEAD-only signature remains an anomaly. No listed real-bug signature occurred: no count/payload mismatch, `JSONDecodeError`, wrong halt reason, `vote_result` mismatch, or `clear_approval` returning `True`.
+
+### E3 Full Suite at HEAD `c4818ed`
+
+- **Invocation**: an initial PowerShell attempt at `2026-11-11T13:53:44.8477746+01:00` could not resolve the `poetry` command; pytest did not start. The actual run used `python -m poetry run pytest hedge_fund -q -rA --tb=short --junitxml=outputs/spec006-e3-20261111-c4818ed/pytest-hedge_fund.junit.xml`. Poetry selected the shared environment above (pytest `7.4.4`). The suite ran alone with normal basetemp handling; no test command overlapped it.
+- **Observation**: started `2026-11-11T13:54:26.7093341+01:00`, ended `2026-11-11T14:40:46.9566027+01:00`; exit `1`; **FAIL**, 2,889 passed, 62 skipped, 37 failed, 0 errors in `2,774.26s` (`0:46:14`); wall `2,780.24s` (`0:46:20.24`).
+- **Failure-set comparison**: the retained pytest output contains 37 unique failed IDs. All 36 documented parity IDs failed; none were missing. One extra ID was outside the parity set: `hedge_fund/runtime/test_native_primitives.py::test_native_lock_excludes_owned_cross_process_writer`. Its failure is `AssertionError` at `hedge_fund/runtime/test_native_primitives.py:108`: expected `"blocked"`, observed `""`. This ID was not run in E2 and has no baseline reproduction there. The E3 pass criterion is **not met**.
+- **E2/E3 anomaly comparison**: the HEAD-only B signature from `test_two_process_audit_appends_are_complete_and_uninterleaved` did not recur in E3. The extra E3 native-lock assertion is a different failure and is not explained by E2 baseline evidence.
+- **Retained artifacts**: full output `outputs/spec006-e3-20261111-c4818ed/pytest-hedge_fund.log`; JUnit XML `outputs/spec006-e3-20261111-c4818ed/pytest-hedge_fund.junit.xml`. The JUnit report independently records 2,988 tests, 2,889 passed, 37 failures, 0 errors, 62 skipped, and `2,766.50s` test time.
+- **Disposition**: no code or test changes were made. Full-suite status remains **FAIL** pending QA review of the unclassified native-lock failure and the HEAD-only E2 file-missing signature.
