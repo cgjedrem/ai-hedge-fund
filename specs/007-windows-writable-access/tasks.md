@@ -78,17 +78,17 @@
 
 ### Tests for User Story 3
 
-- [ ] T015 [P] [US3] attest-stale-marker: success, live-process refusal (real dummy process), missing marker, evidence-digest mismatch, idempotent repeat in hedge_fund/runtime/test_handover.py
-- [ ] T016 [P] [US3] attest-protected-fund: success under original name, unknown/unprotected name refusal, rename-evasion impossibility in hedge_fund/runtime/test_handover.py
-- [ ] T017 [P] [US3] Root-layer authz: attested protected fund writable; unattested protected name denied; alias/evasion paths denied in hedge_fund/runtime/test_root.py
-- [ ] T018 [P] [US3] Source-immutability test: full procedure leaves source tree hash-identical in hedge_fund/runtime/test_handover.py
+- [X] T015 [P] [US3] attest-stale-marker: success, live-process refusal (real dummy process), missing marker, evidence-digest mismatch, idempotent repeat in hedge_fund/runtime/test_handover.py
+- [X] T016 [P] [US3] attest-protected-fund: success under original name, unknown/unprotected name refusal, rename-evasion impossibility in hedge_fund/runtime/test_handover.py
+- [X] T017 [P] [US3] Root-layer authz: attested protected fund writable; unattested protected name denied; alias/evasion paths denied in hedge_fund/runtime/test_root.py
+- [X] T018 [P] [US3] Source-immutability test: full procedure leaves source tree hash-identical in hedge_fund/runtime/test_handover.py
 
 ### Implementation for User Story 3
 
-- [ ] T019 [US3] `handover attest-stale-marker --marker RELPATH --source-evidence DIGEST --operator-statement TEXT` (destination-bound; liveness check; marker retired into destination root-private attestation area) in hedge_fund/runtime/handover.py + hedge_fund/run.py
-- [ ] T020 [US3] `handover attest-protected-fund --fund NAME --source-evidence DIGEST --operator-statement TEXT` (destination-bound) in hedge_fund/runtime/handover.py + hedge_fund/run.py
-- [ ] T021 [US3] Attestation-aware protected-name authorization preserving default denial + alias checks in hedge_fund/runtime/root.py:217-270,489-511 and hedge_fund/runtime/admission.py:956-962
-- [ ] T022 [US3] Wire attestation awareness into `build_head_inventory` (hedge_fund/runtime/handover.py:1159-1218) and `relocate-finalize` validation: attested blockers appear as attestation-referenced entries; unattested still refuse
+- [X] T019 [US3] `handover attest-stale-marker --marker RELPATH --source-evidence DIGEST --operator-statement TEXT` (destination-bound; liveness check; marker retired into destination root-private attestation area) in hedge_fund/runtime/handover.py + hedge_fund/run.py
+- [X] T020 [US3] `handover attest-protected-fund --fund NAME --source-evidence DIGEST --operator-statement TEXT` (destination-bound) in hedge_fund/runtime/handover.py + hedge_fund/run.py
+- [X] T021 [US3] Attestation-aware protected-name authorization preserving default denial + alias checks in hedge_fund/runtime/root.py:217-270,489-511 and hedge_fund/runtime/admission.py:956-962
+- [X] T022 [US3] Wire attestation awareness into `build_head_inventory` (hedge_fund/runtime/handover.py:1159-1218) and `relocate-finalize` validation: attested blockers appear as attestation-referenced entries; unattested still refuse
 
 **Checkpoint**: Full synthetic rehearsal (Quickstart Scenario B) passes end-to-end.
 
@@ -96,11 +96,11 @@
 
 ## Phase 6: Polish & Cross-Cutting Concerns
 
-- [ ] T023 Run Quickstart Scenario A: `poetry run pytest hedge_fund/runtime -q` then full `poetry run pytest hedge_fund -q`; record per-failure baseline evidence per Constitution III
-- [ ] T024 Interruption drill (Quickstart B step 10): kill mid-relocate-copy; source untouched; destination marked incomplete; rerun succeeds — automated test
-- [ ] T025 [P] black/isort/flake8 clean on changed files; WRITER_MAP audit passes (`poetry run pytest hedge_fund/runtime/test_writer_map.py -q`)
-- [ ] T026 [P] Update README/docs handover section references for the two-stage relocation + attestation subcommands (docs only)
-- [ ] T027 Produce the real-cutover runbook artifact (Quickstart Scenario C detail) for separate operator authorization — document only, no execution
+- [X] T023 Run focused runtime/TUI gate (`py -m poetry run pytest hedge_fund/runtime hedge_fund/tui -q`) and full suite (`py -m poetry run pytest hedge_fund -q`); 947 passed/22 skipped/1 baseline inventory failure focused, 2,970 passed/62 skipped/23 baseline failures full; see implementation-evidence.md
+- [X] T024 Interruption drill (Quickstart B step 10): kill child after first copied file; source untouched; destination marked incomplete; rerun succeeds — `test_relocate_copy_process_death_leaves_incomplete_state_and_retry_completes`
+- [X] T025 [P] black/isort/flake8 clean on changed files; WRITER_MAP audit passes (`poetry run pytest hedge_fund/runtime/test_writer_map.py -q`)
+- [X] T026 [P] Update README/docs handover section references for the two-stage relocation + attestation subcommands (docs only)
+- [X] T027 Produce the real-cutover runbook artifact (Quickstart Scenario C detail) for separate operator authorization — document only, no execution
 
 ---
 
