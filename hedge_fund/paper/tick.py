@@ -12,8 +12,8 @@ each honest. For a minute fund it is the latest bar boundary that has
 passed, at prints taken now: a bar is never back-filled, so a late tick
 records the print it took and when it took it.
 
-Any failure inside `advance` halts the fund. Cron retrying into a broken
-book is the failure mode this exists to prevent; a human clears the halt.
+Pre-effect failures abort without halt. Book drift and failures after effect
+admission halt the fund.
 """
 
 from __future__ import annotations
@@ -55,6 +55,7 @@ from hedge_fund.paper.ledger import (
 from hedge_fund.pipeline.clock import Clock, LiveClock, Marked
 from hedge_fund.pipeline.session import (
     advance,
+    BookMismatch,
     FundHalted,
     FundState,
     is_rebalance_session,
@@ -188,6 +189,8 @@ def tick(
     capture_id: str | None = None,
     capture_digest: str | None = None,
     on_progress: Callable[[int], None] | None = None,
+    on_effect_started: Callable[[], None] | None = None,
+    operation_store=None,
 ) -> SessionRecord:
     """Advance the paper fund in *directory* by one session and record it.
 
@@ -200,6 +203,13 @@ def tick(
     """
     if on_progress is not None and not callable(on_progress):
         raise ValueError("paper tick progress callback must be callable")
+    if on_effect_started is not None and not callable(on_effect_started):
+        raise ValueError("paper tick effect callback must be callable")
+    if operation_store is not None:
+        from hedge_fund.runtime.operations import OperationStore
+
+        if not isinstance(operation_store, OperationStore):
+            raise ValueError("paper tick operation store is invalid")
     directory = Path(directory)
     operation_context = None
     if request_id is not None:
@@ -272,12 +282,17 @@ def tick(
                 raise LedgerError("paper ledger head changed before the tick request")
             if session is not None and session in ledger.sessions():
                 record = ledger.read(session)
+                from hedge_fund.runtime.operations import paper_tick_logical_key
+
+                logical_key = paper_tick_logical_key(directory.name, session, expected_head)
                 ledger.log_event(
                     "tick",
                     request_id=request_id,
                     request_action="tick",
                     request_digest=operation_context["request_digest"],
                     expected_head=expected_head,
+                    session=record.session,
+                    logical_key=logical_key,
                     result={"session": record.session, "hash": record.hash},
                     durable=True,
                 )
@@ -291,6 +306,9 @@ def tick(
                 now=now,
                 operation_context=operation_context,
                 on_progress=on_progress,
+                on_effect_started=on_effect_started,
+                operation_store=operation_store,
+                operation_id=operation_id,
             )
         except NothingDue as exc:
             if operation_context is not None:
@@ -334,7 +352,12 @@ def _tick(
     now: Callable[[], datetime] | None,
     operation_context: dict | None,
     on_progress: Callable[[int], None] | None,
+    on_effect_started: Callable[[], None] | None = None,
+    operation_store=None,
+    operation_id: str | None = None,
 ) -> SessionRecord:
+    from hedge_fund.runtime.admission import PaperPreflightBusy
+
     deployed = load_deployed(directory)
     if deployed.broker == "saxo":
         require_sim_account_ownership()
@@ -357,7 +380,7 @@ def _tick(
 
     try:
         with _preflight_control(directory, deployed.name):
-            ledger.require_ready_for_work(state, approval_required=spec.approval_required)
+            ledger.require_ready_for_tick(state, approval_required=spec.approval_required)
     except PaperReconciliationRequired:
         ledger.halt("approval journal requires reconciliation")
         raise
@@ -379,32 +402,103 @@ def _tick(
         benchmark = clock.observe([spec.benchmark], due)[spec.benchmark]
         if print_day(benchmark.time) < session_date(due):
             raise NothingDue(f"{deployed.name}: {spec.benchmark} has not printed today (market closed); " f"next {following_session(spec, state.last_session, now())}")
+    from hedge_fund.runtime.operations import (
+        DuplicateLogicalOperationRefusal,
+        OperationError,
+        paper_tick_logical_key,
+    )
+
+    logical_key = paper_tick_logical_key(deployed.name, due, state.prev_hash)
+    if operation_store is not None:
+        try:
+            active = operation_store.find_active_logical_operation(
+                logical_key,
+                exclude_operation_id=operation_id,
+            )
+        except OperationError as exc:
+            raise PaperPreflightBusy("Paper logical-operation state is unavailable.") from exc
+        if active is not None:
+            raise DuplicateLogicalOperationRefusal(active.operation_id, logical_key)
+
+    attempt_context = None
     if operation_context is not None:
+        attempt_context = {
+            **operation_context,
+            "expected_head": state.prev_hash,
+            "attempt_id": uuid4().hex,
+            "logical_key": logical_key,
+        }
         ledger.log_event(
             "tick_intent",
-            request_id=operation_context["request_id"],
-            request_action=operation_context["request_action"],
-            request_digest=operation_context["request_digest"],
+            request_id=attempt_context["request_id"],
+            request_action=attempt_context["request_action"],
+            request_digest=attempt_context["request_digest"],
             expected_head=state.prev_hash,
             requested_session=session,
             session=due,
-            **{key: operation_context[key] for key in ("operation_id", "capture_id", "capture_digest") if key in operation_context},
+            attempt_id=attempt_context["attempt_id"],
+            logical_key=logical_key,
+            **{key: attempt_context[key] for key in ("operation_id", "capture_id", "capture_digest") if key in attempt_context},
             durable=True,
         )
     if on_progress is not None:
-        on_progress(35)
-    return _run(
-        directory,
-        deployed,
-        ledger,
-        state,
-        due,
-        data_client,
-        build_fund,
-        clock=clock,
-        operation_context=operation_context,
-        on_progress=on_progress,
-    )
+        try:
+            on_progress(35)
+        except Exception as exc:
+            if attempt_context is not None:
+                ledger.log_event(
+                    "tick_aborted",
+                    **attempt_context,
+                    session=due,
+                    no_effects=True,
+                    error=f"{type(exc).__name__}: {exc}",
+                    durable=True,
+                )
+            raise
+    effect_state = {"started": False, "abort": False}
+    try:
+        return _run(
+            directory,
+            deployed,
+            ledger,
+            state,
+            due,
+            data_client,
+            build_fund,
+            clock=clock,
+            operation_context=attempt_context,
+            on_progress=on_progress,
+            on_effect_started=on_effect_started,
+            effect_state=effect_state,
+        )
+    except Exception as exc:
+        if attempt_context is not None:
+            try:
+                events = ledger.events()
+            except Exception as lookup_error:
+                raise exc from lookup_error
+            has_outcome = any(event.get("attempt_id") == attempt_context["attempt_id"] and event.get("kind") in {"tick", "tick_failed", "tick_aborted"} for event in events)
+            if not has_outcome:
+                if effect_state["abort"] or not effect_state["started"] and not isinstance(exc, BookMismatch):
+                    ledger.log_event(
+                        "tick_aborted",
+                        **attempt_context,
+                        session=due,
+                        no_effects=True,
+                        error=f"{type(exc).__name__}: {exc}",
+                        durable=True,
+                    )
+                else:
+                    ledger.log_event(
+                        "tick_failed",
+                        **attempt_context,
+                        session=due,
+                        error=f"{type(exc).__name__}: {exc}",
+                        durable=True,
+                    )
+                    if ledger.halted() is None:
+                        ledger.halt(f"tick {due} failed: {type(exc).__name__}: {exc}")
+        raise
 
 
 def print_day(time: str) -> str:
@@ -631,6 +725,8 @@ def _run(
     active_redo_id: str | None = None,
     operation_context: dict | None = None,
     on_progress: Callable[[int], None] | None = None,
+    on_effect_started: Callable[[], None] | None = None,
+    effect_state: dict[str, bool] | None = None,
 ) -> SessionRecord:
     """Advance one session from *state* and record it, halting on failure.
     *fund* lets a long-running caller keep one Fund (and its analysts'
@@ -640,19 +736,38 @@ def _run(
     from hedge_fund.runtime.admission import (
         paper_audit_transition,
         paper_control_transition,
+        PaperControlBusy,
         PaperPreflightBusy,
         WriterConflict,
     )
 
-    with paper_control_transition(directory, deployed.name):
-        ledger._require_completed_redo(active_redo_id=active_redo_id)
-        ledger._require_completed_approval_publication()
+    def mark_effect_started() -> None:
+        if on_effect_started is not None:
+            on_effect_started()
+        if effect_state is not None:
+            effect_state["started"] = True
+
+    try:
+        with paper_control_transition(directory, deployed.name):
+            ledger._require_completed_redo(active_redo_id=active_redo_id)
+            ledger._require_completed_approval_publication()
+    except PaperControlBusy as exc:
+        if effect_state is None:
+            raise
+        effect_state["abort"] = True
+        raise PaperPreflightBusy("Paper preflight control admission is occupied.") from exc
+    except LedgerError:
+        if effect_state is not None:
+            effect_state["abort"] = True
+        raise
     run_state = state
     clear_verdict = None
     consumed_verdict = None
     audit = None
     if deployed.spec.approval_required and state.pending is not None:
         if not isinstance(state.prev_hash, str):
+            if effect_state is not None:
+                effect_state["abort"] = True
             raise LedgerError("pending decision has no source hash")
         journal_attempted = False
         try:
@@ -664,7 +779,8 @@ def _run(
                     approval, clear_verdict = ledger.resolve_approval(state.pending.as_of, state.prev_hash)
                     if approval is None:
                         event = ledger._latest_approval_event(state.pending.as_of, state.prev_hash, strict=True)
-                        if event is not None and (event.get("kind") in {"consume", "tick"} or event.get("consumed") is True):
+                        if event is not None and (event.get("kind") in {"consume", "tick"} or event.get("consumed") is True) and not ledger.approval_consumption_is_resolved(event):
+                            mark_effect_started()
                             journal_attempted = True
                             raise LedgerError("approval consumption is incomplete; reconciliation is required")
                 else:
@@ -681,10 +797,12 @@ def _run(
                     if "approval_id" in approval:
                         fields["approval_id"] = approval["approval_id"]
                     with paper_audit_transition(directory, deployed.name):
+                        mark_effect_started()
                         journal_attempted = True
                         ledger.log_event("consume", durable=True, **fields)
                 if approval is None:
                     with paper_audit_transition(directory, deployed.name):
+                        mark_effect_started()
                         journal_attempted = True
                         ledger.log_event(
                             "expire",
@@ -697,10 +815,14 @@ def _run(
             if journal_attempted:
                 ledger.halt("approval journal requires reconciliation")
                 raise
+            if effect_state is not None:
+                effect_state["abort"] = True
             raise PaperPreflightBusy("Paper preflight audit admission is occupied.") from exc
         except Exception:
             if journal_attempted:
                 ledger.halt("approval journal requires reconciliation")
+            elif effect_state is not None:
+                effect_state["abort"] = True
             raise
         if approval is not None:
             consumed_verdict = approval
@@ -723,6 +845,7 @@ def _run(
         ledger.log_event("broker_fill", session=session, order=order.model_dump(mode="json"), fill=fill.model_dump(mode="json"))
 
     def check_effect_admission() -> None:
+        nonlocal order_pending
         from hedge_fund.runtime.admission import paper_control_transition
 
         with paper_control_transition(directory, deployed.name):
@@ -731,19 +854,24 @@ def _run(
                 raise FundHalted(f"{deployed.name} is halted: {halted}")
             ledger._require_completed_redo(active_redo_id=active_redo_id)
             ledger._require_completed_approval_publication()
+        if order_pending:
+            mark_effect_started()
+            order_pending = False
 
     try:
         with ExitStack() as publication:
             registry_reserved = False
             registry_observation = None
+            order_pending = False
 
             def reserve_publication() -> None:
-                nonlocal registry_reserved, registry_observation
+                nonlocal registry_reserved, registry_observation, order_pending
                 if not registry_reserved and deployed.broker == "paper":
                     from hedge_fund.runtime.handover import paper_effect_registry
 
                     registry_observation = publication.enter_context(paper_effect_registry(directory, deployed.name))
                     registry_reserved = True
+                order_pending = True
 
             broker = broker or build_broker(deployed, directory=directory)
             fund = fund or (build_fund or Fund)(deployed.spec)
@@ -768,6 +896,7 @@ def _run(
             if redo_nonce is not None:
                 record.redo_nonce = redo_nonce
                 record.hash = record.compute_hash()
+            mark_effect_started()
             ledger.append(record)
             if audit is not None:
                 kind, fields = audit
@@ -800,8 +929,16 @@ def _run(
                 ledger.checkpoint(next_state(state, record))
             return record
     except FundHalted:
+        if effect_state is not None and not effect_state["started"]:
+            effect_state["abort"] = True
         raise
     except Exception as exc:
+        # Drift proves broker may include untracked effects.
+        if effect_state is not None and not effect_state["started"] and not isinstance(exc, BookMismatch):
+            effect_state["abort"] = True
+            if isinstance(exc, PaperControlBusy) and not isinstance(exc, PaperPreflightBusy):
+                raise PaperPreflightBusy("Paper preflight control admission is occupied.") from exc
+            raise
         reason = f"tick {session} failed: {type(exc).__name__}: {exc}"
         failure_fields = {"expected_head": state.prev_hash}
         if operation_context is not None:

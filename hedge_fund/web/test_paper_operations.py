@@ -26,6 +26,7 @@ from hedge_fund.test_support.handover import enroll_synthetic_root
 from hedge_fund.web.schemas import (
     DeployRequest,
     PaperTickAcceptRequest,
+    PaperTickIntentReconciliationRequest,
     PaperTickPreviewRequest,
     RunnerPreviewRequest,
     RunnerStartAcceptRequest,
@@ -195,6 +196,482 @@ def test_reviewed_manual_tick_executes_one_session_with_local_fakes(
     assert after == [*before, due_session]
     assert snapshot["last_session"] == due_session
     assert len(data_client.calls) > 0
+
+
+def test_manual_tick_accept_refuses_unresolved_intent_before_worker_dispatch(demo_root, monkeypatch):
+    from hedge_fund.web.schemas import error_payload
+
+    data_client = _OfflineDataClient()
+    service = DeskService(
+        demo_root,
+        allow_writes=True,
+        network_enabled=True,
+        data_client_factory=lambda: data_client,
+        fund_factory=_OfflineFund,
+    )
+    service._runtime_settings = _local_settings()
+    dispatched = []
+    monkeypatch.setattr(
+        service._paper_operation_jobs,
+        "submit",
+        lambda operation, _work, reservation=None: dispatched.append(operation.request_id),
+    )
+    name = "intent-fence-test"
+    interrupted_id = "interrupted-web-tick"
+    request_id = "offline-fenced-manual-tick"
+    try:
+        spec = load_spec(demo_root / "mandates" / "demo-quality.yaml").model_copy(update={"name": name})
+        service.create_mandate(spec.model_dump(mode="python"))
+        service.deploy_mandate(name, DeployRequest(universe=["AAPL"]))
+        ledger = Ledger(demo_root / "paper" / name)
+        preview = service.create_manual_tick_preview(
+            name,
+            PaperTickPreviewRequest(expected_head=None),
+            operator_session="offline-test-session",
+        )
+        due_session = preview["due_set"][0]
+        digest = ledger.tick_request_digest(interrupted_id, expected_head=None, session=due_session)
+        with service._admission.manual_session(name, timeout=0):
+            ledger.log_event(
+                "tick_intent",
+                request_id=interrupted_id,
+                request_action="tick",
+                request_digest=digest,
+                expected_head=None,
+                requested_session=due_session,
+                session=due_session,
+                durable=True,
+            )
+        events_before = ledger.events()
+        request = PaperTickAcceptRequest(
+            request_id=request_id,
+            preview_id=preview["preview_id"],
+            preview_digest=preview["preview_digest"],
+            confirmation_token=preview["confirmation_token"],
+            expected_head=None,
+            due_set=[due_session],
+        )
+
+        with pytest.raises(ServiceError) as refused:
+            service.accept_manual_tick(
+                name,
+                request,
+                operator_session="offline-test-session",
+            )
+        body = error_payload(
+            refused.value.status_code,
+            refused.value.detail,
+            code=refused.value.code,
+            subject_id=refused.value.subject_id,
+            request_id=refused.value.request_id,
+            refusal=refused.value.refusal,
+        )
+        operation = service._operation_store.get_by_request(request_id)
+        events_after = ledger.events()
+    finally:
+        service.close()
+
+    assert refused.value.status_code == 409
+    assert refused.value.code == "unresolved-tick-intent"
+    assert body["refusal"] == {
+        "reason": "unresolved-tick-intent",
+        "fund": name,
+        "intent_request_id": interrupted_id,
+        "intent_session": due_session,
+        "recovery": "reconcile-tick-request",
+    }
+    assert operation is None
+    assert dispatched == []
+    assert events_after == events_before
+    assert ledger.sessions() == []
+
+
+def test_web_reconciles_incomplete_intent_and_admits_new_tick(demo_root):
+    data_client = _OfflineDataClient()
+    service = DeskService(
+        demo_root,
+        allow_writes=True,
+        network_enabled=True,
+        data_client_factory=lambda: data_client,
+        fund_factory=_OfflineFund,
+    )
+    service._runtime_settings = _local_settings()
+    name = "web-intent-recovery-test"
+    try:
+        spec = load_spec(demo_root / "mandates" / "demo-quality.yaml").model_copy(update={"name": name})
+        service.create_mandate(spec.model_dump(mode="python"))
+        service.deploy_mandate(name, DeployRequest(universe=["AAPL"]))
+        preview = service.create_manual_tick_preview(
+            name,
+            PaperTickPreviewRequest(expected_head=None),
+            operator_session="offline-test-session",
+        )
+        due_session = preview["due_set"][0]
+        ledger = Ledger(demo_root / "paper" / name)
+        with service._admission.manual_session(name, timeout=0):
+            ledger.log_event(
+                "tick_intent",
+                request_id="invalid legacy request id",
+                session=due_session,
+            )
+
+        intent_preview = service.paper_reconciliation(name)["intent_preview"]
+        assert intent_preview["required"] is True
+        assert intent_preview["recoverable"] is True
+        assert intent_preview["intent_request_id"] is None
+        request = PaperTickIntentReconciliationRequest(
+            request_id="web-intent-reconcile-001",
+            intent_digest=intent_preview["intent_digest"],
+            preview_digest=intent_preview["preview_digest"],
+        )
+        receipt = service.reconcile_tick_request(name, request)
+        assert receipt["intent_request_id"] is None
+        assert receipt["reconciliation_id"]
+        assert ledger.unresolved_tick_intents() == ()
+
+        accepted = service.accept_manual_tick(
+            name,
+            PaperTickAcceptRequest(
+                request_id="web-tick-after-intent-recovery",
+                preview_id=preview["preview_id"],
+                preview_digest=preview["preview_digest"],
+                confirmation_token=preview["confirmation_token"],
+                expected_head=None,
+                due_set=[due_session],
+            ),
+            operator_session="offline-test-session",
+        )
+        completed = _wait_for_operation(service, accepted["operation_id"])
+    finally:
+        service.close()
+
+    assert completed["status"] == "completed"
+    assert completed["result"]["session"] == due_session
+    assert Ledger(demo_root / "paper" / name).sessions() == [due_session]
+
+
+def test_web_reconcile_post_replays_receipt_before_preview_validation(demo_root):
+    from fastapi.testclient import TestClient
+
+    from hedge_fund.web.app import create_app
+
+    app = create_app(
+        root=demo_root,
+        allow_writes=True,
+        network_enabled=True,
+        data_client_factory=_OfflineDataClient,
+        fund_factory=_OfflineFund,
+    )
+    service = app.state.service
+    service._runtime_settings = _local_settings()
+    name = "web-reconcile-post-replay"
+    try:
+        spec = load_spec(demo_root / "mandates" / "demo-quality.yaml").model_copy(update={"name": name})
+        service.create_mandate(spec.model_dump(mode="python"))
+        service.deploy_mandate(name, DeployRequest(universe=["AAPL"]))
+        ledger = Ledger(demo_root / "paper" / name)
+        with service._admission.manual_session(name, timeout=0):
+            ledger.log_event(
+                "tick_intent",
+                request_id="invalid legacy request id",
+                session="2025-01-06",
+            )
+        preview = service.paper_reconciliation(name)["intent_preview"]
+        request = PaperTickIntentReconciliationRequest(
+            request_id="web-reconcile-post-request",
+            intent_digest=preview["intent_digest"],
+            preview_digest=preview["preview_digest"],
+        )
+
+        with TestClient(app, client=("127.0.0.1", 50000)) as client:
+            capabilities = client.get("/api/capabilities", headers={"host": "127.0.0.1"}).json()
+            headers = {
+                "host": "127.0.0.1",
+                "origin": "http://127.0.0.1",
+                "x-csrf-token": capabilities["mutation_token"],
+            }
+            url = f"/api/paper/{name}/reconcile-tick-request"
+            first = client.post(url, headers=headers, json=request.model_dump(mode="json"))
+            replayed = client.post(url, headers=headers, json=request.model_dump(mode="json"))
+            changed = client.post(
+                url,
+                headers=headers,
+                json={**request.model_dump(mode="json"), "preview_digest": "f" * 64},
+            )
+    finally:
+        service.close()
+
+    assert first.status_code == 200
+    assert replayed.status_code == 200
+    assert replayed.json() == first.json()
+    assert changed.status_code == 409
+    assert changed.json()["code"] == "request-conflict"
+
+
+def test_web_lists_and_reconciles_idless_intents_by_digest(demo_root):
+    service = DeskService(demo_root, allow_writes=True)
+    name = "multiple-idless-intents-test"
+    try:
+        spec = load_spec(demo_root / "mandates" / "demo-quality.yaml").model_copy(update={"name": name})
+        service.create_mandate(spec.model_dump(mode="python"))
+        service.deploy_mandate(name, DeployRequest(universe=["AAPL"]))
+        ledger = Ledger(demo_root / "paper" / name)
+        with service._admission.manual_session(name, timeout=0):
+            ledger.log_event("tick_intent", session="2026-10-30", durable=True)
+            ledger.log_event("tick_intent", session="2026-10-31", durable=True)
+
+        recovery = service.paper_reconciliation(name)
+        targets = recovery["intent_targets"]
+        assert recovery["intent_preview"]["reason"] == "multiple-unresolved-tick-intents"
+        assert len(targets) == 2
+        assert all(target["intent_request_id"] is None for target in targets)
+
+        target = targets[1]
+        selected = service.paper_reconciliation(name, intent_digest=target["intent_digest"])
+        preview = selected["intent_preview"]
+        assert preview["recoverable"] is True
+        assert preview["intent_digest"] == target["intent_digest"]
+        receipt = service.reconcile_tick_request(
+            name,
+            PaperTickIntentReconciliationRequest(
+                request_id="web-idless-intent-reconcile",
+                intent_digest=target["intent_digest"],
+                preview_digest=preview["preview_digest"],
+            ),
+        )
+        unresolved = ledger.unresolved_tick_intents()
+    finally:
+        service.close()
+
+    assert receipt["reconciliation_id"]
+    assert len(unresolved) == 1
+    assert unresolved[0].intent_digest == targets[0]["intent_digest"]
+
+
+def test_corruption_receipt_does_not_resolve_later_identical_line(demo_root):
+    service = DeskService(demo_root, allow_writes=True)
+    name = "corruption-occurrence-test"
+    try:
+        spec = load_spec(demo_root / "mandates" / "demo-quality.yaml").model_copy(update={"name": name})
+        service.create_mandate(spec.model_dump(mode="python"))
+        service.deploy_mandate(name, DeployRequest(universe=["AAPL"]))
+        ledger = Ledger(demo_root / "paper" / name)
+        torn_line = b'{"kind":\n'
+        with service._admission.manual_session(name, timeout=0):
+            with ledger.events_path.open("ab") as history:
+                history.write(torn_line)
+
+        preview = service.paper_reconciliation(name)["intent_preview"]
+        assert preview["required"] is True
+        assert preview["recoverable"] is True
+        first_identity = preview["corrupt_event_digests"][0]
+        request = PaperTickIntentReconciliationRequest(
+            request_id="corruption-occurrence-reconcile",
+            preview_digest=preview["preview_digest"],
+        )
+        service.reconcile_tick_request(name, request)
+        assert ledger.unresolved_tick_intents() == ()
+
+        with service._admission.manual_session(name, timeout=0):
+            with ledger.events_path.open("ab") as history:
+                history.write(torn_line)
+
+        unresolved = ledger.unresolved_tick_intents()
+    finally:
+        service.close()
+
+    assert len(unresolved) == 1
+    assert unresolved[0].is_corrupt is True
+    assert unresolved[0].corrupt_event_digests[0] != first_identity
+
+
+def test_reconciled_corruption_allows_resume_after_manual_halt(demo_root):
+    service = DeskService(demo_root, allow_writes=True)
+    name = "corruption-resume-test"
+    try:
+        spec = load_spec(demo_root / "mandates" / "demo-quality.yaml").model_copy(update={"name": name})
+        service.create_mandate(spec.model_dump(mode="python"))
+        service.deploy_mandate(name, DeployRequest(universe=["AAPL"]))
+        ledger = Ledger(demo_root / "paper" / name)
+        with service._admission.manual_session(name, timeout=0):
+            with ledger.events_path.open("ab") as history:
+                history.write(b'{"kind":\n')
+
+        preview = service.paper_reconciliation(name)["intent_preview"]
+        request = PaperTickIntentReconciliationRequest(
+            request_id="corruption-resume-reconcile",
+            preview_digest=preview["preview_digest"],
+        )
+        service.reconcile_tick_request(name, request)
+        service.halt_fund(name, "manual review", request_id="corruption-resume-halt")
+
+        assert service.paper_reconciliation(name)["resume_allowed"] is True
+        service.resume_fund(name)
+        assert ledger.halted() is None
+    finally:
+        service.close()
+
+
+def test_web_duplicate_logical_tick_refusal_exposes_contract_fields(demo_root, monkeypatch):
+    from hedge_fund.web.schemas import error_payload
+
+    service = DeskService(
+        demo_root,
+        allow_writes=True,
+        network_enabled=True,
+        data_client_factory=_OfflineDataClient,
+        fund_factory=_OfflineFund,
+    )
+    service._runtime_settings = _local_settings()
+    dispatched = []
+    monkeypatch.setattr(
+        service._paper_operation_jobs,
+        "submit",
+        lambda operation, _work, reservation=None: dispatched.append(operation.operation_id),
+    )
+    name = "logical-dedup-test"
+    request_ids = ("logical-first-request", "logical-second-request")
+    try:
+        spec = load_spec(demo_root / "mandates" / "demo-quality.yaml").model_copy(update={"name": name})
+        service.create_mandate(spec.model_dump(mode="python"))
+        service.deploy_mandate(name, DeployRequest(universe=["AAPL"]))
+        previews = [
+            service.create_manual_tick_preview(
+                name,
+                PaperTickPreviewRequest(expected_head=None),
+                operator_session="offline-test-session",
+            )
+            for _ in request_ids
+        ]
+        requests = [
+            PaperTickAcceptRequest(
+                request_id=request_id,
+                preview_id=preview["preview_id"],
+                preview_digest=preview["preview_digest"],
+                confirmation_token=preview["confirmation_token"],
+                expected_head=preview["expected_head"],
+                due_set=preview["due_set"],
+            )
+            for request_id, preview in zip(request_ids, previews)
+        ]
+        first = service.accept_manual_tick(
+            name,
+            requests[0],
+            operator_session="offline-test-session",
+        )
+        with pytest.raises(ServiceError) as refused:
+            service.accept_manual_tick(
+                name,
+                requests[1],
+                operator_session="offline-test-session",
+            )
+        body = error_payload(
+            refused.value.status_code,
+            refused.value.detail,
+            code=refused.value.code,
+            subject_id=refused.value.subject_id,
+            request_id=refused.value.request_id,
+            refusal=refused.value.refusal,
+        )
+        existing = service._operation_store.get_by_request(request_ids[0])
+        rejected = service._operation_store.get_by_request(request_ids[1])
+    finally:
+        service.close()
+
+    assert refused.value.status_code == 409
+    assert body["code"] == "duplicate-logical-operation"
+    assert body["refusal"] == {
+        "reason": "duplicate-logical-operation",
+        "existing_operation_id": first["operation_id"],
+        "logical_key": existing.logical_key,
+    }
+    assert existing.operation_id == first["operation_id"]
+    assert rejected is None
+    assert dispatched == [first["operation_id"]]
+
+
+def test_interrupted_manual_tick_before_intent_releases_logical_key(demo_root, monkeypatch):
+    tick_started = threading.Event()
+
+    def crash_before_tick_intent(*_args, **_kwargs):
+        tick_started.set()
+        raise SystemExit("synthetic process exit before tick intent")
+
+    monkeypatch.setattr(web_services, "tick", crash_before_tick_intent)
+
+    def make_service():
+        result = DeskService(
+            demo_root,
+            allow_writes=True,
+            network_enabled=True,
+            data_client_factory=_OfflineDataClient,
+            fund_factory=_OfflineFund,
+        )
+        result._runtime_settings = _local_settings()
+        return result
+
+    service = make_service()
+    name = "effect-free-interrupted-tick"
+    try:
+        spec = load_spec(demo_root / "mandates" / "demo-quality.yaml").model_copy(update={"name": name})
+        service.create_mandate(spec.model_dump(mode="python"))
+        service.deploy_mandate(name, DeployRequest(universe=["AAPL"]))
+        preview = service.create_manual_tick_preview(
+            name,
+            PaperTickPreviewRequest(expected_head=None),
+            operator_session="offline-test-session",
+        )
+        request = PaperTickAcceptRequest(
+            request_id="effect-free-first",
+            preview_id=preview["preview_id"],
+            preview_digest=preview["preview_digest"],
+            confirmation_token=preview["confirmation_token"],
+            expected_head=preview["expected_head"],
+            due_set=preview["due_set"],
+        )
+        first = service.accept_manual_tick(
+            name,
+            request,
+            operator_session="offline-test-session",
+        )
+        future = service._paper_operation_jobs._submitted[first["operation_id"]]
+        assert tick_started.wait(timeout=30)
+        with pytest.raises(SystemExit, match="synthetic process exit"):
+            future.result(timeout=30)
+        service.close()
+        service = make_service()
+        interrupted = service._operation_store.get_operation(first["operation_id"])
+        assert interrupted.effects_started is False
+
+        preview = service.create_manual_tick_preview(
+            name,
+            PaperTickPreviewRequest(expected_head=None),
+            operator_session="offline-test-session",
+        )
+        request = PaperTickAcceptRequest(
+            request_id="effect-free-second",
+            preview_id=preview["preview_id"],
+            preview_digest=preview["preview_digest"],
+            confirmation_token=preview["confirmation_token"],
+            expected_head=preview["expected_head"],
+            due_set=preview["due_set"],
+        )
+        dispatched = []
+        monkeypatch.setattr(
+            service._paper_operation_jobs,
+            "submit",
+            lambda operation, _work, reservation=None: dispatched.append(operation.operation_id),
+        )
+        second = service.accept_manual_tick(
+            name,
+            request,
+            operator_session="offline-test-session",
+        )
+    finally:
+        service.close()
+
+    assert second["operation_id"] != first["operation_id"]
+    assert dispatched == [second["operation_id"]]
 
 
 def test_reviewed_manual_tick_persists_agent_progress(

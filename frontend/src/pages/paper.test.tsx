@@ -11,6 +11,7 @@ import type {
   PaperOperationPreview,
   PaperReconciliationPreview,
   PaperSnapshot,
+  PaperTickIntentReconciliationPreview,
   RunnerState,
   SessionReport,
 } from "@/lib/types";
@@ -281,6 +282,33 @@ function paperReconciliationPreview(
     decision: "confirm-paper-book-matches-ledger",
     residual_uncertainty: "external-broker-state-not-applicable-local-paper-only",
     preview_digest: "1".repeat(64),
+    ...overrides,
+  };
+}
+
+function paperTickIntentPreview(
+  overrides: Partial<PaperTickIntentReconciliationPreview> = {},
+): PaperTickIntentReconciliationPreview {
+  return {
+    schema_version: 1,
+    required: true,
+    recoverable: true,
+    reason: "ready",
+    intent_request_id: null,
+    intent_session: "2024-06-03",
+    intent_digest: "7".repeat(64),
+    metadata_complete: false,
+    corrupt_event_digests: [],
+    approval_journal_event_digests: [],
+    expected_head: null,
+    current_head: HEAD,
+    broker_book_sha256: "8".repeat(64),
+    fill_identity_sha256: "9".repeat(64),
+    book_matches_ledger: true,
+    head_matches_intent: false,
+    decision: "confirm-paper-book-matches-ledger",
+    residual_uncertainty: "external-broker-state-not-applicable-local-paper-only",
+    preview_digest: "a".repeat(64),
     ...overrides,
   };
 }
@@ -737,6 +765,116 @@ it("keeps resume disabled when local reconciliation is not recoverable", async (
   expect(recovery).toHaveTextContent("broker-book-mismatch");
   expect(screen.getByRole("button", { name: "Review recovery" })).toBeDisabled();
   expect(mutations(calls)).toEqual([]);
+});
+
+it("selects an ID-less tick-intent target by digest before confirming recovery", async () => {
+  const user = userEvent.setup();
+  const firstDigest = "1".repeat(64);
+  const secondDigest = "2".repeat(64);
+  const aggregatePreview = paperTickIntentPreview({
+    recoverable: false,
+    reason: "multiple-unresolved-tick-intents",
+    intent_session: null,
+    intent_digest: null,
+    metadata_complete: null,
+    preview_digest: "3".repeat(64),
+  });
+  const selectedPreview = paperTickIntentPreview({
+    intent_session: "2024-06-02",
+    intent_digest: secondDigest,
+    preview_digest: "4".repeat(64),
+  });
+  const targets = [
+    { intent_request_id: null, intent_session: "2024-06-01", intent_digest: firstDigest, recorded_at: null, metadata_complete: false },
+    { intent_request_id: null, intent_session: "2024-06-02", intent_digest: secondDigest, recorded_at: null, metadata_complete: false },
+  ];
+  const reconciliationPreview = paperReconciliationPreview({
+    required: false,
+    recoverable: false,
+    reason: "no-ambiguous-tick-failure",
+    failure_id: null,
+    failed_request_id: null,
+    operation_id: null,
+    expected_head: null,
+    current_head: null,
+    broker_book_sha256: null,
+    capture_id: null,
+    capture_digest: null,
+    book_matches_ledger: false,
+    head_matches_failure: false,
+    preview_digest: null,
+  });
+  const recovery = (intentPreview: PaperTickIntentReconciliationPreview) => ({
+    name: FUND,
+    halted: null,
+    resume_allowed: false,
+    preview: reconciliationPreview,
+    intent_preview: intentPreview,
+    intent_targets: targets,
+  });
+  const calls = renderDesk(stoppedRunner, {
+    [`GET /api/paper/${FUND}/reconciliation`]: () => json(recovery(aggregatePreview)),
+    [`GET /api/paper/${FUND}/reconciliation?intent_digest=${secondDigest}`]: () => json(recovery(selectedPreview)),
+    [`POST /api/paper/${FUND}/reconcile-tick-request`]: () => json({
+      name: FUND,
+      intent_request_id: null,
+      reconciliation_id: "5".repeat(64),
+    }),
+  });
+
+  const section = await screen.findByTestId("tick-intent-reconciliation");
+  expect(section).toHaveTextContent("Multiple unresolved tick intents");
+  const target = within(section).getAllByTestId("tick-intent-target")[1];
+  await user.click(within(target).getByRole("button", { name: "Review intent target" }));
+  await screen.findByText("Recovery preview:");
+  await waitFor(() => expect(calls.some((call) => call.path === `/api/paper/${FUND}/reconciliation?intent_digest=${secondDigest}`)).toBe(true));
+
+  await user.click(await enabledButton("Review orphaned tick resolution"));
+  const dialog = await screen.findByRole("dialog", { name: "Resolve orphaned paper tick" });
+  await user.click(within(dialog).getByRole("button", { name: "Record intent resolution" }));
+  await waitFor(() => expect(mutations(calls)).toHaveLength(1));
+  expect(mutations(calls)[0].body).toMatchObject({
+    intent_request_id: null,
+    intent_digest: secondDigest,
+    preview_digest: selectedPreview.preview_digest,
+  });
+});
+
+it("shows approval journal identities covered by tick-intent recovery", async () => {
+  const approvalJournalDigest = "6".repeat(64);
+  const recovery = {
+    name: FUND,
+    halted: null,
+    resume_allowed: false,
+    preview: paperReconciliationPreview({
+      required: false,
+      recoverable: false,
+      reason: "no-ambiguous-tick-failure",
+      failure_id: null,
+      failed_request_id: null,
+      operation_id: null,
+      expected_head: null,
+      current_head: null,
+      broker_book_sha256: null,
+      capture_id: null,
+      capture_digest: null,
+      book_matches_ledger: false,
+      head_matches_failure: false,
+      preview_digest: null,
+    }),
+    intent_preview: paperTickIntentPreview({
+      approval_journal_event_digests: [approvalJournalDigest],
+    }),
+    intent_targets: [],
+  };
+  const calls = renderDesk(stoppedRunner, {
+    [`GET /api/paper/${FUND}/reconciliation`]: () => json(recovery),
+  });
+
+  const section = await screen.findByTestId("tick-intent-reconciliation");
+  expect(section).toHaveTextContent("Approval journal events covered by this receipt");
+  expect(section).toHaveTextContent(approvalJournalDigest);
+  expect(calls.some((call) => call.path === `/api/paper/${FUND}/reconciliation`)).toBe(true);
 });
 
 it.each([

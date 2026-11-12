@@ -17,6 +17,7 @@ from pydantic import (
     StrictBool,
     StrictFloat,
     StrictInt,
+    StrictStr,
 )
 
 ErrorCode = Literal[
@@ -33,6 +34,8 @@ ErrorCode = Literal[
     "halted",
     "replay-corrupt",
     "reconciliation-required",
+    "unresolved-tick-intent",
+    "duplicate-logical-operation",
     "readiness-denied",
     "unsupported-filesystem",
     "private-storage-unverified",
@@ -76,6 +79,8 @@ _ERROR_CODE_STATUSES: dict[str, frozenset[int]] = {
     "halted": frozenset({423}),
     "replay-corrupt": frozenset({423}),
     "reconciliation-required": frozenset({423}),
+    "unresolved-tick-intent": frozenset({409}),
+    "duplicate-logical-operation": frozenset({409}),
     "readiness-denied": frozenset({422}),
     "unsupported-filesystem": frozenset({422}),
     "private-storage-unverified": frozenset({422}),
@@ -109,6 +114,8 @@ _RETRY_POLICIES = RETRY_POLICIES
 _SAFE_SUBJECT_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,180}")
 _SAFE_REQUEST_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
 _SAFE_HEAD = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
+_REFUSAL_OPERATION_ID = re.compile(r"[a-f0-9]{32}")
+_REFUSAL_LOGICAL_KEY = re.compile(r"[a-f0-9]{64}")
 MAX_RETRY_AFTER_SECONDS = 300
 
 
@@ -125,6 +132,7 @@ class ErrorResponse(BaseModel):
     subject_id: str | None = None
     request_id: str | None = None
     current_head: str | None = None
+    refusal: dict[str, StrictStr] | None = None
     # Advisory delay mirrored in the Retry-After header; never a promise that capacity will be free.
     retry_after_seconds: int | None = Field(default=None, ge=1, le=MAX_RETRY_AFTER_SECONDS)
 
@@ -168,6 +176,30 @@ def safe_head(value: object) -> str | None:
     return safe_identity(value, _SAFE_HEAD)
 
 
+def validate_refusal_payload(value: object) -> dict[str, str] | None:
+    if value is None:
+        return None
+    if type(value) is not dict or any(type(key) is not str or type(item) is not str for key, item in value.items()):
+        raise ValueError("operation refusal fields are invalid")
+    reason = value.get("reason")
+    if reason == "unresolved-tick-intent":
+        if (
+            set(value) != {"reason", "fund", "intent_request_id", "intent_session", "recovery"}
+            or safe_subject_id(value.get("fund")) != value.get("fund")
+            or safe_request_id(value.get("intent_request_id")) != value.get("intent_request_id")
+            or not 1 <= len(value.get("intent_session", "")) <= 256
+            or any(ord(char) < 32 or ord(char) == 127 for char in value["intent_session"])
+            or value.get("recovery") != "reconcile-tick-request"
+        ):
+            raise ValueError("unresolved tick intent fields are invalid")
+    elif reason == "duplicate-logical-operation":
+        if set(value) != {"reason", "existing_operation_id", "logical_key"} or _REFUSAL_OPERATION_ID.fullmatch(value.get("existing_operation_id", "")) is None or _REFUSAL_LOGICAL_KEY.fullmatch(value.get("logical_key", "")) is None:
+            raise ValueError("duplicate logical operation fields are invalid")
+    else:
+        raise ValueError("operation refusal reason is invalid")
+    return dict(value)
+
+
 def error_payload(
     status_code: int,
     detail: str | list[dict[str, Any]],
@@ -176,6 +208,7 @@ def error_payload(
     subject_id: object = None,
     request_id: object = None,
     current_head: object = None,
+    refusal: object = None,
     refresh_required: bool | None = None,
     retry_policy: str | None = None,
     retry_after_seconds: int | None = None,
@@ -185,6 +218,12 @@ def error_payload(
         raise ValueError(f"unknown retry policy: {retry_policy}")
     if retry_after_seconds is not None and not valid_retry_after(status_code, resolved, retry_after_seconds):
         raise ValueError("retry-after is only a bounded hint on 429/503 responses")
+    try:
+        normalized_refusal = validate_refusal_payload(refusal)
+    except (TypeError, ValueError):
+        normalized_refusal = None
+    if normalized_refusal is not None and normalized_refusal["reason"] != resolved:
+        normalized_refusal = None
     message = detail if isinstance(detail, str) else "Invalid request."
     payload = ErrorResponse(
         detail=detail,
@@ -195,9 +234,12 @@ def error_payload(
         subject_id=safe_subject_id(subject_id),
         request_id=safe_request_id(request_id),
         current_head=safe_head(current_head),
+        refusal=normalized_refusal,
         retry_after_seconds=retry_after_seconds,
     ).model_dump(exclude_none=False)
     # The hint is optional: envelopes without it keep their established shape.
+    if normalized_refusal is None:
+        payload.pop("refusal")
     if retry_after_seconds is None:
         payload.pop("retry_after_seconds")
     return payload
@@ -263,6 +305,20 @@ class PaperResumeRequest(RequestModel):
         fields = (self.failure_id, self.preview_digest, self.decision)
         if any(value is not None for value in fields) and any(value is None for value in fields):
             raise ValueError("reconciliation confirmation fields must be supplied together")
+        return self
+
+
+class PaperTickIntentReconciliationRequest(RequestModel):
+    request_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+    intent_request_id: str | None = Field(default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+    intent_digest: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+    preview_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+    decision: Literal["confirm-paper-book-matches-ledger"] = "confirm-paper-book-matches-ledger"
+
+    @model_validator(mode="after")
+    def _validate_intent_identity(self) -> PaperTickIntentReconciliationRequest:
+        if self.intent_request_id is not None and self.intent_digest is None:
+            raise ValueError("tick-intent request identity requires a digest")
         return self
 
 

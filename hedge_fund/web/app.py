@@ -34,6 +34,7 @@ from hedge_fund.web.schemas import (
     OperationPreviewRequest,
     PaperResumeRequest,
     PaperTickAcceptRequest,
+    PaperTickIntentReconciliationRequest,
     PaperTickPreviewRequest,
     RunnerPreviewRequest,
     RunnerStartAcceptRequest,
@@ -210,6 +211,7 @@ def create_app(
             subject_id=exc.subject_id if exc.subject_id is not None else _path_subject(request),
             request_id=exc.request_id,
             current_head=exc.current_head,
+            refusal=exc.refusal,
             retry_policy=exc.retry_policy,
             retry_after_seconds=exc.retry_after_seconds,
         )
@@ -313,8 +315,20 @@ def create_app(
         return service.paper_detail(name)
 
     @app.get("/api/paper/{name}/reconciliation")
-    def paper_reconciliation(name: str):
-        return service.paper_reconciliation(name)
+    def paper_reconciliation(
+        name: str,
+        intent_request_id: str | None = Query(default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"),
+        intent_digest: str | None = Query(default=None, pattern=r"^[a-f0-9]{64}$"),
+    ):
+        return service.paper_reconciliation(name, intent_request_id=intent_request_id, intent_digest=intent_digest)
+
+    @app.post("/api/paper/{name}/reconcile-tick-request")
+    def reconcile_tick_request(name: str, request: PaperTickIntentReconciliationRequest):
+        return _with_request_identity(
+            lambda: service.reconcile_tick_request(name, request),
+            request_id=request.request_id,
+            subject_id=name,
+        )
 
     @app.post("/api/paper/{name}/tick/preview", status_code=201)
     def paper_tick_preview(name: str, request: PaperTickPreviewRequest, http_request: Request):

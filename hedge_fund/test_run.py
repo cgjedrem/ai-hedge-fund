@@ -129,6 +129,66 @@ def _enroll_test_root(root):
     enroll_synthetic_root(root)
 
 
+def _accept_synthetic_web_tick(root_path, name, due_session):
+    from datetime import timedelta, timezone
+
+    from hedge_fund.paper.deployed import load_deployed
+    from hedge_fund.pipeline.session import code_version, mandate_hash
+    from hedge_fund.runtime.admission import AdmissionCoordinator, RootOwnerLease
+    from hedge_fund.runtime.capture import freeze_capture
+    from hedge_fund.runtime.configuration import resolve_settings
+    from hedge_fund.runtime.operations import OperationStore
+    from hedge_fund.runtime.root import RootContext
+
+    now = datetime.now(timezone.utc)
+    with RootContext.open(root_path) as root:
+        with RootOwnerLease.acquire(root) as owner:
+            admission = AdmissionCoordinator(root, owner_lease=owner)
+            deployed = load_deployed(root_path / "paper" / name)
+            capture = freeze_capture(
+                root=root,
+                subject_id=name,
+                mandate_digest=mandate_hash(deployed.spec),
+                universe=tuple(deployed.universe),
+                broker="paper",
+                settings=resolve_settings(root),
+                credential_versions={},
+                code_version=code_version(),
+                mandate_snapshot=deployed.spec.model_dump(mode="json"),
+            )
+            store = OperationStore(root, admission=admission)
+            payload = {
+                "kind": "manual-tick",
+                "session": due_session,
+                "expected_head": None,
+            }
+            preview = store.create_preview(
+                action="paper-tick",
+                subject_id=name,
+                expected_head=None,
+                due_set=(due_session,),
+                capture=capture,
+                operator_session="synthetic-web-operator",
+                payload=payload,
+                now=now,
+                expires_at=now + timedelta(minutes=5),
+            )
+            operation = store.accept_request(
+                request_id="synthetic-web-logical-tick",
+                action="paper-tick",
+                subject_id=name,
+                preview_id=preview.preview_id,
+                preview_digest=preview.digest,
+                confirmation_token=preview.confirmation_token,
+                operator_session="synthetic-web-operator",
+                expected_head=None,
+                due_set=(due_session,),
+                payload=payload,
+                now=now,
+            )
+            return operation.operation_id, operation.logical_key
+
+
 def test_cli_requires_explicit_root(monkeypatch, capsys):
     monkeypatch.setattr(sys, "argv", ["aihf"])
 
@@ -1460,6 +1520,251 @@ def test_cli_tick_request_replay_skips_provider_and_binds_expected_head(tmp_path
     assert "request identity conflicts" in capsys.readouterr().err
     _main(monkeypatch, "paper", "status", "alpha", "--head")
     assert capsys.readouterr().out.strip() == first["hash"]
+
+
+def test_cli_new_tick_identity_surfaces_unresolved_intent_without_effects(tmp_path, monkeypatch, capsys, offline):
+    from hedge_fund.paper.ledger import Ledger
+    from hedge_fund.runtime.admission import AdmissionCoordinator, RootOwnerLease
+    from hedge_fund.runtime.root import RootContext
+
+    path = _mandate(tmp_path)
+    _enroll_test_root(tmp_path)
+    offline("2025-01-07")
+    _main(monkeypatch, "paper", "create", "alpha", "--mandate", str(path), "--universe", "AAPL")
+    capsys.readouterr()
+
+    directory = tmp_path / "paper" / "alpha"
+    ledger = Ledger(directory)
+    interrupted_id = "interrupted-cli-tick"
+    digest = ledger.tick_request_digest(interrupted_id, expected_head=None, session=None)
+    with RootContext.open(tmp_path) as root:
+        owner = RootOwnerLease.acquire(root)
+        try:
+            admission = AdmissionCoordinator(root, owner_lease=owner)
+            with paths.bound_root(root), admission.manual_session("alpha", timeout=0):
+                ledger.log_event(
+                    "tick_intent",
+                    request_id=interrupted_id,
+                    request_action="tick",
+                    request_digest=digest,
+                    expected_head=None,
+                    requested_session=None,
+                    session="2025-01-06",
+                    durable=True,
+                )
+        finally:
+            owner.close()
+
+    events_before = ledger.events()
+    broker_before = (directory / "broker.json").read_bytes()
+
+    def forbidden_provider(*_args, **_kwargs):
+        pytest.fail("unresolved tick intent reached a provider")
+
+    monkeypatch.setattr(run, "make_data_client", forbidden_provider)
+    with pytest.raises(SystemExit) as refused:
+        _main(
+            monkeypatch,
+            "paper",
+            "tick",
+            "alpha",
+            "--expected-head",
+            "none",
+            "--request-id",
+            "new-cli-tick",
+        )
+
+    error = capsys.readouterr().err
+    assert refused.value.code != 0
+    assert "unresolved-tick-intent" in error
+    assert '"fund": "alpha"' in error
+    assert f'"intent_request_id": "{interrupted_id}"' in error
+    assert '"intent_session": "2025-01-06"' in error
+    assert '"recovery": "reconcile-tick-request"' in error
+    assert ledger.events() == events_before
+    assert ledger.sessions() == []
+    assert (directory / "broker.json").read_bytes() == broker_before
+
+
+def test_cli_duplicate_logical_refusal_surfaces_contract_fields(tmp_path, monkeypatch, capsys, offline):
+    from hedge_fund.paper.ledger import Ledger
+
+    path = _mandate(tmp_path, name="alpha")
+    _enroll_test_root(tmp_path)
+    offline("2025-01-07")
+    _main(monkeypatch, "paper", "create", "alpha", "--mandate", str(path), "--universe", "AAPL")
+    capsys.readouterr()
+
+    existing_operation_id, logical_key = _accept_synthetic_web_tick(
+        tmp_path,
+        "alpha",
+        "2025-01-06",
+    )
+    ledger = Ledger(tmp_path / "paper" / "alpha")
+    events_before = ledger.events()
+    broker_before = (ledger.directory / "broker.json").read_bytes()
+
+    with pytest.raises(SystemExit) as refused:
+        _main(
+            monkeypatch,
+            "paper",
+            "tick",
+            "alpha",
+            "--expected-head",
+            "none",
+            "--request-id",
+            "logical-cli-request",
+        )
+
+    error = capsys.readouterr().err
+    assert refused.value.code != 0
+    assert '"reason": "duplicate-logical-operation"' in error
+    assert f'"existing_operation_id": "{existing_operation_id}"' in error
+    assert f'"logical_key": "{logical_key}"' in error
+    assert ledger.events() == events_before
+    assert ledger.sessions() == []
+    assert (ledger.directory / "broker.json").read_bytes() == broker_before
+
+
+@pytest.mark.parametrize("legacy_request_id", ["crashed-cli-intent", "invalid legacy request id"])
+def test_cli_reconcile_tick_request_resolves_orphan_and_admits_tick(tmp_path, monkeypatch, capsys, offline, legacy_request_id):
+    from hedge_fund.paper.ledger import Ledger
+    from hedge_fund.runtime.admission import AdmissionCoordinator, RootOwnerLease
+    from hedge_fund.runtime.root import RootContext
+
+    path = _mandate(tmp_path, name="alpha")
+    _enroll_test_root(tmp_path)
+    offline("2025-01-07")
+    _main(monkeypatch, "paper", "create", "alpha", "--mandate", str(path), "--universe", "AAPL")
+    capsys.readouterr()
+    directory = tmp_path / "paper" / "alpha"
+    ledger = Ledger(directory)
+
+    with RootContext.open(tmp_path) as root:
+        with RootOwnerLease.acquire(root) as owner:
+            admission = AdmissionCoordinator(root, owner_lease=owner)
+            with admission.manual_session("alpha", timeout=0):
+                fields = {
+                    "request_id": legacy_request_id,
+                    "session": "2025-01-06",
+                }
+                if legacy_request_id == "crashed-cli-intent":
+                    fields.update(
+                        {
+                            "request_action": "tick",
+                            "request_digest": ledger.tick_request_digest(
+                                legacy_request_id,
+                                expected_head=None,
+                                session=None,
+                            ),
+                            "expected_head": None,
+                            "requested_session": None,
+                        }
+                    )
+                ledger.log_event("tick_intent", durable=True, **fields)
+
+    preview_args = ["paper", "reconcile-tick-request", "alpha"]
+    if legacy_request_id == "crashed-cli-intent":
+        preview_args.extend(["--intent-request-id", legacy_request_id])
+    _main(monkeypatch, *preview_args)
+    preview = json.loads(capsys.readouterr().out)
+    assert preview["preview"]["recoverable"] is True
+    intent_request_id = legacy_request_id if legacy_request_id == "crashed-cli-intent" else None
+    assert preview["preview"]["intent_request_id"] == intent_request_id
+
+    confirmation_args = [
+        "paper",
+        "reconcile-tick-request",
+        "alpha",
+        "--request-id",
+        "reconcile-cli-intent",
+        "--intent-digest",
+        preview["preview"]["intent_digest"],
+        "--preview-digest",
+        preview["preview"]["preview_digest"],
+        "--confirm",
+    ]
+    if intent_request_id is not None:
+        confirmation_args.extend(["--intent-request-id", intent_request_id])
+    _main(monkeypatch, *confirmation_args)
+    receipt = json.loads(capsys.readouterr().out)
+    assert receipt["intent_request_id"] == intent_request_id
+    assert receipt["reconciliation_id"]
+    assert ledger.unresolved_tick_intents() == ()
+
+    _main(monkeypatch, *confirmation_args)
+    replayed_receipt = json.loads(capsys.readouterr().out)
+    assert replayed_receipt == receipt
+
+    _main(
+        monkeypatch,
+        "paper",
+        "tick",
+        "alpha",
+        "--session",
+        "2025-01-06",
+        "--expected-head",
+        "none",
+        "--request-id",
+        "tick-after-cli-reconciliation",
+    )
+    assert json.loads(capsys.readouterr().out)["session"] == "2025-01-06"
+
+
+def test_cli_lists_and_reconciles_idless_intents_by_digest(tmp_path, monkeypatch, capsys, offline):
+    from hedge_fund.paper.ledger import Ledger
+    from hedge_fund.runtime.admission import AdmissionCoordinator, RootOwnerLease
+    from hedge_fund.runtime.root import RootContext
+
+    path = _mandate(tmp_path, name="alpha")
+    _enroll_test_root(tmp_path)
+    offline("2025-01-07")
+    _main(monkeypatch, "paper", "create", "alpha", "--mandate", str(path), "--universe", "AAPL")
+    capsys.readouterr()
+    ledger = Ledger(tmp_path / "paper" / "alpha")
+
+    with RootContext.open(tmp_path) as root:
+        with RootOwnerLease.acquire(root) as owner:
+            admission = AdmissionCoordinator(root, owner_lease=owner)
+            with admission.manual_session("alpha", timeout=0):
+                ledger.log_event("tick_intent", session="2025-01-06", durable=True)
+                ledger.log_event("tick_intent", session="2025-01-07", durable=True)
+
+    _main(monkeypatch, "paper", "reconcile-tick-request", "alpha")
+    initial = json.loads(capsys.readouterr().out)
+    targets = initial["targets"]
+    assert initial["preview"]["reason"] == "multiple-unresolved-tick-intents"
+    assert len(targets) == 2
+    assert all(target["intent_request_id"] is None for target in targets)
+
+    for index, target in enumerate(targets):
+        _main(
+            monkeypatch,
+            "paper",
+            "reconcile-tick-request",
+            "alpha",
+            "--intent-digest",
+            target["intent_digest"],
+        )
+        selected = json.loads(capsys.readouterr().out)["preview"]
+        assert selected["recoverable"] is True
+        assert selected["intent_digest"] == target["intent_digest"]
+        _main(
+            monkeypatch,
+            "paper",
+            "reconcile-tick-request",
+            "alpha",
+            "--request-id",
+            f"reconcile-idless-intent-{index}",
+            "--intent-digest",
+            target["intent_digest"],
+            "--preview-digest",
+            selected["preview_digest"],
+            "--confirm",
+        )
+        assert json.loads(capsys.readouterr().out)["reconciliation_id"]
+
+    assert ledger.unresolved_tick_intents() == ()
 
 
 def test_cli_halt_request_id_replays_and_conflicts_on_reason(tmp_path, monkeypatch, capsys, offline):

@@ -49,6 +49,7 @@ _MAX_LOCK_WAIT_SECONDS = 5.0
 _DENIED_FIELDS = ("apikey", "capability", "credential", "environment", "networkauthorized", "password", "pid", "process", "root", "secret", "token", "argv")
 _KEY_FIELDS = {"accesskey", "clientkey", "encryptionkey", "key", "keymaterial", "keyref", "keyvalue", "privatekey", "providerkey", "secretkey", "signingkey"}
 _LOGGER = logging.getLogger(__name__)
+DUPLICATE_LOGICAL_OPERATION_REASON = "duplicate-logical-operation"
 
 
 class OperationError(RuntimeError):
@@ -65,6 +66,27 @@ class ConfirmationRejected(OperationError):
 
 class OperationConflict(OperationError):
     """Request identity conflicts with durable state."""
+
+
+class DuplicateLogicalOperationRefusal(OperationError):
+    """Logical action already has a non-terminal operation."""
+
+    reason = DUPLICATE_LOGICAL_OPERATION_REASON
+
+    def __init__(self, existing_operation_id: str, logical_key: str) -> None:
+        self.existing_operation_id = _validate_operation_id(existing_operation_id)
+        if not isinstance(logical_key, str) or not _SHA256.fullmatch(logical_key):
+            raise OperationError("logical operation identity is invalid")
+        self.logical_key = logical_key
+        super().__init__(f"Logical action already has non-terminal operation {self.existing_operation_id}.")
+
+    @property
+    def fields(self) -> dict[str, str]:
+        return {
+            "reason": self.reason,
+            "existing_operation_id": self.existing_operation_id,
+            "logical_key": self.logical_key,
+        }
 
 
 class OperationStartUncertain(OperationError):
@@ -102,6 +124,14 @@ _UNFINISHED_STATUSES = frozenset(
         OperationStatus.ACCEPTED.value,
         OperationStatus.RUNNING.value,
         OperationStatus.CANCEL_REQUESTED.value,
+    }
+)
+_LOGICAL_DEDUP_STATUSES = frozenset(
+    {
+        OperationStatus.ACCEPTED.value,
+        OperationStatus.RUNNING.value,
+        OperationStatus.CANCEL_REQUESTED.value,
+        OperationStatus.INTERRUPTED.value,
     }
 )
 
@@ -197,6 +227,8 @@ class OperationRecord:
     fence_generation: int = 0
     created_at: str = ""
     updated_at: str = ""
+    logical_key: str | None = None
+    effects_started: bool | None = None
 
     def __post_init__(self) -> None:
         _validate_operation_id(self.operation_id)
@@ -209,6 +241,10 @@ class OperationRecord:
             raise OperationError("operation request digest is invalid")
         if not isinstance(self.capture_digest, str) or not _SHA256.fullmatch(self.capture_digest):
             raise OperationError("operation capture digest is invalid")
+        if self.logical_key is not None and (not isinstance(self.logical_key, str) or not _SHA256.fullmatch(self.logical_key)):
+            raise OperationError("operation logical key is invalid")
+        if self.effects_started is not None and type(self.effects_started) is not bool:
+            raise OperationError("operation effect state is invalid")
         if not isinstance(self.status, OperationStatus):
             raise OperationError("operation status is invalid")
         if type(self.progress) is not int or not 0 <= self.progress <= 100:
@@ -420,6 +456,16 @@ class OperationStore:
             raise OperationError("request head is invalid")
         normalized_payload = _normalize_payload(payload)
         payload_digest = _sha256(_canonical_json(normalized_payload))
+        logical_key = (
+            derive_logical_operation_key(
+                subject_id=subject_id,
+                action=action,
+                target=due_set,
+                payload_digest=payload_digest,
+            )
+            if action.startswith("paper-")
+            else None
+        )
         operator_hash = _sha256(_validate_session(operator_session).encode("utf-8"))
         token_hash = _sha256(confirmation_token.encode("utf-8"))
         request_digest = _sha256(
@@ -509,6 +555,11 @@ class OperationStore:
                     raise StalePreview("reviewed payload changed")
                 if resolved_state is not None and resolved_state != (expected_head, due_set):
                     raise StalePreview("current head or due-set changed")
+                if logical_key is not None:
+                    matching_operations = [item for item in index["operations"].values() if item.get("logical_key") == logical_key and _blocks_logical_dedup(item)]
+                    if matching_operations:
+                        existing_operation = min(matching_operations, key=lambda item: (item["created_at"], item["operation_id"]))
+                        raise DuplicateLogicalOperationRefusal(existing_operation["operation_id"], logical_key)
                 if capacity is not None:
                     capacity_actions, capacity_limit = capacity
                     unfinished = sum(1 for item in index["operations"].values() if item.get("action") in capacity_actions and item.get("status") in _UNFINISHED_STATUSES)
@@ -537,7 +588,10 @@ class OperationStore:
                     "worker_fence_hash": None,
                     "events": [{"status": OperationStatus.ACCEPTED.value, "at": timestamp}],
                     "result": None,
+                    "effects_started": False,
                 }
+                if logical_key is not None:
+                    operation_record["logical_key"] = logical_key
                 request_record = {
                     "operation_id": operation_id,
                     "request_digest": request_digest,
@@ -586,6 +640,26 @@ class OperationStore:
             self._verify_operation_sidecars(operation)
             self._verify_operation_capture(index, operation)
             return self._operation_from_index(index, operation_id)
+
+    def find_active_logical_operation(
+        self,
+        logical_key: str,
+        *,
+        exclude_operation_id: str | None = None,
+    ) -> OperationRecord | None:
+        self._require_private_storage()
+        if not isinstance(logical_key, str) or not _SHA256.fullmatch(logical_key):
+            raise OperationError("logical operation identity is invalid")
+        if exclude_operation_id is not None:
+            _validate_operation_id(exclude_operation_id)
+        with self._read_snapshot() as index:
+            selected = [operation for operation in index["operations"].values() if operation.get("logical_key") == logical_key and operation.get("operation_id") != exclude_operation_id and _blocks_logical_dedup(operation)]
+            if not selected:
+                return None
+            operation = min(selected, key=lambda item: (item["created_at"], item["operation_id"]))
+            self._verify_operation_sidecars(operation)
+            self._verify_operation_capture(index, operation)
+            return self._operation_from_index(index, operation["operation_id"])
 
     def get_by_request(self, request_id: str) -> OperationRecord | None:
         self._require_private_storage()
@@ -955,7 +1029,54 @@ class OperationStore:
             self._require_current_fence(operation, operation_id, fence)
             if operation["status"] != OperationStatus.RUNNING.value:
                 raise WorkerFenced("worker is not running")
+            self._mark_effect_started(index, operation, now=datetime.now(timezone.utc))
             return effect()
+
+    def check_if_current(self, operation_id: str, fence: WorkerFence) -> None:
+        self._require_private_storage()
+        _validate_operation_id(operation_id)
+        with self._locked_for_operation(operation_id):
+            index = self._read_index()
+            operation = self._operation_entry(index, operation_id)
+            self._verify_operation_sidecars(operation)
+            self._verify_operation_capture(index, operation)
+            self._require_current_fence(operation, operation_id, fence)
+            if operation["status"] != OperationStatus.RUNNING.value:
+                raise WorkerFenced("worker is not running")
+
+    def mark_effect_started(
+        self,
+        operation_id: str,
+        fence: WorkerFence,
+        *,
+        now: datetime,
+    ) -> OperationRecord:
+        self._require_private_storage()
+        _validate_operation_id(operation_id)
+        _validate_datetime(now)
+        with self._locked_for_operation(operation_id):
+            index = self._read_index()
+            operation = self._operation_entry(index, operation_id)
+            self._verify_operation_sidecars(operation)
+            self._verify_operation_capture(index, operation)
+            self._require_current_fence(operation, operation_id, fence)
+            if operation["status"] != OperationStatus.RUNNING.value:
+                raise WorkerFenced("operation is not running")
+            self._mark_effect_started(index, operation, now=now)
+            return self._operation_from_index(index, operation_id)
+
+    def _mark_effect_started(
+        self,
+        index: dict[str, Any],
+        operation: dict[str, Any],
+        *,
+        now: datetime,
+    ) -> None:
+        if operation.get("effects_started") is True:
+            return
+        operation["effects_started"] = True
+        operation["updated_at"] = _datetime_text(now)
+        self._persist_transition(index, operation)
 
     def recover_unfinished(self, *, now: datetime) -> tuple[OperationRecord, ...]:
         self._require_private_storage()
@@ -1284,6 +1405,8 @@ class OperationStore:
                 fence_generation=entry["fence_generation"],
                 created_at=entry["created_at"],
                 updated_at=entry["updated_at"],
+                logical_key=entry.get("logical_key"),
+                effects_started=entry.get("effects_started"),
             )
         except (KeyError, ValueError, TypeError):
             raise OperationError("operation record is invalid") from None
@@ -1496,6 +1619,12 @@ def _validate_index(index: dict[str, Any]) -> None:
         "events",
         "result",
     }
+    allowed_operation_fields = {
+        frozenset(operation_fields),
+        frozenset(operation_fields | {"logical_key"}),
+        frozenset(operation_fields | {"effects_started"}),
+        frozenset(operation_fields | {"logical_key", "effects_started"}),
+    }
     request_fields = {"operation_id", "request_digest", "preview_id", "payload_digest"}
     cancel_fields = {"operation_id", "request_digest"}
     transitions = {
@@ -1576,7 +1705,7 @@ def _validate_index(index: dict[str, Any]) -> None:
             raise OperationError("preview digest is invalid")
 
     for operation_id, operation in index["operations"].items():
-        if not isinstance(operation_id, str) or not _HEX_ID.fullmatch(operation_id) or set(operation) != operation_fields:
+        if not isinstance(operation_id, str) or not _HEX_ID.fullmatch(operation_id) or not isinstance(operation, dict) or frozenset(operation) not in allowed_operation_fields:
             raise OperationError("operation storage is invalid")
         if type(operation.get("schema")) is not int or operation["schema"] != 1 or operation.get("operation_id") != operation_id:
             raise OperationError("operation storage is invalid")
@@ -1598,6 +1727,10 @@ def _validate_index(index: dict[str, Any]) -> None:
             raise OperationError("operation storage is invalid")
         if not isinstance(operation.get("capture_digest"), str) or not _SHA256.fullmatch(operation["capture_digest"]):
             raise OperationError("operation storage is invalid")
+        if "logical_key" in operation and (not isinstance(operation["logical_key"], str) or not _SHA256.fullmatch(operation["logical_key"])):
+            raise OperationError("operation logical key is invalid")
+        if "effects_started" in operation and type(operation["effects_started"]) is not bool:
+            raise OperationError("operation effect state is invalid")
         if type(operation.get("fence_generation")) is not int or operation["fence_generation"] < 0:
             raise OperationError("operation storage is invalid")
         if type(operation.get("progress")) is not int or not 0 <= operation["progress"] <= 100:
@@ -1707,6 +1840,63 @@ def _validate_due_set(value: object) -> tuple[str, ...]:
     if not isinstance(value, tuple) or len(value) > 10000 or any(not _safe_text(item, maximum=256) for item in value) or len(set(value)) != len(value):
         raise OperationError("operation due-set is invalid")
     return value
+
+
+def paper_tick_logical_key(subject_id: object, session: object, expected_head: object) -> str:
+    """Reuse web paper-tick identity at shared tick admission."""
+    payload = _normalize_payload(
+        {
+            "kind": "manual-tick",
+            "session": session,
+            "expected_head": expected_head,
+        }
+    )
+    return derive_logical_operation_key(
+        subject_id=subject_id,
+        action="paper-tick",
+        target=(session,),
+        payload_digest=_sha256(_canonical_json(payload)),
+    )
+
+
+def derive_logical_operation_key(
+    *,
+    subject_id: object,
+    action: object,
+    target: object,
+    payload_digest: object,
+) -> str:
+    """Return canonical digest for reviewed action identity."""
+    normalized_subject = _validate_subject(subject_id)
+    normalized_action = _validate_action(action)
+    if isinstance(target, str):
+        normalized_target = (target,)
+    elif isinstance(target, (list, tuple)) and len(target) <= 10000:
+        normalized_target = tuple(target)
+    else:
+        raise OperationError("operation target is invalid")
+    normalized_target = _validate_due_set(normalized_target)
+    if not isinstance(payload_digest, str) or not _SHA256.fullmatch(payload_digest):
+        raise OperationError("reviewed payload digest is invalid")
+    return _sha256(
+        _canonical_json(
+            {
+                "subject_id": normalized_subject,
+                "action": normalized_action,
+                "target": list(normalized_target),
+                "payload_digest": payload_digest,
+            }
+        )
+    )
+
+
+def _blocks_logical_dedup(operation: Mapping[str, Any]) -> bool:
+    status = operation.get("status")
+    if status not in _LOGICAL_DEDUP_STATUSES:
+        return False
+    if status == OperationStatus.INTERRUPTED.value:
+        return operation.get("effects_started", True) is not False
+    return True
 
 
 def _validate_request_id(value: object) -> str:

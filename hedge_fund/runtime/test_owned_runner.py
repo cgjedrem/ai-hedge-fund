@@ -116,6 +116,51 @@ def test_runner_record_validators_require_timezone_aware_timestamps(tmp_path):
         assert not validate_runner_control(root, fund, nonce_hash, control)
 
 
+def test_blocked_duplicate_logical_refusal_runner_state_is_valid(tmp_path):
+    with RootContext.open(tmp_path) as root:
+        created = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        state = {
+            "schema": 1,
+            "protocol_version": PROTOCOL_VERSION,
+            "build_id": code_version(),
+            "root": root_binding(root),
+            "fund": "test-fund",
+            "nonce_hash": "a" * 64,
+            "status": "blocked",
+            "created_at": created.isoformat(),
+            "expires_at": (created + timedelta(hours=1)).isoformat(),
+            "max_sessions": 1,
+            "sessions_completed": 0,
+            "last_session": None,
+            "reason": "duplicate-logical-operation",
+            "pid": None,
+            "process_identity": None,
+            "refusal": {
+                "reason": "duplicate-logical-operation",
+                "existing_operation_id": "b" * 32,
+                "logical_key": "c" * 64,
+            },
+        }
+
+        assert validate_runner_state(root, "test-fund", state)
+
+        unresolved = {
+            **state,
+            "reason": "unresolved-tick-intent",
+            "refusal": {
+                "reason": "unresolved-tick-intent",
+                "fund": "test-fund",
+                "intent_request_id": "interrupted-tick",
+                "intent_session": "2026-01-02",
+                "recovery": "reconcile-tick-request",
+            },
+        }
+        assert validate_runner_state(root, "test-fund", unresolved)
+
+        invalid = {**state, "refusal": {**state["refusal"], "logical_key": "invalid"}}
+        assert not validate_runner_state(root, "test-fund", invalid)
+
+
 _FUND = "synthetic-runner"
 
 

@@ -351,6 +351,8 @@ def test_sibling_registry_contention_before_order_does_not_change_book(enrolled_
                     client,
                     now=lambda: datetime(2024, 6, 5, 12, tzinfo=NEW_YORK),
                     build_fund=build_fund,
+                    expected_head=first.hash,
+                    request_id="registry-contention-before-order",
                 )
     finally:
         release.set()
@@ -358,8 +360,13 @@ def test_sibling_registry_contention_before_order_does_not_change_book(enrolled_
     assert not sibling.is_alive()
     assert failures == []
     assert (directory / "broker.json").read_bytes() == book_before
-    assert Ledger(directory).latest().hash == first.hash
-    assert Ledger(directory).halted() is not None
+    ledger = Ledger(directory)
+    assert ledger.latest().hash == first.hash
+    # QA R1: pre-effect contention aborts without halting.
+    aborts = [event for event in ledger.events() if event.get("kind") == "tick_aborted" and event.get("request_id") == "registry-contention-before-order"]
+    assert len(aborts) == 1
+    assert aborts[0]["no_effects"] is True
+    assert ledger.halted() is None
     verify_root_inventory(root)
 
 
@@ -634,10 +641,14 @@ def test_noncontention_inventory_failures_are_not_retryable(enrolled_funds, monk
 @pytest.mark.parametrize("source", ["ownership", "read-body"])
 def test_noncontention_audit_failures_are_not_retryable(enrolled_funds, monkeypatch, source):
     from contextlib import contextmanager
-    from pathlib import Path
 
-    from hedge_fund.paper.ledger import AuditObservationUnavailable, LedgerError
+    from hedge_fund.paper.ledger import (
+        AuditObservationUnavailable,
+        EVENTS_FILE,
+        LedgerError,
+    )
     from hedge_fund.runtime import admission as admission_module
+    from hedge_fund.runtime.root import RootContext
 
     root, admission = enrolled_funds
     ledger = Ledger(root.path / "paper" / "alpha")
@@ -652,18 +663,22 @@ def test_noncontention_audit_failures_are_not_retryable(enrolled_funds, monkeypa
 
         monkeypatch.setattr(admission_module, "_existing_read_lock", lost_ownership)
     else:
-        original_read = Path.read_text
+        original_read = RootContext.read_bytes
+        read_attempts = []
 
-        def failed_read(candidate, *args, **kwargs):
-            if candidate == ledger.events_path:
+        def failed_read(candidate, relative, *args, **kwargs):
+            if candidate.path == ledger.directory and relative == EVENTS_FILE:
+                read_attempts.append(relative)
                 raise admission_module.WriterConflict("synthetic failure after audit admission")
-            return original_read(candidate, *args, **kwargs)
+            return original_read(candidate, relative, *args, **kwargs)
 
-        monkeypatch.setattr(Path, "read_text", failed_read)
+        monkeypatch.setattr(RootContext, "read_bytes", failed_read)
 
     with pytest.raises((LedgerError, admission_module.AdmissionError)) as caught:
         ledger.events()
     assert not isinstance(caught.value, AuditObservationUnavailable)
+    if source == "read-body":
+        assert read_attempts == [EVENTS_FILE]
 
 
 def test_busy_audit_observation_is_explicit_and_does_not_halt(enrolled_funds, monkeypatch):

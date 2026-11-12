@@ -1,6 +1,8 @@
 """The ledger: append-only, hash-chained, replayable; and the kill switch."""
 
+import hashlib
 import json
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -13,10 +15,271 @@ from hedge_fund.backtesting.test_fund import (
     WEEKDAYS,
 )
 from hedge_fund.fund import Fund, FundSpec
-from hedge_fund.paper.ledger import Ledger, LedgerError
+from hedge_fund.paper.ledger import (
+    Ledger,
+    LedgerError,
+    TICK_INTENT_RECOVERY,
+    UNRESOLVED_TICK_INTENT_REASON,
+    UnresolvedTickIntentRefusal,
+)
 from hedge_fund.pipeline.session import FundState, SessionRecord
 
 _DECISION_HASH = "0" * 64
+
+
+@pytest.fixture
+def owned_ledger(tmp_path):
+    from hedge_fund.runtime.admission import AdmissionCoordinator, RootOwnerLease
+    from hedge_fund.runtime.root import RootContext
+    from hedge_fund.test_support.handover import enroll_synthetic_root
+
+    enroll_synthetic_root(tmp_path)
+    with RootContext.open(tmp_path) as root:
+        root.mkdir("paper")
+        root.mkdir("paper/alpha")
+        with RootOwnerLease.acquire(root) as owner:
+            admission = AdmissionCoordinator(root, owner_lease=owner)
+            yield Ledger(root.path / "paper" / "alpha"), admission
+
+
+@contextmanager
+def _ledger_write_lane(admission):
+    with admission.manual_session("alpha", timeout=0):
+        yield
+
+
+def test_unresolved_intent_refusal_contract_fields():
+    refusal = UnresolvedTickIntentRefusal("alpha", "tick-001", "2026-10-31")
+
+    assert refusal.reason == UNRESOLVED_TICK_INTENT_REASON
+    assert refusal.fields == {
+        "reason": "unresolved-tick-intent",
+        "fund": "alpha",
+        "intent_request_id": "tick-001",
+        "intent_session": "2026-10-31",
+        "recovery": TICK_INTENT_RECOVERY,
+    }
+
+
+def test_unresolved_intent_query_reports_pending_request(tmp_path):
+    ledger = Ledger(tmp_path)
+    ledger.log_event(
+        "tick_intent",
+        request_id="tick-001",
+        request_action="tick",
+        request_digest="a" * 64,
+        expected_head=None,
+        requested_session=None,
+        session="2026-10-31",
+    )
+
+    unresolved = ledger.unresolved_tick_intents()
+
+    assert len(unresolved) == 1
+    assert unresolved[0].request_id == "tick-001"
+    assert unresolved[0].session == "2026-10-31"
+    assert unresolved[0].recorded_at == ledger.events()[0]["time"]
+    assert unresolved[0].metadata_complete is True
+
+
+def test_tick_readiness_guard_refuses_unresolved_intent(tmp_path):
+    ledger = Ledger(tmp_path)
+    ledger.log_event(
+        "tick_intent",
+        request_id="tick-ready",
+        request_action="tick",
+        request_digest="a" * 64,
+        expected_head=None,
+        requested_session=None,
+        session="2026-10-31",
+    )
+
+    with pytest.raises(UnresolvedTickIntentRefusal):
+        ledger.require_ready_for_tick(FundState.initial(100_000), approval_required=False)
+
+
+@pytest.mark.parametrize("outcome", ["tick", "tick_failed"])
+def test_intent_outcome_events_resolve_pending_request(tmp_path, outcome):
+    ledger = Ledger(tmp_path)
+    fields = {
+        "request_id": "tick-002",
+        "request_action": "tick",
+        "request_digest": "b" * 64,
+        "expected_head": None,
+        "requested_session": None,
+        "session": "2026-10-31",
+    }
+    ledger.log_event("tick_intent", **fields)
+    if outcome == "tick":
+        ledger.log_event("tick", **fields, result={"session": "2026-10-31", "hash": "c" * 64})
+    else:
+        ledger.log_event("tick_failed", **fields, error="RuntimeError: synthetic")
+
+    assert ledger.unresolved_tick_intents() == ()
+
+
+def test_redo_supersession_resolves_unresolved_intent(tmp_path):
+    ledger = Ledger(tmp_path)
+    ledger.log_event(
+        "tick_intent",
+        request_id="tick-redo",
+        request_action="tick",
+        request_digest="d" * 64,
+        expected_head="e" * 64,
+        requested_session="2026-10-31",
+        session="2026-10-31",
+    )
+    ledger.log_event("redo", request_id="redo-001", request_action="redo", session="2026-10-31", superseded="f" * 64)
+
+    assert ledger.unresolved_tick_intents() == ()
+
+
+def test_torn_intent_metadata_fails_closed(tmp_path):
+    ledger = Ledger(tmp_path)
+    ledger.log_event("tick_intent", request_id="tick-torn", request_action="tick", request_digest="1" * 64)
+
+    unresolved = ledger.unresolved_tick_intents()
+
+    assert len(unresolved) == 1
+    assert unresolved[0].request_id == "tick-torn"
+    assert unresolved[0].metadata_complete is False
+
+
+def test_multiple_unresolved_intents_are_reported_oldest_first(tmp_path):
+    ledger = Ledger(tmp_path)
+    for request_id, session in (("tick-oldest", "2026-10-30"), ("tick-newest", "2026-10-31")):
+        ledger.log_event(
+            "tick_intent",
+            request_id=request_id,
+            request_action="tick",
+            request_digest="2" * 64,
+            expected_head=None,
+            requested_session=None,
+            session=session,
+        )
+
+    unresolved = ledger.unresolved_tick_intents()
+
+    assert [intent.request_id for intent in unresolved] == ["tick-oldest", "tick-newest"]
+    assert [event["kind"] for event in ledger.events()] == ["tick_intent", "tick_intent"]
+
+
+def test_pre_feature_intent_event_without_new_fields_classifies_as_unresolved(owned_ledger):
+    ledger, admission = owned_ledger
+    with _ledger_write_lane(admission):
+        ledger.log_event(
+            "tick_intent",
+            request_id="legacy-tick-001",
+            session="2026-10-31",
+        )
+
+    unresolved = ledger.unresolved_tick_intents()
+
+    assert len(unresolved) == 1
+    assert unresolved[0].request_id == "legacy-tick-001"
+    assert unresolved[0].metadata_complete is False
+    assert unresolved[0].intent_digest
+
+
+def test_matching_outcome_resolves_metadata_incomplete_intent(owned_ledger):
+    ledger, admission = owned_ledger
+    with _ledger_write_lane(admission):
+        ledger.log_event(
+            "tick_intent",
+            request_id="legacy-tick-outcome",
+            session="2026-10-31",
+        )
+        ledger.log_event(
+            "tick",
+            request_id="legacy-tick-outcome",
+            session="2026-10-31",
+            result={"session": "2026-10-31", "hash": "5" * 64},
+        )
+
+    unresolved = ledger.unresolved_tick_intents()
+
+    assert unresolved == ()
+
+
+def test_unreadable_intent_sentinel_cannot_collide_with_request_id(owned_ledger):
+    ledger, admission = owned_ledger
+    with _ledger_write_lane(admission):
+        ledger.log_event(
+            "tick_intent",
+            request_id="unreadable",
+            request_action="tick",
+            request_digest="4" * 64,
+            expected_head=None,
+            requested_session=None,
+            session="2026-10-31",
+        )
+        with ledger.events_path.open("ab") as history:
+            history.write(b'{"kind":\n')
+
+    unresolved = ledger.unresolved_tick_intents()
+
+    assert len(unresolved) == 2
+    assert unresolved[0].request_id == "unreadable"
+    assert unresolved[1].request_id is None
+    assert unresolved[1].is_corrupt is True
+    assert unresolved[1].corrupt_event_digests
+
+
+def test_corruption_receipt_cannot_resolve_a_later_event_line(tmp_path):
+    from hedge_fund.paper.ledger import _control_request_digest
+    from hedge_fund.runtime.reconciliation import (
+        TickIntentReconciliationPreview,
+        TickIntentReconciliationReceipt,
+    )
+
+    ledger = Ledger(tmp_path)
+    torn_line = b'{"kind":\n'
+    corruption_digest = hashlib.sha256(torn_line.rstrip(b"\r\n")).hexdigest()
+    preview = TickIntentReconciliationPreview.create(
+        required=True,
+        recoverable=True,
+        reason="ready",
+        corrupt_event_digests=(corruption_digest,),
+        broker_book_sha256="a" * 64,
+        fill_identity_sha256="b" * 64,
+        book_matches_ledger=True,
+        head_matches_intent=True,
+    )
+    receipt = TickIntentReconciliationReceipt.create(
+        preview=preview,
+        request_id="future-corruption-receipt",
+        operator="web",
+        recorded_at="2026-11-11T00:00:00+00:00",
+    )
+    legacy_receipt = receipt.model_dump(mode="json")
+    legacy_receipt.pop("approval_journal_event_digests")
+    assert TickIntentReconciliationReceipt.model_validate(legacy_receipt).receipt_id == receipt.receipt_id
+    request_digest = _control_request_digest(
+        TICK_INTENT_RECOVERY,
+        ledger.directory.name,
+        {
+            "intent_request_id": None,
+            "intent_digest": None,
+            "preview_digest": preview.preview_digest,
+            "decision": "confirm-paper-book-matches-ledger",
+        },
+    )
+    event = {
+        "time": receipt.recorded_at,
+        "kind": "tick_intent_resolved",
+        "request_id": receipt.request_id,
+        "request_action": TICK_INTENT_RECOVERY,
+        "request_digest": request_digest,
+        "intent_request_id": None,
+        "intent_digest": None,
+        "corrupt_event_digests": [corruption_digest],
+        "decision": receipt.decision,
+        "receipt": receipt.model_dump(mode="json"),
+    }
+    ledger.events_path.write_bytes(json.dumps(event).encode("utf-8") + b"\n" + torn_line)
+
+    with pytest.raises(json.JSONDecodeError):
+        ledger.events()
 
 
 @pytest.fixture(autouse=True)

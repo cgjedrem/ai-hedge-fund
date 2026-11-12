@@ -66,6 +66,7 @@ from hedge_fund.paper.ledger import (
     LedgerError,
     PaperReconciliationRequired,
     PaperRequestConflict,
+    UnresolvedTickIntentRefusal,
 )
 from hedge_fund.paper.tick import following_session, next_session, tick
 from hedge_fund.pipeline.session import (
@@ -143,6 +144,7 @@ from hedge_fund.runtime.lifecycle import (
 from hedge_fund.runtime.operations import (
     ConfirmationExpired,
     ConfirmationRejected,
+    DuplicateLogicalOperationRefusal,
     OperationBusy,
     OperationCapacityExceeded,
     OperationConflict,
@@ -167,10 +169,19 @@ from hedge_fund.runtime.policy import (
     ProviderClass,
     ProviderTarget,
 )
-from hedge_fund.runtime.reconciliation import build_reconciliation_snapshot
+from hedge_fund.runtime.reconciliation import (
+    build_reconciliation_snapshot,
+    build_tick_intent_reconciliation_snapshot,
+    tick_intent_reconciliation_targets,
+)
 from hedge_fund.runtime.root import RootContext, RootPathError
 from hedge_fund.scorecard import score
-from hedge_fund.web.jobs import JobCancelled, JobConflict, OperationJobRegistry
+from hedge_fund.web.jobs import (
+    JobCancelled,
+    JobConflict,
+    OperationEffect,
+    OperationJobRegistry,
+)
 from hedge_fund.web.saxo_inspection import (
     SaxoInspectionCoordinator,
     SaxoInspectionError,
@@ -189,12 +200,14 @@ from hedge_fund.web.schemas import (
     OperationPreviewRequest,
     PaperResumeRequest,
     PaperTickAcceptRequest,
+    PaperTickIntentReconciliationRequest,
     PaperTickPreviewRequest,
     RETRY_POLICIES,
     RunnerPreviewRequest,
     RunnerStartAcceptRequest,
     RuntimeSettingsRequest,
     valid_retry_after,
+    validate_refusal_payload,
     ValuationRefreshRequest,
 )
 from hedge_fund.web.valuation import estimate_valuation, MAX_VALUATION_POSITIONS
@@ -223,6 +236,7 @@ class ServiceError(RuntimeError):
         subject_id: str | None = None,
         request_id: str | None = None,
         current_head: str | None = None,
+        refusal: dict[str, str] | None = None,
         retry_policy: str | None = None,
         retry_after_seconds: int | None = None,
     ) -> None:
@@ -233,6 +247,12 @@ class ServiceError(RuntimeError):
         self.subject_id = subject_id
         self.request_id = request_id
         self.current_head = current_head
+        try:
+            self.refusal = validate_refusal_payload(refusal)
+            if self.refusal is not None and self.refusal["reason"] != self.code:
+                self.refusal = None
+        except (TypeError, ValueError):
+            self.refusal = None
         if retry_policy is not None and retry_policy not in RETRY_POLICIES:
             raise ValueError(f"unknown retry policy: {retry_policy}")
         self.retry_policy = retry_policy
@@ -259,6 +279,21 @@ def _capacity_denied(subject_id: str, request_id: str) -> ServiceError:
         retry_after_seconds=OPERATION_CAPACITY_RETRY_AFTER_SECONDS,
         subject_id=subject_id,
         request_id=request_id,
+    )
+
+
+def _duplicate_logical_operation_denied(
+    subject_id: str,
+    request_id: str,
+    refusal: DuplicateLogicalOperationRefusal,
+) -> ServiceError:
+    return ServiceError(
+        409,
+        str(refusal),
+        code=refusal.reason,
+        subject_id=subject_id,
+        request_id=request_id,
+        refusal=refusal.fields,
     )
 
 
@@ -772,7 +807,13 @@ class DeskService:
             raise ServiceError(422, f"Paper fund is invalid ({type(exc).__name__}).", code="readiness-denied") from None
         return self._paper_snapshot(deployed, directory, include_records=True)
 
-    def paper_reconciliation(self, name: str) -> dict:
+    def paper_reconciliation(
+        self,
+        name: str,
+        *,
+        intent_request_id: str | None = None,
+        intent_digest: str | None = None,
+    ) -> dict:
         normalized = self._validated_name(name)
         directory, deployed, ledger, state, latest = self._paper_state(
             normalized,
@@ -781,15 +822,135 @@ class DeskService:
         self._safe_child("paper", normalized, "broker.json")
         try:
             snapshot = build_reconciliation_snapshot(directory, deployed, ledger, state, latest)
+            intent_snapshot = build_tick_intent_reconciliation_snapshot(
+                directory,
+                deployed,
+                ledger,
+                state,
+                latest,
+                intent_request_id=intent_request_id,
+                intent_digest=intent_digest,
+            )
+            intent_targets = tick_intent_reconciliation_targets(ledger)
             halted = ledger.halted()
         except (LedgerError, OSError, ValueError):
             raise ServiceError(423, "Paper state is invalid (LedgerError).", code="replay-corrupt") from None
         preview = snapshot.preview
+        intent_preview = intent_snapshot.preview
         return {
             "name": normalized,
             "halted": halted,
-            "resume_allowed": halted is not None and (not preview.required or preview.recoverable),
+            "resume_allowed": halted is not None and not intent_preview.required and (not preview.required or preview.recoverable),
             "preview": preview.model_dump(mode="json"),
+            "intent_preview": intent_preview.model_dump(mode="json"),
+            "intent_targets": intent_targets,
+        }
+
+    def reconcile_tick_request(
+        self,
+        name: str,
+        request: PaperTickIntentReconciliationRequest,
+    ) -> dict:
+        self._require_writes()
+        if not isinstance(request, PaperTickIntentReconciliationRequest):
+            raise ServiceError(400, "Tick-intent reconciliation confirmation is invalid.")
+        normalized = self._validated_name(name)
+        self._guard_protected(normalized)
+        with self._fund_lock(normalized):
+            with self._paper_control_lane(normalized):
+                directory, deployed, ledger, state, latest = self._paper_state(
+                    normalized,
+                    local_paper_only=True,
+                )
+                self._safe_child("paper", normalized, "broker.json")
+                try:
+                    prior_receipt_id = ledger.tick_intent_reconciliation_request_result(
+                        request.request_id,
+                        intent_request_id=request.intent_request_id,
+                        intent_digest=request.intent_digest,
+                        preview_digest=request.preview_digest,
+                        decision=request.decision,
+                    )
+                except PaperRequestConflict:
+                    raise ServiceError(
+                        409,
+                        "Request ID was already used for a different tick-intent reconciliation.",
+                        code="request-conflict",
+                        request_id=request.request_id,
+                    ) from None
+                except PaperReconciliationRequired:
+                    raise ServiceError(
+                        423,
+                        "Tick-intent reconciliation outcome is uncertain; inspect paper state.",
+                        code="reconciliation-required",
+                        request_id=request.request_id,
+                    ) from None
+                except LedgerError:
+                    raise ServiceError(423, "Paper state is invalid (LedgerError).", code="replay-corrupt", request_id=request.request_id) from None
+                if prior_receipt_id is not None:
+                    return {
+                        "name": normalized,
+                        "intent_request_id": request.intent_request_id,
+                        "reconciliation_id": prior_receipt_id,
+                    }
+                try:
+                    snapshot = build_tick_intent_reconciliation_snapshot(
+                        directory,
+                        deployed,
+                        ledger,
+                        state,
+                        latest,
+                        intent_request_id=request.intent_request_id,
+                        intent_digest=request.intent_digest,
+                    )
+                except (LedgerError, OSError, ValueError):
+                    raise ServiceError(423, "Paper state is invalid (LedgerError).", code="replay-corrupt", request_id=request.request_id) from None
+                preview = snapshot.preview
+                if not preview.required or preview.intent_request_id != request.intent_request_id or preview.intent_digest != request.intent_digest or preview.preview_digest != request.preview_digest:
+                    raise ServiceError(
+                        409,
+                        "Paper state changed after tick-intent reconciliation review.",
+                        code="stale-preview",
+                        request_id=request.request_id,
+                    )
+                if not preview.recoverable:
+                    raise ServiceError(
+                        423,
+                        "Tick intent remains unresolved; the local paper book does not match verified ledger state.",
+                        code="reconciliation-required",
+                        request_id=request.request_id,
+                    )
+                try:
+                    receipt_id = ledger.reconcile_tick_intent(
+                        deployed.spec.capital,
+                        confirmation=request.model_dump(mode="json"),
+                        operator="web",
+                    )
+                except PaperRequestConflict:
+                    raise ServiceError(
+                        409,
+                        "Request ID was already used for a different tick-intent reconciliation.",
+                        code="request-conflict",
+                        request_id=request.request_id,
+                    ) from None
+                except PaperReconciliationRequired:
+                    raise ServiceError(
+                        423,
+                        "Tick-intent reconciliation outcome is uncertain; inspect paper state.",
+                        code="reconciliation-required",
+                        request_id=request.request_id,
+                    ) from None
+                except LedgerError:
+                    raise ServiceError(
+                        409,
+                        "Tick-intent reconciliation review is stale or no longer valid.",
+                        code="stale-preview",
+                        request_id=request.request_id,
+                    ) from None
+        return {
+            "name": normalized,
+            "intent_request_id": request.intent_request_id,
+            "reconciliation_id": receipt_id,
         }
 
     def paper_sessions(
@@ -1165,7 +1326,11 @@ class DeskService:
             raise ServiceError(409, "Reviewed ledger head changed; review again.", code="stale-preview")
 
         def current_state() -> tuple[str | None, tuple[str, ...]]:
-            return self._resolve_paper_schedule(normalized, capture)
+            return self._resolve_paper_schedule(
+                normalized,
+                capture,
+                request_id=request.request_id,
+            )
 
         def start_worker(operation: OperationRecord) -> None:
             selected_capture = self._captures.get(operation.capture_id)
@@ -1179,12 +1344,14 @@ class DeskService:
                         selected_capture,
                         progress,
                         cancelled,
+                        _apply_if_current,
                     )
                 return self._execute_runner_start(
                     operation,
                     selected_capture,
                     progress,
                     cancelled,
+                    _apply_if_current,
                 )
 
             worker.submit(operation, work, reservation=reservation)
@@ -1217,6 +1384,8 @@ class DeskService:
                     raise ServiceError(410, "Confirmation expired; review the paper operation again.") from None
                 except (ConfirmationRejected, StalePreview):
                     raise ServiceError(409, "Reviewed paper operation is stale or no longer valid.", code="stale-preview") from None
+                except DuplicateLogicalOperationRefusal as exc:
+                    raise _duplicate_logical_operation_denied(normalized, request.request_id, exc) from None
                 except OperationCapacityExceeded:
                     raise _capacity_denied(normalized, request.request_id) from None
                 except OperationStartUncertain:
@@ -1260,6 +1429,7 @@ class DeskService:
         capture: FrozenCapture,
         progress: Callable[[int], None],
         cancelled: Callable[[], bool],
+        apply_if_current: OperationEffect,
     ) -> dict[str, object]:
         payload = dict(operation.payload)
         kind = payload.get("kind")
@@ -1311,7 +1481,12 @@ class DeskService:
                         raise ServiceError(409, "Paper ledger head changed after review.", code="stale-preview")
                     if state.halted is not None:
                         raise ServiceError(423, "Halted funds cannot run a paper tick.", code="halted")
-                    self._require_paper_work_ready(deployed, ledger, state)
+                    self._require_paper_work_ready(
+                        deployed,
+                        ledger,
+                        state,
+                        request_id=operation.request_id,
+                    )
                     if head != payload["expected_head"]:
                         raise ServiceError(409, "Paper ledger head changed after review.", code="stale-preview")
                     progress(20)
@@ -1330,6 +1505,10 @@ class DeskService:
                             )
                             if due != session:
                                 raise ServiceError(409, "Paper due-set changed after review.", code="stale-preview")
+                            store = self._operation_store
+                            if store is None:
+                                raise OperationError("paper operation store is unavailable")
+                            apply_if_current.check_current()
                             record = tick(
                                 directory,
                                 client,
@@ -1345,6 +1524,8 @@ class DeskService:
                                 capture_id=capture.capture_id,
                                 capture_digest=capture.digest,
                                 on_progress=progress,
+                                operation_store=store,
+                                on_effect_started=apply_if_current.mark_effect_started,
                             )
         except ServiceError:
             raise
@@ -1372,6 +1553,7 @@ class DeskService:
         capture: FrozenCapture,
         progress: Callable[[int], None],
         cancelled: Callable[[], bool],
+        apply_if_current: OperationEffect,
     ) -> dict[str, object]:
         payload = dict(operation.payload)
         expected = {
@@ -1417,7 +1599,9 @@ class DeskService:
         if cancelled():
             raise JobCancelled()
         progress(10)
+        apply_if_current.check_current()
         try:
+            apply_if_current.mark_effect_started()
             state = self._runner_manager.start(
                 operation.subject_id,
                 capture,
@@ -1448,6 +1632,8 @@ class DeskService:
         self,
         name: str,
         capture: FrozenCapture,
+        *,
+        request_id: str | None = None,
     ) -> tuple[str | None, tuple[str, ...]]:
         self._verify_root_inventory()
         directory, deployed, ledger, state, latest = self._paper_state(
@@ -1458,7 +1644,12 @@ class DeskService:
             raise ServiceError(409, "Paper deployment changed after review.", code="stale-preview")
         if state.halted is not None:
             raise ServiceError(423, "Halted funds cannot accept a paper operation.", code="halted")
-        self._require_paper_work_ready(deployed, ledger, state)
+        self._require_paper_work_ready(
+            deployed,
+            ledger,
+            state,
+            request_id=request_id,
+        )
         head = latest.hash if latest is not None else None
         preview_dispatch = self._authorize_manual_capture(
             capture,
@@ -3973,13 +4164,29 @@ class DeskService:
             raise ServiceError(423, f"Paper state is invalid ({type(exc).__name__}).", code="replay-corrupt") from None
         return state, latest
 
-    def _require_paper_work_ready(self, deployed: DeployedFund, ledger: Ledger, state: FundState) -> None:
+    def _require_paper_work_ready(
+        self,
+        deployed: DeployedFund,
+        ledger: Ledger,
+        state: FundState,
+        *,
+        request_id: str | None = None,
+    ) -> None:
         try:
             with self._paper_control_lane(deployed.name, verify_inventory=False):
                 if ledger.halted() is not None:
                     raise ServiceError(423, "Halted funds cannot accept a paper operation.", code="halted")
                 try:
-                    ledger.require_ready_for_work(state, approval_required=deployed.spec.approval_required)
+                    ledger.require_ready_for_tick(state, approval_required=deployed.spec.approval_required)
+                except UnresolvedTickIntentRefusal as exc:
+                    raise ServiceError(
+                        409,
+                        str(exc),
+                        code=exc.reason,
+                        subject_id=deployed.name,
+                        request_id=request_id,
+                        refusal=exc.fields,
+                    ) from None
                 except PaperReconciliationRequired:
                     if self._admission.lane_is_held("runner", deployed.name) and self._admission.lane_is_held("execution", deployed.name):
                         ledger.halt("approval journal requires reconciliation")

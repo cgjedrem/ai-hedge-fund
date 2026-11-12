@@ -22,6 +22,7 @@ from hedge_fund.paper.ledger import (
     AuditObservationUnavailable,
     Ledger,
     PaperReconciliationRequired,
+    UnresolvedTickIntentRefusal,
 )
 from hedge_fund.paper.tick import next_session, tick
 from hedge_fund.pipeline.session import code_version, mandate_hash
@@ -44,6 +45,7 @@ from hedge_fund.runtime.handover import (
     verify_ledger_head,
     verify_root_inventory,
 )
+from hedge_fund.runtime.operations import DuplicateLogicalOperationRefusal
 from hedge_fund.runtime.owned_runner import (
     OwnedRunnerError,
     read_runner_record,
@@ -341,8 +343,8 @@ def _runner_loop(
         boundary_check=dispatch_fence,
         resolver=resolver,
     )
-    last_session = None
-    sessions_completed = 0
+    last_session = status.get("last_session")
+    sessions_completed = status.get("sessions_completed", 0)
     try:
         while not stop_event.is_set():
             moment = _validated_now(now())
@@ -474,6 +476,11 @@ def _runner_loop(
             _write_status(root, fund, nonce_hash, status)
             if stop_event.is_set():
                 break
+    except (UnresolvedTickIntentRefusal, DuplicateLogicalOperationRefusal) as exc:
+        status["status"] = "blocked"
+        status["reason"] = exc.reason
+        status["refusal"] = exc.fields
+        raise
     except AuthorizationDenied as exc:
         if stop_event.is_set():
             status["status"] = "stopped"
@@ -525,6 +532,9 @@ def _execute_session(
     expires_at: datetime,
 ) -> None:
     due_set = (due,)
+    from hedge_fund.runtime.operations import OperationStore
+
+    operation_store = OperationStore(root, admission=admission)
     authorize_session(
         authorization,
         root_id=capture.root_id,
@@ -568,6 +578,7 @@ def _execute_session(
                     request_id=f"runner:{authorization.operation_id}:{due}",
                     capture_id=capture.capture_id,
                     capture_digest=capture.digest,
+                    operation_store=operation_store,
                 )
                 break
             except PaperPreflightBusy:

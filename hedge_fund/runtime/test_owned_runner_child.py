@@ -761,6 +761,91 @@ def test_runner_interrupted_redo_fails_before_provider(tmp_path):
             owner.close()
 
 
+def test_runner_duplicate_logical_refusal_is_persisted_as_blocked(tmp_path, monkeypatch):
+    from hedge_fund.brokers.account_binding import runner_quiescence, RunnerQuiescence
+    from hedge_fund.runtime import owned_runner_child
+    from hedge_fund.runtime.operations import DuplicateLogicalOperationRefusal
+    from hedge_fund.runtime.owned_runner import validate_runner_state
+
+    root_path = tmp_path / "root"
+    root_path.mkdir()
+    data_client = _OfflineDataClient()
+    data_client.release.set()
+    spec = _fund_spec()
+    refusal = DuplicateLogicalOperationRefusal("a" * 32, "b" * 64)
+
+    def refuse_tick(*_args, **_kwargs):
+        raise refusal
+
+    monkeypatch.setattr(owned_runner_child, "tick", refuse_tick)
+    with RootContext.open(root_path) as root:
+        enroll_fresh(root)
+        owner = RootOwnerLease.acquire(root)
+        admission = AdmissionCoordinator(root, owner_lease=owner)
+        try:
+            with admission.deployment_lock("alpha"):
+                directory = deploy("alpha", spec, ["AAPL"], root=root_path / "paper")
+            initial = SessionRecord(
+                fund="alpha",
+                session=_INITIAL_SESSION,
+                universe=["AAPL"],
+                nav=spec.capital,
+                cash=spec.capital,
+                positions={},
+                marks={},
+                benchmark=spec.benchmark,
+                benchmark_close=100.0,
+                rebalance=True,
+                code_version=code_version(),
+                mandate_hash=mandate_hash(spec),
+            )
+            initial.hash = initial.compute_hash()
+            with admission.runner_reservation("alpha"):
+                with admission.execution_lease("alpha"):
+                    Ledger(directory).append(initial)
+            settings = resolve_settings(
+                root,
+                launch={
+                    "data_provider": "yfinance",
+                    "model": "gemma3:4b",
+                    "endpoint": "http://127.0.0.1:11434",
+                },
+            )
+            capture = freeze_capture(
+                root=root,
+                subject_id="alpha",
+                mandate_digest=mandate_hash(spec),
+                universe=("AAPL",),
+                broker="paper",
+                settings=settings,
+                credential_versions={},
+                code_version=code_version(),
+                mandate_snapshot=spec.model_dump(mode="json"),
+            )
+            _install_runner_records(root, "alpha", capture, _INITIAL_SESSION)
+
+            with pytest.raises(DuplicateLogicalOperationRefusal) as raised:
+                run_owned_runner(
+                    root,
+                    "alpha",
+                    data_client_factory=lambda _capture, _root, dispatch: _GuardedOfflineDataClient(data_client, dispatch),
+                    build_fund=_OfflineFund,
+                    now=lambda: _RUNNER_NOW,
+                    resolver=lambda _host, _port: ["93.184.216.34"],
+                )
+
+            final = read_runner_record(root, "alpha", "state")
+            assert raised.value.fields == refusal.fields
+            assert final["status"] == "blocked"
+            assert final["reason"] == "duplicate-logical-operation"
+            assert final["refusal"] == refusal.fields
+            assert validate_runner_state(root, "alpha", final)
+            assert runner_quiescence(root, "alpha") == RunnerQuiescence(True, "blocked")
+            assert Ledger(directory).sessions() == [_INITIAL_SESSION]
+        finally:
+            owner.close()
+
+
 @pytest.mark.parametrize("journal_state", ["unfinished", "malformed"])
 def test_runner_unfinished_consumption_halts_before_provider(tmp_path, journal_state):
     from hedge_fund.pipeline.models import DecisionRecord

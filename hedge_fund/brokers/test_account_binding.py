@@ -464,8 +464,25 @@ def test_production_runner_quiescence_reads_owned_runner_records(roots):
         "pid": 4242,
         "process_identity": {"pid": 4242, "creation_time": "1", "image": "python", "host": "synthetic", "namespace": "synthetic"},
     }
-    for status, expected in (("running", RunnerQuiescence(False, "running")), ("stopping", RunnerQuiescence(False, "stopping")), ("stopped", RunnerQuiescence(True, "stopped"))):
-        root.write_bytes(state_path, json.dumps({**base, "status": status}).encode("utf-8"), mode=0o600)
+    for status, expected in (
+        ("running", RunnerQuiescence(False, "running")),
+        ("stopping", RunnerQuiescence(False, "stopping")),
+        ("stopped", RunnerQuiescence(True, "stopped")),
+        ("blocked", RunnerQuiescence(True, "blocked")),
+    ):
+        state = {**base, "status": status}
+        if status == "blocked":
+            state.update(
+                {
+                    "reason": "duplicate-logical-operation",
+                    "refusal": {
+                        "reason": "duplicate-logical-operation",
+                        "existing_operation_id": "a" * 32,
+                        "logical_key": "b" * 64,
+                    },
+                }
+            )
+        root.write_bytes(state_path, json.dumps(state).encode("utf-8"), mode=0o600)
         assert runner_quiescence(root, "demo-alpha") == expected
 
 

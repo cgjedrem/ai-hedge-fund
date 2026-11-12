@@ -7,6 +7,7 @@ const RUNNER_LABELS: Record<string, string> = {
   stopped: "Runner stopped",
   completed: "Runner completed",
   failed: "Runner error",
+  blocked: "Runner blocked",
   unknown: "Runner unverified",
 };
 

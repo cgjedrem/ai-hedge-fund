@@ -437,6 +437,14 @@ def _parser() -> argparse.ArgumentParser:
     resume = actions.add_parser("resume", help="resume only after verified reconciliation")
     resume.add_argument("name")
 
+    reconcile_tick = actions.add_parser("reconcile-tick-request", help="review or resolve an orphaned paper tick intent")
+    reconcile_tick.add_argument("name")
+    reconcile_tick.add_argument("--intent-request-id")
+    reconcile_tick.add_argument("--request-id")
+    reconcile_tick.add_argument("--intent-digest")
+    reconcile_tick.add_argument("--preview-digest")
+    reconcile_tick.add_argument("--confirm", action="store_true")
+
     approve = actions.add_parser("approve", help="approve a pending decision")
     approve.add_argument("name")
     approve.add_argument("--now", action="store_true", help="run a session now when one is due")
@@ -629,7 +637,9 @@ def _lifecycle(args, parser: argparse.ArgumentParser, root: RootContext) -> None
                 )
         print(json.dumps(result, sort_keys=True))
     except (ServiceError, AdmissionError, OperationError, RootPathError, ValueError) as exc:
-        parser.error(f"offline lifecycle denied ({type(exc).__name__}): {exc}")
+        refusal = exc.refusal if isinstance(exc, ServiceError) else None
+        detail = json.dumps(refusal, sort_keys=True) if refusal is not None else str(exc)
+        parser.error(f"offline lifecycle denied ({type(exc).__name__}): {detail}")
     finally:
         service.close()
 
@@ -1293,11 +1303,15 @@ def _run_cli_tick(
     expected_head: str | None,
     authorization=None,
 ):
+    from hedge_fund.paper.ledger import UnresolvedTickIntentRefusal
+    from hedge_fund.runtime.operations import DuplicateLogicalOperationRefusal
+
     _require_cli_sim_account_ownership(deployed.broker, parser)
 
     def execute():
         from hedge_fund.paper.ledger import PaperReconciliationRequired, PaperTickNoWork
         from hedge_fund.runtime.admission import paper_control_transition
+        from hedge_fund.runtime.operations import OperationStore
 
         _verify_enrolled_head(participant, name)
         ledger = Ledger(directory)
@@ -1332,7 +1346,10 @@ def _run_cli_tick(
                 halted = ledger.halted()
                 if halted is not None:
                     raise FundHalted(f"{name} is halted: {halted}")
-                ledger.require_ready_for_work(state, approval_required=deployed.spec.approval_required)
+                if again:
+                    ledger.require_ready_for_work(state, approval_required=deployed.spec.approval_required)
+                else:
+                    ledger.require_ready_for_tick(state, approval_required=deployed.spec.approval_required)
         except PaperReconciliationRequired:
             ledger.halt("approval journal requires reconciliation")
             raise
@@ -1420,12 +1437,18 @@ def _run_cli_tick(
                     expected_head=expected_head,
                     build_fund=build_fund,
                     request_id=request_id,
+                    operation_store=OperationStore(participant[0], admission=participant[1]),
                 )
 
-    if participant is None:
-        return execute()
-    with _paper_lane(participant, name, "manual_session"):
-        return execute()
+    try:
+        if participant is None:
+            return execute()
+        with _paper_lane(participant, name, "manual_session"):
+            return execute()
+    except UnresolvedTickIntentRefusal as exc:
+        parser.error(f"{exc.reason}: {json.dumps(exc.fields, sort_keys=True)}")
+    except DuplicateLogicalOperationRefusal as exc:
+        parser.error(f"{exc.reason}: {json.dumps(exc.fields, sort_keys=True)}")
 
 
 # ---------------------------------------------------------------------------
@@ -1581,6 +1604,81 @@ def _paper(
         parser.error("Legacy unattended paper runner controls are disabled.")
 
     directory = _fund_dir(args.name, parser)
+
+    if args.action == "reconcile-tick-request":
+        confirmation_values = (args.request_id, args.preview_digest)
+        if args.confirm:
+            if args.request_id is None or args.preview_digest is None:
+                parser.error("--confirm requires --request-id and --preview-digest")
+            if args.intent_request_id is not None and args.intent_digest is None:
+                parser.error("--intent-request-id requires --intent-digest")
+        elif any(value is not None for value in confirmation_values):
+            parser.error("confirmation fields require --confirm")
+        with _paper_writer_admission() as participant:
+            with _paper_lane(participant, args.name, "control_lane"):
+                _verify_enrolled_head(participant, args.name)
+                from hedge_fund.runtime.reconciliation import (
+                    build_tick_intent_reconciliation_snapshot,
+                    tick_intent_reconciliation_targets,
+                    TickIntentReconciliationConfirmation,
+                )
+
+                deployed = load_deployed(directory)
+                ledger = Ledger(directory)
+                if args.confirm:
+                    try:
+                        confirmation = TickIntentReconciliationConfirmation(
+                            request_id=args.request_id,
+                            intent_request_id=args.intent_request_id,
+                            intent_digest=args.intent_digest,
+                            preview_digest=args.preview_digest,
+                        )
+                        receipt_id = ledger.reconcile_tick_intent(
+                            deployed.spec.capital,
+                            confirmation=confirmation,
+                            operator="cli",
+                        )
+                    except (TypeError, ValueError, LedgerError) as exc:
+                        parser.error(f"Tick-intent reconciliation failed: {type(exc).__name__}")
+                    print(
+                        json.dumps(
+                            {
+                                "name": args.name,
+                                "intent_request_id": args.intent_request_id,
+                                "intent_digest": args.intent_digest,
+                                "reconciliation_id": receipt_id,
+                            },
+                            indent=2,
+                            sort_keys=True,
+                        )
+                    )
+                    return
+                state = ledger.replay(deployed.spec.capital, full=True)
+                latest = ledger.latest()
+                try:
+                    snapshot = build_tick_intent_reconciliation_snapshot(
+                        directory,
+                        deployed,
+                        ledger,
+                        state,
+                        latest,
+                        intent_request_id=args.intent_request_id,
+                        intent_digest=args.intent_digest,
+                    )
+                except ValueError as exc:
+                    parser.error(f"Tick-intent selector is invalid: {type(exc).__name__}")
+                print(
+                    json.dumps(
+                        {
+                            "name": args.name,
+                            "preview": snapshot.preview.model_dump(mode="json"),
+                            "targets": tick_intent_reconciliation_targets(ledger),
+                        },
+                        indent=2,
+                        sort_keys=True,
+                    )
+                )
+        return
 
     if args.action == "tick":
         if not args.enable_network:

@@ -68,7 +68,7 @@ _KEY_BYTES = 32
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _ACCOUNT_KEY = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 _RUNNER_ACTIVE = frozenset({"starting", "running", "stopping"})
-_RUNNER_TERMINAL = frozenset({"completed", "stopped", "failed"})
+_RUNNER_TERMINAL = frozenset({"blocked", "completed", "stopped", "failed"})
 
 
 class AccountBindingError(RuntimeError):

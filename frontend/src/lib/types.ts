@@ -328,11 +328,54 @@ export interface PaperReconciliationPreview {
   preview_digest: string | null;
 }
 
+export interface PaperTickIntentReconciliationPreview {
+  schema_version: 1;
+  required: boolean;
+  recoverable: boolean;
+  reason:
+    | "no-unresolved-tick-intent"
+    | "multiple-unresolved-tick-intents"
+    | "intent-not-found"
+    | "ledger-head-changed"
+    | "broker-not-local-paper"
+    | "broker-book-unavailable"
+    | "broker-book-invalid"
+    | "broker-book-changed"
+    | "broker-book-mismatch"
+    | "approval-journal-incomplete"
+    | "ready";
+  intent_request_id: string | null;
+  intent_session: string | null;
+  intent_digest: string | null;
+  metadata_complete: boolean | null;
+  corrupt_event_digests: string[];
+  approval_journal_event_digests: string[];
+  expected_head: string | null;
+  current_head: string | null;
+  broker_book_sha256: string | null;
+  fill_identity_sha256: string;
+  book_matches_ledger: boolean;
+  head_matches_intent: boolean;
+  decision: "confirm-paper-book-matches-ledger";
+  residual_uncertainty: "external-broker-state-not-applicable-local-paper-only";
+  preview_digest: string | null;
+}
+
 export interface PaperReconciliation {
   name: string;
   halted: string | null;
   resume_allowed: boolean;
   preview: PaperReconciliationPreview;
+  intent_preview: PaperTickIntentReconciliationPreview;
+  intent_targets: PaperTickIntentReconciliationTarget[];
+}
+
+export interface PaperTickIntentReconciliationTarget {
+  intent_request_id: string | null;
+  intent_session: string | null;
+  intent_digest: string;
+  recorded_at: string | null;
+  metadata_complete: boolean;
 }
 
 export interface PaperSessionsCollection {
