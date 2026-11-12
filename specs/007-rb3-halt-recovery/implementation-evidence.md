@@ -137,3 +137,24 @@ US1 passed and was checkpointed in commit `a66b3ae0023643a838681e338c2cacf2f3b76
   Result: `7 passed in 61.32s`, exit `0`; started `2026-11-12T14:35:25.4563508+01:00`, ended `2026-11-12T14:36:34.1308835+01:00`, wall `68.675s`.
 - Black (`--check --line-length 420`; `3 files unchanged`), isort (`--check-only --profile black`), flake8 (`--max-line-length=420 --extend-ignore=E203`), and `git diff --check` passed.
 - Source/test diff against `2bd7280b868cd75d5c0e750da9989b55337b83a2`: SHA-256 `9c02066423b4908515319a39f8ad0745467c1a63973598b731dc35792fcd7e53`, `8,846` bytes; paths: `hedge_fund/paper/ledger.py`, `hedge_fund/paper/test_ledger.py`, `hedge_fund/web/test_recovery.py`. No raw-write primitive added.
+
+## QA review rework cycle 1 — finding 3
+
+- Test-first red against checkpoint `b83970873c2b8db398d2c1192357dde02cb7fbe3`:
+
+  ```text
+  python.exe -m pytest hedge_fund/runtime/test_owned_runner_child.py::test_runner_orphaned_tick_intent_is_blocked_without_halt hedge_fund/test_run.py::test_cli_again_allows_orphaned_tick_intent_to_be_superseded -q
+  ```
+
+  Result: `2 failed in 28.47s`, exit `1`; started `2026-11-12T14:39:42.9103946+01:00`, ended `2026-11-12T14:40:15.1289709+01:00`, wall `32.219s`. Runner did not surface `UnresolvedTickIntentRefusal`; CLI `--again` raised `PaperReconciliationRequired` before redo.
+- Fix: runner work preflight and CLI `--again` redo preflight set `allow_tick_intents=True`. Tick execution still owns the runner refusal; `redo()` still owns supersession.
+- Final focused command repeated both new tests; result `2 passed in 33.23s`, exit `0`; started `2026-11-12T14:40:28.2443949+01:00`, ended `2026-11-12T14:41:05.0623189+01:00`, wall `36.818s`.
+- Adjacent runner, CLI, and redo slice:
+
+  ```text
+  python.exe -m pytest hedge_fund/runtime/test_owned_runner_child.py::test_runner_orphaned_tick_intent_is_blocked_without_halt hedge_fund/runtime/test_owned_runner_child.py::test_runner_interrupted_redo_fails_before_provider hedge_fund/runtime/test_owned_runner_child.py::test_runner_unfinished_consumption_halts_before_provider hedge_fund/runtime/test_owned_runner_child.py::test_runner_duplicate_logical_refusal_is_persisted_as_blocked hedge_fund/test_run.py::test_cli_again_allows_orphaned_tick_intent_to_be_superseded hedge_fund/test_run.py::test_cli_interrupted_redo_denies_before_provider_and_allows_halt hedge_fund/paper/test_ledger.py::test_redo_supersession_resolves_unresolved_intent -q
+  ```
+
+  Result: `8 passed in 62.15s`, exit `0`; started `2026-11-12T14:41:30.9490462+01:00`, ended `2026-11-12T14:42:36.0564411+01:00`, wall `65.107s`. An earlier adjacent selector used the Ledger test name under `paper/test_tick.py`; pytest collected no tests and exited `4` in `3.73s`. Corrected selector targets `paper/test_ledger.py`.
+- Isort (`--check-only --profile black`), flake8 (`--max-line-length=420 --extend-ignore=E203`) across all four changed Python files, and `git diff --check` passed. Black passed on `run.py`, `test_run.py`, and `runtime/test_owned_runner_child.py` (`3 files unchanged`). Whole-file Black check of `runtime/owned_runner_child.py` reports one pre-existing blank-line delta at line 545, outside this diff; left unchanged per no-reformat constraint.
+- Source/test diff against `b83970873c2b8db398d2c1192357dde02cb7fbe3`: SHA-256 `26fe08e14181b851623d5b975a2eea199e3e964a979d229b984f2172f2f13889`, `8,319` bytes; paths: `hedge_fund/run.py`, `hedge_fund/runtime/owned_runner_child.py`, `hedge_fund/runtime/test_owned_runner_child.py`, `hedge_fund/test_run.py`. No raw-write primitive added.

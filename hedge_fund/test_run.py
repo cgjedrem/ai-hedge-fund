@@ -1843,6 +1843,54 @@ def test_cli_interrupted_redo_denies_before_provider_and_allows_halt(tmp_path, m
     assert ledger.halted() == "emergency"
 
 
+def test_cli_again_allows_orphaned_tick_intent_to_be_superseded(tmp_path, monkeypatch, capsys, offline):
+    from hedge_fund.paper.ledger import Ledger
+    from hedge_fund.runtime.admission import AdmissionCoordinator, RootOwnerLease
+    from hedge_fund.runtime.root import RootContext
+
+    path = _mandate(tmp_path)
+    _enroll_test_root(tmp_path)
+    offline("2025-01-07")
+    _main(monkeypatch, "paper", "create", "alpha", "--mandate", str(path), "--universe", "AAPL")
+    _main(monkeypatch, "paper", "tick", "alpha")
+    original = json.loads(capsys.readouterr().out)
+    ledger = Ledger(tmp_path / "paper" / "alpha")
+    latest = ledger.latest()
+    assert latest is not None
+    intent_request_id = "orphaned-cli-redo-intent"
+    intent_digest = ledger.tick_request_digest(
+        intent_request_id,
+        expected_head=latest.prev_hash,
+        session=latest.session,
+    )
+    with RootContext.open(tmp_path) as root:
+        owner = RootOwnerLease.acquire(root)
+        try:
+            admission = AdmissionCoordinator(root, owner_lease=owner)
+            with paths.bound_root(root), admission.manual_session("alpha", timeout=0):
+                ledger.log_event(
+                    "tick_intent",
+                    request_id=intent_request_id,
+                    request_action="tick",
+                    request_digest=intent_digest,
+                    expected_head=latest.prev_hash,
+                    requested_session=latest.session,
+                    session=latest.session,
+                    durable=True,
+                )
+        finally:
+            owner.close()
+
+    assert len(ledger.unresolved_tick_intents()) == 1
+    _main(monkeypatch, "paper", "tick", "alpha", "--again")
+
+    redone = json.loads(capsys.readouterr().out)
+    assert redone["session"] == original["session"]
+    assert ledger.halted() is None
+    assert ledger.unresolved_tick_intents() == ()
+    assert any(event["kind"] == "redo" and event.get("session") == original["session"] for event in ledger.events())
+
+
 def test_cli_halt_does_not_wait_for_a_busy_control_lane(tmp_path, monkeypatch, capsys, offline):
     from threading import Event, Thread
 
