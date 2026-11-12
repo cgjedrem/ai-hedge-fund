@@ -76,6 +76,74 @@ def _spec():
     )
 
 
+def test_attestation_artifact_round_trip_rejects_another_root(tmp_path):
+    first_path = tmp_path / "attestation-root-a"
+    second_path = tmp_path / "attestation-root-b"
+    first_path.mkdir()
+    second_path.mkdir()
+
+    with RootContext.open(first_path) as first, RootContext.open(second_path) as second:
+        record = handover._new_attestation_artifact(
+            first,
+            kind="protected-fund-inclusion",
+            subject="umbrella",
+            evidence={"source_inventory_digest": "1" * 64},
+            source_evidence_digest="2" * 64,
+            operator_statement="I confirm this synthetic fund belongs to this destination.",
+            recorded_at="2026-11-12T10:00:00+00:00",
+        )
+        round_trip = json.loads(json.dumps(record))
+
+        assert handover._validate_attestation_artifact(first, round_trip) == record
+        with pytest.raises(HandoverError, match="identity"):
+            handover._validate_attestation_artifact(second, round_trip)
+
+
+@pytest.mark.parametrize(
+    ("kind", "evidence", "recorded_at"),
+    [
+        ([], {}, "2026-11-12T10:00:00+00:00"),
+        ("protected-fund-inclusion", {"invalid": object()}, "2026-11-12T10:00:00+00:00"),
+        ("protected-fund-inclusion", {}, ""),
+    ],
+)
+def test_attestation_artifact_rejects_invalid_schema_values(tmp_path, kind, evidence, recorded_at):
+    root_path = tmp_path / "invalid-attestation"
+    root_path.mkdir()
+    with RootContext.open(root_path) as root:
+        with pytest.raises(HandoverError, match="attestation"):
+            handover._new_attestation_artifact(
+                root,
+                kind=kind,
+                subject="umbrella",
+                evidence=evidence,
+                source_evidence_digest="2" * 64,
+                operator_statement="I confirm this synthetic fund belongs to this destination.",
+                recorded_at=recorded_at,
+            )
+
+
+def test_attestation_artifact_storage_is_root_private_and_refuses_overwrite(tmp_path):
+    root_path = tmp_path / "attestation-storage"
+    root_path.mkdir()
+    with RootContext.open(root_path) as root:
+        root.prepare_private_storage()
+        record = handover._new_attestation_artifact(
+            root,
+            kind="protected-fund-inclusion",
+            subject="umbrella",
+            evidence={"source_inventory_digest": "1" * 64},
+            source_evidence_digest="2" * 64,
+            operator_statement="I confirm this synthetic fund belongs to this destination.",
+            recorded_at="2026-11-12T10:00:00+00:00",
+        )
+        relative = handover._write_attestation_artifact(root, record)
+
+        assert json.loads(root.read_bytes(relative)) == record
+        with pytest.raises(HandoverError, match="already exists"):
+            handover._write_attestation_artifact(root, record)
+
+
 def test_fresh_enrollment_requires_empty_root_and_records_fixed_identity(tmp_path):
     root = tmp_path / "fresh"
     root.mkdir()

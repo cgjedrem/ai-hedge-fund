@@ -32,6 +32,7 @@ from hedge_fund.runtime.exclusion import out_of_band_exclusion_basis
 from hedge_fund.runtime.exclusion import UNPROVEN_REASON as EXCLUSION_UNPROVEN_REASON
 from hedge_fund.runtime.ownership import process_identity, ProcessIdentityError
 from hedge_fund.runtime.root import (
+    _windows_current_user_sid,
     ensure_unique_resource_name,
     PRIVATE_ROOT,
     RootContext,
@@ -42,7 +43,12 @@ HANDOVER_PATH = f"{PRIVATE_ROOT}/handover.json"
 RECOVERY_ROOT = f"{PRIVATE_ROOT}/recoveries"
 SINGLE_WRITER_STATE_PATH = f"{PRIVATE_ROOT}/single-writer.json"
 SINGLE_WRITER_CHALLENGE_PATH = f"{PRIVATE_ROOT}/single-writer-review.json"
+SOURCE_EVIDENCE_PATH = f"{PRIVATE_ROOT}/source-evidence.json"
+RELOCATION_STATE_PATH = f"{PRIVATE_ROOT}/relocation-copy.json"
+ATTESTATION_ROOT = f"{PRIVATE_ROOT}/attestations"
+RETIRED_MARKER_ROOT = f"{ATTESTATION_ROOT}/retired-markers"
 _SHA256 = re.compile(r"[a-f0-9]{64}")
+_WINDOWS_SID = re.compile(r"S-\d(?:-\d+){1,15}", re.IGNORECASE | re.ASCII)
 _MAX_RECORD_BYTES = 2 * 1024 * 1024
 _MAX_TRUST_RECORD_BYTES = 64 * 1024
 _MAX_TRUST_REVIEW_AGE = timedelta(minutes=15)
@@ -99,6 +105,8 @@ RELOCATED_TOP_LEVEL = ("mandates", "paper", "research")
 _MAX_RELOCATION_FILES = 50000
 _MAX_RELOCATION_FILE_BYTES = 256 * 1024 * 1024
 _MAX_RELOCATION_TOTAL_BYTES = 2 * 1024 * 1024 * 1024
+_PROTECTED_RESOURCE_NAMES = frozenset({"umbrella", "watchtower", "watchtower-weekly"})
+_ATTESTATION_KINDS = frozenset({"stale-marker-retirement", "protected-fund-inclusion"})
 
 
 _OBSERVATION_CONTEXT = threading.local()
@@ -200,7 +208,7 @@ def root_binding(root: RootContext) -> dict[str, Any]:
 
 
 def _runtime_scope_identity(root: RootContext) -> dict[str, Any]:
-    """Return runtime scope shared by processes in this container or host boot."""
+    """Return stable runtime scope for participating processes."""
     if not isinstance(root, RootContext):
         raise TypeError("an explicit RootContext is required")
     if sys.platform.startswith("linux"):
@@ -232,7 +240,20 @@ def _runtime_scope_identity(root: RootContext) -> dict[str, Any]:
             "namespace": namespace,
         }
     if os.name == "nt" or sys.platform.startswith("win"):
-        raise HandoverError("Windows runtime identity is unavailable; trusted single-writer mode is disabled")
+        try:
+            machine = root.host_identity.strip()
+            volume = root.device_identity.strip()
+            operator_sid = _windows_current_user_sid()
+        except (OSError, ValueError, AttributeError) as exc:
+            raise HandoverError("Windows runtime scope identity is unavailable") from exc
+        if not machine or machine.casefold() == "unknown" or not volume or not isinstance(operator_sid, str) or not _WINDOWS_SID.fullmatch(operator_sid):
+            raise HandoverError("Windows runtime scope identity is incomplete")
+        return {
+            "kind": "windows-user-volume",
+            "machine": machine.casefold(),
+            "operator_sid": operator_sid.upper(),
+            "volume": volume.casefold(),
+        }
     raise HandoverError("runtime scope identity is unsupported")
 
 
@@ -718,6 +739,138 @@ def _write_private_json(root: RootContext, relative: str, record: dict[str, Any]
     if len(payload) > _MAX_TRUST_RECORD_BYTES:
         raise HandoverError("single-writer record exceeds its storage bound")
     root.write_bytes(relative, payload, mode=stat.S_IRUSR | stat.S_IWUSR)
+
+
+def _attestation_path(kind: str, subject: str) -> str:
+    if not isinstance(kind, str) or kind not in _ATTESTATION_KINDS or not isinstance(subject, str) or not subject:
+        raise HandoverError("attestation identity is invalid")
+    key = hashlib.sha256(subject.encode("utf-8")).hexdigest()
+    return f"{ATTESTATION_ROOT}/{kind}/{key}.json"
+
+
+def _new_attestation_artifact(
+    root: RootContext,
+    *,
+    kind: str,
+    subject: str,
+    evidence: dict[str, Any],
+    source_evidence_digest: str,
+    operator_statement: str,
+    recorded_at: str | None = None,
+) -> dict[str, Any]:
+    if not isinstance(root, RootContext):
+        raise TypeError("an explicit RootContext is required")
+    if not isinstance(kind, str) or kind not in _ATTESTATION_KINDS:
+        raise HandoverError("attestation kind is invalid")
+    if not isinstance(subject, str) or not subject or not isinstance(evidence, dict):
+        raise HandoverError("attestation subject or evidence is invalid")
+    if not isinstance(source_evidence_digest, str) or not _SHA256.fullmatch(source_evidence_digest):
+        raise HandoverError("attestation source evidence digest is invalid")
+    if not isinstance(operator_statement, str) or not operator_statement.strip() or len(operator_statement) > 1024:
+        raise HandoverError("attestation operator statement is invalid")
+    body = {
+        "schema": 1,
+        "kind": kind,
+        "subject": subject,
+        "evidence": evidence,
+        "source_evidence_digest": source_evidence_digest,
+        "operator_statement": operator_statement,
+        "recorded_at": recorded_at if recorded_at is not None else datetime.now(timezone.utc).isoformat(timespec="microseconds"),
+        "root_binding": root_binding(root),
+    }
+    try:
+        record = {**body, "record_digest": _digest(body)}
+    except (TypeError, ValueError, OverflowError):
+        raise HandoverError("attestation artifact is not serializable") from None
+    _validate_attestation_artifact(root, record)
+    return record
+
+
+def _validate_attestation_artifact(
+    root: RootContext,
+    record: object,
+    *,
+    kind: str | None = None,
+    subject: str | None = None,
+    source_evidence_digest: str | None = None,
+) -> dict[str, Any]:
+    expected_fields = {
+        "schema",
+        "kind",
+        "subject",
+        "evidence",
+        "source_evidence_digest",
+        "operator_statement",
+        "recorded_at",
+        "root_binding",
+        "record_digest",
+    }
+    if not isinstance(root, RootContext) or not isinstance(record, dict) or set(record) != expected_fields:
+        raise HandoverError("attestation artifact fields are invalid")
+    body = {key: value for key, value in record.items() if key != "record_digest"}
+    statement = record["operator_statement"]
+    try:
+        expected_digest = _digest(body)
+        payload = json.dumps(record, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")
+    except (TypeError, ValueError, OverflowError):
+        raise HandoverError("attestation artifact is not serializable") from None
+    if (
+        type(record["schema"]) is not int
+        or record["schema"] != 1
+        or not isinstance(record["kind"], str)
+        or record["kind"] not in _ATTESTATION_KINDS
+        or (kind is not None and record["kind"] != kind)
+        or not isinstance(record["subject"], str)
+        or not record["subject"]
+        or len(record["subject"]) > 4096
+        or not isinstance(record["evidence"], dict)
+        or not isinstance(record["source_evidence_digest"], str)
+        or not _SHA256.fullmatch(record["source_evidence_digest"])
+        or (source_evidence_digest is not None and record["source_evidence_digest"] != source_evidence_digest)
+        or not isinstance(statement, str)
+        or not statement.strip()
+        or len(statement) > 1024
+        or any(ord(char) < 32 and char not in "\t\n\r" for char in statement)
+        or not _valid_timestamp(record["recorded_at"])
+        or record["root_binding"] != root_binding(root)
+        or (subject is not None and record["subject"] != subject)
+        or record["record_digest"] != expected_digest
+    ):
+        raise HandoverError("attestation artifact identity is invalid")
+    if len(payload) > _MAX_TRUST_RECORD_BYTES:
+        raise HandoverError("attestation artifact exceeds its storage bound")
+    return record
+
+
+def _read_attestation_artifact(
+    root: RootContext,
+    *,
+    kind: str,
+    subject: str,
+) -> dict[str, Any] | None:
+    path = _attestation_path(kind, subject)
+    try:
+        record = _read_private_json(root, path)
+    except FileNotFoundError:
+        return None
+    return _validate_attestation_artifact(root, record, kind=kind, subject=subject)
+
+
+def _write_attestation_artifact(root: RootContext, record: dict[str, Any]) -> str:
+    validated = _validate_attestation_artifact(root, record)
+    if not root.verify_private_storage():
+        raise HandoverError("destination private storage is not verified")
+    relative = _attestation_path(validated["kind"], validated["subject"])
+    try:
+        root.file_info(relative)
+    except FileNotFoundError:
+        pass
+    else:
+        raise HandoverError("attestation already exists; inspect the destination root")
+    directory = relative.rsplit("/", 1)[0]
+    root.mkdir(directory, parents=True, mode=0o700)
+    _write_private_json(root, relative, validated)
+    return relative
 
 
 def _remove_single_writer_challenge(root: RootContext) -> None:
