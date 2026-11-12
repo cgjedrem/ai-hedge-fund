@@ -30,18 +30,26 @@ All findings verified against commit `b6aefe5cf04753265168ec32bcb02976932a9588` 
 - **Rationale**: FR-005; the names are the operator's real funds and must stay under their original names (spec User Story 3).
 - **Alternatives considered**: archive-then-recreate under new names (rejected: changes fund identity and history addressing; user requires original funds kept); blanket removal of the protected set (rejected: destroys a deliberate safeguard).
 
-## R5 — Enrollment/trust sequence after code changes
+## R5 — Enrollment/trust sequence after code changes (revised after plan review)
 
-- **Decision**: Final operator sequence (native, both roots NTFS):
-  1. `aihf --root C:\Users\ChristianGjedrem\.hedge-fund handover inspect-source` (read-only inventory of source)
-  2. Resolve blockers on the source record: per-fund protected-name attestations; stale-marker retirement with liveness evidence
-  3. `aihf --root C:\Users\ChristianGjedrem\aihf-data handover relocate-from C:\Users\ChristianGjedrem\.hedge-fund --content-digest DIGEST` (verified copy incl. settings)
-  4. `aihf --root C:\Users\ChristianGjedrem\aihf-data handover inspect` (issues challenge)
-  5. `aihf --root C:\Users\ChristianGjedrem\aihf-data handover trust-single-writer --inventory-digest DIGEST --operator-acknowledgement "EXACT STATEMENT"`
-  6. Launch native TUI against the new root; synthetic-fund write smoke precedes real-fund use
-- **Rationale**: every step is an existing ceremony shape; only R1/R2-gap/R3/R4 are new code.
-- **Note**: exact subcommand names/flags are contract-level decisions finalized in `contracts/handover-cli.md` during Phase 1; the sequence above is the design baseline.
+- **Decision**: Final operator sequence (native, both roots NTFS; source tree read-only throughout):
+  1. `aihf --root C:\Users\ChristianGjedrem\.hedge-fund handover inspect-source --evidence-out PATH` (read-only inventory; evidence bundle written OUTSIDE the source)
+  2. `aihf --root C:\Users\ChristianGjedrem\aihf-data handover relocate-copy <source> --content-digest DIGEST` (verified copy incl. settings; no enrollment, no target inventory validation yet)
+  3. On the destination: `handover attest-stale-marker` ×2 and `handover attest-protected-fund` ×3, each hash-bound to the source evidence bundle; marker retirement applied at the destination only
+  4. `aihf --root C:\Users\ChristianGjedrem\aihf-data handover relocate-finalize` (attestation-aware target inventory validation + enrollment — reachable only because destination-bound attestations predate it, `handover.py:1033-1045`)
+  5. `aihf --root C:\Users\ChristianGjedrem\aihf-data handover inspect` (issues challenge)
+  6. `aihf --root C:\Users\ChristianGjedrem\aihf-data handover trust-single-writer --inventory-digest DIGEST --operator-acknowledgement "EXACT STATEMENT"`
+  7. Launch native TUI against the new root; synthetic-fund write smoke precedes real-fund use
+- **Rationale**: every step is an existing ceremony shape; only R1/R2-gap/R3/R4 plus the review-mandated root-layer authorization and TUI admitted operations are new code. Source-side attestation was rejected (plan review): it would mutate the source before relocation is verified, violating FR-007.
+- **Note**: exact subcommand names/flags are contract-level decisions finalized in `contracts/handover-cli.md`; the sequence above is the design baseline.
 
 ## R6 — PR11 relationship
 
-- **Decision**: No dependency. PR11 (`cgjedrem-didactic-meme`, head `da6cfee1`, tick-intent fencing + operation dedup) does not touch `runtime/root.py`, `runtime/handover.py`, or the migration contract, and leaves protected production funds and platform work out of scope. This feature proceeds on `main`; if PR11 merges first, rebase and re-run targeted admission tests.
+- **Decision**: No dependency, and now merged: PR11 landed in `main` as `448056f` (2026-11-12) during this feature's planning. It touches tick-intent fencing and operation dedup, not `runtime/root.py` or the handover attestation surface; this feature rebases onto it. The spec numbering collision (PR11 used `specs/006-paper-writer-safety`) is resolved by numbering this feature 007.
+
+## R7 — Plan-review findings incorporated (2026-11-12)
+
+- Destination-bound attestation stage before target inventory validation (was: source-side attestation — unreachable and source-mutating).
+- Root-bound, attestation-aware authorization in `root.py` `_relative_parts` and `admission.py` resource validation (was: inventory-only exception — insufficient for relocation or writes).
+- TUI admitted write operations with owner/lane acquisition and operation-bound authorization at `tui/funds.py:34-45` and `tui/paper.py:511-516` (was: "no TUI changes" — FR-001 unreachable).
+- FR-006 scoped to participating writers; unaware external-writer exclusion recorded as an operator prerequisite per `docs/governance/web-migration-contract.md:204-225`.

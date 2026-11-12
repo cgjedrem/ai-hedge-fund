@@ -1,6 +1,6 @@
 # Feature Specification: Native Single-User Writable Access for Existing Funds
 
-**Feature Branch**: `cgjedrem-cautious-spork` (app-managed worktree; branch creation skipped, numbering applied — computed name `006-windows-writable-access`)
+**Feature Branch**: `cgjedrem-cautious-spork` (app-managed worktree; branch creation skipped, numbering applied — computed name `007-windows-writable-access`)
 
 **Created**: 2026-11-12
 
@@ -56,7 +56,7 @@ The operator resolves the protected fund names and stale `runner.pid` markers th
 
 ### Edge Cases
 
-- A second writer process (cooperating or unaware) attempts writes while the trusted writer is active: the attempt is denied or serialized, never interleaved.
+- A second participating writer process attempts writes while the trusted writer is active: the attempt is denied or serialized by the admission locks, never interleaved. (An unaware external program writing the files directly cannot be fenced by the engine; excluding such programs is a recorded operator prerequisite of the trust grant.)
 - Enablement is interrupted mid-procedure (crash, power loss): re-running resumes or safely restarts without corrupting the root or producing a half-trusted state.
 - A stale trust record from a previous machine/runtime scope is presented: it is denied and a fresh challenge is required.
 - The relocation copy is interrupted: the source root remains untouched and authoritative; the partial target is discarded or clearly marked incomplete.
@@ -71,7 +71,7 @@ The operator resolves the protected fund names and stale `runner.pid` markers th
 - **FR-003**: The system MUST require an explicit, recorded operator acknowledgement bound to an exact root inventory before any write is enabled.
 - **FR-004**: The system MUST provide a supported, attestation-based resolution for stale runner markers that records evidence and never silently deletes them.
 - **FR-005**: The system MUST provide a supported, attestation-based inclusion path for the protected funds `umbrella`, `watchtower`, and `watchtower-weekly` under their original names.
-- **FR-006**: The system MUST continue to deny writes from any second concurrent writer and from stale or mismatched trust records.
+- **FR-006**: The system MUST continue to deny writes from any second concurrent participating writer (any writer using the engine's admission/locking machinery) and from stale or mismatched trust records. Exclusion of unaware external programs that write the files directly is an operator prerequisite for the trust grant, not a system guarantee.
 - **FR-007**: If data relocation is part of the procedure, the source root MUST remain intact and authoritative until the destination is verified against an identity manifest with hashes, and a rollback path MUST exist.
 - **FR-008**: The enabled surface MUST deny all writes with a clear reason whenever any precondition (inventory match, trust validity, single-writer exclusivity) is not met.
 - **FR-009**: The procedure MUST NOT require renaming protected funds, forging enrollment records, disabling admission checks, or rewriting ledger hashes.
@@ -92,7 +92,7 @@ The operator resolves the protected fund names and stale `runner.pid` markers th
 - **SC-001**: The operator can open the supported interface and complete a write operation (e.g., a paper tick) on every existing fund, including the three protected funds, with 100% of pre-existing ledger records verifying byte-identically afterward.
 - **SC-002**: The full enablement procedure, excluding operator reading time, completes in under 30 minutes on the operator's machine.
 - **SC-003**: Zero data loss: a post-cutover comparison of source and destination manifests shows 100% hash match across all fund data, and the original root remains intact until the operator explicitly authorizes its retirement.
-- **SC-004**: Every denial path (second writer, stale trust, inventory mismatch) is exercised in testing and produces a clear, actionable error message in 100% of tested cases.
+- **SC-004**: Every denial path (second participating writer, stale trust, inventory mismatch) is exercised in testing and produces a clear, actionable error message in 100% of tested cases.
 - **SC-005**: Every trust grant and attestation is reconstructible from on-disk artifacts alone, with no information available only in chat or session logs.
 
 ## Assumptions
