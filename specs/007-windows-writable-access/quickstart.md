@@ -15,17 +15,18 @@ Validation uses synthetic test-owned roots only until the separately authorized 
 
 ## Scenario B — End-to-end synthetic rehearsal (pre-cutover gate)
 
-On synthetic fixtures replicating the real root's shape (three protected-named funds, two stale `runner.pid` markers, settings file):
+On synthetic fixtures replicating the real root's shape (three protected-named funds, two stale `runner.pid` markers, settings file). The synthetic source tree is hash-snapshotted before and after to prove zero source mutation:
 
-1. `aihf --root SYNTH_SRC handover inspect-source` → inventory lists 3 protected funds + 2 markers as blockers
-2. `handover attest-stale-marker` ×2 → artifacts recorded; live-process refusal path exercised separately with a real dummy process
-3. `handover attest-protected-fund` ×3 → artifacts recorded; original names kept
-4. `aihf --root SYNTH_DST handover relocate-from SYNTH_SRC --content-digest D` → copy verified incl. settings; ledger heads match
-5. `aihf --root SYNTH_DST handover inspect` → challenge issued
-6. `handover trust-single-writer --inventory-digest D --operator-acknowledgement "EXACT"` → trust recorded with Windows scope
-7. Launch native TUI on SYNTH_DST → write op succeeds; prior history replays byte-identically
-8. Negative checks: second writer process → denied; tampered scope (different account) → denied; trust from SYNTH_SRC presented at SYNTH_DST → denied
-9. Interruption drill: kill mid-relocate → source untouched; target marked incomplete; rerun succeeds
+1. `aihf --root SYNTH_SRC handover inspect-source --evidence-out OUT/bundle.json` → inventory lists 3 protected funds + 2 markers as blockers; source tree untouched
+2. `aihf --root SYNTH_DST handover relocate-copy SYNTH_SRC --content-digest D` → copy verified incl. settings; ledger heads match; no enrollment yet
+3. On SYNTH_DST: `handover attest-stale-marker` ×2 → destination-bound artifacts recorded, markers retired at destination only; live-process refusal path exercised separately with a real dummy process
+4. On SYNTH_DST: `handover attest-protected-fund` ×3 → artifacts recorded; original names kept; rename-evasion attempt denied
+5. `aihf --root SYNTH_DST handover relocate-finalize` → attestation-aware inventory validation + enrollment succeeds
+6. `aihf --root SYNTH_DST handover inspect` → challenge issued
+7. `handover trust-single-writer --inventory-digest D --operator-acknowledgement "EXACT"` → trust recorded with Windows scope
+8. Launch native TUI on SYNTH_DST → admitted write op succeeds through owner/lane acquisition; prior history replays byte-identically
+9. Negative checks: second participating writer process → denied; tampered scope (different account) → denied; trust from SYNTH_SRC presented at SYNTH_DST → denied; unattested protected-name write → denied at root layer
+10. Interruption drill: kill mid-relocate-copy → source untouched; destination marked incomplete; rerun succeeds
 
 ## Scenario C — Real cutover (separate explicit authorization required)
 
