@@ -52,6 +52,7 @@ from hedge_fund.tui.funds import (
     ConfirmWipeScreen,
     fund_name_taken,
     newest_paper_universe,
+    paper_creation_denial,
     paper_write_denial,
     short_tickers,
     wipe_fund,
@@ -351,7 +352,7 @@ class BuilderScreen(Screen):
             self.notify(str(exc), severity="error")
             return
         if fund_name_taken(name) and self._state.get("replace") != name:
-            denial = paper_write_denial()
+            denial = paper_write_denial() or paper_creation_denial()
             if denial is not None:
                 # Replacing wipes the old fund; refuse up front rather than
                 # after a wizard whose final step could only be denied.
@@ -538,10 +539,9 @@ class BuilderScreen(Screen):
 
     def _finish_build(self) -> None:
         if self.mode == "paper":
-            denial = paper_write_denial()
-            if denial is not None:
-                self.notify(denial, severity="warning")
-                return
+            denial = paper_write_denial() or paper_creation_denial()
+            self.notify(denial, severity="warning")
+            return
         # Equal capital slices; master risk defaults. Power users edit the YAML.
         intraday = self._state["rebalance"] == "minute"
         spec = FundSpec(

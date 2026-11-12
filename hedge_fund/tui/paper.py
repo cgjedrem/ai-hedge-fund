@@ -2,8 +2,15 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+import os
 from concurrent.futures import as_completed, ThreadPoolExecutor
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
+from uuid import uuid4
 
 from rich.console import Group
 from rich.text import Text
@@ -20,8 +27,9 @@ from hedge_fund import paths
 from hedge_fund.brokers.factory import demo_token_mode_configured
 from hedge_fund.data import CachedDataClient, make_data_client, PriceSnapshot
 from hedge_fund.data.bars import is_intraday
-from hedge_fund.fund import FundSpec
+from hedge_fund.fund import Fund, FundSpec
 from hedge_fund.llm import make_llm
+from hedge_fund.llm.client import validate_llm_transport
 from hedge_fund.paper import (
     assessment_dates,
     DeployedFund,
@@ -36,13 +44,29 @@ from hedge_fund.paper import (
     tick,
 )
 from hedge_fund.pipeline import DecisionRecord, FundState, SessionRecord
+from hedge_fund.pipeline.session import code_version, mandate_hash
 from hedge_fund.runtime.admission import AdmissionError
+from hedge_fund.runtime.capture import freeze_capture, FrozenCapture
+from hedge_fund.runtime.configuration import resolve_settings, RuntimeSettings
 from hedge_fund.runtime.defaults import BOARD_REFRESH
+from hedge_fund.runtime.dispatch import make_one_shot_dispatch
+from hedge_fund.runtime.policy import (
+    APPROVED_LOCAL_MODELS,
+    AuthorizationDenied,
+    classify_provider,
+    KEN_FRENCH_BREAKPOINTS_TARGET,
+    ProviderClass,
+    ProviderTarget,
+)
 from hedge_fund.runtime.root import RootConfigurationError
 from hedge_fund.scorecard import score
 from hedge_fund.signals import ALPHA_MODEL_REGISTRY, LLMAgent
-from hedge_fund.tui.builder import BuilderScreen
-from hedge_fund.tui.funds import ConfirmWipeScreen, paper_write_denial, wipe_fund
+from hedge_fund.tui.funds import (
+    mandate_delete_denial,
+    paper_creation_denial,
+    paper_write_denial,
+    tui_paper_admission,
+)
 from hedge_fund.tui.palette import BRIGHT, CYAN, GREEN, MUTED, RED, TEXT
 from hedge_fund.tui.paper_view import (
     APP_HALT,
@@ -80,7 +104,7 @@ class PaperScreen(Screen):
     fund on the left, the highlighted one's state and its next run on the
     right. Enter runs its next session; `y`/`n` approve or reject gated
     decisions. `space` reports disabled runner control; `s` opens history;
-    `h`/`r` work the kill switch. The last row builds a fund.
+    `h`/`r` work the kill switch. TUI creation and deletion stay disabled.
     """
 
     BINDINGS = [
@@ -197,10 +221,8 @@ class PaperScreen(Screen):
                 self._poll_quotes()
         elif oid == "build":
             blurb = Text()
-            if not self._snaps:
-                blurb.append("No funds yet.\n\n", style=f"bold {BRIGHT}")
             blurb.append(
-                "Build a fund here and it starts paper trading at once: pick its " "strategies, capital, cadence and tickers, and it gets a ledger, a " "book and a kill switch of its own under\n" + str(paths.PAPER_DIR) + "\n\n" "Unattended runners are disabled. Use the explicit-root CLI or web desk " "for an authorized one-shot session. The next session is the next close " "or the next bar.",
+                paper_creation_denial(),
                 style=MUTED,
             )
             if self._write_denial is not None:
@@ -275,12 +297,13 @@ class PaperScreen(Screen):
         if menu.highlighted is not None and (menu.get_option_at_index(menu.highlighted).id or "") == "build":
             if self._deny_paper_write():
                 return
-            self.app.push_screen(BuilderScreen(mode="paper"))
+            self.notify(paper_creation_denial(), severity="warning")
             return
-        self.notify(
-            "TUI paper execution lacks operation-bound authorization. Use the explicit-root CLI or web desk.",
-            severity="warning",
-        )
+        if self._deny_paper_write():
+            return
+        snap = self._current()
+        if snap is not None:
+            self.app.push_screen(RunConfirmScreen(snap.directory), self._after_confirm)
 
     def action_runner(self) -> None:
         """Space reports disabled legacy unattended runner control."""
@@ -289,9 +312,9 @@ class PaperScreen(Screen):
             severity="warning",
         )
 
-    def _after_confirm(self, directory: Path, verdict: str | None) -> None:
-        if verdict is not None:
-            self.app.push_screen(RunSessionScreen(directory, redo=verdict == "redo"))
+    def _after_confirm(self, plan: _TUIRunPlan | None) -> None:
+        if plan is not None:
+            self.app.push_screen(RunSessionScreen(plan.directory, plan=plan))
 
     def action_sessions(self) -> None:
         snap = self._current()
@@ -305,7 +328,9 @@ class PaperScreen(Screen):
         if snap is None:
             return
         try:
-            snap.ledger.halt(APP_HALT)
+            with tui_paper_admission(snap.deployed.name, snap.directory) as (_root, admission):
+                with admission.halt_lane(snap.deployed.name, timeout=0):
+                    snap.ledger.halt(APP_HALT, request_id=uuid4().hex)
         except (LedgerError, RootConfigurationError, AdmissionError) as exc:
             self.notify(f"{snap.deployed.name} was not halted: {exc}", severity="error")
             return
@@ -319,7 +344,14 @@ class PaperScreen(Screen):
         if snap is None:
             return
         try:
-            snap.ledger.resume(snap.deployed.spec.capital, approval_required=snap.deployed.spec.approval_required, operator="tui")
+            with tui_paper_admission(snap.deployed.name, snap.directory) as (_root, admission):
+                with admission.control_lane(snap.deployed.name, timeout=0):
+                    snap.ledger.resume(
+                        snap.deployed.spec.capital,
+                        approval_required=snap.deployed.spec.approval_required,
+                        request_id=uuid4().hex,
+                        operator="tui",
+                    )
         except (LedgerError, RootConfigurationError, AdmissionError) as exc:
             self.notify(f"{snap.deployed.name} stays halted: {exc}", severity="warning")
             return
@@ -340,7 +372,18 @@ class PaperScreen(Screen):
             return
         name = snap.deployed.name
         try:
-            snap.ledger.set_approval(verdict, snap.pending.as_of, snap.state.prev_hash, "tui")
+            with tui_paper_admission(name, snap.directory) as (_root, admission):
+                from hedge_fund.runtime.admission import paper_approval_transition
+
+                with paper_approval_transition(admission, name) as proof:
+                    snap.ledger.set_approval(
+                        verdict,
+                        snap.pending.as_of,
+                        snap.state.prev_hash,
+                        "tui",
+                        request_id=uuid4().hex,
+                        admission=proof,
+                    )
         except (LedgerError, RootConfigurationError, AdmissionError) as exc:
             self.notify(f"{name} verdict was not recorded: {exc}", severity="error")
             return
@@ -349,36 +392,36 @@ class PaperScreen(Screen):
         self._populate(name)
 
     def action_delete(self) -> None:
-        if self._deny_paper_write():
-            return
-        snap = self._current()
-        if snap is None:
-            return
-        name = snap.deployed.name
-        self.app.push_screen(ConfirmWipeScreen(name), lambda yes: self._finish_delete(name, yes))
+        if self._current() is not None:
+            self.notify(mandate_delete_denial(), severity="warning")
 
     def _finish_delete(self, name: str, yes: bool | None) -> None:
         if not yes:
             return
-        if self._deny_paper_write():
-            return
-        try:
-            wipe_fund(name)
-        except RuntimeError as exc:
-            self.notify(str(exc), severity="warning")
-            return
-        self.notify(f"Deleted {name}", severity="warning")
-        self._populate(None)
+        self.notify(mandate_delete_denial(), severity="warning")
 
 
-class RunConfirmScreen(ModalScreen[str | None]):
+@dataclass(frozen=True, slots=True)
+class _TUIRunPlan:
+    directory: Path
+    deployed: DeployedFund
+    state: FundState
+    expected_head: str | None
+    due: str | None
+    action: str | None
+    capture: FrozenCapture
+    operation_id: str
+    request_id: str
+    operation_digest: str
+
+
+class RunConfirmScreen(ModalScreen[_TUIRunPlan | None]):
     """The approval step. Enter on a fund is "run", so before anything trades
     the user sees exactly what this run will do — the decision about to be
     executed, its targets, whether a new decision follows — and says yes.
     Nothing has touched the ledger or the broker until they do.
 
-    Dismisses with "run" when a session is due, "redo" when nothing is due
-    but the last session can be run again, None when the user backs out.
+    Dismisses with a captured plan after explicit confirmation.
     """
 
     BINDINGS = [
@@ -389,7 +432,7 @@ class RunConfirmScreen(ModalScreen[str | None]):
     def __init__(self, directory: Path) -> None:
         super().__init__()
         self._directory = directory
-        self._verdict: str | None = None  # what enter will do once resolved
+        self._plan: _TUIRunPlan | None = None
         self._ready = False
 
     def compose(self) -> ComposeResult:
@@ -405,37 +448,39 @@ class RunConfirmScreen(ModalScreen[str | None]):
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool:
         if action == "confirm":
-            return self._ready and self._verdict is not None
+            return self._ready and self._plan is not None and self._plan.action is not None
         return True
 
     def action_cancel(self) -> None:
         self.dismiss(None)
 
     def action_confirm(self) -> None:
-        self.dismiss(self._verdict)
+        if self._plan is not None and self._plan.action is not None:
+            self.dismiss(self._plan)
 
     @work(thread=True, exclusive=True)
     def _resolve(self) -> None:
         app = self.app
         try:
-            deployed, state, due = _resolve_next_session(self._directory)
+            plan = _resolve_tui_run_plan(self._directory)
         except Exception as exc:
             app.call_from_thread(self._show_error, exc)
             return
-        app.call_from_thread(self._show, deployed, state, due)
+        app.call_from_thread(self._show, plan)
 
-    def _show(self, deployed: DeployedFund, state: FundState, due: str | None) -> None:
-        self._verdict = "run" if due is not None else "redo" if state.last_session else None
+    def _show(self, plan: _TUIRunPlan) -> None:
+        deployed, state, due = plan.deployed, plan.state, plan.due
+        self._plan = plan
         self._ready = True
-        self.query_one("#run-q", Static).update(Text.assemble(("Run ", f"bold {BRIGHT}"), (deployed.name, f"bold {GREEN}"), (f" through {session_label(due)}?" if due else f" again through {session_label(state.last_session)}?" if self._verdict == "redo" else "?", f"bold {BRIGHT}")))
+        self.query_one("#run-q", Static).update(Text.assemble(("Run ", f"bold {BRIGHT}"), (deployed.name, f"bold {GREEN}"), (f" through {session_label(due)}?" if due else f" again through {session_label(state.last_session)}?" if plan.action == "redo" else "?", f"bold {BRIGHT}")))
         approval = None
         if deployed.spec.approval_required and state.pending is not None:
             approval, _ = Ledger(self._directory).resolve_approval(state.pending.as_of, state.prev_hash)
         self.query_one("#run-body", Static).update(run_plan(deployed.name, state, due, deployed.spec, approval=approval))
         keys = Text()
-        if self._verdict is not None:
+        if plan.action is not None:
             keys.append("enter", style=f"bold {GREEN}")
-            keys.append("  run   " if self._verdict == "run" else "  run again   ", style=MUTED)
+            keys.append("  run   " if plan.action == "run" else "  run again   ", style=MUTED)
         keys.append("esc", style=f"bold {BRIGHT}")
         keys.append("  cancel", style=MUTED)
         self.query_one("#run-keys", Static).update(keys)
@@ -460,10 +505,17 @@ class RunSessionScreen(Screen):
 
     BINDINGS = [Binding("escape", "back", "back")]
 
-    def __init__(self, directory: Path, *, redo: bool = False) -> None:
+    def __init__(
+        self,
+        directory: Path,
+        *,
+        plan: _TUIRunPlan | None = None,
+        redo: bool = False,
+    ) -> None:
         super().__init__()
         self._directory = directory
-        self._redo = redo  # run the last recorded session again, replacing it
+        self._plan = plan
+        self._redo = plan.action == "redo" if plan is not None else redo
         self._phase = "running"
         self._record: SessionRecord | None = None
         self._desks: list[Desk] = []
@@ -508,43 +560,76 @@ class RunSessionScreen(Screen):
     def _run(self) -> None:
         app = self.app
         directory = self._directory
-        denial = paper_write_denial()
-        if denial is None:
-            denial = "TUI paper execution lacks operation-bound authorization; " "use the explicit-root CLI or web desk."
-        if denial is not None:
-            app.call_from_thread(self._fail, RuntimeError(denial))
+        plan = self._plan
+        if not isinstance(plan, _TUIRunPlan) or plan.action not in {"run", "redo"}:
+            denial = paper_write_denial() or "TUI paper execution requires an operation-bound confirmation; reopen the fund's run action."
+            app.call_from_thread(self._fail, AdmissionError(denial))
             return
         try:
-            deployed = load_deployed(directory)
-            spec = deployed.spec
-            ledger = Ledger(directory)
-            state = ledger.replay(spec.capital)
-            with make_data_client() as raw:
-                data = CachedDataClient(raw, live=spec.is_intraday)
-                if self._redo:
-                    if state.last_session is None:
-                        raise NothingDue("no session recorded yet, nothing to run again")
-                    # The board is told about the state going into the session,
-                    # which is what `redo` will advance from.
-                    due = state.last_session
-                    state = ledger.replay(spec.capital, before=due)
-                else:
-                    due = next_session(data, spec, state.last_session)
-                    if due is None:  # the session slipped out from under the approval step
-                        raise NothingDue(f"nothing due after {state.last_session}")
-                dates = assessment_dates(state, due, spec)
-                approval = None
-                if spec.approval_required and state.pending is not None:
-                    approval, _ = ledger.resolve_approval(state.pending.as_of, state.prev_hash)
-                app.call_from_thread(self._begin_board, deployed, due, dates, state.pending, state.prev_hash, approval)
-                if dates:
-                    self._warm(spec, deployed.universe, dates)
-                record = redo(directory, data) if self._redo else tick(directory, data)
+            with tui_paper_admission(plan.deployed.name, directory) as (root, admission):
+                with admission.manual_session(plan.deployed.name, timeout=0):
+                    deployed, state = _verify_tui_run_plan(root, admission, plan)
+                    spec = deployed.spec
+                    dispatch = _make_tui_run_dispatch(
+                        plan.capture,
+                        admission,
+                        operation_id=plan.operation_id,
+                        operation_digest=plan.operation_digest,
+                        include_llm=True,
+                    )
+                    with make_data_client(plan.capture.data_provider, dispatch=dispatch) as raw:
+                        data = CachedDataClient(raw, live=spec.is_intraday)
+                        if plan.action == "run":
+                            due = next_session(data, spec, state.last_session)
+                            if due != plan.due:
+                                raise AdmissionError("The reviewed paper session changed; reopen the run confirmation.")
+                        else:
+                            due = state.last_session
+                            if due is None:
+                                raise NothingDue("no session recorded yet, nothing to run again")
+                            state = Ledger(directory).replay(spec.capital, before=due)
+                        if due is None:
+                            raise NothingDue(f"nothing due after {state.last_session}")
+                        dates = assessment_dates(state, due, spec)
+                        approval = None
+                        if spec.approval_required and state.pending is not None:
+                            approval, _ = Ledger(directory).resolve_approval(state.pending.as_of, state.prev_hash)
+                        app.call_from_thread(self._begin_board, deployed, due, dates, state.pending, state.prev_hash, approval)
+                        if dates:
+                            self._warm(spec, deployed.universe, dates, plan.capture, dispatch)
+                        build_fund = _tui_fund_factory(plan.capture, dispatch)
+                        if plan.action == "redo":
+                            record = redo(
+                                directory,
+                                data,
+                                build_fund=build_fund,
+                                request_id=plan.request_id,
+                                expected_head=plan.expected_head,
+                            )
+                        else:
+                            record = tick(
+                                directory,
+                                data,
+                                session=due,
+                                build_fund=build_fund,
+                                expected_head=plan.expected_head,
+                                operation_id=plan.operation_id,
+                                request_id=plan.request_id,
+                                capture_id=plan.capture.capture_id,
+                                capture_digest=plan.capture.digest,
+                            )
             app.call_from_thread(self._show_report, deployed, record)
         except Exception as exc:  # fail loud, in the UI
             app.call_from_thread(self._fail, exc)
 
-    def _warm(self, spec: FundSpec, universe: list[str], dates: list[str]) -> None:
+    def _warm(
+        self,
+        spec: FundSpec,
+        universe: list[str],
+        dates: list[str],
+        capture: FrozenCapture,
+        dispatch,
+    ) -> None:
         desks = dict(zip(agent_names(spec), self._desks, strict=True))
         # A warm prompt must match the tick prompt or the warm calls never hit
         # the cache the tick reads — so the mandate's model params (e.g.
@@ -560,8 +645,16 @@ class RunSessionScreen(Screen):
             # same temperature the agent was built with — the agent salts its
             # cache keys with it, so a mismatched client would still key
             # correctly but sample at the wrong creativity.
-            model = cls(llm=make_llm(on_token=desk.feed, temperature=kwargs.get("temperature")), **kwargs) if issubclass(cls, LLMAgent) else cls(**kwargs)
-            with make_data_client() as raw:
+            model = (
+                cls(
+                    llm=_tui_llm_factory(capture, dispatch, on_token=desk.feed, temperature=kwargs.get("temperature")),
+                    breakpoints_dispatch=dispatch,
+                    **kwargs,
+                )
+                if issubclass(cls, LLMAgent)
+                else cls(**kwargs)
+            )
+            with make_data_client(capture.data_provider, dispatch=dispatch) as raw:
                 fd = CachedDataClient(raw)
                 for as_of in dates:
                     for ticker in universe:
@@ -815,12 +908,233 @@ class SessionReportScreen(Screen):
             self.query_one("#report-detail", VerticalScroll).scroll_home(animate=False)
 
 
-def _resolve_next_session(directory: Path) -> tuple[DeployedFund, FundState, str | None]:
-    """Load the fund, replay its ledger, and ask which session is due. The
-    one place the confirm modal touches the network (a daily fund asks the
-    market for its closes; a minute fund's bar is read off the clock)."""
-    deployed = load_deployed(directory)
-    state = Ledger(directory).replay(deployed.spec.capital)
-    with make_data_client() as raw:
-        due = next_session(CachedDataClient(raw), deployed.spec, state.last_session)
-    return deployed, state, due
+def _resolve_tui_run_plan(directory: Path) -> _TUIRunPlan:
+    if not isinstance(directory, (str, os.PathLike)):
+        raise AdmissionError("TUI paper run path is invalid.")
+    candidate = Path(directory)
+    with tui_paper_admission(candidate.name, candidate) as (root, admission):
+        deployed = load_deployed(candidate)
+        if deployed.broker != "paper":
+            raise AdmissionError("The native TUI admits local paper funds only.")
+        ledger = Ledger(candidate)
+        state = ledger.replay(deployed.spec.capital)
+        if state.halted is not None:
+            raise AdmissionError("The paper fund is halted; press r to resume before running.")
+        settings = resolve_settings(root, admission=admission)
+        capture = _tui_capture(root, deployed, settings)
+        operation_id = uuid4().hex
+        request_id = uuid4().hex
+        preview_id = uuid4().hex
+        preview_digest = _operation_digest(
+            {
+                "action": "preview",
+                "capture_digest": capture.digest,
+                "expected_head": state.prev_hash,
+                "operation_id": preview_id,
+                "request_id": request_id,
+            }
+        )
+        dispatch = _make_tui_run_dispatch(
+            capture,
+            admission,
+            operation_id=preview_id,
+            operation_digest=preview_digest,
+            include_llm=False,
+        )
+        with make_data_client(capture.data_provider, dispatch=dispatch) as raw:
+            due = next_session(
+                CachedDataClient(raw, live=deployed.spec.is_intraday),
+                deployed.spec,
+                state.last_session,
+            )
+        action = "run" if due is not None else "redo" if state.last_session else None
+        if action == "run":
+            operation_digest = ledger.tick_request_digest(
+                request_id,
+                expected_head=state.prev_hash,
+                session=due,
+                operation_id=operation_id,
+                capture_id=capture.capture_id,
+                capture_digest=capture.digest,
+            )
+        elif action == "redo":
+            operation_digest = ledger.redo_request_digest(request_id, state.prev_hash)
+        else:
+            operation_digest = ""
+        return _TUIRunPlan(
+            directory=candidate,
+            deployed=deployed,
+            state=state,
+            expected_head=state.prev_hash,
+            due=due,
+            action=action,
+            capture=capture,
+            operation_id=operation_id,
+            request_id=request_id,
+            operation_digest=operation_digest,
+        )
+
+
+def _tui_capture(root, deployed: DeployedFund, settings: RuntimeSettings) -> FrozenCapture:
+    _require_tui_providers(settings)
+    return freeze_capture(
+        root=root,
+        subject_id=deployed.name,
+        mandate_digest=mandate_hash(deployed.spec),
+        universe=deployed.universe,
+        broker=deployed.broker,
+        settings=settings,
+        credential_versions={},
+        code_version=code_version(),
+        mandate_snapshot=deployed.spec.model_dump(mode="json"),
+    )
+
+
+def _require_tui_providers(settings: RuntimeSettings) -> None:
+    if not isinstance(settings, RuntimeSettings):
+        raise AdmissionError("Captured paper settings are unavailable.")
+    if settings.data_provider != "yfinance" or settings.llm_provider != "Ollama" or settings.model not in APPROVED_LOCAL_MODELS:
+        raise AuthorizationDenied("TUI paper runs require free yfinance and an approved local Ollama model.")
+    data_target = ProviderTarget(kind="data", provider=settings.data_provider)
+    llm_target = ProviderTarget(
+        kind="llm",
+        provider=settings.llm_provider,
+        model=settings.model,
+        endpoint=settings.endpoint,
+    )
+    try:
+        validate_llm_transport(llm_target)
+        data_class = classify_provider(data_target)
+        llm_class = classify_provider(
+            llm_target,
+            approved_local_models=APPROVED_LOCAL_MODELS,
+        )
+    except AuthorizationDenied:
+        raise AuthorizationDenied("TUI paper runs require free yfinance and an approved local Ollama model.") from None
+    if data_class is not ProviderClass.FREE_DATA or llm_class is not ProviderClass.LOCAL:
+        raise AuthorizationDenied("TUI paper runs require free yfinance and an approved local Ollama model.")
+
+
+def _make_tui_run_dispatch(
+    capture: FrozenCapture,
+    admission,
+    *,
+    operation_id: str,
+    operation_digest: str,
+    include_llm: bool,
+):
+    if not isinstance(capture, FrozenCapture) or type(include_llm) is not bool:
+        raise AuthorizationDenied("TUI provider capture is invalid.")
+    _require_tui_providers(
+        RuntimeSettings(
+            data_provider=capture.data_provider,
+            llm_provider=capture.llm_provider,
+            model=capture.model,
+            endpoint=capture.endpoint,
+            timeout_seconds=capture.timeout_seconds,
+            parameters=capture.parameters,
+            version=capture.settings_version,
+            provenance=capture.provenance,
+        )
+    )
+    targets = [ProviderTarget(kind="data", provider=capture.data_provider)]
+    approved_models = frozenset()
+    if include_llm:
+        llm_target = ProviderTarget(
+            kind="llm",
+            provider=capture.llm_provider,
+            model=capture.model,
+            endpoint=capture.endpoint,
+        )
+        if classify_provider(llm_target, approved_local_models=APPROVED_LOCAL_MODELS) is not ProviderClass.LOCAL:
+            raise AuthorizationDenied("TUI local-model authorization is unavailable.")
+        if classify_provider(KEN_FRENCH_BREAKPOINTS_TARGET) is not ProviderClass.FREE_DATA:
+            raise AuthorizationDenied("TUI free-data authorization is unavailable.")
+        targets.extend((llm_target, KEN_FRENCH_BREAKPOINTS_TARGET))
+        approved_models = APPROVED_LOCAL_MODELS
+    bounds = {target.identity: (10000, Decimal("0"), 10000) for target in targets}
+    return make_one_shot_dispatch(
+        root_id=capture.root_id,
+        subject_id=capture.subject_id,
+        capture_digest=capture.digest,
+        operation_id=operation_id,
+        operation_digest=operation_digest,
+        expires_at=datetime.now(timezone.utc) + timedelta(minutes=15),
+        targets=tuple(targets),
+        max_calls=sum(value[0] for value in bounds.values()),
+        max_cost=Decimal("0"),
+        max_resources=sum(value[2] for value in bounds.values()),
+        upper_bound_costs={target.identity: Decimal("0") for target in targets},
+        per_target_bounds=bounds,
+        approved_local_models=approved_models,
+        boundary_check=admission.require_root_owner,
+    )
+
+
+def _verify_tui_run_plan(root, admission, plan: _TUIRunPlan) -> tuple[DeployedFund, FundState]:
+    if not isinstance(plan, _TUIRunPlan):
+        raise AdmissionError("TUI paper run confirmation is invalid.")
+    admission.require_root_owner()
+    root.revalidate()
+    if plan.directory.name != plan.deployed.name:
+        raise AdmissionError("Paper deployment identity changed after confirmation; review the fund again.")
+    deployed = load_deployed(plan.directory)
+    capture = plan.capture
+    if deployed.name != capture.subject_id or deployed.name != plan.directory.name or deployed.broker != capture.broker or mandate_hash(deployed.spec) != capture.mandate_digest or tuple(deployed.universe) != capture.universe or capture.code_version != code_version():
+        raise AdmissionError("Paper deployment changed after confirmation; review the fund again.")
+    settings = resolve_settings(root, admission=admission)
+    _require_tui_providers(settings)
+    current_capture = _tui_capture(root, deployed, settings)
+    if current_capture.digest != capture.digest or current_capture.root_id != capture.root_id:
+        raise AdmissionError("Paper provider settings changed after confirmation; review the fund again.")
+    state = Ledger(plan.directory).replay(deployed.spec.capital)
+    if state.prev_hash != plan.expected_head:
+        raise AdmissionError("Paper ledger head changed after confirmation; review the fund again.")
+    if state.halted is not None:
+        raise AdmissionError("The paper fund is halted; press r to resume before running.")
+    return deployed, state
+
+
+def _tui_fund_factory(capture: FrozenCapture, dispatch):
+    def build(spec: FundSpec) -> Fund:
+        if not isinstance(spec, FundSpec) or spec.name != capture.subject_id or mandate_hash(spec) != capture.mandate_digest:
+            raise AuthorizationDenied("TUI paper mandate does not match its operation capture.")
+        return Fund(
+            spec,
+            blind=True,
+            llm_factory=lambda model_spec: _tui_llm_factory(
+                capture,
+                dispatch,
+                temperature=model_spec.params.get("temperature"),
+            ),
+            breakpoints_dispatch=dispatch,
+        )
+
+    return build
+
+
+def _tui_llm_factory(
+    capture: FrozenCapture,
+    dispatch,
+    *,
+    on_token=None,
+    temperature: float | None = None,
+):
+    return make_llm(
+        model=capture.model,
+        timeout=capture.timeout_seconds,
+        max_tokens=int(capture.parameters.get("max_tokens", 4096)),
+        on_token=on_token,
+        temperature=temperature if temperature is not None else capture.parameters.get("temperature"),
+        top_p=capture.parameters.get("top_p"),
+        context_size=int(capture.parameters.get("context_size", 8192)),
+        api_key=None,
+        endpoint=capture.endpoint,
+        use_environment=False,
+        dispatch=dispatch,
+    )
+
+
+def _operation_digest(payload: dict[str, object]) -> str:
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()

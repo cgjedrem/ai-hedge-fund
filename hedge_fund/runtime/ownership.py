@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes
+import errno
 import hashlib
 import json
 import os
@@ -31,6 +32,23 @@ def process_identity(pid: int) -> dict[str, Any]:
     if sys.platform.startswith("linux"):
         return _linux_process_identity(pid)
     raise ProcessIdentityError("process identity primitive is unsupported")
+
+
+def process_is_running(pid: int) -> bool:
+    if type(pid) is not int or pid <= 0:
+        raise ProcessIdentityError("process liveness input is invalid")
+    if os.name == "nt":
+        return _windows_process_is_running(pid)
+    if sys.platform.startswith("linux"):
+        try:
+            process_identity(pid)
+        except (OSError, ProcessIdentityError) as exc:
+            cause = exc.__cause__ if isinstance(exc, ProcessIdentityError) else exc
+            if isinstance(cause, OSError) and cause.errno in {errno.ENOENT, errno.ESRCH}:
+                return False
+            raise ProcessIdentityError("process liveness cannot be verified") from exc
+        return True
+    raise ProcessIdentityError("process liveness primitive is unsupported")
 
 
 def current_process_identity() -> dict[str, Any]:
@@ -156,6 +174,32 @@ def _windows_launch_fingerprint(pid: int) -> dict[str, str]:
         "command_sha256": hashlib.sha256(command_line.encode("utf-8")).hexdigest(),
         "user": user,
     }
+
+
+def _windows_process_is_running(pid: int) -> bool:
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+    kernel32.WaitForSingleObject.restype = ctypes.c_ulong
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = ctypes.c_int
+
+    handle = kernel32.OpenProcess(0x00100000 | 0x1000, False, pid)
+    if not handle:
+        error = ctypes.get_last_error()
+        if error in {87, 1168}:
+            return False
+        raise ProcessIdentityError("process liveness cannot be verified") from ctypes.WinError(error)
+    try:
+        result = kernel32.WaitForSingleObject(handle, 0)
+        if result == 0:
+            return False
+        if result == 0x00000102:
+            return True
+        raise ProcessIdentityError("process liveness cannot be verified") from ctypes.WinError(ctypes.get_last_error())
+    finally:
+        kernel32.CloseHandle(handle)
 
 
 def _linux_launch_fingerprint(pid: int) -> dict[str, str]:

@@ -12,6 +12,7 @@ from hedge_fund.runtime.admission import (
     AdmissionError,
     LOCK_DIRECTORY,
     OwnershipUnknown,
+    require_paper_write_lanes,
     RootMigrationLease,
     RootOwnerLease,
     WriterConflict,
@@ -102,9 +103,7 @@ def test_inherited_owner_cleanup_closes_only_the_child_handle(admission_root, mo
 
 
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="POSIX fork is unavailable")
-def test_forked_owner_close_preserves_parent_lock_and_releases_child_copy(
-    tmp_path, admission_root, owned_test_process
-):
+def test_forked_owner_close_preserves_parent_lock_and_releases_child_copy(tmp_path, admission_root, owned_test_process):
     root_path, _context, owner, _coordinator = admission_root
     ready = tmp_path / "child-owner-closed"
     release = tmp_path / "release-owner-child"
@@ -197,9 +196,7 @@ def test_forked_child_cannot_reuse_enrolled_parent_lanes(admission_root):
 
 @pytest.mark.parametrize("lane", ["standalone", "registry", "registry_read", "manual"])
 @pytest.mark.parametrize("exceptional", [False, True])
-def test_inherited_context_cleanup_does_not_unlock_parent(
-    tmp_path, admission_root, monkeypatch, lane, exceptional
-):
+def test_inherited_context_cleanup_does_not_unlock_parent(tmp_path, admission_root, monkeypatch, lane, exceptional):
     from hedge_fund.runtime import admission
 
     _root, _context, _owner, coordinator = admission_root
@@ -241,9 +238,7 @@ def test_inherited_context_cleanup_does_not_unlock_parent(
 
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="POSIX fork is unavailable")
 @pytest.mark.parametrize("lane", ["standalone", "registry", "registry_read", "manual"])
-def test_forked_child_unwind_keeps_parent_lock(
-    tmp_path, admission_root, owned_test_process, lane
-):
+def test_forked_child_unwind_keeps_parent_lock(tmp_path, admission_root, owned_test_process, lane):
     from hedge_fund.runtime import admission
 
     root_path, _context, _owner, coordinator = admission_root
@@ -321,6 +316,21 @@ def admission_root(tmp_path):
     finally:
         owner_lease.close()
         context.close()
+
+
+def test_unattested_protected_fund_denies_admission_without_state_changes(admission_root):
+    root_path, context, _owner_lease, _coordinator = admission_root
+    handover_bytes = context.read_bytes("runtime/private/v1/handover.json")
+
+    with pytest.raises(AdmissionError, match="destination-bound attestation"):
+        require_paper_write_lanes(
+            root_path / "paper" / "umbrella",
+            "umbrella",
+            lane_sets=(("control",),),
+        )
+
+    assert context.read_bytes("runtime/private/v1/handover.json") == handover_bytes
+    assert not (root_path / "paper").exists()
 
 
 def _wait_for(path: Path, process, timeout: float = 5.0) -> None:

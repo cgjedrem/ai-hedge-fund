@@ -1,4 +1,5 @@
 import ctypes
+import hashlib
 import os
 import signal
 import stat
@@ -642,6 +643,127 @@ def test_protected_root_aliases_are_denied_before_path_access(protected, monkeyp
         RootContext.open(candidate)
 
     assert not candidate.exists()
+
+
+def _attested_protected_root(tmp_path, name="umbrella"):
+    import yaml
+
+    from hedge_fund.fund import FundSpec
+    from hedge_fund.paper.deployed import DeployedFund
+    from hedge_fund.runtime import handover
+
+    spec = FundSpec.model_validate(
+        {
+            "schema_version": 2,
+            "name": name,
+            "strategies": [{"name": "solo", "models": [{"name": "graham"}], "blend": {"mode": "long_short"}}],
+            "risk": {"max_position_pct": 1, "max_gross_exposure": 1},
+            "capital": 100_000,
+            "costs": {"spread_bps": 0, "commission_per_share": 0},
+            "rebalance": "daily",
+        }
+    )
+    deployed = DeployedFund(name=name, spec=spec, universe=["AAPL"], broker="paper", created="2026-11-12")
+    fund_bytes = yaml.safe_dump(deployed.model_dump(), sort_keys=False).encode("utf-8")
+    root_path = tmp_path / "destination"
+    fund_path = root_path / "paper" / name
+    fund_path.mkdir(parents=True)
+    (fund_path / "fund.yaml").write_bytes(fund_bytes)
+    source_path = tmp_path / "source"
+    source_fund_path = source_path / "paper" / name
+    source_fund_path.mkdir(parents=True)
+    (source_fund_path / "fund.yaml").write_bytes(fund_bytes)
+    blocker = {
+        "kind": "protected-fund-inclusion",
+        "subject": name,
+        "evidence": {
+            "directory": f"paper/{name}",
+            "fund_file_sha256": hashlib.sha256(fund_bytes).hexdigest(),
+            "fund_file_size": len(fund_bytes),
+        },
+    }
+
+    with RootContext.open(source_path) as source, RootContext.open(root_path) as root:
+        source_binding = handover.root_binding(source)
+        inventory_digest = "1" * 64
+        content_digest = handover._digest(handover._relocation_entries(source))
+        observed_inventory_digest = handover._digest(
+            {
+                "source_root_binding": source_binding,
+                "inventory_digest": inventory_digest,
+                "content_digest": content_digest,
+                "blockers": [blocker],
+            }
+        )
+        snapshot = {
+            "content_digest": content_digest,
+            "inventory_digest": inventory_digest,
+            "observed_inventory_digest": observed_inventory_digest,
+        }
+        bundle = handover._new_source_evidence_bundle(
+            source,
+            {
+                "observed_inventory_digest": observed_inventory_digest,
+                "inventory_digest": inventory_digest,
+                "content_digest": content_digest,
+                "blockers": [blocker],
+            },
+        )
+        root.prepare_private_storage()
+        handover._write_private_json(root, handover.SOURCE_EVIDENCE_PATH, bundle)
+        state = handover._new_relocation_state(
+            root,
+            source,
+            snapshot,
+            state="copied",
+            source_evidence_digest=bundle["record_digest"],
+        )
+        handover._write_relocation_state(root, state)
+        artifact = handover._new_attestation_artifact(
+            root,
+            kind=blocker["kind"],
+            subject=name,
+            evidence=blocker["evidence"],
+            source_evidence_digest=bundle["record_digest"],
+            operator_statement="Synthetic protected fund keeps its original identity.",
+        )
+        handover._write_attestation_artifact(root, artifact)
+    return root_path
+
+
+def test_unattested_protected_resource_stays_denied_under_handover_access(tmp_path):
+    root_path = tmp_path / "unattested"
+    (root_path / "paper" / "umbrella").mkdir(parents=True)
+
+    with RootContext.open(root_path) as root:
+        with root_module._handover_resource_access(root, allow_writes=True):
+            with pytest.raises(RootPathError, match="protected"):
+                root.write_bytes("paper/umbrella/synthetic.json", b"denied")
+
+    assert not (root_path / "paper" / "umbrella" / "synthetic.json").exists()
+
+
+def test_attested_protected_resource_allows_original_name_only(tmp_path):
+    root_path = _attested_protected_root(tmp_path)
+    aliases = (
+        "paper/UMBRELLA/blocked.json",
+        "paper/umbrella./blocked.json",
+        "paper/watchtower/blocked.json",
+        "paper/watchtower-weekly/blocked.json",
+        "paper/umbrella/nested/watchtower/blocked.json",
+        "PAPER/umbrella/blocked.json",
+    )
+
+    with RootContext.open(root_path) as root:
+        with root_module._handover_resource_access(root, allow_writes=True):
+            root.write_bytes("paper/umbrella/synthetic.json", b"allowed")
+            assert root.read_bytes("paper/umbrella/synthetic.json") == b"allowed"
+            for alias in aliases:
+                with pytest.raises(RootPathError):
+                    root.write_bytes(alias, b"denied")
+
+    assert (root_path / "paper" / "umbrella" / "synthetic.json").read_bytes() == b"allowed"
+    assert not any((root_path / "paper").glob("**/blocked.json"))
 
 
 def test_reparse_child_is_denied_before_read(tmp_path):

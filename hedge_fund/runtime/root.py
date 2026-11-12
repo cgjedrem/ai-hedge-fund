@@ -12,8 +12,11 @@ import sys
 import threading
 import unicodedata
 import uuid
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path, PureWindowsPath
+from typing import Iterator
 
 
 class RootPathError(ValueError):
@@ -29,6 +32,8 @@ class UnsupportedFilesystemError(RootPathError):
 
 
 PRIVATE_ROOT = "runtime/private/v1"
+_PROTECTED_RESOURCE_NAMES = frozenset({"umbrella", "watchtower", "watchtower-weekly"})
+_HANDOVER_RESOURCE_ACCESS: ContextVar[tuple[tuple[object, bool, bool], ...]] = ContextVar("handover_resource_access", default=())
 
 
 @dataclass(frozen=True)
@@ -235,7 +240,7 @@ def ensure_unique_resource_name(name: str, existing: list[str] | tuple[str, ...]
     return identity
 
 
-def _validate_component(part: str) -> None:
+def _validate_component(part: str, *, allow_protected: bool = False) -> None:
     if not part or part in {".", ".."}:
         raise RootPathError("path traversal is not allowed")
     if part[-1] in {".", " "}:
@@ -247,15 +252,13 @@ def _validate_component(part: str) -> None:
     device_name = part.split(".", 1)[0].upper()
     if device_name in {"CON", "PRN", "AUX", "NUL"} or re.fullmatch(r"(?:COM|LPT)[1-9¹²³]", device_name):
         raise RootPathError("reserved path component")
-    if _canonical_component_identity(part) in {
-        "watchtower",
-        "watchtower-weekly",
-        "umbrella",
-    }:
+    if not allow_protected and _canonical_component_identity(part) in _PROTECTED_RESOURCE_NAMES:
         raise RootPathError("protected path identity")
 
 
-def _relative_parts(value: str | os.PathLike[str]) -> tuple[str, ...]:
+def _relative_parts(value: str | os.PathLike[str], *, allow_protected: bool = False) -> tuple[str, ...]:
+    if type(allow_protected) is not bool:
+        raise TypeError("allow_protected must be a bool")
     try:
         text = os.fspath(value)
     except TypeError:
@@ -267,8 +270,28 @@ def _relative_parts(value: str | os.PathLike[str]) -> tuple[str, ...]:
         raise RootPathError("absolute paths are not allowed")
     parts = tuple(re.split(r"[\\/]", text))
     for part in parts:
-        _validate_component(part)
+        _validate_component(part, allow_protected=allow_protected)
     return parts
+
+
+@contextmanager
+def _handover_resource_access(
+    root: RootContext,
+    *,
+    allow_writes: bool = False,
+    allow_unattested_protected_writes: bool = False,
+) -> Iterator[None]:
+    if not isinstance(root, RootContext):
+        raise TypeError("an explicit RootContext is required")
+    if type(allow_writes) is not bool or type(allow_unattested_protected_writes) is not bool:
+        raise TypeError("handover access flags must be booleans")
+    if allow_unattested_protected_writes and not allow_writes:
+        raise ValueError("unattested protected writes require write access")
+    token = _HANDOVER_RESOURCE_ACCESS.set(_HANDOVER_RESOURCE_ACCESS.get() + ((root, allow_writes, allow_unattested_protected_writes),))
+    try:
+        yield
+    finally:
+        _HANDOVER_RESOURCE_ACCESS.reset(token)
 
 
 def _root_parts(value: str | os.PathLike[str]) -> tuple[Path, tuple[str, ...], str]:
@@ -487,12 +510,12 @@ class RootContext:
                 os.close(current_fd)
 
     def resolve(self, relative: str | os.PathLike[str]) -> Path:
-        parts = _relative_parts(relative)
+        parts = self._path_parts(relative)
         self.revalidate()
         return self.path.joinpath(*parts)
 
     def read_bytes(self, relative: str | os.PathLike[str]) -> bytes:
-        parts = _relative_parts(relative)
+        parts = self._path_parts(relative)
         self.revalidate()
         if os.name == "nt":
             result = _windows_read_relative(self._handles[-1], parts)
@@ -508,7 +531,7 @@ class RootContext:
         *,
         mode: int = 0o600,
     ) -> Path:
-        parts = _relative_parts(relative)
+        parts = self._path_parts(relative, write=True)
         if not isinstance(data, bytes):
             raise TypeError("data must be bytes")
         if type(mode) is not int or not 0 <= mode <= 0o777:
@@ -530,7 +553,7 @@ class RootContext:
         durable: bool = False,
     ) -> Path:
         """Append bytes through anchored handles. Caller holds the writer lane."""
-        parts = _relative_parts(relative)
+        parts = self._path_parts(relative, write=True)
         if not isinstance(data, bytes):
             raise TypeError("data must be bytes")
         if type(mode) is not int or not 0 <= mode <= 0o777:
@@ -550,8 +573,8 @@ class RootContext:
         source: str | os.PathLike[str],
         destination: str | os.PathLike[str],
     ) -> Path:
-        source_parts = _relative_parts(source)
-        destination_parts = _relative_parts(destination)
+        source_parts = self._path_parts(source, write=True)
+        destination_parts = self._path_parts(destination, write=True)
         if source_parts == destination_parts:
             raise ValueError("source and destination must differ")
         self.revalidate()
@@ -575,8 +598,8 @@ class RootContext:
         source: str | os.PathLike[str],
         destination: str | os.PathLike[str],
     ) -> Path:
-        source_parts = _relative_parts(source)
-        destination_parts = _relative_parts(destination)
+        source_parts = self._path_parts(source, write=True)
+        destination_parts = self._path_parts(destination, write=True)
         if source_parts == destination_parts:
             raise ValueError("source and destination must differ")
         self.revalidate()
@@ -599,7 +622,7 @@ class RootContext:
 
     def unlink_file(self, relative: str | os.PathLike[str]) -> None:
         """Remove one regular file without following reparse components."""
-        parts = _relative_parts(relative)
+        parts = self._path_parts(relative, write=True)
         self.revalidate()
         if os.name == "nt":
             _windows_unlink_relative(self._handles[-1], parts)
@@ -614,7 +637,7 @@ class RootContext:
         parents: bool = True,
         mode: int = 0o700,
     ) -> Path:
-        parts = _relative_parts(relative)
+        parts = self._path_parts(relative, write=True)
         if type(parents) is not bool:
             raise TypeError("parents must be a bool")
         if type(mode) is not int or not 0 <= mode <= 0o777:
@@ -628,7 +651,7 @@ class RootContext:
         return self.path.joinpath(*parts)
 
     def file_info(self, relative: str | os.PathLike[str]) -> RootFileInfo:
-        parts = _relative_parts(relative)
+        parts = self._path_parts(relative)
         self.revalidate()
         if os.name == "nt":
             result = _windows_file_info(self._handles[-1], parts)
@@ -643,7 +666,7 @@ class RootContext:
         *,
         mode: int = 0o600,
     ) -> RootLockHandle:
-        parts = _relative_parts(relative)
+        parts = self._path_parts(relative, write=True)
         if type(mode) is not int or not 0 <= mode <= 0o777:
             raise ValueError("mode must contain permission bits")
         self.revalidate()
@@ -664,6 +687,40 @@ class RootContext:
                 raise
             return RootLockHandle(fd=descriptor)
         raise UnsupportedFilesystemError("platform lock handles are unsupported")
+
+    def _path_parts(self, value: str | os.PathLike[str], *, write: bool = False) -> tuple[str, ...]:
+        if type(write) is not bool:
+            raise TypeError("write must be a bool")
+        access = next(((allow_writes, allow_unattested) for root, allow_writes, allow_unattested in reversed(_HANDOVER_RESOURCE_ACCESS.get()) if root is self), None)
+        if access is None:
+            try:
+                return _relative_parts(value)
+            except RootPathError:
+                parts = _relative_parts(value, allow_protected=True)
+                if not self._is_exact_protected_path(parts):
+                    return _relative_parts(value)
+                if not self._protected_resource_authorized(parts[1]):
+                    raise RootPathError("protected path identity is not attested at this destination") from None
+                return parts
+        parts = _relative_parts(value, allow_protected=True)
+        if not self._is_exact_protected_path(parts):
+            return _relative_parts(value)
+        if write and not access[0]:
+            return _relative_parts(value)
+        if write and not access[1] and not self._protected_resource_authorized(parts[1]):
+            raise RootPathError("protected path identity is not attested at this destination")
+        return parts
+
+    def _is_exact_protected_path(self, parts: tuple[str, ...]) -> bool:
+        return len(parts) >= 2 and parts[0] == "paper" and parts[1] in _PROTECTED_RESOURCE_NAMES and not any(_canonical_component_identity(part) in _PROTECTED_RESOURCE_NAMES for part in parts[2:])
+
+    def _protected_resource_authorized(self, name: str) -> bool:
+        try:
+            from hedge_fund.runtime.handover import protected_fund_is_authorized
+
+            return protected_fund_is_authorized(self, name)
+        except Exception:
+            return False
 
     def _require_open(self) -> None:
         self._require_owner_process()

@@ -156,6 +156,9 @@ def test_credential_precedence(exported, local, expected, isolated_configuration
 
 
 def test_home_offers_paper_trading_first_and_an_empty_paper_screen_denies_builds(monkeypatch):
+    write_denial = paper.paper_write_denial()
+    assert write_denial is not None
+
     async def scenario():
         app = HedgeFundApp()
         async with app.run_test(size=(100, 35)) as pilot:
@@ -166,9 +169,10 @@ def test_home_offers_paper_trading_first_and_an_empty_paper_screen_denies_builds
             assert isinstance(app.screen, paper.PaperScreen)
             rail = app.screen.query_one("#paper-menu", OptionList)
             assert [rail.get_option_at_index(i).id for i in range(rail.option_count)] == ["build"]
-            assert "No funds yet" in render(app.screen.query_one("#detail-body", Static).content)
-            # h/r/s have nothing to act on; enter on the build row is denied
-            # because the TUI holds no deployment admission.
+            detail = render(app.screen.query_one("#detail-body", Static).content)
+            assert "paper-fund creation is not admitted" in detail
+            assert write_denial in detail
+            # h/r/s have nothing to act on; enter on the build row is denied.
             assert not app.screen.check_action("halt", ()) and not app.screen.check_action("sessions", ())
             paper_screen = app.screen
             notified: list[str] = []
@@ -176,7 +180,7 @@ def test_home_offers_paper_trading_first_and_an_empty_paper_screen_denies_builds
             await pilot.press("enter")
             await pilot.pause()
             assert app.screen is paper_screen
-            assert notified == ["TUI paper writes are disabled on enrolled roots; use the web desk."]
+            assert notified == [write_denial]
             await app.push_screen(builder.BuilderScreen(mode="paper"))
             assert isinstance(app.screen, builder.BuilderScreen) and app.screen.mode == "paper"
             assert "BUILD A FUND" in render(app.screen.query_one(".rail-title", Static).content)

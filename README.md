@@ -110,6 +110,29 @@ With no arguments, this launches the interactive terminal app. It has two modes:
 Provider dispatch is disabled in the TUI; use the guarded CLI or web desk for
 provider-backed actions.
 
+#### Existing-root handover
+
+An existing Windows data root remains read-only until an offline handover and
+separate trusted-single-writer acknowledgement. The staged flow inspects the
+source, copies `mandates`, `paper`, `research`, and
+`runtime/private/v1/settings.json` into a separate destination, records
+destination-bound attestations when source blockers require them, then validates
+and enrolls the destination. The source stays read-only; `.env`, cache, and the
+rest of `runtime` are not copied.
+
+Use `handover attest-stale-marker` only after confirming the recorded owner is
+quiescent; it retires the destination marker into private attestation storage.
+Use `handover attest-protected-fund` with the original protected name; renaming
+does not authorize a fund. `relocate-from` remains available for blocker-free
+sources. Enrollment alone does not permit writes; the native TUI still requires
+current root trust and its admission owner/lane. Cooperative admission does not
+exclude unaware external writers.
+
+See the [handover contract](docs/governance/web-migration-contract.md) and
+[real-cutover runbook](specs/007-windows-writable-access/runbook.md). The runbook
+is a planning artifact only; real-root execution requires separate explicit
+operator authorization.
+
 ### Check one stock
 
 From a source checkout, use an existing enrolled root and explicitly enable
