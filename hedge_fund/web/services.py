@@ -8,6 +8,7 @@ import os
 import re
 import stat
 import threading
+import time
 import unicodedata
 from contextlib import contextmanager, ExitStack
 from datetime import date, datetime, timedelta
@@ -221,6 +222,7 @@ _BACKTEST_POOL_CAPACITY = 1
 _PAPER_POOL_CAPACITY = 2
 # Advisory only: the bound holds until a running operation finishes, which has no fixed duration.
 OPERATION_CAPACITY_RETRY_AFTER_SECONDS = 30
+_PAPER_CONTROL_LANE_RETRY_DELAYS_SECONDS = (0.025, 0.05, 0.1)
 _REPORT_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,180}\.json$")
 _SESSION_CURSOR = re.compile(r"\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}:\d{2})?$")
 _SECRET_FIELD = re.compile(r"(?:api.?key|secret|token|password|credential|authorization)", re.IGNORECASE)
@@ -1110,7 +1112,7 @@ class DeskService:
         normalized = self._validated_name(name)
         self._guard_protected(normalized)
         with self._fund_lock(normalized):
-            with self._paper_control_lane(normalized):
+            with self._paper_control_lane(normalized, retry_busy=True):
                 self._paper_control_state(normalized)
                 try:
                     return self._runner_manager.request_stop(normalized)
@@ -4038,14 +4040,33 @@ class DeskService:
         name: str,
         *,
         verify_inventory: bool = True,
+        retry_busy: bool = False,
     ) -> Iterator[None]:
+        if type(retry_busy) is not bool:
+            raise ValueError("retry_busy must be a bool")
         if verify_inventory:
             self._verify_root_inventory()
-        try:
-            with self._admission.control_lane(name, timeout=0.1):
-                yield
-        except AdmissionError:
-            raise ServiceError(409, "Paper control admission is unavailable.") from None
+        attempt = 0
+        while True:
+            stack = ExitStack()
+            try:
+                stack.enter_context(self._admission.control_lane(name, timeout=0.1))
+            except WriterConflict:
+                stack.close()
+                if not retry_busy or attempt >= len(_PAPER_CONTROL_LANE_RETRY_DELAYS_SECONDS):
+                    raise ServiceError(409, "Paper control admission is unavailable.") from None
+                time.sleep(_PAPER_CONTROL_LANE_RETRY_DELAYS_SECONDS[attempt])
+                attempt += 1
+                continue
+            except AdmissionError:
+                stack.close()
+                raise ServiceError(409, "Paper control admission is unavailable.") from None
+            try:
+                with stack:
+                    yield
+            except AdmissionError:
+                raise ServiceError(409, "Paper control admission is unavailable.") from None
+            return
 
     @contextmanager
     def _paper_execution_lane(self, name: str) -> Iterator[None]:
