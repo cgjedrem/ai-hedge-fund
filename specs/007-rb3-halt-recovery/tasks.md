@@ -60,13 +60,13 @@
 
 ### Tests for User Story 2 (write FIRST, must FAIL where behavior is new) ⚠️
 
-- [ ] T009 [P] [US2] Test: unresolved Resume intent denies require_ready_for_work and resume_allowed in hedge_fund/paper/test_ledger.py and hedge_fund/web/test_recovery.py
-- [ ] T010 [P] [US2] Test: backend Resume denied while orphaned tick intent exists (parity with desk) in hedge_fund/paper/test_ledger.py
-- [ ] T011 [P] [US2] Test: recovery operations (intent resolution, confirmed Resume) remain admissible while the gate denies ordinary work in hedge_fund/paper/test_ledger.py
+- [x] T009 [P] [US2] Test: unresolved Resume intent denies require_ready_for_work and resume_allowed in hedge_fund/paper/test_ledger.py and hedge_fund/web/test_recovery.py
+- [x] T010 [P] [US2] Test: backend Resume denied while orphaned tick intent exists (parity with desk) in hedge_fund/paper/test_ledger.py
+- [x] T011 [P] [US2] Test: recovery operations (intent resolution, confirmed Resume) remain admissible while the gate denies ordinary work in hedge_fund/paper/test_ledger.py
 
 ### Implementation for User Story 2
 
-- [ ] T012 [US2] Route require_ready_for_work (`hedge_fund/paper/ledger.py:359-369`), web resume_allowed (`hedge_fund/web/services.py:824-846`), and the Ledger.resume() pre-check (`:1207-1216`) through the T002 unresolved-state query; preserve PR #11's separate require_ready_for_tick fence and recovery-path admission unchanged
+- [x] T012 [US2] Route require_ready_for_work (`hedge_fund/paper/ledger.py:359-369`), web resume_allowed (`hedge_fund/web/services.py:824-846`), and the Ledger.resume() pre-check (`:1207-1216`) through the T002 unresolved-state query; preserve PR #11's separate require_ready_for_tick fence and recovery-path admission unchanged
 
 **Checkpoint**: US1+US2 green; gates agree
 

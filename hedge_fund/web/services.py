@@ -833,14 +833,19 @@ class DeskService:
             )
             intent_targets = tick_intent_reconciliation_targets(ledger)
             halted = ledger.halted()
+            unresolved_state = ledger.unresolved_recovery_state()
         except (LedgerError, OSError, ValueError):
             raise ServiceError(423, "Paper state is invalid (LedgerError).", code="replay-corrupt") from None
         preview = snapshot.preview
         intent_preview = intent_snapshot.preview
+        has_pending_failure = bool(unresolved_state.failures)
+        failure_review_allowed = has_pending_failure and preview.required and preview.recoverable
+        no_failure_review_required = not has_pending_failure and not preview.required
+        resume_allowed = halted is not None and not unresolved_state.tick_intents and not unresolved_state.resume_intents and not unresolved_state.approval_consumptions and (failure_review_allowed or no_failure_review_required)
         return {
             "name": normalized,
             "halted": halted,
-            "resume_allowed": halted is not None and not intent_preview.required and (not preview.required or preview.recoverable),
+            "resume_allowed": resume_allowed,
             "preview": preview.model_dump(mode="json"),
             "intent_preview": intent_preview.model_dump(mode="json"),
             "intent_targets": intent_targets,

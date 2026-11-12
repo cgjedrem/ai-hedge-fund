@@ -113,6 +113,28 @@ def test_web_resume_rejects_preview_after_local_book_changes(write_client, demo_
     assert not any(event["kind"] in {"reconciliation", "resume"} for event in ledger.events())
 
 
+def test_web_resume_permission_denies_unresolved_resume_intent(write_client, demo_root):
+    client, _headers = write_client
+    name = "demo-quality"
+    directory = demo_root / "paper" / name
+    ledger = Ledger(directory)
+    latest = ledger.latest()
+    assert latest is not None
+    service = client.app.state.service
+    service.halt_fund(name, "synthetic unresolved Resume intent", "halt-resume-intent-001")
+    with service._paper_control_lane(name):
+        ledger.log_event("resume_effect_intent", head_hash=latest.hash, by="web", durable=True)
+
+    response = client.get(
+        f"/api/paper/{name}/reconciliation",
+        headers={"host": "127.0.0.1"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["halted"] == "synthetic unresolved Resume intent"
+    assert response.json()["resume_allowed"] is False
+
+
 def test_readiness_denial_keeps_recovery_snapshot_available(write_client, demo_root):
     client, _headers = write_client
     name = "demo-quality"

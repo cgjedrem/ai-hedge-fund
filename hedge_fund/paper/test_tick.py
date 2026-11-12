@@ -625,6 +625,7 @@ def test_tick_intent_reconciliation_preview_blocks_unrelated_orphaned_consumptio
 
 
 def test_approval_consumption_without_intent_is_reviewable_and_resolvable(tmp_path, clock, SPEC):
+    from hedge_fund.paper.ledger import PaperReconciliationRequired
     from hedge_fund.runtime.reconciliation import (
         build_tick_intent_reconciliation_snapshot,
         TickIntentReconciliationConfirmation,
@@ -646,6 +647,7 @@ def test_approval_consumption_without_intent_is_reviewable_and_resolvable(tmp_pa
             durable=True,
         )
         approval_events = ledger.unresolved_approval_consumption_events(allow_unresolved_corruption=True)
+        unresolved = ledger.unresolved_recovery_state()
         snapshot = build_tick_intent_reconciliation_snapshot(
             directory,
             load_deployed(directory),
@@ -659,6 +661,10 @@ def test_approval_consumption_without_intent_is_reviewable_and_resolvable(tmp_pa
     assert snapshot.preview.reason == "ready"
     assert snapshot.preview.intent_digest is None
     assert snapshot.preview.approval_journal_event_digests == (approval_events[0][0],)
+    assert unresolved.required is True
+    assert unresolved.approval_consumptions == approval_events
+    with pytest.raises(PaperReconciliationRequired, match="approval consumption is incomplete"):
+        ledger.require_ready_for_work(ledger.replay(SPEC.capital, full=True), approval_required=False)
     confirmation = TickIntentReconciliationConfirmation(
         request_id="resolve-unmatched-approval",
         intent_request_id=None,
@@ -685,6 +691,7 @@ def test_approval_consumption_without_intent_is_reviewable_and_resolvable(tmp_pa
     resolution = next(event for event in ledger.events() if event.get("kind") == "tick_intent_resolved")
     assert resolution["receipt"]["approval_journal_event_digests"] == [approval_events[0][0]]
     assert ledger.unresolved_recovery_state().required is False
+    ledger.require_ready_for_work(ledger.replay(SPEC.capital, full=True), approval_required=False)
 
 
 def test_intent_reconciliation_preview_digest_accepts_nan_event_field(tmp_path, clock, SPEC):

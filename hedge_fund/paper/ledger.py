@@ -369,16 +369,43 @@ class Ledger:
         write_atomic(self.redo_state_path, json.dumps(value, indent=2), mode=0o600, durable=True)
 
     def require_ready_for_work(self, state: FundState, *, approval_required: bool) -> None:
+        self._require_ready_for_work_state(
+            state,
+            approval_required=approval_required,
+        )
+
+    def _require_ready_for_work_state(
+        self,
+        state: FundState,
+        *,
+        approval_required: bool,
+        unresolved_state: UnresolvedPaperState | None = None,
+        allow_recorded_failures: bool = False,
+        allow_tick_intents: bool = False,
+    ) -> UnresolvedPaperState:
         self._require_completed_redo()
         self._require_completed_approval_publication()
+        if unresolved_state is None:
+            unresolved_state = self.unresolved_recovery_state()
+        if not isinstance(unresolved_state, UnresolvedPaperState):
+            raise LedgerError("Unresolved paper recovery state is invalid.")
+        if unresolved_state.approval_consumptions:
+            raise PaperReconciliationRequired("approval consumption is incomplete; reconciliation is required")
         self._require_completed_approval_consumptions()
+        if unresolved_state.resume_intents:
+            raise PaperReconciliationRequired("Resume control write outcome is uncertain; reconciliation is required")
+        if unresolved_state.tick_intents and not allow_tick_intents:
+            raise PaperReconciliationRequired("unresolved tick intent requires reconciliation")
+        if unresolved_state.failures and not allow_recorded_failures:
+            raise PaperReconciliationRequired("paper failure is pending review; reconciliation is required")
         if not approval_required or state.pending is None:
-            return
+            return unresolved_state
         if not isinstance(state.prev_hash, str):
             raise PaperReconciliationRequired("pending decision has no source hash")
         event = self._latest_approval_event(state.pending.as_of, state.prev_hash, strict=True)
         if event is not None and (event.get("kind") in {"consume", "tick"} or event.get("consumed") is True) and not self.approval_consumption_is_resolved(event):
             raise PaperReconciliationRequired("approval consumption is incomplete; reconciliation is required")
+        return unresolved_state
 
     def unresolved_recovery_state(self) -> UnresolvedPaperState:
         from hedge_fund.runtime.reconciliation import unresolved_tick_failures
@@ -396,8 +423,13 @@ class Ledger:
         )
 
     def require_ready_for_tick(self, state: FundState, *, approval_required: bool) -> None:
-        self.require_ready_for_work(state, approval_required=approval_required)
-        unresolved = self.unresolved_tick_intents()
+        unresolved_state = self._require_ready_for_work_state(
+            state,
+            approval_required=approval_required,
+            allow_recorded_failures=True,
+            allow_tick_intents=True,
+        )
+        unresolved = unresolved_state.tick_intents
         if unresolved:
             intent = unresolved[0]
             if intent.is_corrupt or intent.request_id is None or intent.session is None:
@@ -407,6 +439,8 @@ class Ledger:
                 intent.request_id,
                 intent.session,
             )
+        if unresolved_state.failures:
+            raise PaperReconciliationRequired("paper failure is pending review; reconciliation is required")
 
     def unresolved_tick_intents(self) -> tuple[UnresolvedTickIntent, ...]:
         try:
@@ -1233,7 +1267,11 @@ class Ledger:
                     return previous["reconciliation_id"]
             halted = self.halted()
             state = self.replay(capital, full=True)
-            self.require_ready_for_work(state, approval_required=approval_required)
+            self._require_ready_for_work_state(
+                state,
+                approval_required=approval_required,
+                allow_recorded_failures=True,
+            )
             latest = self.latest()
             events = self.events()
             pending_halt = self._halt_request_identity()
@@ -2242,12 +2280,7 @@ def _tick_intent_resolution_state(
         elif receipt.approval_journal_event_digests:
             approval_events_valid = True
             for digest in receipt.approval_journal_event_digests:
-                matches = [
-                    prior_index
-                    for prior_index, prior in enumerate(events[:index])
-                    if _approval_journal_event_identity(prior, event_offsets[prior_index]) == digest
-                    and (prior.get("kind") == "consume" or (prior.get("kind") == "reject" and prior.get("consumed") is True))
-                ]
+                matches = [prior_index for prior_index, prior in enumerate(events[:index]) if _approval_journal_event_identity(prior, event_offsets[prior_index]) == digest and (prior.get("kind") == "consume" or (prior.get("kind") == "reject" and prior.get("consumed") is True))]
                 if len(matches) != 1 or digest in resolved_approval_events:
                     approval_events_valid = False
                     break
