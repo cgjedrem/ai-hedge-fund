@@ -16,29 +16,11 @@ from pathlib import Path
 from typing import Any, Callable, Iterator, TypedDict, TypeVar
 
 from hedge_fund.pipeline.session import code_version
-from hedge_fund.runtime.admission import (
-    AdmissionCoordinator,
-    AdmissionError,
-    LOCK_DIRECTORY,
-    MAX_LOCK_WAIT_SECONDS,
-    OWNER_LOCK_PATH,
-    PROTOCOL_VERSION,
-    require_paper_write_lanes,
-    RootMigrationLease,
-    RootOwnerLease,
-    WriterConflict,
-)
+from hedge_fund.runtime.admission import AdmissionCoordinator, AdmissionError, LOCK_DIRECTORY, MAX_LOCK_WAIT_SECONDS, OWNER_LOCK_PATH, PROTOCOL_VERSION, require_paper_write_lanes, RootMigrationLease, RootOwnerLease, WriterConflict
 from hedge_fund.runtime.exclusion import out_of_band_exclusion_basis
 from hedge_fund.runtime.exclusion import UNPROVEN_REASON as EXCLUSION_UNPROVEN_REASON
 from hedge_fund.runtime.ownership import process_identity, ProcessIdentityError
-from hedge_fund.runtime.root import (
-    _handover_resource_access,
-    _windows_current_user_sid,
-    ensure_unique_resource_name,
-    PRIVATE_ROOT,
-    RootContext,
-    RootPathError,
-)
+from hedge_fund.runtime.root import _handover_resource_access, _windows_current_user_sid, ensure_unique_resource_name, PRIVATE_ROOT, RootContext, RootPathError
 
 HANDOVER_PATH = f"{PRIVATE_ROOT}/handover.json"
 RECOVERY_ROOT = f"{PRIVATE_ROOT}/recoveries"
@@ -856,6 +838,120 @@ def _read_attestation_artifact(
     except FileNotFoundError:
         return None
     return _validate_attestation_artifact(root, record, kind=kind, subject=subject)
+
+
+def inspect_attestation_state(root: RootContext) -> dict[str, Any]:
+    """Return verified destination attestations and unresolved source blockers."""
+    if not isinstance(root, RootContext):
+        raise TypeError("an explicit RootContext is required")
+    artifacts = _list_attestation_artifacts(root)
+    source_evidence = _read_source_evidence_bundle(root)
+    source_digest = source_evidence["record_digest"] if source_evidence is not None else None
+    if source_evidence is not None:
+        blockers = source_evidence["blockers"]
+    else:
+        entries = _relocation_entries(root)
+        blockers = _source_evidence_blockers(root, entries)
+
+    artifact_keys = {(artifact["kind"], artifact["subject"], artifact["source_evidence_digest"]) for artifact in artifacts}
+    remaining = []
+    for blocker in blockers:
+        if source_digest is not None and (blocker["kind"], blocker["subject"], source_digest) in artifact_keys:
+            continue
+        if source_digest is None:
+            command = "handover inspect-source"
+            arguments = ["--evidence-out", f"<destination>/{SOURCE_EVIDENCE_PATH}"]
+            state = "source-evidence-required"
+        elif blocker["kind"] == "stale-marker-retirement":
+            command = "handover attest-stale-marker"
+            arguments = [
+                "--marker",
+                blocker["subject"],
+                "--source-evidence",
+                source_digest,
+                "--operator-statement",
+                "<operator statement>",
+            ]
+            state = "attestation-required"
+        else:
+            command = "handover attest-protected-fund"
+            arguments = [
+                "--fund",
+                blocker["subject"],
+                "--source-evidence",
+                source_digest,
+                "--operator-statement",
+                "<operator statement>",
+            ]
+            state = "attestation-required"
+        remaining.append(
+            {
+                **blocker,
+                "source_evidence_digest": source_digest,
+                "state": state,
+                "resolving_subcommand": command,
+                "resolving_arguments": arguments,
+            }
+        )
+    remaining.sort(key=lambda item: (item["kind"], item["subject"].casefold()))
+    return {
+        "source_evidence_digest": source_digest,
+        "attestation_artifacts": artifacts,
+        "remaining_blockers": remaining,
+    }
+
+
+def _list_attestation_artifacts(root: RootContext) -> list[dict[str, Any]]:
+    if not root.verify_private_storage():
+        return []
+    base = root.path.joinpath(*Path(ATTESTATION_ROOT).parts)
+    try:
+        if _is_reparse_point(base) or not stat.S_ISDIR(base.lstat().st_mode):
+            raise HandoverError("attestation storage is not a regular directory")
+    except FileNotFoundError:
+        return []
+    artifacts = []
+    allowed_root_entries = _ATTESTATION_KINDS | {"retired-markers"}
+    try:
+        with os.scandir(base) as entries:
+            kind_dirs = []
+            for entry in entries:
+                if entry.name not in allowed_root_entries or not entry.is_dir(follow_symlinks=False):
+                    raise HandoverError("attestation storage contains an unknown entry")
+                if entry.name in _ATTESTATION_KINDS:
+                    kind_dirs.append(entry.name)
+    except OSError as exc:
+        raise HandoverError(f"attestation storage is unavailable ({type(exc).__name__})") from None
+    for kind in sorted(kind_dirs):
+        directory = base / kind
+        if _is_reparse_point(directory):
+            raise HandoverError("attestation storage contains a reparse point")
+        try:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    if not entry.name.endswith(".json") or not entry.is_file(follow_symlinks=False):
+                        raise HandoverError("attestation storage contains an invalid artifact entry")
+                    relative = f"{ATTESTATION_ROOT}/{kind}/{entry.name}"
+                    try:
+                        info = root.file_info(relative)
+                        if info.size <= 0 or info.size > _MAX_TRUST_RECORD_BYTES:
+                            raise HandoverError("attestation artifact size is invalid")
+                        data = root.read_bytes(relative)
+                        if len(data) != info.size:
+                            raise HandoverError("attestation artifact changed during inspection")
+                        record = json.loads(data.decode("utf-8"))
+                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        raise HandoverError("attestation artifact is malformed") from None
+                    artifact = _validate_attestation_artifact(root, record, kind=kind)
+                    if _attestation_path(kind, artifact["subject"]) != relative:
+                        raise HandoverError("attestation artifact path does not match its identity")
+                    artifacts.append(artifact)
+                    if len(artifacts) > _MAX_INVENTORY_FUNDS * 2:
+                        raise HandoverError("attestation inventory exceeds its bound")
+        except OSError as exc:
+            raise HandoverError(f"attestation storage is unavailable ({type(exc).__name__})") from None
+    root.revalidate()
+    return sorted(artifacts, key=lambda item: (item["kind"], item["subject"].casefold()))
 
 
 def _write_attestation_artifact(root: RootContext, record: dict[str, Any]) -> str:
@@ -1824,10 +1920,14 @@ def _relocation_entries(root: RootContext) -> dict[str, dict[str, Any]]:
     return dict(sorted(entries.items()))
 
 
-def build_head_inventory(root: RootContext) -> dict[str, dict[str, Any]]:
-    """Replay every deployed paper ledger and return canonical head identities."""
+def build_head_inventory(
+    root: RootContext,
+    *,
+    allow_relocation_blockers: bool = False,
+) -> dict[str, dict[str, Any]]:
+    """Replay deployed ledgers; inspection may retain relocation blockers."""
     try:
-        return _build_head_inventory(root)
+        return _build_head_inventory(root, allow_relocation_blockers=allow_relocation_blockers)
     except OSError as exc:
         raise HandoverError(f"paper inventory is unavailable ({type(exc).__name__})") from None
 
@@ -2322,13 +2422,7 @@ def recover_stale_reservation(
     if operator_attestation != STALE_RECOVERY_ATTESTATION:
         raise HandoverError("explicit stale-reservation recovery attestation is required")
 
-    from hedge_fund.runtime.owned_runner import (
-        OwnedRunnerError,
-        read_runner_record,
-        runner_key,
-        validate_runner_state,
-        write_runner_record,
-    )
+    from hedge_fund.runtime.owned_runner import OwnedRunnerError, read_runner_record, runner_key, validate_runner_state, write_runner_record
 
     runner_identity = runner_key(fund)
     try:

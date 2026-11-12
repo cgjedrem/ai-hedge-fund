@@ -59,12 +59,12 @@
 
 ### Tests for User Story 2
 
-- [ ] T012 [P] [US2] Denial-path matrix (unenrolled, untrusted, scope mismatch, inventory mismatch, second writer) prints failed precondition + resolving command and writes no partial state in hedge_fund/runtime/test_write_authority.py and hedge_fund/runtime/test_handover.py
+- [X] T012 [P] [US2] Denial-path matrix (unenrolled, untrusted, scope mismatch, inventory mismatch, second writer) prints failed precondition + resolving command and writes no partial state in hedge_fund/runtime/test_write_authority.py and hedge_fund/runtime/test_handover.py
 
 ### Implementation for User Story 2
 
-- [ ] T013 [US2] Extend `handover inspect` output to list recorded attestation artifacts and remaining blockers with the exact resolving subcommand each in hedge_fund/runtime/handover.py + hedge_fund/run.py
-- [ ] T014 [US2] Error-contract pass: exit code 2 family preserved for unenabled roots; every new denial follows the contract in specs/007-windows-writable-access/contracts/handover-cli.md §Error contract
+- [X] T013 [US2] Extend `handover inspect` output to list recorded attestation artifacts and remaining blockers with the exact resolving subcommand each in hedge_fund/runtime/handover.py + hedge_fund/run.py
+- [X] T014 [US2] Error-contract pass: exit code 2 family preserved for unenabled roots; every new denial follows the contract in specs/007-windows-writable-access/contracts/handover-cli.md §Error contract
 
 **Checkpoint**: Trust grant fully reconstructible from on-disk artifacts (SC-005).
 
