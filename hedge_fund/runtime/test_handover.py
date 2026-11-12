@@ -9,33 +9,9 @@ from hedge_fund.fund import FundSpec
 from hedge_fund.paper.deployed import deploy
 from hedge_fund.pipeline.session import code_version
 from hedge_fund.runtime import handover
-from hedge_fund.runtime.admission import (
-    OwnershipUnknown,
-    RootMigrationLease,
-    RootOwnerLease,
-    WriterConflict,
-)
-from hedge_fund.runtime.handover import (
-    build_head_inventory,
-    enroll_fresh,
-    enrollment_status,
-    EnrollmentInvalid,
-    HANDOVER_PATH,
-    HandoverError,
-    inventory_digest,
-    LedgerDrift,
-    migrate_existing,
-    OPERATOR_ATTESTATION,
-    require_enrollment,
-    root_binding,
-    verify_ledger_head,
-)
-from hedge_fund.runtime.owned_runner import (
-    read_runner_record,
-    runner_key,
-    RUNNER_ROOT,
-    write_runner_record,
-)
+from hedge_fund.runtime.admission import OwnershipUnknown, RootMigrationLease, RootOwnerLease, WriterConflict
+from hedge_fund.runtime.handover import build_head_inventory, enroll_fresh, enrollment_status, EnrollmentInvalid, HANDOVER_PATH, HandoverError, inventory_digest, LedgerDrift, migrate_existing, OPERATOR_ATTESTATION, require_enrollment, root_binding, verify_ledger_head
+from hedge_fund.runtime.owned_runner import read_runner_record, runner_key, RUNNER_ROOT, write_runner_record
 from hedge_fund.runtime.ownership import process_identity
 from hedge_fund.runtime.root import PRIVATE_ROOT, RootContext, RootPathError
 
@@ -219,6 +195,51 @@ def test_inspect_source_refuses_evidence_path_inside_source_without_writing(tmp_
             handover.inspect_relocation_source(source, evidence_out=source_path / handover.SOURCE_EVIDENCE_PATH)
 
     assert _tree_digest_snapshot(source_path) == before
+
+
+def test_handover_inspect_lists_attestations_and_remaining_blockers(tmp_path, capsys):
+    import hedge_fund.run as run
+
+    source_path = _legacy_relocation_source(tmp_path / "source", protected_fund=True, marker="987654")
+    destination_path = tmp_path / "destination"
+    destination_path.mkdir()
+    with RootContext.open(source_path) as source:
+        source_review = handover.inspect_relocation_source(
+            source,
+            evidence_out=destination_path / handover.SOURCE_EVIDENCE_PATH,
+        )
+
+    protected_blocker = next(blocker for blocker in source_review["blockers"] if blocker["kind"] == "protected-fund-inclusion")
+    with RootContext.open(source_path) as source, RootContext.open(destination_path) as destination:
+        handover.relocate_copy(destination, source=source, expected_content_digest=source_review["content_digest"])
+        artifact = handover._new_attestation_artifact(
+            destination,
+            kind=protected_blocker["kind"],
+            subject=protected_blocker["subject"],
+            evidence=protected_blocker["evidence"],
+            source_evidence_digest=source_review["source_evidence_digest"],
+            operator_statement="Synthetic destination retains the original fund identity.",
+        )
+        handover._write_attestation_artifact(destination, artifact)
+
+    run.main(["--root", str(destination_path), "handover", "inspect"])
+    inspected = json.loads(capsys.readouterr().out)
+
+    assert inspected["source_evidence_digest"] == source_review["source_evidence_digest"]
+    assert [(artifact["kind"], artifact["subject"]) for artifact in inspected["attestation_artifacts"]] == [("protected-fund-inclusion", "umbrella")]
+    assert len(inspected["remaining_blockers"]) == 1
+    blocker = inspected["remaining_blockers"][0]
+    assert blocker["kind"] == "stale-marker-retirement"
+    assert blocker["subject"] == "paper/umbrella/runner.pid"
+    assert blocker["resolving_subcommand"] == "handover attest-stale-marker"
+    assert blocker["resolving_arguments"] == [
+        "--marker",
+        "paper/umbrella/runner.pid",
+        "--source-evidence",
+        source_review["source_evidence_digest"],
+        "--operator-statement",
+        "<operator statement>",
+    ]
 
 
 def test_relocate_copy_transfers_settings_and_finalize_enrolls(tmp_path, monkeypatch):
@@ -437,6 +458,123 @@ def test_migration_refuses_any_runner_pid_and_releases_exclusive_lease(tmp_path)
         lease.close()
 
     assert not (root / HANDOVER_PATH).exists()
+
+
+def test_handover_cli_unenrolled_trust_denial_prints_remedies_without_writing(tmp_path, capsys):
+    import hedge_fund.run as run
+
+    root_path = tmp_path / "cli-unenrolled"
+    root_path.mkdir()
+    before = _tree_digest_snapshot(root_path)
+
+    with pytest.raises(SystemExit) as denied:
+        run.main(
+            [
+                "--root",
+                str(root_path),
+                "handover",
+                "trust-single-writer",
+                "--inventory-digest",
+                "0" * 64,
+                "--operator-acknowledgement",
+                "I ACCEPT",
+            ]
+        )
+
+    assert denied.value.code == 2
+    error = capsys.readouterr().err
+    assert "private root storage is not verified" in error.lower()
+    assert _tree_digest_snapshot(root_path) == before
+    assert "handover inspect" in error
+    assert "enroll-fresh" in error
+
+
+@pytest.mark.parametrize(
+    ("scenario", "failed_precondition"),
+    [
+        ("untrusted", "exact root-specific operator acknowledgement is required"),
+        ("scope-mismatch", "another runtime"),
+        ("inventory-mismatch", "inventory differs"),
+        ("second-writer", "another root participant is active"),
+    ],
+)
+def test_handover_cli_denials_print_remedies_without_partial_trust(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    synthetic_runtime_scope,
+    scenario,
+    failed_precondition,
+):
+    import hedge_fund.run as run
+
+    root_path = _legacy_relocation_source(tmp_path / f"cli-{scenario}")
+    with RootContext.open(root_path) as root:
+        heads = build_head_inventory(root)
+        migrate_existing(
+            root,
+            expected_inventory_digest=inventory_digest(heads),
+            operator_attestation=OPERATOR_ATTESTATION,
+        )
+        review = handover.prepare_single_writer_acknowledgement(root)
+        if scenario == "second-writer":
+            handover.trust_single_writer(
+                root,
+                expected_inventory_digest=review["inventory_digest"],
+                operator_acknowledgement=review["operator_acknowledgement"],
+            )
+
+        if scenario == "scope-mismatch":
+            changed_scope = {**synthetic_runtime_scope, "namespace": synthetic_runtime_scope["namespace"] + ";changed"}
+            monkeypatch.setattr(handover, "_runtime_scope_identity", lambda _root: changed_scope)
+        elif scenario == "inventory-mismatch":
+            fund_file = root_path / "paper" / "alpha" / "fund.yaml"
+            fund_file.write_bytes(fund_file.read_bytes() + b"\n# synthetic inventory drift\n")
+
+        def trust_attempt():
+            command = ["--root", str(root_path), "handover"]
+            if scenario == "second-writer":
+                command.append("revoke-single-writer")
+            else:
+                acknowledgement = "I ACCEPT" if scenario == "untrusted" else review["operator_acknowledgement"]
+                command.extend(
+                    [
+                        "trust-single-writer",
+                        "--inventory-digest",
+                        review["inventory_digest"],
+                        "--operator-acknowledgement",
+                        acknowledgement,
+                    ]
+                )
+            with pytest.raises(SystemExit) as denied:
+                run.main(command)
+            assert denied.value.code == 2
+            error = capsys.readouterr().err
+            assert failed_precondition in error
+            assert "Resolve with:" in error
+            assert "handover inspect" in error
+
+        def state_snapshot():
+            records = {}
+            for relative in (
+                HANDOVER_PATH,
+                handover.SINGLE_WRITER_CHALLENGE_PATH,
+                handover.SINGLE_WRITER_STATE_PATH,
+            ):
+                try:
+                    records[relative] = hashlib.sha256(root.read_bytes(relative)).hexdigest()
+                except FileNotFoundError:
+                    records[relative] = None
+            records["paper"] = _tree_digest_snapshot(root_path / "paper")
+            return records
+
+        before = state_snapshot()
+        if scenario == "second-writer":
+            with RootOwnerLease.acquire(root, timeout=0):
+                trust_attempt()
+        else:
+            trust_attempt()
+        assert state_snapshot() == before
 
 
 def test_inventory_does_not_ignore_directory_walk_errors(tmp_path, monkeypatch):

@@ -667,6 +667,7 @@ def _handover(args, parser: argparse.ArgumentParser, root: RootContext) -> None:
         enrollment_status,
         HANDOVER_PATH,
         HandoverError,
+        inspect_attestation_state,
         inspect_relocation_source,
         inventory_digest,
         migrate_existing,
@@ -691,6 +692,7 @@ def _handover(args, parser: argparse.ArgumentParser, root: RootContext) -> None:
             inspectable = status["state"] in {"unenrolled", "enrolled"} or orphaned_admission
             if not inspectable:
                 raise HandoverError("root enrollment or ledger inventory is unavailable")
+            attestation_state = inspect_attestation_state(root)
             acknowledgement = None
             acknowledgement_expires_at = None
             runtime_scope = None
@@ -708,7 +710,10 @@ def _handover(args, parser: argparse.ArgumentParser, root: RootContext) -> None:
                 if not root.verify_private_storage():
                     root.prepare_private_storage()
                 with RootMigrationLease.acquire(root, timeout=0):
-                    heads = build_head_inventory(root)
+                    heads = build_head_inventory(
+                        root,
+                        allow_relocation_blockers=attestation_state["source_evidence_digest"] is not None,
+                    )
                     try:
                         root.file_info(HANDOVER_PATH)
                     except FileNotFoundError:
@@ -734,6 +739,7 @@ def _handover(args, parser: argparse.ArgumentParser, root: RootContext) -> None:
                         "operator_acknowledgement_expires_at": acknowledgement_expires_at,
                         "runtime_scope": runtime_scope,
                         "operator_responsibility": SINGLE_WRITER_RESPONSIBILITY_WARNING,
+                        **attestation_state,
                     },
                     sort_keys=True,
                     indent=2,
@@ -772,7 +778,7 @@ def _handover(args, parser: argparse.ArgumentParser, root: RootContext) -> None:
                 operator_attestation=args.operator_attestation,
             )
     except Exception as exc:
-        parser.error(f"offline handover failed ({type(exc).__name__}): {exc}")
+        parser.error(f"offline handover failed ({type(exc).__name__}): {exc}. Resolve with: {_handover_remedy(args, exc)}")
     print(
         json.dumps(
             {
@@ -786,20 +792,36 @@ def _handover(args, parser: argparse.ArgumentParser, root: RootContext) -> None:
     )
 
 
+def _handover_remedy(args, error: Exception) -> str:
+    action = args.handover_action
+    inspect = "aihf --root ROOT handover inspect"
+    if action == "trust-single-writer":
+        if "private root storage is not verified" in str(error).casefold():
+            return f"run `{inspect}`; for a genuinely empty root, run `aihf --root ROOT handover enroll-fresh`, then inspect again"
+        return f"run `{inspect}` and retry `handover trust-single-writer` with its fresh inventory digest and exact acknowledgement"
+    if action in {"relocate-copy", "relocate-from"}:
+        return "run `aihf --root SOURCE handover inspect-source --evidence-out DEST/runtime/private/v1/source-evidence.json`, then retry the relocation with its current content digest"
+    if action == "relocate-finalize":
+        return f"run `{inspect}` and resolve every listed blocker before retrying `handover relocate-finalize`"
+    if action == "inspect-source":
+        return "verify the source is readable and `--evidence-out` is an absolute destination-private path outside the source, then retry `handover inspect-source`"
+    if action == "migrate-existing":
+        return f"run `{inspect}` and retry `handover migrate-existing` with its current inventory digest and exact operator attestation"
+    if action == "enroll-fresh":
+        return f"run `{inspect}`; `handover enroll-fresh` applies only to a genuinely empty root"
+    if action == "revoke-single-writer":
+        return f"stop participating writers, run `{inspect}`, then retry `handover revoke-single-writer`"
+    if action == "attest-stale-marker":
+        return f"verify the marker owner is quiescent, run `{inspect}`, then retry `handover attest-stale-marker` with the listed source evidence digest"
+    if action == "attest-protected-fund":
+        return f"run `{inspect}` and retry `handover attest-protected-fund` with the original fund name and listed source evidence digest"
+    return f"run `{inspect}` and follow its reported resolution"
+
+
 @contextmanager
 def _paper_writer_admission(*, verify_inventory: bool = True) -> Iterator[tuple[RootContext, object] | None]:
-    from hedge_fund.runtime.admission import (
-        AdmissionCoordinator,
-        AdmissionError,
-        RootOwnerLease,
-    )
-    from hedge_fund.runtime.handover import (
-        enrollment_status,
-        HandoverError,
-        has_write_authority,
-        verify_root_inventory,
-        write_authority,
-    )
+    from hedge_fund.runtime.admission import AdmissionCoordinator, AdmissionError, RootOwnerLease
+    from hedge_fund.runtime.handover import enrollment_status, HandoverError, has_write_authority, verify_root_inventory, write_authority
 
     root = paths.root_context()
     status = enrollment_status(root, verify_inventory=verify_inventory)
@@ -926,27 +948,11 @@ def _authorize_cli_operation(
     from hedge_fund.pipeline.session import SessionRecord as CapturedSessionRecord
     from hedge_fund.runtime.capture import freeze_capture
     from hedge_fund.runtime.configuration import ConfigurationError, resolve_settings
-    from hedge_fund.runtime.costs import (
-        cost_model_description,
-        cost_model_identity,
-        COST_MODEL_VERSION,
-        has_verified_cost_model,
-        minimum_attempt_cost,
-    )
+    from hedge_fund.runtime.costs import cost_model_description, cost_model_identity, COST_MODEL_VERSION, has_verified_cost_model, minimum_attempt_cost
     from hedge_fund.runtime.credentials import CredentialStore, CredentialStoreError
     from hedge_fund.runtime.dispatch import make_one_shot_dispatch
-    from hedge_fund.runtime.handover import (
-        HandoverError,
-        verify_ledger_head,
-        verify_root_inventory,
-    )
-    from hedge_fund.runtime.policy import (
-        AuthorizationDenied,
-        classify_provider,
-        KEN_FRENCH_BREAKPOINTS_TARGET,
-        ProviderClass,
-        ProviderTarget,
-    )
+    from hedge_fund.runtime.handover import HandoverError, verify_ledger_head, verify_root_inventory
+    from hedge_fund.runtime.policy import AuthorizationDenied, classify_provider, KEN_FRENCH_BREAKPOINTS_TARGET, ProviderClass, ProviderTarget
 
     if not args.enable_network:
         parser.error("provider access requires explicit --enable-network")
@@ -1300,10 +1306,7 @@ def _cli_fund(spec, settings, dispatch, api_key):
 
 def _require_cli_sim_account_ownership(broker: str, parser: argparse.ArgumentParser) -> None:
     if broker == "saxo":
-        from hedge_fund.brokers.account_binding import (
-            require_sim_account_ownership,
-            SIMOwnershipUnknown,
-        )
+        from hedge_fund.brokers.account_binding import require_sim_account_ownership, SIMOwnershipUnknown
 
         try:
             require_sim_account_ownership()
@@ -1641,11 +1644,7 @@ def _paper(
         with _paper_writer_admission() as participant:
             with _paper_lane(participant, args.name, "control_lane"):
                 _verify_enrolled_head(participant, args.name)
-                from hedge_fund.runtime.reconciliation import (
-                    build_tick_intent_reconciliation_snapshot,
-                    tick_intent_reconciliation_targets,
-                    TickIntentReconciliationConfirmation,
-                )
+                from hedge_fund.runtime.reconciliation import build_tick_intent_reconciliation_snapshot, tick_intent_reconciliation_targets, TickIntentReconciliationConfirmation
 
                 deployed = load_deployed(directory)
                 ledger = Ledger(directory)
@@ -1866,10 +1865,7 @@ def _paper(
                     request_id=args.request_id,
                 )
             else:
-                from hedge_fund.runtime.admission import (
-                    AdmissionError,
-                    paper_approval_transition,
-                )
+                from hedge_fund.runtime.admission import AdmissionError, paper_approval_transition
                 from hedge_fund.runtime.handover import HandoverError
 
                 try:
