@@ -4051,6 +4051,7 @@ class DeskService:
 
     def _paper_snapshot(self, deployed: DeployedFund, directory: Path, *, include_records: bool = False) -> dict:
         ledger = Ledger(directory)
+        recovery_state = "ready"
         try:
             halted = ledger.halted()
             halt_state = "halted" if halted is not None else "clear"
@@ -4065,6 +4066,7 @@ class DeskService:
             records = []
             state = None
             ledger_status = {"ok": False, "error": f"Ledger verification failed ({type(exc).__name__})."}
+            recovery_state = "corrupt"
         latest = records[-1] if records else None
         positions = []
         if state is not None:
@@ -4085,8 +4087,10 @@ class DeskService:
                 approval = ledger.observe_approval_for_display(state, approval_required=deployed.spec.approval_required)
             except PaperReconciliationRequired:
                 ledger_status = {"ok": False, "error": "Paper work is in progress or requires reconciliation."}
+                recovery_state = "reconciliation_required"
             except (LedgerError, OSError, ValueError):
                 ledger_status = {"ok": False, "error": "Approval history is unavailable."}
+                recovery_state = "corrupt"
         try:
             next_run = following_session(deployed.spec, state.last_session if state is not None else None, _utcnow())
         except (OverflowError, ValueError):
@@ -4124,6 +4128,7 @@ class DeskService:
             "next_run": next_run,
             "halted": halted,
             "halt_state": halt_state,
+            "recovery_state": recovery_state,
             "ledger": ledger_status,
             "runner": self._runner_state(deployed.name),
             "live_value": self._cached_valuation_view(

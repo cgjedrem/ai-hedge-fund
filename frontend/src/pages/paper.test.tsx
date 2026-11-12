@@ -211,6 +211,7 @@ function paperSnapshot(runner: RunnerState, halted = false): PaperSnapshot {
     next_run: null,
     halted: halted ? "synthetic tick failure" : null,
     halt_state: halted ? "halted" : "clear",
+    recovery_state: "ready",
     ledger: { ok: true, error: null },
     runner,
     live_value: {
@@ -568,6 +569,57 @@ it("reviews and records an idempotent nothing-due manual operation", async () =>
   expect(requestId).toMatch(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/);
   expect(window.localStorage.getItem(`aihf.paper.${FUND}.operation`)).toBe(OPERATION_ID);
   expect(JSON.stringify({ ...window.localStorage })).not.toContain("synthetic-confirmation");
+});
+
+it("loads reviewed recovery when ledger replay is valid but readiness requires reconciliation", async () => {
+  const approvalEventDigest = "a".repeat(64);
+  const snapshot = {
+    ...paperSnapshot(stoppedRunner),
+    ledger: { ok: false, error: "Paper work is in progress or requires reconciliation." },
+    recovery_state: "reconciliation_required",
+  } as PaperSnapshot & { recovery_state: "reconciliation_required" };
+  const intentPreview = paperTickIntentPreview({
+    required: true,
+    recoverable: true,
+    reason: "ready",
+    intent_request_id: null,
+    intent_session: null,
+    intent_digest: null,
+    metadata_complete: null,
+    approval_journal_event_digests: [approvalEventDigest],
+  });
+  const calls = renderDesk(stoppedRunner, {
+    [`GET /api/paper/${FUND}`]: () => json(snapshot),
+    [`GET /api/paper/${FUND}/reconciliation`]: () => json({
+      name: FUND,
+      halted: null,
+      resume_allowed: false,
+      preview: paperReconciliationPreview({
+        required: false,
+        recoverable: false,
+        reason: "no-ambiguous-tick-failure",
+        failure_id: null,
+        failed_request_id: null,
+        operation_id: null,
+        expected_head: null,
+        current_head: null,
+        broker_book_sha256: null,
+        capture_id: null,
+        capture_digest: null,
+        book_matches_ledger: false,
+        head_matches_failure: false,
+        preview_digest: null,
+      }),
+      intent_preview: intentPreview,
+      intent_targets: [],
+    }),
+  });
+
+  await screen.findByText("Unmatched approval consumption");
+  const recoveryCard = screen.getByTestId("paper-reconciliation");
+
+  expect(recoveryCard).toHaveTextContent("Unmatched approval consumption");
+  expect(calls.some((call) => call.path === `/api/paper/${FUND}/reconciliation`)).toBe(true);
 });
 
 it("reviews hash-bound local reconciliation before resuming without retrying the failed tick", async () => {

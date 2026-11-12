@@ -16,7 +16,7 @@
 
 ## Phase 1: Setup
 
-- [ ] T001 Verify baseline `448056f` ancestor + clean tree; record pre-change targeted results (`poetry run pytest hedge_fund/paper/test_ledger.py hedge_fund/runtime/test_reconciliation.py hedge_fund/web/test_recovery.py -q`) as red/green baseline in specs/007-rb3-halt-recovery/implementation-evidence.md
+- [x] T001 Verify baseline `448056f` ancestor + clean tree; record pre-change targeted results (`poetry run pytest hedge_fund/paper/test_ledger.py hedge_fund/runtime/test_reconciliation.py hedge_fund/web/test_recovery.py -q`) as red/green baseline in specs/007-rb3-halt-recovery/implementation-evidence.md. `poetry` CLI unavailable; cached Poetry environment used directly.
 
 ---
 
@@ -24,8 +24,8 @@
 
 **⚠️ CRITICAL**: blocks all user stories
 
-- [ ] T002 Add a single fund-level unresolved-state query in hedge_fund/paper/ledger.py covering: recorded failures pending review, outstanding tick intents (reuse PR #11 orphan scan `:371-432`), unresolved Resume intents, and unmatched approval-consumption entries; additive helper near the readiness guard (`:359-369`)
-- [ ] T003 Regression test: pre-feature ledger fixtures replay byte-identically with the helper present in hedge_fund/paper/test_ledger.py
+- [x] T002 Add a single fund-level unresolved-state query in hedge_fund/paper/ledger.py covering: recorded failures pending review, outstanding tick intents (reuse PR #11 orphan scan `:371-432`), unresolved Resume intents, and unmatched approval-consumption entries; additive helper near the readiness guard (`:359-369`)
+- [x] T003 Regression test: pre-feature ledger fixtures replay byte-identically with the helper present in hedge_fund/paper/test_ledger.py
 
 **Checkpoint**: helper exists; old records replay identically
 
@@ -39,14 +39,14 @@
 
 ### Tests for User Story 1 (write FIRST, must FAIL before implementation) ⚠️
 
-- [ ] T004 [P] [US1] Test: readiness denial surfaces as reconciliation_required (distinct from corrupt replay) and snapshot still exposes recovery state in hedge_fund/web/test_recovery.py
-- [ ] T005 [P] [US1] Test: unmatched approval-consumption entry appears in the recovery preview and resolves through the reviewed path (extend regression anchor around hedge_fund/paper/test_tick.py:627-655) in hedge_fund/paper/test_tick.py
-- [ ] T006 [P] [US1] Test: genuine corrupt replay still reports corruption (no regression to corruption visibility) in hedge_fund/web/test_recovery.py
+- [x] T004 [P] [US1] Test: readiness denial surfaces as reconciliation_required (distinct from corrupt replay) and snapshot still exposes recovery state in hedge_fund/web/test_recovery.py
+- [x] T005 [P] [US1] Test: unmatched approval-consumption entry appears in the recovery preview and resolves through the reviewed path (extend regression anchor around hedge_fund/paper/test_tick.py:627-655) in hedge_fund/paper/test_tick.py
+- [x] T006 [P] [US1] Test: genuine corrupt replay still reports corruption (no regression to corruption visibility) in hedge_fund/web/test_recovery.py
 
 ### Implementation for User Story 1
 
-- [ ] T007 [US1] Distinguish valid-but-not-ready (reconciliation_required) from corrupt replay in the snapshot/report path in hedge_fund/web/services.py (`:4082-4089` region) and keep recovery fetch/display available in that state (frontend/src/pages/paper.tsx:157-159,690-693 — service-level fix preferred; touch frontend only if required)
-- [ ] T008 [US1] Extend the orphaned-intent resolution path to enumerate and resolve unmatched approval-consumption entries with the same audited digest-bound review in hedge_fund/paper/ledger.py (`:1025-1104`) and hedge_fund/runtime/reconciliation.py preview (`:497-535`); add WRITER_MAP entry citing T005 if a new raw write is introduced (hedge_fund/runtime/test_writer_map.py)
+- [x] T007 [US1] Distinguish valid-but-not-ready (reconciliation_required) from corrupt replay in the snapshot/report path in hedge_fund/web/services.py (`:4082-4089` region) and keep recovery fetch/display available in that state (frontend/src/pages/paper.tsx:157-159,690-693 — service-level fix preferred; touch frontend only if required)
+- [x] T008 [US1] Extend the orphaned-intent resolution path to enumerate and resolve unmatched approval-consumption entries with the same audited digest-bound review in hedge_fund/paper/ledger.py (`:1025-1104`) and hedge_fund/runtime/reconciliation.py preview (`:497-535`); add WRITER_MAP entry citing T005 if a new raw write is introduced (hedge_fund/runtime/test_writer_map.py)
 
 **Checkpoint**: US1 green; no dead-end halted fund
 
@@ -156,3 +156,5 @@ US1 → commit → US2 → commit → US3 → commit → US4 → commit → Poli
 - New raw writes require WRITER_MAP entries (hedge_fund/runtime/test_writer_map.py) citing test nodes.
 - PR #11 behaviors (safe aborts, dedup, tick fence, intent resolution, receipt replay) must not regress — T022 guards this.
 - No PR-scope change without user instruction; PR #12 already open for these spec docs.
+- Execution deviation: `poetry` CLI was unavailable, so cached Poetry-venv Python ran pytest directly; frontend uses Vitest. Both are recorded in implementation-evidence.md.
+- US1 required the frontend recovery-fetch/display condition: `ledger.ok` remains false to keep normal work fenced while `recovery_state` exposes the recovery surface.

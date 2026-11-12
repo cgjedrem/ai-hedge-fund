@@ -290,6 +290,7 @@ export interface PaperSnapshot {
   next_run: string | null;
   halted: string | null;
   halt_state: HaltState;
+  recovery_state: "ready" | "reconciliation_required" | "corrupt";
   ledger: { ok: boolean; error: string | null };
   runner: RunnerState;
   live_value: LiveValuation;

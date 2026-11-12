@@ -111,3 +111,70 @@ def test_web_resume_rejects_preview_after_local_book_changes(write_client, demo_
     assert resumed.json()["code"] == "stale-preview"
     assert ledger.halted() == "synthetic ambiguous tick"
     assert not any(event["kind"] in {"reconciliation", "resume"} for event in ledger.events())
+
+
+def test_readiness_denial_keeps_recovery_snapshot_available(write_client, demo_root):
+    client, _headers = write_client
+    name = "demo-quality"
+    directory = demo_root / "paper" / name
+    ledger = Ledger(directory)
+    latest = ledger.latest()
+    assert latest is not None
+    service = client.app.state.service
+    with service._paper_control_lane(name):
+        ledger.log_event(
+            "consume",
+            decision_as_of="2024-06-06",
+            decision_hash=latest.hash,
+            approval_verdict="approve",
+            approval_by="cli",
+            approval_id="d" * 32,
+            session="2024-06-07",
+        )
+
+    snapshot_response = client.get(
+        f"/api/paper/{name}",
+        headers={"host": "127.0.0.1"},
+    )
+    recovery_response = client.get(
+        f"/api/paper/{name}/reconciliation",
+        headers={"host": "127.0.0.1"},
+    )
+
+    assert snapshot_response.status_code == 200
+    snapshot = snapshot_response.json()
+    assert snapshot["ledger"]["ok"] is False
+    assert snapshot["recovery_state"] == "reconciliation_required"
+    assert recovery_response.status_code == 200
+    assert recovery_response.json()["intent_preview"]["required"] is True
+
+
+def test_corrupt_replay_stays_distinct_from_reconciliation_required(write_client, demo_root):
+    import json
+
+    client, _headers = write_client
+    name = "demo-quality"
+    directory = demo_root / "paper" / name
+    ledger = Ledger(directory)
+    latest = ledger.latest()
+    assert latest is not None
+    record_path = ledger.path(latest.session)
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    record["hash"] = "0" * 64 if record["hash"] != "0" * 64 else "1" * 64
+    record_path.write_text(json.dumps(record), encoding="utf-8")
+
+    snapshot_response = client.get(
+        f"/api/paper/{name}",
+        headers={"host": "127.0.0.1"},
+    )
+    recovery_response = client.get(
+        f"/api/paper/{name}/reconciliation",
+        headers={"host": "127.0.0.1"},
+    )
+
+    assert snapshot_response.status_code == 200
+    snapshot = snapshot_response.json()
+    assert snapshot["ledger"]["ok"] is False
+    assert snapshot["recovery_state"] == "corrupt"
+    assert recovery_response.status_code == 423
+    assert recovery_response.json()["code"] == "replay-corrupt"

@@ -624,24 +624,28 @@ def test_tick_intent_reconciliation_preview_blocks_unrelated_orphaned_consumptio
     assert snapshot.preview.reason == "approval-journal-incomplete"
 
 
-def test_approval_consumption_without_intent_has_unrecoverable_preview(tmp_path, clock, SPEC):
+def test_approval_consumption_without_intent_is_reviewable_and_resolvable(tmp_path, clock, SPEC):
     from hedge_fund.runtime.reconciliation import (
         build_tick_intent_reconciliation_snapshot,
+        TickIntentReconciliationConfirmation,
     )
 
     directory = _deploy_owned_paper_test_fund(tmp_path, SPEC)
     ledger = Ledger(directory)
+    clock("2024-06-04")
     with _owned_paper_lane(directory, "alpha"):
+        latest = _tick(directory)
         ledger.log_event(
             "consume",
-            decision_as_of="2024-06-03",
-            decision_hash="a" * 64,
+            decision_as_of=latest.session,
+            decision_hash=latest.hash,
             approval_verdict="approve",
             approval_by="cli",
             approval_id="b" * 32,
-            session="2024-06-04",
+            session=latest.session,
             durable=True,
         )
+        approval_events = ledger.unresolved_approval_consumption_events(allow_unresolved_corruption=True)
         snapshot = build_tick_intent_reconciliation_snapshot(
             directory,
             load_deployed(directory),
@@ -651,9 +655,36 @@ def test_approval_consumption_without_intent_has_unrecoverable_preview(tmp_path,
         )
 
     assert snapshot.preview.required is True
-    assert snapshot.preview.recoverable is False
-    assert snapshot.preview.reason == "approval-journal-incomplete"
+    assert snapshot.preview.recoverable is True
+    assert snapshot.preview.reason == "ready"
     assert snapshot.preview.intent_digest is None
+    assert snapshot.preview.approval_journal_event_digests == (approval_events[0][0],)
+    confirmation = TickIntentReconciliationConfirmation(
+        request_id="resolve-unmatched-approval",
+        intent_request_id=None,
+        intent_digest=None,
+        preview_digest=snapshot.preview.preview_digest,
+        decision="confirm-paper-book-matches-ledger",
+    )
+    with _owned_paper_lane(directory, "alpha"):
+        receipt_id = ledger.reconcile_tick_intent(
+            SPEC.capital,
+            confirmation=confirmation,
+            operator="cli",
+        )
+    with _owned_paper_lane(directory, "alpha"):
+        replayed_receipt_id = ledger.reconcile_tick_intent(
+            SPEC.capital,
+            confirmation=confirmation,
+            operator="cli",
+        )
+
+    assert receipt_id
+    assert replayed_receipt_id == receipt_id
+    assert ledger.unresolved_approval_consumption_events(allow_unresolved_corruption=True) == ()
+    resolution = next(event for event in ledger.events() if event.get("kind") == "tick_intent_resolved")
+    assert resolution["receipt"]["approval_journal_event_digests"] == [approval_events[0][0]]
+    assert ledger.unresolved_recovery_state().required is False
 
 
 def test_intent_reconciliation_preview_digest_accepts_nan_event_field(tmp_path, clock, SPEC):

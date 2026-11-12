@@ -223,6 +223,7 @@ class TickIntentReconciliationPreview(BaseModel):
             if (
                 self.intent_digest is None
                 and not self.corrupt_event_digests
+                and not self.approval_journal_event_digests
                 and self.reason
                 not in {
                     "intent-not-found",
@@ -293,8 +294,6 @@ class TickIntentReconciliationReceipt(BaseModel):
             raise ValueError("corrupt event identities must be unique")
         if len(set(self.approval_journal_event_digests)) != len(self.approval_journal_event_digests) or any(_SHA256.fullmatch(digest) is None for digest in self.approval_journal_event_digests):
             raise ValueError("approval journal event identities are invalid")
-        if self.intent_digest is None and self.approval_journal_event_digests:
-            raise ValueError("approval journal events require a tick-intent target")
         try:
             recorded_at = datetime.fromisoformat(self.recorded_at.replace("Z", "+00:00"))
         except ValueError as exc:
@@ -537,7 +536,7 @@ def build_tick_intent_reconciliation_snapshot(
 
     if approval_journal_unavailable and reason == "ready":
         reason = "approval-journal-incomplete"
-    elif approval_journal_events and selected is None and reason == "ready":
+    elif approval_journal_events and selected is None and (intents or intent_request_id is not None or intent_digest is not None) and reason == "ready":
         reason = "approval-journal-incomplete"
 
     if selected is None and not corrupt_digests and not approval_journal_events and not approval_journal_unavailable and reason == "ready":
@@ -568,6 +567,13 @@ def build_tick_intent_reconciliation_snapshot(
             observed_head = intent_event["expected_head"]
             if observed_head is None or isinstance(observed_head, str) and _SHA256.fullmatch(observed_head):
                 expected_head = observed_head
+    elif approval_journal_events and not intents and intent_request_id is None and intent_digest is None and reason == "ready":
+        approval_heads = {journal_event.get("decision_hash") for _event_digest, journal_event, _event_offset in approval_journal_events}
+        approval_head = next(iter(approval_heads), None)
+        if len(approval_heads) != 1 or not isinstance(approval_head, str) or _SHA256.fullmatch(approval_head) is None:
+            reason = "approval-journal-incomplete"
+        else:
+            expected_head = approval_head
 
     approval_journal_event_digests = ()
     if approval_journal_unavailable and reason == "ready":
@@ -599,14 +605,29 @@ def build_tick_intent_reconciliation_snapshot(
             approval_journal_event_digests = tuple(sorted(resolved_journal_digests))
         else:
             approval_journal_event_digests = ()
+    elif approval_journal_events and not intents and intent_request_id is None and intent_digest is None and reason == "ready":
+        offset_to_index = {offset: index for index, offset in enumerate(event_offsets)}
+        resolved_journal_digests = []
+        for event_digest, journal_event, event_offset in approval_journal_events:
+            journal_index = offset_to_index.get(event_offset)
+            if journal_index is None or events[journal_index] != journal_event or (journal_event.get("kind") != "consume" and not (journal_event.get("kind") == "reject" and journal_event.get("consumed") is True)):
+                reason = "approval-journal-incomplete"
+                break
+            resolved_journal_digests.append(event_digest)
+        if reason == "ready" and len(resolved_journal_digests) == len(approval_journal_events):
+            approval_journal_event_digests = tuple(sorted(resolved_journal_digests))
+        else:
+            approval_journal_event_digests = ()
     elif approval_journal_events and reason == "ready":
         reason = "approval-journal-incomplete"
 
     current_head = latest.hash if latest is not None else None
     ledger_head_matches = state.prev_hash == current_head
+    if selected is None and approval_journal_events and not intents and intent_request_id is None and intent_digest is None and reason == "ready" and expected_head != current_head:
+        reason = "ledger-head-changed"
     if reason == "ready" and not ledger_head_matches:
         reason = "ledger-head-changed"
-    head_matches_intent = bool(intent_event is not None and "expected_head" in intent_event and expected_head == current_head)
+    head_matches_intent = bool(expected_head == current_head and (intent_event is not None or approval_journal_event_digests))
     book_digest = None
     book_matches = False
     if reason == "ready" and deployed.broker != "paper":

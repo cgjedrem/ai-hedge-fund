@@ -154,7 +154,7 @@ export function PaperDetailPage() {
   const [selectedIntent, setSelectedIntent] = useState<{ fund: string; digest: string } | null>(null);
   const selectedIntentDigest = selectedIntent?.fund === name ? selectedIntent.digest : null;
   useEffect(() => setSelectedIntent(null), [name]);
-  const reconciliationPath = name && resource.data?.broker === "paper" && resource.data.ledger.ok
+  const reconciliationPath = name && resource.data?.broker === "paper" && (resource.data.ledger.ok || resource.data.recovery_state === "reconciliation_required")
     ? `/api/paper/${encodeURIComponent(name)}/reconciliation${selectedIntentDigest ? `?intent_digest=${encodeURIComponent(selectedIntentDigest)}` : ""}`
     : null;
   const reconciliationResource = useResource<PaperReconciliation>(
@@ -221,6 +221,7 @@ export function PaperDetailPage() {
   const canApprove = canWritePaper && approvalRequired && data?.halt_state === "clear" && data?.ledger.ok === true;
   const canResumePaper = Boolean(canWritePaper && data?.halt_state === "halted" && data.ledger.ok && recovery?.resume_allowed === true);
   const intentPreview = recovery?.intent_preview;
+  const approvalConsumptionOnly = Boolean(intentPreview?.required && intentPreview.intent_digest === null && intentPreview.approval_journal_event_digests.length > 0);
   const intentTargets = recovery?.intent_targets ?? [];
   const canReconcileTickIntent = Boolean(
     canWritePaper
@@ -671,7 +672,12 @@ export function PaperDetailPage() {
       {resource.error ? <ErrorState message={resource.error} error={resource.apiError} onRetry={resource.refresh} /> : null}
       {data ? (
         <>
-          {!data.ledger.ok ? <Alert tone="danger" className="mb-5"><strong>Paper state unavailable.</strong> <span>{data.ledger.error}</span></Alert> : null}
+          {!data.ledger.ok ? (
+            <Alert tone="danger" className="mb-5">
+              <strong>{data.recovery_state === "reconciliation_required" ? "Reconciliation required." : "Paper state unavailable."}</strong>{" "}
+              <span>{data.ledger.error}</span>
+            </Alert>
+          ) : null}
           {writeUnavailable ? (
             <Alert tone="warning" className="mb-5">
               Root enrollment: <span className="mono">{enrollmentState}</span>. Writes unavailable: <span className="mono">{capabilities?.write_unavailable_reason}</span>.
@@ -685,8 +691,8 @@ export function PaperDetailPage() {
           {data.halt_state === "unreadable" ? (
             <Alert tone="warning" className="mb-5">Halt state is unreadable. Paper controls and approval writes are disabled.</Alert>
           ) : null}
-          {data.ledger.ok && data.broker === "paper" && (
-            data.halt_state === "halted" || intentPreview?.required
+          {data.broker === "paper" && (data.ledger.ok || data.recovery_state === "reconciliation_required") && (
+            data.halt_state === "halted" || data.recovery_state === "reconciliation_required" || intentPreview?.required
           ) ? (
             <Card className="mb-5" data-testid="paper-reconciliation">
               <CardHeader><CardTitle>Paper recovery review</CardTitle></CardHeader>
@@ -729,7 +735,7 @@ export function PaperDetailPage() {
                     ) : null}
                     {intentPreview?.required ? (
                       <div className="space-y-3 border-t border-border pt-3" data-testid="tick-intent-reconciliation">
-                        <p className="font-medium">Orphaned paper tick intent</p>
+                        <p className="font-medium">{approvalConsumptionOnly ? "Unmatched approval consumption" : "Orphaned paper tick intent"}</p>
                         {intentPreview.reason === "multiple-unresolved-tick-intents" && !selectedIntentDigest ? (
                           <>
                             <Alert tone="danger">Multiple unresolved tick intents. Select an individual target by digest before reviewing recovery.</Alert>
@@ -779,7 +785,7 @@ export function PaperDetailPage() {
                                   ) : null}
                                 </Alert>
                                 <Button onClick={() => setIntentRecoveryOpen(true)} disabled={busy}>
-                                  Review orphaned tick resolution
+                                  {approvalConsumptionOnly ? "Review approval-consumption resolution" : "Review orphaned tick resolution"}
                                 </Button>
                               </>
                             ) : (
@@ -1118,9 +1124,11 @@ export function PaperDetailPage() {
       <ConfirmDialog
         open={intentRecoveryOpen}
         onOpenChange={setIntentRecoveryOpen}
-        title="Resolve orphaned paper tick"
-        description="Record an explicit, audited verdict that the local paper book matches the ledger. This clears the intent fence only; it never retries a tick."
-        confirmLabel="Record intent resolution"
+        title={approvalConsumptionOnly ? "Resolve unmatched approval consumption" : "Resolve orphaned paper tick"}
+        description={approvalConsumptionOnly
+          ? "Record an explicit, audited verdict that the local paper book matches the ledger. This resolves the listed approval journal entries only; it never retries a tick."
+          : "Record an explicit, audited verdict that the local paper book matches the ledger. This clears the intent fence only; it never retries a tick."}
+        confirmLabel={approvalConsumptionOnly ? "Record approval resolution" : "Record intent resolution"}
         busy={busy}
         onConfirm={() => void submitIntentRecovery()}
       />

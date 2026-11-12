@@ -150,6 +150,18 @@ class UnresolvedTickIntent:
 
 
 @dataclass(frozen=True, slots=True)
+class UnresolvedPaperState:
+    failures: tuple[dict, ...]
+    tick_intents: tuple[UnresolvedTickIntent, ...]
+    resume_intents: tuple[dict, ...]
+    approval_consumptions: tuple[tuple[str, dict, int], ...]
+
+    @property
+    def required(self) -> bool:
+        return bool(self.failures or self.tick_intents or self.resume_intents or self.approval_consumptions)
+
+
+@dataclass(frozen=True, slots=True)
 class _CorruptEventOccurrence:
     identity: str
     legacy_identity: str
@@ -367,6 +379,21 @@ class Ledger:
         event = self._latest_approval_event(state.pending.as_of, state.prev_hash, strict=True)
         if event is not None and (event.get("kind") in {"consume", "tick"} or event.get("consumed") is True) and not self.approval_consumption_is_resolved(event):
             raise PaperReconciliationRequired("approval consumption is incomplete; reconciliation is required")
+
+    def unresolved_recovery_state(self) -> UnresolvedPaperState:
+        from hedge_fund.runtime.reconciliation import unresolved_tick_failures
+
+        events, _corrupt_digests = self.recovery_events_with_unresolved_corruption()
+        failures = tuple(unresolved_tick_failures(events))
+        tick_intents = self.unresolved_tick_intents()
+        resume_intents = tuple(event for index, event in enumerate(events) if event.get("kind") == "resume_effect_intent" and not _resume_effect_has_completion(events, index))
+        approval_consumptions = self.unresolved_approval_consumption_events(allow_unresolved_corruption=True)
+        return UnresolvedPaperState(
+            failures=failures,
+            tick_intents=tick_intents,
+            resume_intents=resume_intents,
+            approval_consumptions=approval_consumptions,
+        )
 
     def require_ready_for_tick(self, state: FundState, *, approval_required: bool) -> None:
         self.require_ready_for_work(state, approval_required=approval_required)
@@ -1002,7 +1029,7 @@ class Ledger:
             },
         )
         events, corrupt_occurrences, event_offsets = self._recovery_events_with_offsets()
-        resolved_intents, resolved_corrupt, _resolved_approval_events = _tick_intent_resolution_state(events, corrupt_occurrences, event_offsets, self.directory.name)
+        resolved_intents, resolved_corrupt, resolved_approval_events = _tick_intent_resolution_state(events, corrupt_occurrences, event_offsets, self.directory.name)
         matches = [event for event in events if event.get("request_id") == request_id]
         if not matches:
             return None
@@ -1018,7 +1045,7 @@ class Ledger:
                 except (TypeError, ValueError):
                     raise PaperReconciliationRequired("tick-intent reconciliation outcome is invalid") from None
                 if receipt.request_id == request_id and receipt.intent_request_id == intent_request_id and receipt.intent_digest == intent_digest and receipt.preview_digest == preview_digest and receipt.decision == decision:
-                    if (intent_digest is None or intent_digest in resolved_intents) and set(receipt.corrupt_event_digests).issubset(resolved_corrupt):
+                    if (intent_digest is None or intent_digest in resolved_intents) and set(receipt.corrupt_event_digests).issubset(resolved_corrupt) and set(receipt.approval_journal_event_digests).issubset(resolved_approval_events):
                         return receipt.receipt_id
         raise PaperRequestConflict("request identity conflicts with durable paper history")
 
@@ -2212,7 +2239,22 @@ def _tick_intent_resolution_state(
             resolved_approval_events.update(receipt.approval_journal_event_digests)
         elif receipt.intent_request_id is not None:
             continue
-        if not receipt.intent_digest and not receipt.corrupt_event_digests:
+        elif receipt.approval_journal_event_digests:
+            approval_events_valid = True
+            for digest in receipt.approval_journal_event_digests:
+                matches = [
+                    prior_index
+                    for prior_index, prior in enumerate(events[:index])
+                    if _approval_journal_event_identity(prior, event_offsets[prior_index]) == digest
+                    and (prior.get("kind") == "consume" or (prior.get("kind") == "reject" and prior.get("consumed") is True))
+                ]
+                if len(matches) != 1 or digest in resolved_approval_events:
+                    approval_events_valid = False
+                    break
+            if not approval_events_valid:
+                continue
+            resolved_approval_events.update(receipt.approval_journal_event_digests)
+        if not receipt.intent_digest and not receipt.corrupt_event_digests and not receipt.approval_journal_event_digests:
             continue
         resolved_corrupt.update(item.identity for item in covered_corruption)
         resolved_corrupt.update(receipt.corrupt_event_digests)

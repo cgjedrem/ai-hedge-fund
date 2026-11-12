@@ -1269,9 +1269,16 @@ def test_pre_approval_ledger_fixture_replays_with_full_hash_verification(tmp_pat
     path.write_bytes(record)
 
     state = ledger.replay(100_000, full=True)
+    unresolved = ledger.unresolved_recovery_state()
 
     assert state.last_session == "2025-01-21"
     assert state.prev_hash == "b5c627cd3d54021fff9d25e18a9710245e48c12bff752f8341d34e515b2615e3"
     assert state.pending is not None and state.pending.as_of == "2025-01-21"
     assert not state.pending.spec.approval_required
     assert "approval_required" not in state.pending.spec.model_dump()
+    assert unresolved.required is False
+    assert unresolved.failures == ()
+    assert unresolved.tick_intents == ()
+    assert unresolved.resume_intents == ()
+    assert unresolved.approval_consumptions == ()
+    assert path.read_bytes() == record
