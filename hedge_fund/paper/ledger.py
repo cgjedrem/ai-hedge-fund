@@ -926,6 +926,8 @@ class Ledger:
                 head_hash = effect.get("head_hash")
                 if not resumes or effect.get("by") != payload.get("operator") or effect.get("reconciliation_id") != expected_receipt_id or effect.get("head_hash") != resumes[0].get("head_hash") or (head_hash is not None and (not isinstance(head_hash, str) or _HASH.fullmatch(head_hash) is None)):
                     raise PaperReconciliationRequired("Resume control-write intent conflicts with its request; reconciliation is required")
+                if self.control_path.exists() and self.halted() is None:
+                    return None
                 raise PaperReconciliationRequired("Resume control write outcome is uncertain; reconciliation is required")
             if receipts or resumes:
                 return None
@@ -1205,6 +1207,39 @@ class Ledger:
             },
         )
 
+    def _complete_landed_resume_intent(self, request_id: str, request_digest: str) -> dict[str, object] | None:
+        if not self.control_path.exists() or self.halted() is not None:
+            return None
+        events = self.events()
+        matches = [event for event in events if isinstance(event, dict) and event.get("request_id") == request_id]
+        if not matches:
+            return None
+        if any(event.get("request_action") != "resume" or event.get("request_digest") != request_digest for event in matches):
+            raise PaperRequestConflict("request identity conflicts with durable control history")
+        resumes = [event for event in matches if event.get("kind") == "resume"]
+        effect_intents = [event for event in matches if event.get("kind") == "resume_effect_intent"]
+        if len(resumes) != 1 or len(effect_intents) != 1:
+            return None
+        resume_event = resumes[0]
+        effect = effect_intents[0]
+        identity_fields = ("head_hash", "by", "reconciliation_id", "request_id", "request_action", "request_digest")
+        if any(effect.get(field) != resume_event.get(field) for field in identity_fields):
+            raise PaperReconciliationRequired("Resume control-write intent conflicts with its request; reconciliation is required")
+        effect_index = next(index for index, event in enumerate(events) if event is effect)
+        if effect_index != len(events) - 1:
+            raise PaperReconciliationRequired("Resume control-write intent is no longer the latest event; reconciliation is required")
+        reconciliation_id = effect.get("reconciliation_id")
+        if reconciliation_id is not None and not isinstance(reconciliation_id, str):
+            raise PaperReconciliationRequired("Resume control-write intent has an invalid reconciliation identity; reconciliation is required")
+        result = {
+            "name": self.directory.name,
+            "halted": False,
+            "reconciliation_id": reconciliation_id,
+        }
+        fields = {field: effect[field] for field in identity_fields if field in effect}
+        self.log_event("resume_completed", **fields, result=result, durable=True)
+        return result
+
     def resume(
         self,
         capital: float | None = None,
@@ -1274,6 +1309,10 @@ class Ledger:
                 )
                 if previous is not None:
                     return previous["reconciliation_id"]
+                if request_digest is not None:
+                    completed = self._complete_landed_resume_intent(request_id, request_digest)
+                    if completed is not None:
+                        return completed["reconciliation_id"]
             halted = self.halted()
             state = self.replay(capital, full=True)
             self._require_ready_for_work_state(

@@ -116,3 +116,24 @@ US1 passed and was checkpointed in commit `a66b3ae0023643a838681e338c2cacf2f3b76
 - Synthetic end-to-end journal contains a legacy failure receipt, Resume/completion events, a cleared Halt, and then a successful later tick. Fresh receipts remain authorized; field-less failure- and intent-bound receipts remain denied at presentation.
 - Source/test diff against checkpoint `a5db5e7e2c6b272dd2a6861ff00c80d4b3f1e3da`: SHA-256 `c955481efec5fe31d50f264f4f1deda3b73da5d8bddcae1598450d229784dbb4`, `15,481` bytes; paths: `hedge_fund/runtime/reconciliation.py`, `hedge_fund/runtime/test_reconciliation.py`, `hedge_fund/paper/ledger.py`, `hedge_fund/paper/test_ledger.py`, `hedge_fund/paper/test_tick.py`.
 - Style: Black (`5 files unchanged`), isort, and flake8 `--extend-ignore=E203` passed. No raw-write primitive added.
+
+## QA review rework cycle 1 — finding 2
+
+- Test-first red against checkpoint `2bd7280b868cd75d5c0e750da9989b55337b83a2`:
+
+  ```text
+  python.exe -m pytest hedge_fund/paper/test_ledger.py::test_resume_same_request_completes_after_control_clear_crash hedge_fund/web/test_recovery.py::test_web_resume_retries_after_control_clear_before_completion -q
+  ```
+
+  Result: `2 failed in 22.23s`, exit `1`; started `2026-11-12T14:32:58.5540972+01:00`, ended `2026-11-12T14:33:27.7496485+01:00`, wall `29.196s`. Both failures showed same-ID retries refused the uncompleted Resume effect.
+- Fix: read-only request lookup permits retry only when an existing control file reports cleared; Ledger appends `resume_completed` only for matching Resume/effect identities with the effect intent still the latest journal event. Retry does not write control again. Halted control remains uncertain.
+- Final focused command repeated the red-test nodes; result `2 passed in 18.55s`, exit `0`; started `2026-11-12T14:34:48.0181920+01:00`, ended `2026-11-12T14:35:13.2583415+01:00`, wall `25.240s`.
+- Adjacent gate and idempotency slice:
+
+  ```text
+  python.exe -m pytest hedge_fund/paper/test_ledger.py::test_work_readiness_refuses_unresolved_resume_intent hedge_fund/paper/test_ledger.py::test_resume_does_not_repeat_after_uncertain_control_write_without_request_id hedge_fund/paper/test_ledger.py::test_resume_same_request_completes_after_control_clear_crash hedge_fund/paper/test_ledger.py::test_confirmed_resume_resolves_failure_while_work_gate_denies hedge_fund/web/test_recovery.py::test_web_recovery_uses_reviewed_preview_and_retries_same_request hedge_fund/web/test_recovery.py::test_web_resume_retries_after_control_clear_before_completion hedge_fund/web/test_recovery.py::test_web_resume_permission_denies_unresolved_resume_intent -q
+  ```
+
+  Result: `7 passed in 61.32s`, exit `0`; started `2026-11-12T14:35:25.4563508+01:00`, ended `2026-11-12T14:36:34.1308835+01:00`, wall `68.675s`.
+- Black (`--check --line-length 420`; `3 files unchanged`), isort (`--check-only --profile black`), flake8 (`--max-line-length=420 --extend-ignore=E203`), and `git diff --check` passed.
+- Source/test diff against `2bd7280b868cd75d5c0e750da9989b55337b83a2`: SHA-256 `9c02066423b4908515319a39f8ad0745467c1a63973598b731dc35792fcd7e53`, `8,846` bytes; paths: `hedge_fund/paper/ledger.py`, `hedge_fund/paper/test_ledger.py`, `hedge_fund/web/test_recovery.py`. No raw-write primitive added.

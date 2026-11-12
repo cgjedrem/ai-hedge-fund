@@ -721,6 +721,41 @@ def test_resume_does_not_repeat_after_uncertain_control_write_without_request_id
     assert [event["kind"] for event in ledger.events()] == ["halt", "resume", "resume_effect_intent"]
 
 
+def test_resume_same_request_completes_after_control_clear_crash(tmp_path, monkeypatch):
+    ledger = Ledger(tmp_path)
+    ledger.init()
+    ledger.halt("operator pause")
+    request_id = "resume-after-clear-crash"
+    original_log_event = ledger.log_event
+    original_write_control = Ledger._write_control
+    failed_completion = []
+    clear_writes = []
+
+    def interrupt_before_completion(kind, **fields):
+        if kind == "resume_completed" and not failed_completion:
+            failed_completion.append(True)
+            raise OSError("synthetic crash before Resume completion")
+        return original_log_event(kind, **fields)
+
+    def observe_clear_write(self, halted, reason, **kwargs):
+        if halted is False:
+            clear_writes.append(halted)
+        return original_write_control(self, halted, reason, **kwargs)
+
+    monkeypatch.setattr(ledger, "log_event", interrupt_before_completion)
+    monkeypatch.setattr(Ledger, "_write_control", observe_clear_write)
+    with pytest.raises(OSError, match="synthetic crash before Resume completion"):
+        ledger.resume(capital=100_000, request_id=request_id, operator="web")
+
+    assert ledger.halted() is None
+    assert ledger.resume(capital=100_000, request_id=request_id, operator="web") is None
+
+    assert clear_writes == [False]
+    assert len([event for event in ledger.events() if event["kind"] == "resume_effect_intent"]) == 1
+    assert len([event for event in ledger.events() if event["kind"] == "resume_completed"]) == 1
+    assert ledger.unresolved_recovery_state().resume_intents == ()
+
+
 def test_audit_observation_without_a_writer_is_read_only(tmp_path):
     directory = tmp_path / "fund with spaces"
     directory.mkdir()

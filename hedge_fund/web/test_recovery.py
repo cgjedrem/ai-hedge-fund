@@ -81,6 +81,62 @@ def test_web_recovery_uses_reviewed_preview_and_retries_same_request(write_clien
     assert sum(event["kind"] == "resume" for event in ledger.events()) == 1
 
 
+def test_web_resume_retries_after_control_clear_before_completion(write_client, demo_root, monkeypatch):
+    client, ledger = _failed_web_tick(write_client, demo_root)
+    headers = write_client[1]
+    preview_response = client.get(
+        "/api/paper/demo-quality/reconciliation",
+        headers={"host": "127.0.0.1"},
+    )
+    assert preview_response.status_code == 200
+    preview = preview_response.json()["preview"]
+    request = {
+        "request_id": "resume-after-clear-crash",
+        "failure_id": preview["failure_id"],
+        "preview_digest": preview["preview_digest"],
+        "decision": _DECISION,
+    }
+    original_log_event = Ledger.log_event
+    original_write_control = Ledger._write_control
+    failed_completion = []
+    clear_writes = []
+
+    def interrupt_before_completion(self, kind, **fields):
+        if kind == "resume_completed" and fields.get("request_id") == request["request_id"] and not failed_completion:
+            failed_completion.append(True)
+            raise OSError("synthetic crash before Resume completion")
+        return original_log_event(self, kind, **fields)
+
+    def observe_clear_write(self, halted, reason, **kwargs):
+        if halted is False:
+            clear_writes.append(halted)
+        return original_write_control(self, halted, reason, **kwargs)
+
+    monkeypatch.setattr(Ledger, "log_event", interrupt_before_completion)
+    monkeypatch.setattr(Ledger, "_write_control", observe_clear_write)
+    first = client.post(
+        "/api/paper/demo-quality/resume",
+        headers=headers,
+        json=request,
+    )
+
+    assert first.status_code == 423
+    assert first.json()["code"] == "reconciliation-required"
+    assert ledger.halted() is None
+    assert len(ledger.unresolved_recovery_state().resume_intents) == 1
+    retried = client.post(
+        "/api/paper/demo-quality/resume",
+        headers=headers,
+        json=request,
+    )
+
+    assert retried.status_code == 200
+    assert retried.json()["halted"] is False
+    assert clear_writes == [False]
+    assert len([event for event in ledger.events() if event["kind"] == "resume_completed"]) == 1
+    assert ledger.unresolved_recovery_state().required is False
+
+
 def test_web_resume_rejects_preview_after_local_book_changes(write_client, demo_root):
     client, ledger = _failed_web_tick(write_client, demo_root)
     headers = write_client[1]
