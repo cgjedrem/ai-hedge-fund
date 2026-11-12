@@ -12,7 +12,7 @@
 
 ## Phase 1: Setup (Shared Infrastructure)
 
-- [ ] T001 Confirm baseline: `poetry run pytest hedge_fund/runtime hedge_fund/tui -q` on the branch head; record any pre-existing failures with exact test IDs as baseline evidence (Constitution III)
+- [X] T001 Confirm baseline: `poetry run pytest hedge_fund/runtime hedge_fund/tui -q` on the branch head; record any pre-existing failures with exact test IDs as baseline evidence (Constitution III)
 
 ---
 
