@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 from datetime import datetime, timedelta, timezone
@@ -36,7 +37,7 @@ from hedge_fund.runtime.owned_runner import (
     write_runner_record,
 )
 from hedge_fund.runtime.ownership import process_identity
-from hedge_fund.runtime.root import PRIVATE_ROOT, RootContext
+from hedge_fund.runtime.root import PRIVATE_ROOT, RootContext, RootPathError
 
 
 @pytest.fixture(autouse=True)
@@ -74,6 +75,32 @@ def _spec():
             "rebalance": "daily",
         }
     )
+
+
+def _tree_digest_snapshot(path):
+    return {item.relative_to(path).as_posix(): ("dir" if item.is_dir() else hashlib.sha256(item.read_bytes()).hexdigest()) for item in sorted(path.rglob("*"))}
+
+
+def _legacy_relocation_source(path, *, protected_fund=False, marker=None, settings=None):
+    path.mkdir()
+    (path / "paper").mkdir()
+    deploy("alpha", _spec(), ["AAPL"], root=path / "paper")
+    (path / "mandates").mkdir()
+    (path / "mandates" / "alpha.yaml").write_text("name: alpha\n", encoding="utf-8")
+    (path / "research" / "alpha").mkdir(parents=True)
+    (path / "research" / "alpha" / "note.json").write_text("{}", encoding="utf-8")
+    if protected_fund:
+        (path / "paper" / "alpha").rename(path / "paper" / "umbrella")
+        fund_file = path / "paper" / "umbrella" / "fund.yaml"
+        fund_file.write_text(fund_file.read_text(encoding="utf-8").replace("name: alpha", "name: umbrella"), encoding="utf-8")
+    if marker is not None:
+        fund_name = "umbrella" if protected_fund else "alpha"
+        (path / "paper" / fund_name / "runner.pid").write_text(marker, encoding="ascii")
+    if settings is not None:
+        settings_path = path / handover.RELOCATED_SETTINGS_PATH
+        settings_path.parent.mkdir(parents=True)
+        settings_path.write_bytes(settings)
+    return path
 
 
 def test_attestation_artifact_round_trip_rejects_another_root(tmp_path):
@@ -142,6 +169,162 @@ def test_attestation_artifact_storage_is_root_private_and_refuses_overwrite(tmp_
         assert json.loads(root.read_bytes(relative)) == record
         with pytest.raises(HandoverError, match="already exists"):
             handover._write_attestation_artifact(root, record)
+
+
+def test_inspect_source_stages_destination_evidence_and_preserves_source(tmp_path):
+    source_path = tmp_path / "legacy-source"
+    destination_path = tmp_path / "native-target"
+    source_path.mkdir()
+    (source_path / "paper").mkdir()
+    destination_path.mkdir()
+    deploy("alpha", _spec(), ["AAPL"], root=source_path / "paper")
+    protected = source_path / "paper" / "alpha"
+    protected.rename(source_path / "paper" / "umbrella")
+    fund_file = source_path / "paper" / "umbrella" / "fund.yaml"
+    fund_file.write_text(fund_file.read_text(encoding="utf-8").replace("name: alpha", "name: umbrella"), encoding="utf-8")
+    marker = source_path / "paper" / "umbrella" / "runner.pid"
+    marker.write_text("4242\n", encoding="ascii")
+    before = _tree_digest_snapshot(source_path)
+    evidence_path = destination_path / handover.SOURCE_EVIDENCE_PATH
+
+    with RootContext.open(source_path) as source:
+        with pytest.raises(RootPathError, match="protected"):
+            source.read_bytes("paper/umbrella/fund.yaml")
+        observed = handover.inspect_relocation_source(source, evidence_out=evidence_path)
+        bundle = json.loads(evidence_path.read_bytes())
+        repeated = handover.inspect_relocation_source(source, evidence_out=evidence_path)
+
+    assert _tree_digest_snapshot(source_path) == before
+    assert observed["source_evidence_digest"] == bundle["record_digest"]
+    assert repeated["source_evidence_digest"] == observed["source_evidence_digest"]
+    assert handover._validate_source_evidence_bundle(bundle)["observed_inventory_digest"] == observed["observed_inventory_digest"]
+    assert {(item["kind"], item["subject"]) for item in observed["blockers"]} == {
+        ("protected-fund-inclusion", "umbrella"),
+        ("stale-marker-retirement", "paper/umbrella/runner.pid"),
+    }
+    marker_blocker = next(item for item in observed["blockers"] if item["kind"] == "stale-marker-retirement")
+    assert marker_blocker["evidence"]["content_class"] == "pid"
+    assert marker_blocker["evidence"]["pid"] == 4242
+
+
+def test_inspect_source_refuses_evidence_path_inside_source_without_writing(tmp_path):
+    source_path = tmp_path / "source-without-staging"
+    source_path.mkdir()
+    (source_path / "paper").mkdir()
+    deploy("alpha", _spec(), ["AAPL"], root=source_path / "paper")
+    before = _tree_digest_snapshot(source_path)
+
+    with RootContext.open(source_path) as source:
+        with pytest.raises(HandoverError, match="source and target"):
+            handover.inspect_relocation_source(source, evidence_out=source_path / handover.SOURCE_EVIDENCE_PATH)
+
+    assert _tree_digest_snapshot(source_path) == before
+
+
+def test_relocate_copy_transfers_settings_and_finalize_enrolls(tmp_path, monkeypatch):
+    source_path = _legacy_relocation_source(tmp_path / "legacy", settings=b'{"model":"synthetic"}')
+    destination_path = tmp_path / "destination"
+    destination_path.mkdir()
+    before = _tree_digest_snapshot(source_path)
+    original_build_head_inventory = handover._build_head_inventory
+    inventory_roots = []
+
+    def track_inventory(root, **kwargs):
+        inventory_roots.append(root.path)
+        return original_build_head_inventory(root, **kwargs)
+
+    with RootContext.open(source_path) as source, RootContext.open(destination_path) as destination:
+        described = handover.inspect_relocation_source(source)
+        monkeypatch.setattr(handover, "_build_head_inventory", track_inventory)
+        copied = handover.relocate_copy(destination, source=source, expected_content_digest=described["content_digest"])
+
+        assert copied["state"] == "copied"
+        assert destination.path not in inventory_roots
+        assert destination.read_bytes(handover.RELOCATED_SETTINGS_PATH) == b'{"model":"synthetic"}'
+        assert json.loads(destination.read_bytes(handover.RELOCATION_STATE_PATH))["state"] == "copied"
+        with pytest.raises(FileNotFoundError):
+            destination.file_info(HANDOVER_PATH)
+
+        record = handover.relocate_finalize(destination)
+
+    assert destination_path in inventory_roots
+    assert record["mode"] == "relocated"
+    assert _tree_digest_snapshot(source_path) == before
+
+
+def test_relocate_copy_digest_mismatch_leaves_destination_empty(tmp_path):
+    source_path = _legacy_relocation_source(tmp_path / "legacy")
+    destination_path = tmp_path / "destination"
+    destination_path.mkdir()
+    before = _tree_digest_snapshot(source_path)
+
+    with RootContext.open(source_path) as source, RootContext.open(destination_path) as destination:
+        with pytest.raises(HandoverError, match="source content changed"):
+            handover.relocate_copy(destination, source=source, expected_content_digest="0" * 64)
+
+    assert list(destination_path.iterdir()) == []
+    assert _tree_digest_snapshot(source_path) == before
+
+
+def test_interrupted_relocate_copy_is_marked_incomplete_and_retry_completes(tmp_path, monkeypatch):
+    source_path = _legacy_relocation_source(tmp_path / "legacy")
+    destination_path = tmp_path / "destination"
+    destination_path.mkdir()
+    before = _tree_digest_snapshot(source_path)
+    original_write = RootContext.write_bytes
+
+    def interrupt_after_first_copy(self, relative, data, **kwargs):
+        result = original_write(self, relative, data, **kwargs)
+        if os.path.normcase(str(self.path)) == os.path.normcase(str(destination_path)) and str(relative) == "mandates/alpha.yaml":
+            raise OSError("synthetic relocation interruption")
+        return result
+
+    with RootContext.open(source_path) as source, RootContext.open(destination_path) as destination:
+        digest = handover.inspect_relocation_source(source)["content_digest"]
+        monkeypatch.setattr(RootContext, "write_bytes", interrupt_after_first_copy)
+        with pytest.raises(OSError, match="synthetic relocation interruption"):
+            handover.relocate_copy(destination, source=source, expected_content_digest=digest)
+        monkeypatch.setattr(RootContext, "write_bytes", original_write)
+        state = json.loads(destination.read_bytes(handover.RELOCATION_STATE_PATH))
+        assert state["state"] == "incomplete"
+        with pytest.raises(FileNotFoundError):
+            destination.file_info(HANDOVER_PATH)
+
+        copied = handover.relocate_copy(destination, source=source, expected_content_digest=digest)
+        assert copied["state"] == "copied"
+        record = handover.relocate_finalize(destination)
+
+    assert record["mode"] == "relocated"
+    assert _tree_digest_snapshot(source_path) == before
+
+
+def test_relocate_copy_keeps_blocked_data_unenrolled_and_source_unchanged(tmp_path):
+    source_path = _legacy_relocation_source(tmp_path / "legacy", protected_fund=True, marker="4242\n")
+    destination_path = tmp_path / "destination"
+    destination_path.mkdir()
+    before = _tree_digest_snapshot(source_path)
+    evidence_path = destination_path / handover.SOURCE_EVIDENCE_PATH
+
+    with RootContext.open(source_path) as source, RootContext.open(destination_path) as destination:
+        described = handover.inspect_relocation_source(source)
+        with pytest.raises(HandoverError, match="inspect-source --evidence-out"):
+            handover.relocate_copy(destination, source=source, expected_content_digest=described["content_digest"])
+        assert list(destination_path.iterdir()) == []
+
+        described = handover.inspect_relocation_source(source, evidence_out=evidence_path)
+        copied = handover.relocate_copy(destination, source=source, expected_content_digest=described["content_digest"])
+
+        assert copied["state"] == "copied"
+        with pytest.raises(RootPathError, match="protected"):
+            destination.read_bytes("paper/umbrella/runner.pid")
+        assert (destination_path / "paper" / "umbrella" / "runner.pid").read_bytes() == (source_path / "paper" / "umbrella" / "runner.pid").read_bytes()
+        assert (destination_path / "paper" / "umbrella" / "fund.yaml").read_bytes()
+        with pytest.raises(HandoverError, match="runner.pid"):
+            build_head_inventory(destination)
+        with pytest.raises(FileNotFoundError):
+            destination.file_info(HANDOVER_PATH)
+
+    assert _tree_digest_snapshot(source_path) == before
 
 
 def test_fresh_enrollment_requires_empty_root_and_records_fixed_identity(tmp_path):

@@ -32,6 +32,7 @@ from hedge_fund.runtime.exclusion import out_of_band_exclusion_basis
 from hedge_fund.runtime.exclusion import UNPROVEN_REASON as EXCLUSION_UNPROVEN_REASON
 from hedge_fund.runtime.ownership import process_identity, ProcessIdentityError
 from hedge_fund.runtime.root import (
+    _handover_resource_access,
     _windows_current_user_sid,
     ensure_unique_resource_name,
     PRIVATE_ROOT,
@@ -102,6 +103,7 @@ class WriteAuthorityDenied(HandoverError):
 PROTOCOL_NATIVE_MODES = frozenset({"fresh", "relocated"})
 LEGACY_HOME_NAME = ".hedge-fund"
 RELOCATED_TOP_LEVEL = ("mandates", "paper", "research")
+RELOCATED_SETTINGS_PATH = f"{PRIVATE_ROOT}/settings.json"
 _MAX_RELOCATION_FILES = 50000
 _MAX_RELOCATION_FILE_BYTES = 256 * 1024 * 1024
 _MAX_RELOCATION_TOTAL_BYTES = 2 * 1024 * 1024 * 1024
@@ -1121,32 +1123,334 @@ _PAPER_LANE_LOCK = re.compile(r"^\.paper-[a-z]+\.lock$")
 _SECRET_DOTENV = re.compile(r"^\.env(\..*)?$", re.IGNORECASE)
 
 
-def inspect_relocation_source(source: RootContext) -> dict[str, Any]:
-    """Describe a source root for relocation without writing anything to it."""
+def inspect_relocation_source(
+    source: RootContext,
+    *,
+    evidence_out: str | os.PathLike[str] | None = None,
+) -> dict[str, Any]:
+    """Inspect source read-only; optionally stage evidence at a disjoint destination."""
     snapshot = _relocation_source_snapshot(source)
-    return {
+    result = {
         "inventory_digest": snapshot["inventory_digest"],
         "content_digest": snapshot["content_digest"],
         "funds": len(snapshot["heads"]),
         "files": sum(1 for entry in snapshot["entries"].values() if entry["type"] == "file"),
         "bytes": sum(entry["size"] for entry in snapshot["entries"].values() if entry["type"] == "file"),
+        "observed_inventory_digest": snapshot["observed_inventory_digest"],
+        "blockers": snapshot["blockers"],
     }
+    if evidence_out is not None:
+        result["source_evidence_digest"] = _write_source_evidence_bundle(source, snapshot, evidence_out)
+    return result
 
 
-def relocate_existing(
+def _new_source_evidence_bundle(source: RootContext, snapshot: dict[str, Any]) -> dict[str, Any]:
+    body = {
+        "schema": 1,
+        "source_root_binding": root_binding(source),
+        "observed_inventory_digest": snapshot["observed_inventory_digest"],
+        "content_digest": snapshot["content_digest"],
+        "inventory_digest": snapshot["inventory_digest"],
+        "blockers": snapshot["blockers"],
+        "recorded_at": datetime.now(timezone.utc).isoformat(timespec="microseconds"),
+    }
+    try:
+        record = {**body, "record_digest": _digest(body)}
+        payload = json.dumps(record, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")
+    except (TypeError, ValueError, OverflowError):
+        raise HandoverError("source evidence bundle is not serializable") from None
+    if len(payload) > _MAX_TRUST_RECORD_BYTES:
+        raise HandoverError("source evidence bundle exceeds its storage bound")
+    return record
+
+
+def _validate_source_evidence_bundle(record: object, *, source_binding: dict[str, Any] | None = None) -> dict[str, Any]:
+    fields = {
+        "schema",
+        "source_root_binding",
+        "observed_inventory_digest",
+        "content_digest",
+        "inventory_digest",
+        "blockers",
+        "recorded_at",
+        "record_digest",
+    }
+    if not isinstance(record, dict) or set(record) != fields:
+        raise HandoverError("source evidence bundle fields are invalid")
+    body = {key: value for key, value in record.items() if key != "record_digest"}
+    try:
+        digest = _digest(body)
+        observed_inventory_digest = _digest(
+            {
+                "source_root_binding": record["source_root_binding"],
+                "inventory_digest": record["inventory_digest"],
+                "content_digest": record["content_digest"],
+                "blockers": record["blockers"],
+            }
+        )
+        payload = json.dumps(record, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")
+    except (TypeError, ValueError, OverflowError):
+        raise HandoverError("source evidence bundle is not serializable") from None
+    blockers = record["blockers"]
+    if (
+        type(record["schema"]) is not int
+        or record["schema"] != 1
+        or not isinstance(record["source_root_binding"], dict)
+        or (source_binding is not None and record["source_root_binding"] != source_binding)
+        or any(not isinstance(record[key], str) or not _SHA256.fullmatch(record[key]) for key in ("observed_inventory_digest", "content_digest", "inventory_digest"))
+        or not isinstance(blockers, list)
+        or len(blockers) > _MAX_INVENTORY_FUNDS * 2
+        or record["observed_inventory_digest"] != observed_inventory_digest
+        or any(not isinstance(item, dict) or set(item) != {"kind", "subject", "evidence"} or not isinstance(item["kind"], str) or item["kind"] not in _ATTESTATION_KINDS or not isinstance(item["subject"], str) or not item["subject"] or not isinstance(item["evidence"], dict) for item in blockers)
+        or not _valid_timestamp(record["recorded_at"])
+        or not isinstance(record["record_digest"], str)
+        or record["record_digest"] != digest
+        or len(payload) > _MAX_TRUST_RECORD_BYTES
+    ):
+        raise HandoverError("source evidence bundle identity is invalid")
+    return record
+
+
+def _write_source_evidence_bundle(
+    source: RootContext,
+    snapshot: dict[str, Any],
+    evidence_out: str | os.PathLike[str],
+) -> str:
+    if not isinstance(source, RootContext):
+        raise TypeError("an explicit RootContext is required")
+    try:
+        raw_path = os.fspath(evidence_out)
+    except TypeError:
+        raise HandoverError("source evidence output path is invalid") from None
+    if not isinstance(raw_path, str) or not raw_path:
+        raise HandoverError("source evidence output path is invalid")
+    output = Path(raw_path)
+    suffix = Path(SOURCE_EVIDENCE_PATH).parts
+    if not output.is_absolute() or ".." in output.parts or len(output.parts) <= len(suffix):
+        raise HandoverError("source evidence output must be an absolute destination-private path")
+    if tuple(part.casefold() for part in output.parts[-len(suffix) :]) != tuple(part.casefold() for part in suffix):
+        raise HandoverError(f"source evidence output must be the destination's {SOURCE_EVIDENCE_PATH}")
+    destination_path = output.parents[len(suffix) - 1]
+    expected_output = destination_path / SOURCE_EVIDENCE_PATH
+    if os.path.normcase(os.path.abspath(os.fspath(output))) != os.path.normcase(os.path.abspath(os.fspath(expected_output))):
+        raise HandoverError("source evidence output path is not canonical")
+
+    record = _new_source_evidence_bundle(source, snapshot)
+    try:
+        destination = RootContext.open(destination_path)
+    except (OSError, RootPathError) as exc:
+        raise HandoverError(f"source evidence destination is unavailable ({type(exc).__name__})") from None
+    try:
+        _require_disjoint_roots(source, destination)
+        if not destination.verify_private_storage():
+            if any(destination.path.iterdir()):
+                raise HandoverError("source evidence destination must be empty or have verified private storage")
+            destination.prepare_private_storage()
+        elif not _private_stage_layout_matches(destination, allowed_files=(SOURCE_EVIDENCE_PATH,)):
+            raise HandoverError("source evidence destination contains unrelated data")
+        try:
+            with RootMigrationLease.acquire(destination, timeout=0):
+                current = _relocation_source_snapshot(source)
+                if current["observed_inventory_digest"] != snapshot["observed_inventory_digest"]:
+                    raise HandoverError("source changed during inspection; inspect again")
+                try:
+                    existing = _read_private_json(destination, SOURCE_EVIDENCE_PATH)
+                except FileNotFoundError:
+                    if not _fresh_bootstrap_only(destination):
+                        raise HandoverError("source evidence destination contains unrelated data")
+                    _write_private_json(destination, SOURCE_EVIDENCE_PATH, record)
+                    return record["record_digest"]
+                existing = _validate_source_evidence_bundle(existing, source_binding=root_binding(source))
+                if existing["observed_inventory_digest"] != record["observed_inventory_digest"] or existing["content_digest"] != record["content_digest"] or existing["blockers"] != record["blockers"]:
+                    raise HandoverError("different source evidence already exists at the destination")
+                if not _fresh_bootstrap_only(destination, allowed_files=(SOURCE_EVIDENCE_PATH,)):
+                    raise HandoverError("source evidence destination contains unrelated data")
+                return existing["record_digest"]
+        except WriterConflict as exc:
+            raise HandoverError("source evidence destination is active") from exc
+    finally:
+        destination.close()
+
+
+def _read_source_evidence_bundle(
+    root: RootContext,
+    *,
+    source_binding: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    try:
+        record = _read_private_json(root, SOURCE_EVIDENCE_PATH)
+    except FileNotFoundError:
+        return None
+    return _validate_source_evidence_bundle(record, source_binding=source_binding)
+
+
+def _new_relocation_state(
+    target: RootContext,
+    source: RootContext,
+    snapshot: dict[str, Any],
+    *,
+    state: str,
+    source_evidence_digest: str | None,
+) -> dict[str, Any]:
+    body = {
+        "schema": 1,
+        "state": state,
+        "source_root_binding": root_binding(source),
+        "target_root_binding": root_binding(target),
+        "source_content_digest": snapshot["content_digest"],
+        "source_inventory_digest": snapshot["inventory_digest"],
+        "source_observed_inventory_digest": snapshot["observed_inventory_digest"],
+        "source_evidence_digest": source_evidence_digest,
+        "recorded_at": datetime.now(timezone.utc).isoformat(timespec="microseconds"),
+    }
+    return {**body, "record_digest": _digest(body)}
+
+
+def _validate_relocation_state(
+    target: RootContext,
+    record: object,
+    *,
+    source_binding: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    fields = {
+        "schema",
+        "state",
+        "source_root_binding",
+        "target_root_binding",
+        "source_content_digest",
+        "source_inventory_digest",
+        "source_observed_inventory_digest",
+        "source_evidence_digest",
+        "recorded_at",
+        "record_digest",
+    }
+    if not isinstance(target, RootContext) or not isinstance(record, dict) or set(record) != fields:
+        raise HandoverError("relocation state fields are invalid")
+    body = {key: value for key, value in record.items() if key != "record_digest"}
+    try:
+        digest = _digest(body)
+        payload = json.dumps(record, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")
+    except (TypeError, ValueError, OverflowError):
+        raise HandoverError("relocation state is not serializable") from None
+    evidence_digest = record["source_evidence_digest"]
+    if (
+        type(record["schema"]) is not int
+        or record["schema"] != 1
+        or not isinstance(record["state"], str)
+        or record["state"] not in {"incomplete", "copied"}
+        or not isinstance(record["source_root_binding"], dict)
+        or (source_binding is not None and record["source_root_binding"] != source_binding)
+        or record["target_root_binding"] != root_binding(target)
+        or any(not isinstance(record[key], str) or not _SHA256.fullmatch(record[key]) for key in ("source_content_digest", "source_inventory_digest", "source_observed_inventory_digest"))
+        or (evidence_digest is not None and (not isinstance(evidence_digest, str) or not _SHA256.fullmatch(evidence_digest)))
+        or not _valid_timestamp(record["recorded_at"])
+        or not isinstance(record["record_digest"], str)
+        or record["record_digest"] != digest
+        or len(payload) > _MAX_TRUST_RECORD_BYTES
+    ):
+        raise HandoverError("relocation state identity is invalid")
+    return record
+
+
+def _read_relocation_state(target: RootContext, *, source_binding: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    try:
+        record = _read_private_json(target, RELOCATION_STATE_PATH)
+    except FileNotFoundError:
+        return None
+    return _validate_relocation_state(target, record, source_binding=source_binding)
+
+
+def _source_evidence_matches_relocation_state(evidence: dict[str, Any] | None, state: dict[str, Any]) -> bool:
+    return evidence is not None and evidence["record_digest"] == state["source_evidence_digest"] and evidence["content_digest"] == state["source_content_digest"] and evidence["inventory_digest"] == state["source_inventory_digest"] and evidence["observed_inventory_digest"] == state["source_observed_inventory_digest"]
+
+
+def _write_relocation_state(target: RootContext, record: dict[str, Any]) -> None:
+    _validate_relocation_state(target, record)
+    _write_private_json(target, RELOCATION_STATE_PATH, record)
+
+
+def _relocation_target_layout_matches(
+    target: RootContext,
+    entries: dict[str, dict[str, Any]],
+    *,
+    has_source_evidence: bool,
+    allow_partial: bool,
+) -> bool:
+    bootstrap_dirs = {
+        Path("runtime"),
+        Path("runtime/private"),
+        Path(PRIVATE_ROOT),
+        Path(f"{PRIVATE_ROOT}/admission"),
+        Path(f"{PRIVATE_ROOT}/admission/v1"),
+    }
+    expected_dirs = set(bootstrap_dirs)
+    expected_files = {
+        Path(OWNER_LOCK_PATH),
+        Path(RELOCATION_STATE_PATH),
+    }
+    if has_source_evidence:
+        expected_files.add(Path(SOURCE_EVIDENCE_PATH))
+    for relative, entry in entries.items():
+        path = Path(relative)
+        if entry["type"] == "dir":
+            expected_dirs.add(path)
+        else:
+            expected_files.add(path)
+            expected_dirs.update(parent for parent in path.parents if parent != Path("."))
+
+    observed_dirs: set[Path] = set()
+    observed_files: set[Path] = set()
+
+    def fail_walk(_exc: OSError) -> None:
+        raise HandoverError("relocation target cannot be inspected")
+
+    try:
+        target.revalidate()
+        for directory, subdirs, files in os.walk(target.path, followlinks=False, onerror=fail_walk):
+            current = Path(directory)
+            for name in list(subdirs):
+                child = current / name
+                if _is_reparse_point(child):
+                    return False
+                observed_dirs.add(child.relative_to(target.path))
+            for name in files:
+                child = current / name
+                if _is_reparse_point(child):
+                    return False
+                observed_files.add(child.relative_to(target.path))
+        target.revalidate()
+    except (OSError, RootPathError, HandoverError):
+        return False
+    if not bootstrap_dirs.issubset(observed_dirs) or not {Path(OWNER_LOCK_PATH), Path(RELOCATION_STATE_PATH)}.issubset(observed_files):
+        return False
+    if has_source_evidence and Path(SOURCE_EVIDENCE_PATH) not in observed_files:
+        return False
+    if allow_partial:
+        return observed_dirs.issubset(expected_dirs) and observed_files.issubset(expected_files)
+    return observed_dirs == expected_dirs and observed_files == expected_files
+
+
+def _validate_relocation_target_entries(
+    target: RootContext,
+    expected: dict[str, dict[str, Any]],
+    *,
+    allow_partial: bool,
+) -> None:
+    with _handover_resource_access(target):
+        actual = _relocation_entries(target)
+    if any(relative not in expected or expected[relative]["type"] != entry["type"] for relative, entry in actual.items()):
+        raise HandoverError("relocation target contains unrelated data")
+    if not allow_partial and actual != expected:
+        raise HandoverError("relocation target content does not match the source")
+
+
+def relocate_copy(
     target: RootContext,
     *,
     source: RootContext,
     expected_content_digest: str,
 ) -> dict[str, Any]:
-    """Import a quiescent legacy root into an empty read-only target.
-
-    The source is only read. Mandates, deployed paper funds and research are
-    copied after a reviewed content digest matches, and the source must be
-    byte-identical before and after the copy. Credentials, caches and runtime
-    state never transfer. The target remains read-only until separate
-    trusted-single-writer acknowledgement; the source is never enrolled.
-    """
+    """Copy reviewed source data; leave target unenrolled until finalize."""
     if not isinstance(target, RootContext) or not isinstance(source, RootContext):
         raise TypeError("explicit RootContexts are required")
     if not isinstance(expected_content_digest, str) or not _SHA256.fullmatch(expected_content_digest):
@@ -1156,49 +1460,175 @@ def relocate_existing(
     _require_disjoint_roots(source, target)
     if _record_exists(target):
         raise EnrollmentInvalid("root already has a handover record")
-    if any(target.path.iterdir()):
-        raise HandoverError("relocation requires an empty target root")
     reason = legacy_reachability_reason(target)
     if reason is not None:
         raise WriteAuthorityDenied(f"relocation target must be unreachable by legacy writers ({reason})")
     before = _relocation_source_snapshot(source)
     if before["content_digest"] != expected_content_digest:
         raise HandoverError("source content changed; inspect the source and retry")
-    target.prepare_private_storage()
+    private_storage_verified = target.verify_private_storage()
+    if before["blockers"] and not private_storage_verified:
+        raise HandoverError("source blockers require inspect-source --evidence-out before relocation-copy")
+    staged_evidence = _read_source_evidence_bundle(target, source_binding=root_binding(source)) if private_storage_verified else None
+    if before["blockers"] and staged_evidence is None:
+        raise HandoverError("source blockers require inspect-source --evidence-out before relocation-copy")
+    if staged_evidence is not None and (staged_evidence["content_digest"] != before["content_digest"] or staged_evidence["inventory_digest"] != before["inventory_digest"] or staged_evidence["observed_inventory_digest"] != before["observed_inventory_digest"]):
+        raise HandoverError("source evidence does not match the reviewed source; inspect again")
+    if not private_storage_verified:
+        if any(target.path.iterdir()):
+            raise HandoverError("relocation requires an empty target or a verified evidence stage")
+        target.prepare_private_storage()
+    state_before_lock = _read_relocation_state(target, source_binding=root_binding(source))
+    if state_before_lock is None:
+        if not _private_stage_layout_matches(target, allowed_files=(SOURCE_EVIDENCE_PATH,) if staged_evidence else ()):
+            raise HandoverError("relocation target contains unrelated data")
+    else:
+        if state_before_lock["source_content_digest"] != before["content_digest"] or state_before_lock["source_inventory_digest"] != before["inventory_digest"] or state_before_lock["source_observed_inventory_digest"] != before["observed_inventory_digest"] or state_before_lock["source_evidence_digest"] != (staged_evidence["record_digest"] if staged_evidence else None):
+            raise HandoverError("relocation state does not match the reviewed source")
+        if not _relocation_target_layout_matches(target, before["entries"], has_source_evidence=staged_evidence is not None, allow_partial=state_before_lock["state"] == "incomplete"):
+            raise HandoverError("relocation target contains unrelated data")
+        _validate_relocation_target_entries(target, before["entries"], allow_partial=state_before_lock["state"] == "incomplete")
+
     try:
         with RootMigrationLease.acquire(target, timeout=0):
-            if not _fresh_bootstrap_only(target):
-                raise HandoverError("target changed during relocation")
-            for relative, entry in before["entries"].items():
-                if entry["type"] == "dir":
-                    target.mkdir(relative, parents=True)
-                    continue
-                data = source.read_bytes(relative)
-                if len(data) != entry["size"] or hashlib.sha256(data).hexdigest() != entry["sha256"]:
-                    raise HandoverError("source content changed during relocation")
-                target.write_bytes(relative, data, mode=stat.S_IRUSR | stat.S_IWUSR)
+            if _record_exists(target):
+                raise EnrollmentInvalid("root already has a handover record")
+            source_evidence = _read_source_evidence_bundle(target, source_binding=root_binding(source))
+            if before["blockers"] and source_evidence is None:
+                raise HandoverError("source blockers require inspect-source --evidence-out before relocation-copy")
+            if source_evidence is not None and (source_evidence["content_digest"] != before["content_digest"] or source_evidence["inventory_digest"] != before["inventory_digest"] or source_evidence["observed_inventory_digest"] != before["observed_inventory_digest"]):
+                raise HandoverError("source evidence does not match the reviewed source; inspect again")
+
+            state = _read_relocation_state(target, source_binding=root_binding(source))
+            has_evidence = source_evidence is not None
+            if state is None:
+                if not _fresh_bootstrap_only(target, allowed_files=(SOURCE_EVIDENCE_PATH,) if has_evidence else ()):
+                    raise HandoverError("relocation target contains unrelated data")
+                state = _new_relocation_state(
+                    target,
+                    source,
+                    before,
+                    state="incomplete",
+                    source_evidence_digest=source_evidence["record_digest"] if source_evidence else None,
+                )
+                _write_relocation_state(target, state)
+            else:
+                if state["source_content_digest"] != before["content_digest"] or state["source_inventory_digest"] != before["inventory_digest"] or state["source_observed_inventory_digest"] != before["observed_inventory_digest"] or state["source_evidence_digest"] != (source_evidence["record_digest"] if source_evidence else None):
+                    raise HandoverError("relocation state does not match the reviewed source")
+                if state["state"] == "copied":
+                    if not _relocation_target_layout_matches(target, before["entries"], has_source_evidence=has_evidence, allow_partial=False):
+                        raise HandoverError("copied relocation target contains unrelated data")
+                    _validate_relocation_target_entries(target, before["entries"], allow_partial=False)
+                    return {
+                        "state": "copied",
+                        "content_digest": state["source_content_digest"],
+                        "inventory_digest": state["source_inventory_digest"],
+                    }
+                if state["state"] != "incomplete":
+                    raise HandoverError("relocation target state is invalid")
+                if not _relocation_target_layout_matches(target, before["entries"], has_source_evidence=has_evidence, allow_partial=True):
+                    raise HandoverError("incomplete relocation target contains unrelated data")
+                _validate_relocation_target_entries(target, before["entries"], allow_partial=True)
+
+            with _handover_resource_access(source), _handover_resource_access(target, allow_writes=True):
+                for relative, entry in before["entries"].items():
+                    if entry["type"] == "dir":
+                        target.mkdir(relative, parents=True)
+                        continue
+                    data = source.read_bytes(relative)
+                    if len(data) != entry["size"] or hashlib.sha256(data).hexdigest() != entry["sha256"]:
+                        raise HandoverError("source content changed during relocation")
+                    target.write_bytes(relative, data, mode=stat.S_IRUSR | stat.S_IWUSR)
             after = _relocation_source_snapshot(source)
-            if after["content_digest"] != before["content_digest"] or after["heads"] != before["heads"]:
+            if after["observed_inventory_digest"] != before["observed_inventory_digest"] or after["heads"] != before["heads"]:
                 raise HandoverError("source content changed during relocation")
-            copied = _relocation_entries(target)
-            if _digest(copied) != before["content_digest"]:
-                raise HandoverError("relocated content does not match the source")
+            _validate_relocation_target_entries(target, before["entries"], allow_partial=False)
+            if not _relocation_target_layout_matches(target, before["entries"], has_source_evidence=has_evidence, allow_partial=False):
+                raise HandoverError("relocation target contains unrelated data")
+            copied_state = _new_relocation_state(
+                target,
+                source,
+                before,
+                state="copied",
+                source_evidence_digest=source_evidence["record_digest"] if source_evidence else None,
+            )
+            _write_relocation_state(target, copied_state)
+            return {
+                "state": "copied",
+                "content_digest": copied_state["source_content_digest"],
+                "inventory_digest": copied_state["source_inventory_digest"],
+            }
+    except WriterConflict as exc:
+        raise HandoverError("another target participant is active") from exc
+
+
+def relocate_finalize(target: RootContext) -> dict[str, Any]:
+    """Validate a completed copy and enroll destination read-only."""
+    if not isinstance(target, RootContext):
+        raise TypeError("an explicit RootContext is required")
+    target.revalidate()
+    if _record_exists(target):
+        raise EnrollmentInvalid("root already has a handover record")
+    if not target.verify_private_storage():
+        raise HandoverError("relocation-copy must complete before relocate-finalize")
+    reason = legacy_reachability_reason(target)
+    if reason is not None:
+        raise WriteAuthorityDenied(f"relocation target must be unreachable by legacy writers ({reason})")
+    staged_state = _read_relocation_state(target)
+    if staged_state is None or staged_state["state"] != "copied":
+        raise HandoverError("relocation-copy is incomplete; rerun relocate-copy before finalize")
+    if staged_state["source_evidence_digest"] is not None:
+        staged_evidence = _read_source_evidence_bundle(target, source_binding=staged_state["source_root_binding"])
+        if not _source_evidence_matches_relocation_state(staged_evidence, staged_state):
+            raise HandoverError("source evidence is missing or changed; inspect-source and relocate-copy again")
+    try:
+        with RootMigrationLease.acquire(target, timeout=0):
+            state = _read_relocation_state(target)
+            if state is None or state["state"] != "copied":
+                raise HandoverError("relocation-copy is incomplete; rerun relocate-copy before finalize")
+            if state["source_evidence_digest"] is not None:
+                evidence = _read_source_evidence_bundle(target, source_binding=state["source_root_binding"])
+                if not _source_evidence_matches_relocation_state(evidence, state):
+                    raise HandoverError("source evidence is missing or changed; inspect-source and relocate-copy again")
+            actual_entries = _relocation_entries(target)
+            if _digest(actual_entries) != state["source_content_digest"]:
+                raise HandoverError("copied relocation content changed; inspect and relocate again")
             heads = build_head_inventory(target)
-            if heads != before["heads"]:
+            if _digest(heads) != state["source_inventory_digest"]:
                 raise HandoverError("relocated ledger heads do not match the source")
             record = _new_record(
                 target,
                 mode="relocated",
                 heads=heads,
                 attestation={
-                    "source_inventory_digest": before["inventory_digest"],
-                    "source_content_digest": before["content_digest"],
+                    "source_inventory_digest": state["source_inventory_digest"],
+                    "source_content_digest": state["source_content_digest"],
                 },
             )
             _write_record(target, record)
             return require_enrollment(target)
     except WriterConflict as exc:
         raise HandoverError("another target participant is active") from exc
+
+
+def relocate_existing(
+    target: RootContext,
+    *,
+    source: RootContext,
+    expected_content_digest: str,
+) -> dict[str, Any]:
+    """Run the legacy one-command relocation ceremony."""
+    if not isinstance(target, RootContext) or not isinstance(source, RootContext):
+        raise TypeError("explicit RootContexts are required")
+    if not isinstance(expected_content_digest, str) or not _SHA256.fullmatch(expected_content_digest):
+        raise HandoverError("source content digest is invalid")
+    before = _relocation_source_snapshot(source)
+    if before["blockers"]:
+        raise HandoverError("source blockers require relocate-copy, destination attestations, and relocate-finalize")
+    copied = relocate_copy(target, source=source, expected_content_digest=expected_content_digest)
+    if copied["state"] != "copied":
+        raise HandoverError("relocation-copy is incomplete")
+    return relocate_finalize(target)
 
 
 def _require_disjoint_roots(source: RootContext, target: RootContext) -> None:
@@ -1224,9 +1654,8 @@ def _relocation_source_snapshot(source: RootContext) -> dict[str, Any]:
         raise TypeError("an explicit RootContext is required")
     source.revalidate()
     entries = _relocation_entries(source)
-    if any(relative.rsplit("/", 1)[-1] == "runner.pid" for relative in entries):
-        raise HandoverError("runner.pid is present; unknown owners block relocation")
-    heads = build_head_inventory(source)
+    blockers = _source_evidence_blockers(source, entries)
+    heads = _build_head_inventory(source, allow_relocation_blockers=True)
     from hedge_fund.paper.deployed import load_deployed
 
     for relative in entries:
@@ -1239,12 +1668,86 @@ def _relocation_source_snapshot(source: RootContext) -> dict[str, Any]:
             if broker != "paper":
                 raise HandoverError("broker-backed deployments cannot be relocated")
     source.revalidate()
+    content_digest = _digest(entries)
+    inventory_digest_value = _digest(heads)
     return {
         "heads": heads,
-        "inventory_digest": _digest(heads),
+        "inventory_digest": inventory_digest_value,
         "entries": entries,
-        "content_digest": _digest(entries),
+        "content_digest": content_digest,
+        "blockers": blockers,
+        "observed_inventory_digest": _digest(
+            {
+                "source_root_binding": root_binding(source),
+                "inventory_digest": inventory_digest_value,
+                "content_digest": content_digest,
+                "blockers": blockers,
+            }
+        ),
     }
+
+
+def _source_evidence_blockers(source: RootContext, entries: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    from hedge_fund.paper.deployed import FUND_FILE, load_deployed
+
+    blockers = []
+    with _handover_resource_access(source):
+        for relative, entry in entries.items():
+            parts = relative.split("/")
+            if len(parts) == 2 and parts[0] == "paper" and entry["type"] == "dir" and parts[1] in _PROTECTED_RESOURCE_NAMES:
+                fund_file = entries.get(f"{relative}/{FUND_FILE}")
+                if fund_file is None or fund_file["type"] != "file":
+                    continue
+                try:
+                    fund_data = source.read_bytes(f"{relative}/{FUND_FILE}")
+                except (OSError, RootPathError) as exc:
+                    raise HandoverError(f"protected fund evidence is unreadable ({type(exc).__name__})") from None
+                if len(fund_data) != fund_file["size"] or hashlib.sha256(fund_data).hexdigest() != fund_file["sha256"]:
+                    raise HandoverError("source content changed during inspection")
+                try:
+                    deployed = load_deployed(source.path / relative)
+                except (OSError, ValueError, RootPathError) as exc:
+                    raise HandoverError(f"protected fund evidence is unreadable ({type(exc).__name__})") from None
+                if deployed.name != parts[1]:
+                    raise HandoverError("protected fund identity must keep its original name")
+                blockers.append(
+                    {
+                        "kind": "protected-fund-inclusion",
+                        "subject": deployed.name,
+                        "evidence": {
+                            "directory": relative,
+                            "fund_file_sha256": fund_file["sha256"],
+                            "fund_file_size": fund_file["size"],
+                        },
+                    }
+                )
+            if parts[-1] != "runner.pid" or entry["type"] != "file":
+                continue
+            try:
+                data = source.read_bytes(relative)
+            except (OSError, RootPathError) as exc:
+                raise HandoverError(f"source marker is unreadable ({type(exc).__name__})") from None
+            if len(data) != entry["size"] or hashlib.sha256(data).hexdigest() != entry["sha256"]:
+                raise HandoverError("source content changed during inspection")
+            try:
+                text = data.decode("ascii").strip()
+            except UnicodeDecodeError:
+                text = ""
+            marker_pid = int(text) if text.isdecimal() and len(text) <= 10 else None
+            content_class = "empty" if not text else "pid" if marker_pid is not None and marker_pid > 0 else "opaque"
+            blockers.append(
+                {
+                    "kind": "stale-marker-retirement",
+                    "subject": relative,
+                    "evidence": {
+                        "content_class": content_class,
+                        "pid": marker_pid,
+                        "sha256": entry["sha256"],
+                        "size": entry["size"],
+                    },
+                }
+            )
+    return sorted(blockers, key=lambda item: (item["kind"], item["subject"].casefold()))
 
 
 def _relocation_entries(root: RootContext) -> dict[str, dict[str, Any]]:
@@ -1289,10 +1792,30 @@ def _relocation_entries(root: RootContext) -> dict[str, dict[str, Any]]:
                     total += child_info.st_size
                     if total > _MAX_RELOCATION_TOTAL_BYTES or len(entries) >= _MAX_RELOCATION_FILES:
                         raise HandoverError("relocation source exceeds its bound")
-                    data = root.read_bytes(relative)
+                    with _handover_resource_access(root):
+                        data = root.read_bytes(relative)
                     entries[relative] = {"type": "file", "size": len(data), "sha256": hashlib.sha256(data).hexdigest()}
                 if len(entries) > _MAX_RELOCATION_FILES:
                     raise HandoverError("relocation source exceeds its bound")
+        settings_path = root.path / RELOCATED_SETTINGS_PATH
+        try:
+            settings_info = settings_path.lstat()
+        except FileNotFoundError:
+            pass
+        else:
+            if _is_reparse_point(settings_path) or not stat.S_ISREG(settings_info.st_mode):
+                raise HandoverError("relocation settings file is not a regular file")
+            if settings_info.st_size > _MAX_RELOCATION_FILE_BYTES:
+                raise HandoverError("relocation source file exceeds its bound")
+            data = root.read_bytes(RELOCATED_SETTINGS_PATH)
+            total += len(data)
+            if total > _MAX_RELOCATION_TOTAL_BYTES or len(entries) >= _MAX_RELOCATION_FILES:
+                raise HandoverError("relocation source exceeds its bound")
+            entries[RELOCATED_SETTINGS_PATH] = {
+                "type": "file",
+                "size": len(data),
+                "sha256": hashlib.sha256(data).hexdigest(),
+            }
     except HandoverError:
         raise
     except (OSError, RootPathError) as exc:
@@ -1309,9 +1832,11 @@ def build_head_inventory(root: RootContext) -> dict[str, dict[str, Any]]:
         raise HandoverError(f"paper inventory is unavailable ({type(exc).__name__})") from None
 
 
-def _build_head_inventory(root: RootContext) -> dict[str, dict[str, Any]]:
+def _build_head_inventory(root: RootContext, *, allow_relocation_blockers: bool = False) -> dict[str, dict[str, Any]]:
     if not isinstance(root, RootContext):
         raise TypeError("an explicit RootContext is required")
+    if type(allow_relocation_blockers) is not bool:
+        raise TypeError("allow_relocation_blockers must be a bool")
     root.revalidate()
     paper = root.path / "paper"
     try:
@@ -1333,7 +1858,7 @@ def _build_head_inventory(root: RootContext) -> dict[str, dict[str, Any]]:
             raise HandoverError("paper inventory contains a reparse point")
         if not stat.S_ISDIR(directory_info.st_mode):
             raise HandoverError("paper inventory contains an unknown entry")
-        if _has_legacy_runner_pid(directory):
+        if not allow_relocation_blockers and _has_legacy_runner_pid(directory):
             raise HandoverError("runner.pid is present; unknown owners block handover")
         fund_file = directory / FUND_FILE
         try:
@@ -1346,8 +1871,13 @@ def _build_head_inventory(root: RootContext) -> dict[str, dict[str, Any]]:
             raise HandoverError("paper inventory contains an incomplete deployment")
         try:
             deployed: DeployedFund = load_deployed(directory)
-            key = ensure_unique_resource_name(deployed.name, [])
-            if key != ensure_unique_resource_name(directory.name, []):
+            if allow_relocation_blockers:
+                key = _relocation_resource_key(deployed.name)
+                directory_key = _relocation_resource_key(directory.name)
+            else:
+                key = ensure_unique_resource_name(deployed.name, [])
+                directory_key = ensure_unique_resource_name(directory.name, [])
+            if key != directory_key:
                 raise HandoverError("paper deployment identity does not match its directory")
             ledger = Ledger(directory)
             sessions = ledger.sessions()
@@ -1375,6 +1905,12 @@ def _build_head_inventory(root: RootContext) -> dict[str, dict[str, Any]]:
         inventory[key] = entry
     root.revalidate()
     return dict(sorted(inventory.items()))
+
+
+def _relocation_resource_key(name: str) -> str:
+    if name in _PROTECTED_RESOURCE_NAMES:
+        return name
+    return ensure_unique_resource_name(name, [])
 
 
 def verify_root_inventory(
@@ -2064,7 +2600,7 @@ def _record_exists(root: RootContext) -> bool:
     return True
 
 
-def _fresh_bootstrap_only(root: RootContext) -> bool:
+def _fresh_bootstrap_only(root: RootContext, *, allowed_files: tuple[str, ...] = ()) -> bool:
     expected_dirs = {
         Path("runtime"),
         Path("runtime/private"),
@@ -2074,6 +2610,7 @@ def _fresh_bootstrap_only(root: RootContext) -> bool:
     }
     expected_files = {
         Path(f"{LOCK_DIRECTORY}/owner.lock"),
+        *(Path(relative) for relative in allowed_files),
     }
     observed_dirs: set[Path] = set()
     observed_files: set[Path] = set()
@@ -2090,6 +2627,44 @@ def _fresh_bootstrap_only(root: RootContext) -> bool:
                 return False
             observed_files.add(child.relative_to(root.path))
     return observed_dirs == expected_dirs and observed_files == expected_files
+
+
+def _private_stage_layout_matches(root: RootContext, *, allowed_files: tuple[str, ...] = ()) -> bool:
+    expected_dirs = {
+        Path("runtime"),
+        Path("runtime/private"),
+        Path(PRIVATE_ROOT),
+        Path(f"{PRIVATE_ROOT}/admission"),
+        Path(f"{PRIVATE_ROOT}/admission/v1"),
+    }
+    expected_files = {
+        Path(OWNER_LOCK_PATH),
+        *(Path(relative) for relative in allowed_files),
+    }
+    observed_dirs: set[Path] = set()
+    observed_files: set[Path] = set()
+
+    def fail_walk(_exc: OSError) -> None:
+        raise HandoverError("private staging area cannot be inspected")
+
+    try:
+        root.revalidate()
+        for directory, subdirs, files in os.walk(root.path, followlinks=False, onerror=fail_walk):
+            current = Path(directory)
+            for name in list(subdirs):
+                child = current / name
+                if _is_reparse_point(child):
+                    return False
+                observed_dirs.add(child.relative_to(root.path))
+            for name in files:
+                child = current / name
+                if _is_reparse_point(child):
+                    return False
+                observed_files.add(child.relative_to(root.path))
+        root.revalidate()
+    except (OSError, RootPathError, HandoverError):
+        return False
+    return observed_dirs.issubset(expected_dirs) and observed_files.issubset(expected_files)
 
 
 def _has_legacy_runner_pid(root: Path) -> bool:

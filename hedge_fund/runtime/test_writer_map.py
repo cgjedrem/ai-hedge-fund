@@ -179,13 +179,24 @@ WRITER_MAP: dict[tuple[str, str, str], Writer] = {
     ("hedge_fund.runtime.credentials", "CredentialStore._write_bytes", "write_bytes"): Writer(ROOT, "race", ("hedge_fund/runtime/test_credentials.py::test_credential_store_compare_and_swap_rejects_stale_version",)),
     ("hedge_fund.runtime.credentials", "save_credential", "write_atomic"): Writer(RESIDUAL, "denial", ("hedge_fund/web/test_settings.py::test_credential_write_is_allowlisted_write_only_and_control_safe",), BOUND_NOTE),
     # handover records and relocation
-    ("hedge_fund.runtime.handover", "relocate_existing", "mkdir"): Writer(ROOT, "denial", ("hedge_fund/runtime/test_write_authority.py::test_relocation_refuses_reparse_points_in_source",)),
-    ("hedge_fund.runtime.handover", "relocate_existing", "write_bytes"): Writer(ROOT, "denial", ("hedge_fund/runtime/test_write_authority.py::test_relocation_refuses_reparse_points_in_source",)),
+    ("hedge_fund.runtime.handover", "relocate_copy", "mkdir"): Writer(
+        ROOT,
+        "race",
+        ("hedge_fund/runtime/test_write_authority.py::test_relocation_detects_source_change_during_copy_and_leaves_target_fail_closed",),
+    ),
+    ("hedge_fund.runtime.handover", "relocate_copy", "write_bytes"): Writer(
+        ROOT,
+        "race",
+        ("hedge_fund/runtime/test_write_authority.py::test_relocation_detects_source_change_during_copy_and_leaves_target_fail_closed",),
+    ),
     ("hedge_fund.runtime.handover", "_write_private_json", "write_bytes"): Writer(
         BOOTSTRAP,
         "denial",
-        ("hedge_fund/runtime/test_write_authority.py::test_existing_root_needs_fresh_root_bound_trust_ack_and_revocation_is_fail_closed",),
-        "root-private trust records require offline RootMigrationLease admission",
+        (
+            "hedge_fund/runtime/test_write_authority.py::test_existing_root_needs_fresh_root_bound_trust_ack_and_revocation_is_fail_closed",
+            "hedge_fund/runtime/test_handover.py::test_inspect_source_stages_destination_evidence_and_preserves_source",
+        ),
+        "root-private handover records require offline RootMigrationLease admission",
     ),
     ("hedge_fund.runtime.handover", "_write_attestation_artifact", "mkdir"): Writer(
         BOOTSTRAP,

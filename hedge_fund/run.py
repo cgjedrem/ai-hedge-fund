@@ -483,9 +483,14 @@ def _parser() -> argparse.ArgumentParser:
         "enroll-fresh",
         help="enroll only a genuinely empty root",
     )
-    handover_actions.add_parser(
+    source_inspection = handover_actions.add_parser(
         "inspect-source",
         help="read-only: show the relocation content digest of this legacy root without writing to it",
+    )
+    source_inspection.add_argument(
+        "--evidence-out",
+        required=True,
+        help="absolute destination-private path for the source evidence bundle",
     )
     relocation = handover_actions.add_parser(
         "relocate-from",
@@ -496,6 +501,16 @@ def _parser() -> argparse.ArgumentParser:
         "--content-digest",
         required=True,
         help="exact content_digest printed by `aihf --root SOURCE handover inspect-source`",
+    )
+    relocation_copy = handover_actions.add_parser(
+        "relocate-copy",
+        help="copy reviewed source data into this empty destination without enrolling it",
+    )
+    relocation_copy.add_argument("source", help="absolute path of the legacy root to copy (never written)")
+    relocation_copy.add_argument("--content-digest", required=True, help="exact content_digest printed by inspect-source")
+    handover_actions.add_parser(
+        "relocate-finalize",
+        help="validate a completed relocation copy and enroll this destination read-only",
     )
     migration = handover_actions.add_parser(
         "migrate-existing",
@@ -657,7 +672,9 @@ def _handover(args, parser: argparse.ArgumentParser, root: RootContext) -> None:
         migrate_existing,
         OPERATOR_ATTESTATION,
         prepare_single_writer_acknowledgement,
+        relocate_copy,
         relocate_existing,
+        relocate_finalize,
         revoke_single_writer,
         SINGLE_WRITER_RESPONSIBILITY_WARNING,
         trust_single_writer,
@@ -666,7 +683,7 @@ def _handover(args, parser: argparse.ArgumentParser, root: RootContext) -> None:
 
     try:
         if args.handover_action == "inspect-source":
-            print(json.dumps(inspect_relocation_source(root), sort_keys=True, indent=2))
+            print(json.dumps(inspect_relocation_source(root, evidence_out=args.evidence_out), sort_keys=True, indent=2))
             return
         if args.handover_action == "inspect":
             status = enrollment_status(root, verify_inventory=True)
@@ -729,6 +746,13 @@ def _handover(args, parser: argparse.ArgumentParser, root: RootContext) -> None:
         elif args.handover_action == "relocate-from":
             with RootContext.open(args.source) as source:
                 record = relocate_existing(root, source=source, expected_content_digest=args.content_digest)
+        elif args.handover_action == "relocate-copy":
+            with RootContext.open(args.source) as source:
+                copied = relocate_copy(root, source=source, expected_content_digest=args.content_digest)
+            print(json.dumps(copied, sort_keys=True))
+            return
+        elif args.handover_action == "relocate-finalize":
+            record = relocate_finalize(root)
         elif args.handover_action == "trust-single-writer":
             authority = trust_single_writer(
                 root,
