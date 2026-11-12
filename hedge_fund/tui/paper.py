@@ -30,7 +30,19 @@ from hedge_fund.data.bars import is_intraday
 from hedge_fund.fund import Fund, FundSpec
 from hedge_fund.llm import make_llm
 from hedge_fund.llm.client import validate_llm_transport
-from hedge_fund.paper import assessment_dates, DeployedFund, is_running, Ledger, LedgerError, list_deployed, load_deployed, next_session, NothingDue, redo, tick
+from hedge_fund.paper import (
+    assessment_dates,
+    DeployedFund,
+    is_running,
+    Ledger,
+    LedgerError,
+    list_deployed,
+    load_deployed,
+    next_session,
+    NothingDue,
+    redo,
+    tick,
+)
 from hedge_fund.pipeline import DecisionRecord, FundState, SessionRecord
 from hedge_fund.pipeline.session import code_version, mandate_hash
 from hedge_fund.runtime.admission import AdmissionError
@@ -38,16 +50,52 @@ from hedge_fund.runtime.capture import freeze_capture, FrozenCapture
 from hedge_fund.runtime.configuration import resolve_settings, RuntimeSettings
 from hedge_fund.runtime.defaults import BOARD_REFRESH
 from hedge_fund.runtime.dispatch import make_one_shot_dispatch
-from hedge_fund.runtime.policy import APPROVED_LOCAL_MODELS, AuthorizationDenied, classify_provider, KEN_FRENCH_BREAKPOINTS_TARGET, ProviderClass, ProviderTarget
+from hedge_fund.runtime.policy import (
+    APPROVED_LOCAL_MODELS,
+    AuthorizationDenied,
+    classify_provider,
+    KEN_FRENCH_BREAKPOINTS_TARGET,
+    ProviderClass,
+    ProviderTarget,
+)
 from hedge_fund.runtime.root import RootConfigurationError
 from hedge_fund.scorecard import score
 from hedge_fund.signals import ALPHA_MODEL_REGISTRY, LLMAgent
-from hedge_fund.tui.funds import mandate_delete_denial, paper_creation_denial, paper_write_denial, tui_paper_admission
+from hedge_fund.tui.funds import (
+    mandate_delete_denial,
+    paper_creation_denial,
+    paper_write_denial,
+    tui_paper_admission,
+)
 from hedge_fund.tui.palette import BRIGHT, CYAN, GREEN, MUTED, RED, TEXT
-from hedge_fund.tui.paper_view import APP_HALT, day_heading, fetch_snapshots, LIVE_REFRESH, paper_detail, paper_slot, PaperSnapshot, run_plan
-from hedge_fund.tui.report import book_summary, Desk, desk_table, session_detail, session_headline, session_nav, session_overview, session_row
+from hedge_fund.tui.paper_view import (
+    APP_HALT,
+    day_heading,
+    fetch_snapshots,
+    LIVE_REFRESH,
+    paper_detail,
+    paper_slot,
+    PaperSnapshot,
+    run_plan,
+)
+from hedge_fund.tui.report import (
+    book_summary,
+    Desk,
+    desk_table,
+    session_detail,
+    session_headline,
+    session_nav,
+    session_overview,
+    session_row,
+)
 from hedge_fund.tui.scorecard_view import analyst_table, strategy_table
-from hedge_fund.tui.shared import agent_names, cadence_identity, DISPLAY_NAMES, render_area_chart, session_label
+from hedge_fund.tui.shared import (
+    agent_names,
+    cadence_identity,
+    DISPLAY_NAMES,
+    render_area_chart,
+    session_label,
+)
 from hedge_fund.tui.widgets import first_selectable, StatTiles
 
 

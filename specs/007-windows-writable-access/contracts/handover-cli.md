@@ -4,7 +4,7 @@ Interface: `aihf --root ROOT handover <subcommand>` (existing CLI surface in `ru
 
 ## 1. `handover inspect-source` (extended)
 
-- **Effects**: read-only inventory of the source root, listing protected-fund and marker blockers; writes the **source evidence bundle** to an operator-supplied path OUTSIDE the source tree (`--evidence-out PATH`). Nothing is created or modified inside the source root.
+- **Effects**: read-only inventory of the source root, listing protected-fund and marker blockers; writes the **source evidence bundle** to exactly `DEST/runtime/private/v1/source-evidence.json`. `--evidence-out PATH` must name that absolute canonical destination-private path. Nothing is created or modified inside the source root.
 
 ## 2. `handover relocate-copy SOURCE --content-digest DIGEST` (split from relocate-from)
 

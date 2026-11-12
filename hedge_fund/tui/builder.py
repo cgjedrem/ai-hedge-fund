@@ -13,22 +13,63 @@ from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import Screen
-from textual.widgets import ContentSwitcher, Footer, Input, Label, OptionList, SelectionList, Static
+from textual.widgets import (
+    ContentSwitcher,
+    Footer,
+    Input,
+    Label,
+    OptionList,
+    SelectionList,
+    Static,
+)
 from textual.widgets.option_list import Option
 from textual.widgets.selection_list import Selection
 
 from hedge_fund import paths
 from hedge_fund.brokers.factory import demo_token_mode_configured
-from hedge_fund.fund import custom_strategy, format_interval, FundSpec, load_strategy, normalize_universe, save_spec, StrategySpec, TradingWindow
+from hedge_fund.fund import (
+    custom_strategy,
+    format_interval,
+    FundSpec,
+    load_strategy,
+    normalize_universe,
+    save_spec,
+    StrategySpec,
+    TradingWindow,
+)
 from hedge_fund.fund.spec import EARLIEST_WINDOW, LATEST_WINDOW, validate_saxo_window
 from hedge_fund.fund.storage import StorageAdmissionError
 from hedge_fund.paper import deploy, validate_fund_name
-from hedge_fund.runtime.defaults import fast_caveat, interval_line, parse_interval, window_lines
+from hedge_fund.runtime.defaults import (
+    fast_caveat,
+    interval_line,
+    parse_interval,
+    window_lines,
+)
 from hedge_fund.signals import ALPHA_MODEL_REGISTRY, get_investment_approach, LLMAgent
 from hedge_fund.tui.backtest import BacktestScreen
-from hedge_fund.tui.funds import ConfirmWipeScreen, fund_name_taken, newest_paper_universe, paper_creation_denial, paper_write_denial, short_tickers, wipe_fund
+from hedge_fund.tui.funds import (
+    ConfirmWipeScreen,
+    fund_name_taken,
+    newest_paper_universe,
+    paper_creation_denial,
+    paper_write_denial,
+    short_tickers,
+    wipe_fund,
+)
 from hedge_fund.tui.palette import BRIGHT, GREEN, MUTED, RED, TEXT
-from hedge_fund.tui.shared import cadence_identity, DEFAULT_CAPITAL, DEFAULT_RISK, DISPLAY_NAMES, MODE_LABELS, SHORT_NAMES, strategy_description, STRATEGY_DIR, strategy_kind, UNIVERSE_PRESETS
+from hedge_fund.tui.shared import (
+    cadence_identity,
+    DEFAULT_CAPITAL,
+    DEFAULT_RISK,
+    DISPLAY_NAMES,
+    MODE_LABELS,
+    SHORT_NAMES,
+    strategy_description,
+    STRATEGY_DIR,
+    strategy_kind,
+    UNIVERSE_PRESETS,
+)
 
 CUSTOM = "custom"  # sentinel value in the strategy list for "build your own"
 

@@ -17,7 +17,7 @@ Validation uses synthetic test-owned roots only until the separately authorized 
 
 On synthetic fixtures replicating the real root's shape (three protected-named funds, two stale `runner.pid` markers, settings file). The synthetic source tree is hash-snapshotted before and after to prove zero source mutation:
 
-1. `aihf --root SYNTH_SRC handover inspect-source --evidence-out OUT/bundle.json` → inventory lists 3 protected funds + 2 markers as blockers; source tree untouched
+1. `aihf --root SYNTH_SRC handover inspect-source --evidence-out SYNTH_DST/runtime/private/v1/source-evidence.json` → inventory lists 3 protected funds + 2 markers as blockers; evidence staged under destination-private storage; source tree untouched
 2. `aihf --root SYNTH_DST handover relocate-copy SYNTH_SRC --content-digest D` → copy verified incl. settings; ledger heads match; no enrollment yet
 3. On SYNTH_DST: `handover attest-stale-marker` ×2 → destination-bound artifacts recorded, markers retired at destination only; live-process refusal path exercised separately with a real dummy process
 4. On SYNTH_DST: `handover attest-protected-fund` ×3 → artifacts recorded; original names kept; rename-evasion attempt denied

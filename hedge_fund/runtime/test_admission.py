@@ -7,7 +7,16 @@ from threading import current_thread, Event, Thread
 
 import pytest
 
-from hedge_fund.runtime.admission import AdmissionCoordinator, AdmissionError, LOCK_DIRECTORY, OwnershipUnknown, require_paper_write_lanes, RootMigrationLease, RootOwnerLease, WriterConflict
+from hedge_fund.runtime.admission import (
+    AdmissionCoordinator,
+    AdmissionError,
+    LOCK_DIRECTORY,
+    OwnershipUnknown,
+    require_paper_write_lanes,
+    RootMigrationLease,
+    RootOwnerLease,
+    WriterConflict,
+)
 from hedge_fund.runtime.handover import enroll_fresh
 from hedge_fund.runtime.root import PRIVATE_ROOT, RootContext
 

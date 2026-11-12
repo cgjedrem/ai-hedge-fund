@@ -16,11 +16,34 @@ from pathlib import Path
 from typing import Any, Callable, Iterator, TypedDict, TypeVar
 
 from hedge_fund.pipeline.session import code_version
-from hedge_fund.runtime.admission import AdmissionCoordinator, AdmissionError, LOCK_DIRECTORY, MAX_LOCK_WAIT_SECONDS, OWNER_LOCK_PATH, PROTOCOL_VERSION, require_paper_write_lanes, RootMigrationLease, RootOwnerLease, WriterConflict
+from hedge_fund.runtime.admission import (
+    AdmissionCoordinator,
+    AdmissionError,
+    LOCK_DIRECTORY,
+    MAX_LOCK_WAIT_SECONDS,
+    OWNER_LOCK_PATH,
+    PROTOCOL_VERSION,
+    require_paper_write_lanes,
+    RootMigrationLease,
+    RootOwnerLease,
+    WriterConflict,
+)
 from hedge_fund.runtime.exclusion import out_of_band_exclusion_basis
 from hedge_fund.runtime.exclusion import UNPROVEN_REASON as EXCLUSION_UNPROVEN_REASON
-from hedge_fund.runtime.ownership import process_identity, process_is_running, ProcessIdentityError
-from hedge_fund.runtime.root import _handover_resource_access, _relative_parts, _windows_current_user_sid, ensure_unique_resource_name, PRIVATE_ROOT, RootContext, RootPathError
+from hedge_fund.runtime.ownership import (
+    process_identity,
+    process_is_running,
+    ProcessIdentityError,
+)
+from hedge_fund.runtime.root import (
+    _handover_resource_access,
+    _relative_parts,
+    _windows_current_user_sid,
+    ensure_unique_resource_name,
+    PRIVATE_ROOT,
+    RootContext,
+    RootPathError,
+)
 
 HANDOVER_PATH = f"{PRIVATE_ROOT}/handover.json"
 RECOVERY_ROOT = f"{PRIVATE_ROOT}/recoveries"
@@ -1174,18 +1197,23 @@ def _validate_protected_fund_source_evidence(fund: str, blocker: dict[str, Any])
 
 
 def _validate_destination_protected_fund(root: RootContext, fund: str, evidence: dict[str, Any]) -> None:
-    from hedge_fund.paper.deployed import FUND_FILE, load_deployed
+    import yaml
+
+    from hedge_fund.paper.deployed import DeployedFund, FUND_FILE
 
     relative = f"paper/{fund}/{FUND_FILE}"
     try:
         with _handover_resource_access(root):
             info = root.file_info(relative)
             data = root.read_bytes(relative)
-        deployed = load_deployed(root.path / "paper" / fund)
     except FileNotFoundError:
         raise HandoverError("protected fund original name is missing from the destination copy") from None
     except (OSError, ValueError, RootPathError) as exc:
         raise HandoverError(f"protected fund destination is unreadable ({type(exc).__name__})") from None
+    try:
+        deployed = DeployedFund.model_validate(yaml.safe_load(data))
+    except (TypeError, ValueError, yaml.YAMLError) as exc:
+        raise HandoverError(f"protected fund destination is invalid ({type(exc).__name__})") from None
     if deployed.name != fund or info.size != evidence["fund_file_size"] or len(data) != info.size or hashlib.sha256(data).hexdigest() != evidence["fund_file_sha256"]:
         raise HandoverError("protected fund identity or file differs from source evidence")
 
@@ -2955,7 +2983,13 @@ def recover_stale_reservation(
     if operator_attestation != STALE_RECOVERY_ATTESTATION:
         raise HandoverError("explicit stale-reservation recovery attestation is required")
 
-    from hedge_fund.runtime.owned_runner import OwnedRunnerError, read_runner_record, runner_key, validate_runner_state, write_runner_record
+    from hedge_fund.runtime.owned_runner import (
+        OwnedRunnerError,
+        read_runner_record,
+        runner_key,
+        validate_runner_state,
+        write_runner_record,
+    )
 
     runner_identity = runner_key(fund)
     try:

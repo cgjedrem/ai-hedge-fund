@@ -15,7 +15,15 @@ from hedge_fund.data.sessions import NEW_YORK
 from hedge_fund.paper import deploy, Ledger, load_deployed
 from hedge_fund.tui import backtest, builder, funds, paper, paper_view, report
 from hedge_fund.tui.app import HedgeFundApp
-from hedge_fund.tui.fixtures import executed_and_decided, make_minute_spec, make_pending, make_quote, make_session, make_spec, render
+from hedge_fund.tui.fixtures import (
+    executed_and_decided,
+    make_minute_spec,
+    make_pending,
+    make_quote,
+    make_session,
+    make_spec,
+    render,
+)
 
 
 @pytest.mark.parametrize("mode", ["long_only", "long_short", "dollar_neutral"])

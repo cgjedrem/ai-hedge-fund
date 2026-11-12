@@ -13,7 +13,15 @@ from types import SimpleNamespace
 import pytest
 
 import hedge_fund.runtime.root as root_module
-from hedge_fund.runtime.root import ensure_unique_resource_name, FilesystemIdentity, RootConfigurationError, RootContext, RootPathError, UnsupportedFilesystemError, validate_filesystem
+from hedge_fund.runtime.root import (
+    ensure_unique_resource_name,
+    FilesystemIdentity,
+    RootConfigurationError,
+    RootContext,
+    RootPathError,
+    UnsupportedFilesystemError,
+    validate_filesystem,
+)
 
 
 @pytest.fixture
@@ -499,7 +507,10 @@ def test_atomic_replace_failure_preserves_record_and_original_error(
 
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="POSIX FIFO is unavailable")
 def test_posix_fifo_read_fails_without_blocking(tmp_path):
-    from hedge_fund.test_support.network_guard import child_test_environment, guarded_test_python_command
+    from hedge_fund.test_support.network_guard import (
+        child_test_environment,
+        guarded_test_python_command,
+    )
 
     root = tmp_path / "root"
     root.mkdir()

@@ -8,12 +8,43 @@ import pytest
 
 from hedge_fund.fund import FundSpec
 from hedge_fund.paper.deployed import deploy
-from hedge_fund.pipeline.session import code_version
+from hedge_fund.paper.ledger import Ledger
+from hedge_fund.pipeline.session import code_version, SessionRecord
 from hedge_fund.runtime import handover
-from hedge_fund.runtime.admission import AdmissionCoordinator, OwnershipUnknown, require_paper_write_lanes, RootMigrationLease, RootOwnerLease, WriterConflict
-from hedge_fund.runtime.handover import build_head_inventory, enroll_fresh, enrollment_status, EnrollmentInvalid, HANDOVER_PATH, HandoverError, inventory_digest, LedgerDrift, migrate_existing, OPERATOR_ATTESTATION, require_enrollment, root_binding, verify_ledger_head
-from hedge_fund.runtime.owned_runner import read_runner_record, runner_key, RUNNER_ROOT, write_runner_record
-from hedge_fund.runtime.ownership import process_identity, process_is_running, ProcessIdentityError
+from hedge_fund.runtime.admission import (
+    AdmissionCoordinator,
+    OwnershipUnknown,
+    require_paper_write_lanes,
+    RootMigrationLease,
+    RootOwnerLease,
+    WriterConflict,
+)
+from hedge_fund.runtime.handover import (
+    build_head_inventory,
+    enroll_fresh,
+    enrollment_status,
+    EnrollmentInvalid,
+    HANDOVER_PATH,
+    HandoverError,
+    inventory_digest,
+    LedgerDrift,
+    migrate_existing,
+    OPERATOR_ATTESTATION,
+    require_enrollment,
+    root_binding,
+    verify_ledger_head,
+)
+from hedge_fund.runtime.owned_runner import (
+    read_runner_record,
+    runner_key,
+    RUNNER_ROOT,
+    write_runner_record,
+)
+from hedge_fund.runtime.ownership import (
+    process_identity,
+    process_is_running,
+    ProcessIdentityError,
+)
 from hedge_fund.runtime.root import PRIVATE_ROOT, RootContext, RootPathError
 
 
@@ -281,6 +312,35 @@ def test_handover_inspect_lists_attestations_and_remaining_blockers(tmp_path, ca
         "--operator-statement",
         "<operator statement>",
     ]
+
+
+def test_handover_inspect_skips_attestation_walk_for_enrolled_root_without_relocation_state(tmp_path, monkeypatch, capsys):
+    import hedge_fund.run as run
+
+    root_path = tmp_path / "ordinary-enrolled-root"
+    root_path.mkdir()
+    (root_path / "mandates").mkdir()
+    (root_path / "paper").mkdir()
+    (root_path / "research").mkdir()
+    with RootContext.open(root_path) as root:
+        heads = build_head_inventory(root)
+        migrate_existing(
+            root,
+            expected_inventory_digest=inventory_digest(heads),
+            operator_attestation=OPERATOR_ATTESTATION,
+        )
+
+    calls = []
+    monkeypatch.setattr(handover, "inspect_attestation_state", lambda root: calls.append(root))
+
+    run.main(["--root", str(root_path), "handover", "inspect"])
+    inspected = json.loads(capsys.readouterr().out)
+
+    assert calls == []
+    assert inspected["state"] == "enrolled"
+    assert inspected["source_evidence_digest"] is None
+    assert inspected["attestation_artifacts"] == []
+    assert inspected["remaining_blockers"] == []
 
 
 def test_attest_stale_marker_retires_destination_and_refuses_repeat(tmp_path, capsys, owned_test_process):
@@ -679,9 +739,10 @@ def test_attest_protected_fund_cannot_authorize_renamed_identity(tmp_path, capsy
     assert _tree_digest_snapshot(source_path) == source_before
 
 
-def test_full_attested_relocation_keeps_source_tree_hash_identical(tmp_path, capsys, owned_test_process):
+def test_full_attested_relocation_keeps_source_tree_hash_identical(tmp_path, capsys, owned_test_process, monkeypatch):
     import hedge_fund.run as run
 
+    monkeypatch.setattr(handover, "out_of_band_exclusion_basis", lambda _root: None)
     marker_pid = _terminated_dummy_pid(owned_test_process)
     source_path = _legacy_relocation_source(tmp_path / "source", protected_fund=True)
     for name in ("watchtower", "watchtower-weekly"):
@@ -783,6 +844,18 @@ def test_full_attested_relocation_keeps_source_tree_hash_identical(tmp_path, cap
         assert handover._read_attestation_artifact(destination, kind="stale-marker-retirement", subject=marker_paths[0]) is not None
         with pytest.raises(FileNotFoundError):
             destination.file_info(marker_paths[0])
+
+        review = handover.prepare_single_writer_acknowledgement(destination)
+        assert review["write_authority"] == "ownership-unknown"
+        assert handover.out_of_band_exclusion_basis(destination) is None
+        trusted = handover.trust_single_writer(
+            destination,
+            expected_inventory_digest=review["inventory_digest"],
+            operator_acknowledgement=review["operator_acknowledgement"],
+        )
+        assert trusted["authority"] == handover.TRUSTED_SINGLE_WRITER_AUTHORITY
+        assert handover.write_authority(destination)["authority"] == handover.TRUSTED_SINGLE_WRITER_AUTHORITY
+
         owner = RootOwnerLease.acquire(destination)
         coordinator = AdmissionCoordinator(destination, owner_lease=owner)
         try:
@@ -792,8 +865,30 @@ def test_full_attested_relocation_keeps_source_tree_hash_identical(tmp_path, cap
                     "umbrella",
                     lane_sets=(("runner",),),
                 )
+            record = SessionRecord(
+                fund="umbrella",
+                session="2025-01-21",
+                universe=["AAPL"],
+                nav=100_000,
+                cash=100_000,
+                positions={},
+                marks={},
+                benchmark="SPY",
+                benchmark_close=100,
+                rebalance=False,
+                code_version=code_version(),
+                mandate_hash="synthetic",
+            )
+            record.hash = record.compute_hash()
+            ledger = Ledger(destination.path / "paper" / "umbrella")
+            with coordinator.manual_session("umbrella", timeout=0):
+                appended_path = ledger.append(record)
+            assert appended_path.is_file()
+            assert ledger.latest().hash == record.hash
+            assert verify_ledger_head(destination, "umbrella")["head_hash"] == record.hash
         finally:
             owner.close()
+    assert _tree_digest_snapshot(source_path) == source_before
 
 
 def test_head_inventory_and_finalize_refuse_unattested_protected_fund(tmp_path):

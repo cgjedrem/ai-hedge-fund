@@ -18,7 +18,22 @@ from hedge_fund.paper.deployed import deploy
 from hedge_fund.pipeline.session import code_version
 from hedge_fund.runtime import handover
 from hedge_fund.runtime.admission import OwnershipUnknown, RootOwnerLease
-from hedge_fund.runtime.handover import build_head_inventory, enroll_fresh, enrollment_status, HANDOVER_PATH, HandoverError, inspect_relocation_source, inventory_digest, migrate_existing, OPERATOR_ATTESTATION, relocate_existing, require_enrollment, require_write_authority, write_authority, WriteAuthorityDenied
+from hedge_fund.runtime.handover import (
+    build_head_inventory,
+    enroll_fresh,
+    enrollment_status,
+    HANDOVER_PATH,
+    HandoverError,
+    inspect_relocation_source,
+    inventory_digest,
+    migrate_existing,
+    OPERATOR_ATTESTATION,
+    relocate_existing,
+    require_enrollment,
+    require_write_authority,
+    write_authority,
+    WriteAuthorityDenied,
+)
 from hedge_fund.runtime.root import RootContext
 
 _ORIGINAL_RUNTIME_SCOPE_IDENTITY = handover._runtime_scope_identity
@@ -1113,7 +1128,11 @@ def test_protocol_native_root_loses_authority_when_legacy_writers_can_reach_it(t
 
 
 def test_writer_already_holding_lanes_is_denied_at_write_time_after_authority_flips(tmp_path):
-    from hedge_fund.runtime.admission import AdmissionCoordinator, require_paper_write_lanes, root_registry_writer
+    from hedge_fund.runtime.admission import (
+        AdmissionCoordinator,
+        require_paper_write_lanes,
+        root_registry_writer,
+    )
 
     root = tmp_path / "native"
     root.mkdir()

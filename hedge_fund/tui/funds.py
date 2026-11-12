@@ -21,8 +21,19 @@ from textual.widgets.option_list import Option
 from hedge_fund import paths
 from hedge_fund.backtesting.research import last_score, receipts, summarize
 from hedge_fund.fund import discover_funds, FundSpec
-from hedge_fund.paper import DeployedFund, Ledger, LedgerError, list_deployed, load_deployed
-from hedge_fund.runtime.admission import AdmissionCoordinator, AdmissionError, RootOwnerLease, WriterConflict
+from hedge_fund.paper import (
+    DeployedFund,
+    Ledger,
+    LedgerError,
+    list_deployed,
+    load_deployed,
+)
+from hedge_fund.runtime.admission import (
+    AdmissionCoordinator,
+    AdmissionError,
+    RootOwnerLease,
+    WriterConflict,
+)
 from hedge_fund.runtime.root import RootContext
 from hedge_fund.tui.backtest import BacktestScreen
 from hedge_fund.tui.palette import BRIGHT, CYAN, GREEN, MUTED, RED, TEXT
@@ -30,7 +41,11 @@ from hedge_fund.tui.shared import cadence_identity, MODE_LABELS, strategy_descri
 
 
 def paper_write_denial() -> str | None:
-    from hedge_fund.runtime.handover import enrollment_status, has_write_authority, write_authority
+    from hedge_fund.runtime.handover import (
+        enrollment_status,
+        has_write_authority,
+        write_authority,
+    )
 
     try:
         root = paths.root_context(required=False)
@@ -88,21 +103,25 @@ def tui_paper_admission(
         raise AdmissionError("TUI paper admission requires the fund directory under the configured root.")
     owner = None
     try:
-        if directory is not None:
-            root.resolve(f"paper/{identity}")
-        owner = RootOwnerLease.acquire(root, timeout=0)
-        admission = AdmissionCoordinator(root, owner_lease=owner)
-        verify_root_inventory(root)
-        if directory is not None:
-            verify_ledger_head(root, identity)
-        admission.require_root_owner()
+        try:
+            if directory is not None:
+                root.resolve(f"paper/{identity}")
+            owner = RootOwnerLease.acquire(root, timeout=0)
+            admission = AdmissionCoordinator(root, owner_lease=owner)
+            verify_root_inventory(root)
+            if directory is not None:
+                verify_ledger_head(root, identity)
+            admission.require_root_owner()
+        except WriterConflict as exc:
+            raise AdmissionError(f"TUI paper admission denied: another participating writer holds the required root or fund lane ({exc}).") from None
+        except AdmissionError:
+            raise
+        except Exception as exc:
+            raise AdmissionError(f"TUI paper admission is unavailable ({type(exc).__name__}); run `aihf --root ROOT handover inspect`.") from None
+
         yield root, admission
     except WriterConflict as exc:
         raise AdmissionError(f"TUI paper admission denied: another participating writer holds the required root or fund lane ({exc}).") from None
-    except AdmissionError:
-        raise
-    except Exception as exc:
-        raise AdmissionError(f"TUI paper admission is unavailable ({type(exc).__name__}); run `aihf --root ROOT handover inspect`.") from None
     finally:
         if owner is not None:
             owner.close()

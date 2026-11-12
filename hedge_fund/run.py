@@ -692,6 +692,7 @@ def _handover(args, parser: argparse.ArgumentParser, root: RootContext) -> None:
         relocate_copy,
         relocate_existing,
         relocate_finalize,
+        RELOCATION_STATE_PATH,
         revoke_single_writer,
         SINGLE_WRITER_RESPONSIBILITY_WARNING,
         trust_single_writer,
@@ -726,7 +727,19 @@ def _handover(args, parser: argparse.ArgumentParser, root: RootContext) -> None:
             inspectable = status["state"] in {"unenrolled", "enrolled"} or orphaned_admission
             if not inspectable:
                 raise HandoverError("root enrollment or ledger inventory is unavailable")
-            attestation_state = inspect_attestation_state(root)
+            attestation_state = {
+                "source_evidence_digest": None,
+                "attestation_artifacts": [],
+                "remaining_blockers": [],
+            }
+            try:
+                root.file_info(RELOCATION_STATE_PATH)
+            except FileNotFoundError:
+                relocation_state_present = False
+            else:
+                relocation_state_present = True
+            if status["state"] == "unenrolled" or relocation_state_present:
+                attestation_state = inspect_attestation_state(root)
             acknowledgement = None
             acknowledgement_expires_at = None
             runtime_scope = None
@@ -854,8 +867,18 @@ def _handover_remedy(args, error: Exception) -> str:
 
 @contextmanager
 def _paper_writer_admission(*, verify_inventory: bool = True) -> Iterator[tuple[RootContext, object] | None]:
-    from hedge_fund.runtime.admission import AdmissionCoordinator, AdmissionError, RootOwnerLease
-    from hedge_fund.runtime.handover import enrollment_status, HandoverError, has_write_authority, verify_root_inventory, write_authority
+    from hedge_fund.runtime.admission import (
+        AdmissionCoordinator,
+        AdmissionError,
+        RootOwnerLease,
+    )
+    from hedge_fund.runtime.handover import (
+        enrollment_status,
+        HandoverError,
+        has_write_authority,
+        verify_root_inventory,
+        write_authority,
+    )
 
     root = paths.root_context()
     status = enrollment_status(root, verify_inventory=verify_inventory)
@@ -982,11 +1005,27 @@ def _authorize_cli_operation(
     from hedge_fund.pipeline.session import SessionRecord as CapturedSessionRecord
     from hedge_fund.runtime.capture import freeze_capture
     from hedge_fund.runtime.configuration import ConfigurationError, resolve_settings
-    from hedge_fund.runtime.costs import cost_model_description, cost_model_identity, COST_MODEL_VERSION, has_verified_cost_model, minimum_attempt_cost
+    from hedge_fund.runtime.costs import (
+        cost_model_description,
+        cost_model_identity,
+        COST_MODEL_VERSION,
+        has_verified_cost_model,
+        minimum_attempt_cost,
+    )
     from hedge_fund.runtime.credentials import CredentialStore, CredentialStoreError
     from hedge_fund.runtime.dispatch import make_one_shot_dispatch
-    from hedge_fund.runtime.handover import HandoverError, verify_ledger_head, verify_root_inventory
-    from hedge_fund.runtime.policy import AuthorizationDenied, classify_provider, KEN_FRENCH_BREAKPOINTS_TARGET, ProviderClass, ProviderTarget
+    from hedge_fund.runtime.handover import (
+        HandoverError,
+        verify_ledger_head,
+        verify_root_inventory,
+    )
+    from hedge_fund.runtime.policy import (
+        AuthorizationDenied,
+        classify_provider,
+        KEN_FRENCH_BREAKPOINTS_TARGET,
+        ProviderClass,
+        ProviderTarget,
+    )
 
     if not args.enable_network:
         parser.error("provider access requires explicit --enable-network")
@@ -1340,7 +1379,10 @@ def _cli_fund(spec, settings, dispatch, api_key):
 
 def _require_cli_sim_account_ownership(broker: str, parser: argparse.ArgumentParser) -> None:
     if broker == "saxo":
-        from hedge_fund.brokers.account_binding import require_sim_account_ownership, SIMOwnershipUnknown
+        from hedge_fund.brokers.account_binding import (
+            require_sim_account_ownership,
+            SIMOwnershipUnknown,
+        )
 
         try:
             require_sim_account_ownership()
@@ -1678,7 +1720,11 @@ def _paper(
         with _paper_writer_admission() as participant:
             with _paper_lane(participant, args.name, "control_lane"):
                 _verify_enrolled_head(participant, args.name)
-                from hedge_fund.runtime.reconciliation import build_tick_intent_reconciliation_snapshot, tick_intent_reconciliation_targets, TickIntentReconciliationConfirmation
+                from hedge_fund.runtime.reconciliation import (
+                    build_tick_intent_reconciliation_snapshot,
+                    tick_intent_reconciliation_targets,
+                    TickIntentReconciliationConfirmation,
+                )
 
                 deployed = load_deployed(directory)
                 ledger = Ledger(directory)
@@ -1899,7 +1945,10 @@ def _paper(
                     request_id=args.request_id,
                 )
             else:
-                from hedge_fund.runtime.admission import AdmissionError, paper_approval_transition
+                from hedge_fund.runtime.admission import (
+                    AdmissionError,
+                    paper_approval_transition,
+                )
                 from hedge_fund.runtime.handover import HandoverError
 
                 try:
