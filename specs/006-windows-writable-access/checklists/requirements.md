@@ -13,7 +13,7 @@
 
 ## Requirement Completeness
 
-- [ ] No [NEEDS CLARIFICATION] markers remain
+- [x] No [NEEDS CLARIFICATION] markers remain
 - [x] Requirements are testable and unambiguous
 - [x] Success criteria are measurable
 - [x] Success criteria are technology-agnostic (no implementation details)
@@ -31,5 +31,5 @@
 
 ## Notes
 
-- 2 [NEEDS CLARIFICATION] markers open (target interface, relocation target path) — presented to user as Q1/Q2. All other items pass on first validation pass.
+- Both [NEEDS CLARIFICATION] markers resolved by operator on 2026-11-12: Q1 → native TUI; Q2 → `C:\Users\ChristianGjedrem\aihf-data`. All items now pass.
 - File paths and fund names appear only as operator-provided context (Background/Assumptions), not as implementation prescriptions.
