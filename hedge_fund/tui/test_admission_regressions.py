@@ -16,7 +16,11 @@ from hedge_fund.backtesting.research import receipts
 from hedge_fund.data.models import Price
 from hedge_fund.paper import deploy, Ledger
 from hedge_fund.runtime import handover
-from hedge_fund.runtime.admission import AdmissionCoordinator, AdmissionError, RootOwnerLease
+from hedge_fund.runtime.admission import (
+    AdmissionCoordinator,
+    AdmissionError,
+    RootOwnerLease,
+)
 from hedge_fund.runtime.configuration import RuntimeSettings
 from hedge_fund.runtime.handover import record_ledger_head
 from hedge_fund.runtime.root import RootContext
@@ -254,6 +258,65 @@ def test_tui_run_records_one_captured_quant_session(trusted_tui_root, monkeypatc
     assert event["operation_id"] == plan.operation_id
     assert event["capture_id"] == plan.capture.capture_id
     assert event["capture_digest"] == plan.capture.digest
+
+
+def test_tui_run_shows_nothing_due_without_relabeling_it_as_admission_error(trusted_tui_root, monkeypatch):
+    from dataclasses import replace
+
+    root = paths.root_context()
+    owner = RootOwnerLease.acquire(root, timeout=0)
+    admission = AdmissionCoordinator(root, owner_lease=owner)
+    try:
+        with admission.deployment_lock("alpha", timeout=0):
+            directory = deploy("alpha", make_spec(["pead"], "alpha"), ["TEST"], root=paths.PAPER_DIR)
+        record_ledger_head(root, "alpha", admission=admission)
+    finally:
+        owner.close()
+
+    assert handover.write_authority(root)["authority"] == "operator-trusted-single-writer"
+
+    monkeypatch.setattr(paper, "make_data_client", lambda *_args, **_kwargs: nullcontext(object()))
+    monkeypatch.setattr(paper, "CachedDataClient", lambda client, **_kwargs: client)
+    monkeypatch.setattr(paper, "next_session", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        paper,
+        "resolve_settings",
+        lambda *_args, **_kwargs: RuntimeSettings(
+            data_provider="yfinance",
+            llm_provider="Ollama",
+            model="gemma3:4b",
+        ),
+    )
+    plan = paper._resolve_tui_run_plan(directory)
+    assert plan.action is None and plan.due is None
+    operation_digest = Ledger(directory).tick_request_digest(
+        plan.request_id,
+        expected_head=plan.expected_head,
+        session="2025-01-21",
+        operation_id=plan.operation_id,
+        capture_id=plan.capture.capture_id,
+        capture_digest=plan.capture.digest,
+    )
+    plan = replace(plan, action="run", operation_digest=operation_digest)
+    deployed = paper.load_deployed(directory)
+    monkeypatch.setattr(paper, "_verify_tui_run_plan", lambda *_args: (deployed, Ledger(directory).replay(deployed.spec.capital)))
+
+    async def scenario():
+        app = HedgeFundApp()
+        async with app.run_test(size=(140, 50)) as pilot:
+            screen = paper.RunSessionScreen(directory, plan=plan)
+            await app.push_screen(screen)
+            for _ in range(20):
+                await pilot.pause(0.05)
+                if screen._phase == "failed":
+                    break
+            assert screen._phase == "failed"
+            phase = str(screen.query_one("#run-phase").content)
+            assert "Nothing due" in phase
+            assert "AdmissionError" not in phase
+
+    asyncio.run(scenario())
+    assert Ledger(directory).events() == []
 
 
 def test_backtest_builder_save_on_unenrolled_root_reports_denial_without_crashing(unenrolled_root, monkeypatch):

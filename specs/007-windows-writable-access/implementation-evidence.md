@@ -113,3 +113,25 @@ All 23 full-suite failures match pre-change failures. No feature-specific test f
 
 - **Result**: focused and full pytest commands exit `1` on inherited failures; all 23 full-suite failures have pre-change evidence. Feature acceptance tests, final T024 process-death regression, writer-map audit, and style/hygiene checks pass. T023 execution and baseline-recording work complete; full suite is not green.
 - **T026–T027**: README/governance references and the Scenario C operator runbook are updated. Runbook is documentation only; no real cutover or real-root write was performed.
+
+## QA rework cycle 1 — finding dispositions
+
+- **I-1 — fixed**: `tui_paper_admission` translates setup failures only; exceptions from the caller block pass through unchanged, except `WriterConflict` mapping. The TUI regression runs with no due session, asserts the “Nothing due” phase, and confirms no ledger event was written.
+- **I-2 — fixed**: project-config isort restored imports on the 12 failing files; no `--line-length 420` override. Other changed Python files remain import-clean. Isort edits are confined to import blocks.
+- **I-3 — fixed**: `handover inspect` computes attestation blockers for unenrolled roots or roots with relocation-copy state. Ordinary enrolled roots return empty attestation fields without calling the tree walker.
+- **M-1 — caveat retained**: each protected-name authorization reopens relocation state, source evidence, the artifact, and protected-fund bytes through anchored root access; digests are revalidated. Runtime cost is unmeasured.
+- **M-2 — fixed**: protected-fund YAML parses from `RootContext.read_bytes` output; no unanchored `Path` read remains in `_validate_destination_protected_fund`.
+- **M-3 — fixed**: the full relocation test disables out-of-band test-owner authority, performs a fresh `trust-single-writer` review, asserts `operator-trusted-single-writer`, then appends a real `SessionRecord` through `Ledger.append` / `paper_inventory_transition` to attested `paper/umbrella`. The enrolled head matches the appended record; source-tree hash remains unchanged after the write.
+- **M-4 — fixed**: `inspect-source --evidence-out` is documented as exactly `DEST/runtime/private/v1/source-evidence.json`.
+- **M-5 — documented deviation**: the feature branch also added writer-map entries for five pre-existing sites outside the plan: `build_identity.bake_build_identity/write_text`; `credential_delivery._prepare_socket_directory/mkdir`, `_recover_stale_socket/unlink`, `close/unlink`, and `close/rmdir`. These entries cite existing tests. The separate writer-inventory gate still reports six legacy sites, including `start/os.chmod`, as unclassified.
+- **M-6 — documented deviation**: `wipe_fund` now denies TUI deletion and preserves mandates, receipts, and paper history; builder name collisions deny replacement when the existing-fund workflow lacks admission. Both changes fail closed but exceed the approved TUI scope.
+- **TUI history correction**: the earlier handoff statement “No TUI files changed” was inaccurate. Commit `064c852` changed eight TUI files: `builder.py`, `funds.py`, `paper.py`, `test_admission_regressions.py`, `test_builder.py`, `test_builder_broker.py`, `test_home.py`, and `test_paper.py`.
+
+### Rework validation
+
+- **Source identity**: base revision `252d8d027e06eb0f3bf7808ccd1a5102b916bbdf`; dirty `hedge_fund/` diff SHA-256 `01d10becb0957557590ff9becf7d11f6dae368c313694685b342b4452cc1a127` (35,303 bytes). Tests imported worktree source directly; no wheel or installed artifact.
+- **Environment**: Windows `10.0.26200`, Python `3.11.15`, Poetry `2.5.1`, pytest `7.4.4`, flake8 `6.1.0`. Synthetic roots only; no real user root, provider, or broker.
+- **Targeted regressions**: selected TUI `NothingDue`, normal-root inspect, relocation inspect, protected-fund attestation, and post-finalize ledger append tests — **5 passed in 20.42s** on this source diff.
+- **Focused gate**: `py -m poetry run pytest hedge_fund/runtime hedge_fund/tui -q`; result collected `2026-11-12T19:52:30.2934960+01:00`; **FAIL — 949 passed, 22 skipped, 1 failed in 1168.48s**. Only failure: `hedge_fund/runtime/test_writer_inventory.py::test_every_production_writer_is_classified_by_admission_class`. It reports the same six legacy sites documented by the T001 run on pre-change revision `b35b0d0dc2dda4dadf7f95fc380de24db5a9e81d`; expected no unclassified sites, observed the six listed above. No new focused-gate failure.
+- **Style / hygiene**: Black check, project-config isort check, flake8 at the project’s deliberate 420-column style (`--max-line-length=420 --extend-ignore=E203`), and `git diff --check` all **PASS** on 21 changed Python files. Observed `2026-11-12T19:52:44.5976733+01:00`–`2026-11-12T19:52:57.1527024+01:00`. Bare flake8 uses its unconfigured 79-column default and reports E501; the project has no flake8 config file.
+- **Full suite**: not rerun during this QA cycle. The prior 2,970-pass / 62-skip / 23-failure run and baseline reproductions above predate this rework and are not final-revision full-suite evidence.

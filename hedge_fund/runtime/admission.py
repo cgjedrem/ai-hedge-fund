@@ -15,7 +15,14 @@ from contextlib import contextmanager, ExitStack
 from pathlib import Path
 from typing import Callable, Iterator, TypeVar
 
-from hedge_fund.runtime.root import ensure_unique_resource_name, PRIVATE_ROOT, RootConfigurationError, RootContext, RootPathError, UnsupportedFilesystemError
+from hedge_fund.runtime.root import (
+    ensure_unique_resource_name,
+    PRIVATE_ROOT,
+    RootConfigurationError,
+    RootContext,
+    RootPathError,
+    UnsupportedFilesystemError,
+)
 
 PROTOCOL_VERSION = 1
 LOCK_DIRECTORY = f"{PRIVATE_ROOT}/admission/v{PROTOCOL_VERSION}"
@@ -213,7 +220,11 @@ RootParticipantLease = RootOwnerLease
 
 def _require_protocol_native_authority(root: RootContext) -> None:
     """Enrollment alone is not write authority."""
-    from hedge_fund.runtime.handover import HandoverError, require_write_authority, WriteAuthorityDenied
+    from hedge_fund.runtime.handover import (
+        HandoverError,
+        require_write_authority,
+        WriteAuthorityDenied,
+    )
 
     try:
         require_write_authority(root)
@@ -902,7 +913,12 @@ def require_paper_write_lanes(
         return False
 
     try:
-        from hedge_fund.runtime.handover import protected_fund_is_authorized, require_enrollment, root_is_enrolled, verify_root_inventory
+        from hedge_fund.runtime.handover import (
+            protected_fund_is_authorized,
+            require_enrollment,
+            root_is_enrolled,
+            verify_root_inventory,
+        )
 
         if not root_is_enrolled(root):
             for marker in (LOCK_DIRECTORY, OWNER_LOCK_PATH):
