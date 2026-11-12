@@ -932,6 +932,48 @@ def test_halt_before_effect_aborts_intent_then_resume_admits_new_tick(tmp_path, 
     assert record.session == "2024-06-03"
 
 
+def test_tui_resume_without_request_id_is_completed_before_tick_gate(tmp_path, clock, SPEC, monkeypatch):
+    clock("2024-06-05")
+    directory = _deploy_owned_paper_test_fund(tmp_path, SPEC)
+    ledger = Ledger(directory)
+    with _owned_paper_lane(directory, "alpha"):
+        ledger.halt("operator pause")
+
+    original_log_event = Ledger.log_event
+    original_write_control = Ledger._write_control
+    failed_completion = []
+    clear_writes = []
+
+    def interrupt_before_completion(self, kind, **fields):
+        if kind == "resume_completed" and not failed_completion:
+            failed_completion.append(True)
+            raise OSError("synthetic TUI crash before Resume completion")
+        return original_log_event(self, kind, **fields)
+
+    def observe_clear_write(self, halted, reason, **kwargs):
+        if halted is False:
+            clear_writes.append(halted)
+        return original_write_control(self, halted, reason, **kwargs)
+
+    monkeypatch.setattr(Ledger, "log_event", interrupt_before_completion)
+    monkeypatch.setattr(Ledger, "_write_control", observe_clear_write)
+    with _owned_paper_lane(directory, "alpha"):
+        with pytest.raises(OSError, match="synthetic TUI crash"):
+            ledger.resume(SPEC.capital, operator="tui")
+
+    monkeypatch.setattr(paper_tick_module, "next_session", lambda *_args, **_kwargs: None)
+    with _owned_paper_lane(directory, "alpha"):
+        with pytest.raises(NothingDue):
+            tick(directory, FakeDataClient(SERIES), build_fund=build_fund)
+
+    completions = [event for event in ledger.events() if event["kind"] == "resume_completed"]
+    assert len(completions) == 1
+    assert "request_id" not in completions[0]
+    assert clear_writes == [False]
+    assert ledger.halted() is None
+    assert ledger.unresolved_recovery_state().required is False
+
+
 def test_pre_expiry_failure_receipt_keeps_fund_tickable(tmp_path, clock, SPEC):
     from hedge_fund.runtime.reconciliation import (
         build_reconciliation_snapshot,

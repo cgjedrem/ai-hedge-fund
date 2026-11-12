@@ -380,6 +380,7 @@ def _tick(
 
     try:
         with _preflight_control(directory, deployed.name):
+            ledger.complete_landed_resume_intent()
             ledger.require_ready_for_tick(state, approval_required=spec.approval_required)
     except PaperReconciliationRequired:
         ledger.halt("approval journal requires reconciliation")
@@ -604,6 +605,7 @@ def _redo(
                 raise FundHalted(f"{deployed.name} is halted")
             if deployed.spec.approval_required:
                 _verified_redo_approval(ledger, before, superseded)
+            ledger.complete_landed_resume_intent()
             ledger.require_ready_for_work(state, approval_required=deployed.spec.approval_required, allow_tick_intents=True)
             redo_id = ledger.begin_redo(
                 superseded,

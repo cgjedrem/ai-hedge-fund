@@ -1,9 +1,16 @@
+import importlib
+
+import pytest
+
+from hedge_fund.backtesting.test_fund import FakeDataClient, SERIES
 from hedge_fund.brokers.models import Order
 from hedge_fund.brokers.paper import PaperBroker
+from hedge_fund.paper import NothingDue
 from hedge_fund.paper.deployed import load_deployed
 from hedge_fund.paper.ledger import Ledger
 
 _DECISION = "confirm-paper-book-matches-ledger"
+paper_tick_module = importlib.import_module("hedge_fund.paper.tick")
 
 
 def _failed_web_tick(write_client, demo_root):
@@ -134,6 +141,123 @@ def test_web_resume_retries_after_control_clear_before_completion(write_client, 
     assert retried.json()["halted"] is False
     assert clear_writes == [False]
     assert len([event for event in ledger.events() if event["kind"] == "resume_completed"]) == 1
+    assert ledger.unresolved_recovery_state().required is False
+
+
+def test_tick_attempt_completes_landed_resume_before_readiness_gate(write_client, demo_root, monkeypatch):
+    client, ledger = _failed_web_tick(write_client, demo_root)
+    headers = write_client[1]
+    preview = client.get(
+        "/api/paper/demo-quality/reconciliation",
+        headers={"host": "127.0.0.1"},
+    ).json()["preview"]
+    request = {
+        "request_id": "resume-tick-between-crash-and-retry",
+        "failure_id": preview["failure_id"],
+        "preview_digest": preview["preview_digest"],
+        "decision": _DECISION,
+    }
+    original_log_event = Ledger.log_event
+    original_write_control = Ledger._write_control
+    failed_completion = []
+    clear_writes = []
+
+    def interrupt_before_completion(self, kind, **fields):
+        if kind == "resume_completed" and fields.get("request_id") == request["request_id"] and not failed_completion:
+            failed_completion.append(True)
+            raise OSError("synthetic crash before Resume completion")
+        return original_log_event(self, kind, **fields)
+
+    def observe_clear_write(self, halted, reason, **kwargs):
+        if halted is False:
+            clear_writes.append(halted)
+        return original_write_control(self, halted, reason, **kwargs)
+
+    monkeypatch.setattr(Ledger, "log_event", interrupt_before_completion)
+    monkeypatch.setattr(Ledger, "_write_control", observe_clear_write)
+    first = client.post(
+        "/api/paper/demo-quality/resume",
+        headers=headers,
+        json=request,
+    )
+    assert first.status_code == 423
+    assert first.json()["code"] == "reconciliation-required"
+    assert ledger.halted() is None
+    assert len(ledger.unresolved_recovery_state().resume_intents) == 1
+
+    monkeypatch.setattr(paper_tick_module, "next_session", lambda *_args, **_kwargs: None)
+    service = client.app.state.service
+    with service._paper_manual_lane("demo-quality"):
+        with pytest.raises(NothingDue):
+            paper_tick_module.tick(
+                demo_root / "paper" / "demo-quality",
+                FakeDataClient(SERIES),
+            )
+
+    retried = client.post(
+        "/api/paper/demo-quality/resume",
+        headers=headers,
+        json={"request_id": request["request_id"]},
+    )
+    assert retried.status_code == 200
+    assert retried.json()["halted"] is False
+    assert ledger.halted() is None
+    assert clear_writes == [False]
+    assert len([event for event in ledger.events() if event["kind"] == "resume_completed"]) == 1
+    assert ledger.unresolved_recovery_state().required is False
+
+
+def test_web_reconciliation_exposes_landed_resume_identity_after_reload(write_client, demo_root, monkeypatch):
+    client, ledger = _failed_web_tick(write_client, demo_root)
+    headers = write_client[1]
+    preview = client.get(
+        "/api/paper/demo-quality/reconciliation",
+        headers={"host": "127.0.0.1"},
+    ).json()["preview"]
+    request = {
+        "request_id": "resume-journal-discovered",
+        "failure_id": preview["failure_id"],
+        "preview_digest": preview["preview_digest"],
+        "decision": _DECISION,
+    }
+    original_log_event = Ledger.log_event
+    failed_completion = []
+
+    def interrupt_before_completion(self, kind, **fields):
+        if kind == "resume_completed" and fields.get("request_id") == request["request_id"] and not failed_completion:
+            failed_completion.append(True)
+            raise OSError("synthetic crash before Resume completion")
+        return original_log_event(self, kind, **fields)
+
+    monkeypatch.setattr(Ledger, "log_event", interrupt_before_completion)
+    first = client.post(
+        "/api/paper/demo-quality/resume",
+        headers=headers,
+        json=request,
+    )
+    assert first.status_code == 423
+    assert ledger.halted() is None
+
+    recovered = client.get(
+        "/api/paper/demo-quality/reconciliation",
+        headers={"host": "127.0.0.1"},
+    )
+    assert recovered.status_code == 200
+    recovery = recovered.json()
+    assert recovery["halted"] is None
+    assert recovery["resume_allowed"] is True
+    assert recovery["resume_completion_required"] is True
+    assert recovery["resume_request_id"] == request["request_id"]
+    intent = ledger.unresolved_recovery_state().resume_intents[0]
+    assert recovery["resume_request_id"] == intent["request_id"]
+
+    retried = client.post(
+        "/api/paper/demo-quality/resume",
+        headers=headers,
+        json={"request_id": recovery["resume_request_id"]},
+    )
+    assert retried.status_code == 200
+    assert retried.json()["halted"] is False
     assert ledger.unresolved_recovery_state().required is False
 
 

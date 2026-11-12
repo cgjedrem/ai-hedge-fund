@@ -382,6 +382,7 @@ def _runner_loop(
                         status["reason"] = "fund-halted"
                         break
                     try:
+                        ledger.complete_landed_resume_intent()
                         ledger.require_ready_for_work(state, approval_required=spec.approval_required, allow_tick_intents=True)
                     except PaperReconciliationRequired:
                         ledger.halt("approval journal requires reconciliation")

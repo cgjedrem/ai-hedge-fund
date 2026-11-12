@@ -1346,6 +1346,7 @@ def _run_cli_tick(
                 halted = ledger.halted()
                 if halted is not None:
                     raise FundHalted(f"{name} is halted: {halted}")
+                ledger.complete_landed_resume_intent()
                 if again:
                     ledger.require_ready_for_work(state, approval_required=deployed.spec.approval_required, allow_tick_intents=True)
                 else:

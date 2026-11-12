@@ -835,6 +835,7 @@ class DeskService:
             intent_targets = tick_intent_reconciliation_targets(ledger)
             halted = ledger.halted()
             unresolved_state = ledger.unresolved_recovery_state()
+            landed_resume = ledger.landed_resume_intent()
         except PaperReconciliationRequired:
             raise ServiceError(423, "Paper work requires reconciliation before it can continue.", code="reconciliation-required") from None
         except (LedgerError, OSError, ValueError):
@@ -844,11 +845,16 @@ class DeskService:
         has_pending_failure = bool(unresolved_state.failures)
         failure_review_allowed = has_pending_failure and preview.required and preview.recoverable
         no_failure_review_required = not has_pending_failure and not preview.required
-        resume_allowed = halted is not None and not unresolved_state.tick_intents and not unresolved_state.resume_intents and not unresolved_state.approval_consumptions and (failure_review_allowed or no_failure_review_required)
+        resume_completion_required = landed_resume is not None and len(unresolved_state.resume_intents) == 1
+        resume_completion_allowed = resume_completion_required and not unresolved_state.failures and not unresolved_state.tick_intents and not unresolved_state.approval_consumptions
+        normal_resume_allowed = halted is not None and not unresolved_state.tick_intents and not unresolved_state.resume_intents and not unresolved_state.approval_consumptions and (failure_review_allowed or no_failure_review_required)
+        resume_allowed = resume_completion_allowed or normal_resume_allowed
         return {
             "name": normalized,
             "halted": halted,
             "resume_allowed": resume_allowed,
+            "resume_completion_required": resume_completion_required,
+            "resume_request_id": landed_resume.get("request_id") if landed_resume is not None else None,
             "preview": preview.model_dump(mode="json"),
             "intent_preview": intent_preview.model_dump(mode="json"),
             "intent_targets": intent_targets,
@@ -3860,6 +3866,37 @@ class DeskService:
             with self._paper_control_lane(normalized):
                 directory, deployed, ledger = self._paper_control_state(normalized)
                 if request is not None:
+                    if request.failure_id is None:
+                        try:
+                            landed_resume = ledger.landed_resume_intent()
+                            completion = None
+                            if landed_resume is not None and (landed_resume.get("request_id") is None or landed_resume.get("request_id") == request.request_id):
+                                completion = ledger.complete_landed_resume_intent(request_id=landed_resume.get("request_id"))
+                            if completion is None:
+                                completion = ledger.resume_completion_result(request.request_id)
+                        except PaperRequestConflict:
+                            raise ServiceError(
+                                409,
+                                "Request ID was already used for a different Resume request.",
+                                code="request-conflict",
+                                request_id=request.request_id,
+                            ) from None
+                        except PaperReconciliationRequired:
+                            raise ServiceError(
+                                423,
+                                "Resume request outcome is uncertain; inspect paper state before further action.",
+                                code="reconciliation-required",
+                                request_id=request.request_id,
+                            ) from None
+                        except LedgerError:
+                            raise ServiceError(
+                                423,
+                                "Resume request history is unavailable.",
+                                code="reconciliation-required",
+                                request_id=request.request_id,
+                            ) from None
+                        if completion is not None:
+                            return completion
                     try:
                         previous = ledger.resume_request_result(
                             request.request_id,
@@ -4190,6 +4227,7 @@ class DeskService:
                 if ledger.halted() is not None:
                     raise ServiceError(423, "Halted funds cannot accept a paper operation.", code="halted")
                 try:
+                    ledger.complete_landed_resume_intent()
                     ledger.require_ready_for_tick(state, approval_required=deployed.spec.approval_required)
                 except UnresolvedTickIntentRefusal as exc:
                     raise ServiceError(

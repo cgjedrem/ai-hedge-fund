@@ -1207,38 +1207,101 @@ class Ledger:
             },
         )
 
-    def _complete_landed_resume_intent(self, request_id: str, request_digest: str) -> dict[str, object] | None:
+    def landed_resume_intent(self) -> dict[str, object] | None:
         if not self.control_path.exists() or self.halted() is not None:
             return None
-        events = self.events()
-        matches = [event for event in events if isinstance(event, dict) and event.get("request_id") == request_id]
-        if not matches:
+        try:
+            events = self.events()
+        except (OSError, UnicodeError, ValueError):
             return None
-        if any(event.get("request_action") != "resume" or event.get("request_digest") != request_digest for event in matches):
-            raise PaperRequestConflict("request identity conflicts with durable control history")
-        resumes = [event for event in matches if event.get("kind") == "resume"]
-        effect_intents = [event for event in matches if event.get("kind") == "resume_effect_intent"]
-        if len(resumes) != 1 or len(effect_intents) != 1:
+        pending = [(index, event) for index, event in enumerate(events) if event.get("kind") == "resume_effect_intent" and not _resume_effect_has_completion(events, index)]
+        if len(pending) != 1 or pending[0][0] != len(events) - 1:
             return None
-        resume_event = resumes[0]
-        effect = effect_intents[0]
+        effect_index, effect = pending[0]
         identity_fields = ("head_hash", "by", "reconciliation_id", "request_id", "request_action", "request_digest")
-        if any(effect.get(field) != resume_event.get(field) for field in identity_fields):
-            raise PaperReconciliationRequired("Resume control-write intent conflicts with its request; reconciliation is required")
-        effect_index = next(index for index, event in enumerate(events) if event is effect)
-        if effect_index != len(events) - 1:
-            raise PaperReconciliationRequired("Resume control-write intent is no longer the latest event; reconciliation is required")
+        resume_events = [event for event in events[:effect_index] if event.get("kind") == "resume" and all(event.get(field) == effect.get(field) for field in identity_fields)]
+        if len(resume_events) != 1:
+            return None
+        operator = effect.get("by")
+        head_hash = effect.get("head_hash")
         reconciliation_id = effect.get("reconciliation_id")
-        if reconciliation_id is not None and not isinstance(reconciliation_id, str):
-            raise PaperReconciliationRequired("Resume control-write intent has an invalid reconciliation identity; reconciliation is required")
+        if not isinstance(operator, str) or operator not in {"cli", "tui", "web"}:
+            return None
+        if head_hash is not None and (not isinstance(head_hash, str) or _HASH.fullmatch(head_hash) is None):
+            return None
+        if reconciliation_id is not None and (not isinstance(reconciliation_id, str) or _HASH.fullmatch(reconciliation_id) is None):
+            return None
+        request_id = effect.get("request_id")
+        if request_id is None:
+            if "request_action" in effect or "request_digest" in effect:
+                return None
+        else:
+            try:
+                _validate_request_id(request_id)
+            except ValueError:
+                return None
+            if effect.get("request_action") != "resume" or not isinstance(effect.get("request_digest"), str) or _HASH.fullmatch(effect["request_digest"]) is None:
+                return None
+        return dict(effect)
+
+    def complete_landed_resume_intent(
+        self,
+        request_id: str | None = None,
+        *,
+        request_digest: str | None = None,
+    ) -> dict[str, object] | None:
+        if request_id is not None:
+            _validate_request_id(request_id)
+        if request_digest is not None and (not isinstance(request_digest, str) or _HASH.fullmatch(request_digest) is None):
+            raise ValueError("Resume request digest is invalid.")
+        self._require_write_lanes(_CONTROL_LANES)
+        effect = self.landed_resume_intent()
+        if effect is None or (request_id is not None and effect.get("request_id") != request_id):
+            return None
+        if request_digest is not None and effect.get("request_digest") != request_digest:
+            raise PaperRequestConflict("request identity conflicts with durable control history")
+        identity_fields = ("head_hash", "by", "reconciliation_id", "request_id", "request_action", "request_digest")
         result = {
             "name": self.directory.name,
             "halted": False,
-            "reconciliation_id": reconciliation_id,
+            "reconciliation_id": effect.get("reconciliation_id"),
         }
         fields = {field: effect[field] for field in identity_fields if field in effect}
         self.log_event("resume_completed", **fields, result=result, durable=True)
         return result
+
+    def resume_completion_result(self, request_id: str) -> dict[str, object] | None:
+        _validate_request_id(request_id)
+        events = self.events()
+        matches = [event for event in events if event.get("request_id") == request_id]
+        if not matches:
+            return None
+        if any(event.get("request_action") != "resume" for event in matches):
+            return None
+        effect_intents = [event for event in matches if event.get("kind") == "resume_effect_intent"]
+        completions = [event for event in matches if event.get("kind") == "resume_completed"]
+        if not effect_intents or not completions:
+            return None
+        if len(effect_intents) != 1 or len(completions) != 1:
+            raise PaperReconciliationRequired("Resume request history is ambiguous; reconciliation is required")
+        effect = effect_intents[0]
+        identity_fields = ("request_id", "request_digest", "head_hash", "by", "reconciliation_id")
+        if not isinstance(effect.get("request_digest"), str) or _HASH.fullmatch(effect["request_digest"]) is None:
+            raise PaperReconciliationRequired("Resume request identity is invalid; reconciliation is required")
+        if any(event.get("request_digest") != effect["request_digest"] for event in matches):
+            raise PaperRequestConflict("request identity conflicts with durable control history")
+        effect_index = events.index(effect)
+        resume_events = [event for event in events[:effect_index] if event.get("kind") == "resume" and all(event.get(field) == effect.get(field) for field in identity_fields)]
+        matching_completions = [event for event in events[effect_index + 1 :] if event.get("kind") == "resume_completed" and all(event.get(field) == effect.get(field) for field in identity_fields)]
+        if len(resume_events) != 1 or len(matching_completions) != 1 or not _resume_effect_has_completion(events, effect_index):
+            raise PaperReconciliationRequired("Resume completion conflicts with its request; reconciliation is required")
+        result = matching_completions[0].get("result")
+        if not isinstance(result, dict) or set(result) != {"name", "halted", "reconciliation_id"} or result.get("name") != self.directory.name or result.get("halted") is not False or (result.get("reconciliation_id") is not None and not isinstance(result.get("reconciliation_id"), str)):
+            raise PaperReconciliationRequired("Resume request result is invalid; reconciliation is required")
+        return result
+
+    def _complete_landed_resume_intent(self, request_id: str, request_digest: str) -> dict[str, object] | None:
+        return self.complete_landed_resume_intent(request_id, request_digest=request_digest)
 
     def resume(
         self,
@@ -1313,6 +1376,10 @@ class Ledger:
                     completed = self._complete_landed_resume_intent(request_id, request_digest)
                     if completed is not None:
                         return completed["reconciliation_id"]
+            else:
+                completed = self.complete_landed_resume_intent()
+                if completed is not None:
+                    return completed["reconciliation_id"]
             halted = self.halted()
             state = self.replay(capital, full=True)
             self._require_ready_for_work_state(

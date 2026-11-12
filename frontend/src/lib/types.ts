@@ -368,6 +368,8 @@ export interface PaperReconciliation {
   name: string;
   halted: string | null;
   resume_allowed: boolean;
+  resume_completion_required?: boolean;
+  resume_request_id?: string | null;
   preview: PaperReconciliationPreview;
   intent_preview: PaperTickIntentReconciliationPreview;
   intent_targets: PaperTickIntentReconciliationTarget[];

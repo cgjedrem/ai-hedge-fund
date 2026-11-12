@@ -848,6 +848,58 @@ it("reuses a manual Resume request ID after a lost response", async () => {
   expect(await screen.findByText("Halt cleared. No paper operation ran and no runner was started.")).toBeInTheDocument();
 });
 
+it("completes a landed Resume after reload using identity from the journal-backed recovery snapshot", async () => {
+  const user = userEvent.setup();
+  const requestId = "resume-id-from-journal";
+  const snapshot = {
+    ...paperSnapshot(stoppedRunner),
+    halt_state: "clear",
+    ledger: { ok: false, error: "Paper work is in progress or requires reconciliation." },
+    recovery_state: "reconciliation_required",
+  } as PaperSnapshot & { recovery_state: "reconciliation_required" };
+  const preview = paperReconciliationPreview({
+    required: false,
+    reason: "no-ambiguous-tick-failure",
+    failure_id: null,
+    failed_request_id: null,
+    operation_id: null,
+    expected_head: null,
+    current_head: null,
+    broker_book_sha256: null,
+    capture_id: null,
+    capture_digest: null,
+    book_matches_ledger: false,
+    head_matches_failure: false,
+    preview_digest: null,
+  });
+  const calls = renderDesk(stoppedRunner, {
+    [`GET /api/paper/${FUND}`]: () => json(snapshot),
+    [`GET /api/paper/${FUND}/reconciliation`]: () => json({
+      name: FUND,
+      halted: null,
+      resume_allowed: true,
+      resume_completion_required: true,
+      resume_request_id: requestId,
+      preview,
+    }),
+    [`POST /api/paper/${FUND}/resume`]: () => json({
+      name: FUND,
+      halted: false,
+      reconciliation_id: null,
+    }),
+  });
+
+  expect(await screen.findByText(/Resume control write already landed/)).toBeInTheDocument();
+  await user.click(await enabledButton("Complete Resume"));
+  const dialog = await screen.findByRole("dialog", { name: "Complete Resume" });
+  await user.click(within(dialog).getByRole("button", { name: "Complete Resume" }));
+
+  await waitFor(() => expect(mutations(calls)).toHaveLength(1));
+  expect(mutations(calls)[0].path).toBe(`/api/paper/${FUND}/resume`);
+  expect(mutations(calls)[0].body).toEqual({ request_id: requestId });
+  expect(await screen.findByText("Resume completion recorded. No control write or paper operation was repeated.")).toBeInTheDocument();
+});
+
 it("keeps resume disabled when local reconciliation is not recoverable", async () => {
   const preview = paperReconciliationPreview({
     recoverable: false,
