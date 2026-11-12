@@ -116,10 +116,10 @@
 
 - [x] T021 [P] Cadence regression subset (`pytest hedge_fund/paper/test_tick.py -q -k "weekly or daily or session"`) — 16 passed, 113 deselected (FR-007)
 - [x] T022 [P] PR #11 writer-safety regression subset (`pytest hedge_fund/paper/test_ledger.py hedge_fund/paper/test_tick.py -q`) — 216 passed. T012's default work gate initially blocked existing redo supersession; redo now admits outstanding tick intents while retaining the other recovery blockers.
-- [ ] T023 Full targeted slice green: `poetry run pytest hedge_fund/paper/test_ledger.py hedge_fund/paper/test_tick.py hedge_fund/runtime/test_reconciliation.py hedge_fund/runtime/test_writer_map.py hedge_fund/web/test_recovery.py -q` (+ frontend jest if paper.tsx touched) — FAIL: writer-map scan found five callsites in unchanged modules; details in implementation-evidence.md.
+- [ ] T023 Full targeted slice green: `poetry run pytest hedge_fund/paper/test_ledger.py hedge_fund/paper/test_tick.py hedge_fund/runtime/test_reconciliation.py hedge_fund/runtime/test_writer_map.py hedge_fund/web/test_recovery.py -q` (+ frontend jest if paper.tsx touched) — FAIL: writer-map scan found five callsites in unchanged modules; verified pre-existing baseline failure on `448056f` (files and test unchanged on branch; reproduced on base). Disposition: individually-evidenced baseline defect per Principle III, handoff recorded; not repaired by this branch (out of scope).
 - [x] T024 Style gate: black --check, isort --check, flake8 on changed files (line-length 420) — PASS with E203 compatibility ignore; bare flake8 reports two unchanged E203 lines.
 - [x] T025 Complete specs/007-rb3-halt-recovery/implementation-evidence.md: per-task results, exact commands, durations, platform, fixture provenance (evidence contract)
-- [ ] T026 Isolated full suite `poetry run pytest hedge_fund -q` (~40 min, alone); record any failure vs pre-change baseline per Principle III; BLOCKED/INCONCLUSIVE is not PASS
+- [x] T026 Isolated full suite `poetry run pytest hedge_fund -q` (~40 min, alone); record any failure vs pre-change baseline per Principle III; BLOCKED/INCONCLUSIVE is not PASS — final run on `8d81ace`: 2856 passed / 108 failed / 66 skipped in 2617s; 108/108 failures ID-identical to baseline `448056f` reproduction (zero branch-attributable failures); details in implementation-evidence.md.
 
 ---
 
