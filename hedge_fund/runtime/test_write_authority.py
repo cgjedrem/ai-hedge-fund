@@ -890,10 +890,16 @@ def test_relocation_refuses_unknown_owners_and_interrupted_writes(tmp_path, muta
     target_path = tmp_path / "native"
     target_path.mkdir()
     with RootContext.open(source_path) as source, RootContext.open(target_path) as target:
-        with pytest.raises(HandoverError, match=message):
-            inspect_relocation_source(source)
-        with pytest.raises(HandoverError, match=message):
-            relocate_existing(target, source=source, expected_content_digest="0" * 64)
+        if message == "runner.pid":
+            described = inspect_relocation_source(source)
+            assert any(item["kind"] == "stale-marker-retirement" for item in described["blockers"])
+            with pytest.raises(HandoverError, match="source blockers"):
+                relocate_existing(target, source=source, expected_content_digest=described["content_digest"])
+        else:
+            with pytest.raises(HandoverError, match=message):
+                inspect_relocation_source(source)
+            with pytest.raises(HandoverError, match=message):
+                relocate_existing(target, source=source, expected_content_digest="0" * 64)
     assert list(target_path.iterdir()) == []
 
 

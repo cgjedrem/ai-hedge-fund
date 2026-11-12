@@ -510,6 +510,7 @@ def test_paper_writer_remediation_covers_invalid_trust_and_unavailable_runtime(
 
 def test_handover_cli_relocates_legacy_root_without_writing_source(tmp_path, monkeypatch, capsys):
     from hedge_fund.paper.deployed import deploy
+    from hedge_fund.runtime.handover import SOURCE_EVIDENCE_PATH
 
     source = tmp_path / "legacy-source"
     (source / "paper").mkdir(parents=True)
@@ -518,12 +519,14 @@ def test_handover_cli_relocates_legacy_root_without_writing_source(tmp_path, mon
     before = {item.relative_to(source).as_posix(): (item.is_dir() or item.read_bytes()) for item in sorted(source.rglob("*"))}
     target = tmp_path / "native-target"
     target.mkdir()
+    evidence_stage = tmp_path / "evidence-stage"
+    evidence_stage.mkdir()
     forbidden = Mock(side_effect=AssertionError("offline handover initialized the engine"))
     monkeypatch.setattr(run, "_load_runtime", forbidden)
     monkeypatch.setattr(paths, "load_root_dotenv", forbidden)
 
     monkeypatch.setattr(run, "PAPER_DIR", source / "paper")
-    _main(monkeypatch, "handover", "inspect-source")
+    _main(monkeypatch, "handover", "inspect-source", "--evidence-out", str(evidence_stage / SOURCE_EVIDENCE_PATH))
     described = json.loads(capsys.readouterr().out)
     assert described["funds"] == 1
 
@@ -538,6 +541,41 @@ def test_handover_cli_relocates_legacy_root_without_writing_source(tmp_path, mon
     with pytest.raises(SystemExit) as again:
         _main(monkeypatch, "handover", "relocate-from", str(source), "--content-digest", described["content_digest"])
     assert again.value.code == 2
+
+
+def test_handover_cli_runs_copy_then_finalize_with_staged_evidence(tmp_path, monkeypatch, capsys):
+    from hedge_fund.paper.deployed import deploy
+    from hedge_fund.runtime.handover import HANDOVER_PATH, SOURCE_EVIDENCE_PATH
+
+    source = tmp_path / "legacy-source"
+    (source / "paper").mkdir(parents=True)
+    deploy("alpha", FundSpec(schema_version=2, name="alpha", strategies=[custom_strategy(["buffett"])], risk={"max_position_pct": 0.25, "max_gross_exposure": 1}), ["AAPL"], root=source / "paper")
+    (source / "mandates").mkdir()
+    (source / "mandates" / "alpha.yaml").write_text("name: alpha\n", encoding="utf-8")
+    before = {item.relative_to(source).as_posix(): (item.is_dir() or item.read_bytes()) for item in sorted(source.rglob("*"))}
+    target = tmp_path / "native-target"
+    target.mkdir()
+    forbidden = Mock(side_effect=AssertionError("offline handover initialized the engine"))
+    monkeypatch.setattr(run, "_load_runtime", forbidden)
+    monkeypatch.setattr(paths, "load_root_dotenv", forbidden)
+
+    monkeypatch.setattr(run, "PAPER_DIR", source / "paper")
+    evidence_out = target / SOURCE_EVIDENCE_PATH
+    _main(monkeypatch, "handover", "inspect-source", "--evidence-out", str(evidence_out))
+    described = json.loads(capsys.readouterr().out)
+
+    monkeypatch.setattr(run, "PAPER_DIR", target / "paper")
+    _main(monkeypatch, "handover", "relocate-copy", str(source), "--content-digest", described["content_digest"])
+    copied = json.loads(capsys.readouterr().out)
+    assert copied["state"] == "copied"
+    assert not (target / HANDOVER_PATH).exists()
+
+    _main(monkeypatch, "handover", "relocate-finalize")
+    finalized = json.loads(capsys.readouterr().out)
+    assert finalized["state"] == "enrolled"
+    assert finalized["mode"] == "relocated"
+    assert before == {item.relative_to(source).as_posix(): (item.is_dir() or item.read_bytes()) for item in sorted(source.rglob("*"))}
+    assert forbidden.call_count == 0
 
 
 def test_cli_paper_writer_denies_attested_migration_as_ownership_unknown(tmp_path, monkeypatch):
