@@ -123,6 +123,7 @@ WRITER_INVENTORY: dict[tuple[str, str, str], tuple[int, str]] = {
     ("runtime/handover.py", "_write_record", "write_bytes"): (1, BOOTSTRAP),
     ("runtime/handover.py", "_write_stale_recovery_record", "write_bytes"): (1, BOOTSTRAP),
     ("runtime/handover.py", "_write_private_json", "write_bytes"): (1, BOOTSTRAP),
+    ("runtime/handover.py", "_write_attestation_artifact", "mkdir"): (1, BOOTSTRAP),
     ("runtime/handover.py", "PaperInventoryTransition.mkdir", "mkdir"): (2, PAPER_LANES),
     ("runtime/handover.py", "PaperInventoryTransition.rename_file", "rename_file"): (1, PAPER_LANES),
     ("runtime/handover.py", "PaperInventoryTransition.write_bytes", "write_bytes"): (1, PAPER_LANES),

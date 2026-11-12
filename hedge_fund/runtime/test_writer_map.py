@@ -187,6 +187,12 @@ WRITER_MAP: dict[tuple[str, str, str], Writer] = {
         ("hedge_fund/runtime/test_write_authority.py::test_existing_root_needs_fresh_root_bound_trust_ack_and_revocation_is_fail_closed",),
         "root-private trust records require offline RootMigrationLease admission",
     ),
+    ("hedge_fund.runtime.handover", "_write_attestation_artifact", "mkdir"): Writer(
+        BOOTSTRAP,
+        "denial",
+        ("hedge_fund/runtime/test_handover.py::test_attestation_artifact_storage_is_root_private_and_refuses_overwrite",),
+        "destination-only attestation path after private-storage verification",
+    ),
     ("hedge_fund.runtime.handover", "_remove_single_writer_challenge", "unlink_file"): Writer(
         BOOTSTRAP,
         "denial",
