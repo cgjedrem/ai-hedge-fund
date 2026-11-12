@@ -622,6 +622,59 @@ it("loads reviewed recovery when ledger replay is valid but readiness requires r
   expect(calls.some((call) => call.path === `/api/paper/${FUND}/reconciliation`)).toBe(true);
 });
 
+it("allows reviewed Resume when ledger readiness requires reconciliation", async () => {
+  const user = userEvent.setup();
+  const snapshot = {
+    ...paperSnapshot(stoppedRunner, true),
+    ledger: { ok: false, error: "Paper work is in progress or requires reconciliation." },
+    recovery_state: "reconciliation_required",
+  } as PaperSnapshot & { recovery_state: "reconciliation_required" };
+  const preview = paperReconciliationPreview();
+  const calls = renderDesk(stoppedRunner, {
+    [`GET /api/paper/${FUND}`]: () => json(snapshot),
+    [`GET /api/paper/${FUND}/reconciliation`]: () => json({
+      name: FUND,
+      halted: "synthetic tick failure",
+      resume_allowed: true,
+      preview,
+    }),
+    [`POST /api/paper/${FUND}/resume`]: () => json({
+      name: FUND,
+      halted: false,
+      reconciliation_id: "2".repeat(64),
+    }),
+  });
+
+  expect(await screen.findByText("Ambiguous tick failure")).toBeInTheDocument();
+  await user.click(await enabledButton("Review recovery"));
+  const dialog = await screen.findByRole("dialog", { name: "Reconcile and resume paper fund" });
+  await user.click(within(dialog).getByRole("button", { name: "Confirm recovery and resume" }));
+
+  await waitFor(() => expect(mutations(calls)).toHaveLength(1));
+  expect(mutations(calls)[0].path).toBe(`/api/paper/${FUND}/resume`);
+});
+
+it("keeps Resume disabled when ledger replay is corrupt", async () => {
+  const snapshot = {
+    ...paperSnapshot(stoppedRunner, true),
+    ledger: { ok: false, error: "Ledger verification failed (LedgerError)." },
+    recovery_state: "corrupt",
+  } as PaperSnapshot & { recovery_state: "corrupt" };
+  const calls = renderDesk(stoppedRunner, {
+    [`GET /api/paper/${FUND}`]: () => json(snapshot),
+    [`GET /api/paper/${FUND}/reconciliation`]: () => json({
+      name: FUND,
+      halted: "synthetic tick failure",
+      resume_allowed: true,
+      preview: paperReconciliationPreview(),
+    }),
+  });
+
+  expect(await screen.findByText("Paper state unavailable.")).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Resume" })).toBeDisabled();
+  expect(calls.some((call) => call.path === `/api/paper/${FUND}/reconciliation`)).toBe(false);
+});
+
 it("reviews hash-bound local reconciliation before resuming without retrying the failed tick", async () => {
   const user = userEvent.setup();
   const preview = paperReconciliationPreview();

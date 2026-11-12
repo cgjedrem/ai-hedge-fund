@@ -89,4 +89,13 @@
 | T025 | PASS | Evidence updated with per-task counts, commands, timestamps, dirty-diff identity, platform, artifact mapping, fixture provenance, and T023 limitation. |
 | T026 | NOT RUN by specialist | Isolated full suite reserved for coordinator as directed; no full `pytest hedge_fund` run. |
 
-US1 passed and was checkpointed in commit `a66b3ae0023643a838681e338c2cacf2f3b76b33`; US2 in `58a638841bb68a57992cdf8dc1972ae160c4d1aa`; US3 in `46110955a486f149afa38fda1ee39bc79114c306`. US4 targeted tests pass and the checkpoint is committed; see Git history for its revision. Overall targeted acceptance remains blocked by the T023 writer-map failure in unchanged modules; coordinator owns T026 and decision on that inherited gate.
+US1 passed and was checkpointed in commit `a66b3ae0023643a838681e338c2cacf2f3b76b33`; US2 in `58a638841bb68a57992cdf8dc1972ae160c4d1aa`; US3 in `46110955a486f149afa38fda1ee39bc79114c306`. US4 targeted tests pass and the checkpoint is committed; see Git history for its revision.
+
+## Final frontend gate correction after checkpoint review
+
+- Review found `canResumePaper` still denied Resume when `ledger.ok=false`, including valid-but-not-ready state with `recovery_state="reconciliation_required"` and service `resume_allowed=true`.
+- Test-first red against checkpoint `839435d91bcd51728c5286036f15ea4ed5505d27`: from `frontend`, `npm exec -- vitest run src/pages/paper.test.tsx`; started `14:04:49`; `26 passed, 1 failed in 88.97s`, exit `1`. The new regression found the reviewed Resume button disabled.
+- Final frontend code/test dirty diff against that checkpoint: SHA-256 `997a17f13f98771c82797e73384a1c51d03d5ab05f91cff3a0169b2edd64aadd`, `4,852` bytes; paths `frontend/src/pages/paper.tsx`, `frontend/src/pages/paper.test.tsx`.
+- Fix accepts either a valid ledger or `reconciliation_required` snapshot, still requiring service `resume_allowed`. Corrupt replay remains blocked and recovery fetch remains suppressed.
+- Final command from `frontend`: `npm exec -- vitest run src/pages/paper.test.tsx src/App.test.tsx src/pages/paper-session-days.test.tsx`; Vitest reported `3 passed` files, `87 passed` tests, `29.56s`, exit `0` (start `14:09:09`). `npm exec -- tsc --noEmit` exited `0`.
+- No Python source changed after T023. Overall targeted acceptance remains blocked by the T023 writer-map failure in unchanged modules; coordinator owns T026 and disposition of that gate.

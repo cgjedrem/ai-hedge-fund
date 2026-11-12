@@ -219,7 +219,13 @@ export function PaperDetailPage() {
   const approvalRequired = data?.spec.approval_required === true;
   const canWritePaper = canWrite && data?.broker === "paper";
   const canApprove = canWritePaper && approvalRequired && data?.halt_state === "clear" && data?.ledger.ok === true;
-  const canResumePaper = Boolean(canWritePaper && data?.halt_state === "halted" && data.ledger.ok && recovery?.resume_allowed === true);
+  const canResumePaper = Boolean(
+    canWritePaper
+    && data?.halt_state === "halted"
+    && data.recovery_state !== "corrupt"
+    && (data.ledger.ok || data.recovery_state === "reconciliation_required")
+    && recovery?.resume_allowed === true,
+  );
   const intentPreview = recovery?.intent_preview;
   const approvalConsumptionOnly = Boolean(intentPreview?.required && intentPreview.intent_digest === null && intentPreview.approval_journal_event_digests.length > 0);
   const intentTargets = recovery?.intent_targets ?? [];
@@ -936,7 +942,7 @@ export function PaperDetailPage() {
                       variant="secondary"
                       onClick={() => setConfirmAction("resume")}
                       disabled={!canResumePaper}
-                      title={!data.ledger.ok ? "Resume requires a valid, replayable ledger." : recovery?.preview.required && !recovery.resume_allowed ? "Current paper state is not reconcilable." : undefined}
+                      title={!data.ledger.ok && data.recovery_state !== "reconciliation_required" ? "Resume requires a valid, replayable ledger." : recovery?.preview.required && !recovery.resume_allowed ? "Current paper state is not reconcilable." : undefined}
                     >
                       <CirclePlay className="h-3.5 w-3.5" /> {recovery?.preview.required ? "Review recovery" : "Resume"}
                     </Button>
