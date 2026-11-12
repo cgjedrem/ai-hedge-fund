@@ -13,17 +13,9 @@ from textual.widgets import ContentSwitcher, Input, OptionList, Static
 from hedge_fund import paths
 from hedge_fund.data.sessions import NEW_YORK
 from hedge_fund.paper import deploy, Ledger, load_deployed
-from hedge_fund.tui import backtest, funds, paper, paper_view, report
+from hedge_fund.tui import backtest, builder, funds, paper, paper_view, report
 from hedge_fund.tui.app import HedgeFundApp
-from hedge_fund.tui.fixtures import (
-    executed_and_decided,
-    make_minute_spec,
-    make_pending,
-    make_quote,
-    make_session,
-    make_spec,
-    render,
-)
+from hedge_fund.tui.fixtures import executed_and_decided, make_minute_spec, make_pending, make_quote, make_session, make_spec, render
 
 
 @pytest.mark.parametrize("mode", ["long_only", "long_short", "dollar_neutral"])
@@ -51,8 +43,9 @@ def test_all_modes_can_be_backtested_and_paper_traded(mode, size):
     asyncio.run(scenario())
 
 
-def test_enrolled_root_displays_tui_write_denial_and_blocks_paper_controls(monkeypatch):
+def test_untrusted_enrolled_root_displays_tui_write_denial_and_blocks_paper_controls(monkeypatch):
     from hedge_fund.paper import runner as legacy_runner
+    from hedge_fund.runtime import handover
     from hedge_fund.runtime.admission import AdmissionCoordinator, RootOwnerLease
     from hedge_fund.runtime.handover import enroll_fresh, record_ledger_head
     from hedge_fund.runtime.root import RootContext
@@ -80,6 +73,7 @@ def test_enrolled_root_displays_tui_write_denial_and_blocks_paper_controls(monke
             with admission.manual_session("alpha", timeout=0):
                 ledger.append(make_session("2025-01-20", decision=pending))
             record_ledger_head(context, "alpha", admission=admission)
+            monkeypatch.setattr(handover, "out_of_band_exclusion_basis", lambda _root: None)
             before_files = {path.relative_to(root).as_posix(): path.read_bytes() for path in root.rglob("*") if path.is_file() and "runtime/private" not in path.relative_to(root).as_posix()}
 
             async def scenario():
@@ -89,7 +83,7 @@ def test_enrolled_root_displays_tui_write_denial_and_blocks_paper_controls(monke
                     screen = app.screen
                     detail = render(screen.query_one("#detail-body", Static).content)
                     assert "WRITE UNAVAILABLE" in detail
-                    assert "enrolled roots" in detail
+                    assert "trust-single-writer" in detail
 
                     screen.action_run()
                     assert app.screen is screen
@@ -109,13 +103,13 @@ def test_enrolled_root_displays_tui_write_denial_and_blocks_paper_controls(monke
                         if app.screen._phase == "failed":
                             break
                     assert app.screen._phase == "failed"
-                    assert "TUI paper writes are disabled on enrolled roots" in render(app.screen.query_one("#run-phase", Static).content)
+                    assert "trust-single-writer" in render(app.screen.query_one("#run-phase", Static).content)
 
-                    await app.push_screen(paper.BuilderScreen(mode="paper"))
+                    await app.push_screen(builder.BuilderScreen(mode="paper"))
                     app.screen._finish_build()
 
             asyncio.run(scenario())
-            with pytest.raises(RuntimeError, match="TUI paper writes are disabled"):
+            with pytest.raises(RuntimeError, match="trust-single-writer"):
                 funds.wipe_fund("alpha")
 
             after_files = {path.relative_to(root).as_posix(): path.read_bytes() for path in root.rglob("*") if path.is_file() and "runtime/private" not in path.relative_to(root).as_posix()}
@@ -146,7 +140,7 @@ def test_tui_delete_denies_orphaned_admission_state_without_side_effects(tmp_pat
         with paths.bound_root(context):
             with pytest.raises(
                 RuntimeError,
-                match="root enrollment or ledger inventory is unavailable",
+                match="root enrollment or ledger inventory",
             ):
                 funds.wipe_fund("alpha")
 
@@ -154,15 +148,16 @@ def test_tui_delete_denies_orphaned_admission_state_without_side_effects(tmp_pat
         assert paper_record.read_text(encoding="utf-8") == "synthetic-ledger\n"
 
 
-def test_paper_screen_denies_approval_verdicts_from_y_and_n(monkeypatch):
-    """Approval verdicts write the ledger's approval lane, which the TUI never
-    holds: y and n are offered for a pending gated decision but denied."""
+def test_paper_screen_requires_admitted_root_for_approval_verdicts(monkeypatch):
+    """Unrooted test paper cannot bypass TUI root admission."""
     spec = make_spec(["pead"], "alpha").model_copy(update={"approval_required": True})
     directory = deploy("alpha", spec, ["TEST"], root=paths.PAPER_DIR)
     ledger = Ledger(directory)
     pending = make_pending("2025-01-20")
     ledger.append(make_session("2025-01-20", decision=pending))
     state = ledger.replay(spec.capital)
+    denial = paper.paper_write_denial()
+    assert denial is not None
 
     async def scenario():
         app = HedgeFundApp()
@@ -179,7 +174,7 @@ def test_paper_screen_denies_approval_verdicts_from_y_and_n(monkeypatch):
             await pilot.pause()
             await pilot.press("n")
             await pilot.pause()
-            assert notified == ["TUI paper writes are disabled on enrolled roots; use the web desk.", "TUI paper writes are disabled on enrolled roots; use the web desk."]
+            assert notified == [denial, denial]
             assert ledger.approval() is None and ledger.events() == []
             assert ledger.replay(spec.capital).prev_hash == state.prev_hash
             assert "awaiting approval" in render(screen.query_one("#detail-body", Static).content)
@@ -273,6 +268,8 @@ def test_paper_screen_execution_denies_before_provider_or_ledger_effects(monkeyp
     ledger = Ledger(directory)
     before_records = ledger.records()
     before_events = ledger.events()
+    denial = paper.paper_write_denial()
+    assert denial is not None
     forbidden_client = Mock(side_effect=AssertionError("TUI execution reached provider setup"))
     monkeypatch.setattr(paper, "make_data_client", forbidden_client)
 
@@ -286,7 +283,7 @@ def test_paper_screen_execution_denies_before_provider_or_ledger_effects(monkeyp
             await pilot.press("enter")
             await pilot.pause()
             assert app.screen is screen
-            assert notified == ["TUI paper execution lacks operation-bound authorization. Use the explicit-root CLI or web desk."]
+            assert notified == [denial]
             run_screen = paper.RunSessionScreen(directory)
             await app.push_screen(run_screen)
             for _ in range(20):
@@ -294,7 +291,7 @@ def test_paper_screen_execution_denies_before_provider_or_ledger_effects(monkeyp
                 if run_screen._phase == "failed":
                     break
             assert run_screen._phase == "failed"
-            assert "TUI paper writes are disabled on enrolled roots; use the web desk." in render(run_screen.query_one("#run-phase", Static).content)
+            assert "paper/" in render(run_screen.query_one("#run-phase", Static).content)
             await pilot.pause()
 
     asyncio.run(scenario())
@@ -360,6 +357,8 @@ def test_paper_screen_works_the_kill_switch_and_sessions_reads_the_ledger(
     spec = make_spec(["pead"], "alpha")
     directory = deploy("alpha", spec, ["TEST"], root=paths.PAPER_DIR)
     ledger = Ledger(directory)
+    write_denial = paper.paper_write_denial()
+    assert write_denial is not None
 
     async def scenario():
         app = HedgeFundApp()
@@ -375,10 +374,10 @@ def test_paper_screen_works_the_kill_switch_and_sessions_reads_the_ledger(
 
             notified: list[str] = []
             monkeypatch.setattr(screen, "notify", lambda message, **_kwargs: notified.append(message))
-            await pilot.press("h")  # the kill switch writes the halt lane: denied in the TUI
+            await pilot.press("h")
             await pilot.pause()
             assert app.screen is screen
-            assert notified == ["TUI paper writes are disabled on enrolled roots; use the web desk."]
+            assert notified == [write_denial]
             assert ledger.halted() is None and ledger.events() == []
             # A halt recorded elsewhere (CLI or web desk) is shown on reload.
             ledger.halt(paper_view.APP_HALT)
@@ -392,9 +391,9 @@ def test_paper_screen_works_the_kill_switch_and_sessions_reads_the_ledger(
             await pilot.press("enter")  # halted funds do not run
             await pilot.pause()
             assert app.screen is screen
-            await pilot.press("r")  # resume is reconciliation-bound: denied, still halted
+            await pilot.press("r")
             await pilot.pause()
-            assert notified[-1] == "TUI paper writes are disabled on enrolled roots; use the web desk."
+            assert notified[-1] == write_denial
             assert ledger.halted() == paper_view.APP_HALT
             assert [e["kind"] for e in ledger.events()] == ["halt"]
 
@@ -431,13 +430,12 @@ def test_paper_screen_works_the_kill_switch_and_sessions_reads_the_ledger(
             await pilot.press("escape")
             assert app.screen is screen
 
-            # d would wipe ledger, book, definition and backtests: denied with no
-            # confirmation modal, and every file stays.
+            # Deletion stays unavailable.
             (paths.MANDATES_DIR / "alpha.yaml").write_text(yaml.safe_dump(spec.model_dump()))
             await pilot.press("d")
             await pilot.pause()
             assert app.screen is screen
-            assert notified[-1] == "TUI paper writes are disabled on enrolled roots; use the web desk."
+            assert notified[-1] == funds.mandate_delete_denial()
             assert directory.exists() and (paths.MANDATES_DIR / "alpha.yaml").exists()
             assert len(ledger.records()) == 2
             assert [menu.get_option_at_index(i).id for i in range(menu.option_count)] == ["paper:0", "build"]
@@ -446,10 +444,10 @@ def test_paper_screen_works_the_kill_switch_and_sessions_reads_the_ledger(
 
 
 def test_paper_screen_enter_on_a_minute_fund_reports_execution_unavailable(monkeypatch):
-    """Enter means one thing at every cadence. TUI execution lacks
-    operation-bound authorization, so a minute fund gets the same denial as a
-    daily one: no confirmation modal, no session board, no provider setup."""
+    """Unrooted seed funds cannot reach the admitted one-session path."""
     directory = deploy("fast", make_minute_spec(), ["TEST"], root=paths.PAPER_DIR)
+    denial = paper.paper_write_denial()
+    assert denial is not None
     for variable in ("FINANCIAL_DATASETS_API_KEY", "TYPESAFE_API_KEY"):
         monkeypatch.setenv(variable, "x")
     monkeypatch.setenv("HEDGE_FUND_LLM_MODEL", "jev-1.13.0")
@@ -468,7 +466,7 @@ def test_paper_screen_enter_on_a_minute_fund_reports_execution_unavailable(monke
             await pilot.press("enter")
             await pilot.pause()
             assert app.screen is screen
-            assert notified == ["TUI paper execution lacks operation-bound authorization. Use the explicit-root CLI or web desk."]
+            assert notified == [denial]
             assert started == [] and Ledger(directory).records() == []
 
     asyncio.run(scenario())
