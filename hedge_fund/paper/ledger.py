@@ -1212,7 +1212,7 @@ class Ledger:
             return None
         try:
             events = self.events()
-        except (OSError, UnicodeError, ValueError):
+        except (AuditObservationUnavailable, OSError, UnicodeError, ValueError):
             return None
         pending = [(index, event) for index, event in enumerate(events) if event.get("kind") == "resume_effect_intent" and not _resume_effect_has_completion(events, index)]
         if len(pending) != 1 or pending[0][0] != len(events) - 1:
