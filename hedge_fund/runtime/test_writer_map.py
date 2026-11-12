@@ -245,9 +245,6 @@ WRITER_MAP: dict[tuple[str, str, str], Writer] = {
     ("hedge_fund.runtime.root", "_posix_write_relative", "fdopen:wb"): Writer(PRIMITIVE, "primitive", ROOT_TESTS),
     ("hedge_fund.runtime.root", "_posix_write_relative", "replace"): Writer(PRIMITIVE, "primitive", ROOT_TESTS),
     ("hedge_fund.runtime.root", "_posix_write_relative", "unlink"): Writer(PRIMITIVE, "primitive", ROOT_TESTS),
-    # TUI destructive writer (always denied)
-    ("hedge_fund.tui.funds", "wipe_fund", "unlink"): Writer(DENIED, "denial", ("hedge_fund/tui/test_paper.py::test_tui_delete_denies_orphaned_admission_state_without_side_effects", "hedge_fund/tui/test_admission_regressions.py::test_mandate_library_delete_is_denied_and_keeps_every_file")),
-    ("hedge_fund.tui.funds", "wipe_fund", "rmtree"): Writer(DENIED, "denial", ("hedge_fund/tui/test_paper.py::test_tui_delete_denies_orphaned_admission_state_without_side_effects",)),
     # web
     ("hedge_fund.web.__main__", "main", "mkdir"): Writer(BOOTSTRAP, "none", (), "creates the explicit demo root before RootContext opens it; no enrolled data exists yet"),
     ("hedge_fund.web.demo", "seed_demo", "mkdir"): Writer(BOOTSTRAP, "none", (), "creates an empty synthetic demo root before enroll_fresh"),

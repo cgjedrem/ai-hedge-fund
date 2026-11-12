@@ -3,7 +3,7 @@ import asyncio
 from textual.widgets import ContentSwitcher, Input, OptionList, SelectionList
 
 from hedge_fund import paths
-from hedge_fund.tui import builder
+from hedge_fund.tui import builder, paper
 from hedge_fund.tui.app import HedgeFundApp
 
 
@@ -12,6 +12,8 @@ def test_builder_blocks_daily_saxo_and_denies_the_minute_saxo_build(monkeypatch)
     but the TUI holds no deployment admission, so the final step is denied and
     nothing is written."""
     notices: list[str] = []
+    write_denial = paper.paper_write_denial()
+    assert write_denial is not None
 
     async def scenario():
         app = HedgeFundApp()
@@ -61,7 +63,7 @@ def test_builder_blocks_daily_saxo_and_denies_the_minute_saxo_build(monkeypatch)
             await pilot.press("enter")
             await pilot.pause()
             assert screen.query_one("#panes", ContentSwitcher).current == "step-tickers"
-            assert notices == ["TUI paper writes are disabled on enrolled roots; use the web desk."]
+            assert notices == [write_denial]
             assert not (paths.PAPER_DIR / "saxo-choice").exists()
             assert not (paths.MANDATES_DIR / "saxo-choice.yaml").exists()
 

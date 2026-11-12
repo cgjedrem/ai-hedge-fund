@@ -39,13 +39,13 @@
 ### Tests for User Story 1
 
 - [X] T007 [P] [US1] trust-single-writer accepts valid Windows scope and denies tampered scope / stale challenge / inventory mismatch in hedge_fund/runtime/test_write_authority.py
-- [ ] T008 [P] [US1] TUI admitted-write tests: enrolled+trusted root write succeeds with held owner/lane and operation-bound authorization; unenrolled or untrusted root still denied in hedge_fund/tui/test_admission_regressions.py (extend)
+- [X] T008 [P] [US1] TUI admitted-write tests: enrolled+trusted root write succeeds with held owner/lane and operation-bound authorization; unenrolled or untrusted root still denied in hedge_fund/tui/test_admission_regressions.py (extend)
 
 ### Implementation for User Story 1
 
-- [ ] T009 [US1] Accept the Windows runtime scope in `trust-single-writer` ceremony (challenge, 15-min expiry, exclusive admission, inventory recheck) in hedge_fund/runtime/handover.py:431-565,641-686
-- [ ] T010 [US1] Convert the enrolled-root blanket rejections into admission checks (held owner/lane + valid trust required; operation-bound authorization) in hedge_fund/tui/funds.py:34-45 and hedge_fund/tui/paper.py:511-516 — no bypass path
-- [ ] T011 [US1] Second-participating-writer denial test: concurrent TUI/CLI write attempt on a trusted root denied or serialized in hedge_fund/tui/test_admission_regressions.py
+- [X] T009 [US1] Accept the Windows runtime scope in `trust-single-writer` ceremony (challenge, 15-min expiry, exclusive admission, inventory recheck) in hedge_fund/runtime/handover.py:431-565,641-686
+- [X] T010 [US1] Convert the enrolled-root blanket rejections into admission checks (held owner/lane + valid trust required; operation-bound authorization) in hedge_fund/tui/funds.py:34-45 and hedge_fund/tui/paper.py:511-516 — no bypass path
+- [X] T011 [US1] Second-participating-writer denial test: concurrent TUI/CLI write attempt on a trusted root denied or serialized in hedge_fund/tui/test_admission_regressions.py
 
 **Checkpoint**: Synthetic two-fund root end-to-end writable through the TUI; all denial paths green.
 
