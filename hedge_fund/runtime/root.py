@@ -33,7 +33,7 @@ class UnsupportedFilesystemError(RootPathError):
 
 PRIVATE_ROOT = "runtime/private/v1"
 _PROTECTED_RESOURCE_NAMES = frozenset({"umbrella", "watchtower", "watchtower-weekly"})
-_HANDOVER_RESOURCE_ACCESS: ContextVar[tuple[tuple[object, bool], ...]] = ContextVar("handover_resource_access", default=())
+_HANDOVER_RESOURCE_ACCESS: ContextVar[tuple[tuple[object, bool, bool], ...]] = ContextVar("handover_resource_access", default=())
 
 
 @dataclass(frozen=True)
@@ -275,12 +275,19 @@ def _relative_parts(value: str | os.PathLike[str], *, allow_protected: bool = Fa
 
 
 @contextmanager
-def _handover_resource_access(root: RootContext, *, allow_writes: bool = False) -> Iterator[None]:
+def _handover_resource_access(
+    root: RootContext,
+    *,
+    allow_writes: bool = False,
+    allow_unattested_protected_writes: bool = False,
+) -> Iterator[None]:
     if not isinstance(root, RootContext):
         raise TypeError("an explicit RootContext is required")
-    if type(allow_writes) is not bool:
-        raise TypeError("allow_writes must be a bool")
-    token = _HANDOVER_RESOURCE_ACCESS.set(_HANDOVER_RESOURCE_ACCESS.get() + ((root, allow_writes),))
+    if type(allow_writes) is not bool or type(allow_unattested_protected_writes) is not bool:
+        raise TypeError("handover access flags must be booleans")
+    if allow_unattested_protected_writes and not allow_writes:
+        raise ValueError("unattested protected writes require write access")
+    token = _HANDOVER_RESOURCE_ACCESS.set(_HANDOVER_RESOURCE_ACCESS.get() + ((root, allow_writes, allow_unattested_protected_writes),))
     try:
         yield
     finally:
@@ -684,13 +691,36 @@ class RootContext:
     def _path_parts(self, value: str | os.PathLike[str], *, write: bool = False) -> tuple[str, ...]:
         if type(write) is not bool:
             raise TypeError("write must be a bool")
-        access = next((allow_writes for root, allow_writes in reversed(_HANDOVER_RESOURCE_ACCESS.get()) if root is self), None)
-        if access is None or (write and not access):
-            return _relative_parts(value)
+        access = next(((allow_writes, allow_unattested) for root, allow_writes, allow_unattested in reversed(_HANDOVER_RESOURCE_ACCESS.get()) if root is self), None)
+        if access is None:
+            try:
+                return _relative_parts(value)
+            except RootPathError:
+                parts = _relative_parts(value, allow_protected=True)
+                if not self._is_exact_protected_path(parts):
+                    return _relative_parts(value)
+                if not self._protected_resource_authorized(parts[1]):
+                    raise RootPathError("protected path identity is not attested at this destination") from None
+                return parts
         parts = _relative_parts(value, allow_protected=True)
-        if len(parts) < 2 or parts[0].casefold() != "paper" or parts[1] not in _PROTECTED_RESOURCE_NAMES or any(_canonical_component_identity(part) in _PROTECTED_RESOURCE_NAMES for part in parts[2:]):
+        if not self._is_exact_protected_path(parts):
             return _relative_parts(value)
+        if write and not access[0]:
+            return _relative_parts(value)
+        if write and not access[1] and not self._protected_resource_authorized(parts[1]):
+            raise RootPathError("protected path identity is not attested at this destination")
         return parts
+
+    def _is_exact_protected_path(self, parts: tuple[str, ...]) -> bool:
+        return len(parts) >= 2 and parts[0] == "paper" and parts[1] in _PROTECTED_RESOURCE_NAMES and not any(_canonical_component_identity(part) in _PROTECTED_RESOURCE_NAMES for part in parts[2:])
+
+    def _protected_resource_authorized(self, name: str) -> bool:
+        try:
+            from hedge_fund.runtime.handover import protected_fund_is_authorized
+
+            return protected_fund_is_authorized(self, name)
+        except Exception:
+            return False
 
     def _require_open(self) -> None:
         self._require_owner_process()

@@ -2,6 +2,7 @@ import hashlib
 import json
 import os
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
@@ -9,10 +10,10 @@ from hedge_fund.fund import FundSpec
 from hedge_fund.paper.deployed import deploy
 from hedge_fund.pipeline.session import code_version
 from hedge_fund.runtime import handover
-from hedge_fund.runtime.admission import OwnershipUnknown, RootMigrationLease, RootOwnerLease, WriterConflict
+from hedge_fund.runtime.admission import AdmissionCoordinator, OwnershipUnknown, require_paper_write_lanes, RootMigrationLease, RootOwnerLease, WriterConflict
 from hedge_fund.runtime.handover import build_head_inventory, enroll_fresh, enrollment_status, EnrollmentInvalid, HANDOVER_PATH, HandoverError, inventory_digest, LedgerDrift, migrate_existing, OPERATOR_ATTESTATION, require_enrollment, root_binding, verify_ledger_head
 from hedge_fund.runtime.owned_runner import read_runner_record, runner_key, RUNNER_ROOT, write_runner_record
-from hedge_fund.runtime.ownership import process_identity
+from hedge_fund.runtime.ownership import process_identity, process_is_running, ProcessIdentityError
 from hedge_fund.runtime.root import PRIVATE_ROOT, RootContext, RootPathError
 
 
@@ -77,6 +78,46 @@ def _legacy_relocation_source(path, *, protected_fund=False, marker=None, settin
         settings_path.parent.mkdir(parents=True)
         settings_path.write_bytes(settings)
     return path
+
+
+def _write_protected_source_fund(root, name):
+    staging_name = f"staging-{name}"
+    spec_data = _spec().model_dump()
+    spec_data["name"] = staging_name
+    deploy(staging_name, FundSpec.model_validate(spec_data), ["AAPL"], root=root / "paper")
+    staging = root / "paper" / staging_name
+    protected = root / "paper" / name
+    staging.rename(protected)
+    fund_file = protected / "fund.yaml"
+    content = fund_file.read_text(encoding="utf-8").replace(f"name: {staging_name}", f"name: {name}", 1)
+    fund_file.write_text(content, encoding="utf-8")
+
+
+def _copied_destination(tmp_path, *, protected_fund=False, marker=None, settings=None):
+    source_path = _legacy_relocation_source(tmp_path / "source", protected_fund=protected_fund, marker=marker, settings=settings)
+    destination_path = tmp_path / "destination"
+    destination_path.mkdir()
+    with RootContext.open(source_path) as source:
+        source_review = handover.inspect_relocation_source(
+            source,
+            evidence_out=destination_path / handover.SOURCE_EVIDENCE_PATH,
+        )
+    with RootContext.open(source_path) as source, RootContext.open(destination_path) as destination:
+        handover.relocate_copy(destination, source=source, expected_content_digest=source_review["content_digest"])
+    return source_path, destination_path, source_review
+
+
+def _terminated_dummy_pid(owned_test_process):
+    for _attempt in range(10):
+        process = owned_test_process("pass")
+        pid = process.pid
+        assert process.wait(timeout=10) == 0
+        try:
+            if not process_is_running(pid):
+                return pid
+        except (OSError, ProcessIdentityError):
+            continue
+    pytest.fail("could not obtain a recently terminated synthetic process ID")
 
 
 def test_attestation_artifact_round_trip_rejects_another_root(tmp_path):
@@ -242,6 +283,530 @@ def test_handover_inspect_lists_attestations_and_remaining_blockers(tmp_path, ca
     ]
 
 
+def test_attest_stale_marker_retires_destination_and_refuses_repeat(tmp_path, capsys, owned_test_process):
+    import hedge_fund.run as run
+
+    marker_pid = _terminated_dummy_pid(owned_test_process)
+    source_path, destination_path, source_review = _copied_destination(tmp_path, marker=f"{marker_pid}\n")
+    source_before = _tree_digest_snapshot(source_path)
+    marker = "paper/alpha/runner.pid"
+    marker_path = destination_path / Path(marker)
+    marker_bytes = marker_path.read_bytes()
+    command = [
+        "--root",
+        str(destination_path),
+        "handover",
+        "attest-stale-marker",
+        "--marker",
+        marker,
+        "--source-evidence",
+        source_review["source_evidence_digest"],
+        "--operator-statement",
+        "Synthetic runner marker belongs to a terminated process.",
+    ]
+
+    run.main(command)
+    result = json.loads(capsys.readouterr().out)
+
+    assert result["state"] == "attested"
+    assert result["kind"] == "stale-marker-retirement"
+    assert result["subject"] == marker
+    assert result["source_evidence_digest"] == source_review["source_evidence_digest"]
+    assert not marker_path.exists()
+    with RootContext.open(destination_path) as destination:
+        artifact = handover._read_attestation_artifact(destination, kind="stale-marker-retirement", subject=marker)
+        assert artifact is not None
+        assert artifact["evidence"]["liveness"]["status"] == "not-running"
+        retired_path = artifact["evidence"]["retired_marker_path"]
+        assert destination.read_bytes(retired_path) == marker_bytes
+        assert handover._list_attestation_artifacts(destination) == [artifact]
+
+    before_repeat = _tree_digest_snapshot(destination_path)
+    with pytest.raises(SystemExit) as repeated:
+        run.main(command)
+    error = capsys.readouterr().err
+    assert repeated.value.code == 2
+    assert "already exists" in error.lower()
+    assert result["artifact_path"] in error
+    assert _tree_digest_snapshot(destination_path) == before_repeat
+    assert _tree_digest_snapshot(source_path) == source_before
+
+
+def test_attest_stale_marker_rolls_back_partial_artifact_and_marker_move(tmp_path, owned_test_process, monkeypatch):
+    marker_pid = _terminated_dummy_pid(owned_test_process)
+    source_path, destination_path, source_review = _copied_destination(tmp_path, marker=f"{marker_pid}\n")
+    marker = "paper/alpha/runner.pid"
+    marker_path = destination_path / Path(marker)
+    marker_before = marker_path.read_bytes()
+    source_before = _tree_digest_snapshot(source_path)
+
+    def reject_published_artifact(_root, _record, *, source_evidence=None):
+        raise handover.HandoverError("synthetic post-publish validation failure")
+
+    monkeypatch.setattr(handover, "_validate_marker_retirement_artifact", reject_published_artifact)
+    with RootContext.open(destination_path) as destination:
+        with pytest.raises(handover.HandoverError, match="post-publish"):
+            handover.attest_stale_marker(
+                destination,
+                marker=marker,
+                source_evidence_digest=source_review["source_evidence_digest"],
+                operator_statement="Synthetic rollback restores the copied marker.",
+            )
+        assert handover._read_attestation_artifact(destination, kind="stale-marker-retirement", subject=marker) is None
+        assert handover._list_attestation_artifacts(destination) == []
+        with pytest.raises(FileNotFoundError):
+            destination.file_info(handover._retired_marker_path(marker))
+
+    assert marker_path.read_bytes() == marker_before
+    assert _tree_digest_snapshot(source_path) == source_before
+
+
+def test_attest_stale_marker_refuses_live_process_without_writes(tmp_path, capsys, owned_test_process):
+    import hedge_fund.run as run
+
+    process = owned_test_process("import time; time.sleep(120)")
+    marker = "paper/alpha/runner.pid"
+    source_path, destination_path, source_review = _copied_destination(tmp_path, marker=f"{process.pid}\n")
+    source_before = _tree_digest_snapshot(source_path)
+    destination_before = _tree_digest_snapshot(destination_path)
+    marker_path = destination_path / Path(marker)
+    marker_before = marker_path.read_bytes()
+    assert process_identity(process.pid)["pid"] == process.pid
+
+    try:
+        with pytest.raises(SystemExit) as denied:
+            run.main(
+                [
+                    "--root",
+                    str(destination_path),
+                    "handover",
+                    "attest-stale-marker",
+                    "--marker",
+                    marker,
+                    "--source-evidence",
+                    source_review["source_evidence_digest"],
+                    "--operator-statement",
+                    "Synthetic live process must block marker retirement.",
+                ]
+            )
+        error = capsys.readouterr().err
+        assert denied.value.code == 2
+        assert "live process" in error.lower()
+        assert "Resolve with:" in error
+        assert marker_path.read_bytes() == marker_before
+        assert _tree_digest_snapshot(destination_path) == destination_before
+        with RootContext.open(destination_path) as destination:
+            assert handover._read_attestation_artifact(destination, kind="stale-marker-retirement", subject=marker) is None
+    finally:
+        process.terminate()
+        process.wait(timeout=10)
+    assert _tree_digest_snapshot(source_path) == source_before
+
+
+def test_attest_stale_marker_refuses_unobservable_process_without_writes(tmp_path, capsys, owned_test_process, monkeypatch):
+    import hedge_fund.run as run
+
+    marker_pid = _terminated_dummy_pid(owned_test_process)
+    source_path, destination_path, source_review = _copied_destination(tmp_path, marker=f"{marker_pid}\n")
+    source_before = _tree_digest_snapshot(source_path)
+    destination_before = _tree_digest_snapshot(destination_path)
+
+    def unobservable(_pid):
+        raise PermissionError("synthetic access denied")
+
+    monkeypatch.setattr(handover, "process_is_running", unobservable)
+
+    with pytest.raises(SystemExit) as denied:
+        run.main(
+            [
+                "--root",
+                str(destination_path),
+                "handover",
+                "attest-stale-marker",
+                "--marker",
+                "paper/alpha/runner.pid",
+                "--source-evidence",
+                source_review["source_evidence_digest"],
+                "--operator-statement",
+                "Synthetic unobservable process must block marker retirement.",
+            ]
+        )
+
+    error = capsys.readouterr().err
+    assert denied.value.code == 2
+    assert "liveness" in error.lower() or "process identity" in error.lower()
+    assert "Resolve with:" in error
+    assert _tree_digest_snapshot(destination_path) == destination_before
+    assert _tree_digest_snapshot(source_path) == source_before
+
+
+def test_attest_stale_marker_second_liveness_denial_leaves_no_partial_storage(tmp_path, capsys, owned_test_process, monkeypatch):
+    import hedge_fund.run as run
+
+    marker_pid = _terminated_dummy_pid(owned_test_process)
+    source_path, destination_path, source_review = _copied_destination(tmp_path, marker=f"{marker_pid}\n")
+    source_before = _tree_digest_snapshot(source_path)
+    destination_before = _tree_digest_snapshot(destination_path)
+    calls = 0
+
+    def changes_to_live(_pid):
+        nonlocal calls
+        calls += 1
+        return calls == 2
+
+    monkeypatch.setattr(handover, "process_is_running", changes_to_live)
+    with pytest.raises(SystemExit) as denied:
+        run.main(
+            [
+                "--root",
+                str(destination_path),
+                "handover",
+                "attest-stale-marker",
+                "--marker",
+                "paper/alpha/runner.pid",
+                "--source-evidence",
+                source_review["source_evidence_digest"],
+                "--operator-statement",
+                "A changing liveness result must leave the copied marker untouched.",
+            ]
+        )
+
+    assert denied.value.code == 2
+    assert "live process" in capsys.readouterr().err
+    assert calls == 2
+    assert _tree_digest_snapshot(destination_path) == destination_before
+    assert _tree_digest_snapshot(source_path) == source_before
+
+
+def test_attest_stale_marker_refuses_missing_destination_marker_without_writes(tmp_path, capsys, owned_test_process):
+    import hedge_fund.run as run
+
+    marker_pid = _terminated_dummy_pid(owned_test_process)
+    source_path, destination_path, source_review = _copied_destination(tmp_path, marker=f"{marker_pid}\n")
+    source_before = _tree_digest_snapshot(source_path)
+    marker = "paper/alpha/runner.pid"
+    marker_path = destination_path / Path(marker)
+    marker_path.unlink()
+    destination_before = _tree_digest_snapshot(destination_path)
+
+    with pytest.raises(SystemExit) as denied:
+        run.main(
+            [
+                "--root",
+                str(destination_path),
+                "handover",
+                "attest-stale-marker",
+                "--marker",
+                marker,
+                "--source-evidence",
+                source_review["source_evidence_digest"],
+                "--operator-statement",
+                "Synthetic missing marker must not create an attestation.",
+            ]
+        )
+
+    error = capsys.readouterr().err
+    assert denied.value.code == 2
+    assert "marker" in error.lower() and "missing" in error.lower()
+    assert "Resolve with:" in error
+    assert _tree_digest_snapshot(destination_path) == destination_before
+    assert _tree_digest_snapshot(source_path) == source_before
+
+
+def test_attest_stale_marker_refuses_source_evidence_digest_mismatch_without_writes(tmp_path, capsys, owned_test_process):
+    import hedge_fund.run as run
+
+    marker_pid = _terminated_dummy_pid(owned_test_process)
+    source_path, destination_path, source_review = _copied_destination(tmp_path, marker=f"{marker_pid}\n")
+    source_before = _tree_digest_snapshot(source_path)
+    destination_before = _tree_digest_snapshot(destination_path)
+
+    with pytest.raises(SystemExit) as denied:
+        run.main(
+            [
+                "--root",
+                str(destination_path),
+                "handover",
+                "attest-stale-marker",
+                "--marker",
+                "paper/alpha/runner.pid",
+                "--source-evidence",
+                "0" * 64,
+                "--operator-statement",
+                "Synthetic mismatched evidence must not authorize retirement.",
+            ]
+        )
+
+    error = capsys.readouterr().err
+    assert denied.value.code == 2
+    assert "source evidence" in error.lower()
+    assert "digest" in error.lower()
+    assert "Resolve with:" in error
+    assert _tree_digest_snapshot(destination_path) == destination_before
+    assert _tree_digest_snapshot(source_path) == source_before
+
+
+def test_attest_protected_fund_records_original_identity(tmp_path, capsys):
+    import hedge_fund.run as run
+
+    source_path, destination_path, source_review = _copied_destination(tmp_path, protected_fund=True)
+    source_before = _tree_digest_snapshot(source_path)
+
+    run.main(
+        [
+            "--root",
+            str(destination_path),
+            "handover",
+            "attest-protected-fund",
+            "--fund",
+            "umbrella",
+            "--source-evidence",
+            source_review["source_evidence_digest"],
+            "--operator-statement",
+            "Synthetic umbrella fund belongs to the operator and keeps its original name.",
+        ]
+    )
+    result = json.loads(capsys.readouterr().out)
+
+    assert result["state"] == "attested"
+    assert result["kind"] == "protected-fund-inclusion"
+    assert result["subject"] == "umbrella"
+    assert result["source_evidence_digest"] == source_review["source_evidence_digest"]
+    with RootContext.open(destination_path) as destination:
+        artifact = handover._read_attestation_artifact(destination, kind="protected-fund-inclusion", subject="umbrella")
+        assert artifact is not None
+        assert artifact["evidence"]["fund_file_sha256"] == hashlib.sha256((destination_path / "paper" / "umbrella" / "fund.yaml").read_bytes()).hexdigest()
+    assert _tree_digest_snapshot(source_path) == source_before
+
+
+def test_attest_protected_fund_refuses_repeat_without_changes(tmp_path, capsys):
+    import hedge_fund.run as run
+
+    source_path, destination_path, source_review = _copied_destination(tmp_path, protected_fund=True)
+    source_before = _tree_digest_snapshot(source_path)
+    command = [
+        "--root",
+        str(destination_path),
+        "handover",
+        "attest-protected-fund",
+        "--fund",
+        "umbrella",
+        "--source-evidence",
+        source_review["source_evidence_digest"],
+        "--operator-statement",
+        "Synthetic umbrella fund keeps its original identity.",
+    ]
+
+    run.main(command)
+    result = json.loads(capsys.readouterr().out)
+    destination_before_repeat = _tree_digest_snapshot(destination_path)
+    with pytest.raises(SystemExit) as repeated:
+        run.main(command)
+
+    error = capsys.readouterr().err
+    assert repeated.value.code == 2
+    assert "already exists" in error.lower()
+    assert result["artifact_path"] in error
+    assert _tree_digest_snapshot(destination_path) == destination_before_repeat
+    assert _tree_digest_snapshot(source_path) == source_before
+
+
+@pytest.mark.parametrize("fund", ["alpha", "unknown"])
+def test_attest_protected_fund_refuses_unprotected_or_unknown_name(tmp_path, capsys, fund):
+    import hedge_fund.run as run
+
+    source_path, destination_path, source_review = _copied_destination(tmp_path, protected_fund=True)
+    source_before = _tree_digest_snapshot(source_path)
+    destination_before = _tree_digest_snapshot(destination_path)
+
+    with pytest.raises(SystemExit) as denied:
+        run.main(
+            [
+                "--root",
+                str(destination_path),
+                "handover",
+                "attest-protected-fund",
+                "--fund",
+                fund,
+                "--source-evidence",
+                source_review["source_evidence_digest"],
+                "--operator-statement",
+                "Synthetic unknown identity must not be included.",
+            ]
+        )
+
+    error = capsys.readouterr().err
+    assert denied.value.code == 2
+    assert "protected" in error.lower() or "source evidence" in error.lower()
+    assert "Resolve with:" in error
+    assert _tree_digest_snapshot(destination_path) == destination_before
+    assert _tree_digest_snapshot(source_path) == source_before
+
+
+def test_attest_protected_fund_cannot_authorize_renamed_identity(tmp_path, capsys):
+    import hedge_fund.run as run
+
+    source_path, destination_path, source_review = _copied_destination(tmp_path, protected_fund=True)
+    source_before = _tree_digest_snapshot(source_path)
+    protected = destination_path / "paper" / "umbrella"
+    renamed = destination_path / "paper" / "ordinary"
+    protected.rename(renamed)
+    fund_file = renamed / "fund.yaml"
+    fund_file.write_text(fund_file.read_text(encoding="utf-8").replace("name: umbrella", "name: ordinary"), encoding="utf-8")
+    destination_before = _tree_digest_snapshot(destination_path)
+
+    with pytest.raises(SystemExit) as denied:
+        run.main(
+            [
+                "--root",
+                str(destination_path),
+                "handover",
+                "attest-protected-fund",
+                "--fund",
+                "ordinary",
+                "--source-evidence",
+                source_review["source_evidence_digest"],
+                "--operator-statement",
+                "Renaming a synthetic protected fund must not satisfy the original blocker.",
+            ]
+        )
+
+    error = capsys.readouterr().err
+    assert denied.value.code == 2
+    assert "protected" in error.lower() or "source evidence" in error.lower()
+    assert "Resolve with:" in error
+    assert _tree_digest_snapshot(destination_path) == destination_before
+    assert _tree_digest_snapshot(source_path) == source_before
+
+
+def test_full_attested_relocation_keeps_source_tree_hash_identical(tmp_path, capsys, owned_test_process):
+    import hedge_fund.run as run
+
+    marker_pid = _terminated_dummy_pid(owned_test_process)
+    source_path = _legacy_relocation_source(tmp_path / "source", protected_fund=True)
+    for name in ("watchtower", "watchtower-weekly"):
+        _write_protected_source_fund(source_path, name)
+    marker_paths = (
+        "paper/umbrella/runner.pid",
+        "paper/watchtower/runner.pid",
+    )
+    for marker in marker_paths:
+        (source_path / Path(marker)).write_text(f"{marker_pid}\n", encoding="ascii")
+
+    source_before = _tree_digest_snapshot(source_path)
+    destination_path = tmp_path / "destination"
+    destination_path.mkdir()
+    evidence_path = destination_path / Path(handover.SOURCE_EVIDENCE_PATH)
+    run.main(
+        [
+            "--root",
+            str(source_path),
+            "handover",
+            "inspect-source",
+            "--evidence-out",
+            str(evidence_path),
+        ]
+    )
+    source_review = json.loads(capsys.readouterr().out)
+
+    run.main(
+        [
+            "--root",
+            str(destination_path),
+            "handover",
+            "relocate-copy",
+            str(source_path),
+            "--content-digest",
+            source_review["content_digest"],
+        ]
+    )
+    capsys.readouterr()
+
+    for marker in marker_paths:
+        run.main(
+            [
+                "--root",
+                str(destination_path),
+                "handover",
+                "attest-stale-marker",
+                "--marker",
+                marker,
+                "--source-evidence",
+                source_review["source_evidence_digest"],
+                "--operator-statement",
+                "Synthetic dead marker is retired at this destination only.",
+            ]
+        )
+        capsys.readouterr()
+
+    for name in ("umbrella", "watchtower", "watchtower-weekly"):
+        run.main(
+            [
+                "--root",
+                str(destination_path),
+                "handover",
+                "attest-protected-fund",
+                "--fund",
+                name,
+                "--source-evidence",
+                source_review["source_evidence_digest"],
+                "--operator-statement",
+                "Synthetic protected fund keeps its original name at this destination.",
+            ]
+        )
+        capsys.readouterr()
+
+    run.main(["--root", str(destination_path), "handover", "relocate-finalize"])
+    finalized = json.loads(capsys.readouterr().out)
+
+    assert finalized["mode"] == "relocated"
+    assert _tree_digest_snapshot(source_path) == source_before
+    with RootContext.open(destination_path) as destination:
+        inventory = require_enrollment(destination)["heads"]
+        assert build_head_inventory(destination) == inventory
+        for name in ("umbrella", "watchtower", "watchtower-weekly"):
+            artifact = handover._read_attestation_artifact(destination, kind="protected-fund-inclusion", subject=name)
+            assert inventory[name]["attestation_refs"] == [handover._attestation_reference(artifact)]
+        for marker in marker_paths:
+            artifact = handover._read_attestation_artifact(destination, kind="stale-marker-retirement", subject=marker)
+            key = handover._attestation_inventory_key("stale-marker-retirement", marker)
+            assert inventory[key] == {
+                "kind": "stale-marker-retirement",
+                "subject": marker,
+                "attestation_digest": artifact["record_digest"],
+            }
+        forged_inventory = json.loads(json.dumps(inventory))
+        forged_inventory["umbrella"]["attestation_refs"][0]["record_digest"] = "0" * 64
+        with pytest.raises(EnrollmentInvalid, match="attestation references"):
+            handover._validate_enrollment_attestation_refs(destination, forged_inventory)
+        assert handover._read_attestation_artifact(destination, kind="protected-fund-inclusion", subject="umbrella") is not None
+        assert handover._read_attestation_artifact(destination, kind="stale-marker-retirement", subject=marker_paths[0]) is not None
+        with pytest.raises(FileNotFoundError):
+            destination.file_info(marker_paths[0])
+        owner = RootOwnerLease.acquire(destination)
+        coordinator = AdmissionCoordinator(destination, owner_lease=owner)
+        try:
+            with coordinator.manual_session("umbrella", timeout=0):
+                assert require_paper_write_lanes(
+                    destination.path / "paper" / "umbrella",
+                    "umbrella",
+                    lane_sets=(("runner",),),
+                )
+        finally:
+            owner.close()
+
+
+def test_head_inventory_and_finalize_refuse_unattested_protected_fund(tmp_path):
+    _, destination_path, _ = _copied_destination(tmp_path, protected_fund=True)
+    with RootContext.open(destination_path) as destination:
+        with pytest.raises(HandoverError, match="source blocker remains unresolved: umbrella"):
+            build_head_inventory(destination)
+        with pytest.raises(HandoverError, match="source blocker remains unresolved: umbrella"):
+            handover.relocate_finalize(destination)
+        with pytest.raises(FileNotFoundError):
+            destination.file_info(HANDOVER_PATH)
+
+
 def test_relocate_copy_transfers_settings_and_finalize_enrolls(tmp_path, monkeypatch):
     source_path = _legacy_relocation_source(tmp_path / "legacy", settings=b'{"model":"synthetic"}')
     destination_path = tmp_path / "destination"
@@ -311,6 +876,78 @@ def test_interrupted_relocate_copy_is_marked_incomplete_and_retry_completes(tmp_
         with pytest.raises(FileNotFoundError):
             destination.file_info(HANDOVER_PATH)
 
+        copied = handover.relocate_copy(destination, source=source, expected_content_digest=digest)
+        assert copied["state"] == "copied"
+        record = handover.relocate_finalize(destination)
+
+    assert record["mode"] == "relocated"
+    assert _tree_digest_snapshot(source_path) == before
+
+
+def test_relocate_copy_process_death_leaves_incomplete_state_and_retry_completes(tmp_path, owned_test_process):
+    import time
+
+    source_path = _legacy_relocation_source(tmp_path / "legacy")
+    destination_path = tmp_path / "destination"
+    destination_path.mkdir()
+    pause_path = tmp_path / "copy-paused"
+    before = _tree_digest_snapshot(source_path)
+    with RootContext.open(source_path) as source:
+        digest = handover.inspect_relocation_source(source)["content_digest"]
+
+    script = "\n".join(
+        [
+            "import os",
+            "import time",
+            "from pathlib import Path",
+            "from hedge_fund.runtime.handover import relocate_copy",
+            "from hedge_fund.runtime.root import RootContext",
+            f"source_path = Path({str(source_path)!r})",
+            f"destination_path = Path({str(destination_path)!r})",
+            f"pause_path = Path({str(pause_path)!r})",
+            f"digest = {digest!r}",
+            "original_write = RootContext.write_bytes",
+            "def pause_after_first_copy(self, relative, data, **kwargs):",
+            "    result = original_write(self, relative, data, **kwargs)",
+            "    if os.path.normcase(os.fspath(self.path)) == os.path.normcase(os.fspath(destination_path)) and str(relative) == 'mandates/alpha.yaml':",
+            "        pause_path.write_text('paused', encoding='ascii')",
+            "        while True:",
+            "            time.sleep(0.01)",
+            "    return result",
+            "RootContext.write_bytes = pause_after_first_copy",
+            "source = RootContext.open(source_path)",
+            "destination = RootContext.open(destination_path)",
+            "relocate_copy(destination, source=source, expected_content_digest=digest)",
+        ]
+    )
+    child = owned_test_process(script)
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        if pause_path.exists():
+            try:
+                if pause_path.read_text(encoding="ascii") == "paused":
+                    break
+            except (OSError, UnicodeError):
+                pass
+        if child.poll() is not None:
+            pytest.fail(f"relocation child exited before copy barrier: {child.returncode}")
+        time.sleep(0.02)
+    else:
+        pytest.fail("relocation child did not reach mid-copy barrier")
+
+    child.terminate()
+    child.wait(timeout=10)
+    assert child.returncode not in (None, 0)
+    assert _tree_digest_snapshot(source_path) == before
+
+    with RootContext.open(destination_path) as destination:
+        state = json.loads(destination.read_bytes(handover.RELOCATION_STATE_PATH))
+        assert state["state"] == "incomplete"
+        assert destination.read_bytes("mandates/alpha.yaml") == (source_path / "mandates" / "alpha.yaml").read_bytes()
+        with pytest.raises(FileNotFoundError):
+            destination.file_info(HANDOVER_PATH)
+
+    with RootContext.open(source_path) as source, RootContext.open(destination_path) as destination:
         copied = handover.relocate_copy(destination, source=source, expected_content_digest=digest)
         assert copied["state"] == "copied"
         record = handover.relocate_finalize(destination)

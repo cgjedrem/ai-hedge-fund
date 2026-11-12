@@ -492,6 +492,20 @@ def _parser() -> argparse.ArgumentParser:
         required=True,
         help="absolute destination-private path for the source evidence bundle",
     )
+    stale_marker_attestation = handover_actions.add_parser(
+        "attest-stale-marker",
+        help="retire one verified stale runner marker in this copied destination",
+    )
+    stale_marker_attestation.add_argument("--marker", required=True, help="copied runner.pid path to retire")
+    stale_marker_attestation.add_argument("--source-evidence", required=True, help="digest of destination-staged source evidence")
+    stale_marker_attestation.add_argument("--operator-statement", required=True, help="explicit marker-retirement attestation")
+    protected_fund_attestation = handover_actions.add_parser(
+        "attest-protected-fund",
+        help="authorize one protected fund under its original name at this copied destination",
+    )
+    protected_fund_attestation.add_argument("--fund", required=True, help="original protected fund name")
+    protected_fund_attestation.add_argument("--source-evidence", required=True, help="digest of destination-staged source evidence")
+    protected_fund_attestation.add_argument("--operator-statement", required=True, help="explicit protected-fund attestation")
     relocation = handover_actions.add_parser(
         "relocate-from",
         help="copy a quiescent legacy root into this empty target; target stays read-only until trusted",
@@ -662,6 +676,8 @@ def _lifecycle(args, parser: argparse.ArgumentParser, root: RootContext) -> None
 def _handover(args, parser: argparse.ArgumentParser, root: RootContext) -> None:
     from hedge_fund.runtime.admission import RootMigrationLease
     from hedge_fund.runtime.handover import (
+        attest_protected_fund,
+        attest_stale_marker,
         build_head_inventory,
         enroll_fresh,
         enrollment_status,
@@ -685,6 +701,24 @@ def _handover(args, parser: argparse.ArgumentParser, root: RootContext) -> None:
     try:
         if args.handover_action == "inspect-source":
             print(json.dumps(inspect_relocation_source(root, evidence_out=args.evidence_out), sort_keys=True, indent=2))
+            return
+        if args.handover_action == "attest-stale-marker":
+            result = attest_stale_marker(
+                root,
+                marker=args.marker,
+                source_evidence_digest=args.source_evidence,
+                operator_statement=args.operator_statement,
+            )
+            print(json.dumps(result, sort_keys=True))
+            return
+        if args.handover_action == "attest-protected-fund":
+            result = attest_protected_fund(
+                root,
+                fund=args.fund,
+                source_evidence_digest=args.source_evidence,
+                operator_statement=args.operator_statement,
+            )
+            print(json.dumps(result, sort_keys=True))
             return
         if args.handover_action == "inspect":
             status = enrollment_status(root, verify_inventory=True)
