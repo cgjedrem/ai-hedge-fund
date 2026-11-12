@@ -6,7 +6,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Literal
 
@@ -17,6 +17,7 @@ _HEX_ID = re.compile(r"^[a-f0-9]{32}$")
 _SHA256 = re.compile(r"^[a-f0-9]{64}$")
 _DECISION = "confirm-paper-book-matches-ledger"
 _RESIDUAL_UNCERTAINTY = "external-broker-state-not-applicable-local-paper-only"
+_RECEIPT_VALIDITY = timedelta(minutes=30)
 
 
 class TickOperationIdentity(BaseModel):
@@ -117,6 +118,8 @@ class ReconciliationReceipt(BaseModel):
     capture_digest: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
     operator: Literal["cli", "tui", "web"]
     recorded_at: str
+    issued_at: str | None = None
+    valid_until: str | None = None
     decision: Literal["confirm-paper-book-matches-ledger"] = _DECISION
     residual_uncertainty: Literal["external-broker-state-not-applicable-local-paper-only"] = _RESIDUAL_UNCERTAINTY
     receipt_id: str = Field(pattern=r"^[a-f0-9]{64}$")
@@ -125,12 +128,8 @@ class ReconciliationReceipt(BaseModel):
     def _validate_identity(self) -> ReconciliationReceipt:
         if (self.capture_id is None) != (self.capture_digest is None):
             raise ValueError("capture identity and digest must be paired")
-        try:
-            recorded_at = datetime.fromisoformat(self.recorded_at.replace("Z", "+00:00"))
-        except ValueError as exc:
-            raise ValueError("recorded_at must be an ISO timestamp") from exc
-        if recorded_at.tzinfo is None or recorded_at.utcoffset() is None:
-            raise ValueError("recorded_at must include a timezone")
+        recorded_at = _parse_aware_timestamp(self.recorded_at, "recorded_at")
+        _validate_receipt_expiry_fields(self.issued_at, self.valid_until, recorded_at)
         if self.receipt_id != self.compute_receipt_id():
             raise ValueError("receipt_id does not match the receipt contents")
         return self
@@ -163,6 +162,8 @@ class ReconciliationReceipt(BaseModel):
             "capture_digest": failure_event.get("capture_digest"),
             "operator": operator,
             "recorded_at": recorded_at,
+            "issued_at": recorded_at,
+            "valid_until": _receipt_valid_until(recorded_at),
             "decision": _DECISION,
             "residual_uncertainty": _RESIDUAL_UNCERTAINTY,
         }
@@ -170,7 +171,11 @@ class ReconciliationReceipt(BaseModel):
         return cls.model_validate(payload)
 
     def compute_receipt_id(self) -> str:
-        return _receipt_digest(self.model_dump(mode="json", exclude={"receipt_id"}))
+        payload = self.model_dump(mode="json", exclude={"receipt_id"})
+        if self.issued_at is None and self.valid_until is None:
+            payload.pop("issued_at", None)
+            payload.pop("valid_until", None)
+        return _receipt_digest(payload)
 
     def matches_failure(self, failure_event: dict) -> bool:
         return self.failure_id == failure_digest(failure_event) and self.expected_head == failure_event.get("expected_head") and self.failed_request_id == failure_event.get("request_id") and self.operation_id == failure_event.get("operation_id") and self.capture_id == failure_event.get("capture_id") and self.capture_digest == failure_event.get("capture_digest")
@@ -282,6 +287,8 @@ class TickIntentReconciliationReceipt(BaseModel):
     fill_identity_sha256: str = Field(pattern=_SHA256.pattern)
     operator: Literal["cli", "tui", "web"]
     recorded_at: str
+    issued_at: str | None = None
+    valid_until: str | None = None
     decision: Literal["confirm-paper-book-matches-ledger"] = _DECISION
     residual_uncertainty: Literal["external-broker-state-not-applicable-local-paper-only"] = _RESIDUAL_UNCERTAINTY
     receipt_id: str = Field(pattern=_SHA256.pattern)
@@ -294,12 +301,8 @@ class TickIntentReconciliationReceipt(BaseModel):
             raise ValueError("corrupt event identities must be unique")
         if len(set(self.approval_journal_event_digests)) != len(self.approval_journal_event_digests) or any(_SHA256.fullmatch(digest) is None for digest in self.approval_journal_event_digests):
             raise ValueError("approval journal event identities are invalid")
-        try:
-            recorded_at = datetime.fromisoformat(self.recorded_at.replace("Z", "+00:00"))
-        except ValueError as exc:
-            raise ValueError("recorded_at must be an ISO timestamp") from exc
-        if recorded_at.tzinfo is None or recorded_at.utcoffset() is None:
-            raise ValueError("recorded_at must include a timezone")
+        recorded_at = _parse_aware_timestamp(self.recorded_at, "recorded_at")
+        _validate_receipt_expiry_fields(self.issued_at, self.valid_until, recorded_at)
         if self.receipt_id != self.compute_receipt_id():
             raise ValueError("receipt_id does not match the receipt contents")
         return self
@@ -329,6 +332,8 @@ class TickIntentReconciliationReceipt(BaseModel):
             "fill_identity_sha256": preview.fill_identity_sha256,
             "operator": operator,
             "recorded_at": recorded_at,
+            "issued_at": recorded_at,
+            "valid_until": _receipt_valid_until(recorded_at),
             "decision": _DECISION,
             "residual_uncertainty": _RESIDUAL_UNCERTAINTY,
         }
@@ -341,6 +346,9 @@ class TickIntentReconciliationReceipt(BaseModel):
         payload = self.model_dump(mode="json", exclude={"receipt_id"})
         if not self.approval_journal_event_digests:
             payload.pop("approval_journal_event_digests", None)
+        if self.issued_at is None and self.valid_until is None:
+            payload.pop("issued_at", None)
+            payload.pop("valid_until", None)
         return _receipt_digest(payload)
 
 
@@ -361,7 +369,7 @@ def unresolved_tick_failures(events: list[dict]) -> list[dict]:
         raise ValueError("paper events must be a list of objects")
     failures: dict[str, dict] = {}
     receipts: dict[str, ReconciliationReceipt] = {}
-    resumed_receipts: set[str] = set()
+    resumed_receipts: dict[str, list[str | None]] = {}
     for event in events:
         if event.get("kind") == "tick_failed":
             failures[failure_digest(event)] = event
@@ -376,8 +384,16 @@ def unresolved_tick_failures(events: list[dict]) -> list[dict]:
         elif event.get("kind") == "resume":
             receipt_id = event.get("reconciliation_id")
             if isinstance(receipt_id, str) and _SHA256.fullmatch(receipt_id):
-                resumed_receipts.add(receipt_id)
-    resolved = {failure_id for failure_id, receipt in receipts.items() if receipt.receipt_id in resumed_receipts}
+                resumed_receipts.setdefault(receipt_id, []).append(event.get("time"))
+    resolved = set()
+    for failure_id, receipt in receipts.items():
+        for recorded_now in resumed_receipts.get(receipt.receipt_id, []):
+            try:
+                verify_receipt_expiry(receipt, recorded_now=recorded_now)
+            except ValueError:
+                continue
+            resolved.add(failure_id)
+            break
     return [failure for identity, failure in failures.items() if identity not in resolved]
 
 
@@ -703,9 +719,12 @@ def verify_reconciliation_receipt(
     state,
     latest,
     receipt: ReconciliationReceipt,
+    *,
+    recorded_now: str,
 ) -> ReconciliationSnapshot:
     if not isinstance(receipt, ReconciliationReceipt):
         raise ValueError("verified reconciliation receipt is required")
+    verify_receipt_expiry(receipt, recorded_now=recorded_now)
     events = ledger.events()
     failure = next(
         (event for event in events if isinstance(event, dict) and event.get("kind") == "tick_failed" and failure_digest(event) == receipt.failure_id),
@@ -718,6 +737,53 @@ def verify_reconciliation_receipt(
     if not preview.recoverable or receipt.expected_head != preview.expected_head or receipt.current_head != preview.current_head or receipt.broker_book_sha256 != preview.broker_book_sha256 or receipt.fill_identity_sha256 != preview.fill_identity_sha256 or receipt.capture_id != preview.capture_id or receipt.capture_digest != preview.capture_digest:
         raise ValueError("reconciliation receipt no longer matches the paper state")
     return snapshot
+
+
+def verify_tick_intent_reconciliation_receipt(
+    preview: TickIntentReconciliationPreview,
+    receipt: TickIntentReconciliationReceipt,
+    *,
+    recorded_now: str,
+) -> TickIntentReconciliationPreview:
+    if not isinstance(preview, TickIntentReconciliationPreview) or not isinstance(receipt, TickIntentReconciliationReceipt):
+        raise ValueError("verified tick-intent receipt and preview are required")
+    verify_receipt_expiry(receipt, recorded_now=recorded_now)
+    if (
+        not preview.required
+        or not preview.recoverable
+        or receipt.intent_request_id != preview.intent_request_id
+        or receipt.intent_digest != preview.intent_digest
+        or receipt.preview_digest != preview.preview_digest
+        or receipt.corrupt_event_digests != preview.corrupt_event_digests
+        or receipt.approval_journal_event_digests != preview.approval_journal_event_digests
+        or receipt.expected_head != preview.expected_head
+        or receipt.current_head != preview.current_head
+        or receipt.broker_book_sha256 != preview.broker_book_sha256
+        or receipt.fill_identity_sha256 != preview.fill_identity_sha256
+    ):
+        raise ValueError("tick-intent reconciliation receipt no longer matches the paper state")
+    return preview
+
+
+def verify_receipt_expiry(
+    receipt: ReconciliationReceipt | TickIntentReconciliationReceipt,
+    *,
+    recorded_now: str,
+) -> None:
+    if not isinstance(receipt, (ReconciliationReceipt, TickIntentReconciliationReceipt)):
+        raise ValueError("verified recovery receipt is required")
+    if receipt.issued_at is None or receipt.valid_until is None:
+        raise ValueError("recovery receipt expiry fields are missing; fresh review is required")
+    recorded_at = _parse_aware_timestamp(receipt.recorded_at, "recorded_at")
+    issued_at = _parse_aware_timestamp(receipt.issued_at, "issued_at")
+    valid_until = _parse_aware_timestamp(receipt.valid_until, "valid_until")
+    recorded_clock = _parse_aware_timestamp(recorded_now, "recorded_now")
+    if issued_at != recorded_at or valid_until - issued_at != _RECEIPT_VALIDITY:
+        raise ValueError("recovery receipt validity window is invalid")
+    if recorded_clock < issued_at:
+        raise ValueError("recovery receipt is not yet valid on the recorded clock")
+    if recorded_clock > valid_until:
+        raise ValueError("recovery receipt has expired; fresh review is required")
 
 
 def find_receipt_for_request(events: list[dict], request_id: str) -> ReconciliationReceipt | None:
@@ -758,3 +824,30 @@ def _canonical_json(value: dict) -> bytes:
         return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=True).encode("utf-8")
     except (TypeError, ValueError) as exc:
         raise ValueError("canonical identity is invalid") from exc
+
+
+def _parse_aware_timestamp(value: str, field: str) -> datetime:
+    if not isinstance(value, str):
+        raise ValueError(f"{field} must be an ISO timestamp")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError(f"{field} must be an ISO timestamp") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError(f"{field} must include a timezone")
+    return parsed
+
+
+def _validate_receipt_expiry_fields(issued_at: str | None, valid_until: str | None, recorded_at: datetime) -> None:
+    if issued_at is None and valid_until is None:
+        return
+    if issued_at is None or valid_until is None:
+        raise ValueError("receipt expiry fields must be paired")
+    issued = _parse_aware_timestamp(issued_at, "issued_at")
+    expires = _parse_aware_timestamp(valid_until, "valid_until")
+    if issued != recorded_at or expires - issued != _RECEIPT_VALIDITY:
+        raise ValueError("receipt validity window is invalid")
+
+
+def _receipt_valid_until(issued_at: str) -> str:
+    return (_parse_aware_timestamp(issued_at, "issued_at") + _RECEIPT_VALIDITY).isoformat()

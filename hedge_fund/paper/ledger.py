@@ -368,10 +368,13 @@ class Ledger:
         value.update({"state": "completed", "result_hash": record.hash})
         write_atomic(self.redo_state_path, json.dumps(value, indent=2), mode=0o600, durable=True)
 
-    def require_ready_for_work(self, state: FundState, *, approval_required: bool) -> None:
+    def require_ready_for_work(self, state: FundState, *, approval_required: bool, allow_tick_intents: bool = False) -> None:
+        if type(allow_tick_intents) is not bool:
+            raise LedgerError("Tick-intent readiness policy is invalid.")
         self._require_ready_for_work_state(
             state,
             approval_required=approval_required,
+            allow_tick_intents=allow_tick_intents,
         )
 
     def _require_ready_for_work_state(
@@ -1098,6 +1101,7 @@ class Ledger:
             build_tick_intent_reconciliation_snapshot,
             TickIntentReconciliationConfirmation,
             TickIntentReconciliationReceipt,
+            verify_tick_intent_reconciliation_receipt,
         )
 
         try:
@@ -1133,12 +1137,17 @@ class Ledger:
             preview = snapshot.preview
             if not preview.required or not preview.recoverable or preview.intent_request_id != reviewed.intent_request_id or preview.intent_digest != reviewed.intent_digest or preview.preview_digest != reviewed.preview_digest:
                 raise LedgerError("Tick-intent reconciliation confirmation is stale or paper state is not reconcilable.")
+            recorded_at = _now()
             receipt = TickIntentReconciliationReceipt.create(
                 preview=preview,
                 request_id=request_id,
                 operator=operator,
-                recorded_at=_now(),
+                recorded_at=recorded_at,
             )
+            try:
+                verify_tick_intent_reconciliation_receipt(preview, receipt, recorded_now=recorded_at)
+            except ValueError:
+                raise LedgerError("Tick-intent reconciliation receipt is invalid.") from None
             request_digest = _control_request_digest(
                 TICK_INTENT_RECOVERY,
                 self.directory.name,
@@ -1280,6 +1289,7 @@ class Ledger:
             if any(event.get("kind") == "resume_effect_intent" and not _resume_effect_has_completion(events, index) for index, event in enumerate(events)):
                 raise PaperReconciliationRequired("Resume control write outcome is uncertain; reconciliation is required.")
             receipt = None
+            resume_authorized_at = None
             if halted is None:
                 if confirmation is None:
                     raise LedgerError("Paper fund is not halted.")
@@ -1293,7 +1303,7 @@ class Ledger:
                 if confirmation.preview_digest != snapshot.preview.preview_digest:
                     raise LedgerError("Resume confirmation is stale; review the current paper state.")
                 try:
-                    verify_reconciliation_receipt(self.directory, load_deployed(self.directory), self, state, latest, receipt)
+                    verify_reconciliation_receipt(self.directory, load_deployed(self.directory), self, state, latest, receipt, recorded_now=_now())
                 except ValueError:
                     raise LedgerError("Reconciliation receipt no longer matches the paper state.") from None
                 if not any(event.get("kind") == "resume" and event.get("request_id") == confirmation.request_id and event.get("reconciliation_id") == receipt.receipt_id for event in events):
@@ -1333,8 +1343,9 @@ class Ledger:
                     raise LedgerError("Resume request conflicts with its existing reconciliation receipt.")
                 if confirmation.preview_digest != snapshot.preview.preview_digest:
                     raise LedgerError("Resume confirmation is stale; review the current paper state.")
+                resume_authorized_at = _now()
                 try:
-                    verify_reconciliation_receipt(self.directory, deployed, self, state, latest, receipt)
+                    verify_reconciliation_receipt(self.directory, deployed, self, state, latest, receipt, recorded_now=resume_authorized_at)
                 except ValueError:
                     raise LedgerError("Reconciliation receipt no longer matches the paper state.") from None
             elif confirmation is not None:
@@ -1348,8 +1359,9 @@ class Ledger:
                 snapshot = build_reconciliation_snapshot(self.directory, deployed, self, state, latest, failure_event=failure)
                 if confirmation.preview_digest != snapshot.preview.preview_digest:
                     raise LedgerError("Resume confirmation is stale; review the current paper state.")
+                resume_authorized_at = _now()
                 try:
-                    verify_reconciliation_receipt(self.directory, deployed, self, state, latest, receipt)
+                    verify_reconciliation_receipt(self.directory, deployed, self, state, latest, receipt, recorded_now=resume_authorized_at)
                 except ValueError:
                     raise LedgerError("Reconciliation receipt no longer matches the paper state.") from None
             elif any(event.get("kind") == "resume" and isinstance(event.get("reconciliation_id"), str) and not any(later.get("kind") == "halt" for later in events[index + 1 :]) for index, event in enumerate(events)):
@@ -1368,7 +1380,10 @@ class Ledger:
                     }
                 )
             if not any(event.get("kind") == "resume" and event.get("request_id") == resume_fields.get("request_id") and event.get("reconciliation_id") == resume_fields.get("reconciliation_id") for event in events):
-                self.log_event("resume", durable=True, **resume_fields)
+                resume_event_fields = dict(resume_fields)
+                if resume_authorized_at is not None:
+                    resume_event_fields["time"] = resume_authorized_at
+                self.log_event("resume", durable=True, **resume_event_fields)
             self.log_event("resume_effect_intent", durable=True, **resume_fields)
             self._write_control(False, None)
             result = {
@@ -2216,7 +2231,10 @@ def _tick_intent_resolution_state(
     event_offsets: tuple[int, ...],
     fund: str,
 ) -> tuple[set[str], set[str], set[str]]:
-    from hedge_fund.runtime.reconciliation import TickIntentReconciliationReceipt
+    from hedge_fund.runtime.reconciliation import (
+        TickIntentReconciliationReceipt,
+        verify_receipt_expiry,
+    )
 
     if len(events) != len(event_offsets):
         return set(), set(), set()
@@ -2228,6 +2246,7 @@ def _tick_intent_resolution_state(
             continue
         try:
             receipt = TickIntentReconciliationReceipt.model_validate(event.get("receipt"))
+            verify_receipt_expiry(receipt, recorded_now=event.get("time"))
         except (TypeError, ValueError):
             continue
         if event.get("request_id") != receipt.request_id or event.get("request_action") != TICK_INTENT_RECOVERY:

@@ -99,14 +99,14 @@
 
 ### Tests for User Story 4 (write FIRST, must FAIL before implementation) ⚠️
 
-- [ ] T016 [P] [US4] Test: expired receipt denied (recorded clock past valid_until) for failure-bound and intent-bound receipts in hedge_fund/runtime/test_reconciliation.py
-- [ ] T017 [P] [US4] Test: legacy receipt without expiry fields denied fail-closed; fresh bound receipt still authorizes in hedge_fund/runtime/test_reconciliation.py
-- [ ] T018 [P] [US4] Test: bound-state change after issuance still denied (rebind regression) via web flow in hedge_fund/web/test_recovery.py
+- [x] T016 [P] [US4] Test: expired receipt denied (recorded clock past valid_until) for failure-bound and intent-bound receipts in hedge_fund/runtime/test_reconciliation.py
+- [x] T017 [P] [US4] Test: legacy receipt without expiry fields denied fail-closed; fresh bound receipt still authorizes in hedge_fund/runtime/test_reconciliation.py
+- [x] T018 [P] [US4] Test: bound-state change after issuance still denied (rebind regression) via web flow in hedge_fund/web/test_recovery.py
 
 ### Implementation for User Story 4
 
-- [ ] T019 [US4] Add issued_at/valid_until (recorded clock) at issuance for both receipt types in hedge_fund/runtime/reconciliation.py (`:104-136`, `:268-307`); choose bounded validity window (single review-session scale); record value in implementation-evidence.md
-- [ ] T020 [US4] Reject expired and field-less receipts in verification in hedge_fund/runtime/reconciliation.py (`:678-699` and the intent-receipt verifier), preserving digest rebinding
+- [x] T019 [US4] Add issued_at/valid_until (recorded clock) at issuance for both receipt types in hedge_fund/runtime/reconciliation.py (`:104-136`, `:268-307`); choose bounded validity window (single review-session scale); record value in implementation-evidence.md — 30 minutes.
+- [x] T020 [US4] Reject expired and field-less receipts in verification in hedge_fund/runtime/reconciliation.py (`:678-699` and the intent-receipt verifier), preserving digest rebinding
 
 **Checkpoint**: all four stories green; T140 semantics satisfied
 
@@ -114,11 +114,11 @@
 
 ## Phase 7: Polish & Cross-Cutting Concerns
 
-- [ ] T021 [P] Cadence regression subset (`pytest hedge_fund/paper/test_tick.py -q -k "weekly or daily or session"`) — pre-existing tests pass unmodified (FR-007)
-- [ ] T022 [P] PR #11 writer-safety regression subset (`pytest hedge_fund/paper/test_ledger.py hedge_fund/paper/test_tick.py -q`) — dedup/safe-abort/intent-fence tests pass unmodified
-- [ ] T023 Full targeted slice green: `poetry run pytest hedge_fund/paper/test_ledger.py hedge_fund/paper/test_tick.py hedge_fund/runtime/test_reconciliation.py hedge_fund/runtime/test_writer_map.py hedge_fund/web/test_recovery.py -q` (+ frontend jest if paper.tsx touched)
-- [ ] T024 Style gate: black --check, isort --check, flake8 on changed files (line-length 420)
-- [ ] T025 Complete specs/007-rb3-halt-recovery/implementation-evidence.md: per-task results, exact commands, durations, platform, fixture provenance (evidence contract)
+- [x] T021 [P] Cadence regression subset (`pytest hedge_fund/paper/test_tick.py -q -k "weekly or daily or session"`) — 16 passed, 113 deselected (FR-007)
+- [x] T022 [P] PR #11 writer-safety regression subset (`pytest hedge_fund/paper/test_ledger.py hedge_fund/paper/test_tick.py -q`) — 216 passed. T012's default work gate initially blocked existing redo supersession; redo now admits outstanding tick intents while retaining the other recovery blockers.
+- [ ] T023 Full targeted slice green: `poetry run pytest hedge_fund/paper/test_ledger.py hedge_fund/paper/test_tick.py hedge_fund/runtime/test_reconciliation.py hedge_fund/runtime/test_writer_map.py hedge_fund/web/test_recovery.py -q` (+ frontend jest if paper.tsx touched) — FAIL: writer-map scan found five callsites in unchanged modules; details in implementation-evidence.md.
+- [x] T024 Style gate: black --check, isort --check, flake8 on changed files (line-length 420) — PASS with E203 compatibility ignore; bare flake8 reports two unchanged E203 lines.
+- [x] T025 Complete specs/007-rb3-halt-recovery/implementation-evidence.md: per-task results, exact commands, durations, platform, fixture provenance (evidence contract)
 - [ ] T026 Isolated full suite `poetry run pytest hedge_fund -q` (~40 min, alone); record any failure vs pre-change baseline per Principle III; BLOCKED/INCONCLUSIVE is not PASS
 
 ---

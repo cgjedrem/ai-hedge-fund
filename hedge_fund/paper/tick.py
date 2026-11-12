@@ -604,7 +604,7 @@ def _redo(
                 raise FundHalted(f"{deployed.name} is halted")
             if deployed.spec.approval_required:
                 _verified_redo_approval(ledger, before, superseded)
-            ledger.require_ready_for_work(state, approval_required=deployed.spec.approval_required)
+            ledger.require_ready_for_work(state, approval_required=deployed.spec.approval_required, allow_tick_intents=True)
             redo_id = ledger.begin_redo(
                 superseded,
                 request_id=request_id,

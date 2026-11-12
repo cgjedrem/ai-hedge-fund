@@ -521,13 +521,16 @@ def test_resume_refuses_unresolved_tick_intent(tmp_path):
     assert not any(event["kind"] == "resume" for event in ledger.events())
 
 
-def test_intent_resolution_remains_available_while_work_gate_denies(owned_deployed_ledger):
+def test_intent_resolution_remains_available_while_work_gate_denies(owned_deployed_ledger, monkeypatch):
+    import hedge_fund.paper.ledger as ledger_module
     from hedge_fund.paper.deployed import load_deployed
     from hedge_fund.runtime.reconciliation import (
         build_tick_intent_reconciliation_snapshot,
         TickIntentReconciliationConfirmation,
     )
 
+    recorded_at = "2024-06-03T00:00:00+00:00"
+    monkeypatch.setattr(ledger_module, "_now", lambda: recorded_at)
     ledger, admission, spec = owned_deployed_ledger
     request_id = "crashed-tick-for-work-gate"
     request_digest = ledger.tick_request_digest(request_id, expected_head=None, session=None)
@@ -567,6 +570,14 @@ def test_intent_resolution_remains_available_while_work_gate_denies(owned_deploy
 
     assert receipt_id
     assert ledger.unresolved_recovery_state().tick_intents == ()
+    resolved = next(event for event in ledger.events() if event.get("kind") == "tick_intent_resolved")
+    assert resolved["receipt"]["issued_at"] == recorded_at
+    assert resolved["receipt"]["valid_until"] == "2024-06-03T00:30:00+00:00"
+    monkeypatch.setattr(ledger_module, "_now", lambda: "2024-06-03T00:31:00+00:00")
+    assert ledger.unresolved_recovery_state().tick_intents == ()
+    with _ledger_write_lane(admission):
+        replayed = ledger.reconcile_tick_intent(spec.capital, confirmation=confirmation, operator="web")
+    assert replayed == receipt_id
     ledger.require_ready_for_work(ledger.replay(spec.capital, full=True), approval_required=False)
 
 

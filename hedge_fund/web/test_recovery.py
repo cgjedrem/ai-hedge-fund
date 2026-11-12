@@ -113,6 +113,51 @@ def test_web_resume_rejects_preview_after_local_book_changes(write_client, demo_
     assert not any(event["kind"] in {"reconciliation", "resume"} for event in ledger.events())
 
 
+def test_web_resume_rechecks_book_after_receipt_issuance(write_client, demo_root, monkeypatch):
+    client, ledger = _failed_web_tick(write_client, demo_root)
+    headers = write_client[1]
+    preview_response = client.get(
+        "/api/paper/demo-quality/reconciliation",
+        headers={"host": "127.0.0.1"},
+    )
+    assert preview_response.status_code == 200
+    preview = preview_response.json()["preview"]
+    confirmation = {
+        "request_id": "recover-web-rebind-1",
+        "failure_id": preview["failure_id"],
+        "preview_digest": preview["preview_digest"],
+        "decision": _DECISION,
+    }
+    original_log_event = Ledger.log_event
+    original_cash = PaperBroker.cash
+    receipt_issued = []
+
+    def append_then_change_book(self, kind, **fields):
+        result = original_log_event(self, kind, **fields)
+        if kind == "reconciliation" and fields["receipt"]["request_id"] == confirmation["request_id"] and not receipt_issued:
+            receipt_issued.append(True)
+        return result
+
+    def change_book_after_issue(self):
+        cash = original_cash(self)
+        return cash - 1 if receipt_issued else cash
+
+    monkeypatch.setattr(Ledger, "log_event", append_then_change_book)
+    monkeypatch.setattr(PaperBroker, "cash", change_book_after_issue)
+    resumed = client.post(
+        "/api/paper/demo-quality/resume",
+        headers=headers,
+        json=confirmation,
+    )
+
+    assert receipt_issued == [True]
+    assert resumed.status_code == 423
+    assert resumed.json()["code"] == "reconciliation-required"
+    assert sum(event["kind"] == "reconciliation" for event in ledger.events()) == 1
+    assert ledger.halted() == "synthetic ambiguous tick"
+    assert not any(event["kind"] in {"resume", "resume_effect_intent"} for event in ledger.events())
+
+
 def test_web_resume_permission_denies_unresolved_resume_intent(write_client, demo_root):
     client, _headers = write_client
     name = "demo-quality"
