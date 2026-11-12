@@ -38,7 +38,7 @@
 
 ### Tests for User Story 1
 
-- [ ] T007 [P] [US1] trust-single-writer accepts valid Windows scope and denies tampered scope / stale challenge / inventory mismatch in hedge_fund/runtime/test_write_authority.py
+- [X] T007 [P] [US1] trust-single-writer accepts valid Windows scope and denies tampered scope / stale challenge / inventory mismatch in hedge_fund/runtime/test_write_authority.py
 - [ ] T008 [P] [US1] TUI admitted-write tests: enrolled+trusted root write succeeds with held owner/lane and operation-bound authorization; unenrolled or untrusted root still denied in hedge_fund/tui/test_admission_regressions.py (extend)
 
 ### Implementation for User Story 1

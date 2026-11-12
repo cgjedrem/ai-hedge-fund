@@ -54,3 +54,11 @@ Failures 2–10 and 13 expected `operator-single-writer-acknowledgement-required
   - Black (`--line-length 420`), isort (`--profile black`), flake8 (`--max-line-length=420 --extend-ignore=E203`), and `git diff --check` passed on changed Python files.
 - **Unrelated CLI baseline**: current-diff selection `py -m poetry run pytest hedge_fund/test_run.py -k 'test_saxo_demo_execution_refuses_before_ledger_or_execution or test_saxo_guard_preserves_nonexecuting_verdicts_and_oauth_paper_approvals' -q` — **10 failed, 94 deselected in 0.76s**. Every case fails at `monkeypatch.setattr(run, "apply_credentials", ...)` because `hedge_fund.run` lacks that attribute. Reproduced all same 10 IDs on clean pre-change revision `b35b0d0` — **10 failed, 93 deselected in 2.71s**. Current CLI diff does not add/remove this symbol.
 - **Progress**: T004–T006 PASS on synthetic roots. Writer-map gates remain documented baseline failures; Saxo test failures reproduced on pre-change revision.
+
+## T007 - Windows scope and trust challenge validation
+
+- **Identity**: revision `59bde80d54fa8e7404a82e79b3ce74c794c5e040`; clean worktree; dirty-diff SHA-256 `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`; observed `2026-11-12T13:36:44.4849574+01:00`.
+- **Environment / artifact**: Windows `10.0.26200`, Python `3.11.15` 64-bit, pytest `7.4.4`, Poetry environment. Tests imported the worktree source directly; no wheel was built.
+- **Scenarios**: Windows scope binds machine, account SID, and root volume; a changed Windows SID invalidates trust and requires a fresh acknowledgement; challenges cannot cross roots or survive inventory drift; expired reviews deny trust.
+- **Command**: `py -m poetry run pytest hedge_fund/runtime/test_write_authority.py::test_windows_runtime_scope_binds_machine_account_and_volume hedge_fund/runtime/test_write_authority.py::test_windows_trust_scope_mismatch_requires_fresh_review hedge_fund/runtime/test_write_authority.py::test_trust_challenge_cannot_cross_roots_or_survive_inventory_drift hedge_fund/runtime/test_write_authority.py::test_single_writer_review_expires_before_acknowledgement -q` - **4 passed in 1.97s**.
+- **Progress**: T007 PASS. Existing Windows identity and trust-path tests plus cross-root, inventory-drift, and stale-review denial tests pass on synthetic roots.
