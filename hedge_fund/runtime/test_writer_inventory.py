@@ -125,6 +125,8 @@ WRITER_INVENTORY: dict[tuple[str, str, str], tuple[int, str]] = {
     ("runtime/handover.py", "_write_private_json", "write_bytes"): (1, BOOTSTRAP),
     ("runtime/handover.py", "_write_attestation_artifact", "mkdir"): (1, BOOTSTRAP),
     ("runtime/handover.py", "_write_source_evidence_bundle", "prepare_private_storage"): (1, BOOTSTRAP),
+    ("runtime/handover.py", "attest_stale_marker", "mkdir"): (1, BOOTSTRAP),
+    ("runtime/handover.py", "attest_stale_marker", "rename_file"): (1, BOOTSTRAP),
     ("runtime/handover.py", "PaperInventoryTransition.mkdir", "mkdir"): (2, PAPER_LANES),
     ("runtime/handover.py", "PaperInventoryTransition.rename_file", "rename_file"): (1, PAPER_LANES),
     ("runtime/handover.py", "PaperInventoryTransition.write_bytes", "write_bytes"): (1, PAPER_LANES),

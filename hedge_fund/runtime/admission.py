@@ -15,14 +15,7 @@ from contextlib import contextmanager, ExitStack
 from pathlib import Path
 from typing import Callable, Iterator, TypeVar
 
-from hedge_fund.runtime.root import (
-    ensure_unique_resource_name,
-    PRIVATE_ROOT,
-    RootConfigurationError,
-    RootContext,
-    RootPathError,
-    UnsupportedFilesystemError,
-)
+from hedge_fund.runtime.root import ensure_unique_resource_name, PRIVATE_ROOT, RootConfigurationError, RootContext, RootPathError, UnsupportedFilesystemError
 
 PROTOCOL_VERSION = 1
 LOCK_DIRECTORY = f"{PRIVATE_ROOT}/admission/v{PROTOCOL_VERSION}"
@@ -31,6 +24,7 @@ OPERATION_SERVICE_LANE = "service:operations"
 MAX_LOCK_WAIT_SECONDS = 5.0
 MAX_CONTROL_WAIT_SECONDS = 0.5
 _LOCK_POLL_SECONDS = 0.01
+_PROTECTED_RESOURCE_NAMES = frozenset({"umbrella", "watchtower", "watchtower-weekly"})
 _LOCK_STATE = threading.local()
 _LOCAL_LANES_GUARD = threading.Lock()
 _LOCAL_LANES: dict[tuple[tuple[int, ...], str], deque[threading.Event]] = {}
@@ -219,11 +213,7 @@ RootParticipantLease = RootOwnerLease
 
 def _require_protocol_native_authority(root: RootContext) -> None:
     """Enrollment alone is not write authority."""
-    from hedge_fund.runtime.handover import (
-        HandoverError,
-        require_write_authority,
-        WriteAuthorityDenied,
-    )
+    from hedge_fund.runtime.handover import HandoverError, require_write_authority, WriteAuthorityDenied
 
     try:
         require_write_authority(root)
@@ -912,11 +902,7 @@ def require_paper_write_lanes(
         return False
 
     try:
-        from hedge_fund.runtime.handover import (
-            require_enrollment,
-            root_is_enrolled,
-            verify_root_inventory,
-        )
+        from hedge_fund.runtime.handover import protected_fund_is_authorized, require_enrollment, root_is_enrolled, verify_root_inventory
 
         if not root_is_enrolled(root):
             for marker in (LOCK_DIRECTORY, OWNER_LOCK_PATH):
@@ -938,6 +924,8 @@ def require_paper_write_lanes(
             require_enrollment(root)
         except Exception as exc:
             raise OwnershipUnknown("Paper root enrollment is invalid.") from exc
+        if identity in _PROTECTED_RESOURCE_NAMES and not protected_fund_is_authorized(root, identity):
+            raise AdmissionError("Protected paper resource lacks a valid destination-bound attestation.")
         _require_protocol_native_authority(root)
         if verify_inventory:
             try:
@@ -956,6 +944,8 @@ def require_paper_write_lanes(
 def _resource_identity(identity: str) -> str:
     if not isinstance(identity, str):
         raise AdmissionError("deployment identity must be text")
+    if identity in _PROTECTED_RESOURCE_NAMES:
+        return identity
     try:
         return ensure_unique_resource_name(identity, [])
     except RootPathError as exc:

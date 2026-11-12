@@ -19,8 +19,8 @@ from hedge_fund.pipeline.session import code_version
 from hedge_fund.runtime.admission import AdmissionCoordinator, AdmissionError, LOCK_DIRECTORY, MAX_LOCK_WAIT_SECONDS, OWNER_LOCK_PATH, PROTOCOL_VERSION, require_paper_write_lanes, RootMigrationLease, RootOwnerLease, WriterConflict
 from hedge_fund.runtime.exclusion import out_of_band_exclusion_basis
 from hedge_fund.runtime.exclusion import UNPROVEN_REASON as EXCLUSION_UNPROVEN_REASON
-from hedge_fund.runtime.ownership import process_identity, ProcessIdentityError
-from hedge_fund.runtime.root import _handover_resource_access, _windows_current_user_sid, ensure_unique_resource_name, PRIVATE_ROOT, RootContext, RootPathError
+from hedge_fund.runtime.ownership import process_identity, process_is_running, ProcessIdentityError
+from hedge_fund.runtime.root import _handover_resource_access, _relative_parts, _windows_current_user_sid, ensure_unique_resource_name, PRIVATE_ROOT, RootContext, RootPathError
 
 HANDOVER_PATH = f"{PRIVATE_ROOT}/handover.json"
 RECOVERY_ROOT = f"{PRIVATE_ROOT}/recoveries"
@@ -355,6 +355,12 @@ def require_enrollment(root: RootContext) -> dict[str, Any]:
             raise EnrollmentInvalid("relocation provenance is invalid")
         if any(not isinstance(provenance[key], str) or not _SHA256.fullmatch(provenance[key]) for key in provenance):
             raise EnrollmentInvalid("relocation provenance is invalid")
+    try:
+        _validate_enrollment_attestation_refs(root, record["heads"])
+    except EnrollmentInvalid:
+        raise
+    except (HandoverError, OSError, RootPathError) as exc:
+        raise EnrollmentInvalid("handover attestation inventory is invalid") from exc
     root.revalidate()
     return record
 
@@ -845,7 +851,9 @@ def inspect_attestation_state(root: RootContext) -> dict[str, Any]:
     if not isinstance(root, RootContext):
         raise TypeError("an explicit RootContext is required")
     artifacts = _list_attestation_artifacts(root)
-    source_evidence = _read_source_evidence_bundle(root)
+    relocation_state = _read_relocation_state(root)
+    source_binding = relocation_state["source_root_binding"] if relocation_state is not None else None
+    source_evidence = _read_source_evidence_bundle(root, source_binding=source_binding)
     source_digest = source_evidence["record_digest"] if source_evidence is not None else None
     if source_evidence is not None:
         blockers = source_evidence["blockers"]
@@ -853,10 +861,10 @@ def inspect_attestation_state(root: RootContext) -> dict[str, Any]:
         entries = _relocation_entries(root)
         blockers = _source_evidence_blockers(root, entries)
 
-    artifact_keys = {(artifact["kind"], artifact["subject"], artifact["source_evidence_digest"]) for artifact in artifacts}
     remaining = []
     for blocker in blockers:
-        if source_digest is not None and (blocker["kind"], blocker["subject"], source_digest) in artifact_keys:
+        matching = [artifact for artifact in artifacts if artifact["kind"] == blocker["kind"] and artifact["subject"] == blocker["subject"] and artifact["source_evidence_digest"] == source_digest]
+        if source_digest is not None and len(matching) == 1 and _attestation_resolves_blocker(root, matching[0], blocker, source_evidence):
             continue
         if source_digest is None:
             command = "handover inspect-source"
@@ -899,6 +907,26 @@ def inspect_attestation_state(root: RootContext) -> dict[str, Any]:
         "attestation_artifacts": artifacts,
         "remaining_blockers": remaining,
     }
+
+
+def _attestation_resolves_blocker(
+    root: RootContext,
+    artifact: dict[str, Any],
+    blocker: dict[str, Any],
+    source_evidence: dict[str, Any],
+) -> bool:
+    if artifact["source_evidence_digest"] != source_evidence["record_digest"] or artifact["kind"] != blocker["kind"] or artifact["subject"] != blocker["subject"]:
+        return False
+    try:
+        if artifact["kind"] == "protected-fund-inclusion":
+            if artifact["evidence"] != blocker["evidence"]:
+                return False
+            _validate_protected_fund_artifact(root, artifact, source_evidence=source_evidence)
+        else:
+            _validate_marker_retirement_artifact(root, artifact, source_evidence=source_evidence)
+    except HandoverError:
+        return False
+    return True
 
 
 def _list_attestation_artifacts(root: RootContext) -> list[dict[str, Any]]:
@@ -950,6 +978,7 @@ def _list_attestation_artifacts(root: RootContext) -> list[dict[str, Any]]:
                         raise HandoverError("attestation inventory exceeds its bound")
         except OSError as exc:
             raise HandoverError(f"attestation storage is unavailable ({type(exc).__name__})") from None
+    _validate_retired_marker_storage(root, artifacts)
     root.revalidate()
     return sorted(artifacts, key=lambda item: (item["kind"], item["subject"].casefold()))
 
@@ -969,6 +998,481 @@ def _write_attestation_artifact(root: RootContext, record: dict[str, Any]) -> st
     root.mkdir(directory, parents=True, mode=0o700)
     _write_private_json(root, relative, validated)
     return relative
+
+
+def attest_stale_marker(
+    root: RootContext,
+    *,
+    marker: str,
+    source_evidence_digest: str,
+    operator_statement: str,
+) -> dict[str, Any]:
+    if not isinstance(root, RootContext):
+        raise TypeError("an explicit RootContext is required")
+    if not isinstance(marker, str):
+        raise HandoverError("marker path is invalid")
+    try:
+        parts = _relative_parts(marker, allow_protected=True)
+    except RootPathError as exc:
+        raise HandoverError("marker path is invalid") from exc
+    if "/".join(parts) != marker or parts[0] not in RELOCATED_TOP_LEVEL or parts[-1] != "runner.pid":
+        raise HandoverError("marker path must name a copied runner.pid file")
+    if not isinstance(source_evidence_digest, str) or not _SHA256.fullmatch(source_evidence_digest):
+        raise HandoverError("source evidence digest is invalid")
+    if not isinstance(operator_statement, str) or not operator_statement.strip() or len(operator_statement) > 1024:
+        raise HandoverError("attestation operator statement is invalid")
+    root.revalidate()
+    if not root.verify_private_storage():
+        raise HandoverError("destination private storage is not verified")
+
+    try:
+        with RootMigrationLease.acquire(root, timeout=0):
+            state, source_evidence = _require_attestation_destination(root, source_evidence_digest)
+            blocker = _source_evidence_blocker(source_evidence, "stale-marker-retirement", marker)
+            existing = _read_attestation_artifact(root, kind="stale-marker-retirement", subject=marker)
+            if existing is not None:
+                _validate_marker_retirement_artifact(root, existing, source_evidence=source_evidence)
+                raise HandoverError(f"marker attestation already exists at {_attestation_path('stale-marker-retirement', marker)}")
+
+            try:
+                retired_info = root.file_info(_retired_marker_path(marker))
+            except FileNotFoundError:
+                retired_info = None
+            if retired_info is not None:
+                raise HandoverError("retired marker exists without a valid attestation artifact; destination needs offline recovery")
+
+            entries = _relocation_entries(root)
+            if marker not in entries:
+                raise HandoverError("destination marker is missing; inspect the copied root before retrying")
+            _validate_marker_source_evidence(blocker)
+            marker_bytes = _read_destination_marker(root, marker, blocker["evidence"])
+            liveness = _require_marker_process_stopped(blocker["evidence"]["pid"])
+            _validate_relocation_entries_with_retired_markers(root, state, source_evidence, entries=entries)
+
+            retired_path = _retired_marker_path(marker)
+            evidence = {
+                **blocker["evidence"],
+                "liveness": liveness,
+                "retired_marker_path": retired_path,
+            }
+            record = _new_attestation_artifact(
+                root,
+                kind="stale-marker-retirement",
+                subject=marker,
+                evidence=evidence,
+                source_evidence_digest=source_evidence["record_digest"],
+                operator_statement=operator_statement,
+            )
+            _require_marker_process_stopped(blocker["evidence"]["pid"])
+            try:
+                root.file_info(retired_path)
+            except FileNotFoundError:
+                pass
+            else:
+                raise HandoverError("retired marker path already exists; destination needs offline recovery")
+
+            root.mkdir(RETIRED_MARKER_ROOT, parents=True, mode=0o700)
+            marker_moved = False
+            try:
+                with _handover_resource_access(root, allow_writes=True, allow_unattested_protected_writes=True):
+                    root.rename_file(marker, retired_path)
+                marker_moved = True
+                retired_bytes = root.read_bytes(retired_path)
+                if retired_bytes != marker_bytes or hashlib.sha256(retired_bytes).hexdigest() != blocker["evidence"]["sha256"]:
+                    raise HandoverError("retired marker bytes differ from reviewed source evidence")
+                artifact_path = _write_attestation_artifact(root, record)
+                _validate_marker_retirement_artifact(root, record, source_evidence=source_evidence)
+            except BaseException as exc:
+                artifact_path = _attestation_path("stale-marker-retirement", marker)
+                rollback_errors = []
+                try:
+                    root.file_info(artifact_path)
+                except FileNotFoundError:
+                    pass
+                else:
+                    try:
+                        root.unlink_file(artifact_path)
+                    except BaseException as rollback_error:
+                        rollback_errors.append(rollback_error)
+                if marker_moved:
+                    try:
+                        with _handover_resource_access(root, allow_writes=True, allow_unattested_protected_writes=True):
+                            root.rename_file(retired_path, marker)
+                    except BaseException as rollback_error:
+                        rollback_errors.append(rollback_error)
+                if rollback_errors:
+                    raise HandoverError("marker attestation failed and destination rollback is incomplete") from exc
+                raise
+            return {
+                "state": "attested",
+                "kind": record["kind"],
+                "subject": marker,
+                "source_evidence_digest": record["source_evidence_digest"],
+                "artifact_path": artifact_path,
+            }
+    except WriterConflict as exc:
+        raise HandoverError("another destination participant is active") from exc
+
+
+def attest_protected_fund(
+    root: RootContext,
+    *,
+    fund: str,
+    source_evidence_digest: str,
+    operator_statement: str,
+) -> dict[str, Any]:
+    if not isinstance(root, RootContext):
+        raise TypeError("an explicit RootContext is required")
+    if not isinstance(fund, str) or fund not in _PROTECTED_RESOURCE_NAMES:
+        raise HandoverError("fund name must match a protected original identity")
+    if not isinstance(source_evidence_digest, str) or not _SHA256.fullmatch(source_evidence_digest):
+        raise HandoverError("source evidence digest is invalid")
+    if not isinstance(operator_statement, str) or not operator_statement.strip() or len(operator_statement) > 1024:
+        raise HandoverError("attestation operator statement is invalid")
+    root.revalidate()
+    if not root.verify_private_storage():
+        raise HandoverError("destination private storage is not verified")
+
+    try:
+        with RootMigrationLease.acquire(root, timeout=0):
+            state, source_evidence = _require_attestation_destination(root, source_evidence_digest)
+            blocker = _source_evidence_blocker(source_evidence, "protected-fund-inclusion", fund)
+            _validate_protected_fund_source_evidence(fund, blocker)
+            existing = _read_attestation_artifact(root, kind="protected-fund-inclusion", subject=fund)
+            if existing is not None:
+                _validate_protected_fund_artifact(root, existing, source_evidence=source_evidence)
+                raise HandoverError(f"protected-fund attestation already exists at {_attestation_path('protected-fund-inclusion', fund)}")
+
+            evidence = blocker["evidence"]
+            _validate_destination_protected_fund(root, fund, evidence)
+            _validate_relocation_entries_with_retired_markers(root, state, source_evidence)
+            record = _new_attestation_artifact(
+                root,
+                kind="protected-fund-inclusion",
+                subject=fund,
+                evidence=evidence,
+                source_evidence_digest=source_evidence["record_digest"],
+                operator_statement=operator_statement,
+            )
+            artifact_path = _write_attestation_artifact(root, record)
+            _validate_protected_fund_artifact(root, record, source_evidence=source_evidence)
+            return {
+                "state": "attested",
+                "kind": record["kind"],
+                "subject": fund,
+                "source_evidence_digest": record["source_evidence_digest"],
+                "artifact_path": artifact_path,
+            }
+    except WriterConflict as exc:
+        raise HandoverError("another destination participant is active") from exc
+
+
+def _validate_protected_fund_source_evidence(fund: str, blocker: dict[str, Any]) -> None:
+    evidence = blocker["evidence"]
+    if set(evidence) != {"directory", "fund_file_sha256", "fund_file_size"} or evidence["directory"] != f"paper/{fund}" or not isinstance(evidence["fund_file_sha256"], str) or not _SHA256.fullmatch(evidence["fund_file_sha256"]) or type(evidence["fund_file_size"]) is not int or evidence["fund_file_size"] < 0:
+        raise HandoverError("protected-fund source evidence is invalid")
+
+
+def _validate_destination_protected_fund(root: RootContext, fund: str, evidence: dict[str, Any]) -> None:
+    from hedge_fund.paper.deployed import FUND_FILE, load_deployed
+
+    relative = f"paper/{fund}/{FUND_FILE}"
+    try:
+        with _handover_resource_access(root):
+            info = root.file_info(relative)
+            data = root.read_bytes(relative)
+        deployed = load_deployed(root.path / "paper" / fund)
+    except FileNotFoundError:
+        raise HandoverError("protected fund original name is missing from the destination copy") from None
+    except (OSError, ValueError, RootPathError) as exc:
+        raise HandoverError(f"protected fund destination is unreadable ({type(exc).__name__})") from None
+    if deployed.name != fund or info.size != evidence["fund_file_size"] or len(data) != info.size or hashlib.sha256(data).hexdigest() != evidence["fund_file_sha256"]:
+        raise HandoverError("protected fund identity or file differs from source evidence")
+
+
+def _validate_protected_fund_artifact(
+    root: RootContext,
+    record: dict[str, Any],
+    *,
+    source_evidence: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    artifact = _validate_attestation_artifact(root, record, kind="protected-fund-inclusion")
+    if artifact["subject"] not in _PROTECTED_RESOURCE_NAMES:
+        raise HandoverError("protected-fund attestation subject is invalid")
+    evidence = artifact["evidence"]
+    if set(evidence) != {"directory", "fund_file_sha256", "fund_file_size"} or evidence.get("directory") != f"paper/{artifact['subject']}" or not isinstance(evidence.get("fund_file_sha256"), str) or not _SHA256.fullmatch(evidence["fund_file_sha256"]) or type(evidence.get("fund_file_size")) is not int or evidence["fund_file_size"] < 0:
+        raise HandoverError("protected-fund attestation evidence is invalid")
+    if source_evidence is not None:
+        blocker = _source_evidence_blocker(source_evidence, "protected-fund-inclusion", artifact["subject"])
+        _validate_protected_fund_source_evidence(artifact["subject"], blocker)
+        if artifact["source_evidence_digest"] != source_evidence["record_digest"] or evidence != blocker["evidence"]:
+            raise HandoverError("protected-fund attestation does not match source evidence")
+    _validate_destination_protected_fund(root, artifact["subject"], evidence)
+    return artifact
+
+
+def protected_fund_is_authorized(root: RootContext, fund: str) -> bool:
+    if not isinstance(root, RootContext) or not isinstance(fund, str) or fund not in _PROTECTED_RESOURCE_NAMES:
+        return False
+    try:
+        state = _read_relocation_state(root)
+        if state is None or state["state"] != "copied" or not root.verify_private_storage():
+            return False
+        source_evidence = _read_source_evidence_bundle(root, source_binding=state["source_root_binding"])
+        if not _source_evidence_matches_relocation_state(source_evidence, state):
+            return False
+        artifact = _read_attestation_artifact(root, kind="protected-fund-inclusion", subject=fund)
+        if artifact is None:
+            return False
+        _validate_protected_fund_artifact(root, artifact, source_evidence=source_evidence)
+        return True
+    except Exception:
+        return False
+
+
+def _require_attestation_destination(root: RootContext, source_evidence_digest: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    if _record_exists(root):
+        raise HandoverError("attestations require an unenrolled copied destination")
+    state = _read_relocation_state(root)
+    if state is None or state["state"] != "copied":
+        raise HandoverError("attestations require a completed relocate-copy")
+    source_evidence = _read_source_evidence_bundle(root, source_binding=state["source_root_binding"])
+    if not _source_evidence_matches_relocation_state(source_evidence, state):
+        raise HandoverError("source evidence is missing or differs from the copied destination")
+    if source_evidence_digest != source_evidence["record_digest"]:
+        raise HandoverError("source evidence digest mismatch; inspect-source and retry with the destination bundle digest")
+    return state, source_evidence
+
+
+def _source_evidence_blocker(source_evidence: dict[str, Any], kind: str, subject: str) -> dict[str, Any]:
+    matches = [item for item in source_evidence["blockers"] if item["kind"] == kind and item["subject"] == subject]
+    if len(matches) != 1:
+        raise HandoverError("source evidence does not contain one matching attestation blocker")
+    return matches[0]
+
+
+def _validate_marker_source_evidence(blocker: dict[str, Any]) -> None:
+    evidence = blocker["evidence"]
+    if set(evidence) != {"content_class", "pid", "sha256", "size"} or evidence["content_class"] != "pid" or type(evidence["pid"]) is not int or evidence["pid"] <= 0 or not isinstance(evidence["sha256"], str) or not _SHA256.fullmatch(evidence["sha256"]) or type(evidence["size"]) is not int or evidence["size"] < 0:
+        raise HandoverError("source marker evidence has no verifiable process identity")
+
+
+def _read_destination_marker(root: RootContext, marker: str, evidence: dict[str, Any]) -> bytes:
+    try:
+        with _handover_resource_access(root):
+            info = root.file_info(marker)
+            data = root.read_bytes(marker)
+    except FileNotFoundError:
+        raise HandoverError("destination marker is missing; no attestation was recorded") from None
+    except (OSError, RootPathError) as exc:
+        raise HandoverError(f"destination marker is unreadable ({type(exc).__name__})") from None
+    if info.size != evidence["size"] or len(data) != info.size or hashlib.sha256(data).hexdigest() != evidence["sha256"]:
+        raise HandoverError("destination marker differs from source evidence; inspect-source and relocate-copy again")
+    return data
+
+
+def _require_marker_process_stopped(pid: int) -> dict[str, Any]:
+    try:
+        running = process_is_running(pid)
+    except (OSError, ProcessIdentityError, ValueError):
+        raise HandoverError("marker process liveness cannot be verified; marker remains unchanged") from None
+    if type(running) is not bool:
+        raise HandoverError("marker process liveness cannot be verified; marker remains unchanged")
+    if running:
+        raise HandoverError("marker identifies a live process; destination marker remains unchanged")
+    return {
+        "status": "not-running",
+        "method": "native-process-identity",
+        "checked_at": datetime.now(timezone.utc).isoformat(timespec="microseconds"),
+    }
+
+
+def _retired_marker_path(subject: str) -> str:
+    return f"{RETIRED_MARKER_ROOT}/{hashlib.sha256(subject.encode('utf-8')).hexdigest()}.marker"
+
+
+def _validate_marker_retirement_artifact(
+    root: RootContext,
+    record: dict[str, Any],
+    *,
+    source_evidence: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    artifact = _validate_attestation_artifact(root, record, kind="stale-marker-retirement")
+    evidence = artifact["evidence"]
+    liveness = evidence.get("liveness") if isinstance(evidence, dict) else None
+    if (
+        not isinstance(evidence, dict)
+        or set(evidence) != {"content_class", "pid", "sha256", "size", "liveness", "retired_marker_path"}
+        or evidence.get("content_class") != "pid"
+        or type(evidence.get("pid")) is not int
+        or evidence["pid"] <= 0
+        or not isinstance(evidence.get("sha256"), str)
+        or not _SHA256.fullmatch(evidence["sha256"])
+        or type(evidence.get("size")) is not int
+        or evidence["size"] < 0
+        or not isinstance(liveness, dict)
+        or set(liveness) != {"status", "method", "checked_at"}
+        or liveness.get("status") != "not-running"
+        or liveness.get("method") != "native-process-identity"
+        or not _valid_timestamp(liveness.get("checked_at"))
+        or evidence.get("retired_marker_path") != _retired_marker_path(artifact["subject"])
+    ):
+        raise HandoverError("stale-marker attestation evidence is invalid")
+    if source_evidence is not None:
+        blocker = _source_evidence_blocker(source_evidence, "stale-marker-retirement", artifact["subject"])
+        _validate_marker_source_evidence(blocker)
+        if artifact["source_evidence_digest"] != source_evidence["record_digest"] or any(evidence[key] != value for key, value in blocker["evidence"].items()):
+            raise HandoverError("stale-marker attestation does not match source evidence")
+
+    retired_path = evidence["retired_marker_path"]
+    try:
+        info = root.file_info(retired_path)
+        retired_bytes = root.read_bytes(retired_path)
+    except (OSError, RootPathError) as exc:
+        raise HandoverError(f"retired marker is unavailable ({type(exc).__name__})") from None
+    if info.size != evidence["size"] or len(retired_bytes) != info.size or hashlib.sha256(retired_bytes).hexdigest() != evidence["sha256"]:
+        raise HandoverError("retired marker bytes do not match attestation evidence")
+    try:
+        with _handover_resource_access(root):
+            root.file_info(artifact["subject"])
+    except FileNotFoundError:
+        pass
+    else:
+        raise HandoverError("attested marker remains active in the destination copy")
+    return artifact
+
+
+def _validate_retired_marker_storage(root: RootContext, artifacts: list[dict[str, Any]]) -> None:
+    marker_artifacts = [artifact for artifact in artifacts if artifact["kind"] == "stale-marker-retirement"]
+    expected_names = {Path(_retired_marker_path(artifact["subject"])).name for artifact in marker_artifacts}
+    directory = root.path.joinpath(*Path(RETIRED_MARKER_ROOT).parts)
+    try:
+        info = directory.lstat()
+    except FileNotFoundError:
+        if expected_names:
+            raise HandoverError("retired marker storage is missing")
+        return
+    if _is_reparse_point(directory) or not stat.S_ISDIR(info.st_mode):
+        raise HandoverError("retired marker storage is not a regular directory")
+    try:
+        with os.scandir(directory) as entries:
+            observed = set()
+            for entry in entries:
+                if entry.name not in expected_names or not entry.is_file(follow_symlinks=False):
+                    raise HandoverError("retired marker storage contains an unreferenced entry")
+                observed.add(entry.name)
+    except OSError as exc:
+        raise HandoverError(f"retired marker storage is unavailable ({type(exc).__name__})") from None
+    if observed != expected_names:
+        raise HandoverError("retired marker storage does not match its attestation artifacts")
+    for artifact in marker_artifacts:
+        _validate_marker_retirement_artifact(root, artifact)
+
+
+def _validated_destination_attestations(root: RootContext) -> tuple[dict[str, Any] | None, dict[tuple[str, str], dict[str, Any]]]:
+    state = _read_relocation_state(root)
+    source_binding = state["source_root_binding"] if state is not None else None
+    source_evidence = _read_source_evidence_bundle(root, source_binding=source_binding)
+    if state is None:
+        if source_evidence is not None:
+            raise HandoverError("source evidence is not bound to a completed relocation copy")
+    elif state["source_evidence_digest"] is None:
+        if source_evidence is not None:
+            raise HandoverError("source evidence differs from relocation state")
+    elif not _source_evidence_matches_relocation_state(source_evidence, state):
+        raise HandoverError("source evidence is missing or differs from relocation state")
+
+    artifacts = _list_attestation_artifacts(root)
+    if artifacts and source_evidence is None:
+        raise HandoverError("attestation artifacts require destination-bound source evidence")
+    indexed = {}
+    for artifact in artifacts:
+        if source_evidence is None:
+            raise HandoverError("attestation artifacts require destination-bound source evidence")
+        blocker = _source_evidence_blocker(source_evidence, artifact["kind"], artifact["subject"])
+        if not _attestation_resolves_blocker(root, artifact, blocker, source_evidence):
+            raise HandoverError("attestation artifact does not resolve its source-evidence blocker")
+        indexed[(artifact["kind"], artifact["subject"])] = artifact
+    if source_evidence is not None:
+        for blocker in source_evidence["blockers"]:
+            artifact = indexed.get((blocker["kind"], blocker["subject"]))
+            if artifact is None or not _attestation_resolves_blocker(root, artifact, blocker, source_evidence):
+                raise HandoverError(f"source blocker remains unresolved: {blocker['subject']}")
+    return source_evidence, indexed
+
+
+def _attestation_reference(artifact: dict[str, Any]) -> dict[str, str]:
+    return {
+        "kind": artifact["kind"],
+        "subject": artifact["subject"],
+        "record_digest": artifact["record_digest"],
+    }
+
+
+def _attestation_inventory_key(kind: str, subject: str) -> str:
+    if kind != "stale-marker-retirement" or not isinstance(subject, str) or not subject:
+        raise HandoverError("attestation inventory identity is invalid")
+    return f"@attestation/{kind}/{hashlib.sha256(subject.encode('utf-8')).hexdigest()}"
+
+
+def _head_inventory_projection(heads: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    projection = {}
+    for key, entry in heads.items():
+        if key.startswith("@attestation/"):
+            continue
+        projection[key] = {field: value for field, value in entry.items() if field != "attestation_refs"}
+    return projection
+
+
+def _validate_enrollment_attestation_refs(root: RootContext, heads: dict[str, dict[str, Any]]) -> None:
+    _, attestations = _validated_destination_attestations(root)
+    expected = {}
+    for (kind, subject), artifact in attestations.items():
+        if kind == "protected-fund-inclusion":
+            expected[subject] = _attestation_reference(artifact)
+        else:
+            key = _attestation_inventory_key(kind, subject)
+            expected[key] = {
+                "kind": kind,
+                "subject": subject,
+                "attestation_digest": artifact["record_digest"],
+            }
+
+    observed = {}
+    for key, entry in heads.items():
+        if key.startswith("@attestation/"):
+            observed[key] = entry
+        elif "attestation_refs" in entry:
+            observed[key] = entry["attestation_refs"][0]
+    if observed != expected:
+        raise EnrollmentInvalid("handover attestation references do not match destination artifacts")
+
+
+def _validate_relocation_entries_with_retired_markers(
+    root: RootContext,
+    state: dict[str, Any],
+    source_evidence: dict[str, Any],
+    *,
+    entries: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, dict[str, Any]]:
+    reconstructed = dict(entries if entries is not None else _relocation_entries(root))
+    for blocker in source_evidence["blockers"]:
+        if blocker["kind"] != "stale-marker-retirement" or blocker["subject"] in reconstructed:
+            continue
+        artifact = _read_attestation_artifact(root, kind="stale-marker-retirement", subject=blocker["subject"])
+        if artifact is None:
+            continue
+        artifact = _validate_marker_retirement_artifact(root, artifact, source_evidence=source_evidence)
+        marker_evidence = artifact["evidence"]
+        reconstructed[blocker["subject"]] = {
+            "type": "file",
+            "size": marker_evidence["size"],
+            "sha256": marker_evidence["sha256"],
+        }
+    reconstructed = dict(sorted(reconstructed.items()))
+    if _digest(reconstructed) != state["source_content_digest"]:
+        raise HandoverError("destination copy content changed; inspect-source and relocate-copy again")
+    return reconstructed
 
 
 def _remove_single_writer_challenge(root: RootContext) -> None:
@@ -1626,7 +2130,7 @@ def relocate_copy(
                     raise HandoverError("incomplete relocation target contains unrelated data")
                 _validate_relocation_target_entries(target, before["entries"], allow_partial=True)
 
-            with _handover_resource_access(source), _handover_resource_access(target, allow_writes=True):
+            with _handover_resource_access(source), _handover_resource_access(target, allow_writes=True, allow_unattested_protected_writes=True):
                 for relative, entry in before["entries"].items():
                     if entry["type"] == "dir":
                         target.mkdir(relative, parents=True)
@@ -1686,11 +2190,11 @@ def relocate_finalize(target: RootContext) -> dict[str, Any]:
                 evidence = _read_source_evidence_bundle(target, source_binding=state["source_root_binding"])
                 if not _source_evidence_matches_relocation_state(evidence, state):
                     raise HandoverError("source evidence is missing or changed; inspect-source and relocate-copy again")
-            actual_entries = _relocation_entries(target)
-            if _digest(actual_entries) != state["source_content_digest"]:
+                _validate_relocation_entries_with_retired_markers(target, state, evidence)
+            elif _digest(_relocation_entries(target)) != state["source_content_digest"]:
                 raise HandoverError("copied relocation content changed; inspect and relocate again")
             heads = build_head_inventory(target)
-            if _digest(heads) != state["source_inventory_digest"]:
+            if _digest(_head_inventory_projection(heads)) != state["source_inventory_digest"]:
                 raise HandoverError("relocated ledger heads do not match the source")
             record = _new_record(
                 target,
@@ -1938,6 +2442,17 @@ def _build_head_inventory(root: RootContext, *, allow_relocation_blockers: bool 
     if type(allow_relocation_blockers) is not bool:
         raise TypeError("allow_relocation_blockers must be a bool")
     root.revalidate()
+    if not allow_relocation_blockers and _has_legacy_runner_pid(root.path):
+        raise HandoverError("runner.pid is present; unknown owners block handover")
+    if allow_relocation_blockers:
+        source_evidence = None
+        attestations = {}
+    else:
+        source_evidence, attestations = _validated_destination_attestations(root)
+        if source_evidence is None:
+            blockers = _source_evidence_blockers(root, _relocation_entries(root))
+            if any(blocker["kind"] == "stale-marker-retirement" for blocker in blockers):
+                raise HandoverError("runner.pid is present; unknown owners block handover")
     paper = root.path / "paper"
     try:
         paper_info = paper.lstat()
@@ -1974,6 +2489,12 @@ def _build_head_inventory(root: RootContext, *, allow_relocation_blockers: bool 
             if allow_relocation_blockers:
                 key = _relocation_resource_key(deployed.name)
                 directory_key = _relocation_resource_key(directory.name)
+            elif deployed.name in _PROTECTED_RESOURCE_NAMES and directory.name == deployed.name:
+                artifact = attestations.get(("protected-fund-inclusion", deployed.name))
+                if artifact is None:
+                    raise HandoverError("protected fund requires a destination-bound inclusion attestation")
+                key = deployed.name
+                directory_key = deployed.name
             else:
                 key = ensure_unique_resource_name(deployed.name, [])
                 directory_key = ensure_unique_resource_name(directory.name, [])
@@ -1994,6 +2515,8 @@ def _build_head_inventory(root: RootContext, *, allow_relocation_blockers: bool 
                 "head_hash": latest.hash if latest is not None else None,
                 "session_count": len(sessions),
             }
+            if not allow_relocation_blockers and deployed.name in _PROTECTED_RESOURCE_NAMES:
+                entry["attestation_refs"] = [_attestation_reference(attestations[("protected-fund-inclusion", deployed.name)])]
         except HandoverError:
             raise
         except LedgerError:
@@ -2003,6 +2526,16 @@ def _build_head_inventory(root: RootContext, *, allow_relocation_blockers: bool 
         if key in inventory:
             raise HandoverError("paper inventory contains duplicate identities")
         inventory[key] = entry
+    for (kind, subject), artifact in attestations.items():
+        if kind == "stale-marker-retirement":
+            key = _attestation_inventory_key(kind, subject)
+            if key in inventory:
+                raise HandoverError("attestation inventory identity is duplicated")
+            inventory[key] = {
+                "kind": kind,
+                "subject": subject,
+                "attestation_digest": artifact["record_digest"],
+            }
     root.revalidate()
     return dict(sorted(inventory.items()))
 
@@ -2786,18 +3319,32 @@ def _is_reparse_point(path: Path) -> bool:
 
 
 def _valid_inventory_entry(key: str, entry: object) -> bool:
-    if not isinstance(entry, dict) or set(entry) != {
-        "name",
-        "deployment_digest",
-        "last_session",
-        "head_hash",
-        "session_count",
-    }:
+    if not isinstance(key, str) or not isinstance(entry, dict):
+        return False
+    attestation_fields = {"kind", "subject", "attestation_digest"}
+    if set(entry) == attestation_fields:
+        try:
+            subject = entry["subject"]
+            parts = _relative_parts(subject, allow_protected=True) if isinstance(subject, str) else ()
+            return entry["kind"] == "stale-marker-retirement" and bool(parts) and "/".join(parts) == subject and parts[0] in RELOCATED_TOP_LEVEL and parts[-1] == "runner.pid" and isinstance(entry["attestation_digest"], str) and _SHA256.fullmatch(entry["attestation_digest"]) is not None and key == _attestation_inventory_key(entry["kind"], subject)
+        except (HandoverError, RootPathError, TypeError, ValueError):
+            return False
+    base_fields = {"name", "deployment_digest", "last_session", "head_hash", "session_count"}
+    if frozenset(entry) not in {frozenset(base_fields), frozenset(base_fields | {"attestation_refs"})}:
+        return False
+    name = entry["name"]
+    if not isinstance(name, str):
         return False
     try:
-        if ensure_unique_resource_name(entry["name"], []) != key:
+        if _relocation_resource_key(name) != key:
             return False
     except (TypeError, RootPathError):
+        return False
+    if name in _PROTECTED_RESOURCE_NAMES:
+        refs = entry.get("attestation_refs")
+        if not isinstance(refs, list) or len(refs) != 1 or not isinstance(refs[0], dict) or set(refs[0]) != {"kind", "subject", "record_digest"} or refs[0]["kind"] != "protected-fund-inclusion" or refs[0]["subject"] != name or not isinstance(refs[0]["record_digest"], str) or _SHA256.fullmatch(refs[0]["record_digest"]) is None:
+            return False
+    elif "attestation_refs" in entry:
         return False
     if not isinstance(entry["deployment_digest"], str) or not _SHA256.fullmatch(entry["deployment_digest"]):
         return False
@@ -2812,7 +3359,7 @@ def _valid_inventory_entry(key: str, entry: object) -> bool:
 
 def _resource_key(name: str) -> str:
     try:
-        return ensure_unique_resource_name(name, [])
+        return _relocation_resource_key(name)
     except (TypeError, RootPathError):
         raise HandoverError("paper deployment identity is invalid") from None
 

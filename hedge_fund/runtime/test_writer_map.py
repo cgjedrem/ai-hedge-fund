@@ -178,6 +178,36 @@ WRITER_MAP: dict[tuple[str, str, str], Writer] = {
     ("hedge_fund.runtime.credentials", "CredentialStore._write_bytes", "mkdir"): Writer(ROOT, "race", ("hedge_fund/runtime/test_credentials.py::test_credential_store_compare_and_swap_rejects_stale_version",)),
     ("hedge_fund.runtime.credentials", "CredentialStore._write_bytes", "write_bytes"): Writer(ROOT, "race", ("hedge_fund/runtime/test_credentials.py::test_credential_store_compare_and_swap_rejects_stale_version",)),
     ("hedge_fund.runtime.credentials", "save_credential", "write_atomic"): Writer(RESIDUAL, "denial", ("hedge_fund/web/test_settings.py::test_credential_write_is_allowlisted_write_only_and_control_safe",), BOUND_NOTE),
+    ("hedge_fund.runtime.build_identity", "bake_build_identity", "write_text"): Writer(
+        BOOTSTRAP,
+        "none",
+        ("hedge_fund/runtime/test_build_identity.py::test_bake_build_identity_verifies_source_before_writing",),
+        "writes build-time package constants outside data-root admission",
+    ),
+    ("hedge_fund.runtime.credential_delivery", "CredentialDeliveryServer._prepare_socket_directory", "mkdir"): Writer(
+        RESIDUAL,
+        "none",
+        ("hedge_fund/runtime/test_external_credentials.py::test_delivery_server_survives_deep_frame_and_handles_next_status",),
+        "creates permission-checked private IPC directory outside data-root admission",
+    ),
+    ("hedge_fund.runtime.credential_delivery", "CredentialDeliveryServer._recover_stale_socket", "unlink"): Writer(
+        RESIDUAL,
+        "none",
+        ("hedge_fund/runtime/test_external_credentials.py::test_delivery_server_recovers_only_owned_stale_socket",),
+        "removes verified stale IPC socket outside data-root admission; no race test",
+    ),
+    ("hedge_fund.runtime.credential_delivery", "CredentialDeliveryServer.close", "unlink"): Writer(
+        RESIDUAL,
+        "none",
+        ("hedge_fund/runtime/test_external_credentials.py::test_delivery_server_recovers_only_owned_stale_socket",),
+        "removes owned IPC socket outside data-root admission; no race test",
+    ),
+    ("hedge_fund.runtime.credential_delivery", "CredentialDeliveryServer.close", "rmdir"): Writer(
+        RESIDUAL,
+        "none",
+        ("hedge_fund/runtime/test_external_credentials.py::test_delivery_server_recovers_only_owned_stale_socket",),
+        "removes owned IPC directory outside data-root admission; no race test",
+    ),
     # handover records and relocation
     ("hedge_fund.runtime.handover", "relocate_copy", "mkdir"): Writer(
         ROOT,
@@ -203,6 +233,24 @@ WRITER_MAP: dict[tuple[str, str, str], Writer] = {
         "denial",
         ("hedge_fund/runtime/test_handover.py::test_attestation_artifact_storage_is_root_private_and_refuses_overwrite",),
         "destination-only attestation path after private-storage verification",
+    ),
+    ("hedge_fund.runtime.handover", "attest_stale_marker", "mkdir"): Writer(
+        BOOTSTRAP,
+        "denial",
+        ("hedge_fund/runtime/test_handover.py::test_attest_stale_marker_retires_destination_and_refuses_repeat",),
+        "creates destination-private retired-marker storage after evidence and liveness checks",
+    ),
+    ("hedge_fund.runtime.handover", "attest_stale_marker", "rename_file"): Writer(
+        BOOTSTRAP,
+        "denial",
+        ("hedge_fund/runtime/test_handover.py::test_attest_stale_marker_retires_destination_and_refuses_repeat",),
+        "destination-only no-follow marker retirement under exclusive migration lease",
+    ),
+    ("hedge_fund.runtime.handover", "attest_stale_marker", "unlink_file"): Writer(
+        BOOTSTRAP,
+        "denial",
+        ("hedge_fund/runtime/test_handover.py::test_attest_stale_marker_rolls_back_partial_artifact_and_marker_move",),
+        "removes a partially published destination attestation before marker rollback",
     ),
     ("hedge_fund.runtime.handover", "_remove_single_writer_challenge", "unlink_file"): Writer(
         BOOTSTRAP,
@@ -372,6 +420,11 @@ def test_writer_map_reports_residuals_explicitly():
         "hedge_fund.paths:write_atomic:replace",
         "hedge_fund.paths:write_atomic:unlink",
         "hedge_fund.paths:write_atomic:write_bytes",
+        "hedge_fund.runtime.build_identity:bake_build_identity:write_text",
+        "hedge_fund.runtime.credential_delivery:CredentialDeliveryServer._prepare_socket_directory:mkdir",
+        "hedge_fund.runtime.credential_delivery:CredentialDeliveryServer._recover_stale_socket:unlink",
+        "hedge_fund.runtime.credential_delivery:CredentialDeliveryServer.close:rmdir",
+        "hedge_fund.runtime.credential_delivery:CredentialDeliveryServer.close:unlink",
         "hedge_fund.runtime.credentials:save_credential:write_atomic",
         "hedge_fund.web.__main__:main:mkdir",
         "hedge_fund.web.demo:seed_demo:mkdir",

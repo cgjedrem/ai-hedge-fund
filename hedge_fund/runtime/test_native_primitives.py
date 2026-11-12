@@ -33,13 +33,23 @@ def _assert_native_filesystem(root: RootContext) -> None:
     assert root.filesystem.filesystem.casefold() == expected
 
 
-def _wait_for(path: Path, process, timeout: float = 10.0) -> None:
+def _wait_for(path: Path, process, timeout: float = 10.0, *, expected_text: str | None = None) -> None:
     deadline = time.monotonic() + timeout
-    while not path.exists():
+    observed = None
+    while True:
+        if path.exists():
+            if expected_text is None:
+                return
+            try:
+                observed = path.read_text(encoding="ascii")
+                if observed == expected_text:
+                    return
+            except (OSError, UnicodeError):
+                pass
         if process.poll() is not None:
             raise AssertionError(f"owned child exited early: {process.returncode}")
         if time.monotonic() >= deadline:
-            raise TimeoutError(f"owned child did not create {path.name}")
+            raise TimeoutError(f"owned child did not create {path.name}; expected={expected_text!r}, observed={observed!r}, pid={process.pid}")
         time.sleep(0.01)
 
 
@@ -159,7 +169,7 @@ def test_native_atomic_replace_never_exposes_partial_reader_bytes(
             ]
         )
         child = owned_test_process(script)
-        _wait_for(ready, child)
+        _wait_for(ready, child, expected_text="ready")
         _wait_for(reading, child)
         try:
             for index in range(120):
@@ -224,19 +234,18 @@ def test_native_process_identity_expires_with_owned_child(
     release = native_case_dir / "identity-release"
     script = "\n".join(
         [
-            "import os",
             "import time",
             "from pathlib import Path",
             f"ready = Path({str(ready)!r})",
             f"release = Path({str(release)!r})",
-            "ready.write_text(str(os.getpid()), encoding='ascii')",
+            "ready.write_text('ready', encoding='ascii')",
             "while not release.exists():",
             "    time.sleep(0.01)",
         ]
     )
     child = owned_test_process(script)
-    _wait_for(ready, child)
-    pid = int(ready.read_text(encoding="ascii"))
+    _wait_for(ready, child, expected_text="ready")
+    pid = child.pid
     identity = process_identity(pid)
     assert identity["pid"] == pid
     assert identity["creation_time"]
