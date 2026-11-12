@@ -136,6 +136,7 @@ export interface HomeData {
 }
 
 export type HaltState = "clear" | "halted" | "unreadable";
+export type PaperRecoveryState = "ready" | "reconciliation_required" | "corrupt";
 
 export interface PaperSummary {
   name: string;
@@ -146,6 +147,7 @@ export interface PaperSummary {
   cash: number | null;
   last_session: string | null;
   ledger_ok: boolean;
+  recovery_state: PaperRecoveryState;
   halted: string | null;
   halt_state: HaltState;
   runner: RunnerState;

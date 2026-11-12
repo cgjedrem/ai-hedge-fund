@@ -272,6 +272,47 @@ def test_readiness_denial_keeps_recovery_snapshot_available(write_client, demo_r
     assert recovery_response.json()["intent_preview"]["required"] is True
 
 
+def test_approval_history_issue_stays_reconciliation_required_in_endpoint_and_fund_list(write_client, demo_root):
+    client, ledger = _failed_web_tick(write_client, demo_root)
+    name = "demo-quality"
+    latest = ledger.latest()
+    assert latest is not None
+    service = client.app.state.service
+    with service._paper_control_lane(name):
+        ledger.log_event(
+            "consume",
+            decision_as_of="2024-06-06",
+            decision_hash=latest.hash,
+            approval_verdict="approve",
+            approval_by="invalid-operator",
+            approval_id="d" * 32,
+            session="2024-06-07",
+        )
+
+    snapshot_response = client.get(
+        f"/api/paper/{name}",
+        headers={"host": "127.0.0.1"},
+    )
+    recovery_response = client.get(
+        f"/api/paper/{name}/reconciliation",
+        headers={"host": "127.0.0.1"},
+    )
+    home_response = client.get(
+        "/api/home",
+        headers={"host": "127.0.0.1"},
+    )
+
+    assert snapshot_response.status_code == 200
+    assert snapshot_response.json()["recovery_state"] == "reconciliation_required"
+    assert recovery_response.status_code == 423
+    assert recovery_response.json()["code"] == "reconciliation-required"
+    assert home_response.status_code == 200
+    paper = next(item for item in home_response.json()["paper_funds"] if item["name"] == name)
+    assert paper["ledger_ok"] is False
+    assert paper["recovery_state"] == "reconciliation_required"
+    assert paper["halted"] == "synthetic ambiguous tick"
+
+
 def test_corrupt_replay_stays_distinct_from_reconciliation_required(write_client, demo_root):
     import json
 

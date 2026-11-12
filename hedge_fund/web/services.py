@@ -783,6 +783,7 @@ class DeskService:
                         "cash": snapshot.get("cash"),
                         "last_session": snapshot.get("last_session"),
                         "ledger_ok": snapshot["ledger"]["ok"],
+                        "recovery_state": snapshot["recovery_state"],
                         "halted": snapshot.get("halted"),
                         "halt_state": snapshot["halt_state"],
                         "runner": self._runner_state(deployed.name),
@@ -834,6 +835,8 @@ class DeskService:
             intent_targets = tick_intent_reconciliation_targets(ledger)
             halted = ledger.halted()
             unresolved_state = ledger.unresolved_recovery_state()
+        except PaperReconciliationRequired:
+            raise ServiceError(423, "Paper work requires reconciliation before it can continue.", code="reconciliation-required") from None
         except (LedgerError, OSError, ValueError):
             raise ServiceError(423, "Paper state is invalid (LedgerError).", code="replay-corrupt") from None
         preview = snapshot.preview

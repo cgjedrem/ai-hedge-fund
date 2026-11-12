@@ -158,3 +158,26 @@ US1 passed and was checkpointed in commit `a66b3ae0023643a838681e338c2cacf2f3b76
   Result: `8 passed in 62.15s`, exit `0`; started `2026-11-12T14:41:30.9490462+01:00`, ended `2026-11-12T14:42:36.0564411+01:00`, wall `65.107s`. An earlier adjacent selector used the Ledger test name under `paper/test_tick.py`; pytest collected no tests and exited `4` in `3.73s`. Corrected selector targets `paper/test_ledger.py`.
 - Isort (`--check-only --profile black`), flake8 (`--max-line-length=420 --extend-ignore=E203`) across all four changed Python files, and `git diff --check` passed. Black passed on `run.py`, `test_run.py`, and `runtime/test_owned_runner_child.py` (`3 files unchanged`). Whole-file Black check of `runtime/owned_runner_child.py` reports one pre-existing blank-line delta at line 545, outside this diff; left unchanged per no-reformat constraint.
 - Source/test diff against `b83970873c2b8db398d2c1192357dde02cb7fbe3`: SHA-256 `26fe08e14181b851623d5b975a2eea199e3e964a979d229b984f2172f2f13889`, `8,319` bytes; paths: `hedge_fund/run.py`, `hedge_fund/runtime/owned_runner_child.py`, `hedge_fund/runtime/test_owned_runner_child.py`, `hedge_fund/test_run.py`. No raw-write primitive added.
+
+## QA review rework cycle 1 — finding 4
+
+- Python test-first red against checkpoint `ea69920a34076c46bbc2779648d45494d8fea969`:
+
+  ```text
+  python.exe -m pytest hedge_fund/web/test_recovery.py::test_approval_history_issue_stays_reconciliation_required_in_endpoint_and_fund_list -q
+  ```
+
+  Result: `1 failed in 12.51s`, exit `1`; recovery endpoint returned `replay-corrupt` while the snapshot reported `reconciliation_required`. Started `2026-11-12T14:46:28.7750282+01:00`, ended `2026-11-12T14:46:45.9820035+01:00`, wall `17.207s`.
+- Frontend test-first red from `frontend`: `npm exec -- vitest run src/pages/home.test.tsx`; `1 failed`, exit `1`, missing reconciliation label; Vitest duration `4.04s`, started `2026-11-12T14:46:52.1894746+01:00`, ended `2026-11-12T14:46:58.9538628+01:00`, wall `6.764s`. An initial invocation from repo root failed alias resolution before collecting tests; rerun from `frontend` exposed the intended assertion.
+- Fix: `PaperReconciliationRequired` now maps to `423 reconciliation-required`; list summaries include snapshot `recovery_state`; home badges distinguish reconciliation-required from corrupt ledgers.
+- Final focused Python command repeated the new node; result `1 passed in 13.05s`, exit `0`; started `2026-11-12T14:47:35.4735394+01:00`, ended `2026-11-12T14:47:54.9178696+01:00`, wall `19.444s`.
+- Adjacent Python command:
+
+  ```text
+  python.exe -m pytest hedge_fund/web/test_recovery.py::test_approval_history_issue_stays_reconciliation_required_in_endpoint_and_fund_list hedge_fund/web/test_recovery.py::test_readiness_denial_keeps_recovery_snapshot_available hedge_fund/web/test_recovery.py::test_corrupt_replay_stays_distinct_from_reconciliation_required hedge_fund/web/test_services.py::test_read_adapters_match_seeded_mandate_paper_ledger_and_report hedge_fund/web/test_services.py::test_unreadable_control_is_explicit_in_paper_list_and_detail -q
+  ```
+
+  Result: `7 passed in 26.52s`, exit `0`; started `2026-11-12T14:48:10.1673413+01:00`, ended `2026-11-12T14:48:40.4744079+01:00`, wall `30.307s`.
+- Frontend red node passed after implementation (`1 passed`, Vitest `3.99s`, wall `7.059s`, started `2026-11-12T14:47:35.5242786+01:00`, ended `2026-11-12T14:47:42.5831373+01:00`). Home and App slice: `2 files, 57 tests passed`, Vitest `15.64s`, wall `17.538s`, started `2026-11-12T14:48:10.3133950+01:00`, ended `2026-11-12T14:48:27.8510014+01:00`. Typecheck environment: Node `v22.13.1`, npm `10.9.2`; `npm exec -- tsc --noEmit` passed exit `0`, started `2026-11-12T14:50:38.5533902+01:00`, ended `2026-11-12T14:50:45.7445675+01:00`, wall `7.191s`.
+- Black (`--check --line-length 420`; `2 files unchanged`), isort (`--check-only --profile black`), flake8 (`--max-line-length=420 --extend-ignore=E203`), and `git diff --check` passed. No raw-write primitive added.
+- Source/test diff against `ea69920a34076c46bbc2779648d45494d8fea969`: SHA-256 `35d7c6ed261fe83b0ec55b8fd9fe479b02481f71675114eb0a8e435d2cadad88`, `9,052` bytes; paths: `hedge_fund/web/services.py`, `hedge_fund/web/test_recovery.py`, `frontend/src/lib/types.ts`, `frontend/src/pages/home.tsx`, `frontend/src/pages/home.test.tsx`, `frontend/src/App.test.tsx`.

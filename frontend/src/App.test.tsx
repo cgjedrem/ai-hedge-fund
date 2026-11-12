@@ -61,6 +61,7 @@ const home: HomeData = {
       cash: 90_000,
       last_session: "2024-06-05",
       ledger_ok: true,
+      recovery_state: "ready",
       halted: null,
       halt_state: "clear",
       runner: { status: "unknown", available: false, reason: "Runner ownership is not verified." },
