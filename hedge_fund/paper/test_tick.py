@@ -2443,6 +2443,76 @@ def test_halt_after_first_order_prevents_second_order(tmp_path, clock, SPEC, mon
     assert ledger._latest_approval_event(first.decision.as_of, first.hash, strict=True)["kind"] == "consume"
 
 
+def test_legacy_halt_after_fill_journals_failure_bound_to_transmitted_fills(tmp_path, clock, SPEC, monkeypatch):
+    from hedge_fund.runtime.reconciliation import (
+        build_reconciliation_snapshot,
+        failure_digest,
+    )
+
+    spec = SPEC.model_copy(update={"approval_required": True})
+    client = FakeDataClient({**SERIES, "MSFT": SERIES["AAPL"]})
+    directory = deploy("alpha", spec, ["AAPL", "MSFT"], root=tmp_path)
+    ledger = Ledger(directory)
+
+    def build_two_ticker_fund(selected):
+        return Fund(selected, models={"solo": [FakeAnalyst("a", {"AAPL": 0.5, "MSFT": 0.5})]})
+
+    clock("2024-06-04")
+    first = tick(directory, client, build_fund=build_two_ticker_fund)
+    ledger.set_approval("approve", first.decision.as_of, first.hash, "cli")
+    place_order = PaperBroker.place_order
+    transmitted_fills = []
+
+    def halt_after_fill(broker, order):
+        fill = place_order(broker, order)
+        transmitted_fills.append(
+            {
+                "order": order.model_dump(mode="json"),
+                "fill": fill.model_dump(mode="json"),
+            }
+        )
+        ledger.halt("synthetic emergency")
+        return fill
+
+    monkeypatch.setattr(PaperBroker, "place_order", halt_after_fill)
+    clock("2024-06-05")
+    with pytest.raises(FundHalted):
+        tick(directory, client, build_fund=build_two_ticker_fund)
+
+    failure = next(event for event in ledger.events() if event["kind"] == "tick_failed")
+    assert len(transmitted_fills) == 1
+    assert "request_id" not in failure
+    assert failure["session"] == "2024-06-04"
+    assert failure["expected_head"] == first.hash
+    assert failure["transmitted_fills"] == transmitted_fills
+    snapshot = build_reconciliation_snapshot(directory, load_deployed(directory), ledger, ledger.replay(spec.capital, full=True), ledger.latest())
+    assert snapshot.failure_event == failure
+    assert snapshot.preview.required is True
+    assert snapshot.preview.failure_id == failure_digest(failure)
+    assert snapshot.preview.recoverable is False
+
+
+def test_legacy_zero_effect_halt_does_not_require_reconciliation(tmp_path, clock, SPEC, monkeypatch):
+    from hedge_fund.runtime.reconciliation import build_reconciliation_snapshot
+
+    clock("2024-06-04")
+    directory = deploy("alpha", SPEC, ["AAPL"], root=tmp_path)
+    ledger = Ledger(directory)
+
+    def halt_before_effect(*_args, **_kwargs):
+        ledger.halt("synthetic pre-effect halt")
+        raise FundHalted("synthetic pre-effect halt")
+
+    monkeypatch.setattr(paper_tick_module, "advance", halt_before_effect)
+    with pytest.raises(FundHalted, match="synthetic pre-effect halt"):
+        _tick(directory)
+
+    assert not any(event["kind"] in {"tick_failed", "tick_aborted"} for event in ledger.events())
+    snapshot = build_reconciliation_snapshot(directory, load_deployed(directory), ledger, ledger.replay(SPEC.capital, full=True), ledger.latest())
+    assert snapshot.preview.required is False
+    assert snapshot.failure_event is None
+
+
 def test_halt_before_refresh_prevents_new_assessment(tmp_path, clock, SPEC, monkeypatch):
     from hedge_fund.pipeline import stages
 

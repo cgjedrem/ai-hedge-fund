@@ -5,6 +5,7 @@
 - Branch: `cgjedrem-musical-eureka`
 - Pre-change source revision: `38b3fc85123487a29f2cb53e7c92bd9902be54fb`
 - US1 checkpoint revision: `a66b3ae0023643a838681e338c2cacf2f3b76b33`
+- US2 checkpoint revision: `58a638841bb68a57992cdf8dc1972ae160c4d1aa`
 - Base verification: `448056f` is an ancestor of HEAD
 - Pre-change tree: clean; no dirty-diff digest
 - Artifact: no build/install performed; tests used cached Poetry virtualenv `aihf-4l3vIF0x-py3.11`
@@ -15,6 +16,7 @@
 - US1 test-first tracked diff: SHA-256 `87b8209ce088689fe1ad3e8384b59290b898f25db0fc87e029b66a82970e7cd6` (`ledger.py`, `test_ledger.py`, `test_tick.py`, `web/test_recovery.py`, `paper.test.tsx`; evidence file excluded)
 - Final US1 code/test diff after self-review correction: SHA-256 `9d97909a5188c308308efa88042026497dd681d611eb9c749ac658630194a9f1`; paths: `frontend/src/App.test.tsx`, `frontend/src/lib/types.ts`, `frontend/src/pages/paper-session-days.test.tsx`, `frontend/src/pages/paper.test.tsx`, `frontend/src/pages/paper.tsx`, `hedge_fund/paper/ledger.py`, `hedge_fund/paper/test_ledger.py`, `hedge_fund/paper/test_tick.py`, `hedge_fund/runtime/reconciliation.py`, `hedge_fund/web/services.py`, `hedge_fund/web/test_recovery.py`; evidence/docs excluded
 - Final US2 tracked code/test diff against checkpoint `a66b3ae0023643a838681e338c2cacf2f3b76b33`: SHA-256 `490c6fd8e24dcff748eb9811a1e6a0cfe5fc6f7f62023608e6c0de41ba5a245b`; computed `2026-11-12T12:54:31.404+01:00`; paths: `hedge_fund/paper/ledger.py`, `hedge_fund/paper/test_ledger.py`, `hedge_fund/paper/test_tick.py`, `hedge_fund/web/services.py`, `hedge_fund/web/test_recovery.py`; evidence/docs excluded
+- US3 tracked code/test diff against checkpoint `58a638841bb68a57992cdf8dc1972ae160c4d1aa`: SHA-256 `8e7a6cc97552c122264d4ce39e7244e777e0a9dad641506abcb6158638d437bf`; computed `2026-11-12T13:05:01.926+01:00`; paths: `hedge_fund/paper/tick.py`, `hedge_fund/paper/test_tick.py`; evidence/docs excluded
 
 ## Task results
 
@@ -33,6 +35,9 @@
 | T010 | PASS; expected test-first red retained. | Backend `Ledger.resume()` cleared Halt with an orphaned tick intent before implementation; final test asserts denial and Halt preservation. See US2 commands below. |
 | T011 | PASS; expected test-first red retained. | Ordinary readiness accepted unresolved tick intent and recorded failure before implementation; audited intent resolution and confirmed Resume remain admissible after implementation. See US2 commands below. |
 | T012 | PASS. Readiness, web Resume permission, and backend Resume pre-check consume `unresolved_recovery_state()`. | Final verification below covers all categories and preserves PR #11 tick-intent refusal and recovery admission. |
+| T013 | PASS; expected post-fill red retained. | Red command: cached Poetry Python 3.11 `-m pytest hedge_fund/paper/test_tick.py -q -k 'legacy_halt_after_fill_journals_failure or legacy_zero_effect_halt' --durations=0`; `1 failed, 1 passed in 2.41s`, exit `1`; failure was absence of a `tick_failed` event after the first no-ID fill. Final command reported `2 passed, 127 deselected in 3.18s`, exit `0`; event contains exact order/fill pairs, expected head, and attempt identity, and appears in recovery preview. |
+| T014 | PASS. Zero-effect guard passed on the pre-implementation run and again after implementation. | Same red/final commands as T013; asserts no `tick_failed`/`tick_aborted` event and no required reconciliation preview. |
+| T015 | PASS. No-ID `FundHalted` after a recorded fill journals durable `tick_failed` only when no outcome exists; pre-effect Halt stays a clean abort. Existing `Ledger.log_event` is the only persistence API used; no new raw-write primitive, no WRITER_MAP entry required. | US3 regression command reported `31 passed, 98 deselected in 59.58s`, exit `0`; see commands below. |
 
 ## Post-review US1 verification
 
@@ -51,4 +56,14 @@
 - Focused style commands on `hedge_fund/paper/ledger.py hedge_fund/paper/test_ledger.py hedge_fund/paper/test_tick.py hedge_fund/web/services.py hedge_fund/web/test_recovery.py`: `C:\Users\ChristianGjedrem\AppData\Local\pypoetry\Cache\virtualenvs\aihf-4l3vIF0x-py3.11\Scripts\python.exe -m black --check --line-length 420 hedge_fund/paper/ledger.py hedge_fund/paper/test_ledger.py hedge_fund/paper/test_tick.py hedge_fund/web/services.py hedge_fund/web/test_recovery.py` PASS (`5 files would be left unchanged`; `12:54:10.898+01:00`–`12:54:12.475+01:00`, exit `0`); `C:\Users\ChristianGjedrem\AppData\Local\pypoetry\Cache\virtualenvs\aihf-4l3vIF0x-py3.11\Scripts\python.exe -m isort --check-only --profile black hedge_fund/paper/ledger.py hedge_fund/paper/test_ledger.py hedge_fund/paper/test_tick.py hedge_fund/web/services.py hedge_fund/web/test_recovery.py` PASS (`12:54:12.494+01:00`–`12:54:12.925+01:00`, exit `0`); `C:\Users\ChristianGjedrem\AppData\Local\pypoetry\Cache\virtualenvs\aihf-4l3vIF0x-py3.11\Scripts\python.exe -m flake8 --max-line-length=420 hedge_fund/paper/ledger.py hedge_fund/paper/test_ledger.py hedge_fund/paper/test_tick.py hedge_fund/web/services.py hedge_fund/web/test_recovery.py` FAIL only on unchanged `ledger.py` E203 at `:1355` and `:2383` (`12:54:12.925+01:00`–`12:54:14.687+01:00`, exit `1`); same command with `--extend-ignore=E203` PASS (`12:54:14.688+01:00`–`12:54:16.427+01:00`, exit `0`). No baseline style lines changed.
 - `git diff --check`: PASS; started `2026-11-12T12:56:28.931+01:00`, ended `2026-11-12T12:56:29.023+01:00`, wall `0.092 s`, exit `0`.
 
-US1 passed and was checkpointed in commit `a66b3ae0023643a838681e338c2cacf2f3b76b33`. US2 is green and ready for its checkpoint commit. US3–US4 are pending. Full suite is not run; coordinator owns T026.
+## US3 test-first and final verification
+
+- Red command (cached Poetry Python 3.11): `C:\Users\ChristianGjedrem\AppData\Local\pypoetry\Cache\virtualenvs\aihf-4l3vIF0x-py3.11\Scripts\python.exe -m pytest hedge_fund/paper/test_tick.py -q -k "legacy_halt_after_fill_journals_failure or legacy_zero_effect_halt" --durations=0`; pytest reported `1 failed, 1 passed in 2.41s`, exit `1`. T013 failed because no `tick_failed` event existed after a successful local fill; T014's zero-effect guard passed before implementation.
+- Immediate green command on implemented artifact: same command; pytest reported `2 passed, 127 deselected in 2.02s`, exit `0`.
+- Targeted US3/PR #11 regressions (cached Poetry Python 3.11): `C:\Users\ChristianGjedrem\AppData\Local\pypoetry\Cache\virtualenvs\aihf-4l3vIF0x-py3.11\Scripts\python.exe -m pytest hedge_fund/paper/test_tick.py -q -k "halt or failure or intent_outcome_lookup or fill_then_append" --durations=0`; pytest reported `31 passed, 98 deselected in 59.58s`, exit `0`. Covers no-ID Halt, request-identified failures, safe pre-effect aborts, receipt recovery, and halt admission.
+- Final US3 command after assertion/style review: `C:\Users\ChristianGjedrem\AppData\Local\pypoetry\Cache\virtualenvs\aihf-4l3vIF0x-py3.11\Scripts\python.exe -m pytest hedge_fund/paper/test_tick.py -q -k "legacy_halt_after_fill_journals_failure or legacy_zero_effect_halt" --durations=0`; pytest reported `2 passed, 127 deselected in 3.18s`, exit `0`.
+- Style on `hedge_fund/paper/tick.py hedge_fund/paper/test_tick.py`: `black --check --line-length 420` PASS (`2 files would be left unchanged`); `isort --check-only --profile black` PASS; `flake8 --max-line-length=420 --extend-ignore=E203` PASS; `git diff --check` PASS. All used cached Poetry Python 3.11 environment.
+- Fixture provenance: `tmp_path` synthetic deployed local-paper fund, fake data client and fake analyst, monkeypatched `PaperBroker.place_order`; no production roots, external broker calls, or paid data.
+- Change: in-memory fill capture feeds the failure event's `transmitted_fills`; `failure_digest()` consequently binds exact serialized orders/fills. Recovery preview references that event by its digest. Generated legacy `attempt_id` prevents duplicate outcomes from being recorded for one attempt.
+
+US1 passed and was checkpointed in commit `a66b3ae0023643a838681e338c2cacf2f3b76b33`. US2 passed and was checkpointed in commit `58a638841bb68a57992cdf8dc1972ae160c4d1aa`. US3 tests, regression subset, and style gates are green; checkpoint hash is reported in handoff. US4 is pending. Full suite is not run; coordinator owns T026.

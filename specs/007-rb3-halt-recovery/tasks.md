@@ -80,12 +80,12 @@
 
 ### Tests for User Story 3 (write FIRST, must FAIL before implementation) ⚠️
 
-- [ ] T013 [P] [US3] Test: no-request-ID tick halted after ≥1 transmitted fill journals tick_failed bound to fill identities and appears in recovery in hedge_fund/paper/test_tick.py
-- [ ] T014 [P] [US3] Test: no-request-ID zero-effect halt keeps clean-abort semantics (no book-ambiguity review) in hedge_fund/paper/test_tick.py
+- [x] T013 [P] [US3] Test: no-request-ID tick halted after ≥1 transmitted fill journals tick_failed bound to fill identities and appears in recovery in hedge_fund/paper/test_tick.py
+- [x] T014 [P] [US3] Test: no-request-ID zero-effect halt keeps clean-abort semantics (no book-ambiguity review) in hedge_fund/paper/test_tick.py
 
 ### Implementation for User Story 3
 
-- [ ] T015 [US3] Journal post-effect tick_failed for the no-request-ID path when interrupted by Halt with no outcome, mirroring the request-identified handler in hedge_fund/paper/tick.py (`:212-216`, `:474-500`, cf. `:931-934`); WRITER_MAP entry citing T013 if a new raw write appears
+- [x] T015 [US3] Journal post-effect tick_failed for the no-request-ID path when interrupted by Halt with no outcome, mirroring the request-identified handler in hedge_fund/paper/tick.py (`:212-216`, `:474-500`, cf. `:931-934`); WRITER_MAP entry citing T013 if a new raw write appears
 
 **Checkpoint**: all execution paths journal reviewable post-fill interruptions
 
