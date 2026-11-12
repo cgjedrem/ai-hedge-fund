@@ -388,10 +388,11 @@ def unresolved_tick_failures(events: list[dict]) -> list[dict]:
     resolved = set()
     for failure_id, receipt in receipts.items():
         for recorded_now in resumed_receipts.get(receipt.receipt_id, []):
-            try:
-                verify_receipt_expiry(receipt, recorded_now=recorded_now)
-            except ValueError:
-                continue
+            if receipt.issued_at is not None or receipt.valid_until is not None:
+                try:
+                    verify_receipt_expiry(receipt, recorded_now=recorded_now)
+                except ValueError:
+                    continue
             resolved.add(failure_id)
             break
     return [failure for identity, failure in failures.items() if identity not in resolved]

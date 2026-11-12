@@ -110,6 +110,76 @@ def test_unresolved_intent_query_reports_pending_request(tmp_path):
     assert unresolved[0].metadata_complete is True
 
 
+def test_legacy_intent_receipt_replay_preserves_resolution(tmp_path):
+    from hedge_fund.paper.ledger import _control_request_digest
+    from hedge_fund.runtime.reconciliation import (
+        TickIntentReconciliationPreview,
+        TickIntentReconciliationReceipt,
+    )
+
+    ledger = Ledger(tmp_path)
+    request_id = "tick-before-legacy-resolution"
+    ledger.log_event(
+        "tick_intent",
+        request_id=request_id,
+        request_action="tick",
+        request_digest="a" * 64,
+        expected_head=None,
+        requested_session=None,
+        session="2024-06-03",
+    )
+    intent = ledger.unresolved_tick_intents()[0]
+    preview = TickIntentReconciliationPreview.create(
+        required=True,
+        recoverable=True,
+        reason="ready",
+        intent_request_id=request_id,
+        intent_session=intent.session,
+        intent_digest=intent.intent_digest,
+        metadata_complete=True,
+        expected_head=None,
+        current_head=None,
+        broker_book_sha256="b" * 64,
+        fill_identity_sha256="c" * 64,
+        book_matches_ledger=True,
+        head_matches_intent=True,
+    )
+    recorded_at = "2024-06-03T00:00:00+00:00"
+    receipt = TickIntentReconciliationReceipt.create(
+        preview=preview,
+        request_id="legacy-intent-resolution",
+        operator="web",
+        recorded_at=recorded_at,
+    )
+    receipt_payload = receipt.model_dump(mode="python", exclude={"receipt_id", "issued_at", "valid_until"})
+    legacy_receipt = TickIntentReconciliationReceipt.model_construct(**receipt_payload, receipt_id="0" * 64)
+    receipt_payload["receipt_id"] = legacy_receipt.compute_receipt_id()
+    request_digest = _control_request_digest(
+        TICK_INTENT_RECOVERY,
+        ledger.directory.name,
+        {
+            "intent_request_id": request_id,
+            "intent_digest": intent.intent_digest,
+            "preview_digest": preview.preview_digest,
+            "decision": receipt.decision,
+        },
+    )
+    ledger.log_event(
+        "tick_intent_resolved",
+        time=recorded_at,
+        request_id=receipt.request_id,
+        request_action=TICK_INTENT_RECOVERY,
+        request_digest=request_digest,
+        intent_request_id=request_id,
+        intent_digest=intent.intent_digest,
+        corrupt_event_digests=[],
+        decision=receipt.decision,
+        receipt=receipt_payload,
+    )
+
+    assert ledger.unresolved_tick_intents() == ()
+
+
 def test_tick_readiness_guard_refuses_unresolved_intent(tmp_path):
     ledger = Ledger(tmp_path)
     ledger.log_event(

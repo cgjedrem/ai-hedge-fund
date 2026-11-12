@@ -2246,7 +2246,8 @@ def _tick_intent_resolution_state(
             continue
         try:
             receipt = TickIntentReconciliationReceipt.model_validate(event.get("receipt"))
-            verify_receipt_expiry(receipt, recorded_now=event.get("time"))
+            if receipt.issued_at is not None or receipt.valid_until is not None:
+                verify_receipt_expiry(receipt, recorded_now=event.get("time"))
         except (TypeError, ValueError):
             continue
         if event.get("request_id") != receipt.request_id or event.get("request_action") != TICK_INTENT_RECOVERY:

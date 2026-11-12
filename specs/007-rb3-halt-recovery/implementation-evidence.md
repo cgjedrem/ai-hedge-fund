@@ -99,3 +99,20 @@ US1 passed and was checkpointed in commit `a66b3ae0023643a838681e338c2cacf2f3b76
 - Fix accepts either a valid ledger or `reconciliation_required` snapshot, still requiring service `resume_allowed`. Corrupt replay remains blocked and recovery fetch remains suppressed.
 - Final command from `frontend`: `npm exec -- vitest run src/pages/paper.test.tsx src/App.test.tsx src/pages/paper-session-days.test.tsx`; Vitest reported `3 passed` files, `87 passed` tests, `29.56s`, exit `0` (start `14:09:09`). `npm exec -- tsc --noEmit` exited `0`.
 - No Python source changed after T023. Overall targeted acceptance remains blocked by the T023 writer-map failure in unchanged modules; coordinator owns T026 and disposition of that gate.
+
+## QA review rework cycle 1 — finding 1
+
+- Replay now skips expiry checks only for parsed receipts with both legacy expiry fields absent. Presentation verification still rejects those receipts; malformed or partial expiry identity still fails validation.
+- Python executable for these commands: `C:\Users\ChristianGjedrem\AppData\Local\pypoetry\Cache\virtualenvs\aihf-4l3vIF0x-py3.11\Scripts\python.exe`; Poetry CLI unavailable.
+- Test-first red command: `python.exe -m pytest hedge_fund/runtime/test_reconciliation.py::test_legacy_failure_receipt_replay_preserves_resolution hedge_fund/paper/test_ledger.py::test_legacy_intent_receipt_replay_preserves_resolution hedge_fund/paper/test_tick.py::test_pre_expiry_failure_receipt_keeps_fund_tickable -q`; `3 failed in 18.38s`, exit `1`.
+- One post-implementation end-to-end attempt exposed a fixture error: the synthetic Resume event used the new receipt ID rather than the old-digest ID. The journal fixture now uses the legacy ID; no production change was made for that intermediate failure.
+- Final focused command used that interpreter:
+
+  ```text
+  python.exe -m pytest hedge_fund/runtime/test_reconciliation.py::test_expired_failure_bound_receipt_is_denied hedge_fund/runtime/test_reconciliation.py::test_expired_intent_bound_receipt_is_denied hedge_fund/runtime/test_reconciliation.py::test_fresh_receipts_authorize_at_presentation hedge_fund/runtime/test_reconciliation.py::test_legacy_receipts_are_denied_at_presentation hedge_fund/runtime/test_reconciliation.py::test_legacy_failure_receipt_replay_preserves_resolution hedge_fund/paper/test_ledger.py::test_legacy_intent_receipt_replay_preserves_resolution hedge_fund/paper/test_tick.py::test_pre_expiry_failure_receipt_keeps_fund_tickable -q
+  ```
+
+  Result: `7 passed in 22.55s`, exit `0`; started `2026-11-12T14:30:23.5509857+01:00`, ended `2026-11-12T14:30:49.7388872+01:00`, wall `26.188s`.
+- Synthetic end-to-end journal contains a legacy failure receipt, Resume/completion events, a cleared Halt, and then a successful later tick. Fresh receipts remain authorized; field-less failure- and intent-bound receipts remain denied at presentation.
+- Source/test diff against checkpoint `a5db5e7e2c6b272dd2a6861ff00c80d4b3f1e3da`: SHA-256 `c955481efec5fe31d50f264f4f1deda3b73da5d8bddcae1598450d229784dbb4`, `15,481` bytes; paths: `hedge_fund/runtime/reconciliation.py`, `hedge_fund/runtime/test_reconciliation.py`, `hedge_fund/paper/ledger.py`, `hedge_fund/paper/test_ledger.py`, `hedge_fund/paper/test_tick.py`.
+- Style: Black (`5 files unchanged`), isort, and flake8 `--extend-ignore=E203` passed. No raw-write primitive added.

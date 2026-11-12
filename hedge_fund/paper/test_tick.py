@@ -115,6 +115,13 @@ def _tick(directory, session=None, data=None):
     return tick(directory, data or FakeDataClient(SERIES), session=session, build_fund=build_fund)
 
 
+def _pre_expiry_receipt_payload(receipt):
+    payload = receipt.model_dump(mode="python", exclude={"receipt_id", "issued_at", "valid_until"})
+    legacy = type(receipt).model_construct(**payload, receipt_id="0" * 64)
+    payload["receipt_id"] = legacy.compute_receipt_id()
+    return type(receipt).model_validate(payload).model_dump(mode="json", exclude={"issued_at", "valid_until"})
+
+
 def _deploy_owned_paper_test_fund(root, spec):
     from hedge_fund.runtime.admission import AdmissionCoordinator, RootOwnerLease
     from hedge_fund.runtime.handover import record_ledger_head
@@ -923,6 +930,92 @@ def test_halt_before_effect_aborts_intent_then_resume_admits_new_tick(tmp_path, 
             request_id="tick-after-halt-resume",
         )
     assert record.session == "2024-06-03"
+
+
+def test_pre_expiry_failure_receipt_keeps_fund_tickable(tmp_path, clock, SPEC):
+    from hedge_fund.runtime.reconciliation import (
+        build_reconciliation_snapshot,
+        failure_digest,
+        ReconciliationReceipt,
+        unresolved_tick_failures,
+    )
+
+    directory = _deploy_owned_paper_test_fund(tmp_path, SPEC)
+    clock("2024-06-04")
+    with _owned_paper_lane(directory, "alpha"):
+        first = _tick(directory)
+    ledger = Ledger(directory)
+
+    clock("2024-06-05")
+    failure_time = "2024-06-05T00:00:00+00:00"
+    with _owned_paper_lane(directory, "alpha"):
+        ledger.log_event(
+            "tick_failed",
+            time=failure_time,
+            session="2024-06-04",
+            error="synthetic pre-expiry failure",
+            expected_head=first.hash,
+            operation_id="a" * 32,
+            request_id="pre-expiry-failed-tick",
+            capture_id="b" * 32,
+            capture_digest="c" * 64,
+            transmitted_fills=[],
+            durable=True,
+        )
+        ledger.halt("synthetic pre-expiry failure")
+        deployed = load_deployed(directory)
+        state = ledger.replay(SPEC.capital, full=True)
+        snapshot = build_reconciliation_snapshot(directory, deployed, ledger, state, ledger.latest())
+        receipt = ReconciliationReceipt.create(
+            failure_event=snapshot.failure_event,
+            request_id="pre-expiry-recovery",
+            current_head=snapshot.preview.current_head,
+            broker_book_sha256=snapshot.preview.broker_book_sha256,
+            fill_identity_sha256=snapshot.preview.fill_identity_sha256,
+            operator="web",
+            recorded_at=failure_time,
+        )
+        legacy_payload = _pre_expiry_receipt_payload(receipt)
+        ledger.log_event(
+            "reconciliation",
+            time=failure_time,
+            receipt=legacy_payload,
+            durable=True,
+        )
+        resume_fields = {
+            "head_hash": first.hash,
+            "by": "web",
+            "reconciliation_id": legacy_payload["receipt_id"],
+        }
+        ledger.log_event("resume", time=failure_time, **resume_fields, durable=True)
+        ledger.log_event("resume_effect_intent", time=failure_time, **resume_fields, durable=True)
+        ledger._write_control(False, None)
+        ledger.log_event(
+            "resume_completed",
+            time=failure_time,
+            **resume_fields,
+            result={"name": "alpha", "halted": False, "reconciliation_id": legacy_payload["receipt_id"]},
+            durable=True,
+        )
+
+    events = ledger.events()
+    failure_event = next(event for event in events if event.get("kind") == "tick_failed")
+    receipt_event = next(event for event in events if event.get("kind") == "reconciliation")
+    resume_event = next(event for event in events if event.get("kind") == "resume")
+    legacy_receipt = ReconciliationReceipt.model_validate(receipt_event["receipt"])
+    assert "issued_at" not in receipt_event["receipt"]
+    assert "valid_until" not in receipt_event["receipt"]
+    assert receipt_event["receipt"]["failure_id"] == failure_digest(failure_event)
+    assert legacy_receipt.issued_at is None
+    assert legacy_receipt.matches_failure(failure_event)
+    assert resume_event["reconciliation_id"] == legacy_receipt.receipt_id
+    assert unresolved_tick_failures([failure_event, receipt_event, resume_event]) == []
+    assert unresolved_tick_failures(events) == []
+    assert ledger.unresolved_recovery_state().required is False
+    with _owned_paper_lane(directory, "alpha"):
+        later = _tick(directory)
+    assert later.session == "2024-06-04"
+    assert ledger.latest().session == later.session
 
 
 def test_preflight_busy_after_intent_records_abort_and_same_identity_retries(tmp_path, clock, SPEC, monkeypatch):

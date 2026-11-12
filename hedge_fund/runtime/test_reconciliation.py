@@ -362,14 +362,14 @@ def test_expired_intent_bound_receipt_is_denied():
         verify_tick_intent_reconciliation_receipt(preview, receipt, recorded_now="2024-06-03T00:30:01+00:00")
 
 
-def test_legacy_receipts_fail_closed_and_fresh_receipts_authorize(tmp_path, monkeypatch):
+def test_fresh_receipts_authorize_at_presentation(tmp_path, monkeypatch):
     from hedge_fund.runtime.reconciliation import (
         TickIntentReconciliationPreview,
         TickIntentReconciliationReceipt,
         verify_tick_intent_reconciliation_receipt,
     )
 
-    spec, directory, deployed, ledger, state, latest, snapshot = _failure_recovery_context(tmp_path, monkeypatch)
+    _spec, directory, deployed, ledger, state, latest, snapshot = _failure_recovery_context(tmp_path, monkeypatch)
     failure = snapshot.failure_event
     issued_at = "2024-06-03T00:00:00+00:00"
     failure_receipt = ReconciliationReceipt.create(
@@ -384,13 +384,6 @@ def test_legacy_receipts_fail_closed_and_fresh_receipts_authorize(tmp_path, monk
     assert failure_receipt.issued_at == issued_at
     assert failure_receipt.valid_until == "2024-06-03T00:30:00+00:00"
     verify_reconciliation_receipt(directory, deployed, ledger, state, latest, failure_receipt, recorded_now="2024-06-03T00:01:00+00:00")
-
-    legacy_failure_receipt = _legacy_receipt(failure_receipt)
-    with pytest.raises(ValueError, match="expiry|expired"):
-        verify_reconciliation_receipt(directory, deployed, ledger, state, latest, legacy_failure_receipt, recorded_now="2024-06-03T00:01:00+00:00")
-    legacy_reconciliation = {"kind": "reconciliation", "receipt": legacy_failure_receipt.model_dump(mode="json")}
-    legacy_resume = {"kind": "resume", "reconciliation_id": legacy_failure_receipt.receipt_id, "time": "2024-06-03T00:01:00+00:00"}
-    assert unresolved_tick_failures([failure, legacy_reconciliation, legacy_resume]) == [failure]
 
     intent_preview = TickIntentReconciliationPreview.create(
         required=True,
@@ -415,9 +408,74 @@ def test_legacy_receipts_fail_closed_and_fresh_receipts_authorize(tmp_path, monk
     )
     verify_tick_intent_reconciliation_receipt(intent_preview, intent_receipt, recorded_now="2024-06-03T00:01:00+00:00")
 
+
+def test_legacy_receipts_are_denied_at_presentation(tmp_path, monkeypatch):
+    from hedge_fund.runtime.reconciliation import (
+        TickIntentReconciliationPreview,
+        TickIntentReconciliationReceipt,
+        verify_tick_intent_reconciliation_receipt,
+    )
+
+    _spec, directory, deployed, ledger, state, latest, snapshot = _failure_recovery_context(tmp_path, monkeypatch)
+    issued_at = "2024-06-03T00:00:00+00:00"
+    failure_receipt = ReconciliationReceipt.create(
+        failure_event=snapshot.failure_event,
+        request_id="legacy-failure-presentation",
+        current_head=snapshot.preview.current_head,
+        broker_book_sha256=snapshot.preview.broker_book_sha256,
+        fill_identity_sha256=snapshot.preview.fill_identity_sha256,
+        operator="web",
+        recorded_at=issued_at,
+    )
+    legacy_failure_receipt = _legacy_receipt(failure_receipt)
+    with pytest.raises(ValueError, match="expiry|expired"):
+        verify_reconciliation_receipt(directory, deployed, ledger, state, latest, legacy_failure_receipt, recorded_now="2024-06-03T00:01:00+00:00")
+
+    intent_preview = TickIntentReconciliationPreview.create(
+        required=True,
+        recoverable=True,
+        reason="ready",
+        intent_request_id="tick-intent-1",
+        intent_session="2024-06-03",
+        intent_digest="a" * 64,
+        metadata_complete=True,
+        expected_head=None,
+        current_head=None,
+        broker_book_sha256="b" * 64,
+        fill_identity_sha256="c" * 64,
+        book_matches_ledger=True,
+        head_matches_intent=True,
+    )
+    intent_receipt = TickIntentReconciliationReceipt.create(
+        preview=intent_preview,
+        request_id="legacy-intent-presentation",
+        operator="web",
+        recorded_at=issued_at,
+    )
     legacy_intent_receipt = _legacy_receipt(intent_receipt)
     with pytest.raises(ValueError, match="expiry|expired"):
         verify_tick_intent_reconciliation_receipt(intent_preview, legacy_intent_receipt, recorded_now="2024-06-03T00:01:00+00:00")
+
+
+def test_legacy_failure_receipt_replay_preserves_resolution(tmp_path, monkeypatch):
+    _spec, _directory, _deployed, _ledger, _state, _latest, snapshot = _failure_recovery_context(tmp_path, monkeypatch)
+    receipt = ReconciliationReceipt.create(
+        failure_event=snapshot.failure_event,
+        request_id="legacy-failure-replay",
+        current_head=snapshot.preview.current_head,
+        broker_book_sha256=snapshot.preview.broker_book_sha256,
+        fill_identity_sha256=snapshot.preview.fill_identity_sha256,
+        operator="web",
+        recorded_at="2024-06-03T00:00:00+00:00",
+    )
+    legacy_receipt = _legacy_receipt(receipt)
+    reconciliation = {
+        "kind": "reconciliation",
+        "receipt": legacy_receipt.model_dump(mode="json", exclude={"issued_at", "valid_until"}),
+    }
+    resume = {"kind": "resume", "reconciliation_id": legacy_receipt.receipt_id, "time": "2024-06-03T00:01:00+00:00"}
+
+    assert unresolved_tick_failures([snapshot.failure_event, reconciliation, resume]) == []
 
 
 def _legacy_receipt(receipt):
