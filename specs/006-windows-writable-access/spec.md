@@ -66,7 +66,7 @@ The operator resolves the protected fund names and stale `runner.pid` markers th
 
 ### Functional Requirements
 
-- **FR-001**: The system MUST provide a supported procedure that grants single-user writer authority for an existing, previously unsupported root on the operator's own Windows machine.
+- **FR-001**: The system MUST provide a supported procedure that grants single-user writer authority for an existing, previously unsupported root on the operator's own Windows machine, delivered through the native TUI as the target interface.
 - **FR-002**: The procedure MUST preserve every existing fund's complete ledger history, approval records, book state, mandates, and settings without rewriting, re-serializing, or re-hashing any prior record.
 - **FR-003**: The system MUST require an explicit, recorded operator acknowledgement bound to an exact root inventory before any write is enabled.
 - **FR-004**: The system MUST provide a supported, attestation-based resolution for stale runner markers that records evidence and never silently deletes them.
@@ -102,9 +102,9 @@ The operator resolves the protected fund names and stale `runner.pid` markers th
 - The two `runner.pid` markers are stale (no live owning process); this will be verified, not assumed, during the procedure.
 - Relocation of the data directory to a new path is acceptable to the operator; the legacy path itself carries no required meaning.
 - Paper-only operation is unchanged: no live broker orders, no paid data providers, no unattended trading loops are introduced by this feature.
-- The target interface is the native TUI unless clarification below selects otherwise; the same enablement procedure serves either surface.
+- The target interface is the native TUI on the operator's Windows machine (operator decision, 2026-11-12). The React web UI is out of scope for this feature and may follow as a later spec.
 
-## Open Questions
+## Decisions
 
-- **FR-001 surface choice** [NEEDS CLARIFICATION: target interface — native TUI (smallest, recommended by discovery) or the React web UI (larger: additionally requires supervisor and deployment work)?]
-- **FR-007 relocation target** [NEEDS CLARIFICATION: new root path — `C:\Users\ChristianGjedrem\aihf-data` (recommended) or a different operator-chosen path? Blessing the legacy `.hedge-fund` path in place was evaluated and is not recommended.]
+- **Target interface (2026-11-12, operator)**: Native TUI. The web UI is explicitly out of scope for this feature.
+- **Relocation target (2026-11-12, operator)**: `C:\Users\ChristianGjedrem\aihf-data` on the same NTFS volume. The legacy `.hedge-fund` path is not blessed in place; data is relocated by copy-then-verify, and the original root remains intact until the operator explicitly authorizes its retirement.
