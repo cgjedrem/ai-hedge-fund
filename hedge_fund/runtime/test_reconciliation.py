@@ -83,14 +83,30 @@ def test_reconciliation_receipt_binds_failure_head_book_capture_and_operator():
     assert receipt.capture_digest == "d" * 64
     assert receipt.operator == "web"
     assert receipt.receipt_id == receipt.compute_receipt_id()
+    assert receipt.issued_at == "2026-11-05T08:01:00+00:00"
+    assert receipt.valid_until == "2026-11-05T08:31:00+00:00"
 
     event = {"kind": "reconciliation", "receipt": receipt.model_dump(mode="json")}
     assert unresolved_tick_failures([failure, event]) == [failure]
-    resume = {"kind": "resume", "reconciliation_id": receipt.receipt_id, "time": "2026-11-05T08:01:00+00:00"}
-    assert unresolved_tick_failures([failure, event, resume]) == []
+    resume_identity = {
+        "head_hash": "a" * 64,
+        "by": "web",
+        "reconciliation_id": receipt.receipt_id,
+        "request_id": receipt.request_id,
+        "request_action": "resume",
+        "request_digest": "e" * 64,
+    }
+    resume = {
+        "kind": "resume",
+        **resume_identity,
+        "time": "2026-11-05T08:01:00+00:00",
+    }
+    assert unresolved_tick_failures([failure, event, resume]) == [failure]
+    effect_intent = {"kind": "resume_effect_intent", **resume_identity}
+    assert unresolved_tick_failures([failure, event, resume, effect_intent]) == []
 
     changed_failure = {**failure, "expected_head": "0" * 64}
-    assert unresolved_tick_failures([changed_failure, event, resume]) == [changed_failure]
+    assert unresolved_tick_failures([changed_failure, event, resume, effect_intent]) == [changed_failure]
 
     altered = receipt.model_dump(mode="json")
     altered["current_head"] = "0" * 64
