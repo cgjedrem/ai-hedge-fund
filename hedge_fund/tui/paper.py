@@ -617,6 +617,7 @@ class RunSessionScreen(Screen):
                                 request_id=plan.request_id,
                                 capture_id=plan.capture.capture_id,
                                 capture_digest=plan.capture.digest,
+                                root_context=root,
                             )
             app.call_from_thread(self._show_report, deployed, record)
         except Exception as exc:  # fail loud, in the UI

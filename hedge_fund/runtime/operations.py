@@ -27,6 +27,7 @@ from hedge_fund.runtime.admission import (
 )
 from hedge_fund.runtime.capture import _root_id, FrozenCapture
 from hedge_fund.runtime.root import (
+    _PROTECTED_RESOURCE_NAMES,
     ensure_unique_resource_name,
     PRIVATE_ROOT,
     RootContext,
@@ -1827,12 +1828,23 @@ def _validate_action(value: object) -> str:
     return value
 
 
-def _validate_subject(value: object) -> str:
+def _validate_subject(value: object, *, root: RootContext | None = None) -> str:
     if not isinstance(value, str):
         raise OperationError("operation subject is invalid")
+    if root is not None:
+        if not isinstance(root, RootContext):
+            raise OperationError("operation subject is invalid")
+        try:
+            root.revalidate()
+        except Exception:
+            raise OperationError("operation subject is invalid") from None
     try:
         return ensure_unique_resource_name(value, [])
     except RootPathError:
+        if value not in _PROTECTED_RESOURCE_NAMES or not isinstance(root, RootContext):
+            raise OperationError("operation subject is invalid") from None
+        if root._protected_resource_authorized(value):
+            return value
         raise OperationError("operation subject is invalid") from None
 
 
@@ -1842,7 +1854,13 @@ def _validate_due_set(value: object) -> tuple[str, ...]:
     return value
 
 
-def paper_tick_logical_key(subject_id: object, session: object, expected_head: object) -> str:
+def paper_tick_logical_key(
+    subject_id: object,
+    session: object,
+    expected_head: object,
+    *,
+    root: RootContext | None = None,
+) -> str:
     """Reuse web paper-tick identity at shared tick admission."""
     payload = _normalize_payload(
         {
@@ -1856,6 +1874,7 @@ def paper_tick_logical_key(subject_id: object, session: object, expected_head: o
         action="paper-tick",
         target=(session,),
         payload_digest=_sha256(_canonical_json(payload)),
+        root=root,
     )
 
 
@@ -1865,9 +1884,10 @@ def derive_logical_operation_key(
     action: object,
     target: object,
     payload_digest: object,
+    root: RootContext | None = None,
 ) -> str:
     """Return canonical digest for reviewed action identity."""
-    normalized_subject = _validate_subject(subject_id)
+    normalized_subject = _validate_subject(subject_id, root=root)
     normalized_action = _validate_action(action)
     if isinstance(target, str):
         normalized_target = (target,)

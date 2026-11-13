@@ -89,7 +89,7 @@ def _tree_digest_snapshot(path):
     return {item.relative_to(path).as_posix(): ("dir" if item.is_dir() else hashlib.sha256(item.read_bytes()).hexdigest()) for item in sorted(path.rglob("*"))}
 
 
-def _legacy_relocation_source(path, *, protected_fund=False, marker=None, settings=None):
+def _legacy_relocation_source(path, *, protected_fund=False, protected_artifacts=False, marker=None, settings=None):
     path.mkdir()
     (path / "paper").mkdir()
     deploy("alpha", _spec(), ["AAPL"], root=path / "paper")
@@ -101,6 +101,10 @@ def _legacy_relocation_source(path, *, protected_fund=False, marker=None, settin
         (path / "paper" / "alpha").rename(path / "paper" / "umbrella")
         fund_file = path / "paper" / "umbrella" / "fund.yaml"
         fund_file.write_text(fund_file.read_text(encoding="utf-8").replace("name: alpha", "name: umbrella"), encoding="utf-8")
+    if protected_artifacts:
+        (path / "mandates" / "umbrella.yaml").write_text("name: umbrella\n", encoding="utf-8")
+        (path / "research" / "umbrella").mkdir()
+        (path / "research" / "umbrella" / "note.json").write_text('{"fund":"umbrella"}\n', encoding="utf-8")
     if marker is not None:
         fund_name = "umbrella" if protected_fund else "alpha"
         (path / "paper" / fund_name / "runner.pid").write_text(marker, encoding="ascii")
@@ -124,8 +128,14 @@ def _write_protected_source_fund(root, name):
     fund_file.write_text(content, encoding="utf-8")
 
 
-def _copied_destination(tmp_path, *, protected_fund=False, marker=None, settings=None):
-    source_path = _legacy_relocation_source(tmp_path / "source", protected_fund=protected_fund, marker=marker, settings=settings)
+def _copied_destination(tmp_path, *, protected_fund=False, protected_artifacts=False, marker=None, settings=None):
+    source_path = _legacy_relocation_source(
+        tmp_path / "source",
+        protected_fund=protected_fund,
+        protected_artifacts=protected_artifacts,
+        marker=marker,
+        settings=settings,
+    )
     destination_path = tmp_path / "destination"
     destination_path.mkdir()
     with RootContext.open(source_path) as source:
@@ -888,6 +898,48 @@ def test_full_attested_relocation_keeps_source_tree_hash_identical(tmp_path, cap
             assert verify_ledger_head(destination, "umbrella")["head_hash"] == record.hash
         finally:
             owner.close()
+    assert _tree_digest_snapshot(source_path) == source_before
+
+
+def test_relocation_preserves_protected_mandate_and_research_after_attestation(tmp_path):
+    source_path = _legacy_relocation_source(
+        tmp_path / "source",
+        protected_fund=True,
+        protected_artifacts=True,
+    )
+    destination_path = tmp_path / "destination"
+    destination_path.mkdir()
+    source_before = _tree_digest_snapshot(source_path)
+    evidence_path = destination_path / Path(handover.SOURCE_EVIDENCE_PATH)
+
+    with RootContext.open(source_path) as source:
+        source_review = handover.inspect_relocation_source(source, evidence_out=evidence_path)
+
+    with RootContext.open(source_path) as source, RootContext.open(destination_path) as destination:
+        copied = handover.relocate_copy(
+            destination,
+            source=source,
+            expected_content_digest=source_review["content_digest"],
+        )
+        assert copied["state"] == "copied"
+
+        destination_before_denial = _tree_digest_snapshot(destination_path)
+        with pytest.raises(HandoverError, match="source blocker remains unresolved: umbrella"):
+            handover.relocate_finalize(destination)
+        assert _tree_digest_snapshot(destination_path) == destination_before_denial
+
+        handover.attest_protected_fund(
+            destination,
+            fund="umbrella",
+            source_evidence_digest=source_review["source_evidence_digest"],
+            operator_statement="Synthetic protected fund keeps its original name.",
+        )
+        finalized = handover.relocate_finalize(destination)
+        assert finalized["mode"] == "relocated"
+        assert handover.protected_fund_is_authorized(destination, "umbrella")
+
+    assert (destination_path / "mandates" / "umbrella.yaml").read_bytes() == (source_path / "mandates" / "umbrella.yaml").read_bytes()
+    assert (destination_path / "research" / "umbrella" / "note.json").read_bytes() == (source_path / "research" / "umbrella" / "note.json").read_bytes()
     assert _tree_digest_snapshot(source_path) == source_before
 
 

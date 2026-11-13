@@ -95,6 +95,59 @@ def trusted_tui_root(tmp_path, monkeypatch):
 
 
 @pytest.fixture
+def attested_trusted_tui_root(tmp_path, monkeypatch):
+    source_path = tmp_path / "protected-source"
+    destination_path = tmp_path / "protected-destination"
+    source_path.mkdir()
+    (source_path / "paper").mkdir()
+    destination_path.mkdir()
+    deployed = deploy("alpha", make_spec(["pead"], "alpha"), ["TEST"], root=source_path / "paper")
+    protected_directory = source_path / "paper" / "umbrella"
+    deployed.rename(protected_directory)
+    fund_file = protected_directory / "fund.yaml"
+    fund_file.write_text(
+        fund_file.read_text(encoding="utf-8").replace("name: alpha", "name: umbrella"),
+        encoding="utf-8",
+    )
+    source_before = _tree_snapshot(source_path)
+    evidence_path = destination_path / Path(handover.SOURCE_EVIDENCE_PATH)
+
+    with RootContext.open(source_path) as source:
+        source_review = handover.inspect_relocation_source(source, evidence_out=evidence_path)
+    with RootContext.open(source_path) as source, RootContext.open(destination_path) as destination:
+        handover.relocate_copy(
+            destination,
+            source=source,
+            expected_content_digest=source_review["content_digest"],
+        )
+        handover.attest_protected_fund(
+            destination,
+            fund="umbrella",
+            source_evidence_digest=source_review["source_evidence_digest"],
+            operator_statement="Synthetic protected fund keeps its original name.",
+        )
+        assert handover.relocate_finalize(destination)["mode"] == "relocated"
+
+    monkeypatch.setattr(handover, "out_of_band_exclusion_basis", lambda _root: None)
+    monkeypatch.setattr(
+        handover,
+        "_runtime_scope_identity",
+        lambda _root: {"kind": "synthetic-test-owner", "identity": "tui"},
+    )
+    with RootContext.open(destination_path) as root, paths.bound_root(root):
+        review = handover.prepare_single_writer_acknowledgement(root)
+        assert (
+            handover.trust_single_writer(
+                root,
+                expected_inventory_digest=review["inventory_digest"],
+                operator_acknowledgement=review["operator_acknowledgement"],
+            )["authority"]
+            == handover.TRUSTED_SINGLE_WRITER_AUTHORITY
+        )
+        yield destination_path, source_path, source_before
+
+
+@pytest.fixture
 def trusted_tui_paper_fund(trusted_tui_root):
     root_path = trusted_tui_root
     root = paths.root_context()
@@ -199,8 +252,6 @@ def test_trusted_tui_resume_is_admitted_and_request_bound(trusted_tui_paper_fund
 
 
 def test_tui_run_records_one_captured_quant_session(trusted_tui_root, monkeypatch):
-    from importlib import import_module
-
     root = paths.root_context()
     owner = RootOwnerLease.acquire(root, timeout=0)
     admission = AdmissionCoordinator(root, owner_lease=owner)
@@ -210,6 +261,22 @@ def test_tui_run_records_one_captured_quant_session(trusted_tui_root, monkeypatc
         record_ledger_head(root, "alpha", admission=admission)
     finally:
         owner.close()
+
+    _run_tui_captured_quant_session(directory, "alpha", monkeypatch)
+
+
+def test_tui_run_records_attested_protected_quant_session(attested_trusted_tui_root, monkeypatch):
+    root_path, source_path, source_before = attested_trusted_tui_root
+    plan = _run_tui_captured_quant_session(root_path / "paper" / "umbrella", "umbrella", monkeypatch)
+
+    assert plan.capture.subject_id == "umbrella"
+    assert _tree_snapshot(source_path) == source_before
+
+
+def _run_tui_captured_quant_session(directory, subject_id, monkeypatch):
+    from importlib import import_module
+
+    from hedge_fund.runtime.capture import FrozenCapture
 
     class FakeDataClient:
         def get_prices(self, ticker, start_date, end_date, **_kwargs):
@@ -237,6 +304,9 @@ def test_tui_run_records_one_captured_quant_session(trusted_tui_root, monkeypatc
     plan = paper._resolve_tui_run_plan(directory)
     assert plan.action == "run"
     assert plan.due == "2025-01-21"
+    assert plan.capture.subject_id == subject_id
+    restored = FrozenCapture.from_private_bytes(paths.root_context(), plan.capture.private_bytes())
+    assert restored == plan.capture
 
     async def scenario():
         app = HedgeFundApp()
@@ -247,7 +317,7 @@ def test_tui_run_records_one_captured_quant_session(trusted_tui_root, monkeypatc
                 await pilot.pause(0.05)
                 if screen._phase in {"done", "failed"}:
                     break
-            assert screen._phase == "done"
+            assert screen._phase == "done", str(screen.query_one("#run-phase").content)
 
     asyncio.run(scenario())
     ledger = Ledger(directory)
@@ -258,6 +328,7 @@ def test_tui_run_records_one_captured_quant_session(trusted_tui_root, monkeypatc
     assert event["operation_id"] == plan.operation_id
     assert event["capture_id"] == plan.capture.capture_id
     assert event["capture_digest"] == plan.capture.digest
+    return plan
 
 
 def test_tui_run_shows_nothing_due_without_relabeling_it_as_admission_error(trusted_tui_root, monkeypatch):

@@ -242,6 +242,13 @@ def test_logical_duplicate_nonterminal_operation_refuses_and_links_existing(oper
     assert [operation.operation_id for operation in starts] == [first.operation_id]
 
 
+def test_paper_tick_logical_key_denies_protected_subject_without_root():
+    from hedge_fund.runtime.operations import paper_tick_logical_key
+
+    with pytest.raises(OperationError, match="operation subject is invalid"):
+        paper_tick_logical_key("umbrella", "2026-10-31", "a" * 64)
+
+
 def test_logical_shared_paper_tick_key_matches_web_operation(operation_store, frozen_capture):
     from hedge_fund.runtime.operations import paper_tick_logical_key
 

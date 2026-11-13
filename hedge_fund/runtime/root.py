@@ -703,16 +703,31 @@ class RootContext:
                     raise RootPathError("protected path identity is not attested at this destination") from None
                 return parts
         parts = _relative_parts(value, allow_protected=True)
-        if not self._is_exact_protected_path(parts):
+        resource = self._handover_protected_resource(parts)
+        if resource is None:
             return _relative_parts(value)
         if write and not access[0]:
             return _relative_parts(value)
-        if write and not access[1] and not self._protected_resource_authorized(parts[1]):
+        if write and not access[1] and not self._protected_resource_authorized(resource):
             raise RootPathError("protected path identity is not attested at this destination")
         return parts
 
     def _is_exact_protected_path(self, parts: tuple[str, ...]) -> bool:
         return len(parts) >= 2 and parts[0] == "paper" and parts[1] in _PROTECTED_RESOURCE_NAMES and not any(_canonical_component_identity(part) in _PROTECTED_RESOURCE_NAMES for part in parts[2:])
+
+    def _handover_protected_resource(self, parts: tuple[str, ...]) -> str | None:
+        if self._is_exact_protected_path(parts):
+            return parts[1]
+        if len(parts) == 2 and parts[0] == "mandates":
+            for suffix in (".yaml", ".yml"):
+                if parts[1].endswith(suffix):
+                    resource = parts[1][: -len(suffix)]
+                    if resource in _PROTECTED_RESOURCE_NAMES:
+                        return resource
+        if len(parts) >= 2 and parts[0] == "research" and parts[1] in _PROTECTED_RESOURCE_NAMES:
+            if not any(_canonical_component_identity(part) in _PROTECTED_RESOURCE_NAMES for part in parts[2:]):
+                return parts[1]
+        return None
 
     def _protected_resource_authorized(self, name: str) -> bool:
         try:

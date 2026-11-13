@@ -766,6 +766,71 @@ def test_attested_protected_resource_allows_original_name_only(tmp_path):
     assert not any((root_path / "paper").glob("**/blocked.json"))
 
 
+def test_handover_scope_reads_protected_mandate_and_research_artifacts(tmp_path):
+    root_path = tmp_path / "source"
+    mandate = root_path / "mandates" / "umbrella.yaml"
+    report = root_path / "research" / "umbrella" / "report.json"
+    mandate.parent.mkdir(parents=True)
+    report.parent.mkdir(parents=True)
+    mandate.write_bytes(b"name: umbrella\n")
+    report.write_bytes(b'{"fund":"umbrella"}\n')
+
+    with RootContext.open(root_path) as root:
+        with root_module._handover_resource_access(root):
+            assert root.read_bytes("mandates/umbrella.yaml") == b"name: umbrella\n"
+            assert root.read_bytes("research/umbrella/report.json") == b'{"fund":"umbrella"}\n'
+
+        with pytest.raises(RootPathError, match="protected"):
+            root.read_bytes("mandates/umbrella.yaml")
+        with pytest.raises(RootPathError, match="protected"):
+            root.read_bytes("research/umbrella/report.json")
+
+
+@pytest.mark.parametrize(
+    "relative",
+    [
+        "mandates/umbrella.yaml",
+        "research/umbrella/synthetic.json",
+    ],
+)
+def test_unattested_protected_artifact_write_stays_denied_under_handover_access(tmp_path, relative):
+    root_path = tmp_path / "unattested"
+    root_path.mkdir()
+    target = root_path / Path(relative)
+
+    with RootContext.open(root_path) as root:
+        with root_module._handover_resource_access(root, allow_writes=True):
+            with pytest.raises(RootPathError, match="protected"):
+                root.write_bytes(relative, b"denied")
+
+    assert not target.exists()
+
+
+def test_handover_scope_keeps_protected_artifact_aliases_denied(tmp_path):
+    root_path = tmp_path / "source"
+    root_path.mkdir()
+    aliases = (
+        "mandates/umbrella.yaml/child",
+        "mandates/umbrella~1.yaml",
+        "research/Umbrella/report.json",
+        "research/umbrella/watchtower/report.json",
+        "research/ordinary/umbrella/report.json",
+    )
+
+    with RootContext.open(root_path) as root:
+        with root_module._handover_resource_access(
+            root,
+            allow_writes=True,
+            allow_unattested_protected_writes=True,
+        ):
+            for alias in aliases:
+                with pytest.raises(RootPathError):
+                    root.write_bytes(alias, b"denied")
+
+    assert not (root_path / "mandates").exists()
+    assert not (root_path / "research").exists()
+
+
 def test_reparse_child_is_denied_before_read(tmp_path):
     root = tmp_path / "root"
     outside = tmp_path / "outside"

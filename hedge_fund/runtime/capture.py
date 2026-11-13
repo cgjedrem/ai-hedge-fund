@@ -7,12 +7,13 @@ import json
 import os
 import re
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, InitVar
 from types import MappingProxyType
 from uuid import uuid4
 
 from hedge_fund.runtime.configuration import ConfigurationError, RuntimeSettings
 from hedge_fund.runtime.root import (
+    _PROTECTED_RESOURCE_NAMES,
     ensure_unique_resource_name,
     RootContext,
     RootPathError,
@@ -86,20 +87,29 @@ class FrozenCapture:
     credential_versions: Mapping[str, int] = field(repr=False)
     credential_handles: Mapping[str, CredentialHandle] = field(repr=False)
     code_version: str = field(repr=False)
+    root: InitVar[RootContext]
     mandate_snapshot: bytes | None = field(default=None, repr=False)
 
-    def __post_init__(self) -> None:
+    def __post_init__(self, root: RootContext) -> None:
         if not isinstance(self.capture_id, str) or not re.fullmatch(r"[a-fA-F0-9]{32}", self.capture_id):
             raise ConfigurationError("capture identity is invalid")
         if not isinstance(self.digest, str) or not _SHA256.fullmatch(self.digest):
             raise ConfigurationError("capture digest is invalid")
         if not isinstance(self.root_id, str) or not _SHA256.fullmatch(self.root_id):
             raise ConfigurationError("capture root identity is invalid")
+        if not isinstance(root, RootContext):
+            raise ConfigurationError("capture root identity is invalid")
+        try:
+            root.revalidate()
+            actual_root_id = _root_id(root)
+        except Exception:
+            raise ConfigurationError("capture root identity is invalid") from None
+        if actual_root_id != self.root_id.casefold():
+            raise ConfigurationError("capture root identity does not match")
         if not isinstance(self.subject_id, str):
             raise ConfigurationError("capture subject is invalid")
-        try:
-            subject_id = ensure_unique_resource_name(self.subject_id, [])
-        except RootPathError:
+        subject_id = _canonical_capture_subject(self.subject_id)
+        if subject_id in _PROTECTED_RESOURCE_NAMES and not root._protected_resource_authorized(subject_id):
             raise ConfigurationError("capture subject is invalid") from None
         if not isinstance(self.mandate_digest, str) or not _SHA256.fullmatch(self.mandate_digest):
             raise ConfigurationError("mandate digest is invalid")
@@ -186,6 +196,7 @@ class FrozenCapture:
         if self.digest.casefold() != expected_digest:
             raise ConfigurationError("capture digest does not match contents")
 
+        root.revalidate()
         object.__setattr__(self, "capture_id", self.capture_id.casefold())
         object.__setattr__(self, "digest", expected_digest)
         object.__setattr__(self, "root_id", root_id)
@@ -378,6 +389,7 @@ class FrozenCapture:
                 credential_versions=versions,
                 credential_handles=handles,
                 code_version=record["code_version"],
+                root=root,
                 mandate_snapshot=snapshot,
             )
         except (ConfigurationError, TypeError, ValueError, KeyError):
@@ -405,10 +417,7 @@ def freeze_capture(
     root.revalidate()
     if not isinstance(settings, RuntimeSettings):
         raise ConfigurationError("runtime settings are required")
-    try:
-        canonical_subject = ensure_unique_resource_name(subject_id, [])
-    except RootPathError:
-        raise ConfigurationError("capture subject is invalid") from None
+    canonical_subject = _canonical_capture_subject(subject_id)
     if not isinstance(mandate_digest, str) or not _SHA256.fullmatch(mandate_digest):
         raise ConfigurationError("mandate digest is invalid")
     if isinstance(universe, (str, bytes)) or not isinstance(universe, Sequence) or not universe:
@@ -512,10 +521,22 @@ def freeze_capture(
         credential_versions=versions,
         credential_handles=handles,
         code_version=code_version,
+        root=root,
         mandate_snapshot=snapshot_bytes,
     )
     root.revalidate()
     return capture
+
+
+def _canonical_capture_subject(subject_id: str) -> str:
+    if not isinstance(subject_id, str):
+        raise ConfigurationError("capture subject is invalid")
+    if subject_id in _PROTECTED_RESOURCE_NAMES:
+        return subject_id
+    try:
+        return ensure_unique_resource_name(subject_id, [])
+    except RootPathError:
+        raise ConfigurationError("capture subject is invalid") from None
 
 
 def _root_id(root: RootContext) -> str:
