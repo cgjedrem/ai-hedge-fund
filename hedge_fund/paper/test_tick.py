@@ -974,6 +974,102 @@ def test_tui_resume_without_request_id_is_completed_before_tick_gate(tmp_path, c
     assert ledger.unresolved_recovery_state().required is False
 
 
+def test_tui_resume_dedup_matches_full_identity_across_tick(tmp_path, clock, SPEC, monkeypatch):
+    clock("2024-06-04")
+    directory = _deploy_owned_paper_test_fund(tmp_path, SPEC)
+    ledger = Ledger(directory)
+    with _owned_paper_lane(directory, "alpha"):
+        ledger.halt("first operator pause")
+        ledger.resume(SPEC.capital, operator="tui")
+    first_resume = next(event for event in ledger.events() if event.get("kind") == "resume")
+
+    with _owned_paper_lane(directory, "alpha"):
+        record = tick(
+            directory,
+            FakeDataClient(SERIES),
+            session="2024-06-03",
+            expected_head=None,
+            build_fund=build_fund,
+        )
+    latest_head = ledger.latest().hash
+    assert latest_head != first_resume.get("head_hash")
+    assert record.session == "2024-06-03"
+
+    with _owned_paper_lane(directory, "alpha"):
+        ledger.halt("second operator pause")
+    original_log_event = Ledger.log_event
+    failed_completion = []
+
+    def interrupt_before_completion(self, kind, **fields):
+        if kind == "resume_completed" and not failed_completion:
+            failed_completion.append(True)
+            raise OSError("synthetic TUI crash before second Resume completion")
+        return original_log_event(self, kind, **fields)
+
+    monkeypatch.setattr(Ledger, "log_event", interrupt_before_completion)
+    with _owned_paper_lane(directory, "alpha"):
+        with pytest.raises(OSError, match="second Resume completion"):
+            ledger.resume(SPEC.capital, operator="tui")
+
+    landed = ledger.landed_resume_intent()
+
+    assert failed_completion == [True]
+    assert ledger.halted() is None
+    assert landed is not None
+    assert landed["head_hash"] == latest_head
+    assert len([event for event in ledger.events() if event.get("kind") == "resume"]) == 2
+    with _owned_paper_lane(directory, "alpha"):
+        completed = ledger.complete_landed_resume_intent()
+    assert completed == {"name": directory.name, "halted": False, "reconciliation_id": None}
+    assert ledger.unresolved_recovery_state().required is False
+
+
+def test_tick_retries_landed_resume_after_transient_audit_probe(tmp_path, clock, SPEC, monkeypatch):
+    from hedge_fund.paper.ledger import AuditObservationUnavailable
+
+    clock("2024-06-05")
+    directory = _deploy_owned_paper_test_fund(tmp_path, SPEC)
+    ledger = Ledger(directory)
+    with _owned_paper_lane(directory, "alpha"):
+        ledger.halt("operator pause")
+
+    original_log_event = Ledger.log_event
+    failed_completion = []
+
+    def interrupt_before_completion(self, kind, **fields):
+        if kind == "resume_completed" and not failed_completion:
+            failed_completion.append(True)
+            raise OSError("synthetic TUI crash before Resume completion")
+        return original_log_event(self, kind, **fields)
+
+    monkeypatch.setattr(Ledger, "log_event", interrupt_before_completion)
+    with _owned_paper_lane(directory, "alpha"):
+        with pytest.raises(OSError, match="synthetic TUI crash"):
+            ledger.resume(SPEC.capital, operator="tui")
+
+    original_events = Ledger.events
+    failed_probe = []
+
+    def unavailable_once(self):
+        if self.directory == directory and not failed_probe:
+            failed_probe.append(True)
+            raise AuditObservationUnavailable("synthetic audit contention")
+        return original_events(self)
+
+    monkeypatch.setattr(Ledger, "events", unavailable_once)
+    monkeypatch.setattr(paper_tick_module, "next_session", lambda *_args, **_kwargs: None)
+    with _owned_paper_lane(directory, "alpha"):
+        with pytest.raises(NothingDue):
+            tick(directory, FakeDataClient(SERIES), build_fund=build_fund)
+
+    assert ledger.halted() is None
+    assert len([event for event in ledger.events() if event["kind"] == "halt"]) == 1
+    assert failed_probe == [True]
+    assert ledger.halted() is None
+    assert len([event for event in ledger.events() if event["kind"] == "resume_completed"]) == 1
+    assert ledger.unresolved_recovery_state().required is False
+
+
 def test_pre_expiry_failure_receipt_keeps_fund_tickable(tmp_path, clock, SPEC):
     from hedge_fund.runtime.reconciliation import (
         build_reconciliation_snapshot,
@@ -2370,6 +2466,46 @@ except BaseException as exc:
         tick(directory, NoPreflightData(SERIES), build_fund=build_fund)
     assert ledger.halted() == "approval journal requires reconciliation"
     assert ledger.latest().hash == second.hash
+
+    from hedge_fund.runtime.reconciliation import (
+        build_tick_intent_reconciliation_snapshot,
+        TickIntentReconciliationConfirmation,
+    )
+
+    snapshot = build_tick_intent_reconciliation_snapshot(
+        directory,
+        load_deployed(directory),
+        ledger,
+        ledger.replay(spec.capital, full=True),
+        ledger.latest(),
+    )
+    assert snapshot.preview.required is True
+    assert snapshot.preview.recoverable is True
+    assert snapshot.preview.reason == "ready"
+    assert snapshot.preview.expected_head == first.hash
+    assert snapshot.preview.current_head == second.hash
+    assert snapshot.preview.head_matches_intent is True
+    assert snapshot.preview.book_matches_ledger is True
+
+    confirmation = TickIntentReconciliationConfirmation(
+        request_id="recover-owned-child-exit",
+        intent_request_id=None,
+        intent_digest=None,
+        preview_digest=snapshot.preview.preview_digest,
+        decision="confirm-paper-book-matches-ledger",
+    )
+    receipt_id = ledger.reconcile_tick_intent(spec.capital, confirmation=confirmation, operator="cli")
+    resolved = next(event for event in ledger.events() if event.get("kind") == "tick_intent_resolved")
+    receipt = resolved["receipt"]
+
+    assert receipt_id == receipt["receipt_id"]
+    assert receipt["expected_head"] == first.hash
+    assert receipt["current_head"] == second.hash
+    assert receipt["broker_book_sha256"] == snapshot.preview.broker_book_sha256
+    ledger.resume(spec.capital, approval_required=True)
+    assert ledger.halted() is None
+    assert ledger.unresolved_approval_consumption_events(allow_unresolved_corruption=True) == ()
+    assert ledger.unresolved_recovery_state().required is False
 
 
 def test_interrupted_redo_blocks_new_work_after_owned_child_exit(tmp_path, clock, SPEC, owned_test_process):

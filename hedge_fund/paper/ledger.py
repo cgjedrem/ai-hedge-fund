@@ -96,6 +96,10 @@ class PaperRequestConflict(LedgerError):
     """A request ID was reused for another or already-failed control action."""
 
 
+class PaperReceiptExpired(LedgerError):
+    """Recovery receipt expired; fresh review required."""
+
+
 class PaperTickNoWork(LedgerError):
     """A tick request completed without a due session."""
 
@@ -1207,12 +1211,18 @@ class Ledger:
             },
         )
 
-    def landed_resume_intent(self) -> dict[str, object] | None:
+    def landed_resume_intent(self, *, require_audit_observation: bool = False) -> dict[str, object] | None:
+        if type(require_audit_observation) is not bool:
+            raise ValueError("Resume audit-observation policy is invalid.")
         if not self.control_path.exists() or self.halted() is not None:
             return None
         try:
             events = self.events()
-        except (AuditObservationUnavailable, OSError, UnicodeError, ValueError):
+        except AuditObservationUnavailable:
+            if require_audit_observation:
+                raise
+            return None
+        except (OSError, UnicodeError, ValueError):
             return None
         pending = [(index, event) for index, event in enumerate(events) if event.get("kind") == "resume_effect_intent" and not _resume_effect_has_completion(events, index)]
         if len(pending) != 1 or pending[0][0] != len(events) - 1:
@@ -1249,13 +1259,16 @@ class Ledger:
         request_id: str | None = None,
         *,
         request_digest: str | None = None,
+        require_audit_observation: bool = False,
     ) -> dict[str, object] | None:
         if request_id is not None:
             _validate_request_id(request_id)
         if request_digest is not None and (not isinstance(request_digest, str) or _HASH.fullmatch(request_digest) is None):
             raise ValueError("Resume request digest is invalid.")
+        if type(require_audit_observation) is not bool:
+            raise ValueError("Resume audit-observation policy is invalid.")
         self._require_write_lanes(_CONTROL_LANES)
-        effect = self.landed_resume_intent()
+        effect = self.landed_resume_intent(require_audit_observation=require_audit_observation)
         if effect is None or (request_id is not None and effect.get("request_id") != request_id):
             return None
         if request_digest is not None and effect.get("request_digest") != request_digest:
@@ -1324,6 +1337,7 @@ class Ledger:
             find_receipt_for_request,
             ReconciliationConfirmation,
             ReconciliationReceipt,
+            RecoveryReceiptExpired,
             unresolved_tick_failures,
             verify_reconciliation_receipt,
         )
@@ -1410,6 +1424,8 @@ class Ledger:
                     raise LedgerError("Resume confirmation is stale; review the current paper state.")
                 try:
                     verify_reconciliation_receipt(self.directory, load_deployed(self.directory), self, state, latest, receipt, recorded_now=_now())
+                except RecoveryReceiptExpired:
+                    raise PaperReceiptExpired("Reconciliation receipt expired; fresh review is required.") from None
                 except ValueError:
                     raise LedgerError("Reconciliation receipt no longer matches the paper state.") from None
                 if not any(event.get("kind") == "resume" and event.get("request_id") == confirmation.request_id and event.get("reconciliation_id") == receipt.receipt_id for event in events):
@@ -1452,6 +1468,8 @@ class Ledger:
                 resume_authorized_at = _now()
                 try:
                     verify_reconciliation_receipt(self.directory, deployed, self, state, latest, receipt, recorded_now=resume_authorized_at)
+                except RecoveryReceiptExpired:
+                    raise PaperReceiptExpired("Reconciliation receipt expired; fresh review is required.") from None
                 except ValueError:
                     raise LedgerError("Reconciliation receipt no longer matches the paper state.") from None
             elif confirmation is not None:
@@ -1468,6 +1486,8 @@ class Ledger:
                 resume_authorized_at = _now()
                 try:
                     verify_reconciliation_receipt(self.directory, deployed, self, state, latest, receipt, recorded_now=resume_authorized_at)
+                except RecoveryReceiptExpired:
+                    raise PaperReceiptExpired("Reconciliation receipt expired; fresh review is required.") from None
                 except ValueError:
                     raise LedgerError("Reconciliation receipt no longer matches the paper state.") from None
             elif any(event.get("kind") == "resume" and isinstance(event.get("reconciliation_id"), str) and not any(later.get("kind") == "halt" for later in events[index + 1 :]) for index, event in enumerate(events)):
@@ -1485,7 +1505,8 @@ class Ledger:
                         "reconciliation_id": receipt.receipt_id,
                     }
                 )
-            if not any(event.get("kind") == "resume" and event.get("request_id") == resume_fields.get("request_id") and event.get("reconciliation_id") == resume_fields.get("reconciliation_id") for event in events):
+            identity_fields = ("head_hash", "by", "reconciliation_id", "request_id", "request_action", "request_digest")
+            if not any(event.get("kind") == "resume" and all(event.get(field) == resume_fields.get(field) for field in identity_fields) for event in events):
                 resume_event_fields = dict(resume_fields)
                 if resume_authorized_at is not None:
                     resume_event_fields["time"] = resume_authorized_at

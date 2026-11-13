@@ -751,6 +751,46 @@ it("does not auto-resubmit a lost recovery response and reuses its request ident
   expect(await screen.findByText("Reconciliation receipt recorded. Halt cleared. Failed tick was not retried; no runner was started.")).toBeInTheDocument();
 });
 
+it("allocates a fresh recovery request after explicit review of an expired receipt", async () => {
+  const user = userEvent.setup();
+  const preview = paperReconciliationPreview();
+  const requestIds: unknown[] = [];
+  const calls = renderDesk(stoppedRunner, {
+    [`GET /api/paper/${FUND}`]: () => json(paperSnapshot(stoppedRunner, true)),
+    [`GET /api/paper/${FUND}/reconciliation`]: () => json({
+      name: FUND,
+      halted: "synthetic tick failure",
+      resume_allowed: true,
+      preview,
+    }),
+    [`POST /api/paper/${FUND}/resume`]: (call) => {
+      requestIds.push(call.body?.request_id);
+      return requestIds.length === 1
+        ? json({
+          detail: "Recovery receipt expired; request a fresh review.",
+          code: "expired-confirmation",
+          refresh_required: true,
+          retry_policy: "review-again",
+        }, 410)
+        : json({ name: FUND, halted: false, reconciliation_id: "2".repeat(64) });
+    },
+  });
+
+  await user.click(await enabledButton("Review recovery"));
+  const firstDialog = await screen.findByRole("dialog", { name: "Reconcile and resume paper fund" });
+  await user.click(within(firstDialog).getByRole("button", { name: "Confirm recovery and resume" }));
+  await waitFor(() => expect(mutations(calls)).toHaveLength(1));
+
+  await user.click(await enabledButton("Review recovery"));
+  const secondDialog = await screen.findByRole("dialog", { name: "Reconcile and resume paper fund" });
+  await user.click(within(secondDialog).getByRole("button", { name: "Confirm recovery and resume" }));
+  await waitFor(() => expect(mutations(calls)).toHaveLength(2));
+
+  expect(requestIds[0]).toMatch(/^[a-f0-9]{32}$/);
+  expect(requestIds[1]).toMatch(/^[a-f0-9]{32}$/);
+  expect(requestIds[1]).not.toBe(requestIds[0]);
+});
+
 it("resumes a manual halt with an empty confirmation and no paper operation", async () => {
   const user = userEvent.setup();
   const preview = paperReconciliationPreview({

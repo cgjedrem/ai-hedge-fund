@@ -65,6 +65,7 @@ from hedge_fund.paper.ledger import (
     HaltAuditUnavailable,
     Ledger,
     LedgerError,
+    PaperReceiptExpired,
     PaperReconciliationRequired,
     PaperRequestConflict,
     UnresolvedTickIntentRefusal,
@@ -3975,6 +3976,13 @@ class DeskService:
                         request_id=request.request_id if request is not None else None,
                         operator="web",
                     )
+                except PaperReceiptExpired:
+                    raise ServiceError(
+                        410,
+                        "Recovery receipt expired; review the current paper state before confirming again.",
+                        code="expired-confirmation",
+                        request_id=request.request_id if request is not None else None,
+                    ) from None
                 except PaperRequestConflict:
                     raise ServiceError(
                         409,

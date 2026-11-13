@@ -88,6 +88,154 @@ def test_web_recovery_uses_reviewed_preview_and_retries_same_request(write_clien
     assert sum(event["kind"] == "resume" for event in ledger.events()) == 1
 
 
+def test_web_expired_receipt_requires_fresh_resume_request(write_client, demo_root, monkeypatch):
+    import hedge_fund.paper.ledger as ledger_module
+
+    client, ledger = _failed_web_tick(write_client, demo_root)
+    headers = write_client[1]
+    preview = client.get(
+        "/api/paper/demo-quality/reconciliation",
+        headers={"host": "127.0.0.1"},
+    ).json()["preview"]
+    request = {
+        "request_id": "resume-expiring-receipt",
+        "failure_id": preview["failure_id"],
+        "preview_digest": preview["preview_digest"],
+        "decision": _DECISION,
+    }
+    recorded_at = ["2024-06-03T00:00:00+00:00"]
+    monkeypatch.setattr(ledger_module, "_now", lambda: recorded_at[0])
+    original_log_event = Ledger.log_event
+    failed_resume = []
+
+    def interrupt_before_resume(self, kind, **fields):
+        if kind == "resume" and fields.get("request_id") == request["request_id"] and not failed_resume:
+            failed_resume.append(True)
+            raise OSError("synthetic crash after receipt persistence")
+        return original_log_event(self, kind, **fields)
+
+    monkeypatch.setattr(Ledger, "log_event", interrupt_before_resume)
+    first = client.post(
+        "/api/paper/demo-quality/resume",
+        headers=headers,
+        json=request,
+    )
+    assert first.status_code == 423
+    assert [event["kind"] for event in ledger.events()].count("reconciliation") == 1
+    assert not any(event["kind"] == "resume" for event in ledger.events())
+
+    recorded_at[0] = "2024-06-03T00:30:01+00:00"
+    expired = client.post(
+        "/api/paper/demo-quality/resume",
+        headers=headers,
+        json=request,
+    )
+
+    assert expired.status_code == 410
+    assert expired.json()["code"] == "expired-confirmation"
+    assert ledger.halted() == "synthetic ambiguous tick"
+    assert not any(event["kind"] in {"resume", "resume_effect_intent"} for event in ledger.events())
+
+    current_preview = client.get(
+        "/api/paper/demo-quality/reconciliation",
+        headers={"host": "127.0.0.1"},
+    ).json()["preview"]
+    fresh_request = {
+        **request,
+        "request_id": "resume-fresh-after-expiry",
+        "failure_id": current_preview["failure_id"],
+        "preview_digest": current_preview["preview_digest"],
+    }
+    resumed = client.post(
+        "/api/paper/demo-quality/resume",
+        headers=headers,
+        json=fresh_request,
+    )
+
+    assert resumed.status_code == 200
+    assert resumed.json()["halted"] is False
+    assert ledger.halted() is None
+    assert failed_resume == [True]
+    assert [event["kind"] for event in ledger.events()].count("reconciliation") == 2
+    assert [event["kind"] for event in ledger.events()].count("resume") == 1
+
+
+def test_web_partial_resume_keeps_expired_failure_reviewable(write_client, demo_root, monkeypatch):
+    import hedge_fund.paper.ledger as ledger_module
+
+    client, ledger = _failed_web_tick(write_client, demo_root)
+    headers = write_client[1]
+    preview = client.get(
+        "/api/paper/demo-quality/reconciliation",
+        headers={"host": "127.0.0.1"},
+    ).json()["preview"]
+    request = {
+        "request_id": "resume-before-effect-intent",
+        "failure_id": preview["failure_id"],
+        "preview_digest": preview["preview_digest"],
+        "decision": _DECISION,
+    }
+    recorded_at = ["2024-06-03T00:00:00+00:00"]
+    monkeypatch.setattr(ledger_module, "_now", lambda: recorded_at[0])
+    original_log_event = Ledger.log_event
+    failed_effect_intent = []
+
+    def interrupt_before_effect_intent(self, kind, **fields):
+        if kind == "resume_effect_intent" and not failed_effect_intent:
+            failed_effect_intent.append(True)
+            raise OSError("synthetic crash before Resume effect intent")
+        return original_log_event(self, kind, **fields)
+
+    monkeypatch.setattr(Ledger, "log_event", interrupt_before_effect_intent)
+    first = client.post(
+        "/api/paper/demo-quality/resume",
+        headers=headers,
+        json=request,
+    )
+    assert first.status_code == 423
+    assert ledger.halted() == "synthetic ambiguous tick"
+    assert [event["kind"] for event in ledger.events()].count("resume") == 1
+    assert not any(event["kind"] == "resume_effect_intent" for event in ledger.events())
+
+    recorded_at[0] = "2024-06-03T00:30:01+00:00"
+    recovery = client.get(
+        "/api/paper/demo-quality/reconciliation",
+        headers={"host": "127.0.0.1"},
+    ).json()
+
+    assert recovery["preview"]["required"] is True
+    assert recovery["preview"]["recoverable"] is True
+    assert recovery["preview"]["failure_id"] == request["failure_id"]
+    assert recovery["resume_allowed"] is True
+    expired = client.post(
+        "/api/paper/demo-quality/resume",
+        headers=headers,
+        json=request,
+    )
+    assert expired.status_code == 410
+    assert expired.json()["code"] == "expired-confirmation"
+    assert ledger.halted() == "synthetic ambiguous tick"
+
+    fresh_request = {
+        **request,
+        "request_id": "resume-after-partial-expiry",
+        "failure_id": recovery["preview"]["failure_id"],
+        "preview_digest": recovery["preview"]["preview_digest"],
+    }
+    resumed = client.post(
+        "/api/paper/demo-quality/resume",
+        headers=headers,
+        json=fresh_request,
+    )
+
+    assert resumed.status_code == 200
+    assert resumed.json()["halted"] is False
+    assert ledger.halted() is None
+    assert failed_effect_intent == [True]
+    assert len([event for event in ledger.events() if event["kind"] == "resume_effect_intent"]) == 1
+    assert ledger.unresolved_recovery_state().required is False
+
+
 def test_web_resume_retries_after_control_clear_before_completion(write_client, demo_root, monkeypatch):
     client, ledger = _failed_web_tick(write_client, demo_root)
     headers = write_client[1]

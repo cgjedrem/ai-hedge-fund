@@ -20,6 +20,10 @@ _RESIDUAL_UNCERTAINTY = "external-broker-state-not-applicable-local-paper-only"
 _RECEIPT_VALIDITY = timedelta(minutes=30)
 
 
+class RecoveryReceiptExpired(ValueError):
+    """Recorded-clock receipt expired; fresh review required."""
+
+
 class TickOperationIdentity(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -369,8 +373,8 @@ def unresolved_tick_failures(events: list[dict]) -> list[dict]:
         raise ValueError("paper events must be a list of objects")
     failures: dict[str, dict] = {}
     receipts: dict[str, ReconciliationReceipt] = {}
-    resumed_receipts: dict[str, list[str | None]] = {}
-    for event in events:
+    resumed_receipts: dict[str, list[tuple[int, dict]]] = {}
+    for event_index, event in enumerate(events):
         if event.get("kind") == "tick_failed":
             failures[failure_digest(event)] = event
         elif event.get("kind") == "reconciliation":
@@ -384,14 +388,19 @@ def unresolved_tick_failures(events: list[dict]) -> list[dict]:
         elif event.get("kind") == "resume":
             receipt_id = event.get("reconciliation_id")
             if isinstance(receipt_id, str) and _SHA256.fullmatch(receipt_id):
-                resumed_receipts.setdefault(receipt_id, []).append(event.get("time"))
+                resumed_receipts.setdefault(receipt_id, []).append((event_index, event))
     resolved = set()
     for failure_id, receipt in receipts.items():
-        for recorded_now in resumed_receipts.get(receipt.receipt_id, []):
+        for resume_index, resume_event in resumed_receipts.get(receipt.receipt_id, []):
+            recorded_now = resume_event.get("time")
             if receipt.issued_at is not None or receipt.valid_until is not None:
                 try:
                     verify_receipt_expiry(receipt, recorded_now=recorded_now)
                 except ValueError:
+                    continue
+                identity_fields = ("head_hash", "by", "reconciliation_id", "request_id", "request_action", "request_digest")
+                matching_effect_intents = [event for event in events[resume_index + 1 :] if event.get("kind") == "resume_effect_intent" and all(event.get(field) == resume_event.get(field) for field in identity_fields)]
+                if len(matching_effect_intents) != 1:
                     continue
             resolved.add(failure_id)
             break
@@ -640,11 +649,12 @@ def build_tick_intent_reconciliation_snapshot(
 
     current_head = latest.hash if latest is not None else None
     ledger_head_matches = state.prev_hash == current_head
-    if selected is None and approval_journal_events and not intents and intent_request_id is None and intent_digest is None and reason == "ready" and expected_head != current_head:
+    approval_successor = bool(selected is None and approval_journal_events and not intents and intent_request_id is None and intent_digest is None and reason == "ready" and approval_journal_event_digests and latest is not None and expected_head != current_head and latest.prev_hash == expected_head and all(journal_event.get("session") == latest.session for _, journal_event, _ in approval_journal_events))
+    if selected is None and approval_journal_events and not intents and intent_request_id is None and intent_digest is None and reason == "ready" and expected_head != current_head and not approval_successor:
         reason = "ledger-head-changed"
     if reason == "ready" and not ledger_head_matches:
         reason = "ledger-head-changed"
-    head_matches_intent = bool(expected_head == current_head and (intent_event is not None or approval_journal_event_digests))
+    head_matches_intent = bool((expected_head == current_head and (intent_event is not None or approval_journal_event_digests)) or approval_successor)
     book_digest = None
     book_matches = False
     if reason == "ready" and deployed.broker != "paper":
@@ -784,7 +794,7 @@ def verify_receipt_expiry(
     if recorded_clock < issued_at:
         raise ValueError("recovery receipt is not yet valid on the recorded clock")
     if recorded_clock > valid_until:
-        raise ValueError("recovery receipt has expired; fresh review is required")
+        raise RecoveryReceiptExpired("recovery receipt has expired; fresh review is required")
 
 
 def find_receipt_for_request(events: list[dict], request_id: str) -> ReconciliationReceipt | None:

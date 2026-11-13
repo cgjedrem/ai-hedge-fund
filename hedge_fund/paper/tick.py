@@ -381,7 +381,12 @@ def _tick(
     try:
         with _preflight_control(directory, deployed.name):
             ledger.complete_landed_resume_intent()
-            ledger.require_ready_for_tick(state, approval_required=spec.approval_required)
+            try:
+                ledger.require_ready_for_tick(state, approval_required=spec.approval_required)
+            except PaperReconciliationRequired:
+                if ledger.complete_landed_resume_intent(require_audit_observation=True) is None:
+                    raise
+                ledger.require_ready_for_tick(state, approval_required=spec.approval_required)
     except PaperReconciliationRequired:
         ledger.halt("approval journal requires reconciliation")
         raise
@@ -606,7 +611,12 @@ def _redo(
             if deployed.spec.approval_required:
                 _verified_redo_approval(ledger, before, superseded)
             ledger.complete_landed_resume_intent()
-            ledger.require_ready_for_work(state, approval_required=deployed.spec.approval_required, allow_tick_intents=True)
+            try:
+                ledger.require_ready_for_work(state, approval_required=deployed.spec.approval_required, allow_tick_intents=True)
+            except PaperReconciliationRequired:
+                if ledger.complete_landed_resume_intent(require_audit_observation=True) is None:
+                    raise
+                ledger.require_ready_for_work(state, approval_required=deployed.spec.approval_required, allow_tick_intents=True)
             redo_id = ledger.begin_redo(
                 superseded,
                 request_id=request_id,

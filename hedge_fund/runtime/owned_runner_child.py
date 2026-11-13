@@ -383,7 +383,12 @@ def _runner_loop(
                         break
                     try:
                         ledger.complete_landed_resume_intent()
-                        ledger.require_ready_for_work(state, approval_required=spec.approval_required, allow_tick_intents=True)
+                        try:
+                            ledger.require_ready_for_work(state, approval_required=spec.approval_required, allow_tick_intents=True)
+                        except PaperReconciliationRequired:
+                            if ledger.complete_landed_resume_intent(require_audit_observation=True) is None:
+                                raise
+                            ledger.require_ready_for_work(state, approval_required=spec.approval_required, allow_tick_intents=True)
                     except PaperReconciliationRequired:
                         ledger.halt("approval journal requires reconciliation")
                         raise
@@ -547,6 +552,7 @@ def _execute_session(
         now=now,
     )
     with admission.execution_lease(fund, timeout=0):
+
         def require_retry_authority() -> None:
             if stop_event.is_set():
                 raise AuthorizationDenied("runner stop was requested")

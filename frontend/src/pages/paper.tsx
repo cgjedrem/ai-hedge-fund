@@ -37,7 +37,7 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { apiPost, isPreAdmissionDenial, requireMutationOperationReceipt } from "@/lib/api";
+import { apiPost, isExpiredConfirmation, isPreAdmissionDenial, requireMutationOperationReceipt } from "@/lib/api";
 import { toActionableError, type ActionableError } from "@/lib/errors";
 import { useDesk, useOperation, useResource } from "@/lib/hooks";
 import type { PendingOperation } from "@/lib/pending-operations";
@@ -407,6 +407,7 @@ export function PaperDetailPage() {
     } catch (cause) {
       fail(cause, "Action failed.");
       if (confirmAction === "resume") {
+        if (isExpiredConfirmation(cause)) recoveryRequest.current = null;
         resource.refresh();
         reconciliationResource.refresh();
       }
