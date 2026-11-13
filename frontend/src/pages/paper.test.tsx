@@ -211,6 +211,7 @@ function paperSnapshot(runner: RunnerState, halted = false): PaperSnapshot {
     next_run: null,
     halted: halted ? "synthetic tick failure" : null,
     halt_state: halted ? "halted" : "clear",
+    recovery_state: "ready",
     ledger: { ok: true, error: null },
     runner,
     live_value: {
@@ -570,6 +571,110 @@ it("reviews and records an idempotent nothing-due manual operation", async () =>
   expect(JSON.stringify({ ...window.localStorage })).not.toContain("synthetic-confirmation");
 });
 
+it("loads reviewed recovery when ledger replay is valid but readiness requires reconciliation", async () => {
+  const approvalEventDigest = "a".repeat(64);
+  const snapshot = {
+    ...paperSnapshot(stoppedRunner),
+    ledger: { ok: false, error: "Paper work is in progress or requires reconciliation." },
+    recovery_state: "reconciliation_required",
+  } as PaperSnapshot & { recovery_state: "reconciliation_required" };
+  const intentPreview = paperTickIntentPreview({
+    required: true,
+    recoverable: true,
+    reason: "ready",
+    intent_request_id: null,
+    intent_session: null,
+    intent_digest: null,
+    metadata_complete: null,
+    approval_journal_event_digests: [approvalEventDigest],
+  });
+  const calls = renderDesk(stoppedRunner, {
+    [`GET /api/paper/${FUND}`]: () => json(snapshot),
+    [`GET /api/paper/${FUND}/reconciliation`]: () => json({
+      name: FUND,
+      halted: null,
+      resume_allowed: false,
+      preview: paperReconciliationPreview({
+        required: false,
+        recoverable: false,
+        reason: "no-ambiguous-tick-failure",
+        failure_id: null,
+        failed_request_id: null,
+        operation_id: null,
+        expected_head: null,
+        current_head: null,
+        broker_book_sha256: null,
+        capture_id: null,
+        capture_digest: null,
+        book_matches_ledger: false,
+        head_matches_failure: false,
+        preview_digest: null,
+      }),
+      intent_preview: intentPreview,
+      intent_targets: [],
+    }),
+  });
+
+  await screen.findByText("Unmatched approval consumption");
+  const recoveryCard = screen.getByTestId("paper-reconciliation");
+
+  expect(recoveryCard).toHaveTextContent("Unmatched approval consumption");
+  expect(calls.some((call) => call.path === `/api/paper/${FUND}/reconciliation`)).toBe(true);
+});
+
+it("allows reviewed Resume when ledger readiness requires reconciliation", async () => {
+  const user = userEvent.setup();
+  const snapshot = {
+    ...paperSnapshot(stoppedRunner, true),
+    ledger: { ok: false, error: "Paper work is in progress or requires reconciliation." },
+    recovery_state: "reconciliation_required",
+  } as PaperSnapshot & { recovery_state: "reconciliation_required" };
+  const preview = paperReconciliationPreview();
+  const calls = renderDesk(stoppedRunner, {
+    [`GET /api/paper/${FUND}`]: () => json(snapshot),
+    [`GET /api/paper/${FUND}/reconciliation`]: () => json({
+      name: FUND,
+      halted: "synthetic tick failure",
+      resume_allowed: true,
+      preview,
+    }),
+    [`POST /api/paper/${FUND}/resume`]: () => json({
+      name: FUND,
+      halted: false,
+      reconciliation_id: "2".repeat(64),
+    }),
+  });
+
+  expect(await screen.findByText("Ambiguous tick failure")).toBeInTheDocument();
+  await user.click(await enabledButton("Review recovery"));
+  const dialog = await screen.findByRole("dialog", { name: "Reconcile and resume paper fund" });
+  await user.click(within(dialog).getByRole("button", { name: "Confirm recovery and resume" }));
+
+  await waitFor(() => expect(mutations(calls)).toHaveLength(1));
+  expect(mutations(calls)[0].path).toBe(`/api/paper/${FUND}/resume`);
+});
+
+it("keeps Resume disabled when ledger replay is corrupt", async () => {
+  const snapshot = {
+    ...paperSnapshot(stoppedRunner, true),
+    ledger: { ok: false, error: "Ledger verification failed (LedgerError)." },
+    recovery_state: "corrupt",
+  } as PaperSnapshot & { recovery_state: "corrupt" };
+  const calls = renderDesk(stoppedRunner, {
+    [`GET /api/paper/${FUND}`]: () => json(snapshot),
+    [`GET /api/paper/${FUND}/reconciliation`]: () => json({
+      name: FUND,
+      halted: "synthetic tick failure",
+      resume_allowed: true,
+      preview: paperReconciliationPreview(),
+    }),
+  });
+
+  expect(await screen.findByText("Paper state unavailable.")).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Resume" })).toBeDisabled();
+  expect(calls.some((call) => call.path === `/api/paper/${FUND}/reconciliation`)).toBe(false);
+});
+
 it("reviews hash-bound local reconciliation before resuming without retrying the failed tick", async () => {
   const user = userEvent.setup();
   const preview = paperReconciliationPreview();
@@ -644,6 +749,46 @@ it("does not auto-resubmit a lost recovery response and reuses its request ident
 
   expect(mutations(calls)[1].body?.request_id).toBe(firstRequestId);
   expect(await screen.findByText("Reconciliation receipt recorded. Halt cleared. Failed tick was not retried; no runner was started.")).toBeInTheDocument();
+});
+
+it("allocates a fresh recovery request after explicit review of an expired receipt", async () => {
+  const user = userEvent.setup();
+  const preview = paperReconciliationPreview();
+  const requestIds: unknown[] = [];
+  const calls = renderDesk(stoppedRunner, {
+    [`GET /api/paper/${FUND}`]: () => json(paperSnapshot(stoppedRunner, true)),
+    [`GET /api/paper/${FUND}/reconciliation`]: () => json({
+      name: FUND,
+      halted: "synthetic tick failure",
+      resume_allowed: true,
+      preview,
+    }),
+    [`POST /api/paper/${FUND}/resume`]: (call) => {
+      requestIds.push(call.body?.request_id);
+      return requestIds.length === 1
+        ? json({
+          detail: "Recovery receipt expired; request a fresh review.",
+          code: "expired-confirmation",
+          refresh_required: true,
+          retry_policy: "review-again",
+        }, 410)
+        : json({ name: FUND, halted: false, reconciliation_id: "2".repeat(64) });
+    },
+  });
+
+  await user.click(await enabledButton("Review recovery"));
+  const firstDialog = await screen.findByRole("dialog", { name: "Reconcile and resume paper fund" });
+  await user.click(within(firstDialog).getByRole("button", { name: "Confirm recovery and resume" }));
+  await waitFor(() => expect(mutations(calls)).toHaveLength(1));
+
+  await user.click(await enabledButton("Review recovery"));
+  const secondDialog = await screen.findByRole("dialog", { name: "Reconcile and resume paper fund" });
+  await user.click(within(secondDialog).getByRole("button", { name: "Confirm recovery and resume" }));
+  await waitFor(() => expect(mutations(calls)).toHaveLength(2));
+
+  expect(requestIds[0]).toMatch(/^[a-f0-9]{32}$/);
+  expect(requestIds[1]).toMatch(/^[a-f0-9]{32}$/);
+  expect(requestIds[1]).not.toBe(requestIds[0]);
 });
 
 it("resumes a manual halt with an empty confirmation and no paper operation", async () => {
@@ -741,6 +886,58 @@ it("reuses a manual Resume request ID after a lost response", async () => {
 
   expect(mutations(calls)[1].body).toEqual({ request_id: requestId });
   expect(await screen.findByText("Halt cleared. No paper operation ran and no runner was started.")).toBeInTheDocument();
+});
+
+it("completes a landed Resume after reload using identity from the journal-backed recovery snapshot", async () => {
+  const user = userEvent.setup();
+  const requestId = "resume-id-from-journal";
+  const snapshot = {
+    ...paperSnapshot(stoppedRunner),
+    halt_state: "clear",
+    ledger: { ok: false, error: "Paper work is in progress or requires reconciliation." },
+    recovery_state: "reconciliation_required",
+  } as PaperSnapshot & { recovery_state: "reconciliation_required" };
+  const preview = paperReconciliationPreview({
+    required: false,
+    reason: "no-ambiguous-tick-failure",
+    failure_id: null,
+    failed_request_id: null,
+    operation_id: null,
+    expected_head: null,
+    current_head: null,
+    broker_book_sha256: null,
+    capture_id: null,
+    capture_digest: null,
+    book_matches_ledger: false,
+    head_matches_failure: false,
+    preview_digest: null,
+  });
+  const calls = renderDesk(stoppedRunner, {
+    [`GET /api/paper/${FUND}`]: () => json(snapshot),
+    [`GET /api/paper/${FUND}/reconciliation`]: () => json({
+      name: FUND,
+      halted: null,
+      resume_allowed: true,
+      resume_completion_required: true,
+      resume_request_id: requestId,
+      preview,
+    }),
+    [`POST /api/paper/${FUND}/resume`]: () => json({
+      name: FUND,
+      halted: false,
+      reconciliation_id: null,
+    }),
+  });
+
+  expect(await screen.findByText(/Resume control write already landed/)).toBeInTheDocument();
+  await user.click(await enabledButton("Complete Resume"));
+  const dialog = await screen.findByRole("dialog", { name: "Complete Resume" });
+  await user.click(within(dialog).getByRole("button", { name: "Complete Resume" }));
+
+  await waitFor(() => expect(mutations(calls)).toHaveLength(1));
+  expect(mutations(calls)[0].path).toBe(`/api/paper/${FUND}/resume`);
+  expect(mutations(calls)[0].body).toEqual({ request_id: requestId });
+  expect(await screen.findByText("Resume completion recorded. No control write or paper operation was repeated.")).toBeInTheDocument();
 });
 
 it("keeps resume disabled when local reconciliation is not recoverable", async () => {

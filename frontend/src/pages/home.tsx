@@ -12,6 +12,22 @@ import { useDesk, useResource } from "@/lib/hooks";
 import type { HomeData, PaperSummary } from "@/lib/types";
 import { dateLabel, money } from "@/lib/utils";
 
+function paperStateLabel(item: PaperSummary): string {
+  if (!item.ledger_ok) {
+    if (item.recovery_state === "reconciliation_required") return "Reconciliation required";
+    if (item.recovery_state === "corrupt") return "Ledger corrupt";
+    return "Ledger issue";
+  }
+  if (item.halt_state === "unreadable") return "Halt state unknown";
+  if (item.halt_state === "halted") return "Halted";
+  return "Recorded";
+}
+
+function paperStateVariant(item: PaperSummary): "negative" | "warning" | "positive" {
+  if (!item.ledger_ok) return item.recovery_state === "reconciliation_required" ? "warning" : "negative";
+  return item.halt_state === "unreadable" || item.halt_state === "halted" ? "warning" : "positive";
+}
+
 export function HomePage() {
   const { capabilities } = useDesk();
   const resource = useResource<HomeData>("/api/home");
@@ -38,9 +54,7 @@ export function HomePage() {
       label: "State",
       render: (item) => (
         <div className="flex flex-wrap gap-1">
-          <Badge variant={!item.ledger_ok ? "negative" : item.halt_state === "unreadable" || item.halt_state === "halted" ? "warning" : "positive"}>
-            {!item.ledger_ok ? "Ledger issue" : item.halt_state === "unreadable" ? "Halt state unknown" : item.halt_state === "halted" ? "Halted" : "Recorded"}
-          </Badge>
+          <Badge variant={paperStateVariant(item)}>{paperStateLabel(item)}</Badge>
           {!item.ledger_ok && item.halt_state === "unreadable" ? <Badge variant="warning">Halt state unknown</Badge> : null}
         </div>
       ),

@@ -38,6 +38,7 @@ const snapshot: PaperSnapshot = {
   next_run: null,
   halted: null,
   halt_state: "clear",
+  recovery_state: "ready",
   ledger: { ok: true, error: null },
   runner,
   live_value: {

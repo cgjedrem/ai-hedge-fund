@@ -8,6 +8,7 @@ import os
 import re
 import stat
 import threading
+import time
 import unicodedata
 from contextlib import contextmanager, ExitStack
 from datetime import date, datetime, timedelta
@@ -64,6 +65,7 @@ from hedge_fund.paper.ledger import (
     HaltAuditUnavailable,
     Ledger,
     LedgerError,
+    PaperReceiptExpired,
     PaperReconciliationRequired,
     PaperRequestConflict,
     UnresolvedTickIntentRefusal,
@@ -221,6 +223,7 @@ _BACKTEST_POOL_CAPACITY = 1
 _PAPER_POOL_CAPACITY = 2
 # Advisory only: the bound holds until a running operation finishes, which has no fixed duration.
 OPERATION_CAPACITY_RETRY_AFTER_SECONDS = 30
+_PAPER_CONTROL_LANE_RETRY_DELAYS_SECONDS = (0.025, 0.05, 0.1)
 _REPORT_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,180}\.json$")
 _SESSION_CURSOR = re.compile(r"\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}:\d{2})?$")
 _SECRET_FIELD = re.compile(r"(?:api.?key|secret|token|password|credential|authorization)", re.IGNORECASE)
@@ -783,6 +786,7 @@ class DeskService:
                         "cash": snapshot.get("cash"),
                         "last_session": snapshot.get("last_session"),
                         "ledger_ok": snapshot["ledger"]["ok"],
+                        "recovery_state": snapshot["recovery_state"],
                         "halted": snapshot.get("halted"),
                         "halt_state": snapshot["halt_state"],
                         "runner": self._runner_state(deployed.name),
@@ -833,14 +837,27 @@ class DeskService:
             )
             intent_targets = tick_intent_reconciliation_targets(ledger)
             halted = ledger.halted()
+            unresolved_state = ledger.unresolved_recovery_state()
+            landed_resume = ledger.landed_resume_intent()
+        except PaperReconciliationRequired:
+            raise ServiceError(423, "Paper work requires reconciliation before it can continue.", code="reconciliation-required") from None
         except (LedgerError, OSError, ValueError):
             raise ServiceError(423, "Paper state is invalid (LedgerError).", code="replay-corrupt") from None
         preview = snapshot.preview
         intent_preview = intent_snapshot.preview
+        has_pending_failure = bool(unresolved_state.failures)
+        failure_review_allowed = has_pending_failure and preview.required and preview.recoverable
+        no_failure_review_required = not has_pending_failure and not preview.required
+        resume_completion_required = landed_resume is not None and len(unresolved_state.resume_intents) == 1
+        resume_completion_allowed = resume_completion_required and not unresolved_state.failures and not unresolved_state.tick_intents and not unresolved_state.approval_consumptions
+        normal_resume_allowed = halted is not None and not unresolved_state.tick_intents and not unresolved_state.resume_intents and not unresolved_state.approval_consumptions and (failure_review_allowed or no_failure_review_required)
+        resume_allowed = resume_completion_allowed or normal_resume_allowed
         return {
             "name": normalized,
             "halted": halted,
-            "resume_allowed": halted is not None and not intent_preview.required and (not preview.required or preview.recoverable),
+            "resume_allowed": resume_allowed,
+            "resume_completion_required": resume_completion_required,
+            "resume_request_id": landed_resume.get("request_id") if landed_resume is not None else None,
             "preview": preview.model_dump(mode="json"),
             "intent_preview": intent_preview.model_dump(mode="json"),
             "intent_targets": intent_targets,
@@ -1096,7 +1113,7 @@ class DeskService:
         normalized = self._validated_name(name)
         self._guard_protected(normalized)
         with self._fund_lock(normalized):
-            with self._paper_control_lane(normalized):
+            with self._paper_control_lane(normalized, retry_busy=True):
                 self._paper_control_state(normalized)
                 try:
                     return self._runner_manager.request_stop(normalized)
@@ -3852,6 +3869,37 @@ class DeskService:
             with self._paper_control_lane(normalized):
                 directory, deployed, ledger = self._paper_control_state(normalized)
                 if request is not None:
+                    if request.failure_id is None:
+                        try:
+                            landed_resume = ledger.landed_resume_intent()
+                            completion = None
+                            if landed_resume is not None and (landed_resume.get("request_id") is None or landed_resume.get("request_id") == request.request_id):
+                                completion = ledger.complete_landed_resume_intent(request_id=landed_resume.get("request_id"))
+                            if completion is None:
+                                completion = ledger.resume_completion_result(request.request_id)
+                        except PaperRequestConflict:
+                            raise ServiceError(
+                                409,
+                                "Request ID was already used for a different Resume request.",
+                                code="request-conflict",
+                                request_id=request.request_id,
+                            ) from None
+                        except PaperReconciliationRequired:
+                            raise ServiceError(
+                                423,
+                                "Resume request outcome is uncertain; inspect paper state before further action.",
+                                code="reconciliation-required",
+                                request_id=request.request_id,
+                            ) from None
+                        except LedgerError:
+                            raise ServiceError(
+                                423,
+                                "Resume request history is unavailable.",
+                                code="reconciliation-required",
+                                request_id=request.request_id,
+                            ) from None
+                        if completion is not None:
+                            return completion
                     try:
                         previous = ledger.resume_request_result(
                             request.request_id,
@@ -3928,6 +3976,13 @@ class DeskService:
                         request_id=request.request_id if request is not None else None,
                         operator="web",
                     )
+                except PaperReceiptExpired:
+                    raise ServiceError(
+                        410,
+                        "Recovery receipt expired; review the current paper state before confirming again.",
+                        code="expired-confirmation",
+                        request_id=request.request_id if request is not None else None,
+                    ) from None
                 except PaperRequestConflict:
                     raise ServiceError(
                         409,
@@ -3993,14 +4048,33 @@ class DeskService:
         name: str,
         *,
         verify_inventory: bool = True,
+        retry_busy: bool = False,
     ) -> Iterator[None]:
+        if type(retry_busy) is not bool:
+            raise ValueError("retry_busy must be a bool")
         if verify_inventory:
             self._verify_root_inventory()
-        try:
-            with self._admission.control_lane(name, timeout=0.1):
-                yield
-        except AdmissionError:
-            raise ServiceError(409, "Paper control admission is unavailable.") from None
+        attempt = 0
+        while True:
+            stack = ExitStack()
+            try:
+                stack.enter_context(self._admission.control_lane(name, timeout=0.1))
+            except WriterConflict:
+                stack.close()
+                if not retry_busy or attempt >= len(_PAPER_CONTROL_LANE_RETRY_DELAYS_SECONDS):
+                    raise ServiceError(409, "Paper control admission is unavailable.") from None
+                time.sleep(_PAPER_CONTROL_LANE_RETRY_DELAYS_SECONDS[attempt])
+                attempt += 1
+                continue
+            except AdmissionError:
+                stack.close()
+                raise ServiceError(409, "Paper control admission is unavailable.") from None
+            try:
+                with stack:
+                    yield
+            except AdmissionError:
+                raise ServiceError(409, "Paper control admission is unavailable.") from None
+            return
 
     @contextmanager
     def _paper_execution_lane(self, name: str) -> Iterator[None]:
@@ -4051,6 +4125,7 @@ class DeskService:
 
     def _paper_snapshot(self, deployed: DeployedFund, directory: Path, *, include_records: bool = False) -> dict:
         ledger = Ledger(directory)
+        recovery_state = "ready"
         try:
             halted = ledger.halted()
             halt_state = "halted" if halted is not None else "clear"
@@ -4065,6 +4140,7 @@ class DeskService:
             records = []
             state = None
             ledger_status = {"ok": False, "error": f"Ledger verification failed ({type(exc).__name__})."}
+            recovery_state = "corrupt"
         latest = records[-1] if records else None
         positions = []
         if state is not None:
@@ -4085,8 +4161,10 @@ class DeskService:
                 approval = ledger.observe_approval_for_display(state, approval_required=deployed.spec.approval_required)
             except PaperReconciliationRequired:
                 ledger_status = {"ok": False, "error": "Paper work is in progress or requires reconciliation."}
+                recovery_state = "reconciliation_required"
             except (LedgerError, OSError, ValueError):
                 ledger_status = {"ok": False, "error": "Approval history is unavailable."}
+                recovery_state = "corrupt"
         try:
             next_run = following_session(deployed.spec, state.last_session if state is not None else None, _utcnow())
         except (OverflowError, ValueError):
@@ -4124,6 +4202,7 @@ class DeskService:
             "next_run": next_run,
             "halted": halted,
             "halt_state": halt_state,
+            "recovery_state": recovery_state,
             "ledger": ledger_status,
             "runner": self._runner_state(deployed.name),
             "live_value": self._cached_valuation_view(
@@ -4177,6 +4256,7 @@ class DeskService:
                 if ledger.halted() is not None:
                     raise ServiceError(423, "Halted funds cannot accept a paper operation.", code="halted")
                 try:
+                    ledger.complete_landed_resume_intent()
                     ledger.require_ready_for_tick(state, approval_required=deployed.spec.approval_required)
                 except UnresolvedTickIntentRefusal as exc:
                     raise ServiceError(

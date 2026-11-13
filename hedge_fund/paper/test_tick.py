@@ -115,6 +115,13 @@ def _tick(directory, session=None, data=None):
     return tick(directory, data or FakeDataClient(SERIES), session=session, build_fund=build_fund)
 
 
+def _pre_expiry_receipt_payload(receipt):
+    payload = receipt.model_dump(mode="python", exclude={"receipt_id", "issued_at", "valid_until"})
+    legacy = type(receipt).model_construct(**payload, receipt_id="0" * 64)
+    payload["receipt_id"] = legacy.compute_receipt_id()
+    return type(receipt).model_validate(payload).model_dump(mode="json", exclude={"issued_at", "valid_until"})
+
+
 def _deploy_owned_paper_test_fund(root, spec):
     from hedge_fund.runtime.admission import AdmissionCoordinator, RootOwnerLease
     from hedge_fund.runtime.handover import record_ledger_head
@@ -624,24 +631,30 @@ def test_tick_intent_reconciliation_preview_blocks_unrelated_orphaned_consumptio
     assert snapshot.preview.reason == "approval-journal-incomplete"
 
 
-def test_approval_consumption_without_intent_has_unrecoverable_preview(tmp_path, clock, SPEC):
+def test_approval_consumption_without_intent_is_reviewable_and_resolvable(tmp_path, clock, SPEC):
+    from hedge_fund.paper.ledger import PaperReconciliationRequired
     from hedge_fund.runtime.reconciliation import (
         build_tick_intent_reconciliation_snapshot,
+        TickIntentReconciliationConfirmation,
     )
 
     directory = _deploy_owned_paper_test_fund(tmp_path, SPEC)
     ledger = Ledger(directory)
+    clock("2024-06-04")
     with _owned_paper_lane(directory, "alpha"):
+        latest = _tick(directory)
         ledger.log_event(
             "consume",
-            decision_as_of="2024-06-03",
-            decision_hash="a" * 64,
+            decision_as_of=latest.session,
+            decision_hash=latest.hash,
             approval_verdict="approve",
             approval_by="cli",
             approval_id="b" * 32,
-            session="2024-06-04",
+            session=latest.session,
             durable=True,
         )
+        approval_events = ledger.unresolved_approval_consumption_events(allow_unresolved_corruption=True)
+        unresolved = ledger.unresolved_recovery_state()
         snapshot = build_tick_intent_reconciliation_snapshot(
             directory,
             load_deployed(directory),
@@ -651,9 +664,41 @@ def test_approval_consumption_without_intent_has_unrecoverable_preview(tmp_path,
         )
 
     assert snapshot.preview.required is True
-    assert snapshot.preview.recoverable is False
-    assert snapshot.preview.reason == "approval-journal-incomplete"
+    assert snapshot.preview.recoverable is True
+    assert snapshot.preview.reason == "ready"
     assert snapshot.preview.intent_digest is None
+    assert snapshot.preview.approval_journal_event_digests == (approval_events[0][0],)
+    assert unresolved.required is True
+    assert unresolved.approval_consumptions == approval_events
+    with pytest.raises(PaperReconciliationRequired, match="approval consumption is incomplete"):
+        ledger.require_ready_for_work(ledger.replay(SPEC.capital, full=True), approval_required=False)
+    confirmation = TickIntentReconciliationConfirmation(
+        request_id="resolve-unmatched-approval",
+        intent_request_id=None,
+        intent_digest=None,
+        preview_digest=snapshot.preview.preview_digest,
+        decision="confirm-paper-book-matches-ledger",
+    )
+    with _owned_paper_lane(directory, "alpha"):
+        receipt_id = ledger.reconcile_tick_intent(
+            SPEC.capital,
+            confirmation=confirmation,
+            operator="cli",
+        )
+    with _owned_paper_lane(directory, "alpha"):
+        replayed_receipt_id = ledger.reconcile_tick_intent(
+            SPEC.capital,
+            confirmation=confirmation,
+            operator="cli",
+        )
+
+    assert receipt_id
+    assert replayed_receipt_id == receipt_id
+    assert ledger.unresolved_approval_consumption_events(allow_unresolved_corruption=True) == ()
+    resolution = next(event for event in ledger.events() if event.get("kind") == "tick_intent_resolved")
+    assert resolution["receipt"]["approval_journal_event_digests"] == [approval_events[0][0]]
+    assert ledger.unresolved_recovery_state().required is False
+    ledger.require_ready_for_work(ledger.replay(SPEC.capital, full=True), approval_required=False)
 
 
 def test_intent_reconciliation_preview_digest_accepts_nan_event_field(tmp_path, clock, SPEC):
@@ -885,6 +930,230 @@ def test_halt_before_effect_aborts_intent_then_resume_admits_new_tick(tmp_path, 
             request_id="tick-after-halt-resume",
         )
     assert record.session == "2024-06-03"
+
+
+def test_tui_resume_without_request_id_is_completed_before_tick_gate(tmp_path, clock, SPEC, monkeypatch):
+    clock("2024-06-05")
+    directory = _deploy_owned_paper_test_fund(tmp_path, SPEC)
+    ledger = Ledger(directory)
+    with _owned_paper_lane(directory, "alpha"):
+        ledger.halt("operator pause")
+
+    original_log_event = Ledger.log_event
+    original_write_control = Ledger._write_control
+    failed_completion = []
+    clear_writes = []
+
+    def interrupt_before_completion(self, kind, **fields):
+        if kind == "resume_completed" and not failed_completion:
+            failed_completion.append(True)
+            raise OSError("synthetic TUI crash before Resume completion")
+        return original_log_event(self, kind, **fields)
+
+    def observe_clear_write(self, halted, reason, **kwargs):
+        if halted is False:
+            clear_writes.append(halted)
+        return original_write_control(self, halted, reason, **kwargs)
+
+    monkeypatch.setattr(Ledger, "log_event", interrupt_before_completion)
+    monkeypatch.setattr(Ledger, "_write_control", observe_clear_write)
+    with _owned_paper_lane(directory, "alpha"):
+        with pytest.raises(OSError, match="synthetic TUI crash"):
+            ledger.resume(SPEC.capital, operator="tui")
+
+    monkeypatch.setattr(paper_tick_module, "next_session", lambda *_args, **_kwargs: None)
+    with _owned_paper_lane(directory, "alpha"):
+        with pytest.raises(NothingDue):
+            tick(directory, FakeDataClient(SERIES), build_fund=build_fund)
+
+    completions = [event for event in ledger.events() if event["kind"] == "resume_completed"]
+    assert len(completions) == 1
+    assert "request_id" not in completions[0]
+    assert clear_writes == [False]
+    assert ledger.halted() is None
+    assert ledger.unresolved_recovery_state().required is False
+
+
+def test_tui_resume_dedup_matches_full_identity_across_tick(tmp_path, clock, SPEC, monkeypatch):
+    clock("2024-06-04")
+    directory = _deploy_owned_paper_test_fund(tmp_path, SPEC)
+    ledger = Ledger(directory)
+    with _owned_paper_lane(directory, "alpha"):
+        ledger.halt("first operator pause")
+        ledger.resume(SPEC.capital, operator="tui")
+    first_resume = next(event for event in ledger.events() if event.get("kind") == "resume")
+
+    with _owned_paper_lane(directory, "alpha"):
+        record = tick(
+            directory,
+            FakeDataClient(SERIES),
+            session="2024-06-03",
+            expected_head=None,
+            build_fund=build_fund,
+        )
+    latest_head = ledger.latest().hash
+    assert latest_head != first_resume.get("head_hash")
+    assert record.session == "2024-06-03"
+
+    with _owned_paper_lane(directory, "alpha"):
+        ledger.halt("second operator pause")
+    original_log_event = Ledger.log_event
+    failed_completion = []
+
+    def interrupt_before_completion(self, kind, **fields):
+        if kind == "resume_completed" and not failed_completion:
+            failed_completion.append(True)
+            raise OSError("synthetic TUI crash before second Resume completion")
+        return original_log_event(self, kind, **fields)
+
+    monkeypatch.setattr(Ledger, "log_event", interrupt_before_completion)
+    with _owned_paper_lane(directory, "alpha"):
+        with pytest.raises(OSError, match="second Resume completion"):
+            ledger.resume(SPEC.capital, operator="tui")
+
+    landed = ledger.landed_resume_intent()
+
+    assert failed_completion == [True]
+    assert ledger.halted() is None
+    assert landed is not None
+    assert landed["head_hash"] == latest_head
+    assert len([event for event in ledger.events() if event.get("kind") == "resume"]) == 2
+    with _owned_paper_lane(directory, "alpha"):
+        completed = ledger.complete_landed_resume_intent()
+    assert completed == {"name": directory.name, "halted": False, "reconciliation_id": None}
+    assert ledger.unresolved_recovery_state().required is False
+
+
+def test_tick_retries_landed_resume_after_transient_audit_probe(tmp_path, clock, SPEC, monkeypatch):
+    from hedge_fund.paper.ledger import AuditObservationUnavailable
+
+    clock("2024-06-05")
+    directory = _deploy_owned_paper_test_fund(tmp_path, SPEC)
+    ledger = Ledger(directory)
+    with _owned_paper_lane(directory, "alpha"):
+        ledger.halt("operator pause")
+
+    original_log_event = Ledger.log_event
+    failed_completion = []
+
+    def interrupt_before_completion(self, kind, **fields):
+        if kind == "resume_completed" and not failed_completion:
+            failed_completion.append(True)
+            raise OSError("synthetic TUI crash before Resume completion")
+        return original_log_event(self, kind, **fields)
+
+    monkeypatch.setattr(Ledger, "log_event", interrupt_before_completion)
+    with _owned_paper_lane(directory, "alpha"):
+        with pytest.raises(OSError, match="synthetic TUI crash"):
+            ledger.resume(SPEC.capital, operator="tui")
+
+    original_events = Ledger.events
+    failed_probe = []
+
+    def unavailable_once(self):
+        if self.directory == directory and not failed_probe:
+            failed_probe.append(True)
+            raise AuditObservationUnavailable("synthetic audit contention")
+        return original_events(self)
+
+    monkeypatch.setattr(Ledger, "events", unavailable_once)
+    monkeypatch.setattr(paper_tick_module, "next_session", lambda *_args, **_kwargs: None)
+    with _owned_paper_lane(directory, "alpha"):
+        with pytest.raises(NothingDue):
+            tick(directory, FakeDataClient(SERIES), build_fund=build_fund)
+
+    assert ledger.halted() is None
+    assert len([event for event in ledger.events() if event["kind"] == "halt"]) == 1
+    assert failed_probe == [True]
+    assert ledger.halted() is None
+    assert len([event for event in ledger.events() if event["kind"] == "resume_completed"]) == 1
+    assert ledger.unresolved_recovery_state().required is False
+
+
+def test_pre_expiry_failure_receipt_keeps_fund_tickable(tmp_path, clock, SPEC):
+    from hedge_fund.runtime.reconciliation import (
+        build_reconciliation_snapshot,
+        failure_digest,
+        ReconciliationReceipt,
+        unresolved_tick_failures,
+    )
+
+    directory = _deploy_owned_paper_test_fund(tmp_path, SPEC)
+    clock("2024-06-04")
+    with _owned_paper_lane(directory, "alpha"):
+        first = _tick(directory)
+    ledger = Ledger(directory)
+
+    clock("2024-06-05")
+    failure_time = "2024-06-05T00:00:00+00:00"
+    with _owned_paper_lane(directory, "alpha"):
+        ledger.log_event(
+            "tick_failed",
+            time=failure_time,
+            session="2024-06-04",
+            error="synthetic pre-expiry failure",
+            expected_head=first.hash,
+            operation_id="a" * 32,
+            request_id="pre-expiry-failed-tick",
+            capture_id="b" * 32,
+            capture_digest="c" * 64,
+            transmitted_fills=[],
+            durable=True,
+        )
+        ledger.halt("synthetic pre-expiry failure")
+        deployed = load_deployed(directory)
+        state = ledger.replay(SPEC.capital, full=True)
+        snapshot = build_reconciliation_snapshot(directory, deployed, ledger, state, ledger.latest())
+        receipt = ReconciliationReceipt.create(
+            failure_event=snapshot.failure_event,
+            request_id="pre-expiry-recovery",
+            current_head=snapshot.preview.current_head,
+            broker_book_sha256=snapshot.preview.broker_book_sha256,
+            fill_identity_sha256=snapshot.preview.fill_identity_sha256,
+            operator="web",
+            recorded_at=failure_time,
+        )
+        legacy_payload = _pre_expiry_receipt_payload(receipt)
+        ledger.log_event(
+            "reconciliation",
+            time=failure_time,
+            receipt=legacy_payload,
+            durable=True,
+        )
+        resume_fields = {
+            "head_hash": first.hash,
+            "by": "web",
+            "reconciliation_id": legacy_payload["receipt_id"],
+        }
+        ledger.log_event("resume", time=failure_time, **resume_fields, durable=True)
+        ledger.log_event("resume_effect_intent", time=failure_time, **resume_fields, durable=True)
+        ledger._write_control(False, None)
+        ledger.log_event(
+            "resume_completed",
+            time=failure_time,
+            **resume_fields,
+            result={"name": "alpha", "halted": False, "reconciliation_id": legacy_payload["receipt_id"]},
+            durable=True,
+        )
+
+    events = ledger.events()
+    failure_event = next(event for event in events if event.get("kind") == "tick_failed")
+    receipt_event = next(event for event in events if event.get("kind") == "reconciliation")
+    resume_event = next(event for event in events if event.get("kind") == "resume")
+    legacy_receipt = ReconciliationReceipt.model_validate(receipt_event["receipt"])
+    assert "issued_at" not in receipt_event["receipt"]
+    assert "valid_until" not in receipt_event["receipt"]
+    assert receipt_event["receipt"]["failure_id"] == failure_digest(failure_event)
+    assert legacy_receipt.issued_at is None
+    assert legacy_receipt.matches_failure(failure_event)
+    assert resume_event["reconciliation_id"] == legacy_receipt.receipt_id
+    assert unresolved_tick_failures([failure_event, receipt_event, resume_event]) == []
+    assert unresolved_tick_failures(events) == []
+    assert ledger.unresolved_recovery_state().required is False
+    with _owned_paper_lane(directory, "alpha"):
+        later = _tick(directory)
+    assert later.session == "2024-06-04"
+    assert ledger.latest().session == later.session
 
 
 def test_preflight_busy_after_intent_records_abort_and_same_identity_retries(tmp_path, clock, SPEC, monkeypatch):
@@ -2198,6 +2467,46 @@ except BaseException as exc:
     assert ledger.halted() == "approval journal requires reconciliation"
     assert ledger.latest().hash == second.hash
 
+    from hedge_fund.runtime.reconciliation import (
+        build_tick_intent_reconciliation_snapshot,
+        TickIntentReconciliationConfirmation,
+    )
+
+    snapshot = build_tick_intent_reconciliation_snapshot(
+        directory,
+        load_deployed(directory),
+        ledger,
+        ledger.replay(spec.capital, full=True),
+        ledger.latest(),
+    )
+    assert snapshot.preview.required is True
+    assert snapshot.preview.recoverable is True
+    assert snapshot.preview.reason == "ready"
+    assert snapshot.preview.expected_head == first.hash
+    assert snapshot.preview.current_head == second.hash
+    assert snapshot.preview.head_matches_intent is True
+    assert snapshot.preview.book_matches_ledger is True
+
+    confirmation = TickIntentReconciliationConfirmation(
+        request_id="recover-owned-child-exit",
+        intent_request_id=None,
+        intent_digest=None,
+        preview_digest=snapshot.preview.preview_digest,
+        decision="confirm-paper-book-matches-ledger",
+    )
+    receipt_id = ledger.reconcile_tick_intent(spec.capital, confirmation=confirmation, operator="cli")
+    resolved = next(event for event in ledger.events() if event.get("kind") == "tick_intent_resolved")
+    receipt = resolved["receipt"]
+
+    assert receipt_id == receipt["receipt_id"]
+    assert receipt["expected_head"] == first.hash
+    assert receipt["current_head"] == second.hash
+    assert receipt["broker_book_sha256"] == snapshot.preview.broker_book_sha256
+    ledger.resume(spec.capital, approval_required=True)
+    assert ledger.halted() is None
+    assert ledger.unresolved_approval_consumption_events(allow_unresolved_corruption=True) == ()
+    assert ledger.unresolved_recovery_state().required is False
+
 
 def test_interrupted_redo_blocks_new_work_after_owned_child_exit(tmp_path, clock, SPEC, owned_test_process):
     spec = SPEC.model_copy(update={"approval_required": True})
@@ -2403,6 +2712,76 @@ def test_halt_after_first_order_prevents_second_order(tmp_path, clock, SPEC, mon
     assert ledger.halted() == "synthetic emergency"
     assert ledger.latest().hash == first.hash
     assert ledger._latest_approval_event(first.decision.as_of, first.hash, strict=True)["kind"] == "consume"
+
+
+def test_legacy_halt_after_fill_journals_failure_bound_to_transmitted_fills(tmp_path, clock, SPEC, monkeypatch):
+    from hedge_fund.runtime.reconciliation import (
+        build_reconciliation_snapshot,
+        failure_digest,
+    )
+
+    spec = SPEC.model_copy(update={"approval_required": True})
+    client = FakeDataClient({**SERIES, "MSFT": SERIES["AAPL"]})
+    directory = deploy("alpha", spec, ["AAPL", "MSFT"], root=tmp_path)
+    ledger = Ledger(directory)
+
+    def build_two_ticker_fund(selected):
+        return Fund(selected, models={"solo": [FakeAnalyst("a", {"AAPL": 0.5, "MSFT": 0.5})]})
+
+    clock("2024-06-04")
+    first = tick(directory, client, build_fund=build_two_ticker_fund)
+    ledger.set_approval("approve", first.decision.as_of, first.hash, "cli")
+    place_order = PaperBroker.place_order
+    transmitted_fills = []
+
+    def halt_after_fill(broker, order):
+        fill = place_order(broker, order)
+        transmitted_fills.append(
+            {
+                "order": order.model_dump(mode="json"),
+                "fill": fill.model_dump(mode="json"),
+            }
+        )
+        ledger.halt("synthetic emergency")
+        return fill
+
+    monkeypatch.setattr(PaperBroker, "place_order", halt_after_fill)
+    clock("2024-06-05")
+    with pytest.raises(FundHalted):
+        tick(directory, client, build_fund=build_two_ticker_fund)
+
+    failure = next(event for event in ledger.events() if event["kind"] == "tick_failed")
+    assert len(transmitted_fills) == 1
+    assert "request_id" not in failure
+    assert failure["session"] == "2024-06-04"
+    assert failure["expected_head"] == first.hash
+    assert failure["transmitted_fills"] == transmitted_fills
+    snapshot = build_reconciliation_snapshot(directory, load_deployed(directory), ledger, ledger.replay(spec.capital, full=True), ledger.latest())
+    assert snapshot.failure_event == failure
+    assert snapshot.preview.required is True
+    assert snapshot.preview.failure_id == failure_digest(failure)
+    assert snapshot.preview.recoverable is False
+
+
+def test_legacy_zero_effect_halt_does_not_require_reconciliation(tmp_path, clock, SPEC, monkeypatch):
+    from hedge_fund.runtime.reconciliation import build_reconciliation_snapshot
+
+    clock("2024-06-04")
+    directory = deploy("alpha", SPEC, ["AAPL"], root=tmp_path)
+    ledger = Ledger(directory)
+
+    def halt_before_effect(*_args, **_kwargs):
+        ledger.halt("synthetic pre-effect halt")
+        raise FundHalted("synthetic pre-effect halt")
+
+    monkeypatch.setattr(paper_tick_module, "advance", halt_before_effect)
+    with pytest.raises(FundHalted, match="synthetic pre-effect halt"):
+        _tick(directory)
+
+    assert not any(event["kind"] in {"tick_failed", "tick_aborted"} for event in ledger.events())
+    snapshot = build_reconciliation_snapshot(directory, load_deployed(directory), ledger, ledger.replay(SPEC.capital, full=True), ledger.latest())
+    assert snapshot.preview.required is False
+    assert snapshot.failure_event is None
 
 
 def test_halt_before_refresh_prevents_new_assessment(tmp_path, clock, SPEC, monkeypatch):

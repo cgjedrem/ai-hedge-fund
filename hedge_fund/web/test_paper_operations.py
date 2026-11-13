@@ -1,4 +1,4 @@
-﻿import os
+import os
 import subprocess
 import threading
 import time
@@ -1298,6 +1298,82 @@ def test_owned_runner_child_starts_and_stops_with_exact_process_identity(
         assert process.wait(timeout=30) == 0
     finally:
         _stop_owned_runner(service, name)
+
+
+@pytest.mark.parametrize(
+    ("busy_attempts", "expected_status"),
+    [(2, "stopping"), (4, "unavailable")],
+)
+def test_stop_runner_retries_bounded_control_admission(
+    demo_root,
+    monkeypatch,
+    busy_attempts,
+    expected_status,
+):
+    from hedge_fund.runtime.admission import WriterConflict
+
+    name = "owned-runner-stop-retry"
+    service = DeskService(demo_root, allow_writes=True, network_enabled=True)
+    attempts = []
+    stop_requests = []
+
+    class ControlLane:
+        def __enter__(self):
+            attempts.append(True)
+            if len(attempts) <= busy_attempts:
+                raise WriterConflict("synthetic control-lane contention")
+            return None
+
+        def __exit__(self, *_exc_info):
+            return False
+
+    def control_lane(identity, *, timeout):
+        assert identity == name
+        assert timeout == 0.1
+        return ControlLane()
+
+    monkeypatch.setattr(service, "_verify_root_inventory", lambda: None)
+    monkeypatch.setattr(service, "_paper_control_state", lambda _name: None)
+    monkeypatch.setattr(service._admission, "control_lane", control_lane)
+    monkeypatch.setattr(service._runner_manager, "request_stop", lambda fund: stop_requests.append(fund) or {"status": "stopping"})
+    try:
+        if expected_status == "stopping":
+            assert service.stop_runner(name) == {"status": "stopping"}
+            assert stop_requests == [name]
+        else:
+            with pytest.raises(ServiceError, match="Paper control admission is unavailable"):
+                service.stop_runner(name)
+            assert stop_requests == []
+        assert len(attempts) == min(busy_attempts + 1, 4)
+    finally:
+        service.close()
+
+
+def test_stop_runner_does_not_retry_non_conflict_admission_failure(demo_root, monkeypatch):
+    from hedge_fund.runtime.admission import OwnershipUnknown
+
+    name = "owned-runner-stop-unknown"
+    service = DeskService(demo_root, allow_writes=True, network_enabled=True)
+    attempts = []
+
+    class ControlLane:
+        def __enter__(self):
+            attempts.append(True)
+            raise OwnershipUnknown("synthetic ownership failure")
+
+        def __exit__(self, *_exc_info):
+            return False
+
+    monkeypatch.setattr(service, "_verify_root_inventory", lambda: None)
+    monkeypatch.setattr(service, "_paper_control_state", lambda _name: None)
+    monkeypatch.setattr(service._admission, "control_lane", lambda _identity, **_kwargs: ControlLane())
+    try:
+        with pytest.raises(ServiceError) as exc_info:
+            service.stop_runner(name)
+        assert exc_info.value.status_code == 409
+        assert len(attempts) == 1
+    finally:
+        service.close()
 
 
 def test_real_cli_and_web_tick_conflict_with_owned_runner(demo_root, tmp_path, owned_test_process):

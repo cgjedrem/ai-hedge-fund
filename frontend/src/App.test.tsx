@@ -61,6 +61,7 @@ const home: HomeData = {
       cash: 90_000,
       last_session: "2024-06-05",
       ledger_ok: true,
+      recovery_state: "ready",
       halted: null,
       halt_state: "clear",
       runner: { status: "unknown", available: false, reason: "Runner ownership is not verified." },
@@ -102,6 +103,7 @@ const paperDetail: PaperSnapshot = {
   next_run: "2024-06-06T13:30:00+00:00",
   halted: null,
   halt_state: "clear",
+  recovery_state: "ready",
   ledger: { ok: true, error: null },
   runner: { status: "unknown", available: false, reason: "Runner ownership is not verified; web process controls are disabled." },
   live_value: {

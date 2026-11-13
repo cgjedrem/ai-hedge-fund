@@ -18,6 +18,7 @@ from hedge_fund.fund import Fund, FundSpec
 from hedge_fund.paper.ledger import (
     Ledger,
     LedgerError,
+    PaperReconciliationRequired,
     TICK_INTENT_RECOVERY,
     UNRESOLVED_TICK_INTENT_REASON,
     UnresolvedTickIntentRefusal,
@@ -40,6 +41,33 @@ def owned_ledger(tmp_path):
         with RootOwnerLease.acquire(root) as owner:
             admission = AdmissionCoordinator(root, owner_lease=owner)
             yield Ledger(root.path / "paper" / "alpha"), admission
+
+
+@pytest.fixture
+def owned_deployed_ledger(tmp_path):
+    from hedge_fund.paper import deploy
+    from hedge_fund.runtime.admission import AdmissionCoordinator, RootOwnerLease
+    from hedge_fund.runtime.handover import record_ledger_head
+    from hedge_fund.runtime.root import RootContext
+    from hedge_fund.test_support.handover import enroll_synthetic_root
+
+    spec = FundSpec(
+        schema_version=2,
+        name="paper-fund",
+        strategies=[{"name": "solo", "models": [{"name": "a"}], "blend": {"mode": "long_short"}}],
+        risk={"max_position_pct": 1, "max_gross_exposure": 1},
+        capital=100_000,
+        costs={"spread_bps": 0, "commission_per_share": 0},
+    )
+    enroll_synthetic_root(tmp_path)
+    with RootContext.open(tmp_path) as root:
+        root.mkdir("paper")
+        with RootOwnerLease.acquire(root) as owner:
+            admission = AdmissionCoordinator(root, owner_lease=owner)
+            with admission.deployment_lock("alpha", timeout=0):
+                directory = deploy("alpha", spec, ["AAPL"], root=root.path / "paper")
+            record_ledger_head(root, "alpha", admission=admission)
+            yield Ledger(directory), admission, spec
 
 
 @contextmanager
@@ -82,6 +110,76 @@ def test_unresolved_intent_query_reports_pending_request(tmp_path):
     assert unresolved[0].metadata_complete is True
 
 
+def test_legacy_intent_receipt_replay_preserves_resolution(tmp_path):
+    from hedge_fund.paper.ledger import _control_request_digest
+    from hedge_fund.runtime.reconciliation import (
+        TickIntentReconciliationPreview,
+        TickIntentReconciliationReceipt,
+    )
+
+    ledger = Ledger(tmp_path)
+    request_id = "tick-before-legacy-resolution"
+    ledger.log_event(
+        "tick_intent",
+        request_id=request_id,
+        request_action="tick",
+        request_digest="a" * 64,
+        expected_head=None,
+        requested_session=None,
+        session="2024-06-03",
+    )
+    intent = ledger.unresolved_tick_intents()[0]
+    preview = TickIntentReconciliationPreview.create(
+        required=True,
+        recoverable=True,
+        reason="ready",
+        intent_request_id=request_id,
+        intent_session=intent.session,
+        intent_digest=intent.intent_digest,
+        metadata_complete=True,
+        expected_head=None,
+        current_head=None,
+        broker_book_sha256="b" * 64,
+        fill_identity_sha256="c" * 64,
+        book_matches_ledger=True,
+        head_matches_intent=True,
+    )
+    recorded_at = "2024-06-03T00:00:00+00:00"
+    receipt = TickIntentReconciliationReceipt.create(
+        preview=preview,
+        request_id="legacy-intent-resolution",
+        operator="web",
+        recorded_at=recorded_at,
+    )
+    receipt_payload = receipt.model_dump(mode="python", exclude={"receipt_id", "issued_at", "valid_until"})
+    legacy_receipt = TickIntentReconciliationReceipt.model_construct(**receipt_payload, receipt_id="0" * 64)
+    receipt_payload["receipt_id"] = legacy_receipt.compute_receipt_id()
+    request_digest = _control_request_digest(
+        TICK_INTENT_RECOVERY,
+        ledger.directory.name,
+        {
+            "intent_request_id": request_id,
+            "intent_digest": intent.intent_digest,
+            "preview_digest": preview.preview_digest,
+            "decision": receipt.decision,
+        },
+    )
+    ledger.log_event(
+        "tick_intent_resolved",
+        time=recorded_at,
+        request_id=receipt.request_id,
+        request_action=TICK_INTENT_RECOVERY,
+        request_digest=request_digest,
+        intent_request_id=request_id,
+        intent_digest=intent.intent_digest,
+        corrupt_event_digests=[],
+        decision=receipt.decision,
+        receipt=receipt_payload,
+    )
+
+    assert ledger.unresolved_tick_intents() == ()
+
+
 def test_tick_readiness_guard_refuses_unresolved_intent(tmp_path):
     ledger = Ledger(tmp_path)
     ledger.log_event(
@@ -96,6 +194,14 @@ def test_tick_readiness_guard_refuses_unresolved_intent(tmp_path):
 
     with pytest.raises(UnresolvedTickIntentRefusal):
         ledger.require_ready_for_tick(FundState.initial(100_000), approval_required=False)
+
+
+def test_work_readiness_refuses_unresolved_resume_intent(tmp_path):
+    ledger = Ledger(tmp_path)
+    ledger.log_event("resume_effect_intent", head_hash=None, by="cli")
+
+    with pytest.raises(PaperReconciliationRequired, match="Resume control write outcome is uncertain"):
+        ledger.require_ready_for_work(FundState.initial(100_000), approval_required=False)
 
 
 @pytest.mark.parametrize("outcome", ["tick", "tick_failed"])
@@ -464,6 +570,134 @@ def test_resume_clears_manual_halt_after_full_replay(tmp_path):
     assert [event["kind"] for event in ledger.events()] == ["halt", "resume", "resume_effect_intent", "resume_completed"]
 
 
+def test_resume_refuses_unresolved_tick_intent(tmp_path):
+    ledger = Ledger(tmp_path)
+    ledger.init()
+    ledger.halt("operator pause")
+    ledger.log_event(
+        "tick_intent",
+        request_id="tick-before-resume",
+        request_action="tick",
+        request_digest="a" * 64,
+        expected_head=None,
+        requested_session=None,
+        session="2024-06-03",
+    )
+
+    with pytest.raises(PaperReconciliationRequired, match="unresolved tick intent"):
+        ledger.resume(capital=100_000)
+
+    assert ledger.halted() == "operator pause"
+    assert not any(event["kind"] == "resume" for event in ledger.events())
+
+
+def test_intent_resolution_remains_available_while_work_gate_denies(owned_deployed_ledger, monkeypatch):
+    import hedge_fund.paper.ledger as ledger_module
+    from hedge_fund.paper.deployed import load_deployed
+    from hedge_fund.runtime.reconciliation import (
+        build_tick_intent_reconciliation_snapshot,
+        TickIntentReconciliationConfirmation,
+    )
+
+    recorded_at = "2024-06-03T00:00:00+00:00"
+    monkeypatch.setattr(ledger_module, "_now", lambda: recorded_at)
+    ledger, admission, spec = owned_deployed_ledger
+    request_id = "crashed-tick-for-work-gate"
+    request_digest = ledger.tick_request_digest(request_id, expected_head=None, session=None)
+    with _ledger_write_lane(admission):
+        ledger.log_event(
+            "tick_intent",
+            request_id=request_id,
+            request_action="tick",
+            request_digest=request_digest,
+            expected_head=None,
+            requested_session=None,
+            session="2024-06-03",
+            durable=True,
+        )
+    state = ledger.replay(spec.capital, full=True)
+
+    with pytest.raises(PaperReconciliationRequired, match="unresolved tick intent"):
+        ledger.require_ready_for_work(state, approval_required=False)
+
+    snapshot = build_tick_intent_reconciliation_snapshot(
+        ledger.directory,
+        load_deployed(ledger.directory),
+        ledger,
+        state,
+        ledger.latest(),
+        intent_request_id=request_id,
+    )
+    confirmation = TickIntentReconciliationConfirmation(
+        request_id="resolve-tick-for-work-gate",
+        intent_request_id=request_id,
+        intent_digest=snapshot.preview.intent_digest,
+        preview_digest=snapshot.preview.preview_digest,
+        decision="confirm-paper-book-matches-ledger",
+    )
+    with _ledger_write_lane(admission):
+        receipt_id = ledger.reconcile_tick_intent(spec.capital, confirmation=confirmation, operator="web")
+
+    assert receipt_id
+    assert ledger.unresolved_recovery_state().tick_intents == ()
+    resolved = next(event for event in ledger.events() if event.get("kind") == "tick_intent_resolved")
+    assert resolved["receipt"]["issued_at"] == recorded_at
+    assert resolved["receipt"]["valid_until"] == "2024-06-03T00:30:00+00:00"
+    monkeypatch.setattr(ledger_module, "_now", lambda: "2024-06-03T00:31:00+00:00")
+    assert ledger.unresolved_recovery_state().tick_intents == ()
+    with _ledger_write_lane(admission):
+        replayed = ledger.reconcile_tick_intent(spec.capital, confirmation=confirmation, operator="web")
+    assert replayed == receipt_id
+    ledger.require_ready_for_work(ledger.replay(spec.capital, full=True), approval_required=False)
+
+
+def test_confirmed_resume_resolves_failure_while_work_gate_denies(owned_deployed_ledger):
+    from hedge_fund.paper.deployed import load_deployed
+    from hedge_fund.runtime.reconciliation import (
+        build_reconciliation_snapshot,
+        ReconciliationConfirmation,
+    )
+
+    ledger, admission, spec = owned_deployed_ledger
+    with _ledger_write_lane(admission):
+        ledger.log_event(
+            "tick_failed",
+            session="2024-06-03",
+            error="synthetic failure",
+            expected_head=None,
+            operation_id="a" * 32,
+            request_id="failed-tick-for-resume-gate",
+            capture_id="b" * 32,
+            capture_digest="c" * 64,
+            durable=True,
+        )
+        ledger.halt("synthetic failure")
+    state = ledger.replay(spec.capital, full=True)
+    snapshot = build_reconciliation_snapshot(ledger.directory, load_deployed(ledger.directory), ledger, state, ledger.latest())
+    confirmation = ReconciliationConfirmation(
+        request_id="resume-failure-for-work-gate",
+        failure_id=snapshot.preview.failure_id,
+        preview_digest=snapshot.preview.preview_digest,
+        decision="confirm-paper-book-matches-ledger",
+    )
+
+    with pytest.raises(PaperReconciliationRequired, match="failure is pending review"):
+        ledger.require_ready_for_work(state, approval_required=False)
+
+    with _ledger_write_lane(admission):
+        receipt_id = ledger.resume(
+            spec.capital,
+            reconciliation=confirmation.model_dump(mode="json"),
+            request_id=confirmation.request_id,
+            operator="web",
+        )
+
+    assert receipt_id
+    assert ledger.halted() is None
+    assert ledger.unresolved_recovery_state().failures == ()
+    assert ledger.unresolved_recovery_state().resume_intents == ()
+
+
 def test_resume_does_not_repeat_after_uncertain_control_write_without_request_id(tmp_path, monkeypatch):
     ledger = Ledger(tmp_path)
     ledger.init()
@@ -485,6 +719,41 @@ def test_resume_does_not_repeat_after_uncertain_control_write_without_request_id
     assert attempts == [False]
     assert ledger.halted() == "operator pause"
     assert [event["kind"] for event in ledger.events()] == ["halt", "resume", "resume_effect_intent"]
+
+
+def test_resume_same_request_completes_after_control_clear_crash(tmp_path, monkeypatch):
+    ledger = Ledger(tmp_path)
+    ledger.init()
+    ledger.halt("operator pause")
+    request_id = "resume-after-clear-crash"
+    original_log_event = ledger.log_event
+    original_write_control = Ledger._write_control
+    failed_completion = []
+    clear_writes = []
+
+    def interrupt_before_completion(kind, **fields):
+        if kind == "resume_completed" and not failed_completion:
+            failed_completion.append(True)
+            raise OSError("synthetic crash before Resume completion")
+        return original_log_event(kind, **fields)
+
+    def observe_clear_write(self, halted, reason, **kwargs):
+        if halted is False:
+            clear_writes.append(halted)
+        return original_write_control(self, halted, reason, **kwargs)
+
+    monkeypatch.setattr(ledger, "log_event", interrupt_before_completion)
+    monkeypatch.setattr(Ledger, "_write_control", observe_clear_write)
+    with pytest.raises(OSError, match="synthetic crash before Resume completion"):
+        ledger.resume(capital=100_000, request_id=request_id, operator="web")
+
+    assert ledger.halted() is None
+    assert ledger.resume(capital=100_000, request_id=request_id, operator="web") is None
+
+    assert clear_writes == [False]
+    assert len([event for event in ledger.events() if event["kind"] == "resume_effect_intent"]) == 1
+    assert len([event for event in ledger.events() if event["kind"] == "resume_completed"]) == 1
+    assert ledger.unresolved_recovery_state().resume_intents == ()
 
 
 def test_audit_observation_without_a_writer_is_read_only(tmp_path):
@@ -1269,9 +1538,16 @@ def test_pre_approval_ledger_fixture_replays_with_full_hash_verification(tmp_pat
     path.write_bytes(record)
 
     state = ledger.replay(100_000, full=True)
+    unresolved = ledger.unresolved_recovery_state()
 
     assert state.last_session == "2025-01-21"
     assert state.prev_hash == "b5c627cd3d54021fff9d25e18a9710245e48c12bff752f8341d34e515b2615e3"
     assert state.pending is not None and state.pending.as_of == "2025-01-21"
     assert not state.pending.spec.approval_required
     assert "approval_required" not in state.pending.spec.model_dump()
+    assert unresolved.required is False
+    assert unresolved.failures == ()
+    assert unresolved.tick_intents == ()
+    assert unresolved.resume_intents == ()
+    assert unresolved.approval_consumptions == ()
+    assert path.read_bytes() == record

@@ -380,7 +380,13 @@ def _tick(
 
     try:
         with _preflight_control(directory, deployed.name):
-            ledger.require_ready_for_tick(state, approval_required=spec.approval_required)
+            ledger.complete_landed_resume_intent()
+            try:
+                ledger.require_ready_for_tick(state, approval_required=spec.approval_required)
+            except PaperReconciliationRequired:
+                if ledger.complete_landed_resume_intent(require_audit_observation=True) is None:
+                    raise
+                ledger.require_ready_for_tick(state, approval_required=spec.approval_required)
     except PaperReconciliationRequired:
         ledger.halt("approval journal requires reconciliation")
         raise
@@ -455,7 +461,8 @@ def _tick(
                     durable=True,
                 )
             raise
-    effect_state = {"started": False, "abort": False}
+    legacy_attempt_id = uuid4().hex if attempt_context is None else None
+    effect_state = {"started": False, "abort": False, "transmitted_fills": []}
     try:
         return _run(
             directory,
@@ -498,6 +505,24 @@ def _tick(
                     )
                     if ledger.halted() is None:
                         ledger.halt(f"tick {due} failed: {type(exc).__name__}: {exc}")
+        elif isinstance(exc, FundHalted) and effect_state["transmitted_fills"]:
+            try:
+                events = ledger.events()
+            except Exception as lookup_error:
+                raise exc from lookup_error
+            has_outcome = any(event.get("attempt_id") == legacy_attempt_id and event.get("kind") in {"tick", "tick_failed", "tick_aborted"} for event in events)
+            if not has_outcome:
+                ledger.log_event(
+                    "tick_failed",
+                    attempt_id=legacy_attempt_id,
+                    expected_head=state.prev_hash,
+                    session=due,
+                    transmitted_fills=effect_state["transmitted_fills"],
+                    error=f"{type(exc).__name__}: {exc}",
+                    durable=True,
+                )
+                if ledger.halted() is None:
+                    ledger.halt(f"tick {due} failed: {type(exc).__name__}: {exc}")
         raise
 
 
@@ -585,7 +610,13 @@ def _redo(
                 raise FundHalted(f"{deployed.name} is halted")
             if deployed.spec.approval_required:
                 _verified_redo_approval(ledger, before, superseded)
-            ledger.require_ready_for_work(state, approval_required=deployed.spec.approval_required)
+            ledger.complete_landed_resume_intent()
+            try:
+                ledger.require_ready_for_work(state, approval_required=deployed.spec.approval_required, allow_tick_intents=True)
+            except PaperReconciliationRequired:
+                if ledger.complete_landed_resume_intent(require_audit_observation=True) is None:
+                    raise
+                ledger.require_ready_for_work(state, approval_required=deployed.spec.approval_required, allow_tick_intents=True)
             redo_id = ledger.begin_redo(
                 superseded,
                 request_id=request_id,
@@ -842,7 +873,11 @@ def _run(
             run_state = state.model_copy(update={"pending": None})
 
     def record_fill(order: Order, fill: Fill) -> None:
-        ledger.log_event("broker_fill", session=session, order=order.model_dump(mode="json"), fill=fill.model_dump(mode="json"))
+        transmitted_fill = {"order": order.model_dump(mode="json"), "fill": fill.model_dump(mode="json")}
+        if effect_state is not None:
+            effect_state.setdefault("transmitted_fills", []).append(transmitted_fill)
+        if deployed.broker == "saxo":
+            ledger.log_event("broker_fill", session=session, **transmitted_fill)
 
     def check_effect_admission() -> None:
         nonlocal order_pending
@@ -886,7 +921,7 @@ def _run(
                 data_client,
                 deployed.universe,
                 clock,
-                on_fill=record_fill if deployed.broker == "saxo" else None,
+                on_fill=record_fill,
                 before_effect=check_effect_admission,
                 before_order=reserve_publication,
                 on_progress=on_progress,

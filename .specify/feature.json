@@ -1,3 +1,1 @@
-{
-  "feature_directory": "specs/006-paper-writer-safety"
-}
+{ "feature_directory": "specs/007-rb3-halt-recovery" }

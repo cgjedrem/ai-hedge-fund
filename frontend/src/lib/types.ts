@@ -136,6 +136,7 @@ export interface HomeData {
 }
 
 export type HaltState = "clear" | "halted" | "unreadable";
+export type PaperRecoveryState = "ready" | "reconciliation_required" | "corrupt";
 
 export interface PaperSummary {
   name: string;
@@ -146,6 +147,7 @@ export interface PaperSummary {
   cash: number | null;
   last_session: string | null;
   ledger_ok: boolean;
+  recovery_state: PaperRecoveryState;
   halted: string | null;
   halt_state: HaltState;
   runner: RunnerState;
@@ -290,6 +292,7 @@ export interface PaperSnapshot {
   next_run: string | null;
   halted: string | null;
   halt_state: HaltState;
+  recovery_state: "ready" | "reconciliation_required" | "corrupt";
   ledger: { ok: boolean; error: string | null };
   runner: RunnerState;
   live_value: LiveValuation;
@@ -365,6 +368,8 @@ export interface PaperReconciliation {
   name: string;
   halted: string | null;
   resume_allowed: boolean;
+  resume_completion_required?: boolean;
+  resume_request_id?: string | null;
   preview: PaperReconciliationPreview;
   intent_preview: PaperTickIntentReconciliationPreview;
   intent_targets: PaperTickIntentReconciliationTarget[];

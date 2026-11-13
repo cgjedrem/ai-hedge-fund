@@ -37,7 +37,7 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { apiPost, isPreAdmissionDenial, requireMutationOperationReceipt } from "@/lib/api";
+import { apiPost, isExpiredConfirmation, isPreAdmissionDenial, requireMutationOperationReceipt } from "@/lib/api";
 import { toActionableError, type ActionableError } from "@/lib/errors";
 import { useDesk, useOperation, useResource } from "@/lib/hooks";
 import type { PendingOperation } from "@/lib/pending-operations";
@@ -154,7 +154,7 @@ export function PaperDetailPage() {
   const [selectedIntent, setSelectedIntent] = useState<{ fund: string; digest: string } | null>(null);
   const selectedIntentDigest = selectedIntent?.fund === name ? selectedIntent.digest : null;
   useEffect(() => setSelectedIntent(null), [name]);
-  const reconciliationPath = name && resource.data?.broker === "paper" && resource.data.ledger.ok
+  const reconciliationPath = name && resource.data?.broker === "paper" && (resource.data.ledger.ok || resource.data.recovery_state === "reconciliation_required")
     ? `/api/paper/${encodeURIComponent(name)}/reconciliation${selectedIntentDigest ? `?intent_digest=${encodeURIComponent(selectedIntentDigest)}` : ""}`
     : null;
   const reconciliationResource = useResource<PaperReconciliation>(
@@ -219,8 +219,15 @@ export function PaperDetailPage() {
   const approvalRequired = data?.spec.approval_required === true;
   const canWritePaper = canWrite && data?.broker === "paper";
   const canApprove = canWritePaper && approvalRequired && data?.halt_state === "clear" && data?.ledger.ok === true;
-  const canResumePaper = Boolean(canWritePaper && data?.halt_state === "halted" && data.ledger.ok && recovery?.resume_allowed === true);
+  const canResumePaper = Boolean(
+    canWritePaper
+    && (data?.halt_state === "halted" || (data?.halt_state === "clear" && recovery?.resume_completion_required === true))
+    && data.recovery_state !== "corrupt"
+    && (data.ledger.ok || data.recovery_state === "reconciliation_required")
+    && recovery?.resume_allowed === true,
+  );
   const intentPreview = recovery?.intent_preview;
+  const approvalConsumptionOnly = Boolean(intentPreview?.required && intentPreview.intent_digest === null && intentPreview.approval_journal_event_digests.length > 0);
   const intentTargets = recovery?.intent_targets ?? [];
   const canReconcileTickIntent = Boolean(
     canWritePaper
@@ -378,11 +385,21 @@ export function PaperDetailPage() {
         } else {
           const key = `${name}:${data?.last_record_hash ?? ""}`;
           const current = manualResumeRequest.current;
-          const request = current?.key === key ? current : { key, requestId: newRequestId() };
+          const journalRequestId = recovery.resume_completion_required ? recovery.resume_request_id : null;
+          const request = journalRequestId
+            ? { key, requestId: journalRequestId }
+            : current?.key === key
+              ? current
+              : { key, requestId: newRequestId() };
           manualResumeRequest.current = request;
           await apiPost(`/api/paper/${encodeURIComponent(name)}/resume`, { request_id: request.requestId });
           manualResumeRequest.current = null;
-          setFeedback({ tone: "neutral", message: "Halt cleared. No paper operation ran and no runner was started." });
+          setFeedback({
+            tone: "neutral",
+            message: recovery.resume_completion_required
+              ? "Resume completion recorded. No control write or paper operation was repeated."
+              : "Halt cleared. No paper operation ran and no runner was started.",
+          });
         }
       }
       setConfirmAction(null);
@@ -390,6 +407,7 @@ export function PaperDetailPage() {
     } catch (cause) {
       fail(cause, "Action failed.");
       if (confirmAction === "resume") {
+        if (isExpiredConfirmation(cause)) recoveryRequest.current = null;
         resource.refresh();
         reconciliationResource.refresh();
       }
@@ -671,7 +689,12 @@ export function PaperDetailPage() {
       {resource.error ? <ErrorState message={resource.error} error={resource.apiError} onRetry={resource.refresh} /> : null}
       {data ? (
         <>
-          {!data.ledger.ok ? <Alert tone="danger" className="mb-5"><strong>Paper state unavailable.</strong> <span>{data.ledger.error}</span></Alert> : null}
+          {!data.ledger.ok ? (
+            <Alert tone="danger" className="mb-5">
+              <strong>{data.recovery_state === "reconciliation_required" ? "Reconciliation required." : "Paper state unavailable."}</strong>{" "}
+              <span>{data.ledger.error}</span>
+            </Alert>
+          ) : null}
           {writeUnavailable ? (
             <Alert tone="warning" className="mb-5">
               Root enrollment: <span className="mono">{enrollmentState}</span>. Writes unavailable: <span className="mono">{capabilities?.write_unavailable_reason}</span>.
@@ -685,8 +708,8 @@ export function PaperDetailPage() {
           {data.halt_state === "unreadable" ? (
             <Alert tone="warning" className="mb-5">Halt state is unreadable. Paper controls and approval writes are disabled.</Alert>
           ) : null}
-          {data.ledger.ok && data.broker === "paper" && (
-            data.halt_state === "halted" || intentPreview?.required
+          {data.broker === "paper" && (data.ledger.ok || data.recovery_state === "reconciliation_required") && (
+            data.halt_state === "halted" || data.recovery_state === "reconciliation_required" || intentPreview?.required
           ) ? (
             <Card className="mb-5" data-testid="paper-reconciliation">
               <CardHeader><CardTitle>Paper recovery review</CardTitle></CardHeader>
@@ -727,9 +750,14 @@ export function PaperDetailPage() {
                         Manual Halt only. No ambiguous tick failure requires reconciliation. Resume clears Halt without running a paper operation or starting a runner.
                       </p>
                     ) : null}
+                    {recovery.resume_completion_required ? (
+                      <Alert tone="warning">
+                        Resume control write already landed. Complete the journal record only; no control write or paper operation will run.
+                      </Alert>
+                    ) : null}
                     {intentPreview?.required ? (
                       <div className="space-y-3 border-t border-border pt-3" data-testid="tick-intent-reconciliation">
-                        <p className="font-medium">Orphaned paper tick intent</p>
+                        <p className="font-medium">{approvalConsumptionOnly ? "Unmatched approval consumption" : "Orphaned paper tick intent"}</p>
                         {intentPreview.reason === "multiple-unresolved-tick-intents" && !selectedIntentDigest ? (
                           <>
                             <Alert tone="danger">Multiple unresolved tick intents. Select an individual target by digest before reviewing recovery.</Alert>
@@ -779,7 +807,7 @@ export function PaperDetailPage() {
                                   ) : null}
                                 </Alert>
                                 <Button onClick={() => setIntentRecoveryOpen(true)} disabled={busy}>
-                                  Review orphaned tick resolution
+                                  {approvalConsumptionOnly ? "Review approval-consumption resolution" : "Review orphaned tick resolution"}
                                 </Button>
                               </>
                             ) : (
@@ -930,9 +958,9 @@ export function PaperDetailPage() {
                       variant="secondary"
                       onClick={() => setConfirmAction("resume")}
                       disabled={!canResumePaper}
-                      title={!data.ledger.ok ? "Resume requires a valid, replayable ledger." : recovery?.preview.required && !recovery.resume_allowed ? "Current paper state is not reconcilable." : undefined}
+                      title={!data.ledger.ok && data.recovery_state !== "reconciliation_required" ? "Resume requires a valid, replayable ledger." : recovery?.preview.required && !recovery.resume_allowed ? "Current paper state is not reconcilable." : undefined}
                     >
-                      <CirclePlay className="h-3.5 w-3.5" /> {recovery?.preview.required ? "Review recovery" : "Resume"}
+                      <CirclePlay className="h-3.5 w-3.5" /> {recovery?.resume_completion_required ? "Complete Resume" : recovery?.preview.required ? "Review recovery" : "Resume"}
                     </Button>
                   </div>
                   <div className="border-t border-border pt-3">
@@ -1110,7 +1138,7 @@ export function PaperDetailPage() {
         onOpenChange={(open) => { if (!open) setConfirmAction(null); }}
         title={confirmTitle(confirmAction, recovery)}
         description={confirmDescription(confirmAction, data?.pending, recovery)}
-        confirmLabel={confirmAction === "approve" ? "Approve displayed decision" : confirmAction === "reject" ? "Reject displayed decision" : recovery?.preview.required ? "Confirm recovery and resume" : "Record resume"}
+        confirmLabel={confirmAction === "approve" ? "Approve displayed decision" : confirmAction === "reject" ? "Reject displayed decision" : recovery?.resume_completion_required ? "Complete Resume" : recovery?.preview.required ? "Confirm recovery and resume" : "Record resume"}
         destructive={confirmAction === "reject"}
         busy={busy}
         onConfirm={() => void submitAction()}
@@ -1118,9 +1146,11 @@ export function PaperDetailPage() {
       <ConfirmDialog
         open={intentRecoveryOpen}
         onOpenChange={setIntentRecoveryOpen}
-        title="Resolve orphaned paper tick"
-        description="Record an explicit, audited verdict that the local paper book matches the ledger. This clears the intent fence only; it never retries a tick."
-        confirmLabel="Record intent resolution"
+        title={approvalConsumptionOnly ? "Resolve unmatched approval consumption" : "Resolve orphaned paper tick"}
+        description={approvalConsumptionOnly
+          ? "Record an explicit, audited verdict that the local paper book matches the ledger. This resolves the listed approval journal entries only; it never retries a tick."
+          : "Record an explicit, audited verdict that the local paper book matches the ledger. This clears the intent fence only; it never retries a tick."}
+        confirmLabel={approvalConsumptionOnly ? "Record approval resolution" : "Record intent resolution"}
         busy={busy}
         onConfirm={() => void submitIntentRecovery()}
       />
@@ -1272,6 +1302,7 @@ function newRequestId(): string {
 function confirmTitle(action: PendingAction | null, recovery?: PaperReconciliation | null): string {
   if (action === "approve") return "Approve pending decision";
   if (action === "reject") return "Reject pending decision";
+  if (recovery?.resume_completion_required) return "Complete Resume";
   if (recovery?.preview.required) return "Reconcile and resume paper fund";
   return "Resume paper fund";
 }
@@ -1288,6 +1319,9 @@ function confirmDescription(
   }
   if (recovery?.preview.required) {
     return `Receipt binds failure ${shortHash(recovery.preview.failure_id)} to local book ${shortHash(recovery.preview.broker_book_sha256)} and preview ${shortHash(recovery.preview.preview_digest)}. Failed tick will not be retried. No runner will be started.`;
+  }
+  if (recovery?.resume_completion_required) {
+    return "Resume control write already landed. This records completion only; it does not repeat the control write or run a paper operation.";
   }
   return "This clears Halt only. It does not run a paper operation or start a runner.";
 }
