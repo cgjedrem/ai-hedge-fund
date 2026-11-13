@@ -118,7 +118,7 @@ Recovery receipts (both failure-bound and intent-bound) carry a recorded-clock v
 ### Key Entities
 
 - **Tick intent / orphaned intent**: durable pre-effect record; unresolved until outcome. PR #11 added digest-bound enumeration, fencing, and audited resolution. This feature extends the same treatment to unmatched approval-consumption entries and to permission consistency.
-- **Resume intent**: durable record of an attempted Resume; unresolved Resume intents join the common unresolved-state set.
+- **Resume intent**: durable record of an attempted Resume; unresolved Resume intents join the common unresolved-state set. *(Amended 2026-11-13 after Copilot review finding C3: a reviewed failure counts as resolved only once a uniquely matching `resume_effect_intent` exists — a bare `resume` event without its effect intent is an incomplete transition that remains reviewable, and a fresh head/book-bound review may authorize completing it even after the original receipt expired. Receipt expiry still denies the expired authorization itself.)*
 - **Recovery receipt** (failure-bound and intent-bound): reviewed confirmation bound to identity + ledger head + book digest + fill digest; gains `issued_at`/`valid_until`; single-use; expiring; fail-closed for legacy receipts.
 - **Recovery surface state**: desk distinguishes corrupt replay / valid-not-ready-reconciliation-required / ready.
 
