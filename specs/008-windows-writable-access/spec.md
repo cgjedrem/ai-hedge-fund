@@ -1,6 +1,6 @@
 # Feature Specification: Native Single-User Writable Access for Existing Funds
 
-**Feature Branch**: `cgjedrem-cautious-spork` (app-managed worktree; branch creation skipped, numbering applied — computed name `007-windows-writable-access`)
+**Feature Branch**: `cgjedrem-cautious-spork` (app-managed worktree; branch creation skipped, numbering applied — computed name `008-windows-writable-access`)
 
 **Created**: 2026-11-12
 

@@ -1,8 +1,8 @@
 # Implementation Plan: Native Single-User Writable Access for Existing Funds
 
-**Branch**: `cgjedrem-cautious-spork` (app-managed worktree; computed feature name `007-windows-writable-access`) | **Date**: 2026-11-12 | **Spec**: [spec.md](spec.md)
+**Branch**: `cgjedrem-cautious-spork` (app-managed worktree; computed feature name `008-windows-writable-access`) | **Date**: 2026-11-12 | **Spec**: [spec.md](spec.md)
 
-**Input**: Feature specification from `/specs/007-windows-writable-access/spec.md`
+**Input**: Feature specification from `/specs/008-windows-writable-access/spec.md`
 
 ## Summary
 
@@ -46,7 +46,7 @@ No violations; Complexity Tracking table not required.
 ### Documentation (this feature)
 
 ```text
-specs/007-windows-writable-access/
+specs/008-windows-writable-access/
 ├── plan.md              # This file
 ├── research.md          # Phase 0 output
 ├── data-model.md        # Phase 1 output

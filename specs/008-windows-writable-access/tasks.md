@@ -1,6 +1,6 @@
 # Tasks: Native Single-User Writable Access for Existing Funds
 
-**Input**: Design documents from `/specs/007-windows-writable-access/`
+**Input**: Design documents from `/specs/008-windows-writable-access/`
 
 **Prerequisites**: plan.md, spec.md, research.md, data-model.md, contracts/handover-cli.md, quickstart.md
 
@@ -64,7 +64,7 @@
 ### Implementation for User Story 2
 
 - [X] T013 [US2] Extend `handover inspect` output to list recorded attestation artifacts and remaining blockers with the exact resolving subcommand each in hedge_fund/runtime/handover.py + hedge_fund/run.py
-- [X] T014 [US2] Error-contract pass: exit code 2 family preserved for unenabled roots; every new denial follows the contract in specs/007-windows-writable-access/contracts/handover-cli.md §Error contract
+- [X] T014 [US2] Error-contract pass: exit code 2 family preserved for unenabled roots; every new denial follows the contract in specs/008-windows-writable-access/contracts/handover-cli.md §Error contract
 
 **Checkpoint**: Trust grant fully reconstructible from on-disk artifacts (SC-005).
 
