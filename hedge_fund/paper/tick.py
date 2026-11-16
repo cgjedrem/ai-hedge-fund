@@ -18,6 +18,7 @@ admission halt the fund.
 
 from __future__ import annotations
 
+import os
 from contextlib import contextmanager, ExitStack
 from datetime import date as _date
 from datetime import datetime, timedelta
@@ -191,6 +192,7 @@ def tick(
     on_progress: Callable[[int], None] | None = None,
     on_effect_started: Callable[[], None] | None = None,
     operation_store=None,
+    root_context=None,
 ) -> SessionRecord:
     """Advance the paper fund in *directory* by one session and record it.
 
@@ -211,6 +213,19 @@ def tick(
         if not isinstance(operation_store, OperationStore):
             raise ValueError("paper tick operation store is invalid")
     directory = Path(directory)
+    if root_context is not None:
+        from hedge_fund.runtime.root import RootContext
+
+        if not isinstance(root_context, RootContext):
+            raise ValueError("paper tick root context is invalid")
+        try:
+            root_context.revalidate()
+            root_path = os.path.normcase(os.path.abspath(os.fspath(root_context.path)))
+            directory_root = os.path.normcase(os.path.abspath(os.fspath(directory.parent.parent)))
+        except Exception:
+            raise ValueError("paper tick root context is invalid") from None
+        if directory.parent.name != "paper" or directory_root != root_path:
+            raise ValueError("paper tick root context does not match the fund directory")
     operation_context = None
     if request_id is not None:
         from hedge_fund.paper.ledger import Ledger
@@ -284,7 +299,7 @@ def tick(
                 record = ledger.read(session)
                 from hedge_fund.runtime.operations import paper_tick_logical_key
 
-                logical_key = paper_tick_logical_key(directory.name, session, expected_head)
+                logical_key = paper_tick_logical_key(directory.name, session, expected_head, root=root_context)
                 ledger.log_event(
                     "tick",
                     request_id=request_id,
@@ -309,6 +324,7 @@ def tick(
                 on_effect_started=on_effect_started,
                 operation_store=operation_store,
                 operation_id=operation_id,
+                root_context=root_context,
             )
         except NothingDue as exc:
             if operation_context is not None:
@@ -355,6 +371,7 @@ def _tick(
     on_effect_started: Callable[[], None] | None = None,
     operation_store=None,
     operation_id: str | None = None,
+    root_context=None,
 ) -> SessionRecord:
     from hedge_fund.runtime.admission import PaperPreflightBusy
 
@@ -414,7 +431,7 @@ def _tick(
         paper_tick_logical_key,
     )
 
-    logical_key = paper_tick_logical_key(deployed.name, due, state.prev_hash)
+    logical_key = paper_tick_logical_key(deployed.name, due, state.prev_hash, root=root_context)
     if operation_store is not None:
         try:
             active = operation_store.find_active_logical_operation(

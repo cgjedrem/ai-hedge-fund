@@ -483,10 +483,29 @@ def _parser() -> argparse.ArgumentParser:
         "enroll-fresh",
         help="enroll only a genuinely empty root",
     )
-    handover_actions.add_parser(
+    source_inspection = handover_actions.add_parser(
         "inspect-source",
         help="read-only: show the relocation content digest of this legacy root without writing to it",
     )
+    source_inspection.add_argument(
+        "--evidence-out",
+        required=True,
+        help="absolute destination-private path for the source evidence bundle",
+    )
+    stale_marker_attestation = handover_actions.add_parser(
+        "attest-stale-marker",
+        help="retire one verified stale runner marker in this copied destination",
+    )
+    stale_marker_attestation.add_argument("--marker", required=True, help="copied runner.pid path to retire")
+    stale_marker_attestation.add_argument("--source-evidence", required=True, help="digest of destination-staged source evidence")
+    stale_marker_attestation.add_argument("--operator-statement", required=True, help="explicit marker-retirement attestation")
+    protected_fund_attestation = handover_actions.add_parser(
+        "attest-protected-fund",
+        help="authorize one protected fund under its original name at this copied destination",
+    )
+    protected_fund_attestation.add_argument("--fund", required=True, help="original protected fund name")
+    protected_fund_attestation.add_argument("--source-evidence", required=True, help="digest of destination-staged source evidence")
+    protected_fund_attestation.add_argument("--operator-statement", required=True, help="explicit protected-fund attestation")
     relocation = handover_actions.add_parser(
         "relocate-from",
         help="copy a quiescent legacy root into this empty target; target stays read-only until trusted",
@@ -496,6 +515,16 @@ def _parser() -> argparse.ArgumentParser:
         "--content-digest",
         required=True,
         help="exact content_digest printed by `aihf --root SOURCE handover inspect-source`",
+    )
+    relocation_copy = handover_actions.add_parser(
+        "relocate-copy",
+        help="copy reviewed source data into this empty destination without enrolling it",
+    )
+    relocation_copy.add_argument("source", help="absolute path of the legacy root to copy (never written)")
+    relocation_copy.add_argument("--content-digest", required=True, help="exact content_digest printed by inspect-source")
+    handover_actions.add_parser(
+        "relocate-finalize",
+        help="validate a completed relocation copy and enroll this destination read-only",
     )
     migration = handover_actions.add_parser(
         "migrate-existing",
@@ -647,17 +676,23 @@ def _lifecycle(args, parser: argparse.ArgumentParser, root: RootContext) -> None
 def _handover(args, parser: argparse.ArgumentParser, root: RootContext) -> None:
     from hedge_fund.runtime.admission import RootMigrationLease
     from hedge_fund.runtime.handover import (
+        attest_protected_fund,
+        attest_stale_marker,
         build_head_inventory,
         enroll_fresh,
         enrollment_status,
         HANDOVER_PATH,
         HandoverError,
+        inspect_attestation_state,
         inspect_relocation_source,
         inventory_digest,
         migrate_existing,
         OPERATOR_ATTESTATION,
         prepare_single_writer_acknowledgement,
+        relocate_copy,
         relocate_existing,
+        relocate_finalize,
+        RELOCATION_STATE_PATH,
         revoke_single_writer,
         SINGLE_WRITER_RESPONSIBILITY_WARNING,
         trust_single_writer,
@@ -666,7 +701,25 @@ def _handover(args, parser: argparse.ArgumentParser, root: RootContext) -> None:
 
     try:
         if args.handover_action == "inspect-source":
-            print(json.dumps(inspect_relocation_source(root), sort_keys=True, indent=2))
+            print(json.dumps(inspect_relocation_source(root, evidence_out=args.evidence_out), sort_keys=True, indent=2))
+            return
+        if args.handover_action == "attest-stale-marker":
+            result = attest_stale_marker(
+                root,
+                marker=args.marker,
+                source_evidence_digest=args.source_evidence,
+                operator_statement=args.operator_statement,
+            )
+            print(json.dumps(result, sort_keys=True))
+            return
+        if args.handover_action == "attest-protected-fund":
+            result = attest_protected_fund(
+                root,
+                fund=args.fund,
+                source_evidence_digest=args.source_evidence,
+                operator_statement=args.operator_statement,
+            )
+            print(json.dumps(result, sort_keys=True))
             return
         if args.handover_action == "inspect":
             status = enrollment_status(root, verify_inventory=True)
@@ -674,6 +727,19 @@ def _handover(args, parser: argparse.ArgumentParser, root: RootContext) -> None:
             inspectable = status["state"] in {"unenrolled", "enrolled"} or orphaned_admission
             if not inspectable:
                 raise HandoverError("root enrollment or ledger inventory is unavailable")
+            attestation_state = {
+                "source_evidence_digest": None,
+                "attestation_artifacts": [],
+                "remaining_blockers": [],
+            }
+            try:
+                root.file_info(RELOCATION_STATE_PATH)
+            except FileNotFoundError:
+                relocation_state_present = False
+            else:
+                relocation_state_present = True
+            if status["state"] == "unenrolled" or relocation_state_present:
+                attestation_state = inspect_attestation_state(root)
             acknowledgement = None
             acknowledgement_expires_at = None
             runtime_scope = None
@@ -691,7 +757,10 @@ def _handover(args, parser: argparse.ArgumentParser, root: RootContext) -> None:
                 if not root.verify_private_storage():
                     root.prepare_private_storage()
                 with RootMigrationLease.acquire(root, timeout=0):
-                    heads = build_head_inventory(root)
+                    heads = build_head_inventory(
+                        root,
+                        allow_relocation_blockers=attestation_state["source_evidence_digest"] is not None,
+                    )
                     try:
                         root.file_info(HANDOVER_PATH)
                     except FileNotFoundError:
@@ -717,6 +786,7 @@ def _handover(args, parser: argparse.ArgumentParser, root: RootContext) -> None:
                         "operator_acknowledgement_expires_at": acknowledgement_expires_at,
                         "runtime_scope": runtime_scope,
                         "operator_responsibility": SINGLE_WRITER_RESPONSIBILITY_WARNING,
+                        **attestation_state,
                     },
                     sort_keys=True,
                     indent=2,
@@ -729,6 +799,13 @@ def _handover(args, parser: argparse.ArgumentParser, root: RootContext) -> None:
         elif args.handover_action == "relocate-from":
             with RootContext.open(args.source) as source:
                 record = relocate_existing(root, source=source, expected_content_digest=args.content_digest)
+        elif args.handover_action == "relocate-copy":
+            with RootContext.open(args.source) as source:
+                copied = relocate_copy(root, source=source, expected_content_digest=args.content_digest)
+            print(json.dumps(copied, sort_keys=True))
+            return
+        elif args.handover_action == "relocate-finalize":
+            record = relocate_finalize(root)
         elif args.handover_action == "trust-single-writer":
             authority = trust_single_writer(
                 root,
@@ -748,7 +825,7 @@ def _handover(args, parser: argparse.ArgumentParser, root: RootContext) -> None:
                 operator_attestation=args.operator_attestation,
             )
     except Exception as exc:
-        parser.error(f"offline handover failed ({type(exc).__name__}): {exc}")
+        parser.error(f"offline handover failed ({type(exc).__name__}): {exc}. Resolve with: {_handover_remedy(args, exc)}")
     print(
         json.dumps(
             {
@@ -760,6 +837,32 @@ def _handover(args, parser: argparse.ArgumentParser, root: RootContext) -> None:
             sort_keys=True,
         )
     )
+
+
+def _handover_remedy(args, error: Exception) -> str:
+    action = args.handover_action
+    inspect = "aihf --root ROOT handover inspect"
+    if action == "trust-single-writer":
+        if "private root storage is not verified" in str(error).casefold():
+            return f"run `{inspect}`; for a genuinely empty root, run `aihf --root ROOT handover enroll-fresh`, then inspect again"
+        return f"run `{inspect}` and retry `handover trust-single-writer` with its fresh inventory digest and exact acknowledgement"
+    if action in {"relocate-copy", "relocate-from"}:
+        return "run `aihf --root SOURCE handover inspect-source --evidence-out DEST/runtime/private/v1/source-evidence.json`, then retry the relocation with its current content digest"
+    if action == "relocate-finalize":
+        return f"run `{inspect}` and resolve every listed blocker before retrying `handover relocate-finalize`"
+    if action == "inspect-source":
+        return "verify the source is readable and `--evidence-out` is an absolute destination-private path outside the source, then retry `handover inspect-source`"
+    if action == "migrate-existing":
+        return f"run `{inspect}` and retry `handover migrate-existing` with its current inventory digest and exact operator attestation"
+    if action == "enroll-fresh":
+        return f"run `{inspect}`; `handover enroll-fresh` applies only to a genuinely empty root"
+    if action == "revoke-single-writer":
+        return f"stop participating writers, run `{inspect}`, then retry `handover revoke-single-writer`"
+    if action == "attest-stale-marker":
+        return f"verify the marker owner is quiescent, run `{inspect}`, then retry `handover attest-stale-marker` with the listed source evidence digest"
+    if action == "attest-protected-fund":
+        return f"run `{inspect}` and retry `handover attest-protected-fund` with the original fund name and listed source evidence digest"
+    return f"run `{inspect}` and follow its reported resolution"
 
 
 @contextmanager

@@ -1,4 +1,4 @@
-﻿"""The fund wizard in both modes, including the minute cadence sub-steps."""
+"""The fund wizard in both modes, including the minute cadence sub-steps."""
 
 import asyncio
 import json
@@ -124,6 +124,8 @@ def test_builder_paper_mode_denies_the_build_and_refuses_taken_names(monkeypatch
     deploy("taken", make_spec(["pead"], "taken"), ["NVDA", "AMD"], root=paths.PAPER_DIR)
     (paths.MANDATES_DIR / "saved.yaml").write_text(yaml.safe_dump(make_spec(["pead"], "saved").model_dump()))
     before_paper, before_mandates = _tree(paths.PAPER_DIR), _tree(paths.MANDATES_DIR)
+    write_denial = paper.paper_write_denial()
+    assert write_denial is not None
 
     async def scenario():
         app = HedgeFundApp()
@@ -134,7 +136,7 @@ def test_builder_paper_mode_denies_the_build_and_refuses_taken_names(monkeypatch
             await pilot.press("end", "enter")  # the + row
             await pilot.pause()
             assert app.screen is fund_list
-            assert list_notices == ["TUI paper writes are disabled on enrolled roots; use the web desk."]
+            assert list_notices == [write_denial]
             await app.push_screen(builder.BuilderScreen(mode="paper"))
             screen = app.screen
             notices = _capture_notices(monkeypatch, screen)
@@ -161,7 +163,7 @@ def test_builder_paper_mode_denies_the_build_and_refuses_taken_names(monkeypatch
             await pilot.press("enter")
             await pilot.pause()
             assert screen.query_one("#panes", ContentSwitcher).current == "step-tickers"
-            assert notices[-1] == "TUI paper writes are disabled on enrolled roots; use the web desk."
+            assert notices[-1] == write_denial
             assert screen._built is None
 
     asyncio.run(scenario())
@@ -213,6 +215,8 @@ def test_saxo_builder_requires_account_key_then_blocks_shared_root_deployment(mo
 @pytest.mark.parametrize("approval_required", [False, True])
 def test_builder_paper_mode_records_approval_choice_then_denies_the_build(monkeypatch, approval_required):
     name = "approval-on" if approval_required else "approval-off"
+    write_denial = paper.paper_write_denial()
+    assert write_denial is not None
 
     async def scenario():
         app = HedgeFundApp()
@@ -238,7 +242,7 @@ def test_builder_paper_mode_records_approval_choice_then_denies_the_build(monkey
             screen.query_one("#tickers-input", Input).value = "TEST"
             await pilot.press("enter")
             await pilot.pause()
-            assert notices == ["TUI paper writes are disabled on enrolled roots; use the web desk."]
+            assert notices == [write_denial]
 
     asyncio.run(scenario())
     assert not (paths.PAPER_DIR / name).exists()
@@ -246,6 +250,9 @@ def test_builder_paper_mode_records_approval_choice_then_denies_the_build(monkey
 
 
 def test_builder_minute_path_sets_interval_and_window_then_denies_the_build(monkeypatch):
+    write_denial = paper.paper_write_denial()
+    assert write_denial is not None
+
     async def scenario():
         app = HedgeFundApp()
         async with app.run_test(size=(120, 45)) as pilot:
@@ -323,7 +330,7 @@ def test_builder_minute_path_sets_interval_and_window_then_denies_the_build(monk
             await pilot.press("enter")
             await pilot.pause()
             assert screen.query_one("#panes", ContentSwitcher).current == "step-tickers"
-            assert notices == ["TUI paper writes are disabled on enrolled roots; use the web desk."]
+            assert notices == [write_denial]
             assert screen._state["rebalance"] == "minute" and screen._state["interval"] == 0.5
             assert screen._state["window"] == TradingWindow(start="09:00", end="12:00")
             assert not (paths.MANDATES_DIR / "fast.yaml").exists()
@@ -365,6 +372,8 @@ def test_builder_refuses_to_replace_a_taken_name_and_wipes_nothing(monkeypatch):
     ledger.append(make_session("2025-01-17", nav=100000))
     untouched = deploy("beta", old, ["AMD"], root=paths.PAPER_DIR)
     before = (_tree(paths.MANDATES_DIR), _tree(paths.RESEARCH_DIR), _tree(paths.PAPER_DIR))
+    write_denial = paper.paper_write_denial()
+    assert write_denial is not None
 
     async def scenario():
         app = HedgeFundApp()
@@ -392,7 +401,7 @@ def test_builder_refuses_to_replace_a_taken_name_and_wipes_nothing(monkeypatch):
             await pilot.press("enter")
             await pilot.pause()
             assert screen.query_one("#panes", ContentSwitcher).current == "step-tickers"
-            assert notices[-1] == "TUI paper writes are disabled on enrolled roots; use the web desk."
+            assert notices[-1] == write_denial
 
     asyncio.run(scenario())
     assert (_tree(paths.MANDATES_DIR), _tree(paths.RESEARCH_DIR), _tree(paths.PAPER_DIR)) == before
@@ -403,6 +412,8 @@ def test_builder_refuses_to_replace_a_taken_name_and_wipes_nothing(monkeypatch):
 def test_builder_first_session_is_unreachable_from_the_tui(monkeypatch):
     forbidden_client = Mock(side_effect=AssertionError("TUI reached provider setup"))
     monkeypatch.setattr(paper, "make_data_client", forbidden_client)
+    write_denial = paper.paper_write_denial()
+    assert write_denial is not None
 
     async def scenario():
         app = HedgeFundApp()
@@ -413,7 +424,7 @@ def test_builder_first_session_is_unreachable_from_the_tui(monkeypatch):
             await pilot.press("enter")  # the + row of an empty list
             await pilot.pause()
             assert app.screen is fund_list
-            assert notices == ["TUI paper writes are disabled on enrolled roots; use the web desk."]
+            assert notices == [write_denial]
 
     asyncio.run(scenario())
     forbidden_client.assert_not_called()

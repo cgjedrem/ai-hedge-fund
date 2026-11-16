@@ -2153,6 +2153,20 @@ class Ledger:
         with RootContext.open(directory.parent.parent) as root:
             yield root, f"{directory.parent.name}/{directory.name}/{relative}"
 
+    @contextmanager
+    def _event_root(self) -> Iterator[tuple[object, str]]:
+        from hedge_fund.runtime.root import _PROTECTED_RESOURCE_NAMES, RootContext
+
+        directory = Path(os.path.abspath(self.directory))
+        if directory.parent.name == "paper" and directory.name in _PROTECTED_RESOURCE_NAMES:
+            root_path = directory.parent.parent
+            relative = f"paper/{directory.name}/{EVENTS_FILE}"
+        else:
+            root_path = directory
+            relative = EVENTS_FILE
+        with RootContext.open(root_path) as root:
+            yield root, relative
+
     def _clear_approval(self, expected: dict[str, str] | None, *, enrolled: bool = False) -> bool:
         from hedge_fund.runtime.root import RootPathError
 
@@ -2187,18 +2201,17 @@ class Ledger:
         halt_event = kind in {"halt_intent", "halt"}
         self._require_write_lanes(_HALT_LANES if halt_event else _CONTROL_LANES)
         from hedge_fund.runtime.admission import paper_audit_transition
-        from hedge_fund.runtime.root import RootContext
 
         with paper_audit_transition(self.directory, self.directory.name, halt_event=halt_event):
             line = json.dumps({"time": _now(), "kind": kind, **fields}, default=str)
             self._require_write_lanes(_HALT_LANES if halt_event else _CONTROL_LANES)
-            with RootContext.open(self.directory) as root:
+            with self._event_root() as (root, relative):
                 try:
-                    prior = root.read_bytes(EVENTS_FILE)
+                    prior = root.read_bytes(relative)
                 except FileNotFoundError:
                     prior = b""
                 separator = b"" if not prior or prior.endswith(b"\n") else b"\n"
-                root.append_bytes(EVENTS_FILE, separator + (line + "\n").encode("utf-8"), durable=durable)
+                root.append_bytes(relative, separator + (line + "\n").encode("utf-8"), durable=durable)
 
     def recovery_events(self) -> tuple[list[dict], tuple[str, ...]]:
         events, corrupt_occurrences, _event_offsets = self._recovery_events_with_offsets()
@@ -2218,12 +2231,11 @@ class Ledger:
             paper_audit_snapshot,
             PaperAuditObservationBusy,
         )
-        from hedge_fund.runtime.root import RootContext
 
         def read() -> tuple[list[dict], tuple[_CorruptEventOccurrence, ...], tuple[int, ...]]:
             try:
-                with RootContext.open(self.directory) as root:
-                    raw = root.read_bytes(EVENTS_FILE)
+                with self._event_root() as (root, relative):
+                    raw = root.read_bytes(relative)
             except FileNotFoundError:
                 return [], (), ()
             return _parse_event_history_with_offsets(raw)

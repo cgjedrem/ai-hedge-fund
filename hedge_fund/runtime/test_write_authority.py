@@ -220,15 +220,73 @@ def test_linux_runtime_scope_rejects_unbounded_pid1_numbers(tmp_path, monkeypatc
             handover._runtime_scope_identity(root)
 
 
-def test_windows_runtime_scope_is_unavailable_not_wallclock_derived(tmp_path, monkeypatch):
+def test_windows_runtime_scope_binds_machine_account_and_volume(tmp_path, monkeypatch):
     root_path = tmp_path / "windows-scope"
     root_path.mkdir()
     monkeypatch.setattr(handover, "_runtime_scope_identity", _ORIGINAL_RUNTIME_SCOPE_IDENTITY)
     monkeypatch.setattr(handover, "sys", SimpleNamespace(platform="win32"))
+    monkeypatch.setattr(handover, "_windows_current_user_sid", lambda: "S-1-5-21-100-200-300-1001")
 
     with RootContext.open(root_path) as root:
-        with pytest.raises(HandoverError, match="Windows.*disabled"):
-            handover._runtime_scope_identity(root)
+        scope = handover._runtime_scope_identity(root)
+
+    assert scope == {
+        "kind": "windows-user-volume",
+        "machine": root.host_identity.casefold(),
+        "operator_sid": "S-1-5-21-100-200-300-1001",
+        "volume": root.device_identity.casefold(),
+    }
+
+
+def test_windows_trust_scope_mismatch_requires_fresh_review(tmp_path, monkeypatch):
+    monkeypatch.setattr(handover, "out_of_band_exclusion_basis", lambda _root: None)
+    runtime = {
+        "scope": {
+            "kind": "windows-user-volume",
+            "machine": "synthetic-machine",
+            "operator_sid": "S-1-5-21-100-200-300-1001",
+            "volume": "c:synthetic-volume",
+        }
+    }
+    monkeypatch.setattr(handover, "_runtime_scope_identity", lambda _root: runtime["scope"])
+    root_path = _legacy_source(tmp_path / "windows-trust")
+    with RootContext.open(root_path) as root:
+        heads = build_head_inventory(root)
+        migrate_existing(
+            root,
+            expected_inventory_digest=inventory_digest(heads),
+            operator_attestation=OPERATOR_ATTESTATION,
+        )
+        first_review = handover.prepare_single_writer_acknowledgement(root)
+        first_trust = handover.trust_single_writer(
+            root,
+            expected_inventory_digest=first_review["inventory_digest"],
+            operator_acknowledgement=first_review["operator_acknowledgement"],
+        )
+        assert first_trust["authority"] == "operator-trusted-single-writer"
+
+        prior_state = root.read_bytes(handover.SINGLE_WRITER_STATE_PATH)
+        runtime["scope"] = {**runtime["scope"], "operator_sid": "S-1-5-21-100-200-300-1002"}
+        assert handover.write_authority(root) == {
+            "authority": "ownership-unknown",
+            "reason": "operator-single-writer-runtime-scope-changed",
+        }
+        fresh_review = handover.prepare_single_writer_acknowledgement(root)
+        with pytest.raises(HandoverError, match="acknowledgement"):
+            handover.trust_single_writer(
+                root,
+                expected_inventory_digest=fresh_review["inventory_digest"],
+                operator_acknowledgement=first_review["operator_acknowledgement"],
+            )
+        assert root.read_bytes(handover.SINGLE_WRITER_STATE_PATH) == prior_state
+
+        second_trust = handover.trust_single_writer(
+            root,
+            expected_inventory_digest=fresh_review["inventory_digest"],
+            operator_acknowledgement=fresh_review["operator_acknowledgement"],
+        )
+        assert second_trust["authority"] == "operator-trusted-single-writer"
+        assert fresh_review["runtime_scope"] == runtime["scope"]
 
 
 def _link_directory(link: Path, target: Path) -> None:
@@ -324,6 +382,87 @@ def test_existing_root_needs_fresh_root_bound_trust_ack_and_revocation_is_fail_c
             operator_acknowledgement=renewed_review["operator_acknowledgement"],
         )
         assert renewed["authority"] == "operator-trusted-single-writer"
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    ("unenrolled", "untrusted", "scope-mismatch", "inventory-mismatch", "second-writer"),
+)
+def test_denial_matrix_never_creates_partial_state(tmp_path, monkeypatch, scenario):
+    if scenario == "unenrolled":
+        root_path = tmp_path / "unenrolled-denial"
+        root_path.mkdir()
+        with RootContext.open(root_path) as root:
+            root.prepare_private_storage()
+            before = _filesystem_snapshot(root_path)
+            assert enrollment_status(root) == {"state": "unenrolled", "reason": "handover-required"}
+            assert write_authority(root) == {"authority": "unavailable", "reason": "handover-required"}
+            with pytest.raises(handover.HandoverRequired):
+                require_write_authority(root)
+            assert _filesystem_snapshot(root_path) == before
+        return
+
+    monkeypatch.setattr(handover, "out_of_band_exclusion_basis", lambda _root: None)
+    runtime = {"scope": _synthetic_runtime_scope("100")}
+    monkeypatch.setattr(handover, "_runtime_scope_identity", lambda _root: runtime["scope"])
+    root_path = _legacy_source(tmp_path / f"denial-{scenario}")
+    with RootContext.open(root_path) as root:
+        heads = build_head_inventory(root)
+        migrate_existing(
+            root,
+            expected_inventory_digest=inventory_digest(heads),
+            operator_attestation=OPERATOR_ATTESTATION,
+        )
+        if scenario == "untrusted":
+            before = _filesystem_snapshot(root_path)
+            assert write_authority(root) == {
+                "authority": "ownership-unknown",
+                "reason": "attested-migration-read-only",
+            }
+            with pytest.raises(WriteAuthorityDenied, match="acknowledgement"):
+                require_write_authority(root)
+            assert _filesystem_snapshot(root_path) == before
+            return
+
+        review = handover.prepare_single_writer_acknowledgement(root)
+        handover.trust_single_writer(
+            root,
+            expected_inventory_digest=review["inventory_digest"],
+            operator_acknowledgement=review["operator_acknowledgement"],
+        )
+        if scenario == "scope-mismatch":
+            runtime["scope"] = _synthetic_runtime_scope("200")
+            before = _filesystem_snapshot(root_path)
+            assert write_authority(root)["reason"] == "operator-single-writer-runtime-scope-changed"
+            with pytest.raises(WriteAuthorityDenied, match="another runtime"):
+                require_write_authority(root)
+            assert _filesystem_snapshot(root_path) == before
+            return
+
+        if scenario == "inventory-mismatch":
+            fund_file = root_path / "paper" / "alpha" / "fund.yaml"
+            fund_file.write_bytes(fund_file.read_bytes() + b"\n# synthetic inventory drift\n")
+            before = _filesystem_snapshot(root_path)
+            with pytest.raises(handover.LedgerDrift, match="inventory"):
+                handover.verify_root_inventory(root)
+            assert _filesystem_snapshot(root_path) == before
+            return
+
+        from hedge_fund.runtime.admission import AdmissionCoordinator, WriterConflict
+
+        with RootOwnerLease.acquire(root, timeout=0) as owner:
+            admission = AdmissionCoordinator(root, owner_lease=owner)
+            with admission.control_lane("alpha", timeout=0):
+                paper_path = root_path / "paper" / "alpha"
+                before_paper = _filesystem_snapshot(paper_path)
+                before_handover = root.read_bytes(HANDOVER_PATH)
+                before_trust = root.read_bytes(handover.SINGLE_WRITER_STATE_PATH)
+                with pytest.raises(WriterConflict):
+                    with admission.control_lane("alpha", timeout=0):
+                        pytest.fail("second participating writer entered the held lane")
+                assert _filesystem_snapshot(paper_path) == before_paper
+                assert root.read_bytes(HANDOVER_PATH) == before_handover
+                assert root.read_bytes(handover.SINGLE_WRITER_STATE_PATH) == before_trust
 
 
 def test_trusted_authority_is_bound_to_pid1_incarnation_and_retrust_is_explicit(tmp_path, monkeypatch):
@@ -499,10 +638,11 @@ def test_trusted_authority_fails_closed_when_runtime_identity_is_unavailable(tmp
         assert _filesystem_snapshot(root_path) == before_denial
 
 
-def test_inspection_reports_unavailable_runtime_without_issuing_challenge(tmp_path, monkeypatch):
+def test_inspection_issues_windows_runtime_challenge(tmp_path, monkeypatch):
     monkeypatch.setattr(handover, "out_of_band_exclusion_basis", lambda _root: None)
     monkeypatch.setattr(handover, "_runtime_scope_identity", _ORIGINAL_RUNTIME_SCOPE_IDENTITY)
     monkeypatch.setattr(handover, "sys", SimpleNamespace(platform="win32"))
+    monkeypatch.setattr(handover, "_windows_current_user_sid", lambda: "S-1-5-21-100-200-300-1001")
     root_path = _legacy_source(tmp_path / "runtime-scope-unavailable")
     with RootContext.open(root_path) as root:
         heads = build_head_inventory(root)
@@ -515,18 +655,17 @@ def test_inspection_reports_unavailable_runtime_without_issuing_challenge(tmp_pa
         before = _filesystem_snapshot(root_path)
         assert handover.write_authority(root) == {
             "authority": "ownership-unknown",
-            "reason": "operator-single-writer-runtime-scope-unavailable",
+            "reason": "attested-migration-read-only",
         }
         assert _filesystem_snapshot(root_path) == before
 
         review = handover.prepare_single_writer_acknowledgement(root)
 
         assert review["write_authority"] == "ownership-unknown"
-        assert review["reason"] == "operator-single-writer-runtime-scope-unavailable"
-        assert review["operator_acknowledgement"] is None
-        assert review["runtime_scope"] is None
-        with pytest.raises(FileNotFoundError):
-            root.file_info(handover.SINGLE_WRITER_CHALLENGE_PATH)
+        assert review["reason"] == "attested-migration-read-only"
+        assert review["operator_acknowledgement"]
+        assert review["runtime_scope"]["kind"] == "windows-user-volume"
+        assert root.file_info(handover.SINGLE_WRITER_CHALLENGE_PATH).size > 0
 
 
 def test_unexpected_runtime_scope_errors_are_not_silently_downgraded(tmp_path, monkeypatch):
@@ -832,10 +971,16 @@ def test_relocation_refuses_unknown_owners_and_interrupted_writes(tmp_path, muta
     target_path = tmp_path / "native"
     target_path.mkdir()
     with RootContext.open(source_path) as source, RootContext.open(target_path) as target:
-        with pytest.raises(HandoverError, match=message):
-            inspect_relocation_source(source)
-        with pytest.raises(HandoverError, match=message):
-            relocate_existing(target, source=source, expected_content_digest="0" * 64)
+        if message == "runner.pid":
+            described = inspect_relocation_source(source)
+            assert any(item["kind"] == "stale-marker-retirement" for item in described["blockers"])
+            with pytest.raises(HandoverError, match="source blockers"):
+                relocate_existing(target, source=source, expected_content_digest=described["content_digest"])
+        else:
+            with pytest.raises(HandoverError, match=message):
+                inspect_relocation_source(source)
+            with pytest.raises(HandoverError, match=message):
+                relocate_existing(target, source=source, expected_content_digest="0" * 64)
     assert list(target_path.iterdir()) == []
 
 

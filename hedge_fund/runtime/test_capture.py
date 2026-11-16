@@ -1,3 +1,5 @@
+import hashlib
+import json
 import os
 from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
@@ -349,9 +351,58 @@ def test_frozen_capture_copies_versions_and_redacts_private_references(root_cont
     assert capture.credential_handles["openai"].root_id == capture.root_id
 
     with pytest.raises(ConfigurationError):
-        replace(capture, subject_id="tampered")
+        replace(capture, root=root_context, subject_id="tampered")
     with pytest.raises(ConfigurationError):
         CredentialHandle(root_id="invalid", provider_id="openai", version=4)
+
+
+def test_unattested_protected_subject_is_rejected_when_freezing(root_context):
+    with pytest.raises(ConfigurationError, match="capture subject is invalid"):
+        freeze_capture(
+            root=root_context,
+            subject_id="umbrella",
+            mandate_digest="a" * 64,
+            universe=("AAA",),
+            broker="paper",
+            settings=resolve_settings(root_context),
+            credential_versions={},
+            code_version="synthetic-code-stamp",
+        )
+
+
+def test_unattested_protected_subject_is_rejected_when_restoring(root_context):
+    capture = freeze_capture(
+        root=root_context,
+        subject_id="alpha",
+        mandate_digest="a" * 64,
+        universe=("AAA",),
+        broker="paper",
+        settings=resolve_settings(root_context),
+        credential_versions={},
+        code_version="synthetic-code-stamp",
+    )
+    record = json.loads(capture.private_bytes())
+    record["subject_id"] = "umbrella"
+    payload = {
+        "schema": record["schema"],
+        "root_id": record["root_id"],
+        "subject_id": record["subject_id"],
+        "mandate_digest": record["mandate_digest"],
+        "universe": record["universe"],
+        "broker": record["broker"],
+        "settings_version": record["settings_version"],
+        "settings": record["settings"],
+        "provenance": record["settings"]["provenance"],
+        "credential_versions": {},
+        "code_version": record["code_version"],
+    }
+    record["digest"] = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")).hexdigest()
+
+    with pytest.raises(ConfigurationError, match="capture is invalid"):
+        FrozenCapture.from_private_bytes(
+            root_context,
+            json.dumps(record, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8"),
+        )
 
 
 def test_frozen_capture_restores_only_verified_root_private_bytes(root_context, tmp_path):

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
-import shutil
+import os
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Iterator
 
 from rich.console import Group
 from rich.table import Table
@@ -26,31 +28,111 @@ from hedge_fund.paper import (
     list_deployed,
     load_deployed,
 )
+from hedge_fund.runtime.admission import (
+    AdmissionCoordinator,
+    AdmissionError,
+    RootOwnerLease,
+    WriterConflict,
+)
+from hedge_fund.runtime.root import RootContext
 from hedge_fund.tui.backtest import BacktestScreen
 from hedge_fund.tui.palette import BRIGHT, CYAN, GREEN, MUTED, RED, TEXT
 from hedge_fund.tui.shared import cadence_identity, MODE_LABELS, strategy_description
 
 
 def paper_write_denial() -> str | None:
-    from hedge_fund.runtime.handover import enrollment_status
+    from hedge_fund.runtime.handover import (
+        enrollment_status,
+        has_write_authority,
+        write_authority,
+    )
 
     try:
-        status = enrollment_status(paths.root_context(), verify_inventory=True)
+        root = paths.root_context(required=False)
+        if root is None:
+            return "TUI paper writes require an explicit root; resolve with `aihf --root ROOT handover inspect`."
+        configured_paper = Path(paths.PAPER_DIR) if paths.PAPER_DIR is not None else None
+        expected_paper = root.path / "paper"
+        if configured_paper is None or _absolute_key(configured_paper) != _absolute_key(expected_paper):
+            return "TUI paper writes require `paper/` inside the configured root; resolve with `aihf --root ROOT handover inspect`."
+        status = enrollment_status(root, verify_inventory=True)
     except Exception:
-        return "Paper writes are blocked because root enrollment cannot be verified."
+        return "TUI paper writes are blocked because root enrollment or inventory cannot be verified; run `aihf --root ROOT handover inspect`."
     if status["state"] == "unenrolled":
-        return "TUI paper writes require root admission the TUI does not hold; use the explicit-root CLI or web desk."
-    if status["state"] == "enrolled":
-        return "TUI paper writes are disabled on enrolled roots; use the web desk."
-    return "Paper writes are blocked because root enrollment or ledger inventory is unavailable."
+        return "TUI paper writes require offline root enrollment; resolve with `aihf --root ROOT handover inspect`."
+    if status["state"] != "enrolled":
+        return f"TUI paper writes are blocked by root enrollment or ledger inventory ({status['reason']}); run `aihf --root ROOT handover inspect`."
+    authority = write_authority(root)
+    if has_write_authority(authority):
+        return None
+    reason = authority["reason"] or "write-authority-unavailable"
+    if reason == "operator-single-writer-runtime-scope-unavailable":
+        return "TUI paper writes are blocked because runtime scope cannot be verified; trusted mode stays disabled. Restore runtime identity, then run `aihf --root ROOT handover inspect`."
+    if reason.startswith("operator-single-writer-") or reason == "attested-migration-read-only":
+        return f"TUI paper writes require current trusted-single-writer authority ({reason}); run `aihf --root ROOT handover inspect`, review its fresh challenge, then `aihf --root ROOT handover trust-single-writer --inventory-digest DIGEST --operator-acknowledgement EXACT`."
+    return f"TUI paper writes are blocked by root write authority ({reason}); run `aihf --root ROOT handover inspect`."
+
+
+def paper_creation_denial() -> str:
+    """Keep TUI creation outside existing-fund admission."""
+    return "TUI paper-fund creation is not admitted by the existing-fund workflow; use `aihf --root ROOT paper deploy`."
+
+
+@contextmanager
+def tui_paper_admission(
+    identity: str,
+    directory: Path | None = None,
+) -> Iterator[tuple[RootContext, AdmissionCoordinator]]:
+    """Hold root participation; caller owns fund-lane scope."""
+    from hedge_fund.paper.deployed import validate_fund_name
+    from hedge_fund.runtime.handover import verify_ledger_head, verify_root_inventory
+
+    denial = paper_write_denial()
+    if denial is not None:
+        raise AdmissionError(denial)
+    root = paths.root_context(required=False)
+    if root is None:
+        raise AdmissionError("TUI paper admission requires an explicit root.")
+    try:
+        validate_fund_name(identity)
+    except (TypeError, ValueError):
+        raise AdmissionError("TUI paper admission requires a canonical fund name.") from None
+    expected = root.path / "paper" / identity
+    candidate = expected if directory is None else Path(directory)
+    if _absolute_key(candidate) != _absolute_key(expected):
+        raise AdmissionError("TUI paper admission requires the fund directory under the configured root.")
+    owner = None
+    try:
+        try:
+            if directory is not None:
+                root.resolve(f"paper/{identity}")
+            owner = RootOwnerLease.acquire(root, timeout=0)
+            admission = AdmissionCoordinator(root, owner_lease=owner)
+            verify_root_inventory(root)
+            if directory is not None:
+                verify_ledger_head(root, identity)
+            admission.require_root_owner()
+        except WriterConflict as exc:
+            raise AdmissionError(f"TUI paper admission denied: another participating writer holds the required root or fund lane ({exc}).") from None
+        except AdmissionError:
+            raise
+        except Exception as exc:
+            raise AdmissionError(f"TUI paper admission is unavailable ({type(exc).__name__}); run `aihf --root ROOT handover inspect`.") from None
+
+        yield root, admission
+    except WriterConflict as exc:
+        raise AdmissionError(f"TUI paper admission denied: another participating writer holds the required root or fund lane ({exc}).") from None
+    finally:
+        if owner is not None:
+            owner.close()
+
+
+def _absolute_key(path: Path) -> str:
+    return os.path.normcase(os.path.abspath(os.fspath(path)))
 
 
 def mandate_delete_denial() -> str:
-    """Mandate-library deletion is not admitted from the TUI.
-
-    Root storage offers no admitted delete primitive yet, and the web desk
-    does not delete mandates either, so the TUI keeps every file in place
-    rather than unlinking root paths outside registry/research admission."""
+    """Mandate deletion has no root-admitted write path."""
     return "Mandate deletion is unavailable: the TUI cannot delete under root admission. Mandates and backtests were kept."
 
 
@@ -96,17 +178,13 @@ class FundSelectScreen(Screen):
         menu = self.query_one("#select-menu", OptionList)
         menu.clear_options()
         if not self._slots:
-            self.query_one("#detail-body", Static).update(
-                Text("No funds yet — build one under Paper trading and it shows up here too.",
-                     style=MUTED))
+            self.query_one("#detail-body", Static).update(Text("No funds yet — build one under Paper trading and it shows up here too.", style=MUTED))
             return
         for i, entry in enumerate(self._slots):
             if entry.spec is None:
-                menu.add_option(Option(Text(f"{entry.path.name} — Unavailable\n{entry.error}", style=MUTED),
-                                       id=f"unavailable:{i}", disabled=True))
+                menu.add_option(Option(Text(f"{entry.path.name} — Unavailable\n{entry.error}", style=MUTED), id=f"unavailable:{i}", disabled=True))
             else:
-                menu.add_option(Option(
-                    _slot_card(i, entry.spec, last_score(entry.spec.name)), id=f"fund:{i}"))
+                menu.add_option(Option(_slot_card(i, entry.spec, last_score(entry.spec.name)), id=f"fund:{i}"))
         # Options added after mount leave `highlighted` unset — pin it so the
         # detail pane fills in and Enter works without an arrow press first.
         first = next((i for i, entry in enumerate(self._slots) if entry.spec is not None), None)
@@ -115,8 +193,7 @@ class FundSelectScreen(Screen):
         if first is not None:
             self._show_detail(first)
         else:
-            self.query_one("#detail-body", Static).update(
-                Text("Saved mandates are unavailable. Recreate them in the builder or update their configurations.", style=MUTED))
+            self.query_one("#detail-body", Static).update(Text("Saved mandates are unavailable. Recreate them in the builder or update their configurations.", style=MUTED))
 
     @on(OptionList.OptionHighlighted, "#select-menu")
     def _hover(self, event: OptionList.OptionHighlighted) -> None:
@@ -144,15 +221,14 @@ class FundSelectScreen(Screen):
         blast radius the user picked."""
         if scope is None:
             return
-        # Deletion stays denied even after the confirm: see mandate_delete_denial.
+        # Stale confirm callbacks stay denied.
         self.notify(mandate_delete_denial(), severity="warning")
 
     def _show_detail(self, i: int) -> None:
         spec = self._slots[i].spec
         if spec is None:
             return
-        self.query_one("#detail-body", Static).update(
-            _fund_detail(spec, self._history(spec.name)))
+        self.query_one("#detail-body", Static).update(_fund_detail(spec, self._history(spec.name)))
 
     def _history(self, name: str) -> list[dict]:
         """Every backtest of this mandate, newest first, as light summaries.
@@ -190,17 +266,12 @@ class ConfirmWipeScreen(ModalScreen[bool]):
     def compose(self) -> ComposeResult:
         verb = "Replace" if self._replacing else "Delete"
         then = "The new fund takes the name." if self._replacing else "The name is free again."
-        yes = ("replace it — the new fund starts from nothing" if self._replacing else "delete it")
+        yes = "replace it — the new fund starts from nothing" if self._replacing else "delete it"
         no = "keep it and pick another name" if self._replacing else "keep it"
         with Vertical(id="confirm"):
-            yield Static(Text.assemble(
-                (f"{verb} ", f"bold {BRIGHT}"), (self._name, f"bold {RED}"), ("?", f"bold {BRIGHT}")),
-                id="confirm-q")
+            yield Static(Text.assemble((f"{verb} ", f"bold {BRIGHT}"), (self._name, f"bold {RED}"), ("?", f"bold {BRIGHT}")), id="confirm-q")
             yield Static(_wipe_manifest(self._name, then), id="confirm-files")
-            yield Static(Text.assemble(
-                ("enter", f"bold {RED}"), (f"  {yes}\n", MUTED),
-                ("esc", f"bold {BRIGHT}"), (f"    {no}", MUTED)),
-                id="confirm-keys")
+            yield Static(Text.assemble(("enter", f"bold {RED}"), (f"  {yes}\n", MUTED), ("esc", f"bold {BRIGHT}"), (f"    {no}", MUTED)), id="confirm-keys")
         yield Footer()
 
     def action_cancel(self) -> None:
@@ -219,8 +290,7 @@ class ConfirmDeleteScreen(ModalScreen[str | None]):
     BINDINGS = [
         Binding("escape", "cancel", "cancel"),
         Binding("enter", "delete_mandate", "delete the mandate", priority=True),
-        Binding("ctrl+d", "delete_all", "delete mandate + history",
-                priority=True),
+        Binding("ctrl+d", "delete_all", "delete mandate + history", priority=True),
     ]
 
     def __init__(self, path: Path, spec: FundSpec, history: list[dict]) -> None:
@@ -231,17 +301,9 @@ class ConfirmDeleteScreen(ModalScreen[str | None]):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="confirm"):
-            yield Static(Text.assemble(
-                ("Delete ", f"bold {BRIGHT}"),
-                (self._spec.name, f"bold {RED}"),
-                ("?", f"bold {BRIGHT}")), id="confirm-q")
+            yield Static(Text.assemble(("Delete ", f"bold {BRIGHT}"), (self._spec.name, f"bold {RED}"), ("?", f"bold {BRIGHT}")), id="confirm-q")
             yield Static(self._manifest(), id="confirm-files")
-            yield Static(Text.assemble(
-                ("enter", f"bold {GREEN}"), ("   delete the mandate\n", MUTED),
-                ("ctrl+d", f"bold {RED}"),
-                ("  delete the mandate and its history\n", MUTED),
-                ("esc", f"bold {BRIGHT}"), ("     cancel", MUTED)),
-                id="confirm-keys")
+            yield Static(Text.assemble(("enter", f"bold {GREEN}"), ("   delete the mandate\n", MUTED), ("ctrl+d", f"bold {RED}"), ("  delete the mandate and its history\n", MUTED), ("esc", f"bold {BRIGHT}"), ("     cancel", MUTED)), id="confirm-keys")
         yield Footer()
 
     def _manifest(self) -> Text:
@@ -249,19 +311,13 @@ class ConfirmDeleteScreen(ModalScreen[str | None]):
         when the thing being counted cannot be recovered."""
         lines = Text()
         lines.append(f"{self._path.name}\n", style=TEXT)
-        lines.append("  the mandate — strategies, staff, risk, capital\n\n",
-                     style=MUTED)
+        lines.append("  the mandate — strategies, staff, risk, capital\n\n", style=MUTED)
         if self._backtests:
-            lines.append(
-                f"{self._backtests} "
-                f"{'backtest' if self._backtests == 1 else 'backtests'}\n",
-                style=CYAN)
-            lines.append("  saved results — kept unless you press ctrl+d",
-                         style=MUTED)
+            lines.append(f"{self._backtests} " f"{'backtest' if self._backtests == 1 else 'backtests'}\n", style=CYAN)
+            lines.append("  saved results — kept unless you press ctrl+d", style=MUTED)
         else:
             lines.append("No saved backtests.", style=MUTED)
-        lines.append("\n\nPaper funds deployed from this mandate keep their own copy.",
-                     style=MUTED)
+        lines.append("\n\nPaper funds deployed from this mandate keep their own copy.", style=MUTED)
         return lines
 
     def action_cancel(self) -> None:
@@ -295,17 +351,11 @@ def newest_paper_universe() -> list[str] | None:
 
 
 def wipe_fund(name: str) -> None:
-    """Remove everything that answers to *name*: the saved definition, its
-    backtest results, and the paper fund — ledger, book, events — if one was
-    deployed. Called only after the user has said yes to `ConfirmWipeScreen`,
-    whether to delete the fund or to let a new one take its name."""
+    """Reject TUI deletion; preserve mandate, receipts, and paper history."""
     denial = paper_write_denial()
     if denial is not None:
         raise RuntimeError(denial)
-    (paths.MANDATES_DIR / f"{name}.yaml").unlink(missing_ok=True)
-    for receipt in receipts(name):
-        receipt.unlink(missing_ok=True)
-    shutil.rmtree(paths.PAPER_DIR / name, ignore_errors=True)
+    raise RuntimeError(mandate_delete_denial())
 
 
 def short_tickers(universe: list[str], limit: int = 2) -> str:
@@ -354,10 +404,8 @@ def _slot_card(index: int, spec: FundSpec, score: tuple | None) -> Text:
     if score is not None:
         total, _, _ = score
         up = total >= 0
-        card.append(f"   {'▲' if up else '▼'} {total:+.1%}",
-                    style=f"bold {GREEN if up else RED}")
-    card.append(f"\n     {n} {'strategy' if n == 1 else 'strategies'}"
-                f"  ·  {cadence_identity(spec)}", style=MUTED)
+        card.append(f"   {'▲' if up else '▼'} {total:+.1%}", style=f"bold {GREEN if up else RED}")
+    card.append(f"\n     {n} {'strategy' if n == 1 else 'strategies'}" f"  ·  {cadence_identity(spec)}", style=MUTED)
     card.append("\n     " + ", ".join(MODE_LABELS[s.blend.mode] for s in spec.strategies), style=MUTED)
     return card
 
@@ -374,13 +422,11 @@ def _fund_detail(spec: FundSpec, history: list[dict]) -> Group:
 
     if not history:
         parts.append(Text("\nNo backtests yet.", style=MUTED))
-        parts.append(Text("\nEnter to backtest this mandate over history",
-                          style=MUTED))
+        parts.append(Text("\nEnter to backtest this mandate over history", style=MUTED))
         return Group(*parts)
 
     latest = history[0]
-    facts = [f"{latest['start']} → {latest['end']}",
-             f"{latest['n_cycles']} cycles"]
+    facts = [f"{latest['start']} → {latest['end']}", f"{latest['n_cycles']} cycles"]
     if latest["universe"]:
         facts.append(" ".join(latest["universe"]))
     parts.append(Text("\nLATEST BACKTEST", style=f"bold {BRIGHT}"))
@@ -391,18 +437,18 @@ def _fund_detail(spec: FundSpec, history: list[dict]) -> Group:
     # Three columns, not four. The kind and the number are pinned with no_wrap
     # so a narrow pane can never drop the result — the tickers ride along in
     # the middle column and are the only thing allowed to ellipsize.
-    log = Table(box=None, show_header=False, padding=(0, 1), pad_edge=False,
-                expand=True)
-    log.add_column(no_wrap=True)                          # kind
-    log.add_column(overflow="ellipsis", no_wrap=True)     # when · tickers
-    log.add_column(justify="right", no_wrap=True)         # headline number
+    log = Table(box=None, show_header=False, padding=(0, 1), pad_edge=False, expand=True)
+    log.add_column(no_wrap=True)  # kind
+    log.add_column(overflow="ellipsis", no_wrap=True)  # when · tickers
+    log.add_column(justify="right", no_wrap=True)  # headline number
     for h in history[:12]:
         up = h["total"] >= 0
         when = Text(f"{h['start']} → {h['end']}", style=MUTED)
         if h["universe"]:
             when.append(f"  {short_tickers(h['universe'])}", style=CYAN)
         log.add_row(
-            Text("backtest", style=MUTED), when,
+            Text("backtest", style=MUTED),
+            when,
             Text(f"{h['total']:+.1%}", style=GREEN if up else RED),
         )
     parts.append(log)
@@ -419,17 +465,10 @@ def _stat_list(bt: dict) -> Table:
     table = Table(box=None, show_header=False, padding=(0, 1), pad_edge=False)
     table.add_column(style=MUTED, width=14)
     table.add_column(justify="right", min_width=8)
-    table.add_row("Total return", Text(
-        f"{bt['total']:+.1%}",
-        style=f"bold {GREEN if bt['total'] >= 0 else RED}"))
+    table.add_row("Total return", Text(f"{bt['total']:+.1%}", style=f"bold {GREEN if bt['total'] >= 0 else RED}"))
     table.add_row("Annualized", Text(f"{bt['annualized']:+.1%}", style=TEXT))
-    table.add_row("Sharpe", Text(
-        f"{bt['sharpe']:.2f}",
-        style=(GREEN if bt["sharpe"] > 1
-               else "yellow" if bt["sharpe"] > 0 else RED)))
+    table.add_row("Sharpe", Text(f"{bt['sharpe']:.2f}", style=(GREEN if bt["sharpe"] > 1 else "yellow" if bt["sharpe"] > 0 else RED)))
     table.add_row("Max drawdown", Text(f"{bt['maxdd']:.1%}", style=RED))
     table.add_row(bt["benchmark"], Text(f"{bt['benchret']:+.1%}", style=TEXT))
-    table.add_row("Excess", Text(
-        f"{bt['excess']:+.1%}",
-        style=f"bold {GREEN if bt['excess'] >= 0 else RED}"))
+    table.add_row("Excess", Text(f"{bt['excess']:+.1%}", style=f"bold {GREEN if bt['excess'] >= 0 else RED}"))
     return table

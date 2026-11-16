@@ -246,14 +246,24 @@ recording acknowledgement. `RootOwnerLease.acquire`/`matches`, `root_registry_wr
 `require_paper_write_lanes`, CLI/web/child/runner gates and stale-reservation recovery enforce
 the current authority at their effect boundaries. The web desk reports authority and reason,
 warns on operator-trusted mode, and drops its mutation token and owner lease on denial.
-`aihf --root SOURCE handover inspect-source` (read-only) plus
-`aihf --root TARGET handover relocate-from SOURCE --content-digest D` copies engine data
-(`mandates`, `paper`, `research`) into an empty, disjoint, legacy-unreachable target. The
-top-level `.env`, `cache` and `runtime` are never copied, and any `.env`/`.env.*` file under
-the copied trees refuses relocation before its bytes are read. The copy is digest-pinned and verified per file, the
-source is re-snapshotted unchanged, and target heads must equal source heads. The source
-is never written. A successful relocation remains read-only until separate trusted-single-
-writer acknowledgement. A failed copy leaves the target `invalid` and read-only.
+The Spec007 native-Windows path uses `handover inspect-source --evidence-out
+DEST/runtime/private/v1/source-evidence.json`, then `handover relocate-copy SOURCE
+--content-digest D`. Copy includes `mandates`, `paper`, `research`, and
+`runtime/private/v1/settings.json`; `.env`, cache and other runtime files remain
+excluded. The destination stays unenrolled while copy is staged. Source evidence
+is written outside the source tree, and the copy is digest-pinned and verified per
+file. The source is re-snapshotted during copy; detected source drift aborts the
+copy. The source is never written.
+
+If inspection reports blockers, destination-bound `handover attest-stale-marker`
+and `handover attest-protected-fund` commands bind each resolution to the staged
+source evidence and destination root. Marker retirement moves only the copied
+destination marker into private attestation storage; protected funds remain under
+their original names. `handover relocate-finalize` validates the completed copy,
+attestations and inventory before enrollment. `relocate-from` remains a
+blocker-free compatibility path. Successful relocation is read-only until a
+separate trusted-single-writer acknowledgement. A failed or interrupted copy
+cannot be finalized.
 Raw-write audit (this slice, source grep of non-test modules for file write/replace/unlink
 calls): enrolled-root writes in `paths.py`, `backtesting/research.py`, `fund/storage.py`,
 `paper/ledger.py` and `web/services.py` sit behind the owner-lease lanes,
