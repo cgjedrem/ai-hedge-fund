@@ -146,3 +146,59 @@ All 23 full-suite failures match pre-change failures. No feature-specific test f
 - **Style / hygiene**: observed `2026-11-13T10:31:05+01:00`. Black (`--check --line-length 420`) passed on 10 changed Python files. `test_operations.py` retains pre-existing Black formatting and three E117 findings at lines 776, 838, and 921; `git blame` attributes these lines to commit `0a6d109` and Black's diff affects existing test functions, not the new denial regression. Isort (`--check-only --profile black`) passed on all 11 changed Python files. Flake8 passed on all 11 with inherited E117 ignored; the unfiltered file check reports only those three inherited E117 sites. UTF-8 BOM scan and `git diff --check` passed.
 - **Static review**: self-review found no new authorization bypass or partial-write path. Protected identity remains exact and root-bound; source read-only behavior is asserted by snapshots. Existing writer-inventory and `test_operations.py` style debt remain explicit caveats.
 - **Progress**: execution owner Python developer; automatic focused tests and style/hygiene checks complete. Stop condition: commit named files with required co-author trailer; no push. Full suite intentionally not rerun.
+
+## Final acceptance evidence — 0fc759f (2026-11-16)
+
+QA final verdict: pass-with-caveats (independent reviewer, claude-opus-5.5).
+
+Final full suite: `py -m poetry run pytest hedge_fund -q --tb=line` at 0fc759f, clean tree, Windows 11, Python 3.11.15: **3,012 passed / 62 skipped / 24 failed** in 4,109.45s.
+Main baseline: same command at 1c517e7 (detached worktree, same machine): **2,935 passed / 62 skipped / 37 failed** in 2,460.64s.
+
+### Per-ID baseline mapping (24 branch failures → main 1c517e7 failures)
+
+| # | Branch failure (0fc759f) | Same ID fails on main? |
+|---|---|---|
+| 1 | test_run.py::test_saxo_demo_execution_refuses_before_ledger_or_execution[argv0] | yes |
+| 2 | test_run.py::test_saxo_demo_execution_refuses_before_ledger_or_execution[argv1] | yes |
+| 3 | test_run.py::test_saxo_demo_execution_refuses_before_ledger_or_execution[argv2] | yes |
+| 4 | test_run.py::test_saxo_demo_execution_refuses_before_ledger_or_execution[argv3] | yes |
+| 5 | test_run.py::test_saxo_guard_preserves_nonexecuting_verdicts_and_oauth_paper_approvals[saxo-False-approve-True] | yes |
+| 6 | test_run.py::test_saxo_guard_preserves_nonexecuting_verdicts_and_oauth_paper_approvals[saxo-False-approve-False] | yes |
+| 7 | test_run.py::test_saxo_guard_preserves_nonexecuting_verdicts_and_oauth_paper_approvals[saxo-True-approve-False] | yes |
+| 8 | test_run.py::test_saxo_guard_preserves_nonexecuting_verdicts_and_oauth_paper_approvals[saxo-True-reject-False] | yes |
+| 9 | test_run.py::test_saxo_guard_preserves_nonexecuting_verdicts_and_oauth_paper_approvals[paper-True-approve-True] | yes |
+| 10 | test_run.py::test_saxo_guard_preserves_nonexecuting_verdicts_and_oauth_paper_approvals[paper-False-approve-True] | yes |
+| 11 | data/test_yfinance_client.py::test_news_falls_back_to_search_when_ticker_endpoint_is_down | yes |
+| 12 | data/test_yfinance_client.py::test_news_preserves_failure_when_search_is_empty_after_outage | yes |
+| 13 | data/test_yfinance_client.py::test_news_raises_when_search_also_fails | yes |
+| 14 | paper/test_deployed_broker.py::test_saxo_reconciliation_uses_accounting_cash_and_refuses_mismatch | yes |
+| 15 | paper/test_saxo_e2e.py::test_fake_transport_saxo_client_deferral_reaches_the_session_ledger | yes |
+| 16 | paper/test_saxo_e2e.py::test_saxo_external_adapter_records_order_fill_in_ledger | yes |
+| 17 | runtime/test_writer_inventory.py::test_every_production_writer_is_classified_by_admission_class | yes |
+| 18 | web/test_actions.py::test_nonlocal_broker_mutations_stop_before_ledger_adapter[approve] | yes |
+| 19 | web/test_actions.py::test_nonlocal_broker_mutations_stop_before_ledger_adapter[halt] | yes |
+| 20 | web/test_actions.py::test_nonlocal_broker_mutations_stop_before_ledger_adapter[resume] | yes |
+| 21 | web/test_actions.py::test_nonlocal_broker_mutations_stop_before_ledger_adapter[runner-stop] | yes |
+| 22 | web/test_actions.py::test_saxo_web_routes_deny_before_provider_or_writer_effects | yes |
+| 23 | web/test_actions.py::test_saxo_accept_routes_reject_previews_before_worker_or_ledger_effects | yes |
+| 24 | test_acceptance_isolation.py::test_spawned_python_inherits_network_and_credential_guards | NO — timing-classified (below) |
+
+All 23 ID-matched rows carry the same error signatures on both runs (SaxoCLI apply_credentials AttributeError, yfinance DataClientError/regex, SaxoReconcileError account-id, unclassified writers, web HandoverError inventory-invalid).
+
+### Row 24 — timing-classified (not baseline-reproduced)
+
+`test_spawned_python_inherits_network_and_credential_guards` (unchanged by this branch): failed with `subprocess.TimeoutExpired` at its own 10s child-import limit in full-suite runs at 0e9d782 and 0fc759f; passes in isolation on both revisions and on main. Import timings (5 runs each): branch 2.98–3.41s, main 3.02–3.13s — equivalent, ~3x under limit. Identical timeout recorded in specs/005-web-engine-migration/sim-account-ownership-evidence.md:209-213. Classified environmental per QA terms; re-check if a later suite fails it with a non-timeout signature.
+
+### Resolved flake record
+
+- `test_tui_run_shows_nothing_due_without_relabeling_it_as_admission_error` (new this feature): failed in-suite at 0e9d782 (1s phase wait); wait aligned to sibling 20s budget in 67adfcd; PASSED in-suite at 0fc759f. No flake allowance was claimed — the test was fixed.
+- `test_handover.py::test_attest_protected_fund_refuses_unprotected_or_unknown_name[alpha]` and `test_writer_races.py::test_owned_runner_executes_one_fake_fill_while_cli_web_and_archive_compete`: failed in-suite at pre-rebase 1acef42 run only; passed in isolation (both revisions) and in full suites at 0e9d782 and 0fc759f. Recorded nondeterministic, not branch-caused.
+
+### Tests fixed by this branch (fail on main 1c517e7, pass at 0fc759f)
+
+test_account_binding.py::test_enrolled_root_without_operator_acknowledgement_cannot_bind; test_inventory_cache_race.py::test_cli_halt_succeeds_while_sibling_head_publication_is_inflight; test_process_identity.py::test_linux_process_identity_parses_pid1_stat_with_parenthesized_command; test_writer_admission_race_matrix.py::test_authority_flip_while_lane_is_held_denies_every_write_time_check (8 params); test_root_without_operator_acknowledgement_is_read_only; test_writer_map.py::test_every_production_write_primitive_is_mapped (the 5 unmapped callsites flagged on main); test_writer_races.py::test_authority_revoked_across_processes_blocks_an_admitted_append[synthetic-test-owner]. Baseline list should be updated for the next feature.
+
+### Evidence process notes
+
+- The 0e9d782 run used `-q` without traceback capture; classification of its 2 extra failures rest on 0fc759f `--tb=line` signatures and the isolated reruns. Future acceptance runs must retain full failure output.
+- Rebase purity verified: `git diff 1acef42..0e9d782` contains only spec renumbering (007→008) and memory lines beyond main's own PR12 commits.
