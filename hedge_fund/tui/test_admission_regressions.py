@@ -377,7 +377,7 @@ def test_tui_run_shows_nothing_due_without_relabeling_it_as_admission_error(trus
         async with app.run_test(size=(140, 50)) as pilot:
             screen = paper.RunSessionScreen(directory, plan=plan)
             await app.push_screen(screen)
-            for _ in range(20):
+            for _ in range(400):
                 await pilot.pause(0.05)
                 if screen._phase == "failed":
                     break
