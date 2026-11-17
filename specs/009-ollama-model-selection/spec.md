@@ -28,17 +28,19 @@ The operator configures the engine to use an Ollama model tag other than the sin
 
 ### User Story 2 - See what is actually selectable (Priority: P2)
 
-The operator opens the web settings model picker and sees which Ollama models are selectable, reflecting the daemon's actual offerings (or an explicit operator-approved list), with unavailable or offline states clearly indicated rather than presented as valid choices.
+The operator opens the web settings model picker and sees which Ollama models are selectable per the static operator-approved list, with capability and cost-class (local vs paid/cloud, dispatch-gated) clearly indicated.
 
 **Why this priority**: Configuration acceptance without visibility leaves the operator guessing which tags are valid; the picker is where the mismatch was first observed.
 
-**Independent Test**: Open the settings picker against (a) a daemon offering multiple tags, (b) an unreachable daemon, and (c) a daemon returning malformed metadata, and verify the displayed choices and states match each condition.
+**Independent Test**: Open the settings picker and verify the displayed Ollama choices match the approved catalog with capability and paid/cloud indicators; verify unknown or non-chat tags are rejected on save with explicit reasons.
+
+**Operator decision (2026-11-17, QA rework cycle 1):** FR-004, SC-004, and the US2 scenarios are amended to the static-list scope: the picker shows approved-list selectability with capability/cost-class indicators; live availability probing, offline detection, and malformed-metadata handling are out of scope. FR-009 (static approved list, no daemon cross-check) stands as decided. Approved in-session by the operator pending Gate 2 confirmation.
 
 **Acceptance Scenarios**:
 
-1. **Given** the daemon is reachable and offers several chat-capable tags, **When** the operator opens the picker, **Then** the selectable Ollama entries correspond to those offerings (or the operator-approved subset).
-2. **Given** the daemon is unreachable, **When** the operator opens the picker or saves a selection, **Then** the surface shows an explicit unavailable/offline state instead of pretending the model is usable.
-3. **Given** the daemon returns malformed metadata, **When** the system processes it, **Then** it falls back to a safe state with a clear, credential-free error rather than crashing or accepting arbitrary entries.
+1. **Given** the approved static list contains several chat-capable tags, **When** the operator opens the picker, **Then** the selectable Ollama entries correspond to that list with capability and cost-class indicators.
+2. **Given** a paid/cloud entry, **When** the operator views it in the picker, **Then** it is visibly marked dispatch-gated (paid/cloud), never presented as a free local model.
+3. **Given** an unknown or non-chat tag, **When** the operator attempts to save it, **Then** the surface rejects it with an explicit, credential-free reason.
 
 ---
 
@@ -76,7 +78,7 @@ The operator may select a cloud-labelled Ollama tag (e.g. a `:cloud`-suffixed ta
 - **FR-001**: The system MUST accept operator-chosen Ollama model tags beyond `gemma3:4b` when the tag is validated as an available, chat-capable offering (per the availability source chosen under FR-009).
 - **FR-002**: Model validation MUST produce the same accept/reject outcome across the CLI, environment-based configuration, persisted settings, the web settings write path, and the analysis worker.
 - **FR-003**: A rejected selection MUST fail with an explicit, human-readable reason; the system MUST NOT silently substitute `gemma3:4b` or any other model, on any surface (including the TUI preset fallback behavior).
-- **FR-004**: The web settings model picker MUST present the selectable Ollama models with their availability state, and MUST NOT present unreachable or invalid entries as valid choices.
+- **FR-004**: The web settings model picker MUST present the selectable Ollama models from the approved static list with their capability and cost-class state (including a paid/cloud dispatch-gated indicator). Live availability probing, offline detection, and malformed-metadata handling are OUT OF SCOPE for this feature (static-list decision, FR-009); the picker presents configured selectability, not daemon-reported availability.
 - **FR-005**: Configuration precedence MUST remain launch override > process environment > persisted root settings > defaults, and a persisted selection MUST survive an application restart.
 - **FR-006**: Only chat-capable Ollama models MUST be selectable for analysis; embedding-only or OCR-only tags MUST be rejected with a capability-specific reason.
 - **FR-007**: Cloud-labelled Ollama tags (including the operator's selected `kimi-k3:cloud`) MUST remain classified as paid/cloud: prohibited in scheduled or unattended loops, and permitted for one-shot operations only with explicit per-operation authorization and an enforced budget. Credential presence in the environment MUST NOT constitute authorization.
@@ -97,8 +99,8 @@ The operator may select a cloud-labelled Ollama tag (e.g. a `:cloud`-suffixed ta
 
 - **SC-001**: 100% of configuration surfaces (CLI flag, environment, persisted settings, web settings) produce identical accept/reject outcomes for the same model tag.
 - **SC-002**: Zero silent model substitutions: every rejected selection yields an explicit reason on every surface, verified by tests covering each surface.
-- **SC-003**: An operator can select any daemon-listed local chat-capable model and have it honored by an analysis run on the first attempt, without editing source files.
-- **SC-004**: With the daemon unreachable, all surfaces report an explicit unavailable/offline state within normal response times, and no analysis run starts with a substituted model.
+- **SC-003**: An operator can select any catalog-listed local chat-capable model (currently `gemma3:4b`) and have it honored by an analysis run on the first attempt; adding a new approved tag is a one-line catalog entry with no other list edits.
+- **SC-004**: With the daemon unreachable, configuration validation still works from the static catalog (offline-safe), and paid/cloud dispatch is refused with an explicit reason; no analysis run ever starts with a substituted model.
 - **SC-005**: Full existing test suite remains green; non-Ollama provider behavior is demonstrably unchanged.
 
 ## Assumptions
