@@ -20,8 +20,8 @@
 
 **Purpose**: Fixture and evidence scaffolding shared by all stories
 
-- [ ] T001 Create synthetic fixture helpers for legacy failure recovery in hedge_fund/runtime/test_reconciliation.py: builder for an enrolled synthetic root (`hedge_fund/runtime/test_bootstrap.py` pattern) whose events file contains N legacy `tick_failed` events without `request_id` and without post-effect fields, followed by later verified session records, with a broker book matching replay
-- [ ] T002 [P] Add fixture variant helpers in the same test module: failure event carrying transmitted-fill/post-effect fields; corrupt audit event injection; perturbed broker-book digest; head-advancing append helper (for stale-preview tests)
+- [x] T001 Create synthetic fixture helpers for legacy failure recovery in hedge_fund/runtime/test_reconciliation.py: builder for an enrolled synthetic root (`hedge_fund/runtime/test_bootstrap.py` pattern) whose events file contains N legacy `tick_failed` events without `request_id` and without post-effect fields, followed by later verified session records, with a broker book matching replay
+- [x] T002 [P] Add fixture variant helpers in the same test module: failure event carrying transmitted-fill/post-effect fields; corrupt audit event injection; perturbed broker-book digest; head-advancing append helper (for stale-preview tests)
 
 ---
 
