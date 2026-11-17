@@ -308,6 +308,36 @@ class PaperResumeRequest(RequestModel):
         return self
 
 
+class LegacyFailureReconciliationRequest(RequestModel):
+    preview_head: str = Field(pattern=r"^[a-f0-9]{64}$")
+    preview_book_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+    failure_digests: list[StrictStr] = Field(min_length=1)
+    operator: StrictStr = Field(min_length=1, max_length=180)
+    attestation: StrictBool
+
+    @field_validator("failure_digests")
+    @classmethod
+    def _valid_failure_digests(cls, value: list[str]) -> list[str]:
+        if any(re.fullmatch(r"[a-f0-9]{64}", digest) is None for digest in value):
+            raise ValueError("failure digests must be SHA-256 identities")
+        if len(set(value)) != len(value):
+            raise ValueError("failure digests must be unique")
+        return value
+
+    @field_validator("operator")
+    @classmethod
+    def _valid_operator(cls, value: str) -> str:
+        if not value or any(ord(char) < 32 or ord(char) == 127 for char in value):
+            raise ValueError("operator identity is invalid")
+        return value
+
+    @model_validator(mode="after")
+    def _require_attestation(self) -> LegacyFailureReconciliationRequest:
+        if self.attestation is not True:
+            raise ValueError("operator attestation is required")
+        return self
+
+
 class PaperTickIntentReconciliationRequest(RequestModel):
     request_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
     intent_request_id: str | None = Field(default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")

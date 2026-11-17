@@ -81,6 +81,57 @@
 - Scenario/provenance: automated fake/unit tests on isolated enrolled `tmp_path` roots; verified decision validation, exact multi-failure resolution, duplicate replay, unknown/partial-set refusal, invalid-input and missing-lane zero writes, and preservation of pre-existing file bytes. Existing `test_legacy_failure_receipt_replay_preserves_resolution` ran in the reconciliation module. No provider, LLM, broker, paid-credit, or real-data-root access.
 - Next check: failing-first US1 preview/confirm tests, then implement the web flow.
 
+### T006–T008 failing-first US1 preview and confirm tests
+
+- Result: **FAIL** as expected before T009–T012 implementation.
+- Recorded: `2026-11-17T12:30:42.5674512+01:00`.
+- Source: `HEAD` `fb63e62480833f7e41ad7317cf223f8e387377cf`; uncommitted test diff SHA-256 `f327a43c3f0269a6fc8049fa3dacf9babeb432d95b1bcc46e4731025eef8a79a` (`7461` bytes).
+- Exact command: `poetry run pytest hedge_fund/web/test_services.py::test_paper_reconciliation_exposes_evidence_for_unkeyed_failures hedge_fund/web/test_recovery.py::test_legacy_failure_confirm_restores_work_readiness hedge_fund/web/test_recovery.py::test_legacy_failure_confirm_is_append_only_and_idempotent -q`.
+- Environment/provenance: Microsoft Windows NT `10.0.26200.0`; Poetry source execution; automated fake tests on enrolled synthetic roots; web conftest clears provider credentials and denies provider network access.
+- Expected/observed: `3 failed in 44.38s`, exit `1`; preview lacked `failures`, and both new confirm requests returned HTTP `405`. The readiness guard still returned the expected `423` before confirmation; no confirmation write occurred.
+- Next check: implement pure classification, preview fields, confirm orchestration, and the route; rerun the three tests.
+
+### T009 failing-first error-text independence
+
+- Result: **FAIL** as expected before T009 implementation.
+- Recorded: `2026-11-17T12:35:14.1215607+01:00`.
+- Source: `HEAD` `fb63e62480833f7e41ad7317cf223f8e387377cf`; uncommitted test diff SHA-256 `04d10a0dcc9c0f68503d8d506a2d7c04e90cf0b90d8ba18c3955a9acb77890fc` (`9294` bytes).
+- Exact command: `poetry run pytest hedge_fund/runtime/test_reconciliation.py::test_legacy_failure_classification_does_not_use_error_text -q`.
+- Environment/provenance: Microsoft Windows NT `10.0.26200.0`; Poetry source execution; automated test on a synthetic enrolled root; no provider calls or real-data-root access.
+- Expected/observed: `1 failed in 1.53s`, exit `1`; import failed because `classify_legacy_failure_evidence` was absent. The test changes only synthetic `error` text and compares classifications/checks separately from display summaries.
+- Next check: implement classification from replay, corruption, broker-book, verified-session continuity, and post-effect fields only.
+
+### T009 classification unit
+
+- Result: **PASS** for error-text-independent classification only; US1 preview/confirm remains **INCONCLUSIVE**.
+- Recorded: `2026-11-17T12:40:07.8003740+01:00`.
+- Source: `HEAD` `fb63e62480833f7e41ad7317cf223f8e387377cf`; dirty source diff SHA-256 `496883e242458bb2e4b563219f8c743395552f21a5155e3839bd8a550f58e021` (`7654` bytes) for `hedge_fund/runtime/reconciliation.py` and `hedge_fund/runtime/test_reconciliation.py`.
+- Exact command: `poetry run pytest hedge_fund/runtime/test_reconciliation.py::test_legacy_failure_classification_does_not_use_error_text -q`.
+- Environment/provenance: Microsoft Windows NT `10.0.26200.0`; Python `3.11.15`; Poetry source execution; synthetic enrolled root and fake/unit test only.
+- Expected/observed: `1 passed in 15.06s`, exit `0`; replacing only synthetic error text changed display summaries but left per-failure classifications and all five checks unchanged.
+- Next check: integrate the same classifier into preview and confirm, then run all T006–T008 tests.
+
+### T006–T012 US1 preview and confirm
+
+- Result: **PASS** for focused preview, confirm, replay, append-only, idempotency, and existing recovery regressions; quickstart Scenario A remains **INCONCLUSIVE** pending the T022 evidence run.
+- Recorded: `2026-11-17T12:49:05.8196107+01:00`.
+- Source: `HEAD` `fb63e62480833f7e41ad7317cf223f8e387377cf`; dirty source/test diff SHA-256 `8b8c398bf799250660ed417b4f1f9cabe5da669c4f5afaab3a4c8ac01f9a7f92` (`33952` bytes) for `hedge_fund/runtime/reconciliation.py`, `hedge_fund/runtime/test_reconciliation.py`, `hedge_fund/web/app.py`, `hedge_fund/web/schemas.py`, `hedge_fund/web/services.py`, `hedge_fund/web/test_services.py`, and `hedge_fund/web/test_recovery.py`.
+- Artifact/environment: Poetry executed working-tree source; no built artifact. Microsoft Windows NT `10.0.26200.0`; Python `3.11.15`; Poetry `2.5.1`.
+- Exact commands and results:
+  - `poetry run pytest hedge_fund/web/test_services.py::test_paper_reconciliation_exposes_evidence_for_unkeyed_failures hedge_fund/web/test_recovery.py::test_legacy_failure_confirm_restores_work_readiness hedge_fund/web/test_recovery.py::test_legacy_failure_confirm_is_append_only_and_idempotent -q` — `3 passed in 46.23s`, exit `0`.
+  - `poetry run pytest hedge_fund/runtime/test_reconciliation.py hedge_fund/web/test_recovery.py -q` — `33 passed in 327.70s (0:05:27)`, exit `0`.
+- Scenario/provenance: synthetic enrolled roots and local fakes only. Preview exposed three unkeyed failures and all five passing checks; confirm appended one anchored decision, readiness passed, and repeated confirm returned already-resolved. Existing receipt replay, intent, halt, and Resume regression tests passed in the focused modules. No provider/LLM/broker network calls or production roots.
+- Next check: author T013–T018 failing-first refusal/crash tests, then implement only gaps those tests establish.
+
+### US1 final checkpoint after review
+
+- Result: **PASS** for final focused classification, preview, confirm, byte-preservation, and idempotency tests.
+- Recorded: `2026-11-17T13:01:40.0766212+01:00`.
+- Source: `HEAD` `fb63e62480833f7e41ad7317cf223f8e387377cf`; final tested source/test diff SHA-256 `baf18be97e4589113d8bed0ab3209208c8efd2da8495702aa5d150a75d34f3b8` (`34152` bytes), same seven paths listed in the T006–T012 entry above.
+- Exact command: `poetry run pytest hedge_fund/runtime/test_reconciliation.py::test_legacy_failure_classification_does_not_use_error_text hedge_fund/web/test_services.py::test_paper_reconciliation_exposes_evidence_for_unkeyed_failures hedge_fund/web/test_recovery.py::test_legacy_failure_confirm_restores_work_readiness hedge_fund/web/test_recovery.py::test_legacy_failure_confirm_is_append_only_and_idempotent -q`.
+- Environment/provenance: Microsoft Windows NT `10.0.26200.0`; Python `3.11.15`; Poetry `2.5.1`; synthetic enrolled roots and fake/unit tests only.
+- Expected/observed: `4 passed in 45.88s`, exit `0`; no provider calls or production-root access.
+
 ## Acceptance scenarios
 
 | Scenario | Status | Evidence |

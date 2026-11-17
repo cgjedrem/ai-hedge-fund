@@ -1,6 +1,7 @@
 import importlib
 
 import pytest
+from fastapi.testclient import TestClient
 
 from hedge_fund.backtesting.test_fund import FakeDataClient, SERIES
 from hedge_fund.brokers.models import Order
@@ -8,6 +9,7 @@ from hedge_fund.brokers.paper import PaperBroker
 from hedge_fund.paper import NothingDue
 from hedge_fund.paper.deployed import load_deployed
 from hedge_fund.paper.ledger import Ledger
+from hedge_fund.web.app import create_app
 
 _DECISION = "confirm-paper-book-matches-ledger"
 paper_tick_module = importlib.import_module("hedge_fund.paper.tick")
@@ -39,6 +41,19 @@ def _failed_web_tick(write_client, demo_root):
         )
     service.halt_fund(name, "synthetic ambiguous tick", "halt-ambiguous-tick-001")
     return client, ledger
+
+
+def _legacy_failure_reconciliation_payload(fixture):
+    from hedge_fund.runtime.test_reconciliation import _legacy_failure_decision
+
+    decision = _legacy_failure_decision(fixture)
+    return {
+        "preview_head": decision.ledger_head,
+        "preview_book_digest": decision.book_digest,
+        "failure_digests": decision.failure_digests,
+        "operator": "synthetic-operator",
+        "attestation": True,
+    }
 
 
 def test_web_recovery_uses_reviewed_preview_and_retries_same_request(write_client, demo_root):
@@ -614,3 +629,78 @@ def test_corrupt_replay_stays_distinct_from_reconciliation_required(write_client
     assert snapshot["recovery_state"] == "corrupt"
     assert recovery_response.status_code == 423
     assert recovery_response.json()["code"] == "replay-corrupt"
+
+
+def test_legacy_failure_confirm_restores_work_readiness(tmp_path):
+    from hedge_fund.runtime.reconciliation import unresolved_tick_failures
+    from hedge_fund.runtime.test_reconciliation import _legacy_failure_recovery_fixture
+    from hedge_fund.web.services import ServiceError
+
+    fixture = _legacy_failure_recovery_fixture(tmp_path)
+    body = _legacy_failure_reconciliation_payload(fixture)
+    name = fixture["spec"].name
+    with TestClient(create_app(root=tmp_path, allow_writes=True), client=("127.0.0.1", 50000)) as client:
+        capabilities = client.get("/api/capabilities", headers={"host": "127.0.0.1"}).json()
+        headers = {
+            "host": "127.0.0.1",
+            "origin": "http://127.0.0.1",
+            "x-csrf-token": capabilities["mutation_token"],
+        }
+        preview = client.get(f"/api/paper/{name}/reconciliation", headers={"host": "127.0.0.1"})
+        assert preview.status_code == 200
+
+        service = client.app.state.service
+        _directory, deployed, ledger, state, _latest = service._paper_state(name, local_paper_only=True)
+        with pytest.raises(ServiceError) as blocked:
+            service._require_paper_work_ready(deployed, ledger, state)
+        assert blocked.value.status_code == 423
+
+        response = client.post(f"/api/paper/{name}/reconcile-legacy-failures", headers=headers, json=body)
+        assert response.status_code == 200
+        assert response.json()["status"] == "reconciled"
+
+        detail = client.get(f"/api/paper/{name}", headers={"host": "127.0.0.1"})
+        assert detail.status_code == 200
+        assert detail.json()["recovery_state"] == "ready"
+        assert detail.json()["ledger"]["ok"] is True
+        _directory, deployed, ledger, state, _latest = service._paper_state(name, local_paper_only=True)
+        service._require_paper_work_ready(deployed, ledger, state)
+        assert unresolved_tick_failures(ledger.events()) == []
+        assert sum(event["kind"] == "legacy_failure_reconciliation" for event in ledger.events()) == 1
+
+
+def test_legacy_failure_confirm_is_append_only_and_idempotent(tmp_path):
+    from hedge_fund.runtime.test_reconciliation import (
+        _legacy_failure_recovery_fixture,
+        _legacy_fixture_file_bytes,
+    )
+
+    fixture = _legacy_failure_recovery_fixture(tmp_path)
+    name = fixture["spec"].name
+    body = _legacy_failure_reconciliation_payload(fixture)
+    before = _legacy_fixture_file_bytes(fixture)
+    with TestClient(create_app(root=tmp_path, allow_writes=True), client=("127.0.0.1", 50000)) as client:
+        capabilities = client.get("/api/capabilities", headers={"host": "127.0.0.1"}).json()
+        headers = {
+            "host": "127.0.0.1",
+            "origin": "http://127.0.0.1",
+            "x-csrf-token": capabilities["mutation_token"],
+        }
+        first = client.post(f"/api/paper/{name}/reconcile-legacy-failures", headers=headers, json=body)
+        repeated = client.post(f"/api/paper/{name}/reconcile-legacy-failures", headers=headers, json=body)
+
+    after = _legacy_fixture_file_bytes(fixture)
+    event_path = f"paper/{name}/events.jsonl"
+    assert first.status_code == 200
+    assert repeated.status_code == 200
+    assert repeated.json()["status"] == "already-resolved"
+    assert set(before) == set(after)
+    for relative, old_bytes in before.items():
+        if relative == event_path:
+            assert after[relative].startswith(old_bytes)
+            offset = len(old_bytes)
+            appended = after[relative][offset:]
+            assert appended.count(b"\n") == 1
+        else:
+            assert after[relative] == old_bytes
+    assert sum(event["kind"] == "legacy_failure_reconciliation" for event in fixture["ledger"].events()) == 1

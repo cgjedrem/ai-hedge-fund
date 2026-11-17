@@ -1006,3 +1006,38 @@ def test_paper_session_pages_cover_verified_history_and_search(demo_root):
     assert len(response.json()["items"]) == 1
     assert rejected.status_code == 400
     assert rejected.json()["code"] == "invalid-request"
+
+
+def test_paper_reconciliation_exposes_evidence_for_unkeyed_failures(tmp_path):
+    from hedge_fund.runtime.reconciliation import failure_digest
+    from hedge_fund.runtime.test_reconciliation import (
+        _legacy_failure_decision,
+        _legacy_failure_recovery_fixture,
+    )
+
+    fixture = _legacy_failure_recovery_fixture(tmp_path)
+    decision = _legacy_failure_decision(fixture)
+    service = DeskService(tmp_path)
+    try:
+        preview = service.paper_reconciliation(fixture["spec"].name)
+    finally:
+        service.close()
+
+    expected_checks = {
+        "replay_verified": True,
+        "corrupt_events_zero": True,
+        "book_matches_replay": True,
+        "chain_continuity_across_failure": True,
+        "no_post_effect_fields": True,
+    }
+    failures = preview["failures"]
+    assert preview["preview_head"] == decision.ledger_head
+    assert preview["preview_book_digest"] == decision.book_digest
+    assert preview["confirm_offered"] is True
+    assert preview["set_reason"] is None
+    assert [failure["failure_digest"] for failure in failures] == [failure_digest(event) for event in fixture["failures"]]
+    assert [failure["time"] for failure in failures] == [event["time"] for event in fixture["failures"]]
+    assert [failure["error_summary"] for failure in failures] == [event["error"] for event in fixture["failures"]]
+    assert all(failure["has_request_id"] is False for failure in failures)
+    assert all(failure["classification"] == "resolvable" for failure in failures)
+    assert all(failure["checks"] == expected_checks for failure in failures)

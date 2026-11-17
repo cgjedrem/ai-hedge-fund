@@ -18,6 +18,21 @@ _SHA256 = re.compile(r"^[a-f0-9]{64}$")
 _DECISION = "confirm-paper-book-matches-ledger"
 _RESIDUAL_UNCERTAINTY = "external-broker-state-not-applicable-local-paper-only"
 _RECEIPT_VALIDITY = timedelta(minutes=30)
+_POST_EFFECT_FAILURE_FIELDS = frozenset(
+    {
+        "approval_consumed",
+        "approval_consumption",
+        "broker_fill",
+        "broker_fills",
+        "effect_boundary",
+        "effect_started",
+        "effect_state",
+        "effects_started",
+        "fill",
+        "fills",
+        "transmitted_fills",
+    }
+)
 
 
 class RecoveryReceiptExpired(ValueError):
@@ -495,6 +510,112 @@ def unresolved_tick_failures(events: list[dict]) -> list[dict]:
         decision_resolved.update(decision.failure_digests)
     resolved.update(decision_resolved)
     return [failure for identity, failure in failures.items() if identity not in resolved]
+
+
+def classify_legacy_failure_evidence(
+    events: list[dict],
+    verified_records: list,
+    *,
+    replay_verified: bool,
+    corrupt_events_zero: bool,
+    book_matches_replay: bool,
+) -> list[dict]:
+    if not isinstance(events, list) or not isinstance(verified_records, list):
+        raise ValueError("legacy failure evidence requires event and replay lists")
+    if any(type(value) is not bool for value in (replay_verified, corrupt_events_zero, book_matches_replay)):
+        raise ValueError("legacy failure evidence checks must be bools")
+
+    reasons = {
+        "replay_verified": "Full ledger replay is not verified.",
+        "corrupt_events_zero": "Corrupt audit events are present.",
+        "book_matches_replay": "Local paper book does not match replay.",
+        "chain_continuity_across_failure": "No later verified session proves continuity across this failure.",
+        "no_post_effect_fields": "Post-effect metadata is present on this failure.",
+    }
+    results = []
+    for failure in unresolved_tick_failures(events):
+        checks = {
+            "replay_verified": replay_verified,
+            "corrupt_events_zero": corrupt_events_zero,
+            "book_matches_replay": book_matches_replay,
+            "chain_continuity_across_failure": _legacy_failure_chain_continuity(failure, verified_records),
+            "no_post_effect_fields": not _has_post_effect_failure_fields(failure),
+        }
+        classification = "resolvable" if all(checks.values()) else "not_resolvable"
+        request_id = failure.get("request_id")
+        error_summary = failure.get("error")
+        results.append(
+            {
+                "failure_digest": failure_digest(failure),
+                "time": failure.get("time") if isinstance(failure.get("time"), str) else None,
+                "error_summary": error_summary[:500] if isinstance(error_summary, str) else "",
+                "has_request_id": isinstance(request_id, str) and bool(request_id.strip()),
+                "classification": classification,
+                "checks": checks,
+                "reason": next((reasons[name] for name, passed in checks.items() if not passed), None),
+            }
+        )
+    return results
+
+
+def _legacy_failure_chain_continuity(failure: dict, verified_records: list) -> bool:
+    expected_head = failure.get("expected_head")
+    failure_session = _session_date(failure.get("session"))
+    if not isinstance(expected_head, str) or _SHA256.fullmatch(expected_head) is None or failure_session is None or not verified_records:
+        return False
+
+    records = []
+    for record in verified_records:
+        if isinstance(record, dict):
+            record_hash = record.get("hash")
+            previous_hash = record.get("prev_hash")
+            session = record.get("session")
+        else:
+            record_hash = getattr(record, "hash", None)
+            previous_hash = getattr(record, "prev_hash", None)
+            session = getattr(record, "session", None)
+        if not isinstance(record_hash, str) or _SHA256.fullmatch(record_hash) is None:
+            return False
+        if previous_hash is not None and (not isinstance(previous_hash, str) or _SHA256.fullmatch(previous_hash) is None):
+            return False
+        records.append((record_hash, previous_hash, _session_date(session)))
+
+    hashes = [record[0] for record in records]
+    if len(set(hashes)) != len(hashes):
+        return False
+    if records[0][1] is not None:
+        return False
+    if any(records[index][1] != hashes[index - 1] for index in range(1, len(records))):
+        return False
+    anchor_indexes = [index for index, record_hash in enumerate(hashes) if record_hash == expected_head]
+    if len(anchor_indexes) != 1:
+        return False
+    anchor_index = anchor_indexes[0]
+    anchor_session = records[anchor_index][2]
+    if anchor_session is None or failure_session <= anchor_session:
+        return False
+    later_start = anchor_index + 1
+    later_records = records[later_start:]
+    return any(session is not None and session > failure_session for _record_hash, _previous_hash, session in later_records)
+
+
+def _session_date(value: object):
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).date()
+    except ValueError:
+        return None
+
+
+def _has_post_effect_failure_fields(failure: dict) -> bool:
+    for field in failure:
+        if not isinstance(field, str):
+            continue
+        normalized = field.casefold().replace("-", "_")
+        if normalized in _POST_EFFECT_FAILURE_FIELDS or normalized.startswith(("post_effect", "transmitted_", "effect_", "effects_", "broker_effect")):
+            return True
+    return False
 
 
 def build_reconciliation_snapshot(

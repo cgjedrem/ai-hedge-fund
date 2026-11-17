@@ -47,16 +47,16 @@
 
 ### Tests for User Story 1 ⚠️ (write FIRST, ensure FAIL)
 
-- [ ] T006 [P] [US1] Preview classification tests in hedge_fund/web/test_services.py: multi-failure unkeyed fixture yields per-failure entries with `resolvable` classification, all five checks true, `confirm_offered=true`, and preview_head/preview_book_digest present per contracts/legacy-failure-recovery.md
-- [ ] T007 [P] [US1] Confirm happy-path test in hedge_fund/web/test_recovery.py: confirm with matching preview binds appends exactly one decision record, recovery state becomes ready, work admission no longer returns 423 (`web/services.py:4246-4275`)
-- [ ] T008 [P] [US1] Byte-identity + idempotency tests in hedge_fund/web/test_recovery.py: pre-existing ledger/event bytes hash-identical before/after confirm; repeated identical confirm returns already-resolved with no second record
+- [x] T006 [P] [US1] Preview classification tests in hedge_fund/web/test_services.py: multi-failure unkeyed fixture yields per-failure entries with `resolvable` classification, all five checks true, `confirm_offered=true`, and preview_head/preview_book_digest present per contracts/legacy-failure-recovery.md
+- [x] T007 [P] [US1] Confirm happy-path test in hedge_fund/web/test_recovery.py: confirm with matching preview binds appends exactly one decision record, recovery state becomes ready, work admission no longer returns 423 (`web/services.py:4246-4275`)
+- [x] T008 [P] [US1] Byte-identity + idempotency tests in hedge_fund/web/test_recovery.py: pre-existing ledger/event bytes hash-identical before/after confirm; repeated identical confirm returns already-resolved with no second record
 
 ### Implementation for User Story 1
 
-- [ ] T009 [US1] Implement the evidence classification function in hedge_fund/runtime/reconciliation.py (research.md Decision 2): pure computation over verified replay + events + book digest producing per-failure `resolvable`/`not_resolvable` with per-check detail (replay verified, zero corrupt events, book match, chain continuity across failure, no post-effect fields); exception type/message never an input (FR-002, FR-012)
-- [ ] T010 [US1] Extend recovery preview in hedge_fund/web/services.py (:4126-4167 area) with the `failures` array, `preview_head`, `preview_book_digest`, `confirm_offered`, `set_reason` per contract; classification comes only from T009
-- [ ] T011 [US1] Implement confirm orchestration in hedge_fund/web/services.py: take fund lock + control/audit lanes exactly as web Resume (:3861-3869, :4046-4076), re-verify head/book/failure-set equality, require attestation, append decision record via T003; zero writes on any refusal (FR-006, FR-007, FR-008)
-- [ ] T012 [US1] Add confirm route in hedge_fund/web/app.py beside existing recovery routes (:315-329, :421-427) with the contract's outcome matrix (200 / 409 stale / 422 per-digest / contention / idempotent already-resolved)
+- [x] T009 [US1] Implement the evidence classification function in hedge_fund/runtime/reconciliation.py (research.md Decision 2): pure computation over verified replay + events + book digest producing per-failure `resolvable`/`not_resolvable` with per-check detail (replay verified, zero corrupt events, book match, chain continuity across failure, no post-effect fields); exception type/message never an input (FR-002, FR-012)
+- [x] T010 [US1] Extend recovery preview in hedge_fund/web/services.py (:4126-4167 area) with the `failures` array, `preview_head`, `preview_book_digest`, `confirm_offered`, `set_reason` per contract; classification comes only from T009
+- [x] T011 [US1] Implement confirm orchestration in hedge_fund/web/services.py: take fund lock + control/audit lanes exactly as web Resume (:3861-3869, :4046-4076), re-verify head/book/failure-set equality, require attestation, append decision record via T003; zero writes on any refusal (FR-006, FR-007, FR-008)
+- [x] T012 [US1] Add confirm route in hedge_fund/web/app.py beside existing recovery routes (:315-329, :421-427) with the contract's outcome matrix (200 / 409 stale / 422 per-digest / contention / idempotent already-resolved)
 
 **Checkpoint**: US1 fully functional headlessly (API + replay), MVP demo-able
 

@@ -174,7 +174,11 @@ from hedge_fund.runtime.policy import (
 from hedge_fund.runtime.reconciliation import (
     build_reconciliation_snapshot,
     build_tick_intent_reconciliation_snapshot,
+    classify_legacy_failure_evidence,
+    failure_digest,
+    LegacyFailureReconciliationDecision,
     tick_intent_reconciliation_targets,
+    unresolved_tick_failures,
 )
 from hedge_fund.runtime.root import RootContext, RootPathError
 from hedge_fund.scorecard import score
@@ -194,6 +198,7 @@ from hedge_fund.web.schemas import (
     CredentialRequest,
     DeployRequest,
     error_code_for,
+    LegacyFailureReconciliationRequest,
     LifecycleAcceptRequest,
     LifecyclePreviewRequest,
     ModelRequest,
@@ -819,12 +824,17 @@ class DeskService:
         intent_digest: str | None = None,
     ) -> dict:
         normalized = self._validated_name(name)
+        verified_records = []
         directory, deployed, ledger, state, latest = self._paper_state(
             normalized,
             local_paper_only=True,
+            on_verified=verified_records.append,
         )
         self._safe_child("paper", normalized, "broker.json")
         try:
+            events, corrupt_event_digests = ledger.recovery_events_with_unresolved_corruption()
+            if corrupt_event_digests:
+                raise ServiceError(423, "Paper audit history is invalid (LedgerError).", code="replay-corrupt")
             snapshot = build_reconciliation_snapshot(directory, deployed, ledger, state, latest)
             intent_snapshot = build_tick_intent_reconciliation_snapshot(
                 directory,
@@ -839,8 +849,23 @@ class DeskService:
             halted = ledger.halted()
             unresolved_state = ledger.unresolved_recovery_state()
             landed_resume = ledger.landed_resume_intent()
+            if unresolved_state.failures:
+                preview_book_digest, book_matches_replay, book_status = self._legacy_failure_book_evidence(normalized, deployed, state)
+                failures = classify_legacy_failure_evidence(
+                    events,
+                    verified_records,
+                    replay_verified=state is not None and state.prev_hash == (latest.hash if latest is not None else None),
+                    corrupt_events_zero=not corrupt_event_digests,
+                    book_matches_replay=book_matches_replay,
+                )
+            else:
+                preview_book_digest = None
+                book_status = "no-unresolved-failures"
+                failures = []
         except PaperReconciliationRequired:
             raise ServiceError(423, "Paper work requires reconciliation before it can continue.", code="reconciliation-required") from None
+        except ServiceError:
+            raise
         except (LedgerError, OSError, ValueError):
             raise ServiceError(423, "Paper state is invalid (LedgerError).", code="replay-corrupt") from None
         preview = snapshot.preview
@@ -852,6 +877,10 @@ class DeskService:
         resume_completion_allowed = resume_completion_required and not unresolved_state.failures and not unresolved_state.tick_intents and not unresolved_state.approval_consumptions
         normal_resume_allowed = halted is not None and not unresolved_state.tick_intents and not unresolved_state.resume_intents and not unresolved_state.approval_consumptions and (failure_review_allowed or no_failure_review_required)
         resume_allowed = resume_completion_allowed or normal_resume_allowed
+        confirm_offered = bool(failures) and all(failure["classification"] == "resolvable" for failure in failures)
+        set_reason = None
+        if not confirm_offered:
+            set_reason = self._legacy_failure_set_reason(failures, book_status)
         return {
             "name": normalized,
             "halted": halted,
@@ -861,7 +890,181 @@ class DeskService:
             "preview": preview.model_dump(mode="json"),
             "intent_preview": intent_preview.model_dump(mode="json"),
             "intent_targets": intent_targets,
+            "failures": failures,
+            "preview_head": latest.hash if latest is not None else None,
+            "preview_book_digest": preview_book_digest,
+            "confirm_offered": confirm_offered,
+            "set_reason": set_reason,
         }
+
+    def reconcile_legacy_failures(self, name: str, request: LegacyFailureReconciliationRequest) -> dict:
+        self._require_writes()
+        if not isinstance(request, LegacyFailureReconciliationRequest):
+            raise ServiceError(400, "Legacy failure reconciliation confirmation is invalid.")
+        normalized = self._validated_name(name)
+        self._guard_protected(normalized)
+        with self._fund_lock(normalized):
+            with self._paper_control_lane(normalized):
+                verified_records = []
+                directory, deployed, ledger, state, latest = self._paper_state(
+                    normalized,
+                    local_paper_only=True,
+                    on_verified=verified_records.append,
+                )
+                try:
+                    events, corrupt_event_digests = ledger.recovery_events_with_unresolved_corruption()
+                    if corrupt_event_digests:
+                        raise ServiceError(423, "Paper audit history is invalid (LedgerError).", code="replay-corrupt")
+                    unresolved = unresolved_tick_failures(events)
+                    unresolved_digests = [failure_digest(failure) for failure in unresolved]
+                    current_head = latest.hash if latest is not None else None
+                    book_digest, book_matches_replay, book_status = self._legacy_failure_book_evidence(normalized, deployed, state)
+                    if current_head != request.preview_head or book_digest != request.preview_book_digest:
+                        raise ServiceError(
+                            409,
+                            "Paper state changed after legacy failure review.",
+                            code="stale-preview",
+                            current_head=current_head,
+                        )
+
+                    previous = self._matching_legacy_failure_decision(events, request, unresolved_digests)
+                    if previous is not None:
+                        return {
+                            "name": normalized,
+                            "status": "already-resolved",
+                            "decision_id": previous.decision_id,
+                        }
+
+                    known_digests = {failure_digest(event) for event in events if event.get("kind") == "tick_failed"}
+                    unresolved_set = set(unresolved_digests)
+                    invalid_digests = []
+                    for digest in request.failure_digests:
+                        if digest not in known_digests:
+                            invalid_digests.append((digest, "unknown failure digest"))
+                        elif digest not in unresolved_set:
+                            invalid_digests.append((digest, "failure is already resolved"))
+                    if invalid_digests:
+                        detail = "; ".join(f"{digest}: {reason}" for digest, reason in invalid_digests)
+                        raise ServiceError(422, f"Legacy failure confirmation refused: {detail}.", code="readiness-denied")
+                    if request.failure_digests != unresolved_digests:
+                        raise ServiceError(
+                            409,
+                            "The unresolved failure set changed after legacy failure review.",
+                            code="stale-preview",
+                            current_head=current_head,
+                        )
+                    if book_status == "broker-book-mismatch":
+                        raise ServiceError(
+                            423,
+                            "The current local paper book does not match replay; legacy failure reconciliation is refused.",
+                            code="reconciliation-required",
+                        )
+
+                    replay_verified = state is not None and state.prev_hash == current_head
+                    evidence = classify_legacy_failure_evidence(
+                        events,
+                        verified_records,
+                        replay_verified=replay_verified,
+                        corrupt_events_zero=not corrupt_event_digests,
+                        book_matches_replay=book_matches_replay,
+                    )
+                    evidence_by_digest = {failure["failure_digest"]: failure for failure in evidence}
+                    refused = []
+                    for digest in request.failure_digests:
+                        failure = evidence_by_digest.get(digest)
+                        if failure is None:
+                            refused.append((digest, "failure evidence is unavailable"))
+                        elif failure["classification"] != "resolvable":
+                            refused.append((digest, failure["reason"] or "failure is not resolvable"))
+                    if refused:
+                        detail = "; ".join(f"{digest}: {reason}" for digest, reason in refused)
+                        raise ServiceError(422, f"Legacy failure confirmation refused: {detail}.", code="readiness-denied")
+
+                    decision = LegacyFailureReconciliationDecision.create(
+                        failure_digests=request.failure_digests,
+                        ledger_head=current_head,
+                        book_digest=book_digest,
+                        operator=request.operator,
+                        recorded_time=_utcnow().isoformat(),
+                        attestation=request.attestation,
+                    )
+                    try:
+                        ledger.record_legacy_failure_reconciliation(decision)
+                    except (LedgerError, OSError, ValueError):
+                        raise ServiceError(
+                            423,
+                            "Legacy failure decision outcome is uncertain; inspect paper state before retrying.",
+                            code="reconciliation-required",
+                        ) from None
+                except PaperReconciliationRequired:
+                    raise ServiceError(423, "Paper work requires reconciliation before it can continue.", code="reconciliation-required") from None
+                except ServiceError:
+                    raise
+                except (LedgerError, OSError, ValueError):
+                    raise ServiceError(423, "Paper state is invalid (LedgerError).", code="replay-corrupt") from None
+        return {
+            "name": normalized,
+            "status": "reconciled",
+            "decision_id": decision.decision_id,
+        }
+
+    def _matching_legacy_failure_decision(self, events, request, unresolved_digests):
+        if unresolved_digests:
+            return None
+        for index, event in enumerate(events):
+            if event.get("kind") != "legacy_failure_reconciliation":
+                continue
+            try:
+                decision = LegacyFailureReconciliationDecision.model_validate(event.get("decision"))
+            except (TypeError, ValueError):
+                continue
+            if decision.failure_digests == request.failure_digests and decision.ledger_head == request.preview_head and decision.book_digest == request.preview_book_digest and decision.operator == request.operator and decision.attestation == request.attestation and [failure_digest(failure) for failure in unresolved_tick_failures(events[:index])] == request.failure_digests:
+                return decision
+        return None
+
+    def _legacy_failure_book_evidence(self, name, deployed, state):
+        from hedge_fund.brokers.paper import PaperBroker
+        from hedge_fund.pipeline.session import BookMismatch, reconcile
+
+        if deployed.broker != "paper":
+            return None, False, "broker-not-local-paper"
+        relative = f"paper/{name}/broker.json"
+        book_path = self._safe_child("paper", name, "broker.json")
+        try:
+            before = self.root_context.read_bytes(relative)
+        except (OSError, ValueError):
+            return None, False, "broker-book-unavailable"
+        book_digest = hashlib.sha256(before).hexdigest()
+        try:
+            broker = PaperBroker(book_path, deployed.spec.costs)
+            mismatch = False
+            try:
+                reconcile(state, broker, deployed.name)
+            except BookMismatch:
+                mismatch = True
+            after = self.root_context.read_bytes(relative)
+        except (KeyError, OSError, TypeError, ValueError):
+            return book_digest, False, "broker-book-invalid"
+        if before != after:
+            return book_digest, False, "broker-book-changed"
+        if mismatch:
+            return book_digest, False, "broker-book-mismatch"
+        return book_digest, True, "ready"
+
+    @staticmethod
+    def _legacy_failure_set_reason(failures, book_status):
+        book_reasons = {
+            "broker-not-local-paper": "Deployment is not a local paper broker.",
+            "broker-book-unavailable": "Local paper book could not be read.",
+            "broker-book-invalid": "Local paper book could not be verified.",
+            "broker-book-changed": "Local paper book changed during preview.",
+            "broker-book-mismatch": "Local paper book does not match replay.",
+        }
+        if not failures:
+            return "No unresolved legacy failures require confirmation."
+        if book_status in book_reasons:
+            return book_reasons[book_status]
+        return next((failure["reason"] for failure in failures if failure["classification"] != "resolvable"), "Legacy failure set is not resolvable.")
 
     def reconcile_tick_request(
         self,
@@ -4216,7 +4419,13 @@ class DeskService:
             snapshot["session_reports"] = [self._session_report(record) for record in records[-100:]]
         return snapshot
 
-    def _paper_state(self, name: str, *, local_paper_only: bool = False):
+    def _paper_state(
+        self,
+        name: str,
+        *,
+        local_paper_only: bool = False,
+        on_verified: Callable[[SessionRecord], None] | None = None,
+    ):
         directory = self._safe_child("paper", name)
         if not directory.is_dir():
             raise ServiceError(404, "Paper fund not found.")
@@ -4225,17 +4434,25 @@ class DeskService:
             if local_paper_only and deployed.broker != "paper":
                 raise ServiceError(403, "Web paper mutations require a local-paper deployment.", code="broker-not-web-supported")
             ledger = Ledger(directory)
-            state, latest = self._replay_paper_state(deployed, ledger)
+            state, latest = self._replay_paper_state(deployed, ledger, on_verified=on_verified)
         except (LedgerError, OSError, ValueError) as exc:
             raise ServiceError(423, f"Paper state is invalid ({type(exc).__name__}).", code="replay-corrupt") from None
         return directory, deployed, ledger, state, latest
 
-    def _replay_paper_state(self, deployed: DeployedFund, ledger: Ledger):
+    def _replay_paper_state(
+        self,
+        deployed: DeployedFund,
+        ledger: Ledger,
+        *,
+        on_verified: Callable[[SessionRecord], None] | None = None,
+    ):
         latest = None
 
         def capture(record: SessionRecord) -> None:
             nonlocal latest
             latest = record
+            if on_verified is not None:
+                on_verified(record)
 
         try:
             state = ledger.replay(deployed.spec.capital, full=True, on_verified=capture)

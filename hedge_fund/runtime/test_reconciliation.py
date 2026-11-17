@@ -334,6 +334,33 @@ def test_legacy_failure_decision_append_validates_input_and_requires_lane(tmp_pa
     assert _legacy_fixture_file_bytes(fixture) == before
 
 
+def test_legacy_failure_classification_does_not_use_error_text(tmp_path):
+    from hedge_fund.runtime.reconciliation import classify_legacy_failure_evidence
+
+    fixture = _legacy_failure_recovery_fixture(tmp_path)
+    events = fixture["ledger"].events()
+    changed_errors = [{**event, "error": "BookMismatch: changed synthetic message"} if event.get("kind") == "tick_failed" else event for event in events]
+    evidence = classify_legacy_failure_evidence(
+        events,
+        fixture["verified_records"],
+        replay_verified=True,
+        corrupt_events_zero=True,
+        book_matches_replay=True,
+    )
+    changed_evidence = classify_legacy_failure_evidence(
+        changed_errors,
+        fixture["verified_records"],
+        replay_verified=True,
+        corrupt_events_zero=True,
+        book_matches_replay=True,
+    )
+
+    assert [item["classification"] for item in evidence] == ["resolvable"] * len(fixture["failures"])
+    assert [item["classification"] for item in changed_evidence] == ["resolvable"] * len(fixture["failures"])
+    assert [item["checks"] for item in changed_evidence] == [item["checks"] for item in evidence]
+    assert [item["error_summary"] for item in changed_evidence] != [item["error_summary"] for item in evidence]
+
+
 def test_reconciliation_receipt_binds_failure_head_book_capture_and_operator():
     failure = {
         "kind": "tick_failed",
