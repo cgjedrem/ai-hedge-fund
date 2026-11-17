@@ -13,7 +13,7 @@
 
 ## Requirement Completeness
 
-- [ ] No [NEEDS CLARIFICATION] markers remain
+- [x] No [NEEDS CLARIFICATION] markers remain
 - [x] Requirements are testable and unambiguous
 - [x] Success criteria are measurable
 - [x] Success criteria are technology-agnostic (no implementation details)
@@ -31,5 +31,5 @@
 
 ## Notes
 
-- 3 [NEEDS CLARIFICATION] markers remain (cloud-tag scope, availability source, exact Kimi identifier as assumption). These are genuine operator decisions with policy (paid/cloud) implications; they are presented as Gate 1 questions rather than guessed.
-- Items marked incomplete require spec updates before `/speckit-clarify` or `/speckit-plan`
+- All clarifications resolved by operator decision on 2026-11-17: cloud-suffixed tags in scope as governed one-shot selections; static operator-approved tag list as availability source; target identifier `kimi-k3:cloud`.
+- All checklist items pass; spec is ready for `/speckit-plan`.

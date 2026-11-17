@@ -55,7 +55,7 @@ The operator may select a cloud-labelled Ollama tag (e.g. a `:cloud`-suffixed ta
 1. **Given** a cloud-labelled tag is configured, **When** any scheduled or unattended path attempts to use it, **Then** it is refused regardless of credentials present in the environment.
 2. **Given** a cloud-labelled tag is selected for a one-shot operation without explicit authorization, **When** validation runs, **Then** it is refused with a clear reason naming the authorization requirement.
 
-[NEEDS CLARIFICATION: Are cloud-suffixed tags proxied by the host daemon in scope for this feature at all — as governed one-shot selections (P3 story above) — or explicitly excluded, leaving this feature local-tags-only? This determines whether a paid/cloud authorization design is required.]
+**Operator decision (2026-11-17):** Cloud-suffixed tags proxied by the host daemon ARE in scope — as governed one-shot selections under this P3 story. The operator's target model is `kimi-k3:cloud`. A paid/cloud authorization design (per-operation authorization + enforced budget, no scheduled loops) is therefore required as part of this feature.
 
 ---
 
@@ -79,9 +79,9 @@ The operator may select a cloud-labelled Ollama tag (e.g. a `:cloud`-suffixed ta
 - **FR-004**: The web settings model picker MUST present the selectable Ollama models with their availability state, and MUST NOT present unreachable or invalid entries as valid choices.
 - **FR-005**: Configuration precedence MUST remain launch override > process environment > persisted root settings > defaults, and a persisted selection MUST survive an application restart.
 - **FR-006**: Only chat-capable Ollama models MUST be selectable for analysis; embedding-only or OCR-only tags MUST be rejected with a capability-specific reason.
-- **FR-007**: Cloud-labelled Ollama tags MUST remain classified as paid/cloud: prohibited in scheduled or unattended loops, and permitted for one-shot operations only with explicit per-operation authorization and an enforced budget. [NEEDS CLARIFICATION: whether cloud-labelled tags are in scope at all — see User Story 3.]
+- **FR-007**: Cloud-labelled Ollama tags (including the operator's selected `kimi-k3:cloud`) MUST remain classified as paid/cloud: prohibited in scheduled or unattended loops, and permitted for one-shot operations only with explicit per-operation authorization and an enforced budget. Credential presence in the environment MUST NOT constitute authorization.
 - **FR-008**: Existing endpoint/network guardrails MUST be preserved unchanged: loopback-only endpoints, pinned destinations, no ambient proxy use, no endpoint derived from model text, no new network surface for inference.
-- **FR-009**: [NEEDS CLARIFICATION: Source of availability truth — (a) a static operator-approved tag list (offline-safe, smallest change), (b) live daemon metadata discovery (requires a bounded, separately authorized metadata operation with offline fallback), or (c) hybrid: operator-approved list plus optional guarded discovery where discovered tags remain distinct from authorized targets.]
+- **FR-009**: Availability truth is a **static operator-approved tag list** (operator decision, 2026-11-17): approved tags are validated against that list and, when the daemon is reachable, cross-checked against daemon metadata; the list is the offline-safe baseline. Live discovery is out of scope for this feature.
 - **FR-010**: Error messages surfaced to the operator MUST NOT contain credential material, API keys, or secret values under any failure mode.
 - **FR-011**: Catalogs and behavior of all non-Ollama providers MUST remain unchanged.
 - **FR-012**: Configuration acceptance, metadata availability, and inference success MUST be distinguishable outcomes; this feature validates the first two and does not require live inference to prove configuration acceptance.
@@ -106,6 +106,6 @@ The operator may select a cloud-labelled Ollama tag (e.g. a `:cloud`-suffixed ta
 - The supported Ollama endpoint is the host daemon on loopback; non-loopback or direct cloud API endpoints are out of scope unless the operator explicitly expands scope.
 - The daemon's model metadata is the natural source of availability truth when reachable; the exact mechanism (static list vs discovery vs hybrid) is an open user decision (FR-009).
 - No live inference is required to validate that a configuration is accepted; inference verification is a separate, later, explicitly authorized step.
-- The operator's originally requested model identifier is unresolved: "Kimi K3.1" was requested, but no such identifier exists in the observed daemon metadata; the candidates are `kimi-k3:cloud` (cloud-labelled Ollama tag) and `kimi-k3` (Moonshot provider, a different provider entirely). The exact intended identifier is a user decision and MUST NOT be guessed; it does not block this specification because the feature is about the selection mechanism, not one specific tag.
+- The operator's target model identifier is resolved (2026-11-17): `kimi-k3:cloud`, the cloud-labelled tag offered by the host Ollama daemon. It is distinct from `kimi-k3` on the Moonshot provider, which is out of scope.
 - Free yfinance data remains the market-data path; this feature touches model selection only, not data providers.
 - No real-fund access, no broker orders, no paid-provider spend in development or tests; all new tests use mocked model metadata.
