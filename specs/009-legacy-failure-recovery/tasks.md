@@ -70,16 +70,16 @@
 
 ### Tests for User Story 2 ⚠️ (write FIRST, ensure FAIL)
 
-- [ ] T013 [P] [US2] Post-effect-ambiguous failure test in hedge_fund/web/test_services.py: fixture with transmitted-fill/post-effect fields classifies `not_resolvable` with the specific failing check; no confirm offered (SC-002)
-- [ ] T014 [P] [US2] Corrupt replay / corrupt audit event tests in hedge_fund/web/test_recovery.py: recovery attempt refuses via existing corrupt state, zero writes, distinct from reconciliation-required (FR-009)
-- [ ] T015 [P] [US2] Book-mismatch refusal test in hedge_fund/web/test_recovery.py: perturbed book digest → mismatch refusal, zero writes
-- [ ] T016 [P] [US2] Stale-preview tests in hedge_fund/web/test_recovery.py: head-advancing append between preview and confirm → 409 stale-preview, zero writes; changed failure set likewise
-- [ ] T017 [P] [US2] Lane-contention test in hedge_fund/web/test_recovery.py: second writer holding fund lane → contention response, no concurrent append (FR-008)
-- [ ] T018 [P] [US2] Crash/retry idempotency test in hedge_fund/web/test_recovery.py (quickstart Scenario C): fault injection between intent and completion; retry yields exactly one durable decision and consistent replay
+- [x] T013 [P] [US2] Post-effect-ambiguous failure test in hedge_fund/web/test_services.py: fixture with transmitted-fill/post-effect fields classifies `not_resolvable` with the specific failing check; no confirm offered (SC-002)
+- [x] T014 [P] [US2] Corrupt replay / corrupt audit event tests in hedge_fund/web/test_recovery.py: recovery attempt refuses via existing corrupt state, zero writes, distinct from reconciliation-required (FR-009)
+- [x] T015 [P] [US2] Book-mismatch refusal test in hedge_fund/web/test_recovery.py: perturbed book digest → mismatch refusal, zero writes
+- [x] T016 [P] [US2] Stale-preview tests in hedge_fund/web/test_recovery.py: head-advancing append between preview and confirm → 409 stale-preview, zero writes; changed failure set likewise
+- [x] T017 [P] [US2] Lane-contention test in hedge_fund/web/test_recovery.py: second writer holding fund lane → contention response, no concurrent append (FR-008)
+- [x] T018 [US2] Crash/retry idempotency test in hedge_fund/web/test_recovery.py (quickstart Scenario C): fault injection between intent and completion; retry yields exactly one durable decision and consistent replay
 
 ### Implementation for User Story 2
 
-- [ ] T019 [US2] Close any gaps the failing tests expose in hedge_fund/runtime/reconciliation.py and hedge_fund/web/services.py refusal paths (expected small if T009–T012 are exact); each refusal MUST carry its distinct operator-visible reason per contract
+- [x] T019 [US2] Close any gaps the failing tests expose in hedge_fund/runtime/reconciliation.py and hedge_fund/web/services.py refusal paths (expected small if T009–T012 are exact); each refusal MUST carry its distinct operator-visible reason per contract — verified: T013–T018 passed on first run; no production gap found
 
 **Checkpoint**: US1 + US2 both green; negative space fully evidenced
 

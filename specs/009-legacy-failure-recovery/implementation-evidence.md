@@ -132,6 +132,16 @@
 - Environment/provenance: Microsoft Windows NT `10.0.26200.0`; Python `3.11.15`; Poetry `2.5.1`; synthetic enrolled roots and fake/unit tests only.
 - Expected/observed: `4 passed in 45.88s`, exit `0`; no provider calls or production-root access.
 
+### T013–T019 refusal and crash coverage
+
+- Result: **PASS** on the first run after test authoring; no T019 production gap reproduced. This differs from the plan's failing-first expectation because the T009–T012 implementation already contained the refusal paths.
+- Recorded: `2026-11-17T13:07:14.7274095+01:00`.
+- Source: `HEAD` `291cc72841f4f0cabdd492e0ac4e2e24fe4f3e9a`; uncommitted test-only diff SHA-256 `52380f4727cc83cadfa1574780c29a951611c7fa14abdf7950a4fd16ac255c56` (`15020` bytes) for `hedge_fund/web/test_services.py` and `hedge_fund/web/test_recovery.py`.
+- Exact command: `poetry run pytest hedge_fund/web/test_services.py::test_paper_reconciliation_blocks_post_effect_failure_set hedge_fund/web/test_recovery.py::test_corrupt_replay_stays_distinct_from_reconciliation_required hedge_fund/web/test_recovery.py::test_legacy_failure_confirm_rejects_corrupt_audit_without_writes hedge_fund/web/test_recovery.py::test_legacy_failure_confirm_rejects_book_mismatch_without_writes hedge_fund/web/test_recovery.py::test_legacy_failure_confirm_rejects_post_effect_set_without_writes hedge_fund/web/test_recovery.py::test_legacy_failure_confirm_rejects_stale_head_without_writes hedge_fund/web/test_recovery.py::test_legacy_failure_confirm_rejects_changed_failure_set_without_writes hedge_fund/web/test_recovery.py::test_legacy_failure_confirm_rejects_control_lane_contention hedge_fund/web/test_recovery.py::test_legacy_failure_confirm_retry_deduplicates_after_append_interruption hedge_fund/web/test_recovery.py::test_legacy_failure_request_requires_true_attestation_and_unique_digests -q`.
+- Environment/provenance: Microsoft Windows NT `10.0.26200.0`; Python `3.11.15`; Poetry `2.5.1`; synthetic enrolled roots and local fakes only.
+- Expected/observed: `10 passed in 47.20s`, exit `0`. Corrupt replay/audit, book mismatch, post-effect ambiguity, stale head/set, lane contention, attestation validation, and append-interruption retry all refused or retried with expected status and unchanged bytes where refusal applied. No provider/LLM calls or production-root access.
+- Disposition: T013–T018 tests cover their required negative states. T019 requires no production edit; confirm remains all-or-nothing and uses existing replay, root, and lane boundaries.
+
 ## Acceptance scenarios
 
 | Scenario | Status | Evidence |

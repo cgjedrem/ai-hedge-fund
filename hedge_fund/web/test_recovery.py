@@ -56,6 +56,15 @@ def _legacy_failure_reconciliation_payload(fixture):
     }
 
 
+def _legacy_failure_write_headers(client):
+    capabilities = client.get("/api/capabilities", headers={"host": "127.0.0.1"}).json()
+    return {
+        "host": "127.0.0.1",
+        "origin": "http://127.0.0.1",
+        "x-csrf-token": capabilities["mutation_token"],
+    }
+
+
 def test_web_recovery_uses_reviewed_preview_and_retries_same_request(write_client, demo_root):
     client, _ledger = _failed_web_tick(write_client, demo_root)
     headers = write_client[1]
@@ -613,6 +622,7 @@ def test_corrupt_replay_stays_distinct_from_reconciliation_required(write_client
     record = json.loads(record_path.read_text(encoding="utf-8"))
     record["hash"] = "0" * 64 if record["hash"] != "0" * 64 else "1" * 64
     record_path.write_text(json.dumps(record), encoding="utf-8")
+    before = {path: path.read_bytes() for path in directory.rglob("*") if path.is_file()}
 
     snapshot_response = client.get(
         f"/api/paper/{name}",
@@ -629,6 +639,21 @@ def test_corrupt_replay_stays_distinct_from_reconciliation_required(write_client
     assert snapshot["recovery_state"] == "corrupt"
     assert recovery_response.status_code == 423
     assert recovery_response.json()["code"] == "replay-corrupt"
+    confirm = client.post(
+        f"/api/paper/{name}/reconcile-legacy-failures",
+        headers=_legacy_failure_write_headers(client),
+        json={
+            "preview_head": latest.hash,
+            "preview_book_digest": "b" * 64,
+            "failure_digests": ["c" * 64],
+            "operator": "synthetic-operator",
+            "attestation": True,
+        },
+    )
+    after = {path: path.read_bytes() for path in directory.rglob("*") if path.is_file()}
+    assert confirm.status_code == 423
+    assert confirm.json()["code"] == "replay-corrupt"
+    assert after == before
 
 
 def test_legacy_failure_confirm_restores_work_readiness(tmp_path):
@@ -704,3 +729,255 @@ def test_legacy_failure_confirm_is_append_only_and_idempotent(tmp_path):
         else:
             assert after[relative] == old_bytes
     assert sum(event["kind"] == "legacy_failure_reconciliation" for event in fixture["ledger"].events()) == 1
+
+
+def test_legacy_failure_confirm_rejects_corrupt_audit_without_writes(tmp_path):
+    from hedge_fund.runtime.admission import AdmissionCoordinator, RootOwnerLease
+    from hedge_fund.runtime.test_reconciliation import (
+        _append_corrupt_legacy_audit_event,
+        _legacy_failure_recovery_fixture,
+        _legacy_fixture_file_bytes,
+    )
+    from hedge_fund.runtime.root import RootContext
+
+    fixture = _legacy_failure_recovery_fixture(tmp_path)
+    name = fixture["spec"].name
+    body = _legacy_failure_reconciliation_payload(fixture)
+    with RootContext.open(tmp_path) as root:
+        with RootOwnerLease.acquire(root) as owner:
+            _append_corrupt_legacy_audit_event(fixture, AdmissionCoordinator(root, owner_lease=owner))
+    before = _legacy_fixture_file_bytes(fixture)
+
+    with TestClient(create_app(root=tmp_path, allow_writes=True), client=("127.0.0.1", 50000)) as client:
+        response = client.post(
+            f"/api/paper/{name}/reconcile-legacy-failures",
+            headers=_legacy_failure_write_headers(client),
+            json=body,
+        )
+
+    assert response.status_code == 423
+    assert response.json()["code"] == "replay-corrupt"
+    assert _legacy_fixture_file_bytes(fixture) == before
+
+
+def test_legacy_failure_confirm_rejects_book_mismatch_without_writes(tmp_path):
+    from hedge_fund.runtime.admission import AdmissionCoordinator, RootOwnerLease
+    from hedge_fund.runtime.test_reconciliation import (
+        _legacy_failure_recovery_fixture,
+        _legacy_fixture_file_bytes,
+        _perturb_legacy_fixture_book,
+    )
+    from hedge_fund.runtime.root import RootContext
+
+    fixture = _legacy_failure_recovery_fixture(tmp_path)
+    name = fixture["spec"].name
+    with RootContext.open(tmp_path) as root:
+        with RootOwnerLease.acquire(root) as owner:
+            _perturb_legacy_fixture_book(fixture, AdmissionCoordinator(root, owner_lease=owner))
+    body = _legacy_failure_reconciliation_payload(fixture)
+    before = _legacy_fixture_file_bytes(fixture)
+
+    with TestClient(create_app(root=tmp_path, allow_writes=True), client=("127.0.0.1", 50000)) as client:
+        preview = client.get(f"/api/paper/{name}/reconciliation", headers={"host": "127.0.0.1"})
+        response = client.post(
+            f"/api/paper/{name}/reconcile-legacy-failures",
+            headers=_legacy_failure_write_headers(client),
+            json=body,
+        )
+
+    assert preview.status_code == 200
+    assert preview.json()["confirm_offered"] is False
+    assert preview.json()["failures"][0]["checks"]["book_matches_replay"] is False
+    assert response.status_code == 423
+    assert response.json()["code"] == "reconciliation-required"
+    assert "does not match replay" in response.json()["detail"]
+    assert _legacy_fixture_file_bytes(fixture) == before
+
+
+def test_legacy_failure_confirm_rejects_post_effect_set_without_writes(tmp_path):
+    from hedge_fund.runtime.test_reconciliation import _legacy_failure_recovery_fixture, _legacy_fixture_file_bytes
+
+    fixture = _legacy_failure_recovery_fixture(tmp_path, post_effect_indices={1})
+    name = fixture["spec"].name
+    body = _legacy_failure_reconciliation_payload(fixture)
+    before = _legacy_fixture_file_bytes(fixture)
+
+    with TestClient(create_app(root=tmp_path, allow_writes=True), client=("127.0.0.1", 50000)) as client:
+        response = client.post(
+            f"/api/paper/{name}/reconcile-legacy-failures",
+            headers=_legacy_failure_write_headers(client),
+            json=body,
+        )
+
+    effect_digest = body["failure_digests"][1]
+    assert response.status_code == 422
+    assert response.json()["code"] == "readiness-denied"
+    assert effect_digest in response.json()["detail"]
+    assert "Post-effect metadata is present" in response.json()["detail"]
+    assert _legacy_fixture_file_bytes(fixture) == before
+
+
+def test_legacy_failure_confirm_rejects_stale_head_without_writes(tmp_path):
+    from hedge_fund.runtime.admission import AdmissionCoordinator, RootOwnerLease
+    from hedge_fund.runtime.test_reconciliation import (
+        _append_legacy_fixture_session,
+        _legacy_failure_recovery_fixture,
+        _legacy_fixture_file_bytes,
+    )
+    from hedge_fund.runtime.root import RootContext
+
+    fixture = _legacy_failure_recovery_fixture(tmp_path)
+    name = fixture["spec"].name
+    body = _legacy_failure_reconciliation_payload(fixture)
+    with RootContext.open(tmp_path) as root:
+        with RootOwnerLease.acquire(root) as owner:
+            _append_legacy_fixture_session(
+                fixture["ledger"],
+                fixture["spec"],
+                AdmissionCoordinator(root, owner_lease=owner),
+                "2024-06-07",
+            )
+    before = _legacy_fixture_file_bytes(fixture)
+
+    with TestClient(create_app(root=tmp_path, allow_writes=True), client=("127.0.0.1", 50000)) as client:
+        response = client.post(
+            f"/api/paper/{name}/reconcile-legacy-failures",
+            headers=_legacy_failure_write_headers(client),
+            json=body,
+        )
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "stale-preview"
+    assert _legacy_fixture_file_bytes(fixture) == before
+
+
+def test_legacy_failure_confirm_rejects_changed_failure_set_without_writes(tmp_path):
+    from hedge_fund.runtime.admission import AdmissionCoordinator, RootOwnerLease
+    from hedge_fund.runtime.test_reconciliation import _legacy_failure_recovery_fixture, _legacy_fixture_file_bytes
+    from hedge_fund.runtime.root import RootContext
+
+    fixture = _legacy_failure_recovery_fixture(tmp_path)
+    name = fixture["spec"].name
+    body = _legacy_failure_reconciliation_payload(fixture)
+    with RootContext.open(tmp_path) as root:
+        with RootOwnerLease.acquire(root) as owner:
+            with AdmissionCoordinator(root, owner_lease=owner).control_lane(name, timeout=0):
+                fixture["ledger"].log_event(
+                    "tick_failed",
+                    session="2024-06-07",
+                    error="synthetic failure-set drift",
+                    expected_head=fixture["latest"].hash,
+                )
+    before = _legacy_fixture_file_bytes(fixture)
+
+    with TestClient(create_app(root=tmp_path, allow_writes=True), client=("127.0.0.1", 50000)) as client:
+        response = client.post(
+            f"/api/paper/{name}/reconcile-legacy-failures",
+            headers=_legacy_failure_write_headers(client),
+            json=body,
+        )
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "stale-preview"
+    assert _legacy_fixture_file_bytes(fixture) == before
+
+
+def test_legacy_failure_confirm_rejects_control_lane_contention(tmp_path):
+    from threading import Event, Thread
+    from hedge_fund.runtime.test_reconciliation import _legacy_failure_recovery_fixture, _legacy_fixture_file_bytes
+
+    fixture = _legacy_failure_recovery_fixture(tmp_path)
+    name = fixture["spec"].name
+    body = _legacy_failure_reconciliation_payload(fixture)
+    entered = Event()
+    release = Event()
+    lane_errors = []
+
+    with TestClient(create_app(root=tmp_path, allow_writes=True), client=("127.0.0.1", 50000)) as client:
+        service = client.app.state.service
+
+        def hold_control_lane():
+            try:
+                with service._paper_control_lane(name):
+                    entered.set()
+                    release.wait(timeout=10)
+            except Exception as exc:
+                lane_errors.append(exc)
+
+        thread = Thread(target=hold_control_lane)
+        thread.start()
+        try:
+            assert entered.wait(timeout=5)
+            before = _legacy_fixture_file_bytes(fixture)
+            response = client.post(
+                f"/api/paper/{name}/reconcile-legacy-failures",
+                headers=_legacy_failure_write_headers(client),
+                json=body,
+            )
+        finally:
+            release.set()
+            thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert lane_errors == []
+    assert response.status_code == 409
+    assert _legacy_fixture_file_bytes(fixture) == before
+
+
+def test_legacy_failure_confirm_retry_deduplicates_after_append_interruption(tmp_path, monkeypatch):
+    from hedge_fund.runtime.reconciliation import unresolved_tick_failures
+    from hedge_fund.runtime.test_reconciliation import _legacy_failure_recovery_fixture, _legacy_fixture_file_bytes
+
+    fixture = _legacy_failure_recovery_fixture(tmp_path)
+    name = fixture["spec"].name
+    body = _legacy_failure_reconciliation_payload(fixture)
+    before = _legacy_fixture_file_bytes(fixture)
+    original_log_event = Ledger.log_event
+    interrupted = []
+
+    def append_then_interrupt(self, kind, **fields):
+        original_log_event(self, kind, **fields)
+        if kind == "legacy_failure_reconciliation" and not interrupted:
+            interrupted.append(True)
+            raise OSError("synthetic interruption after durable append")
+
+    monkeypatch.setattr(Ledger, "log_event", append_then_interrupt)
+    with TestClient(create_app(root=tmp_path, allow_writes=True), client=("127.0.0.1", 50000)) as client:
+        headers = _legacy_failure_write_headers(client)
+        first = client.post(f"/api/paper/{name}/reconcile-legacy-failures", headers=headers, json=body)
+        repeated = client.post(f"/api/paper/{name}/reconcile-legacy-failures", headers=headers, json=body)
+
+    after = _legacy_fixture_file_bytes(fixture)
+    event_path = f"paper/{name}/events.jsonl"
+    assert first.status_code == 423
+    assert first.json()["code"] == "reconciliation-required"
+    assert repeated.status_code == 200
+    assert repeated.json()["status"] == "already-resolved"
+    assert interrupted == [True]
+    assert after[event_path].startswith(before[event_path])
+    offset = len(before[event_path])
+    assert after[event_path][offset:].count(b"\n") == 1
+    assert sum(event["kind"] == "legacy_failure_reconciliation" for event in fixture["ledger"].events()) == 1
+    assert unresolved_tick_failures(fixture["ledger"].events()) == []
+
+
+def test_legacy_failure_request_requires_true_attestation_and_unique_digests():
+    from pydantic import ValidationError
+
+    from hedge_fund.web.schemas import LegacyFailureReconciliationRequest
+
+    request = {
+        "preview_head": "a" * 64,
+        "preview_book_digest": "b" * 64,
+        "failure_digests": ["c" * 64],
+        "operator": "synthetic-operator",
+        "attestation": True,
+    }
+
+    assert LegacyFailureReconciliationRequest.model_validate(request).attestation is True
+    with pytest.raises(ValidationError):
+        LegacyFailureReconciliationRequest.model_validate({**request, "attestation": False})
+    with pytest.raises(ValidationError):
+        LegacyFailureReconciliationRequest.model_validate({**request, "attestation": "true"})
+    with pytest.raises(ValidationError):
+        LegacyFailureReconciliationRequest.model_validate({**request, "failure_digests": ["c" * 64] * 2})

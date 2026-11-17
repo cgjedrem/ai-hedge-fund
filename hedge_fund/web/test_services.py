@@ -1041,3 +1041,21 @@ def test_paper_reconciliation_exposes_evidence_for_unkeyed_failures(tmp_path):
     assert all(failure["has_request_id"] is False for failure in failures)
     assert all(failure["classification"] == "resolvable" for failure in failures)
     assert all(failure["checks"] == expected_checks for failure in failures)
+
+
+def test_paper_reconciliation_blocks_post_effect_failure_set(tmp_path):
+    from hedge_fund.runtime.test_reconciliation import _legacy_failure_recovery_fixture
+
+    fixture = _legacy_failure_recovery_fixture(tmp_path, post_effect_indices={1})
+    service = DeskService(tmp_path)
+    try:
+        preview = service.paper_reconciliation(fixture["spec"].name)
+    finally:
+        service.close()
+
+    assert preview["confirm_offered"] is False
+    assert preview["failures"][0]["classification"] == "resolvable"
+    assert preview["failures"][1]["classification"] == "not_resolvable"
+    assert preview["failures"][1]["checks"]["no_post_effect_fields"] is False
+    assert preview["failures"][1]["reason"] == "Post-effect metadata is present on this failure."
+    assert preview["failures"][2]["classification"] == "resolvable"
