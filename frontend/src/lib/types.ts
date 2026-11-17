@@ -65,6 +65,8 @@ export interface ModelOption {
   label: string;
   id: string;
   provider: string;
+  capability?: "chat" | "embedding" | "ocr";
+  cost_class?: "local" | "paid-cloud";
 }
 
 export interface StrategyModelOption {

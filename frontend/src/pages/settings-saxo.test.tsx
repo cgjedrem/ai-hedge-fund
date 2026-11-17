@@ -3,6 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, expect, it, vi } from "vitest";
 
 import { DeskProvider, useDesk } from "@/lib/hooks";
+import type { ModelOption } from "@/lib/types";
 import { SettingsPage } from "@/pages/settings";
 
 const settings = {
@@ -36,7 +37,10 @@ function ReconnectControl() {
   return <button onClick={() => void reconnect()}>Reconnect test session</button>;
 }
 
-function renderSettings(intercept?: (path: string) => Promise<Response> | undefined) {
+function renderSettings(
+  intercept?: (path: string) => Promise<Response> | undefined,
+  models: ModelOption[] = settings.models,
+) {
   const requests: { path: string; init?: RequestInit }[] = [];
   let currentCapability = capability;
   vi.stubGlobal("fetch", vi.fn(async (path: string, init?: RequestInit) => {
@@ -61,7 +65,7 @@ function renderSettings(intercept?: (path: string) => Promise<Response> | undefi
           deferred_actions: {},
       };
     } else if (path === "/api/settings") {
-      body = settings;
+      body = { ...settings, models };
     } else if (path === "/api/saxo/sim/status") {
       body = { environment: "SIM", read_only: true, capability: currentCapability };
     } else if (path === "/api/saxo/sim/accounts") {
@@ -101,6 +105,22 @@ afterEach(() => {
   vi.unstubAllGlobals();
   window.localStorage.clear();
   window.sessionStorage.clear();
+});
+
+it("marks paid-cloud Ollama models as dispatch-gated in the picker", async () => {
+  const user = userEvent.setup();
+  renderSettings(undefined, [
+    { id: "gemma3:4b", label: "Gemma 3 4B", provider: "Ollama", capability: "chat", cost_class: "local" },
+    { id: "kimi-k3:cloud", label: "Kimi K3 Cloud", provider: "Ollama", capability: "chat", cost_class: "paid-cloud" },
+  ]);
+
+  await screen.findByText("Saxo SIM account inspection");
+  screen.getByRole("combobox", { name: "LLM model" }).focus();
+  await user.keyboard("{ArrowDown}");
+
+  expect(await screen.findByText("PAID / CLOUD · DISPATCH-GATED")).toBeTruthy();
+  expect(screen.getByText("LOCAL")).toBeTruthy();
+  expect(screen.getByText("Kimi K3 Cloud · Ollama · chat")).toBeTruthy();
 });
 
 it("keeps Saxo outside provider settings and requires consent before account discovery", async () => {

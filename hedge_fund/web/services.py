@@ -50,7 +50,7 @@ from hedge_fund.llm import (
     PROVIDER_ENV_VARS,
 )
 from hedge_fund.llm.client import validate_llm_transport
-from hedge_fund.llm.registry import is_supported, KEYLESS_PROVIDERS, load_api_models
+from hedge_fund.llm.registry import KEYLESS_PROVIDERS, catalog_entry_for, is_supported, load_api_model_entries
 from hedge_fund.paper.deployed import (
     deploy,
     DeployedFund,
@@ -575,7 +575,7 @@ class DeskService:
         }
 
     def catalog(self) -> dict:
-        models = [{"label": label, "id": model_id, "provider": provider} for label, model_id, provider in load_api_models() if is_supported(provider)]
+        models = _model_options()
         strategies = []
         from hedge_fund.signals import (
             ALPHA_MODEL_REGISTRY,
@@ -2547,7 +2547,7 @@ class DeskService:
         }
 
     def settings(self) -> dict:
-        model_options = [{"label": label, "id": model_id, "provider": provider} for label, model_id, provider in load_api_models() if is_supported(provider)]
+        model_options = _model_options()
         credential_status = self._credential_status_map()
         with self._settings_lock:
             effective = self._runtime_settings
@@ -2691,9 +2691,7 @@ class DeskService:
 
     def set_model(self, request: ModelRequest) -> dict:
         self._require_writes()
-        provider = _supported_model_providers().get(request.model)
-        if provider is None:
-            raise ServiceError(400, "Model is not in the supported provider catalog.")
+        provider = _model_provider_for_selection(request.model)
         values: dict[str, object] = {
             "model": request.model,
             "llm_provider": provider,
@@ -2708,9 +2706,7 @@ class DeskService:
 
     def save_runtime_settings(self, request: RuntimeSettingsRequest) -> dict:
         self._require_writes()
-        provider = _supported_model_providers().get(request.model)
-        if provider is None:
-            raise ServiceError(400, "Model is not in the supported provider catalog.")
+        provider = _model_provider_for_selection(request.model)
         values = request.model_dump(exclude={"expected_version"})
         values["llm_provider"] = provider
         _persisted, updated = self._persist_runtime_settings(
@@ -5219,8 +5215,33 @@ def _credential_provider(value: str) -> str:
     return provider
 
 
-def _supported_model_providers() -> dict[str, str]:
-    return {model_id: provider for _label, model_id, provider in load_api_models() if is_supported(provider)}
+def _model_options() -> list[dict[str, object]]:
+    options = []
+    for entry in load_api_model_entries():
+        if not is_supported(entry.provider) or (entry.provider == "Ollama" and entry.capability != "chat"):
+            continue
+        option: dict[str, object] = {
+            "label": entry.display_name,
+            "id": entry.model_name,
+            "provider": entry.provider,
+        }
+        if entry.provider == "Ollama":
+            option["capability"] = entry.capability
+            option["cost_class"] = entry.cost_class
+        options.append(option)
+    return options
+
+
+def _model_provider_for_selection(model_id: str) -> str:
+    entry = catalog_entry_for(model_id)
+    if entry is None:
+        raise ServiceError(400, f"Model '{model_id}' is not in the supported provider catalog.")
+    if entry.provider == "Ollama" and entry.capability != "chat":
+        capability = entry.capability or "unknown"
+        raise ServiceError(400, f"Model '{model_id}' is not chat-capable ({capability}).")
+    if not is_supported(entry.provider):
+        raise ServiceError(400, "Model is not in the supported provider catalog.")
+    return entry.provider
 
 
 def _is_loopback_endpoint(value: str | None) -> bool:

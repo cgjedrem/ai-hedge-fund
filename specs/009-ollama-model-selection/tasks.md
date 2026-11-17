@@ -68,12 +68,12 @@
 
 ### Tests for User Story 2
 
-- [ ] T011 [P] [US2] Write failing web tests in `hedge_fund/web/test_settings.py` covering: models array entries include `capability` and `cost_class`; rejection responses match contract C2 message shapes and contain no credential material (V5, V7)
+- [x] T011 [P] [US2] Write failing web tests in `hedge_fund/web/test_settings.py` covering: models array entries include `capability` and `cost_class`; rejection responses match contract C2 message shapes and contain no credential material (V5, V7)
 
 ### Implementation for User Story 2
 
-- [ ] T012 [US2] Extend the settings/catalog model serialization in `hedge_fund/web/services.py` (around lines 2287-2319, 572-573) to include `capability` and `cost_class` per contract C1/C3, and specific rejection reasons per contract C2 (lines 2430-2451)
-- [ ] T013 [P] [US2] Update the settings picker in `frontend/src/pages/settings.tsx` (around lines 27, 246-250) to render capability and a paid/cloud dispatch-gated indicator per contract C1
+- [x] T012 [US2] Extend the settings/catalog model serialization in `hedge_fund/web/services.py` (around lines 2287-2319, 572-573) to include `capability` and `cost_class` per contract C1/C3, and specific rejection reasons per contract C2 (lines 2430-2451)
+- [x] T013 [P] [US2] Update the settings picker in `frontend/src/pages/settings.tsx` (around lines 27, 246-250) to render capability and a paid/cloud dispatch-gated indicator per contract C1
 
 **Checkpoint**: US2 independently testable — V5 scenario passes
 

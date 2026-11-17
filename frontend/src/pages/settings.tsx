@@ -84,9 +84,10 @@ export function SettingsPage() {
   const temperatureValue = temperature.trim() ? Number(temperature) : undefined;
   const topPValue = topP.trim() ? Number(topP) : undefined;
   const endpointValue = endpoint.trim() || null;
-  const selectedModelProvider = settings?.models.find((item) => item.id === selectedModel)?.provider;
+  const selectedModelOption = settings?.models.find((item) => item.id === selectedModel);
+  const selectedModelProvider = selectedModelOption?.provider;
   const supportsLocalContext =
-    selectedModelProvider === "Ollama" && !selectedModel.toLowerCase().endsWith(":cloud");
+    selectedModelProvider === "Ollama" && selectedModelOption?.cost_class === "local";
   const parameters = {
     ...(maxTokensValue !== undefined ? { max_tokens: maxTokensValue } : {}),
     ...(supportsLocalContext && contextSizeValue !== undefined
@@ -247,7 +248,15 @@ export function SettingsPage() {
                     <SelectTrigger id="model-choice"><SelectValue /></SelectTrigger>
                     <SelectContent>
                       {settings.models.map((item) => (
-                        <SelectItem key={item.id} value={item.id}>{item.label} · {item.provider}</SelectItem>
+                        <SelectItem key={item.id} value={item.id}>
+                          <span>{item.label} · {item.provider}{item.capability ? ` · ${item.capability}` : ""}</span>
+                          {item.cost_class === "paid-cloud" ? (
+                            <Badge variant="warning" className="ml-2">PAID / CLOUD · DISPATCH-GATED</Badge>
+                          ) : null}
+                          {item.cost_class === "local" ? (
+                            <Badge variant="positive" className="ml-2">LOCAL</Badge>
+                          ) : null}
+                        </SelectItem>
                       ))}
                     </SelectContent>
                   </Select>

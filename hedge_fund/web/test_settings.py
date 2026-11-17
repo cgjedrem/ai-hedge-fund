@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 from pydantic import SecretStr
 
 from hedge_fund.llm import DEFAULT_MODEL, load_api_models
-from hedge_fund.llm.registry import is_supported
+from hedge_fund.llm.registry import ModelCatalogEntry, is_supported
 from hedge_fund.runtime.capture import (
     CredentialHandle,
     freeze_capture,
@@ -35,6 +35,30 @@ from hedge_fund.test_support.network_guard import (
 from hedge_fund.web.app import create_app
 from hedge_fund.web.schemas import CredentialRequest, ModelRequest
 from hedge_fund.web.services import DeskService, ServiceError
+
+
+def test_settings_and_catalog_expose_ollama_model_classifiers(tmp_path):
+    service = DeskService(tmp_path)
+    try:
+        settings = service.settings()
+        catalog = service.catalog()
+
+        for response in (settings, catalog):
+            ollama = next(item for item in response["models"] if item["id"] == "kimi-k3:cloud")
+            assert ollama == {
+                "label": "Kimi K3 Cloud",
+                "id": "kimi-k3:cloud",
+                "provider": "Ollama",
+                "capability": "chat",
+                "cost_class": "paid-cloud",
+            }
+            assert all(
+                set(item) == {"label", "id", "provider"}
+                for item in response["models"]
+                if item["provider"] != "Ollama"
+            )
+    finally:
+        service.close()
 
 
 def test_settings_expose_presence_not_provider_values(tmp_path, monkeypatch):
@@ -422,7 +446,7 @@ def test_model_setting_is_catalog_allowlisted_and_persisted_by_root(tmp_path, mo
         with pytest.raises(ServiceError) as unknown:
             service.set_model(ModelRequest(model="unregistered-model", expected_version=1))
         assert unknown.value.status_code == 400
-        assert "unregistered-model" not in unknown.value.detail
+        assert unknown.value.detail == "Model 'unregistered-model' is not in the supported provider catalog."
     finally:
         service.close()
 
@@ -432,6 +456,64 @@ def test_model_setting_is_catalog_allowlisted_and_persisted_by_root(tmp_path, mo
         assert restarted.settings()["version"] == 1
     finally:
         restarted.close()
+
+
+def test_model_write_api_uses_specific_credential_free_rejections(tmp_path, monkeypatch):
+    from hedge_fund.web import services as web_services
+
+    enroll_synthetic_root(tmp_path)
+    unknown_model = "unregistered-model"
+    embedding_model = "nomic-embed-text:latest"
+    lookup = getattr(web_services, "catalog_entry_for", lambda _model_id: None)
+
+    def catalog_entry_for(model_id):
+        if model_id == embedding_model:
+            return ModelCatalogEntry(
+                "Nomic Embed",
+                embedding_model,
+                "Ollama",
+                "embedding",
+                "local",
+            )
+        return lookup(model_id)
+
+    monkeypatch.setattr(web_services, "catalog_entry_for", catalog_entry_for, raising=False)
+    app = create_app(root=tmp_path, allow_writes=True)
+    with TestClient(app, client=("127.0.0.1", 50000)) as client:
+        token = client.get("/api/capabilities", headers={"host": "127.0.0.1"}).json()["mutation_token"]
+        headers = {
+            "host": "127.0.0.1",
+            "origin": "http://127.0.0.1",
+            "x-csrf-token": token,
+        }
+        unknown_post = client.post(
+            "/api/settings/model",
+            headers=headers,
+            json={"model": unknown_model, "expected_version": 0},
+        )
+        unknown_put = client.put(
+            "/api/settings",
+            headers=headers,
+            json={
+                "data_provider": "yfinance",
+                "model": unknown_model,
+                "endpoint": None,
+                "timeout_seconds": 60.0,
+                "parameters": {},
+                "expected_version": 0,
+            },
+        )
+        embedding_post = client.post(
+            "/api/settings/model",
+            headers=headers,
+            json={"model": embedding_model, "expected_version": 0},
+        )
+
+    assert unknown_post.status_code == unknown_put.status_code == 400
+    assert unknown_post.json()["detail"] == unknown_put.json()["detail"] == f"Model '{unknown_model}' is not in the supported provider catalog."
+    assert embedding_post.status_code == 400
+    assert embedding_post.json()["detail"] == f"Model '{embedding_model}' is not chat-capable (embedding)."
+    assert "secret" not in json.dumps([unknown_post.json(), unknown_put.json(), embedding_post.json()]).casefold()
 
 
 def test_effective_settings_resolve_environment_precedence(tmp_path, monkeypatch):
