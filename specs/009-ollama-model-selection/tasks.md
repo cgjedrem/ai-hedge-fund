@@ -30,11 +30,11 @@
 
 **⚠️ CRITICAL**: No user story work can begin until this phase is complete
 
-- [ ] T002 Extend the Ollama section of `hedge_fund/llm/api_models.json` with `kimi-k3:cloud` and add `capability` (`chat`/`embedding`/`ocr`) and `cost_class` (`local`/`paid-cloud`) fields to Ollama entries; classify `kimi-k3:cloud` as chat + paid-cloud per data-model.md
-- [ ] T003 Expose the new `capability` and `cost_class` classifiers through `hedge_fund/llm/registry.py` without changing provider resolution semantics for non-Ollama providers (FR-011)
-- [ ] T004 [P] Write failing registry/catalog tests in `hedge_fund/llm/test_client.py` (or the existing registry test module) covering: new entry present with correct classifiers, non-Ollama entries byte-identical in meaning
-- [ ] T005 Rework the model whitelist in `hedge_fund/runtime/configuration.py` (around lines 29-37, 526-541) to derive from the catalog instead of a parallel literal list, rejecting unknown tags with an explicit per-tag reason and rejecting non-chat capabilities for analysis use (FR-001, FR-002, FR-006)
-- [ ] T006 [P] Write failing configuration tests in `hedge_fund/runtime/test_capture.py` covering: `kimi-k3:cloud` accepted, unknown tag rejected with explicit reason, embedding/OCR tag rejected with capability reason, precedence launch > env > persisted > default unchanged (V1, V6)
+- [x] T002 Extend the Ollama section of `hedge_fund/llm/api_models.json` with `kimi-k3:cloud` and add `capability` (`chat`/`embedding`/`ocr`) and `cost_class` (`local`/`paid-cloud`) fields to Ollama entries; classify `kimi-k3:cloud` as chat + paid-cloud per data-model.md
+- [x] T003 Expose the new `capability` and `cost_class` classifiers through `hedge_fund/llm/registry.py` without changing provider resolution semantics for non-Ollama providers (FR-011)
+- [x] T004 [P] Write failing registry/catalog tests in `hedge_fund/llm/test_client.py` (or the existing registry test module) covering: new entry present with correct classifiers, non-Ollama entries byte-identical in meaning
+- [x] T005 Rework the model whitelist in `hedge_fund/runtime/configuration.py` (around lines 29-37, 526-541) to derive from the catalog instead of a parallel literal list, rejecting unknown tags with an explicit per-tag reason and rejecting non-chat capabilities for analysis use (FR-001, FR-002, FR-006)
+- [x] T006 [P] Write failing configuration tests in `hedge_fund/runtime/test_capture.py` covering: `kimi-k3:cloud` accepted, unknown tag rejected with explicit reason, embedding/OCR tag rejected with capability reason, precedence launch > env > persisted > default unchanged (V1, V6)
 
 **Checkpoint**: Catalog is single-sourced; validation accepts `kimi-k3:cloud` and rejects invalid tags explicitly — user story implementation can now begin
 

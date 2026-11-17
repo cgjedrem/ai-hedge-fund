@@ -26,15 +26,7 @@ DEFAULT_DATA_PROVIDER = "yfinance"
 DEFAULT_MODEL = "gemma3:4b"
 DEFAULT_TIMEOUT_SECONDS = 60.0
 _PROVIDERS = {provider.casefold(): provider for provider in ("OpenAI", "xAI", "DeepSeek", "Kimi", "TypeSafe", "Ollama")}
-_MODEL_PROVIDERS = {
-    "gpt-6-sol": "OpenAI",
-    "gpt-6-astra": "OpenAI",
-    "jev-1.13.0": "TypeSafe",
-    "grok-4.7": "xAI",
-    "deepseek-flash": "DeepSeek",
-    "kimi-k3": "Kimi",
-    "gemma3:4b": "Ollama",
-}
+_MODEL_CATALOG_PATH = Path(__file__).resolve().parents[1] / "llm" / "api_models.json"
 _DEFAULT_LLM_PROVIDER = "Ollama"
 _DATA_PROVIDERS = {
     "fd": "fd",
@@ -61,6 +53,56 @@ _ENVIRONMENT_FIELDS = {
 }
 _PARAMETER_FIELDS = frozenset({"context_size", "max_tokens", "temperature", "top_p"})
 _PROVENANCE_VALUES = frozenset({"default", "persisted", "environment", "launch"})
+_MODEL_CAPABILITIES = frozenset({"chat", "embedding", "ocr"})
+_MODEL_COST_CLASSES = frozenset({"local", "paid-cloud"})
+
+
+@dataclass(frozen=True, slots=True)
+class _ModelCatalogMetadata:
+    provider: str
+    capability: str | None
+    cost_class: str | None
+
+
+def _load_model_catalog() -> dict[str, _ModelCatalogMetadata]:
+    try:
+        records = json.loads(_MODEL_CATALOG_PATH.read_text(encoding="utf-8"))
+        if not isinstance(records, list):
+            raise ValueError("model catalog is invalid")
+        catalog = {}
+        for record in records:
+            if not isinstance(record, dict):
+                raise ValueError("model catalog is invalid")
+            model = record.get("model_name")
+            provider = record.get("provider")
+            capability = record.get("capability")
+            cost_class = record.get("cost_class")
+            if not isinstance(model, str) or not model or model != model.strip():
+                raise ValueError("model catalog is invalid")
+            if not isinstance(provider, str) or not provider or provider != provider.strip():
+                raise ValueError("model catalog is invalid")
+            if provider == "Ollama" and (capability not in _MODEL_CAPABILITIES or cost_class not in _MODEL_COST_CLASSES):
+                raise ValueError("model catalog is invalid")
+            if capability is not None and capability not in _MODEL_CAPABILITIES:
+                raise ValueError("model catalog is invalid")
+            if cost_class is not None and cost_class not in _MODEL_COST_CLASSES:
+                raise ValueError("model catalog is invalid")
+            if model in catalog:
+                raise ValueError("model catalog is invalid")
+            catalog[model] = _ModelCatalogMetadata(provider, capability, cost_class)
+        if not catalog:
+            raise ValueError("model catalog is invalid")
+        return catalog
+    except (OSError, ValueError, TypeError):
+        return {DEFAULT_MODEL: _ModelCatalogMetadata("Ollama", "chat", "local")}
+
+
+_MODEL_CATALOG = _load_model_catalog()
+_MODEL_PROVIDERS = {
+    model: entry.provider
+    for model, entry in _MODEL_CATALOG.items()
+    if entry.provider.casefold() in _PROVIDERS
+}
 
 
 class ConfigurationError(ValueError):
@@ -534,11 +576,18 @@ def _normalize_settings(values: Mapping[str, object]) -> dict[str, object]:
         raise ConfigurationError("LLM provider is unsupported")
     normalized_provider = _PROVIDERS[llm_provider.casefold()]
     model = _validate_text(values["model"], maximum=256, message="model is invalid")
+    catalog_entry = _MODEL_CATALOG.get(model)
     registered_provider = _MODEL_PROVIDERS.get(model)
+    if registered_provider is None and catalog_entry is not None and catalog_entry.provider.casefold() in _PROVIDERS:
+        registered_provider = _PROVIDERS[catalog_entry.provider.casefold()]
     if registered_provider is None:
+        if normalized_provider == "Ollama" and catalog_entry is None:
+            raise ConfigurationError(f"Model '{model}' is not in the supported provider catalog.")
         raise ConfigurationError("model is not in the supported catalog")
     if registered_provider != normalized_provider:
         raise ConfigurationError("model and provider do not match")
+    if registered_provider == "Ollama" and catalog_entry is not None and catalog_entry.capability != "chat":
+        raise ConfigurationError(f"Model '{model}' is not chat-capable ({catalog_entry.capability}).")
     parameters = _normalize_parameters(values["parameters"])
     if "context_size" in parameters and (
         normalized_provider != "Ollama" or model.casefold().endswith(":cloud")

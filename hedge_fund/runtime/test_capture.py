@@ -3,6 +3,7 @@ import json
 import os
 from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -232,16 +233,72 @@ def test_runtime_provider_catalog_matches_engine_registry():
     assert configuration._MODEL_PROVIDERS == {model: provider for _, model, provider in load_api_models() if provider in SUPPORTED_PROVIDERS}
 
 
-def test_cloud_ollama_models_are_not_selectable_or_resolvable(root_context):
-    from hedge_fund.llm.registry import load_api_models
+def test_cloud_ollama_model_is_selectable_from_all_configuration_sources(root_context):
+    default = resolve_settings(root_context)
+    persisted = resolve_settings(
+        root_context,
+        persisted={"model": "kimi-k3:cloud"},
+    )
+    environment = resolve_settings(
+        root_context,
+        environment={"model": "kimi-k3:cloud"},
+    )
+    launch = resolve_settings(
+        root_context,
+        launch={"model": "kimi-k3:cloud"},
+    )
 
-    models = {model for _, model, _provider in load_api_models()}
-    assert not any(model.endswith(":cloud") for model in models)
-    with pytest.raises(ConfigurationError, match="supported catalog"):
+    assert default.model == "gemma3:4b"
+    for settings in (persisted, environment, launch):
+        assert settings.model == "kimi-k3:cloud"
+        assert settings.llm_provider == "Ollama"
+    assert persisted.provenance["model"] == "persisted"
+    assert environment.provenance["model"] == "environment"
+    assert launch.provenance["model"] == "launch"
+
+
+def test_unknown_model_has_explicit_catalog_reason(root_context):
+    model = "kimi-k3.1:latest"
+
+    with pytest.raises(ConfigurationError) as caught:
         resolve_settings(
             root_context,
-            launch={"model": "glm-5.3:cloud"},
+            launch={"model": model},
         )
+
+    assert str(caught.value) == f"Model '{model}' is not in the supported provider catalog."
+
+
+@pytest.mark.parametrize(
+    ("model", "capability"),
+    [
+        ("nomic-embed-text:latest", "embedding"),
+        ("glm-ocr:latest", "ocr"),
+    ],
+)
+def test_non_chat_ollama_metadata_is_rejected_with_capability_reason(
+    model,
+    capability,
+    root_context,
+    monkeypatch,
+):
+    from hedge_fund.runtime import configuration
+
+    catalog = dict(getattr(configuration, "_MODEL_CATALOG", {}))
+    catalog[model] = SimpleNamespace(
+        provider="Ollama",
+        capability=capability,
+        cost_class="local",
+    )
+    monkeypatch.setattr(configuration, "_MODEL_CATALOG", catalog, raising=False)
+
+    with pytest.raises(ConfigurationError) as caught:
+        resolve_settings(
+            root_context,
+            launch={"llm_provider": "Ollama", "model": model},
+        )
+
+    assert str(caught.value) == f"Model '{model}' is not chat-capable ({capability})."
 
 
 def test_environment_cannot_elevate_root_writes_network_or_paid_policy(root_context, tmp_path):

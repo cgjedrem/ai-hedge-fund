@@ -34,6 +34,7 @@ from hedge_fund.llm import (
     provider_for,
     SUPPORTED_PROVIDERS,
 )
+from hedge_fund.llm import registry as registry_module
 from hedge_fund.llm.client import _flatten, JevLLM
 from hedge_fund.llm.registry import PROVIDER_ENV_VARS
 from hedge_fund.llm.test_contract import _response
@@ -229,6 +230,32 @@ def test_provider_for_reads_the_registry():
     assert provider_for("gpt-6-sol") == "OpenAI"
     assert provider_for("gpt-6-astra") == "OpenAI"
     assert provider_for("not-a-model") is None
+
+
+def test_ollama_catalog_exposes_chat_and_paid_cloud_classifiers():
+    entry = registry_module.catalog_entry_for("kimi-k3:cloud")
+
+    assert entry.model_name == "kimi-k3:cloud"
+    assert entry.provider == "Ollama"
+    assert entry.capability == "chat"
+    assert entry.cost_class == "paid-cloud"
+    assert provider_for("kimi-k3:cloud") == "Ollama"
+
+
+def test_non_ollama_registry_entries_keep_existing_model_semantics():
+    entries = [(display, model, provider) for display, model, provider in load_api_models() if provider != "Ollama"]
+
+    assert entries == [
+        ("Opus 5.5", "claude-opus-5-5", "Anthropic"),
+        ("Fable 5.1", "claude-fable-5-1", "Anthropic"),
+        ("GPT-6 Sol", "gpt-6-sol", "OpenAI"),
+        ("GPT-6 Astra", "gpt-6-astra", "OpenAI"),
+        ("Jev", "jev-1.13.0", "TypeSafe"),
+        ("Grok 4.7", "grok-4.7", "xAI"),
+        ("DeepSeek V4.1 Flash", "deepseek-flash", "DeepSeek"),
+        ("Kimi K3", "kimi-k3", "Kimi"),
+        ("Gemini 3.8 Flash", "gemini-3.8-flash", "Google"),
+    ]
 
 
 class FakeChunk:
