@@ -833,8 +833,6 @@ class DeskService:
         self._safe_child("paper", normalized, "broker.json")
         try:
             events, corrupt_event_digests = ledger.recovery_events_with_unresolved_corruption()
-            if corrupt_event_digests:
-                raise ServiceError(423, "Paper audit history is invalid (LedgerError).", code="replay-corrupt")
             snapshot = build_reconciliation_snapshot(directory, deployed, ledger, state, latest)
             intent_snapshot = build_tick_intent_reconciliation_snapshot(
                 directory,
