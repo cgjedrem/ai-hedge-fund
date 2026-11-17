@@ -56,18 +56,22 @@ class HomeScreen(Screen):
         yield Footer()
 
     def on_mount(self) -> None:
-        # Same seam as the CLI picker: HEDGE_FUND_LLM_MODEL steers every agent built
-        # downstream. Honor a preset from the shell — even an unlisted one, so
-        # a model newer than the registry still works — otherwise pin the
-        # default, so what the screen shows is what the agents use.
+        # Unknown shell presets stay effective; no implicit model substitution.
         models = load_api_models()
         preset = os.environ.get("HEDGE_FUND_LLM_MODEL")
         known = {mid for _, mid, _ in models}
-        self._model_id = preset if preset in known else next(
-            (mid for label, mid, _ in models if label == DEFAULT_MODEL_LABEL),
-            models[0][1],
-        )
-        os.environ["HEDGE_FUND_LLM_MODEL"] = self._model_id
+        if preset is not None and preset not in known:
+            self._model_id = preset
+            self.notify(
+                f"Model '{preset}' is not in the supported provider catalog.",
+                severity="warning",
+            )
+        else:
+            self._model_id = preset or next(
+                (mid for label, mid, _ in models if label == DEFAULT_MODEL_LABEL),
+                models[0][1],
+            )
+            os.environ["HEDGE_FUND_LLM_MODEL"] = self._model_id
         self._show_model()
         self.query_one("#home-menu", OptionList).focus()
 

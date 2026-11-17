@@ -966,7 +966,7 @@ def _verify_enrolled_head(participant, name: str) -> None:
 
 def _cli_settings(root: RootContext, args, parser: argparse.ArgumentParser):
     from hedge_fund.runtime.admission import AdmissionCoordinator, AdmissionError
-    from hedge_fund.runtime.configuration import ConfigurationError, resolve_settings
+    from hedge_fund.runtime.configuration import ConfigurationError, ModelSelectionError, resolve_settings
 
     admission = AdmissionCoordinator(root)
     launch = {"model": args.model} if args.model else None
@@ -976,6 +976,8 @@ def _cli_settings(root: RootContext, args, parser: argparse.ArgumentParser):
             admission=admission,
             launch=launch,
         )
+    except ModelSelectionError as exc:
+        parser.error(str(exc))
     except (AdmissionError, ConfigurationError, OSError, ValueError):
         parser.error("captured runtime settings are unavailable")
     return settings, admission

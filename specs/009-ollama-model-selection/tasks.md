@@ -48,13 +48,13 @@
 
 ### Tests for User Story 1
 
-- [ ] T007 [P] [US1] Write failing CLI surfacing tests covering `--model kimi-k3:cloud` acceptance and unknown-tag fast failure with the catalog reason (not masked as `captured runtime settings are unavailable`) in the existing `hedge_fund/` CLI test module for `run.py`
-- [ ] T008 [P] [US1] Write failing TUI test in `hedge_fund/tui/` covering: unknown persisted preset yields an explicit notice and NO silent substitution with a catalog default (V2)
+- [x] T007 [P] [US1] Write failing CLI surfacing tests covering `--model kimi-k3:cloud` acceptance and unknown-tag fast failure with the catalog reason (not masked as `captured runtime settings are unavailable`) in the existing `hedge_fund/` CLI test module for `run.py`
+- [x] T008 [P] [US1] Write failing TUI test in `hedge_fund/tui/` covering: unknown persisted preset yields an explicit notice and NO silent substitution with a catalog default (V2)
 
 ### Implementation for User Story 1
 
-- [ ] T009 [US1] Fix model-validation error surfacing in `hedge_fund/run.py` (around lines 967-980) so model-validation failures propagate their explicit reason while genuine settings-capture failures keep the existing mask (contract C4)
-- [ ] T010 [US1] Replace the silent preset fallback in `hedge_fund/tui/home.py` (lines 58-70) with an explicit notice and unchanged effective selection (contract C5, FR-003); update the outdated comment
+- [x] T009 [US1] Fix model-validation error surfacing in `hedge_fund/run.py` (around lines 967-980) so model-validation failures propagate their explicit reason while genuine settings-capture failures keep the existing mask (contract C4)
+- [x] T010 [US1] Replace the silent preset fallback in `hedge_fund/tui/home.py` (lines 58-70) with an explicit notice and unchanged effective selection (contract C5, FR-003); update the outdated comment
 
 **Checkpoint**: US1 independently testable — V1/V2 scenarios pass
 

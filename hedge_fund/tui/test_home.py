@@ -194,3 +194,26 @@ def test_home_offers_paper_trading_first_and_an_empty_paper_screen_denies_builds
             assert isinstance(app.screen, funds.FundSelectScreen)
 
     asyncio.run(scenario())
+
+
+def test_unknown_home_preset_keeps_model_and_reports_rejection(monkeypatch, isolated_configuration):
+    preset = "kimi-k3.1:latest"
+    notices = []
+    monkeypatch.setenv("HEDGE_FUND_LLM_MODEL", preset)
+    monkeypatch.setattr(
+        home.HomeScreen,
+        "notify",
+        lambda _screen, message, **_kwargs: notices.append(message),
+    )
+
+    async def scenario():
+        app = HedgeFundApp()
+        async with app.run_test(size=(100, 35)):
+            assert isinstance(app.screen, home.HomeScreen)
+            assert app.screen._model_id == preset
+            assert os.environ["HEDGE_FUND_LLM_MODEL"] == preset
+            assert preset in render(app.screen.query_one("#model-line", Static).content)
+
+    asyncio.run(scenario())
+
+    assert notices == [f"Model '{preset}' is not in the supported provider catalog."]

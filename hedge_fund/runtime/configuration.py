@@ -109,6 +109,10 @@ class ConfigurationError(ValueError):
     """Settings input or persisted data is invalid."""
 
 
+class ModelSelectionError(ConfigurationError):
+    """Model selection failed validation."""
+
+
 class SettingsConflict(RuntimeError):
     """Persisted settings version changed."""
 
@@ -582,12 +586,14 @@ def _normalize_settings(values: Mapping[str, object]) -> dict[str, object]:
         registered_provider = _PROVIDERS[catalog_entry.provider.casefold()]
     if registered_provider is None:
         if normalized_provider == "Ollama" and catalog_entry is None:
-            raise ConfigurationError(f"Model '{model}' is not in the supported provider catalog.")
+            raise ModelSelectionError(f"Model '{model}' is not in the supported provider catalog.")
         raise ConfigurationError("model is not in the supported catalog")
     if registered_provider != normalized_provider:
+        if "Ollama" in {registered_provider, normalized_provider}:
+            raise ModelSelectionError("model and provider do not match")
         raise ConfigurationError("model and provider do not match")
     if registered_provider == "Ollama" and catalog_entry is not None and catalog_entry.capability != "chat":
-        raise ConfigurationError(f"Model '{model}' is not chat-capable ({catalog_entry.capability}).")
+        raise ModelSelectionError(f"Model '{model}' is not chat-capable ({catalog_entry.capability}).")
     parameters = _normalize_parameters(values["parameters"])
     if "context_size" in parameters and (
         normalized_provider != "Ollama" or model.casefold().endswith(":cloud")

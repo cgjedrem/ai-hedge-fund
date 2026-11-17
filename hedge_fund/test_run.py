@@ -935,6 +935,86 @@ def test_paid_provider_requires_explicit_consent_even_with_network_and_env_key(
     assert not (root / "paper").exists()
 
 
+def test_cli_model_flag_accepts_catalog_ollama_cloud_tag(tmp_path, monkeypatch):
+    from hedge_fund.runtime.root import RootContext
+
+    root = tmp_path / "cli-cloud-model"
+    root.mkdir()
+    monkeypatch.setenv("HEDGE_FUND_LLM_MODEL", "gemma3:4b")
+    parser = run._parser()
+    args = parser.parse_args(["--root", str(root), "--model", "kimi-k3:cloud"])
+
+    with RootContext.open(root) as context:
+        settings, _admission = run._cli_settings(context, args, parser)
+
+    assert settings.model == "kimi-k3:cloud"
+    assert settings.llm_provider == "Ollama"
+    assert settings.provenance["model"] == "launch"
+
+
+def test_cli_unknown_model_fails_with_catalog_reason(tmp_path, capsys):
+    from hedge_fund.runtime.root import RootContext
+
+    root = tmp_path / "cli-unknown-model"
+    root.mkdir()
+    model = "kimi-k3.1:latest"
+    parser = run._parser()
+    args = parser.parse_args(["--root", str(root), "--model", model])
+
+    with RootContext.open(root) as context:
+        with pytest.raises(SystemExit) as rejected:
+            run._cli_settings(context, args, parser)
+
+    output = capsys.readouterr()
+    assert rejected.value.code == 2
+    assert f"Model '{model}' is not in the supported provider catalog." in output.err
+    assert "captured runtime settings are unavailable" not in output.err
+
+
+def test_cli_settings_failure_keeps_generic_capture_message(tmp_path, monkeypatch, capsys):
+    from hedge_fund.runtime import configuration
+    from hedge_fund.runtime.root import RootContext
+
+    root = tmp_path / "cli-invalid-settings"
+    root.mkdir()
+    monkeypatch.setattr(
+        configuration,
+        "resolve_settings",
+        Mock(side_effect=configuration.ConfigurationError("settings record is invalid")),
+    )
+    parser = run._parser()
+    args = parser.parse_args(["--root", str(root), "--model", "kimi-k3:cloud"])
+
+    with RootContext.open(root) as context:
+        with pytest.raises(SystemExit) as rejected:
+            run._cli_settings(context, args, parser)
+
+    output = capsys.readouterr()
+    assert rejected.value.code == 2
+    assert "captured runtime settings are unavailable" in output.err
+    assert "settings record is invalid" not in output.err
+
+
+def test_cli_non_ollama_provider_mismatch_keeps_existing_capture_message(tmp_path, monkeypatch, capsys):
+    from hedge_fund.runtime.root import RootContext
+
+    root = tmp_path / "cli-provider-mismatch"
+    root.mkdir()
+    monkeypatch.setenv("HEDGE_FUND_LLM_MODEL", "gpt-6-sol")
+    monkeypatch.setenv("HEDGE_FUND_LLM_PROVIDER", "Kimi")
+    parser = run._parser()
+    args = parser.parse_args(["--root", str(root)])
+
+    with RootContext.open(root) as context:
+        with pytest.raises(SystemExit) as rejected:
+            run._cli_settings(context, args, parser)
+
+    output = capsys.readouterr()
+    assert rejected.value.code == 2
+    assert "captured runtime settings are unavailable" in output.err
+    assert "model and provider do not match" not in output.err
+
+
 def test_paid_fd_cli_backtest_uses_guarded_client_and_fake_transport(
     tmp_path,
     monkeypatch,
