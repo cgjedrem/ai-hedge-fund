@@ -69,6 +69,18 @@
 - Expected/observed: `3 passed in 27.94s`, exit `0`; fixtures cover unkeyed/no-effect failures, explicit transmitted-fill metadata, verified head advancement, broker-book divergence, and malformed audit bytes.
 - T002 failing-first probe disposition: added the missing fixture variant support and helpers; no production write primitive was introduced.
 
+### T003–T005 foundational decision record and replay
+
+- Result: **PASS** for foundational model, append, and replay tests; quickstart Scenarios A–D remain **INCONCLUSIVE** pending the web/API/UI implementation and final suite.
+- Recorded: `2026-11-17T12:25:13.6744204+01:00`.
+- Source: `HEAD` `b90a5d95f2bd8ed27d88dd81b355683120e1e3d0`; dirty source diff SHA-256 `242eb7a31953a50d72919a6926fc998928461a1465443aef884a67d7eaa608df` (`12529` bytes) for `hedge_fund/paper/ledger.py`, `hedge_fund/runtime/reconciliation.py`, and `hedge_fund/runtime/test_reconciliation.py`.
+- Artifact/environment: no built wheel; Poetry executed working-tree source. Microsoft Windows NT `10.0.26200.0`; Python `3.11.15`; Poetry `2.5.1`.
+- Exact commands and results:
+  - `poetry run pytest hedge_fund/runtime/test_reconciliation.py -q` — `18 passed in 83.34s`, exit `0`.
+  - `poetry run pytest hedge_fund/runtime/test_writer_map.py -q` — `119 passed in 6.25s`, exit `0`.
+- Scenario/provenance: automated fake/unit tests on isolated enrolled `tmp_path` roots; verified decision validation, exact multi-failure resolution, duplicate replay, unknown/partial-set refusal, invalid-input and missing-lane zero writes, and preservation of pre-existing file bytes. Existing `test_legacy_failure_receipt_replay_preserves_resolution` ran in the reconciliation module. No provider, LLM, broker, paid-credit, or real-data-root access.
+- Next check: failing-first US1 preview/confirm tests, then implement the web flow.
+
 ## Acceptance scenarios
 
 | Scenario | Status | Evidence |

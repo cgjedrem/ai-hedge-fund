@@ -48,6 +48,7 @@ from hedge_fund.pipeline.session import FundState, next_state, SessionRecord
 
 if TYPE_CHECKING:
     from hedge_fund.runtime.admission import PaperApprovalAdmission
+    from hedge_fund.runtime.reconciliation import LegacyFailureReconciliationDecision
 
 LEDGER_SUBDIR = "ledger"
 SUPERSEDED_SUBDIR = "superseded"  # records taken off the chain by a redo, kept
@@ -2196,6 +2197,19 @@ class Ledger:
         return True
 
     # ---- events -----------------------------------------------------------
+
+    def record_legacy_failure_reconciliation(self, decision: LegacyFailureReconciliationDecision) -> None:
+        from hedge_fund.runtime.reconciliation import LegacyFailureReconciliationDecision
+
+        try:
+            validated = LegacyFailureReconciliationDecision.model_validate(decision)
+        except (TypeError, ValueError):
+            raise LedgerError("legacy failure reconciliation decision is invalid") from None
+        self.log_event(
+            "legacy_failure_reconciliation",
+            durable=True,
+            decision=validated.model_dump(mode="json"),
+        )
 
     def log_event(self, kind: str, *, durable: bool = False, **fields) -> None:
         halt_event = kind in {"halt_intent", "halt"}

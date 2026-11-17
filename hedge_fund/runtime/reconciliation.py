@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, model_validator
 
 _REQUEST_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _HEX_ID = re.compile(r"^[a-f0-9]{32}$")
@@ -183,6 +183,60 @@ class ReconciliationReceipt(BaseModel):
 
     def matches_failure(self, failure_event: dict) -> bool:
         return self.failure_id == failure_digest(failure_event) and self.expected_head == failure_event.get("expected_head") and self.failed_request_id == failure_event.get("request_id") and self.operation_id == failure_event.get("operation_id") and self.capture_id == failure_event.get("capture_id") and self.capture_digest == failure_event.get("capture_digest")
+
+
+class LegacyFailureReconciliationDecision(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, revalidate_instances="always")
+
+    schema_version: Literal[1] = 1
+    decision_id: str = Field(pattern=_SHA256.pattern)
+    failure_digests: list[str] = Field(min_length=1)
+    ledger_head: str = Field(pattern=_SHA256.pattern)
+    book_digest: str = Field(pattern=_SHA256.pattern)
+    operator: str = Field(min_length=1, max_length=180)
+    recorded_time: str
+    attestation: StrictBool
+
+    @model_validator(mode="after")
+    def _validate_decision(self) -> LegacyFailureReconciliationDecision:
+        if any(_SHA256.fullmatch(digest) is None for digest in self.failure_digests):
+            raise ValueError("failure digests must be SHA-256 identities")
+        if len(set(self.failure_digests)) != len(self.failure_digests):
+            raise ValueError("failure digests must be unique")
+        if self.operator != self.operator.strip() or any(ord(char) < 32 or ord(char) == 127 for char in self.operator):
+            raise ValueError("operator identity is invalid")
+        _parse_aware_timestamp(self.recorded_time, "recorded_time")
+        if self.attestation is not True:
+            raise ValueError("operator attestation is required")
+        if self.decision_id != self.compute_decision_id():
+            raise ValueError("decision_id does not match the decision contents")
+        return self
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        failure_digests: list[str],
+        ledger_head: str,
+        book_digest: str,
+        operator: str,
+        recorded_time: str,
+        attestation: bool,
+    ) -> LegacyFailureReconciliationDecision:
+        payload = {
+            "schema_version": 1,
+            "failure_digests": failure_digests,
+            "ledger_head": ledger_head,
+            "book_digest": book_digest,
+            "operator": operator,
+            "recorded_time": recorded_time,
+            "attestation": attestation,
+        }
+        payload["decision_id"] = _receipt_digest(payload)
+        return cls.model_validate(payload)
+
+    def compute_decision_id(self) -> str:
+        return _receipt_digest(self.model_dump(mode="json", exclude={"decision_id"}))
 
 
 class TickIntentReconciliationPreview(BaseModel):
@@ -372,11 +426,15 @@ def unresolved_tick_failures(events: list[dict]) -> list[dict]:
     if not isinstance(events, list) or any(not isinstance(event, dict) for event in events):
         raise ValueError("paper events must be a list of objects")
     failures: dict[str, dict] = {}
+    failure_indexes: dict[str, int] = {}
     receipts: dict[str, ReconciliationReceipt] = {}
     resumed_receipts: dict[str, list[tuple[int, dict]]] = {}
+    decisions: list[tuple[int, LegacyFailureReconciliationDecision]] = []
     for event_index, event in enumerate(events):
         if event.get("kind") == "tick_failed":
-            failures[failure_digest(event)] = event
+            identity = failure_digest(event)
+            failures[identity] = event
+            failure_indexes.setdefault(identity, event_index)
         elif event.get("kind") == "reconciliation":
             try:
                 receipt = ReconciliationReceipt.model_validate(event.get("receipt"))
@@ -389,7 +447,14 @@ def unresolved_tick_failures(events: list[dict]) -> list[dict]:
             receipt_id = event.get("reconciliation_id")
             if isinstance(receipt_id, str) and _SHA256.fullmatch(receipt_id):
                 resumed_receipts.setdefault(receipt_id, []).append((event_index, event))
+        elif event.get("kind") == "legacy_failure_reconciliation":
+            try:
+                decision = LegacyFailureReconciliationDecision.model_validate(event.get("decision"))
+            except (TypeError, ValueError):
+                continue
+            decisions.append((event_index, decision))
     resolved = set()
+    resolved_indexes: dict[str, int] = {}
     for failure_id, receipt in receipts.items():
         for resume_index, resume_event in resumed_receipts.get(receipt.receipt_id, []):
             recorded_now = resume_event.get("time")
@@ -399,11 +464,36 @@ def unresolved_tick_failures(events: list[dict]) -> list[dict]:
                 except ValueError:
                     continue
                 identity_fields = ("head_hash", "by", "reconciliation_id", "request_id", "request_action", "request_digest")
-                matching_effect_intents = [event for event in events[resume_index + 1 :] if event.get("kind") == "resume_effect_intent" and all(event.get(field) == resume_event.get(field) for field in identity_fields)]
-                if len(matching_effect_intents) != 1:
+                matching_effect_indexes = [
+                    index
+                    for index, event in enumerate(events[resume_index + 1 :], start=resume_index + 1)
+                    if event.get("kind") == "resume_effect_intent" and all(event.get(field) == resume_event.get(field) for field in identity_fields)
+                ]
+                if len(matching_effect_indexes) != 1:
                     continue
+                resolved_indexes[failure_id] = matching_effect_indexes[0]
+            else:
+                resolved_indexes[failure_id] = resume_index
             resolved.add(failure_id)
             break
+    seen_decisions: dict[str, dict] = {}
+    decision_resolved = set()
+    for decision_index, decision in decisions:
+        payload = decision.model_dump(mode="json")
+        if decision.decision_id in seen_decisions:
+            continue
+        seen_decisions[decision.decision_id] = payload
+        unresolved_before_decision = [
+            failure_id
+            for failure_id in failures
+            if failure_indexes[failure_id] < decision_index
+            and failure_id not in decision_resolved
+            and (failure_id not in resolved_indexes or resolved_indexes[failure_id] >= decision_index)
+        ]
+        if decision.failure_digests != unresolved_before_decision:
+            continue
+        decision_resolved.update(decision.failure_digests)
+    resolved.update(decision_resolved)
     return [failure for identity, failure in failures.items() if identity not in resolved]
 
 

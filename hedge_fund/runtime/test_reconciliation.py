@@ -131,7 +131,6 @@ def _legacy_failure_decision(fixture, *, failure_digests=None):
 def _legacy_fixture_file_bytes(fixture):
     from hedge_fund.runtime.root import RootContext
 
-    prefix = fixture["directory"].relative_to(fixture["root"])
     with RootContext.open(fixture["root"]) as root:
         return {
             path.relative_to(fixture["root"]).as_posix(): root.read_bytes(path.relative_to(fixture["root"]).as_posix())
@@ -267,6 +266,23 @@ def test_legacy_failure_decision_replay_deduplicates_and_rejects_invalid_sets(tm
     )
     invalid_event = {"kind": "legacy_failure_reconciliation", "decision": invalid.model_dump(mode="json")}
     assert unresolved_tick_failures([*fixture["failures"], invalid_event]) == fixture["failures"]
+    partial = _legacy_failure_decision(fixture, failure_digests=[failure_digest(fixture["failures"][0])])
+    partial_event = {"kind": "legacy_failure_reconciliation", "decision": partial.model_dump(mode="json")}
+    assert unresolved_tick_failures([*fixture["failures"], partial_event]) == fixture["failures"]
+
+
+def test_legacy_failure_decision_requires_attestation_unique_digests_and_aware_time(tmp_path):
+    from hedge_fund.runtime.reconciliation import LegacyFailureReconciliationDecision
+
+    fixture = _legacy_failure_recovery_fixture(tmp_path)
+    fields = _legacy_failure_decision(fixture).model_dump(mode="json", exclude={"schema_version", "decision_id"})
+
+    with pytest.raises(ValidationError):
+        LegacyFailureReconciliationDecision.create(**{**fields, "attestation": False})
+    with pytest.raises(ValidationError):
+        LegacyFailureReconciliationDecision.create(**{**fields, "failure_digests": [fields["failure_digests"][0]] * 2})
+    with pytest.raises(ValidationError):
+        LegacyFailureReconciliationDecision.create(**{**fields, "recorded_time": "2026-11-17T11:05:00"})
 
 
 def test_legacy_failure_decision_append_preserves_existing_bytes(tmp_path):
@@ -291,6 +307,31 @@ def test_legacy_failure_decision_append_preserves_existing_bytes(tmp_path):
             assert after[relative][len(old_bytes) :].count(b"\n") == 1
         else:
             assert after[relative] == old_bytes
+
+
+def test_legacy_failure_decision_append_validates_input_and_requires_lane(tmp_path):
+    from hedge_fund.runtime.admission import AdmissionCoordinator, RootOwnerLease
+    from hedge_fund.runtime.root import RootContext
+
+    fixture = _legacy_failure_recovery_fixture(tmp_path)
+    before = _legacy_fixture_file_bytes(fixture)
+    decision = _legacy_failure_decision(fixture)
+
+    with pytest.raises(LedgerError):
+        fixture["ledger"].record_legacy_failure_reconciliation(decision)
+
+    with RootContext.open(tmp_path) as root:
+        with RootOwnerLease.acquire(root) as owner:
+            admission = AdmissionCoordinator(root, owner_lease=owner)
+            with admission.control_lane(fixture["spec"].name, timeout=0):
+                with pytest.raises(LedgerError):
+                    fixture["ledger"].record_legacy_failure_reconciliation({"invalid": True})
+                mutated = _legacy_failure_decision(fixture)
+                mutated.failure_digests.append("f" * 64)
+                with pytest.raises(LedgerError):
+                    fixture["ledger"].record_legacy_failure_reconciliation(mutated)
+
+    assert _legacy_fixture_file_bytes(fixture) == before
 
 
 def test_reconciliation_receipt_binds_failure_head_book_capture_and_operator():
