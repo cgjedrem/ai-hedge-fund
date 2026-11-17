@@ -39,6 +39,26 @@
 - Expected/observed: `1 failed in 0.87s`, exit `1`; `TypeError` confirmed the fixture did not yet accept `post_effect_indices`.
 - Next check: add the requested variant helpers and rerun T001/T002 focused tests.
 
+### T005 failing-first decision-record tests
+
+- Result: **FAIL** as expected before T003/T004 implementation.
+- Recorded: `2026-11-17T11:03:16.9805610+01:00`.
+- Source: phase-1 commit `a4ae12c36c799593db8326508ba245138295bbce`; dirty test diff SHA-256 `dbfb92dfcf668f89a3acf1a363c1d7e3e6826f9059fb05963e33918cf85e49a5` (`4617` bytes).
+- Exact command: `poetry run pytest hedge_fund/runtime/test_reconciliation.py::test_legacy_failure_decision_resolves_the_exact_unkeyed_set hedge_fund/runtime/test_reconciliation.py::test_legacy_failure_decision_replay_deduplicates_and_rejects_invalid_sets hedge_fund/runtime/test_reconciliation.py::test_legacy_failure_decision_append_preserves_existing_bytes -q`.
+- Provenance: automated fake/unit tests on isolated temporary roots; the append test failed before its ledger write.
+- Expected/observed: `3 failed in 25.77s`, exit `1`; all failed at the missing `LegacyFailureReconciliationDecision` import. This establishes the planned T003/T004 behavior was absent before implementation.
+- Next check: add the validated decision model, anchored Ledger append method, and fail-closed event replay; rerun decision tests plus legacy receipt regression.
+
+### T005 failing-first rerun before test commit
+
+- Result: **FAIL** as expected before implementation.
+- Recorded: `2026-11-17T12:15:17.2598268+01:00`.
+- Source: `HEAD` `a4ae12c36c799593db8326508ba245138295bbce`; uncommitted `hedge_fund/runtime/test_reconciliation.py` diff SHA-256 `dbfb92dfcf668f89a3acf1a363c1d7e3e6826f9059fb05963e33918cf85e49a5` (`4617` bytes).
+- Exact command: `poetry run pytest hedge_fund/runtime/test_reconciliation.py::test_legacy_failure_decision_resolves_the_exact_unkeyed_set hedge_fund/runtime/test_reconciliation.py::test_legacy_failure_decision_replay_deduplicates_and_rejects_invalid_sets hedge_fund/runtime/test_reconciliation.py::test_legacy_failure_decision_append_preserves_existing_bytes -q`.
+- Environment/provenance: Windows; isolated `tmp_path` fixtures; fake/unit tests only; no provider calls or real-data-root access.
+- Expected/observed: `3 failed in 29.72s`, exit `1`; each failed with `ImportError` for `LegacyFailureReconciliationDecision` before the append test reached its ledger write.
+- Next check: commit only the failing-first tests and this evidence update, then implement T003/T004.
+
 ### T001–T002 passing fixture matrix
 
 - Result: **PASS** for setup fixtures only; acceptance Scenarios A–D remain **INCONCLUSIVE** pending the recovery implementation.

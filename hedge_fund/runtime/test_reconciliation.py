@@ -1,3 +1,4 @@
+import hashlib
 from datetime import date, timedelta
 
 import pytest
@@ -110,6 +111,35 @@ def _legacy_failure_recovery_fixture(
     }
 
 
+def _legacy_failure_decision(fixture, *, failure_digests=None):
+    from hedge_fund.runtime.reconciliation import LegacyFailureReconciliationDecision, failure_digest
+    from hedge_fund.runtime.root import RootContext
+
+    relative = f"paper/{fixture['spec'].name}/broker.json"
+    with RootContext.open(fixture["root"]) as root:
+        book_digest = hashlib.sha256(root.read_bytes(relative)).hexdigest()
+    return LegacyFailureReconciliationDecision.create(
+        failure_digests=failure_digests or [failure_digest(event) for event in fixture["failures"]],
+        ledger_head=fixture["latest"].hash,
+        book_digest=book_digest,
+        operator="synthetic-operator",
+        recorded_time="2026-11-17T11:05:00+01:00",
+        attestation=True,
+    )
+
+
+def _legacy_fixture_file_bytes(fixture):
+    from hedge_fund.runtime.root import RootContext
+
+    prefix = fixture["directory"].relative_to(fixture["root"])
+    with RootContext.open(fixture["root"]) as root:
+        return {
+            path.relative_to(fixture["root"]).as_posix(): root.read_bytes(path.relative_to(fixture["root"]).as_posix())
+            for path in fixture["directory"].rglob("*")
+            if path.is_file()
+        }
+
+
 def _perturb_legacy_fixture_book(fixture, admission):
     with admission.manual_session(fixture["spec"].name, timeout=0):
         broker = PaperBroker(fixture["directory"] / "broker.json", fixture["spec"].costs)
@@ -208,6 +238,59 @@ def test_legacy_failure_fixture_supports_corrupt_book_and_head_variants(tmp_path
 
     _events, corrupt_digests = fixture["ledger"].recovery_events_with_unresolved_corruption()
     assert corrupt_digests
+
+
+def test_legacy_failure_decision_resolves_the_exact_unkeyed_set(tmp_path):
+    from hedge_fund.runtime.reconciliation import unresolved_tick_failures
+
+    fixture = _legacy_failure_recovery_fixture(tmp_path)
+    decision = _legacy_failure_decision(fixture)
+    event = {"kind": "legacy_failure_reconciliation", "decision": decision.model_dump(mode="json")}
+
+    assert decision.failure_digests == [failure_digest(failure) for failure in fixture["failures"]]
+    assert unresolved_tick_failures([*fixture["failures"], event]) == []
+
+
+def test_legacy_failure_decision_replay_deduplicates_and_rejects_invalid_sets(tmp_path):
+    from hedge_fund.runtime.reconciliation import unresolved_tick_failures
+
+    fixture = _legacy_failure_recovery_fixture(tmp_path)
+    decision_event = {
+        "kind": "legacy_failure_reconciliation",
+        "decision": _legacy_failure_decision(fixture).model_dump(mode="json"),
+    }
+
+    assert unresolved_tick_failures([*fixture["failures"], decision_event, decision_event]) == []
+    invalid = _legacy_failure_decision(
+        fixture,
+        failure_digests=[failure_digest(fixture["failures"][0]), "f" * 64],
+    )
+    invalid_event = {"kind": "legacy_failure_reconciliation", "decision": invalid.model_dump(mode="json")}
+    assert unresolved_tick_failures([*fixture["failures"], invalid_event]) == fixture["failures"]
+
+
+def test_legacy_failure_decision_append_preserves_existing_bytes(tmp_path):
+    from hedge_fund.runtime.admission import AdmissionCoordinator, RootOwnerLease
+    from hedge_fund.runtime.root import RootContext
+
+    fixture = _legacy_failure_recovery_fixture(tmp_path)
+    before = _legacy_fixture_file_bytes(fixture)
+    decision = _legacy_failure_decision(fixture)
+    with RootContext.open(tmp_path) as root:
+        with RootOwnerLease.acquire(root) as owner:
+            admission = AdmissionCoordinator(root, owner_lease=owner)
+            with admission.control_lane(fixture["spec"].name, timeout=0):
+                fixture["ledger"].record_legacy_failure_reconciliation(decision)
+
+    after = _legacy_fixture_file_bytes(fixture)
+    event_path = f"paper/{fixture['spec'].name}/events.jsonl"
+    assert set(before) == set(after)
+    for relative, old_bytes in before.items():
+        if relative == event_path:
+            assert after[relative].startswith(old_bytes)
+            assert after[relative][len(old_bytes) :].count(b"\n") == 1
+        else:
+            assert after[relative] == old_bytes
 
 
 def test_reconciliation_receipt_binds_failure_head_book_capture_and_operator():
