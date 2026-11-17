@@ -87,13 +87,13 @@
 
 ### Tests for User Story 3
 
-- [ ] T014 [P] [US3] Write failing policy tests in `hedge_fund/runtime/test_policy.py` covering: `:cloud`-suffixed tags classified paid/cloud via `cost_class` metadata, scheduled/unattended refusal independent of credentials, one-shot refusal without explicit authorization (V4)
-- [ ] T015 [P] [US3] Write failing dispatch tests in `hedge_fund/runtime/test_dispatch.py` covering: gated one-shot dispatch of a paid-cloud tag refused without verified cost model with that exact reason; loopback transport guardrails unchanged (V4, V7)
+- [x] T014 [P] [US3] Write failing policy tests in `hedge_fund/runtime/test_policy.py` covering: `:cloud`-suffixed tags classified paid/cloud via `cost_class` metadata, scheduled/unattended refusal independent of credentials, one-shot refusal without explicit authorization (V4)
+- [x] T015 [P] [US3] Write failing dispatch tests in `hedge_fund/runtime/test_dispatch.py` covering: gated one-shot dispatch of a paid-cloud tag refused without verified cost model with that exact reason; loopback transport guardrails unchanged (V4, V7)
 
 ### Implementation for User Story 3
 
-- [ ] T016 [US3] Key the paid/cloud classification in `hedge_fund/runtime/policy.py` (around lines 36, 270-273, 500-502) on the catalog `cost_class` metadata instead of hardcoded literals, preserving all existing classifications
-- [ ] T017 [US3] Add the Ollama cloud cost-model entry in `hedge_fund/runtime/costs.py` (around lines 22-28) using operator-supplied pricing, recorded as operator-declared per research D7; if pricing is unavailable at implementation time, dispatch MUST refuse with the explicit "no verified cost model" reason — never substitute or infer pricing
+- [x] T016 [US3] Key the paid/cloud classification in `hedge_fund/runtime/policy.py` (around lines 36, 270-273, 500-502) on the catalog `cost_class` metadata instead of hardcoded literals, preserving all existing classifications
+- [x] T017 [US3] Add the Ollama cloud cost-model entry in `hedge_fund/runtime/costs.py` (around lines 22-28) using operator-supplied pricing, recorded as operator-declared per research D7; if pricing is unavailable at implementation time, dispatch MUST refuse with the explicit "no verified cost model" reason — never substitute or infer pricing
 
 **Checkpoint**: US3 independently testable — V4 scenario passes
 

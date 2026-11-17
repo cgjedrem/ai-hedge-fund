@@ -10,7 +10,7 @@ from hedge_fund.runtime.dispatch import (
     make_one_shot_dispatch,
     ProviderDispatch,
 )
-from hedge_fund.runtime.endpoints import PinnedAddress, resolve_destination
+from hedge_fund.runtime.endpoints import PinnedAddress, resolve_destination, validate_provider_target
 from hedge_fund.runtime.policy import (
     AuthorizationDenied,
     BudgetDenied,
@@ -436,6 +436,54 @@ def test_local_ollama_uses_literal_loopback_and_zero_cost():
     assert response.status_code == 200
     assert len(calls) == 1
     assert _authorization(dispatch, target).cost_reserved == Decimal("0")
+
+
+def test_ollama_cloud_one_shot_refuses_without_verified_cost_model():
+    target = ProviderTarget(
+        kind="llm",
+        provider="ollama",
+        model="kimi-k3:cloud",
+        endpoint="http://127.0.0.1:11434",
+    )
+
+    with pytest.raises(AuthorizationDenied, match="no verified cost model"):
+        _dispatch(
+            target,
+            max_calls=1,
+            max_cost=Decimal("0"),
+            upper_bound_cost=Decimal("0"),
+            approved_local_models={target.model},
+        )
+
+
+def test_ollama_cloud_non_loopback_override_keeps_endpoint_refusal():
+    target = ProviderTarget(
+        kind="llm",
+        provider="ollama",
+        model="kimi-k3:cloud",
+        endpoint="http://192.168.1.20:11434",
+    )
+
+    with pytest.raises(AuthorizationDenied, match="configured Ollama endpoint is not approved"):
+        _dispatch(
+            target,
+            max_calls=1,
+            max_cost=Decimal("0"),
+            upper_bound_cost=Decimal("0"),
+            approved_local_models={target.model},
+        )
+
+
+def test_ollama_endpoint_guard_still_rejects_non_loopback_destinations():
+    target = ProviderTarget(
+        kind="llm",
+        provider="ollama",
+        model="gemma3:4b",
+        endpoint="http://192.168.1.20:11434",
+    )
+
+    with pytest.raises(AuthorizationDenied, match="configured Ollama endpoint is not approved"):
+        validate_provider_target(target)
 
 
 def test_halt_or_fence_check_denies_before_reservation_and_transport():

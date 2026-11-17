@@ -55,6 +55,23 @@ def test_typesafe_model_mismatch_has_no_cost_bound():
     )
 
 
+def test_ollama_cloud_has_no_verified_cost_model_without_operator_pricing():
+    target = ProviderTarget(kind="llm", provider="ollama", model="kimi-k3:cloud")
+
+    assert not has_verified_cost_model(target)
+    assert cost_model_identity(target) is None
+    assert minimum_attempt_cost(target) is None
+    assert (
+        request_cost_upper_bound(
+            target,
+            url="http://127.0.0.1:11434/api/chat",
+            method="POST",
+            body=b'{"model":"kimi-k3:cloud"}',
+        )
+        is None
+    )
+
+
 @pytest.mark.parametrize(
     ("target", "url", "method", "body"),
     [

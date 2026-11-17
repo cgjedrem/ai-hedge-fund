@@ -14,9 +14,10 @@ import httpcore
 import httpx
 from httpcore._backends.sync import SyncBackend
 
-from hedge_fund.runtime.costs import request_cost_upper_bound
+from hedge_fund.runtime.costs import has_verified_cost_model, request_cost_upper_bound
 from hedge_fund.runtime.endpoints import (
     PinnedAddress,
+    _validate_configured_endpoint,
     resolve_destination,
     validate_provider_target,
     validate_request_url,
@@ -27,6 +28,7 @@ from hedge_fund.runtime.policy import (
     BudgetDenied,
     classify_provider,
     DispatchBudget,
+    ollama_cost_class,
     OneShotAuthorization,
     OperationScope,
     ProviderTarget,
@@ -117,7 +119,16 @@ class ProviderDispatch:
         for target in targets:
             if not isinstance(target, ProviderTarget) or target.identity in self._targets:
                 raise AuthorizationDenied("provider targets are invalid")
-            validate_provider_target(target)
+            unverified_ollama_cloud = (
+                target.kind == "llm"
+                and target.provider == "ollama"
+                and ollama_cost_class(target.model) == "paid-cloud"
+                and not has_verified_cost_model(target)
+            )
+            if unverified_ollama_cloud:
+                _validate_configured_endpoint(target)
+            else:
+                validate_provider_target(target)
             provider_class = classify_provider(
                 target,
                 approved_local_models=self.approved_local_models,
@@ -130,12 +141,16 @@ class ProviderDispatch:
                     raise AuthorizationDenied("provider authorization scope does not match")
                 if authorization.root_id != root_id or authorization.subject_id != subject_id or authorization.capture_digest != capture_digest:
                     raise AuthorizationDenied("provider authorization inputs do not match")
+                if provider_class.value == "paid-cloud" and unverified_ollama_cloud:
+                    raise AuthorizationDenied("no verified cost model")
                 if provider_class.value == "paid-cloud" and authorization.upper_bound_cost <= 0:
                     raise AuthorizationDenied("paid upper-bound cost is unknown")
                 if provider_class.value != "paid-cloud" and authorization.upper_bound_cost != 0:
                     raise AuthorizationDenied("free/local provider cost bound must be zero")
             elif scope is OperationScope.SCHEDULED:
                 if runner is None or target.identity not in runner.provider_ids or provider_class.value == "paid-cloud":
+                    if unverified_ollama_cloud and provider_class.value == "paid-cloud":
+                        raise AuthorizationDenied(f"Model '{target.model}' is paid/cloud and cannot be used in scheduled runs.")
                     raise AuthorizationDenied("scheduled provider is not authorized")
             self._targets[target.identity] = target
         if scope is OperationScope.MANUAL_ONE_SHOT and set(self._one_shot) != set(self._targets):
