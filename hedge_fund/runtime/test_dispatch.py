@@ -10,7 +10,11 @@ from hedge_fund.runtime.dispatch import (
     make_one_shot_dispatch,
     ProviderDispatch,
 )
-from hedge_fund.runtime.endpoints import PinnedAddress, resolve_destination, validate_provider_target
+from hedge_fund.runtime.endpoints import (
+    PinnedAddress,
+    resolve_destination,
+    validate_provider_target,
+)
 from hedge_fund.runtime.policy import (
     AuthorizationDenied,
     BudgetDenied,

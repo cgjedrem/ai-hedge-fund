@@ -16,8 +16,8 @@ from httpcore._backends.sync import SyncBackend
 
 from hedge_fund.runtime.costs import has_verified_cost_model, request_cost_upper_bound
 from hedge_fund.runtime.endpoints import (
-    PinnedAddress,
     _validate_configured_endpoint,
+    PinnedAddress,
     resolve_destination,
     validate_provider_target,
     validate_request_url,
@@ -119,12 +119,7 @@ class ProviderDispatch:
         for target in targets:
             if not isinstance(target, ProviderTarget) or target.identity in self._targets:
                 raise AuthorizationDenied("provider targets are invalid")
-            unverified_ollama_cloud = (
-                target.kind == "llm"
-                and target.provider == "ollama"
-                and ollama_cost_class(target.model) == "paid-cloud"
-                and not has_verified_cost_model(target)
-            )
+            unverified_ollama_cloud = target.kind == "llm" and target.provider == "ollama" and ollama_cost_class(target.model) == "paid-cloud" and not has_verified_cost_model(target)
             if unverified_ollama_cloud:
                 _validate_configured_endpoint(target)
             else:

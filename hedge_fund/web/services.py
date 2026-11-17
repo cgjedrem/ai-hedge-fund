@@ -50,7 +50,12 @@ from hedge_fund.llm import (
     PROVIDER_ENV_VARS,
 )
 from hedge_fund.llm.client import validate_llm_transport
-from hedge_fund.llm.registry import KEYLESS_PROVIDERS, catalog_entry_for, is_supported, load_api_model_entries
+from hedge_fund.llm.registry import (
+    catalog_entry_for,
+    is_supported,
+    KEYLESS_PROVIDERS,
+    load_api_model_entries,
+)
 from hedge_fund.paper.deployed import (
     deploy,
     DeployedFund,

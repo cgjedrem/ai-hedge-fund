@@ -32,9 +32,9 @@ from hedge_fund.llm import (
     prompt_key,
     PromptCache,
     provider_for,
-    SUPPORTED_PROVIDERS,
 )
 from hedge_fund.llm import registry as registry_module
+from hedge_fund.llm import SUPPORTED_PROVIDERS
 from hedge_fund.llm.client import _flatten, JevLLM
 from hedge_fund.llm.registry import PROVIDER_ENV_VARS
 from hedge_fund.llm.test_contract import _response

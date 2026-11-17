@@ -103,10 +103,7 @@ def load_api_models() -> list[tuple[str, str, str]]:
     Falls back to the built-in default alone if the file is missing or
     malformed — a broken registry should cost you the picker, not the app.
     """
-    return [
-        (entry.display_name, entry.model_name, entry.provider)
-        for entry in load_api_model_entries()
-    ]
+    return [(entry.display_name, entry.model_name, entry.provider) for entry in load_api_model_entries()]
 
 
 def catalog_entry_for(model_id: str) -> ModelCatalogEntry | None:

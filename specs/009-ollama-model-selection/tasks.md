@@ -103,8 +103,8 @@
 
 **Purpose**: Regression safety and governance compliance across all stories
 
-- [ ] T018 Verify the writer-map AST scan `hedge_fund/runtime/test_writer_map.py` still passes; add WRITER_MAP entries for any new raw writes introduced (repo memory: new write_text/write_bytes/rename/mkdir/os.open need entries)
-- [ ] T019 [P] Run black (line-length 420), isort (black profile), and flake8 on all changed files (Principle VI)
+- [x] T018 Verify the writer-map AST scan `hedge_fund/runtime/test_writer_map.py` still passes; add WRITER_MAP entries for any new raw writes introduced (repo memory: new write_text/write_bytes/rename/mkdir/os.open need entries)
+- [x] T019 [P] Run black (line-length 420), isort (black profile), and flake8 on all changed files (Principle VI)
 - [ ] T020 Run the full suite `poetry run pytest hedge_fund -q` and confirm green with no new failures versus the T001 baseline (Principle III, SC-005)
 - [ ] T021 Execute quickstart.md scenarios V1-V8 as the acceptance walk and record results in the spec directory
 

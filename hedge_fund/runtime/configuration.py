@@ -98,11 +98,7 @@ def _load_model_catalog() -> dict[str, _ModelCatalogMetadata]:
 
 
 _MODEL_CATALOG = _load_model_catalog()
-_MODEL_PROVIDERS = {
-    model: entry.provider
-    for model, entry in _MODEL_CATALOG.items()
-    if entry.provider.casefold() in _PROVIDERS
-}
+_MODEL_PROVIDERS = {model: entry.provider for model, entry in _MODEL_CATALOG.items() if entry.provider.casefold() in _PROVIDERS}
 
 
 class ConfigurationError(ValueError):

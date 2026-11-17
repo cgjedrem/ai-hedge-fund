@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 from pydantic import SecretStr
 
 from hedge_fund.llm import DEFAULT_MODEL, load_api_models
-from hedge_fund.llm.registry import ModelCatalogEntry, is_supported
+from hedge_fund.llm.registry import is_supported, ModelCatalogEntry
 from hedge_fund.runtime.capture import (
     CredentialHandle,
     freeze_capture,
@@ -52,11 +52,7 @@ def test_settings_and_catalog_expose_ollama_model_classifiers(tmp_path):
                 "capability": "chat",
                 "cost_class": "paid-cloud",
             }
-            assert all(
-                set(item) == {"label", "id", "provider"}
-                for item in response["models"]
-                if item["provider"] != "Ollama"
-            )
+            assert all(set(item) == {"label", "id", "provider"} for item in response["models"] if item["provider"] != "Ollama")
     finally:
         service.close()
 
