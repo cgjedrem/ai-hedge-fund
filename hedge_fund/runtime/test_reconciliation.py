@@ -19,7 +19,7 @@ from hedge_fund.runtime.reconciliation import (
 
 
 def _append_legacy_fixture_session(ledger, spec, admission, session: str):
-    from hedge_fund.pipeline.session import SessionRecord, mandate_hash
+    from hedge_fund.pipeline.session import mandate_hash, SessionRecord
 
     with admission.manual_session(spec.name, timeout=0):
         latest = ledger.latest()
@@ -88,10 +88,7 @@ def _legacy_failure_recovery_fixture(
                         fields["transmitted_fills"] = [{"synthetic": True}]
                     ledger.log_event("tick_failed", **fields)
             later_start = date(2024, 6, 2) + timedelta(days=failure_count)
-            later_records = [
-                _append_legacy_fixture_session(ledger, spec, admission, (later_start + timedelta(days=index)).isoformat())
-                for index in range(2)
-            ]
+            later_records = [_append_legacy_fixture_session(ledger, spec, admission, (later_start + timedelta(days=index)).isoformat()) for index in range(2)]
             verified_records = []
             state = ledger.replay(spec.capital, full=True, on_verified=verified_records.append)
 
@@ -112,7 +109,10 @@ def _legacy_failure_recovery_fixture(
 
 
 def _legacy_failure_decision(fixture, *, failure_digests=None):
-    from hedge_fund.runtime.reconciliation import LegacyFailureReconciliationDecision, failure_digest
+    from hedge_fund.runtime.reconciliation import (
+        failure_digest,
+        LegacyFailureReconciliationDecision,
+    )
     from hedge_fund.runtime.root import RootContext
 
     relative = f"paper/{fixture['spec'].name}/broker.json"
@@ -132,11 +132,7 @@ def _legacy_fixture_file_bytes(fixture):
     from hedge_fund.runtime.root import RootContext
 
     with RootContext.open(fixture["root"]) as root:
-        return {
-            path.relative_to(fixture["root"]).as_posix(): root.read_bytes(path.relative_to(fixture["root"]).as_posix())
-            for path in fixture["directory"].rglob("*")
-            if path.is_file()
-        }
+        return {path.relative_to(fixture["root"]).as_posix(): root.read_bytes(path.relative_to(fixture["root"]).as_posix()) for path in fixture["directory"].rglob("*") if path.is_file()}
 
 
 def _perturb_legacy_fixture_book(fixture, admission):
@@ -304,7 +300,7 @@ def test_legacy_failure_decision_append_preserves_existing_bytes(tmp_path):
     for relative, old_bytes in before.items():
         if relative == event_path:
             assert after[relative].startswith(old_bytes)
-            assert after[relative][len(old_bytes) :].count(b"\n") == 1
+            assert after[relative].count(b"\n", len(old_bytes)) == 1
         else:
             assert after[relative] == old_bytes
 

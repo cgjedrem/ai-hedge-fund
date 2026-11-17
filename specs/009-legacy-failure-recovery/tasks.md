@@ -107,8 +107,8 @@
 
 **Purpose**: Evidence, invariants, and suite-level proof
 
-- [ ] T022 Run quickstart.md Scenarios A–D and record exact commands, outputs, test IDs, platform, and recorded times in specs/009-legacy-failure-recovery/implementation-evidence.md (constitution Principle III format)
-- [ ] T023 [P] Verify writer-map scan passes (hedge_fund/runtime/test_writer_map.py) and black/isort/flake8 are clean on touched files (line-length 420; do not reformat unrelated code)
+- [ ] T022 Run quickstart.md Scenarios A–D and record exact commands, outputs, test IDs, platform, and recorded times in specs/009-legacy-failure-recovery/implementation-evidence.md (A–C PASS on post-style source; D pending T024)
+- [x] T023 [P] Verify writer-map scan passes (hedge_fund/runtime/test_writer_map.py) and black/isort/flake8 are clean on touched files (line-length 420; do not reformat unrelated code) — writer map, Black, isort, and Black-compatible flake8 pass; default flake8 reports only four E203 findings reproduced on baseline
 - [ ] T024 Run full suite `poetry run pytest hedge_fund -q` alone in this worktree (memory: concurrent pytest runs cause runner timeouts); every failure individually evidenced against baseline `e6f04d2` reproduction or fixed; record in implementation-evidence.md
 - [ ] T025 Update specs/007-rb3-halt-recovery/contracts/recovery-semantics.md with a one-paragraph pointer to the new decision-record condition (spec007 calls for entries for every reconciliation condition) and cross-link spec005 runtime-api contract if the 423 semantics text needs the new resolved-by-decision case
 

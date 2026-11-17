@@ -2199,7 +2199,9 @@ class Ledger:
     # ---- events -----------------------------------------------------------
 
     def record_legacy_failure_reconciliation(self, decision: LegacyFailureReconciliationDecision) -> None:
-        from hedge_fund.runtime.reconciliation import LegacyFailureReconciliationDecision
+        from hedge_fund.runtime.reconciliation import (
+            LegacyFailureReconciliationDecision,
+        )
 
         try:
             validated = LegacyFailureReconciliationDecision.model_validate(decision)

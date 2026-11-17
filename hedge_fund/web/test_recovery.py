@@ -733,12 +733,12 @@ def test_legacy_failure_confirm_is_append_only_and_idempotent(tmp_path):
 
 def test_legacy_failure_confirm_rejects_corrupt_audit_without_writes(tmp_path):
     from hedge_fund.runtime.admission import AdmissionCoordinator, RootOwnerLease
+    from hedge_fund.runtime.root import RootContext
     from hedge_fund.runtime.test_reconciliation import (
         _append_corrupt_legacy_audit_event,
         _legacy_failure_recovery_fixture,
         _legacy_fixture_file_bytes,
     )
-    from hedge_fund.runtime.root import RootContext
 
     fixture = _legacy_failure_recovery_fixture(tmp_path)
     name = fixture["spec"].name
@@ -762,12 +762,12 @@ def test_legacy_failure_confirm_rejects_corrupt_audit_without_writes(tmp_path):
 
 def test_legacy_failure_confirm_rejects_book_mismatch_without_writes(tmp_path):
     from hedge_fund.runtime.admission import AdmissionCoordinator, RootOwnerLease
+    from hedge_fund.runtime.root import RootContext
     from hedge_fund.runtime.test_reconciliation import (
         _legacy_failure_recovery_fixture,
         _legacy_fixture_file_bytes,
         _perturb_legacy_fixture_book,
     )
-    from hedge_fund.runtime.root import RootContext
 
     fixture = _legacy_failure_recovery_fixture(tmp_path)
     name = fixture["spec"].name
@@ -795,7 +795,10 @@ def test_legacy_failure_confirm_rejects_book_mismatch_without_writes(tmp_path):
 
 
 def test_legacy_failure_confirm_rejects_post_effect_set_without_writes(tmp_path):
-    from hedge_fund.runtime.test_reconciliation import _legacy_failure_recovery_fixture, _legacy_fixture_file_bytes
+    from hedge_fund.runtime.test_reconciliation import (
+        _legacy_failure_recovery_fixture,
+        _legacy_fixture_file_bytes,
+    )
 
     fixture = _legacy_failure_recovery_fixture(tmp_path, post_effect_indices={1})
     name = fixture["spec"].name
@@ -819,12 +822,12 @@ def test_legacy_failure_confirm_rejects_post_effect_set_without_writes(tmp_path)
 
 def test_legacy_failure_confirm_rejects_stale_head_without_writes(tmp_path):
     from hedge_fund.runtime.admission import AdmissionCoordinator, RootOwnerLease
+    from hedge_fund.runtime.root import RootContext
     from hedge_fund.runtime.test_reconciliation import (
         _append_legacy_fixture_session,
         _legacy_failure_recovery_fixture,
         _legacy_fixture_file_bytes,
     )
-    from hedge_fund.runtime.root import RootContext
 
     fixture = _legacy_failure_recovery_fixture(tmp_path)
     name = fixture["spec"].name
@@ -853,8 +856,11 @@ def test_legacy_failure_confirm_rejects_stale_head_without_writes(tmp_path):
 
 def test_legacy_failure_confirm_rejects_changed_failure_set_without_writes(tmp_path):
     from hedge_fund.runtime.admission import AdmissionCoordinator, RootOwnerLease
-    from hedge_fund.runtime.test_reconciliation import _legacy_failure_recovery_fixture, _legacy_fixture_file_bytes
     from hedge_fund.runtime.root import RootContext
+    from hedge_fund.runtime.test_reconciliation import (
+        _legacy_failure_recovery_fixture,
+        _legacy_fixture_file_bytes,
+    )
 
     fixture = _legacy_failure_recovery_fixture(tmp_path)
     name = fixture["spec"].name
@@ -884,7 +890,11 @@ def test_legacy_failure_confirm_rejects_changed_failure_set_without_writes(tmp_p
 
 def test_legacy_failure_confirm_rejects_control_lane_contention(tmp_path):
     from threading import Event, Thread
-    from hedge_fund.runtime.test_reconciliation import _legacy_failure_recovery_fixture, _legacy_fixture_file_bytes
+
+    from hedge_fund.runtime.test_reconciliation import (
+        _legacy_failure_recovery_fixture,
+        _legacy_fixture_file_bytes,
+    )
 
     fixture = _legacy_failure_recovery_fixture(tmp_path)
     name = fixture["spec"].name
@@ -926,7 +936,10 @@ def test_legacy_failure_confirm_rejects_control_lane_contention(tmp_path):
 
 def test_legacy_failure_confirm_retry_deduplicates_after_append_interruption(tmp_path, monkeypatch):
     from hedge_fund.runtime.reconciliation import unresolved_tick_failures
-    from hedge_fund.runtime.test_reconciliation import _legacy_failure_recovery_fixture, _legacy_fixture_file_bytes
+    from hedge_fund.runtime.test_reconciliation import (
+        _legacy_failure_recovery_fixture,
+        _legacy_fixture_file_bytes,
+    )
 
     fixture = _legacy_failure_recovery_fixture(tmp_path)
     name = fixture["spec"].name

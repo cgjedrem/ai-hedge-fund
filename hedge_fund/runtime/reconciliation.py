@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator, StrictBool
 
 _REQUEST_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _HEX_ID = re.compile(r"^[a-f0-9]{32}$")
@@ -479,11 +479,7 @@ def unresolved_tick_failures(events: list[dict]) -> list[dict]:
                 except ValueError:
                     continue
                 identity_fields = ("head_hash", "by", "reconciliation_id", "request_id", "request_action", "request_digest")
-                matching_effect_indexes = [
-                    index
-                    for index, event in enumerate(events[resume_index + 1 :], start=resume_index + 1)
-                    if event.get("kind") == "resume_effect_intent" and all(event.get(field) == resume_event.get(field) for field in identity_fields)
-                ]
+                matching_effect_indexes = [index for index, event in enumerate(events[resume_index + 1 :], start=resume_index + 1) if event.get("kind") == "resume_effect_intent" and all(event.get(field) == resume_event.get(field) for field in identity_fields)]
                 if len(matching_effect_indexes) != 1:
                     continue
                 resolved_indexes[failure_id] = matching_effect_indexes[0]
@@ -498,13 +494,7 @@ def unresolved_tick_failures(events: list[dict]) -> list[dict]:
         if decision.decision_id in seen_decisions:
             continue
         seen_decisions[decision.decision_id] = payload
-        unresolved_before_decision = [
-            failure_id
-            for failure_id in failures
-            if failure_indexes[failure_id] < decision_index
-            and failure_id not in decision_resolved
-            and (failure_id not in resolved_indexes or resolved_indexes[failure_id] >= decision_index)
-        ]
+        unresolved_before_decision = [failure_id for failure_id in failures if failure_indexes[failure_id] < decision_index and failure_id not in decision_resolved and (failure_id not in resolved_indexes or resolved_indexes[failure_id] >= decision_index)]
         if decision.failure_digests != unresolved_before_decision:
             continue
         decision_resolved.update(decision.failure_digests)
