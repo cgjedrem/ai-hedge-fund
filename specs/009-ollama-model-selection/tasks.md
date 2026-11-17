@@ -20,7 +20,7 @@
 
 **Purpose**: Baseline verification before any change
 
-- [ ] T001 Run `poetry run pytest hedge_fund -q` on the clean feature-branch baseline and record the green/baseline result for later comparison (Principle III)
+- [x] T001 Run `poetry run pytest hedge_fund -q` on the clean feature-branch baseline and record the green/baseline result for later comparison (Principle III)
 
 ---
 
