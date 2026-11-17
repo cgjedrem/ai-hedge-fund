@@ -146,6 +146,32 @@ export function PaperPage() {
 
 type PendingAction = "approve" | "reject" | "resume";
 
+interface LegacyFailureEvidenceChecks {
+  replay_verified: boolean;
+  corrupt_events_zero: boolean;
+  book_matches_replay: boolean;
+  chain_continuity_across_failure: boolean;
+  no_post_effect_fields: boolean;
+}
+
+interface LegacyFailureEvidence {
+  failure_digest: string;
+  time: string | null;
+  error_summary: string;
+  has_request_id: boolean;
+  classification: "resolvable" | "not_resolvable";
+  checks: LegacyFailureEvidenceChecks;
+  reason: string | null;
+}
+
+type PaperReconciliationWithLegacyFailures = PaperReconciliation & {
+  failures: LegacyFailureEvidence[];
+  preview_head: string | null;
+  preview_book_digest: string | null;
+  confirm_offered: boolean;
+  set_reason: string | null;
+};
+
 export function PaperDetailPage() {
   const { name = "" } = useParams();
   const navigate = useNavigate();
@@ -157,7 +183,7 @@ export function PaperDetailPage() {
   const reconciliationPath = name && resource.data?.broker === "paper" && (resource.data.ledger.ok || resource.data.recovery_state === "reconciliation_required")
     ? `/api/paper/${encodeURIComponent(name)}/reconciliation${selectedIntentDigest ? `?intent_digest=${encodeURIComponent(selectedIntentDigest)}` : ""}`
     : null;
-  const reconciliationResource = useResource<PaperReconciliation>(
+  const reconciliationResource = useResource<PaperReconciliationWithLegacyFailures>(
     reconciliationPath,
   );
   const [sessionSearchText, setSessionSearchText] = useState("");
@@ -178,6 +204,9 @@ export function PaperDetailPage() {
   const pendingOperations = usePendingOperations("paper", name);
   const [confirmAction, setConfirmAction] = useState<PendingAction | null>(null);
   const [intentRecoveryOpen, setIntentRecoveryOpen] = useState(false);
+  const [legacyRecoveryOpen, setLegacyRecoveryOpen] = useState(false);
+  const [legacyOperator, setLegacyOperator] = useState("");
+  const [legacyAttestation, setLegacyAttestation] = useState(false);
   const [haltDialogOpen, setHaltDialogOpen] = useState(false);
   const [haltReason, setHaltReason] = useState("");
   const [busy, setBusy] = useState(false);
@@ -207,6 +236,7 @@ export function PaperDetailPage() {
   const canWrite = capabilities?.writes === true && !protectedName;
   const data = resource.data;
   const recovery = reconciliationResource.data?.name === name ? reconciliationResource.data : null;
+  const legacyFailures = recovery?.failures ?? [];
   const writeUnavailable = capabilities?.write_unavailable_reason != null;
   const enrollmentState = capabilities?.enrollment_state ?? "unenrolled";
   const runner = runnerResource.data ?? data?.runner;
@@ -298,6 +328,9 @@ export function PaperDetailPage() {
     setOperationId(readPaperOperationId(name));
     setPaperPreview(null);
     setPaperPreviewKind(null);
+    setLegacyRecoveryOpen(false);
+    setLegacyOperator("");
+    setLegacyAttestation(false);
     recoveryRequest.current = null;
     intentRecoveryRequest.current = null;
   }, [name]);
@@ -446,6 +479,55 @@ export function PaperDetailPage() {
       await Promise.all([resource.refresh(), reconciliationResource.refresh()]);
     } catch (cause) {
       fail(cause, "Tick-intent reconciliation failed.");
+      resource.refresh();
+      reconciliationResource.refresh();
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function submitLegacyFailureReconciliation(): Promise<void> {
+    const preview = recovery;
+    const operator = legacyOperator.trim();
+    const failureDigests = preview?.failures.map((failure) => failure.failure_digest) ?? [];
+    if (
+      !canWritePaper
+      || !preview?.confirm_offered
+      || !preview.preview_head
+      || !preview.preview_book_digest
+      || failureDigests.length === 0
+      || !operator
+      || !legacyAttestation
+    ) {
+      setFeedback({ tone: "danger", message: "Legacy failure confirmation is unavailable. Review a current eligible preview before confirming." });
+      reconciliationResource.refresh();
+      return;
+    }
+
+    setBusy(true);
+    setFeedback(null);
+    try {
+      const result = await apiPost<{ status: "reconciled" | "already-resolved" }>(`/api/paper/${encodeURIComponent(name)}/reconcile-legacy-failures`, {
+        preview_head: preview.preview_head,
+        preview_book_digest: preview.preview_book_digest,
+        failure_digests: failureDigests,
+        operator,
+        attestation: true,
+      });
+      setLegacyRecoveryOpen(false);
+      setLegacyOperator("");
+      setLegacyAttestation(false);
+      setFeedback({
+        tone: "neutral",
+        message: result.status === "already-resolved"
+          ? "Legacy failure reconciliation was already recorded. Historical session and audit records were not rewritten."
+          : "Audited legacy failure reconciliation recorded. Historical session and audit records were not rewritten.",
+      });
+      await Promise.all([resource.refresh(), reconciliationResource.refresh()]);
+    } catch (cause) {
+      fail(cause, "Legacy failure reconciliation failed.");
+      setLegacyRecoveryOpen(false);
+      setLegacyAttestation(false);
       resource.refresh();
       reconciliationResource.refresh();
     } finally {
@@ -754,6 +836,67 @@ export function PaperDetailPage() {
                       <Alert tone="warning">
                         Resume control write already landed. Complete the journal record only; no control write or paper operation will run.
                       </Alert>
+                    ) : null}
+                    {legacyFailures.length > 0 ? (
+                      <div className="space-y-3 border-t border-border pt-3" data-testid="legacy-failure-reconciliation">
+                        <div>
+                          <p className="font-medium">Legacy failure evidence</p>
+                          <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+                            Review every unresolved failure. Confirmation binds the full set to the previewed ledger head and local paper book.
+                          </p>
+                        </div>
+                        <div className="grid gap-2 text-xs">
+                          <p className="break-all">Preview ledger head: <span className="mono">{recovery.preview_head ?? "unavailable"}</span></p>
+                          <p className="break-all">Preview book digest: <span className="mono">{recovery.preview_book_digest ?? "unavailable"}</span></p>
+                        </div>
+                        <ul className="space-y-2">
+                          {legacyFailures.map((failure) => (
+                            <li key={failure.failure_digest} className="space-y-3 rounded-lg border border-border bg-black/10 p-3" data-testid="legacy-failure">
+                              <div className="flex flex-wrap items-center justify-between gap-2">
+                                <Badge variant={failure.classification === "resolvable" ? "positive" : "negative"}>
+                                  {failure.classification === "resolvable" ? "Resolvable" : "Not resolvable"}
+                                </Badge>
+                                <span className="text-[10px] text-muted-foreground">{failure.has_request_id ? "Request ID recorded" : "Unkeyed legacy failure"}</span>
+                              </div>
+                              <div className="space-y-1 text-xs">
+                                <p className="break-all">Failure digest: <span className="mono">{failure.failure_digest}</span></p>
+                                <p>Recorded time: <span className="mono">{failure.time ?? "unavailable"}</span></p>
+                                <p className="break-words">Error summary: <span>{failure.error_summary || "No error summary recorded."}</span></p>
+                              </div>
+                              <div className="space-y-1">
+                                <p className="mono text-[9px] uppercase tracking-[0.14em] text-muted-foreground">Evidence checks</p>
+                                <ul className="space-y-1 text-[10px]">
+                                  {Object.entries(failure.checks).map(([check, passed]) => (
+                                    <li key={check} className="flex flex-wrap justify-between gap-x-3">
+                                      <span className="mono break-all">{check}</span>
+                                      <span>{passed ? "passed" : "failed"}</span>
+                                    </li>
+                                  ))}
+                                </ul>
+                              </div>
+                              <p className="text-xs leading-relaxed">
+                                Reason: <span>{failure.reason ?? (failure.classification === "resolvable" ? "All durable evidence checks passed." : "Evidence gap unavailable.")}</span>
+                              </p>
+                            </li>
+                          ))}
+                        </ul>
+                        {recovery.set_reason ? <Alert tone="danger">{recovery.set_reason}</Alert> : null}
+                        {recovery.confirm_offered ? (
+                          <Alert tone="warning">
+                            One audited decision will resolve this entire failure set. It will not rewrite historical records, clear Halt or tick intents, retry a tick, or create broker effects.
+                          </Alert>
+                        ) : null}
+                        <Button
+                          onClick={() => {
+                            setLegacyOperator("");
+                            setLegacyAttestation(false);
+                            setLegacyRecoveryOpen(true);
+                          }}
+                          disabled={!recovery.confirm_offered || !canWritePaper || busy || !recovery.preview_head || !recovery.preview_book_digest}
+                        >
+                          Confirm legacy failure reconciliation
+                        </Button>
+                      </div>
                     ) : null}
                     {intentPreview?.required ? (
                       <div className="space-y-3 border-t border-border pt-3" data-testid="tick-intent-reconciliation">
@@ -1154,6 +1297,78 @@ export function PaperDetailPage() {
         busy={busy}
         onConfirm={() => void submitIntentRecovery()}
       />
+      <Dialog
+        open={legacyRecoveryOpen}
+        onOpenChange={(open) => {
+          setLegacyRecoveryOpen(open);
+          if (!open) setLegacyAttestation(false);
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Confirm legacy failure reconciliation</DialogTitle>
+            <DialogDescription>
+              The server rechecks this entire failure set, ledger head, and local book before appending one decision. No historical records are rewritten and no tick is retried.
+            </DialogDescription>
+          </DialogHeader>
+          {recovery?.confirm_offered ? (
+            <div className="space-y-2 rounded-lg border border-border bg-black/10 p-3 text-xs">
+              <p className="break-all">Ledger head: <span className="mono">{recovery.preview_head}</span></p>
+              <p className="break-all">Local book digest: <span className="mono">{recovery.preview_book_digest}</span></p>
+              <p>Failures covered: <span className="mono">{legacyFailures.length}</span></p>
+              <ul className="max-h-28 space-y-1 overflow-y-auto">
+                {legacyFailures.map((failure) => (
+                  <li key={failure.failure_digest} className="break-all mono">{failure.failure_digest}</li>
+                ))}
+              </ul>
+            </div>
+          ) : (
+            <Alert tone="danger">The current preview no longer offers confirmation. Close this dialog and review the refreshed evidence.</Alert>
+          )}
+          <div className="space-y-2">
+            <Label htmlFor="legacy-failure-operator">Operator identity</Label>
+            <Input
+              id="legacy-failure-operator"
+              autoComplete="off"
+              maxLength={180}
+              value={legacyOperator}
+              onChange={(event) => setLegacyOperator(event.target.value)}
+              disabled={busy}
+            />
+          </div>
+          <div className="flex items-start gap-2">
+            <input
+              id="legacy-failure-attestation"
+              type="checkbox"
+              className="mt-0.5"
+              checked={legacyAttestation}
+              onChange={(event) => setLegacyAttestation(event.target.checked)}
+              disabled={busy || !recovery?.confirm_offered}
+            />
+            <Label htmlFor="legacy-failure-attestation" className="leading-relaxed">
+              I reviewed every listed failure and accept that durable evidence cannot exclude every historical effect.
+            </Label>
+          </div>
+          <DialogFooter>
+            <Button variant="ghost" onClick={() => setLegacyRecoveryOpen(false)} disabled={busy}>Cancel</Button>
+            <Button
+              onClick={() => void submitLegacyFailureReconciliation()}
+              disabled={
+                busy
+                || !canWritePaper
+                || !recovery?.confirm_offered
+                || !recovery.preview_head
+                || !recovery.preview_book_digest
+                || legacyFailures.length === 0
+                || !legacyOperator.trim()
+                || !legacyAttestation
+              }
+            >
+              {busy ? "Recording…" : "Record legacy failure reconciliation"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
       <Dialog
         open={paperPreview !== null}
         onOpenChange={(open) => {

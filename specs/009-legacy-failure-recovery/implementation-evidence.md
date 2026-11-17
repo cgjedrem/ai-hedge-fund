@@ -142,6 +142,43 @@
 - Expected/observed: `10 passed in 47.20s`, exit `0`. Corrupt replay/audit, book mismatch, post-effect ambiguity, stale head/set, lane contention, attestation validation, and append-interruption retry all refused or retried with expected status and unchanged bytes where refusal applied. No provider/LLM calls or production-root access.
 - Disposition: T013–T018 tests cover their required negative states. T019 requires no production edit; confirm remains all-or-nothing and uses existing replay, root, and lane boundaries.
 
+### T020 failing-first frontend evidence tests
+
+- Result: **FAIL** as expected before T021 implementation.
+- Recorded: `2026-11-17T13:12:39.0615715+01:00`.
+- Source: `HEAD` `68de2dfcd7dffe2766848249cc6a142d89a75865`; uncommitted `frontend/src/pages/paper.test.tsx` diff SHA-256 `d12099c6255cc9516a19c76baebdfaf0e55f702219fc0a5f13931389dd4a21ec` (`5973` bytes).
+- Artifact/environment: Vitest `4.1.12` over working-tree source; Microsoft Windows NT `10.0.26200.0`; Node `v22.13.1`; npm `10.9.2`; dependencies installed from `frontend/package-lock.json`. No production build or browser automation.
+- Exact command: `Set-Location frontend; .\node_modules\.bin\vitest.cmd run src/pages/paper.test.tsx -t "mixed legacy failure evidence|submits an attested preview"`.
+- Provenance: unit tests use `renderDesk` fetch stubs and mixed synthetic recovery data only; no API server, provider, broker, paid-credit, or production-root access.
+- Expected/observed: `3 failed | 30 skipped` in `8.59s`, exit `1`; mixed evidence test could not find `legacy-failure-reconciliation`, and both confirm/refusal tests could not find the confirm button. Failures are missing T021 UI, not fixture or assertion errors.
+- Command calibration: an initial `npm --prefix frontend exec` invocation ran Vitest from the repository root and failed before collection because the `@/` alias was unresolved; the exact frontend-working-directory command above reached and ran the three intended tests.
+- Next check: implement the evidence list, offered-only confirm action, explicit operator attestation, request wiring, and verbatim refusal display; rerun the three tests.
+
+### T020–T021 frontend evidence and confirmation (superseded snapshot)
+
+- Result: **PASS** for legacy failure evidence display, confirmation gating, payload binding, and verbatim 409/422 details on the recorded source snapshot. Final source/build identity is superseded by the revalidation below. Full project acceptance Scenarios A–D remain **INCONCLUSIVE** pending T022/T024.
+- Recorded: `2026-11-17T13:17:44.5226343+01:00`.
+- Source: `HEAD` `68de2dfcd7dffe2766848249cc6a142d89a75865`; tested `frontend/src/pages/paper.tsx` + `frontend/src/pages/paper.test.tsx` diff SHA-256 `56566f8a0bd702cf04ce5954caae15dd0a8f7304d2882a8e8cecbcb5606d16af` (`19863` bytes).
+- Artifact/environment: TypeScript `tsc --noEmit` and Vite `6.4.5` working-tree build; Windows NT `10.0.26200.0`; Node `v22.13.1`; npm `10.9.2`; Vitest `4.1.12`; dependency lock SHA-256 `380011FEB3BD4CE8888CCC3ECB13DB8BFAEC6CEE2C1EECAF30F5BF97E8F444A0`. Vite output in ignored `hedge_fund/web/static`: `index.html` SHA-256 `F23A04618CB6627C5997876C340BE877C2EB3DFE85E9376C192E8914914BFA8D`; CSS `index-DBkeKs0M.css` SHA-256 `BE48D0F397A6CC2063F89F1123B387AC886A719AF878F2F92A18F198CA542052`; JS `index-DoDHNM1-.js` SHA-256 `A5B99C6CF8F7D125FD773042F8B045F028DDA685242FA5C98661A0AFFB6D49D3`.
+- Exact commands and results:
+  - `Set-Location frontend; .\node_modules\.bin\vitest.cmd run src/pages/paper.test.tsx -t "mixed legacy failure evidence|submits an attested preview"` — `3 passed | 30 skipped` in `5.52s`, exit `0`, started `13:15:15`.
+  - `Set-Location frontend; .\node_modules\.bin\vitest.cmd run src/pages/paper.test.tsx` — `33 passed` in `17.12s`, exit `0`, started `13:15:27`.
+  - `Set-Location frontend; npm test` — `15` test files, `243` tests passed in `27.73s`, exit `0`, started `13:16:37`.
+  - `Set-Location frontend; npm run build` — TypeScript check passed; Vite build succeeded in `12.75s`. Vite emitted its existing >500 kB chunk-size warning; no build error.
+- Scenario/provenance: frontend unit tests use `renderDesk` fetch stubs and synthetic failure previews. Assertions cover the mixed resolvable/not-resolvable evidence list, all five check details, set-level reason, disabled confirmation for `confirm_offered=false`, exact request body for offered previews, required operator and explicit attestation, and exact 409/422 refusal text. No Playwright, API server, provider, broker, paid-credit, or production-root access.
+
+### T020–T021 final artifact revalidation
+
+- Result: **PASS** on final frontend source/test diff and generated build. Acceptance Scenarios A–D remain **INCONCLUSIVE** pending T022/T024.
+- Recorded: `2026-11-17T13:22:13.7738325+01:00`.
+- Source: `HEAD` `68de2dfcd7dffe2766848249cc6a142d89a75865`; final `frontend/src/pages/paper.tsx` + `frontend/src/pages/paper.test.tsx` diff SHA-256 `583cbb6616b7bc6afb78ba38e942803b422bddd7f767ebda422a2dd1cf2b2c7c` (`22300` bytes).
+- Artifact/environment: TypeScript `tsc --noEmit` and Vite `6.4.5` working-tree build; Windows NT `10.0.26200.0`; Node `v22.13.1`; npm `10.9.2`; Vitest `4.1.12`; dependency lock SHA-256 `380011FEB3BD4CE8888CCC3ECB13DB8BFAEC6CEE2C1EECAF30F5BF97E8F444A0`. Final ignored Vite artifacts: `hedge_fund/web/static/index.html` SHA-256 `ACC1DF514F6A869010B99CEFDC0C2FC1AB5EE3A2BF3661271E12E0FC2924A716`; CSS `index-DBkeKs0M.css` SHA-256 `BE48D0F397A6CC2063F89F1123B387AC886A719AF878F2F92A18F198CA542052`; JS `index-DePDOT2r.js` SHA-256 `1EFC1646D59ED74103214C924E26D20C49455DBF0F00C6ED715077A1471D79CF`.
+- Exact commands and results:
+  - `Set-Location frontend; .\node_modules\.bin\vitest.cmd run src/pages/paper.test.tsx -t "reports the legacy reconciliation result"` — `2 passed | 33 skipped` in `7.39s`, exit `0`, started `13:21:14`.
+  - `Set-Location frontend; npm test` — `15` test files, `245` tests passed in `37.14s`, exit `0`, started `13:21:30`.
+  - `Set-Location frontend; npm run build` — TypeScript check passed; Vite build succeeded in `20.71s`. Vite emitted its >500 kB chunk-size warning; no build error.
+- Scenario/provenance: final unit tests include mixed failure evidence, confirmation gating, required operator and attestation, request binding, verbatim 409/422 refusal text, and distinct `reconciled` / `already-resolved` success notices; all use synthetic fetch stubs. No Playwright, API server, provider, broker, paid-credit, or production-root access.
+
 ## Acceptance scenarios
 
 | Scenario | Status | Evidence |

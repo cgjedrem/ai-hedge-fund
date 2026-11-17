@@ -93,11 +93,11 @@
 
 ### Tests for User Story 3 ⚠️ (write FIRST, ensure FAIL)
 
-- [ ] T020 [P] [US3] Display tests in frontend/src/pages/paper.test.tsx: per-failure list renders digest, time, error summary, classification, per-check detail and reason; confirm button enabled iff `confirm_offered=true`; not_resolvable failures show their evidence gap
+- [x] T020 [P] [US3] Display tests in frontend/src/pages/paper.test.tsx: per-failure list renders digest, time, error summary, classification, per-check detail and reason; confirm button enabled iff `confirm_offered=true`; not_resolvable failures show their evidence gap
 
 ### Implementation for User Story 3
 
-- [ ] T021 [US3] Extend frontend/src/pages/paper.tsx recovery panel (:710-745, :761-773 area) with the per-failure evidence list and gated confirm action wired to the T012 route, displaying 409/422 refusal reasons verbatim
+- [x] T021 [US3] Extend frontend/src/pages/paper.tsx recovery panel (:710-745, :761-773 area) with the per-failure evidence list and gated confirm action wired to the T012 route, displaying 409/422 refusal reasons verbatim
 
 **Checkpoint**: All three stories functional
 

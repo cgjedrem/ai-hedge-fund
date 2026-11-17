@@ -1127,3 +1127,187 @@ it("restores a persisted operation on reload by reading it and rejects a late ol
   expect(screen.getByRole("progressbar", { name: "Paper operation progress" })).toHaveAttribute("aria-valuenow", "60");
   expect(mutations(calls)).toEqual([]);
 });
+
+function legacyFailureRecovery(failures: unknown[], confirmOffered: boolean) {
+  return {
+    name: FUND,
+    halted: null,
+    resume_allowed: false,
+    preview: paperReconciliationPreview({
+      required: false,
+      recoverable: false,
+      reason: "no-ambiguous-tick-failure",
+      failure_id: null,
+      failed_request_id: null,
+      operation_id: null,
+      expected_head: null,
+      current_head: HEAD,
+      broker_book_sha256: "c".repeat(64),
+      capture_id: null,
+      capture_digest: null,
+      book_matches_ledger: false,
+      head_matches_failure: false,
+      preview_digest: null,
+    }),
+    intent_preview: paperTickIntentPreview({
+      required: false,
+      recoverable: false,
+      reason: "no-unresolved-tick-intent",
+      intent_request_id: null,
+      intent_session: null,
+      intent_digest: null,
+      metadata_complete: null,
+      corrupt_event_digests: [],
+      approval_journal_event_digests: [],
+      expected_head: null,
+      current_head: null,
+      broker_book_sha256: null,
+      book_matches_ledger: false,
+      head_matches_intent: false,
+      preview_digest: null,
+    }),
+    intent_targets: [],
+    failures,
+    preview_head: HEAD,
+    preview_book_digest: "c".repeat(64),
+    confirm_offered: confirmOffered,
+    set_reason: confirmOffered ? null : "At least one legacy failure is not resolvable.",
+  };
+}
+
+function legacyFailureEvidence(
+  failureDigest: string,
+  classification: "resolvable" | "not_resolvable",
+  reason: string | null,
+) {
+  return {
+    failure_digest: failureDigest,
+    time: "2026-11-03T05:05:03Z",
+    error_summary: "Synthetic historical failure summary.",
+    has_request_id: false,
+    classification,
+    checks: {
+      replay_verified: true,
+      corrupt_events_zero: true,
+      book_matches_replay: true,
+      chain_continuity_across_failure: true,
+      no_post_effect_fields: classification === "resolvable",
+    },
+    reason,
+  };
+}
+
+function legacyFailureSnapshot(): PaperSnapshot & { recovery_state: "reconciliation_required" } {
+  return {
+    ...paperSnapshot(stoppedRunner),
+    ledger: { ok: false, error: "Paper work is in progress or requires reconciliation." },
+    recovery_state: "reconciliation_required",
+  } as PaperSnapshot & { recovery_state: "reconciliation_required" };
+}
+
+it("shows mixed legacy failure evidence and disables confirmation when the set is not offered", async () => {
+  const resolvable = legacyFailureEvidence("1".repeat(64), "resolvable", null);
+  const notResolvable = legacyFailureEvidence("2".repeat(64), "not_resolvable", "Post-effect metadata is present on this failure.");
+  const calls = renderDesk(stoppedRunner, {
+    [`GET /api/paper/${FUND}`]: () => json(legacyFailureSnapshot()),
+    [`GET /api/paper/${FUND}/reconciliation`]: () => json(legacyFailureRecovery([resolvable, notResolvable], false)),
+  });
+
+  const section = await screen.findByTestId("legacy-failure-reconciliation");
+  expect(section).toHaveTextContent(resolvable.failure_digest);
+  expect(section).toHaveTextContent(notResolvable.failure_digest);
+  expect(section).toHaveTextContent("2026-11-03T05:05:03Z");
+  expect(section).toHaveTextContent("Synthetic historical failure summary.");
+  expect(section).toHaveTextContent("Resolvable");
+  expect(section).toHaveTextContent("Not resolvable");
+  expect(within(section).getAllByText("chain_continuity_across_failure")[0].closest("li")).toHaveTextContent("passed");
+  expect(within(section).getAllByText("no_post_effect_fields")[1].closest("li")).toHaveTextContent("failed");
+  expect(section).toHaveTextContent("Post-effect metadata is present on this failure.");
+  expect(section).toHaveTextContent("At least one legacy failure is not resolvable.");
+  expect(screen.getByRole("button", { name: "Confirm legacy failure reconciliation" })).toBeDisabled();
+  expect(mutations(calls)).toEqual([]);
+});
+
+it.each([
+  {
+    status: 409,
+    code: "stale-preview",
+    retry_policy: "review-again",
+    detail: "The unresolved failure set changed after legacy failure review.",
+  },
+  {
+    status: 422,
+    code: "readiness-denied",
+    retry_policy: "none",
+    detail: "Legacy failure confirmation refused: synthetic evidence gap.",
+  },
+])("submits an attested preview and displays the $status refusal verbatim", async ({ status, code, retry_policy, detail }) => {
+  const user = userEvent.setup();
+  const failure = legacyFailureEvidence("1".repeat(64), "resolvable", null);
+  const recovery = legacyFailureRecovery([failure], true);
+  const calls = renderDesk(stoppedRunner, {
+    [`GET /api/paper/${FUND}`]: () => json(legacyFailureSnapshot()),
+    [`GET /api/paper/${FUND}/reconciliation`]: () => json(recovery),
+    [`POST /api/paper/${FUND}/reconcile-legacy-failures`]: () => json({
+      detail,
+      code,
+      message: detail,
+      refresh_required: status === 409,
+      retry_policy,
+    }, status),
+  });
+
+  await user.click(await enabledButton("Confirm legacy failure reconciliation"));
+  const dialog = await screen.findByRole("dialog", { name: "Confirm legacy failure reconciliation" });
+  const submit = within(dialog).getByRole("button", { name: "Record legacy failure reconciliation" });
+  expect(submit).toBeDisabled();
+  await user.type(within(dialog).getByLabelText("Operator identity"), "synthetic-operator");
+  await user.click(within(dialog).getByRole("checkbox", { name: /I reviewed every listed failure/ }));
+  await user.click(submit);
+
+  await waitFor(() => expect(mutations(calls)).toHaveLength(1));
+  expect(mutations(calls)[0]).toMatchObject({
+    path: `/api/paper/${FUND}/reconcile-legacy-failures`,
+    body: {
+      preview_head: HEAD,
+      preview_book_digest: "c".repeat(64),
+      failure_digests: [failure.failure_digest],
+      operator: "synthetic-operator",
+      attestation: true,
+    },
+  });
+  expect(await screen.findByText(detail)).toBeInTheDocument();
+});
+
+it.each([
+  {
+    status: "reconciled",
+    message: "Audited legacy failure reconciliation recorded. Historical session and audit records were not rewritten.",
+  },
+  {
+    status: "already-resolved",
+    message: "Legacy failure reconciliation was already recorded. Historical session and audit records were not rewritten.",
+  },
+] as const)("reports the legacy reconciliation result $status", async ({ status, message }) => {
+  const user = userEvent.setup();
+  const failure = legacyFailureEvidence("1".repeat(64), "resolvable", null);
+  const calls = renderDesk(stoppedRunner, {
+    [`GET /api/paper/${FUND}`]: () => json(legacyFailureSnapshot()),
+    [`GET /api/paper/${FUND}/reconciliation`]: () => json(legacyFailureRecovery([failure], true)),
+    [`POST /api/paper/${FUND}/reconcile-legacy-failures`]: () => json({
+      name: FUND,
+      status,
+      decision_id: "2".repeat(64),
+    }),
+  });
+
+  await user.click(await enabledButton("Confirm legacy failure reconciliation"));
+  const dialog = await screen.findByRole("dialog", { name: "Confirm legacy failure reconciliation" });
+  await user.type(within(dialog).getByLabelText("Operator identity"), "synthetic-operator");
+  await user.click(within(dialog).getByRole("checkbox", { name: /I reviewed every listed failure/ }));
+  await user.click(within(dialog).getByRole("button", { name: "Record legacy failure reconciliation" }));
+
+  await waitFor(() => expect(mutations(calls)).toHaveLength(1));
+  expect(await screen.findByText(message)).toBeInTheDocument();
+  expect(screen.queryByRole("dialog")).toBeNull();
+});
