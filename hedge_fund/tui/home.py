@@ -39,17 +39,9 @@ class HomeScreen(Screen):
             yield Static(Text(wordmark, style=f"bold {BRIGHT}"), id="wordmark")
             yield Static(Text("━" * len(wordmark)), id="rule")
             yield OptionList(
-                Option(
-                    Text.assemble(
-                        ("Paper trading\n", "bold"),
-                        ("run a fund on real market days", MUTED)),
-                    id="paper"),
+                Option(Text.assemble(("Paper trading\n", "bold"), ("run a fund on real market days", MUTED)), id="paper"),
                 None,
-                Option(
-                    Text.assemble(
-                        ("Backtesting\n", "bold"),
-                        ("test a fund over history", MUTED)),
-                    id="backtest"),
+                Option(Text.assemble(("Backtesting\n", "bold"), ("test a fund over history", MUTED)), id="backtest"),
                 id="home-menu",
             )
             yield Static("", id="model-line")
@@ -58,7 +50,7 @@ class HomeScreen(Screen):
     def on_mount(self) -> None:
         # Unknown shell presets stay effective; no implicit model substitution.
         models = load_api_models()
-        preset = os.environ.get("HEDGE_FUND_LLM_MODEL")
+        preset = os.environ.get("HEDGE_FUND_LLM_MODEL") or None
         known = {mid for _, mid, _ in models}
         if preset is not None and preset not in known:
             self._model_id = preset
@@ -90,22 +82,19 @@ class HomeScreen(Screen):
         it. Replacing a key that already works is allowed on purpose."""
         provider = provider_for(self._model_id)
         if provider is None:
-            self.notify("Model is not in the registry — set its key by hand.",
-                        severity="warning")
+            self.notify("Model is not in the registry — set its key by hand.", severity="warning")
             return
         env_var = PROVIDER_ENV_VARS.get(provider)
         if env_var is None:
             self.notify(f"No key is needed for {provider}.")
             return
-        self.app.push_screen(KeyPromptScreen(provider, env_var),
-                             lambda _: self._show_model())
+        self.app.push_screen(KeyPromptScreen(provider, env_var), lambda _: self._show_model())
 
     def action_quit_app(self) -> None:
         self.app.exit()
 
     def _show_model(self) -> None:
-        label = next((name for name, mid, _ in load_api_models()
-                      if mid == self._model_id), self._model_id)
+        label = next((name for name, mid, _ in load_api_models() if mid == self._model_id), self._model_id)
         self.query_one("#model-line", Static).update(
             Text.assemble(
                 ("agents reason with  ", MUTED),
@@ -121,6 +110,7 @@ class HomeScreen(Screen):
         # module's key gate, and the home screen is the root of the stack.
         from hedge_fund.tui.funds import FundSelectScreen
         from hedge_fund.tui.paper import PaperScreen
+
         if event.option.id == "paper":
             self.app.push_screen(PaperScreen())
         elif event.option.id == "backtest":
@@ -143,21 +133,10 @@ class KeyPromptScreen(ModalScreen[bool]):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="keyprompt"):
-            yield Static(Text.assemble(
-                (f"{self._provider} API key needed", f"bold {BRIGHT}")),
-                id="key-q")
-            yield Static(Text.assemble(
-                ("The fund cannot run without it. Paste it below and it "
-                 "is saved to\n", MUTED),
-                (str(paths.ENV_PATH), TEXT),
-                ("\nwhich is owner-read-only and loaded automatically on "
-                 "every start.", MUTED)),
-                id="key-blurb")
+            yield Static(Text.assemble((f"{self._provider} API key needed", f"bold {BRIGHT}")), id="key-q")
+            yield Static(Text.assemble(("The fund cannot run without it. Paste it below and it " "is saved to\n", MUTED), (str(paths.ENV_PATH), TEXT), ("\nwhich is owner-read-only and loaded automatically on " "every start.", MUTED)), id="key-blurb")
             yield Input(password=True, placeholder=self._env_var, id="key-input")
-            yield Static(Text.assemble(
-                ("enter", f"bold {GREEN}"), ("  save and continue   ", MUTED),
-                ("esc", f"bold {BRIGHT}"), ("  cancel", MUTED)),
-                classes="hint")
+            yield Static(Text.assemble(("enter", f"bold {GREEN}"), ("  save and continue   ", MUTED), ("esc", f"bold {BRIGHT}"), ("  cancel", MUTED)), classes="hint")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -193,11 +172,9 @@ class ModelPickerScreen(ModalScreen[str | None]):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="picker"):
-            yield Static(Text("Agents reason with", style=f"bold {BRIGHT}"),
-                         id="picker-q")
+            yield Static(Text("Agents reason with", style=f"bold {BRIGHT}"), id="picker-q")
             yield OptionList(*self._options(), id="picker-list")
-            yield Static(Text("enter to pick · esc to cancel", style=MUTED),
-                         classes="hint")
+            yield Static(Text("enter to pick · esc to cancel", style=MUTED), classes="hint")
         yield Footer()
 
     def _options(self) -> list[Option | None]:
@@ -210,13 +187,10 @@ class ModelPickerScreen(ModalScreen[str | None]):
             options.append(Option(head, disabled=True))
             for name, model_id, _ in models:
                 row = Text()
-                row.append(" ✓ " if model_id == self._current else "   ",
-                           style=f"bold {GREEN}")
+                row.append(" ✓ " if model_id == self._current else "   ", style=f"bold {GREEN}")
                 row.append(f"{name:<18}", style=None if reachable else MUTED)
                 row.append(model_id, style=MUTED)
-                options.append(Option(
-                    row, id=model_id if reachable else None,
-                    disabled=not reachable))
+                options.append(Option(row, id=model_id if reachable else None, disabled=not reachable))
             options.append(None)
         return options[:-1] if options else options
 
@@ -226,14 +200,11 @@ class ModelPickerScreen(ModalScreen[str | None]):
         groups: dict[str, list[tuple[str, str, str]]] = {}
         for entry in load_api_models():
             groups.setdefault(entry[2], []).append(entry)
-        return dict(sorted(groups.items(),
-                           key=lambda kv: not is_supported(kv[0])))
+        return dict(sorted(groups.items(), key=lambda kv: not is_supported(kv[0])))
 
     def on_mount(self) -> None:
         picker = self.query_one("#picker-list", OptionList)
-        picker.highlighted = next(
-            (i for i, opt in enumerate(picker._options)
-             if opt.id == self._current), 1)
+        picker.highlighted = next((i for i, opt in enumerate(picker._options) if opt.id == self._current), 1)
         picker.focus()
 
     @on(OptionList.OptionSelected, "#picker-list")
@@ -252,17 +223,12 @@ def demand_run_keys(app, resume) -> bool:
     should re-enter this gate so the next missing key is asked for in
     turn. Ask here, not deep inside a worker thread: a run that dies on a
     missing credential has already spent minutes of warming."""
-    if data_provider() in ("fd", "financialdatasets", "financial-datasets") \
-            and not os.environ.get("FINANCIAL_DATASETS_API_KEY"):
-        app.push_screen(
-            KeyPromptScreen("Financial Datasets",
-                            "FINANCIAL_DATASETS_API_KEY"),
-            lambda saved: resume() if saved else None)
+    if data_provider() in ("fd", "financialdatasets", "financial-datasets") and not os.environ.get("FINANCIAL_DATASETS_API_KEY"):
+        app.push_screen(KeyPromptScreen("Financial Datasets", "FINANCIAL_DATASETS_API_KEY"), lambda saved: resume() if saved else None)
         return False
     provider = provider_for(os.environ.get("HEDGE_FUND_LLM_MODEL", ""))
     env_var = missing_key(provider) if provider else None
     if env_var is None:
         return True
-    app.push_screen(KeyPromptScreen(provider, env_var),
-                    lambda saved: resume() if saved else None)
+    app.push_screen(KeyPromptScreen(provider, env_var), lambda saved: resume() if saved else None)
     return False

@@ -26,6 +26,7 @@ import httpx
 
 from hedge_fund.llm import contract
 from hedge_fund.llm.registry import (
+    catalog_entry_for,
     is_supported,
     KEYLESS_PROVIDERS,
     provider_for,
@@ -308,7 +309,8 @@ def make_llm(
     if not isinstance(dispatch, ProviderDispatch):
         raise AuthorizationDenied("provider operation authorization is required")
     dispatch.validate_target(target)
-    if context_size is not None and (provider != "Ollama" or model.casefold().endswith(":cloud")):
+    catalog_entry = catalog_entry_for(model)
+    if context_size is not None and (provider != "Ollama" or catalog_entry is None or catalog_entry.cost_class != "local"):
         raise ValueError("context size is supported only by local Ollama.")
 
     if api_key is None:

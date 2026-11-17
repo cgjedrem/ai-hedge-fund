@@ -3,13 +3,17 @@ from decimal import Decimal
 
 import pytest
 
-import hedge_fund.runtime.policy as policy
 from hedge_fund.runtime.policy import AuthorizationDenied
 from hedge_fund.runtime.policy import authorize_dispatch as _authorize_dispatch
 from hedge_fund.runtime.policy import authorize_session as _authorize_session
 from hedge_fund.runtime.policy import BudgetDenied, classify_provider, DispatchBudget
 from hedge_fund.runtime.policy import OneShotAuthorization as _OneShotAuthorization
-from hedge_fund.runtime.policy import OperationScope, ProviderClass, ProviderTarget
+from hedge_fund.runtime.policy import (
+    OperationScope,
+    PaidCloudAuthorizationDenied,
+    ProviderClass,
+    ProviderTarget,
+)
 from hedge_fund.runtime.policy import RunnerAuthorization as _RunnerAuthorization
 
 _OPERATION_ID = "operation-1"
@@ -54,7 +58,7 @@ def authorize_session(authorization, *args, **kwargs):
     )
 
 
-def test_cloud_labelled_keyless_ollama_is_not_classified_as_local():
+def test_unknown_keyless_ollama_model_is_not_classified_as_local():
     cloud_target = ProviderTarget(
         kind="llm",
         provider="ollama",
@@ -79,16 +83,13 @@ def test_cloud_labelled_keyless_ollama_is_not_classified_as_local():
     assert classify_provider(remote_target, approved_local_models={"gemma3:4b"}) is ProviderClass.PAID_CLOUD
 
 
-def test_ollama_cost_class_comes_from_catalog_metadata(monkeypatch):
+def test_ollama_cost_class_comes_from_catalog_metadata():
     target = ProviderTarget(
         kind="llm",
         provider="ollama",
         model="kimi-k3:cloud",
         endpoint="http://127.0.0.1:11434",
     )
-    monkeypatch.setattr(policy, "APPROVED_LOCAL_MODELS", frozenset({target.model}))
-    monkeypatch.setattr(policy, "_cloud_labelled", lambda _model: False, raising=False)
-
     from hedge_fund.llm.registry import catalog_entry_for
 
     entry = catalog_entry_for(target.model)
@@ -98,7 +99,7 @@ def test_ollama_cost_class_comes_from_catalog_metadata(monkeypatch):
 
 
 @pytest.mark.parametrize("credential_configured", [False, True])
-def test_scheduled_ollama_cloud_refuses_regardless_of_credentials(monkeypatch, credential_configured):
+def test_scheduled_cloud_refusal_is_independent_of_credential_presence(monkeypatch, credential_configured):
     if credential_configured:
         monkeypatch.setenv("OLLAMA_API_KEY", "synthetic-test-value")
     else:
@@ -145,7 +146,7 @@ def test_ollama_cloud_one_shot_requires_explicit_operation_authorization():
         endpoint="http://127.0.0.1:11434",
     )
 
-    with pytest.raises(AuthorizationDenied, match="operation-bound provider authorization is required"):
+    with pytest.raises(PaidCloudAuthorizationDenied) as refusal:
         authorize_dispatch(
             target,
             scope=OperationScope.MANUAL_ONE_SHOT,
@@ -156,6 +157,24 @@ def test_ollama_cloud_one_shot_requires_explicit_operation_authorization():
             upper_bound_cost=Decimal("0"),
             approved_local_models={target.model},
         )
+
+    assert str(refusal.value) == "Model 'kimi-k3:cloud' requires explicit per-operation authorization."
+
+
+def test_transport_check_reports_paid_cloud_classification_reason():
+    from hedge_fund.runtime.endpoints import validate_provider_target
+
+    target = ProviderTarget(
+        kind="llm",
+        provider="ollama",
+        model="kimi-k3:cloud",
+        endpoint="http://127.0.0.1:11434",
+    )
+
+    with pytest.raises(PaidCloudAuthorizationDenied) as refusal:
+        validate_provider_target(target)
+
+    assert str(refusal.value) == ("Model 'kimi-k3:cloud' is paid/cloud and requires explicit per-operation authorization.")
 
 
 def test_paid_provider_requires_matching_manual_one_shot_authorization():

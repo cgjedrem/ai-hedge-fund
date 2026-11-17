@@ -40,6 +40,7 @@ from hedge_fund.llm.registry import PROVIDER_ENV_VARS
 from hedge_fund.llm.test_contract import _response
 from hedge_fund.runtime.dispatch import make_one_shot_dispatch, ProviderDispatch
 from hedge_fund.runtime.policy import (
+    approved_local_ollama_chat_models,
     AuthorizationDenied,
     classify_provider,
     ProviderTarget,
@@ -198,6 +199,37 @@ def test_ollama_receives_captured_generation_context_and_endpoint(monkeypatch):
     assert llm._chat.temperature == 0.4
     assert llm._chat.top_p == 0.8
     assert llm._chat.base_url == "http://127.0.0.1:11434"
+
+
+def test_ollama_context_size_uses_catalog_cost_class_not_tag_suffix(tmp_path, monkeypatch):
+    model = "synthetic-local:cloud"
+    original = json.loads(registry_module.API_MODELS_PATH.read_text(encoding="utf-8"))
+    catalog_path = tmp_path / "api_models.json"
+    catalog_path.write_text(
+        json.dumps(
+            original
+            + [
+                {
+                    "display_name": "Synthetic local model",
+                    "model_name": model,
+                    "provider": "Ollama",
+                    "capability": "chat",
+                    "cost_class": "local",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(registry_module, "API_MODELS_PATH", catalog_path)
+
+    llm = _authorized_make_llm(
+        model,
+        endpoint="http://127.0.0.1:11434",
+        context_size=8192,
+        use_environment=False,
+    )
+
+    assert llm._chat.num_ctx == 8192
 
 
 def test_typesafe_accepts_and_ignores_temperature(monkeypatch):
@@ -417,10 +449,11 @@ def _authorized_target(model, endpoint=None):
 
 
 def _dispatch(target):
+    approved_models = approved_local_ollama_chat_models()
     local = (
         classify_provider(
             target,
-            approved_local_models={"gemma3:4b"},
+            approved_local_models=approved_models,
         ).value
         == "local"
     )
@@ -437,7 +470,7 @@ def _dispatch(target):
         max_cost=Decimal("10.00"),
         max_resources=100,
         upper_bound_costs={target.identity: cost},
-        approved_local_models={"gemma3:4b"},
+        approved_local_models=approved_models,
         clock=lambda: _NOW,
         resolver=lambda _host, _port: ["8.8.8.8"],
     )

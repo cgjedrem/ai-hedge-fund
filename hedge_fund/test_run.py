@@ -952,12 +952,76 @@ def test_cli_model_flag_accepts_catalog_ollama_cloud_tag(tmp_path, monkeypatch):
     assert settings.provenance["model"] == "launch"
 
 
+def test_cli_backtest_paid_cloud_reports_transport_refusal(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    offline,
+):
+    root = tmp_path / "cli-cloud-run"
+    root.mkdir()
+    _enroll_test_root(root)
+    path = _mandate(root, name="cloud-run")
+    monkeypatch.setattr(run, "PAPER_DIR", root / "paper")
+    monkeypatch.setenv("HEDGE_FUND_LLM_MODEL", "gemma3:4b")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "aihf",
+            "--root",
+            str(root),
+            "--enable-network",
+            "--model",
+            "kimi-k3:cloud",
+            "backtest",
+            str(path),
+            "--universe",
+            "AAPL",
+            "--start",
+            "2025-01-06",
+            "--end",
+            "2025-01-07",
+        ],
+    )
+
+    with pytest.raises(SystemExit) as rejected:
+        run.main()
+
+    output = capsys.readouterr()
+    assert rejected.value.code == 2
+    assert "Model 'kimi-k3:cloud' is paid/cloud and requires explicit per-operation authorization." in output.err
+    assert "no guarded production transport" not in output.err
+    assert not (root / "research").exists()
+    assert not (root / "paper").exists()
+
+
 def test_cli_unknown_model_fails_with_catalog_reason(tmp_path, capsys):
     from hedge_fund.runtime.root import RootContext
 
     root = tmp_path / "cli-unknown-model"
     root.mkdir()
     model = "kimi-k3.1:latest"
+    parser = run._parser()
+    args = parser.parse_args(["--root", str(root), "--model", model])
+
+    with RootContext.open(root) as context:
+        with pytest.raises(SystemExit) as rejected:
+            run._cli_settings(context, args, parser)
+
+    output = capsys.readouterr()
+    assert rejected.value.code == 2
+    assert f"Model '{model}' is not in the supported provider catalog." in output.err
+    assert "captured runtime settings are unavailable" not in output.err
+
+
+def test_cli_unknown_model_with_non_ollama_provider_reports_catalog_reason(tmp_path, monkeypatch, capsys):
+    from hedge_fund.runtime.root import RootContext
+
+    root = tmp_path / "cli-unknown-openai-model"
+    root.mkdir()
+    model = "synthetic-unknown-model"
+    monkeypatch.setenv("HEDGE_FUND_LLM_PROVIDER", "OpenAI")
     parser = run._parser()
     args = parser.parse_args(["--root", str(root), "--model", model])
 

@@ -3,7 +3,6 @@ import json
 import os
 from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
@@ -225,12 +224,12 @@ def test_runtime_configuration_import_does_not_load_provider_clients(owned_test_
 
 def test_runtime_provider_catalog_matches_engine_registry():
     from hedge_fund.llm.client import DEFAULT_MODEL
-    from hedge_fund.llm.registry import load_api_models, SUPPORTED_PROVIDERS
+    from hedge_fund.llm.registry import load_api_model_entries, SUPPORTED_PROVIDERS
     from hedge_fund.runtime import configuration
 
     assert configuration.DEFAULT_MODEL == DEFAULT_MODEL
     assert set(configuration._PROVIDERS.values()) == SUPPORTED_PROVIDERS
-    assert configuration._MODEL_PROVIDERS == {model: provider for _, model, provider in load_api_models() if provider in SUPPORTED_PROVIDERS}
+    assert configuration._model_catalog() == {entry.model_name: entry for entry in load_api_model_entries()}
 
 
 def test_cloud_ollama_model_is_selectable_from_all_configuration_sources(root_context):
@@ -269,6 +268,19 @@ def test_unknown_model_has_explicit_catalog_reason(root_context):
     assert str(caught.value) == f"Model '{model}' is not in the supported provider catalog."
 
 
+def test_unknown_model_reason_is_provider_independent(root_context):
+    model = "synthetic-unknown-model"
+
+    with pytest.raises(ConfigurationError) as caught:
+        resolve_settings(
+            root_context,
+            environment={"llm_provider": "OpenAI"},
+            launch={"model": model},
+        )
+
+    assert str(caught.value) == f"Model '{model}' is not in the supported provider catalog."
+
+
 @pytest.mark.parametrize(
     ("model", "capability"),
     [
@@ -282,15 +294,24 @@ def test_non_chat_ollama_metadata_is_rejected_with_capability_reason(
     root_context,
     monkeypatch,
 ):
-    from hedge_fund.runtime import configuration
+    from hedge_fund.llm import registry
+    from hedge_fund.llm.registry import ModelCatalogEntry
 
-    catalog = dict(getattr(configuration, "_MODEL_CATALOG", {}))
-    catalog[model] = SimpleNamespace(
-        provider="Ollama",
-        capability=capability,
-        cost_class="local",
+    catalog = registry.load_api_model_entries()
+    catalog.append(
+        ModelCatalogEntry(
+            display_name=model,
+            model_name=model,
+            provider="Ollama",
+            capability=capability,
+            cost_class="local",
+        )
     )
-    monkeypatch.setattr(configuration, "_MODEL_CATALOG", catalog, raising=False)
+    monkeypatch.setattr(
+        registry,
+        "load_api_model_entries",
+        lambda: catalog,
+    )
 
     with pytest.raises(ConfigurationError) as caught:
         resolve_settings(
@@ -299,6 +320,89 @@ def test_non_chat_ollama_metadata_is_rejected_with_capability_reason(
         )
 
     assert str(caught.value) == f"Model '{model}' is not chat-capable ({capability})."
+
+
+def test_paid_context_size_uses_catalog_cost_class(root_context, monkeypatch):
+    from hedge_fund.llm import registry
+    from hedge_fund.llm.registry import ModelCatalogEntry
+
+    catalog = registry.load_api_model_entries()
+    catalog.append(
+        ModelCatalogEntry(
+            display_name="Synthetic paid model",
+            model_name="synthetic-paid-remote",
+            provider="Ollama",
+            capability="chat",
+            cost_class="paid-cloud",
+        )
+    )
+    monkeypatch.setattr(
+        registry,
+        "load_api_model_entries",
+        lambda: catalog,
+    )
+
+    with pytest.raises(ConfigurationError, match="context size is supported only by local Ollama"):
+        resolve_settings(
+            root_context,
+            launch={
+                "llm_provider": "Ollama",
+                "model": "synthetic-paid-remote",
+                "parameters": {"context_size": 8192},
+            },
+        )
+
+
+def test_local_catalog_addition_updates_configuration_web_and_transport(tmp_path, root_context, monkeypatch):
+    from hedge_fund.llm import registry
+    from hedge_fund.runtime.endpoints import (
+        validate_provider_target,
+        validate_request_url,
+    )
+    from hedge_fund.runtime.policy import (
+        approved_local_ollama_chat_models,
+        classify_provider,
+        ProviderClass,
+        ProviderTarget,
+    )
+    from hedge_fund.web.services import _model_options
+
+    model = "synthetic-local:latest"
+    original = json.loads(registry.API_MODELS_PATH.read_text(encoding="utf-8"))
+    catalog_path = tmp_path / "api_models.json"
+    catalog_path.write_text(
+        json.dumps(
+            original
+            + [
+                {
+                    "display_name": "Synthetic local model",
+                    "model_name": model,
+                    "provider": "Ollama",
+                    "capability": "chat",
+                    "cost_class": "local",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(registry, "API_MODELS_PATH", catalog_path)
+
+    settings = resolve_settings(root_context, launch={"model": model})
+    target = ProviderTarget("llm", "Ollama", model)
+    validate_provider_target(target)
+    assert validate_request_url(target, "http://127.0.0.1:11434/api/chat") == ("127.0.0.1", 11434, True)
+
+    assert settings.model == model
+    assert model in approved_local_ollama_chat_models()
+    assert classify_provider(target, approved_local_models=approved_local_ollama_chat_models()) is ProviderClass.LOCAL
+    assert model in {option["id"] for option in _model_options()}
+
+    catalog_path.write_text(json.dumps(original), encoding="utf-8")
+
+    with pytest.raises(ConfigurationError, match=f"Model '{model}' is not in the supported provider catalog"):
+        resolve_settings(root_context, launch={"model": model})
+    assert model not in approved_local_ollama_chat_models()
+    assert model not in {option["id"] for option in _model_options()}
 
 
 def test_environment_cannot_elevate_root_writes_network_or_paid_policy(root_context, tmp_path):

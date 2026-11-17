@@ -173,6 +173,7 @@ from hedge_fund.runtime.policy import (
     BudgetDenied,
     classify_provider,
     KEN_FRENCH_BREAKPOINTS_TARGET,
+    PaidCloudAuthorizationDenied,
     ProviderClass,
     ProviderTarget,
 )
@@ -2019,6 +2020,8 @@ class DeskService:
             )
             if data_class is not ProviderClass.FREE_DATA or llm_class is not ProviderClass.LOCAL:
                 raise AuthorizationDenied("manual paper providers are not local/free")
+        except PaidCloudAuthorizationDenied as exc:
+            raise ServiceError(403, str(exc)) from None
         except AuthorizationDenied:
             raise ServiceError(403, "Paper operations require free market data and a local model.") from None
         if operation is None:
@@ -2051,6 +2054,8 @@ class DeskService:
                         capture,
                     ),
                 )
+            except PaidCloudAuthorizationDenied as exc:
+                raise ServiceError(403, str(exc)) from None
             except AuthorizationDenied:
                 raise ServiceError(403, "Paper preview provider authorization could not be established.") from None
         calls = min(10000, max(100, model_calls + 100 * len(capture.universe)))
@@ -2092,6 +2097,8 @@ class DeskService:
                     paper=True,
                 ),
             )
+        except PaidCloudAuthorizationDenied as exc:
+            raise ServiceError(403, str(exc)) from None
         except AuthorizationDenied:
             raise ServiceError(403, "Paper provider authorization could not be established.") from None
 
@@ -2124,6 +2131,12 @@ class DeskService:
                 llm,
                 approved_local_models={settings.model},
             )
+        except PaidCloudAuthorizationDenied as exc:
+            raise ServiceError(
+                403,
+                str(exc),
+                code="readiness-denied",
+            ) from None
         except AuthorizationDenied:
             raise ServiceError(
                 422,
@@ -3266,6 +3279,8 @@ class DeskService:
                     llm_target,
                     approved_local_models={settings.model},
                 )
+            except PaidCloudAuthorizationDenied as exc:
+                raise ServiceError(403, str(exc), code="capability-denied") from None
             except AuthorizationDenied:
                 raise ServiceError(422, "Provider configuration has no guarded production transport.", code="readiness-denied") from None
             paid_targets = [
@@ -3799,6 +3814,8 @@ class DeskService:
                 llm_target,
                 approved_local_models={capture.model},
             )
+        except PaidCloudAuthorizationDenied as exc:
+            raise OperationError(str(exc)) from None
         except AuthorizationDenied:
             raise OperationError("captured provider transport is unavailable") from None
         paid_targets = [
@@ -3917,6 +3934,8 @@ class DeskService:
                     paper=False,
                 ),
             )
+        except PaidCloudAuthorizationDenied as exc:
+            raise OperationError(str(exc)) from None
         except AuthorizationDenied:
             raise OperationError("provider authorization could not be established") from None
 
@@ -5245,7 +5264,7 @@ def _model_provider_for_selection(model_id: str) -> str:
         capability = entry.capability or "unknown"
         raise ServiceError(400, f"Model '{model_id}' is not chat-capable ({capability}).")
     if not is_supported(entry.provider):
-        raise ServiceError(400, "Model is not in the supported provider catalog.")
+        raise ServiceError(400, f"Model '{model_id}' is not in the supported provider catalog.")
     return entry.provider
 
 

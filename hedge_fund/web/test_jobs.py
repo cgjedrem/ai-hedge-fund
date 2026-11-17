@@ -253,6 +253,47 @@ def _mandate_fingerprint(root, name="demo-quality"):
     return mandate_hash(load_spec(root / "mandates" / f"{name}.yaml"))
 
 
+def test_web_backtest_preview_reports_paid_cloud_refusal_at_route(demo_root):
+    app = create_app(
+        root=demo_root,
+        allow_writes=True,
+        network_enabled=True,
+        demo=True,
+    )
+    with TestClient(app, client=("127.0.0.1", 50000)) as client:
+        headers = _write_headers(client)
+        settings = client.get("/api/settings", headers={"host": "127.0.0.1"}).json()
+        selected = client.post(
+            "/api/settings/model",
+            headers=headers,
+            json={"model": "kimi-k3:cloud", "expected_version": settings["version"]},
+        )
+        assert selected.status_code == 200, selected.text
+        mandate_digest = _mandate_fingerprint(demo_root)
+        response = client.post(
+            "/api/operations/preview",
+            headers=headers,
+            json={
+                "action": "backtest",
+                "subject_id": "demo-quality",
+                "expected_head": mandate_digest,
+                "payload": {
+                    "fund": "demo-quality",
+                    "universe": ["AAPL"],
+                    "start": "2024-06-03",
+                    "end": "2024-06-07",
+                    "provider": "yfinance",
+                    "model": "kimi-k3:cloud",
+                    "mandate_hash": mandate_digest,
+                },
+            },
+        )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == ("Model 'kimi-k3:cloud' is paid/cloud and requires explicit per-operation authorization.")
+    assert response.json()["code"] == "capability-denied"
+
+
 def test_builder_canonical_validation_conflicts_and_deployment(tmp_path):
     enroll_synthetic_root(tmp_path)
     service = DeskService(tmp_path, allow_writes=True)

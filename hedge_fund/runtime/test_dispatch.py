@@ -14,12 +14,15 @@ from hedge_fund.runtime.endpoints import (
     PinnedAddress,
     resolve_destination,
     validate_provider_target,
+    validate_request_url,
 )
 from hedge_fund.runtime.policy import (
     AuthorizationDenied,
     BudgetDenied,
     OperationScope,
+    PaidCloudAuthorizationDenied,
     ProviderTarget,
+    RunnerAuthorization,
 )
 
 _NOW = datetime(2026, 10, 31, 12, 0, tzinfo=timezone.utc)
@@ -460,6 +463,32 @@ def test_ollama_cloud_one_shot_refuses_without_verified_cost_model():
         )
 
 
+def test_paid_cloud_dispatch_without_one_shot_authorization_names_requirement():
+    target = ProviderTarget(
+        kind="llm",
+        provider="ollama",
+        model="kimi-k3:cloud",
+        endpoint="http://127.0.0.1:11434",
+    )
+
+    with pytest.raises(PaidCloudAuthorizationDenied) as refusal:
+        ProviderDispatch(
+            scope=OperationScope.MANUAL_ONE_SHOT,
+            root_id="synthetic-root",
+            subject_id="research-1",
+            capture_digest="capture-digest",
+            operation_id="operation-1",
+            operation_digest="b" * 64,
+            targets=(target,),
+            network_authorized=True,
+            approved_local_models=frozenset({target.model}),
+            clock=lambda: _NOW,
+            resolver=lambda _host, _port: ["8.8.8.8"],
+        )
+
+    assert str(refusal.value) == "Model 'kimi-k3:cloud' requires explicit per-operation authorization."
+
+
 def test_ollama_cloud_non_loopback_override_keeps_endpoint_refusal():
     target = ProviderTarget(
         kind="llm",
@@ -476,6 +505,78 @@ def test_ollama_cloud_non_loopback_override_keeps_endpoint_refusal():
             upper_bound_cost=Decimal("0"),
             approved_local_models={target.model},
         )
+
+
+def test_paid_cloud_validation_does_not_skip_catalog_allowlist():
+    target = ProviderTarget(
+        kind="llm",
+        provider="ollama",
+        model="synthetic-unknown-cloud",
+        endpoint="http://127.0.0.1:11434",
+    )
+
+    with pytest.raises(AuthorizationDenied, match="Ollama model is not an approved chat model"):
+        validate_provider_target(target, allow_paid_cloud=True)
+
+
+def test_paid_cloud_url_is_not_in_local_request_allowlist():
+    target = ProviderTarget(
+        kind="llm",
+        provider="ollama",
+        model="kimi-k3:cloud",
+        endpoint="http://127.0.0.1:11434",
+    )
+
+    with pytest.raises(AuthorizationDenied, match="Ollama destination is not the approved loopback endpoint"):
+        validate_request_url(target, "http://127.0.0.1:11434/api/chat")
+
+
+@pytest.mark.parametrize("cost_verified", [False, True])
+def test_scheduled_cloud_refusal_branch_reports_model_specific_reason(
+    monkeypatch,
+    cost_verified,
+):
+    if cost_verified:
+        monkeypatch.setattr(
+            "hedge_fund.runtime.dispatch.has_verified_cost_model",
+            lambda _target: True,
+        )
+    target = ProviderTarget(
+        kind="llm",
+        provider="ollama",
+        model="kimi-k3:cloud",
+        endpoint="http://127.0.0.1:11434",
+    )
+    runner = RunnerAuthorization(
+        root_id="synthetic-root",
+        deployment_id="deployment-1",
+        capture_digest="capture-digest",
+        operation_id="operation-1",
+        operation_digest="b" * 64,
+        provider_ids=(target.identity,),
+        expires_at=_NOW + timedelta(minutes=5),
+        max_sessions=1,
+        max_calls=1,
+        max_resources=1,
+    )
+
+    with pytest.raises(PaidCloudAuthorizationDenied) as refusal:
+        ProviderDispatch(
+            scope=OperationScope.SCHEDULED,
+            root_id="synthetic-root",
+            subject_id="deployment-1",
+            capture_digest="capture-digest",
+            operation_id="operation-1",
+            operation_digest="operation-digest",
+            targets=(target,),
+            network_authorized=True,
+            runner=runner,
+            approved_local_models=frozenset({target.model}),
+            clock=lambda: _NOW,
+            resolver=lambda _host, _port: ["8.8.8.8"],
+        )
+
+    assert str(refusal.value) == "Model 'kimi-k3:cloud' is paid/cloud and cannot be used in scheduled runs."
 
 
 def test_ollama_endpoint_guard_still_rejects_non_loopback_destinations():

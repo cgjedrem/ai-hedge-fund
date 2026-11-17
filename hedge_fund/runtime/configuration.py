@@ -26,7 +26,6 @@ DEFAULT_DATA_PROVIDER = "yfinance"
 DEFAULT_MODEL = "gemma3:4b"
 DEFAULT_TIMEOUT_SECONDS = 60.0
 _PROVIDERS = {provider.casefold(): provider for provider in ("OpenAI", "xAI", "DeepSeek", "Kimi", "TypeSafe", "Ollama")}
-_MODEL_CATALOG_PATH = Path(__file__).resolve().parents[1] / "llm" / "api_models.json"
 _DEFAULT_LLM_PROVIDER = "Ollama"
 _DATA_PROVIDERS = {
     "fd": "fd",
@@ -53,52 +52,13 @@ _ENVIRONMENT_FIELDS = {
 }
 _PARAMETER_FIELDS = frozenset({"context_size", "max_tokens", "temperature", "top_p"})
 _PROVENANCE_VALUES = frozenset({"default", "persisted", "environment", "launch"})
-_MODEL_CAPABILITIES = frozenset({"chat", "embedding", "ocr"})
-_MODEL_COST_CLASSES = frozenset({"local", "paid-cloud"})
 
 
-@dataclass(frozen=True, slots=True)
-class _ModelCatalogMetadata:
-    provider: str
-    capability: str | None
-    cost_class: str | None
+def _model_catalog():
+    """Return current validated entries from shared registry parser."""
+    from hedge_fund.llm.registry import load_api_model_entries
 
-
-def _load_model_catalog() -> dict[str, _ModelCatalogMetadata]:
-    try:
-        records = json.loads(_MODEL_CATALOG_PATH.read_text(encoding="utf-8"))
-        if not isinstance(records, list):
-            raise ValueError("model catalog is invalid")
-        catalog = {}
-        for record in records:
-            if not isinstance(record, dict):
-                raise ValueError("model catalog is invalid")
-            model = record.get("model_name")
-            provider = record.get("provider")
-            capability = record.get("capability")
-            cost_class = record.get("cost_class")
-            if not isinstance(model, str) or not model or model != model.strip():
-                raise ValueError("model catalog is invalid")
-            if not isinstance(provider, str) or not provider or provider != provider.strip():
-                raise ValueError("model catalog is invalid")
-            if provider == "Ollama" and (capability not in _MODEL_CAPABILITIES or cost_class not in _MODEL_COST_CLASSES):
-                raise ValueError("model catalog is invalid")
-            if capability is not None and capability not in _MODEL_CAPABILITIES:
-                raise ValueError("model catalog is invalid")
-            if cost_class is not None and cost_class not in _MODEL_COST_CLASSES:
-                raise ValueError("model catalog is invalid")
-            if model in catalog:
-                raise ValueError("model catalog is invalid")
-            catalog[model] = _ModelCatalogMetadata(provider, capability, cost_class)
-        if not catalog:
-            raise ValueError("model catalog is invalid")
-        return catalog
-    except (OSError, ValueError, TypeError):
-        return {DEFAULT_MODEL: _ModelCatalogMetadata("Ollama", "chat", "local")}
-
-
-_MODEL_CATALOG = _load_model_catalog()
-_MODEL_PROVIDERS = {model: entry.provider for model, entry in _MODEL_CATALOG.items() if entry.provider.casefold() in _PROVIDERS}
+    return {entry.model_name: entry for entry in load_api_model_entries()}
 
 
 class ConfigurationError(ValueError):
@@ -539,8 +499,10 @@ def _derive_model_provider(overrides: dict[str, object]) -> None:
     if "model" not in overrides or "llm_provider" in overrides:
         return
     model = overrides["model"]
-    if isinstance(model, str) and model in _MODEL_PROVIDERS:
-        overrides["llm_provider"] = _MODEL_PROVIDERS[model]
+    if isinstance(model, str):
+        entry = _model_catalog().get(model)
+        if entry is not None and entry.provider.casefold() in _PROVIDERS:
+            overrides["llm_provider"] = _PROVIDERS[entry.provider.casefold()]
 
 
 def _parse_persisted(
@@ -576,13 +538,11 @@ def _normalize_settings(values: Mapping[str, object]) -> dict[str, object]:
         raise ConfigurationError("LLM provider is unsupported")
     normalized_provider = _PROVIDERS[llm_provider.casefold()]
     model = _validate_text(values["model"], maximum=256, message="model is invalid")
-    catalog_entry = _MODEL_CATALOG.get(model)
-    registered_provider = _MODEL_PROVIDERS.get(model)
-    if registered_provider is None and catalog_entry is not None and catalog_entry.provider.casefold() in _PROVIDERS:
-        registered_provider = _PROVIDERS[catalog_entry.provider.casefold()]
+    catalog_entry = _model_catalog().get(model)
+    if catalog_entry is None:
+        raise ModelSelectionError(f"Model '{model}' is not in the supported provider catalog.")
+    registered_provider = _PROVIDERS.get(catalog_entry.provider.casefold())
     if registered_provider is None:
-        if normalized_provider == "Ollama" and catalog_entry is None:
-            raise ModelSelectionError(f"Model '{model}' is not in the supported provider catalog.")
         raise ConfigurationError("model is not in the supported catalog")
     if registered_provider != normalized_provider:
         if "Ollama" in {registered_provider, normalized_provider}:
@@ -591,9 +551,7 @@ def _normalize_settings(values: Mapping[str, object]) -> dict[str, object]:
     if registered_provider == "Ollama" and catalog_entry is not None and catalog_entry.capability != "chat":
         raise ModelSelectionError(f"Model '{model}' is not chat-capable ({catalog_entry.capability}).")
     parameters = _normalize_parameters(values["parameters"])
-    if "context_size" in parameters and (
-        normalized_provider != "Ollama" or model.casefold().endswith(":cloud")
-    ):
+    if "context_size" in parameters and (normalized_provider != "Ollama" or catalog_entry.cost_class != "local"):
         raise ConfigurationError("context size is supported only by local Ollama")
     endpoint = _normalize_endpoint(values["endpoint"])
     timeout = values["timeout_seconds"]

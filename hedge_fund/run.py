@@ -148,7 +148,10 @@ def main(argv: list[str] | None = None) -> None:
             except (RootPathError, UnicodeError, ValueError) as exc:
                 parser.error(str(exc))
             _load_runtime()
-            from hedge_fund.runtime.policy import AuthorizationDenied
+            from hedge_fund.runtime.policy import (
+                AuthorizationDenied,
+                PaidCloudAuthorizationDenied,
+            )
 
             if not (args.command == "paper" and args.action == "halt"):
                 try:
@@ -176,6 +179,9 @@ def main(argv: list[str] | None = None) -> None:
                 console.print(f"[red]{exc}[/]")
                 sys.exit(1)
             except PaperWriterDenied as exc:
+                console.print(f"[red]{exc}[/]")
+                sys.exit(1)
+            except PaidCloudAuthorizationDenied as exc:
                 console.print(f"[red]{exc}[/]")
                 sys.exit(1)
             except AuthorizationDenied:
@@ -1029,6 +1035,7 @@ def _authorize_cli_operation(
         AuthorizationDenied,
         classify_provider,
         KEN_FRENCH_BREAKPOINTS_TARGET,
+        PaidCloudAuthorizationDenied,
         ProviderClass,
         ProviderTarget,
     )
@@ -1088,6 +1095,8 @@ def _authorize_cli_operation(
             targets.append(llm_target)
         if classify_provider(breakpoints_target) is not ProviderClass.FREE_DATA:
             parser.error("breakpoints provider is not approved free data")
+    except PaidCloudAuthorizationDenied as exc:
+        parser.error(str(exc))
     except AuthorizationDenied:
         parser.error("captured provider has no guarded production transport")
     paid_targets = [
@@ -1336,6 +1345,8 @@ def _authorize_cli_operation(
             boundary_check=boundary_check,
             resolver=resolver,
         )
+    except PaidCloudAuthorizationDenied as exc:
+        parser.error(str(exc))
     except AuthorizationDenied:
         parser.error("operation provider authorization could not be established")
     return {
