@@ -34,7 +34,7 @@
 | V5 picker presentation (FR-004) | `web/test_settings.py` — classifier fields in models/catalog payloads; rejection contract C2 | PASS |
 | V6 precedence + persistence (FR-005) | `test_capture.py` — launch > env > persisted > default; restart persistence | PASS |
 | V7 safe failure, no secrets (FR-008/010) | `test_dispatch.py` loopback guardrails unchanged; rejection messages contain no credential material | PASS |
-| V8 non-Ollama unchanged (FR-011) | full-suite diff vs baseline shows no new failures outside pre-existing set | INCONCLUSIVE — superseded by the cycle-3 full-suite section below (2 failures outside the documented baseline IDs on 05b228d, pending baseline-suite classification) |
+| V8 non-Ollama unchanged (FR-011) | full-suite diff vs baseline shows no new failures outside pre-existing set | PASS (2026-11-18) — authoritative baseline full suite at `e6f04d2` (log: `$TEMP\baseline-suite3.log`, 26 failed / 3010 passed / 62 skipped in 5679s) matches the documented 26-ID failure set exactly; the 2 extra delta-run failures (`web/test_saxo_inspection.py::test_http_loss_during_result_redaction_prevents_publication[owner-inspect|root-inspect]`) did NOT reproduce at baseline and QA's static trace found no path from the delta to them — classified as load/timing flakes (same class as the known-flaky `test_inventory_cache_race`, which itself flipped between runs) |
 
 ## QA rework targeted evidence (cycle 1)
 
