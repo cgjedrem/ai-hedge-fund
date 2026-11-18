@@ -6,7 +6,7 @@
 
 ## Summary
 
-Restore schedulability of otherwise-consistent paper funds blocked by multiple historical (partly unkeyed) tick failures, via one operator-mediated, audited, append-only **reconciliation decision record** that binds the resolved failure-digest set + ledger head + broker-book digest + operator + recorded time. A conservative system-computed evidence classification gates the confirm; genuinely ambiguous, corrupt, mismatched, stale, or contended cases refuse with zero writes. No historical bytes change; no fees/cash/positions are touched. Web surface only, reusing spec006/007 lanes and receipt-binding discipline.
+Restore schedulability of otherwise-consistent paper funds blocked by multiple historical (partly unkeyed) tick failures, via one operator-mediated, audited, append-only **reconciliation decision record** that binds the resolved failure-digest set + ledger head + broker-book digest + exact audit-history digest + operator + recorded time + exact attestable subset. Per-failure evidence is `verified`, `attestable`, or `not_resolvable`; ambiguous, corrupt, mismatched, stale, or contended cases refuse with zero writes. No historical bytes change; no fees/cash/positions are touched. Web surface only, reusing spec006/007 lanes and receipt-binding discipline.
 
 ## Technical Context
 
@@ -52,7 +52,7 @@ Key trace anchors:
 Outputs: [data-model.md](data-model.md), [contracts/legacy-failure-recovery.md](contracts/legacy-failure-recovery.md), [quickstart.md](quickstart.md).
 
 Design summary:
-1. **Classification function** (runtime/reconciliation.py): pure computation over verified replay + events + book digest → per-failure `resolvable`/`not_resolvable` with per-check detail. No writes.
+1. **Classification function** (runtime/reconciliation.py): pure computation over verified replay + events + book evidence → per-failure `verified`/`attestable`/`not_resolvable` with per-check detail. `verified` requires no pending decision at `expected_head`; structurally sound uncertainty requires per-failure attestation; any structural failure blocks the set. No writes.
 2. **Decision record** (paper/ledger.py audit kinds + reconciliation replay): new append-only audit kind; replay treats bound digests as resolved; digest-derived ID dedups.
 3. **Web flow** (web/services.py + web/app.py): extended preview; confirm route with fund lock + control/audit lanes; stale/refusal matrix per contract.
 4. **Desk display** (frontend paper.tsx): per-failure classification list + confirm affordance gated on `confirm_offered`.
@@ -97,7 +97,7 @@ frontend/
 
 ## Risk register (carried into tasks)
 
-- **R1 Over-classification**: the evidence rule (research.md Decision 2) could mark a genuinely post-effect failure resolvable if checks are too weak → mitigated by check 3 (post-effect fields) + mandatory operator attestation + P2 fixtures.
+- **R1 Over-classification**: the evidence rule (research.md Decision 2) could mark a genuinely post-effect failure `verified` if the no-pending discriminator or structural checks are too weak → mitigated by treating effect metadata and post-advance failure shapes as `attestable`, blocking structural gaps, and testing pending/no-pending heads.
 - **R2 Replay semantic drift**: decision records must not alter resolution of legacy receipts/intents → FR-011 regression fixtures.
 - **R3 Writer-map/admission regressions**: new append path must reuse anchored boundary → ledger.py tests + writer-map scan.
 

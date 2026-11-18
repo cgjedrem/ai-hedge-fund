@@ -12,21 +12,22 @@ poetry install
 
 ## Scenario A — P1 happy path (multiple unkeyed failures resolved)
 
-1. Fixture: synthetic fund whose events file contains 3 legacy `tick_failed` events (no `request_id`, no post-effect fields), followed by later verified session records; broker book matches replay.
+1. Fixture: synthetic fund whose events file contains 3 legacy `tick_failed` events (no `request_id`, no post-effect fields), each anchored at a head with no pending decision, followed by later verified session records; broker book matches replay.
 2. Run the focused tests (exact IDs assigned in tasks.md), e.g.:
    ```powershell
    poetry run pytest hedge_fund/runtime/test_reconciliation.py hedge_fund/web/test_recovery.py -q -k legacy
    ```
-3. Expected: preview lists 3 failures, all `resolvable`, `confirm_offered=true`; confirm appends exactly one decision record; recovery state ready; work admission no longer returns 423; pre-existing events/ledger bytes hash-identical before/after.
+3. Expected: preview lists 3 failures, all `verified`, `confirm_offered=true`, and an exact audit-history digest; confirm appends one decision binding the failure set and empty attestable subset; recovery state ready; work admission no longer returns 423; pre-existing events/ledger bytes hash-identical before/after.
 
 ## Scenario B — P2 refusals (each independent)
 
 | Fixture | Expected |
 |---|---|
-| One failure carrying transmitted-fill/post-effect fields | that failure `not_resolvable`, no confirm offered |
-| Corrupt audit event injected | corrupt state, zero writes |
+| One structurally sound failure carrying transmitted-fill/post-effect fields | that failure `attestable`, explicit per-failure attestation required |
+| One failure with a structural gap (e.g. no verified successor after its event position) | that failure `not_resolvable`; whole set refused with zero writes |
+| Corrupt audit event present at the reviewed revision | corrupt state, zero writes |
 | Book digest perturbed | book-mismatch refusal, zero writes |
-| Append an event between preview and confirm | 409 stale-preview, zero writes |
+| Append any event, including Halt, between preview and confirm | 409 stale-preview, zero writes |
 | Second writer holds fund lane | contention response, zero writes |
 | Confirm repeated after success | idempotent already-resolved, no second record |
 
