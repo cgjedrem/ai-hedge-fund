@@ -80,6 +80,8 @@ def _validated_entries(value: object) -> list[ModelCatalogEntry]:
             raise ValueError("model catalog is invalid")
         if cost_class is not None and cost_class not in _COST_CLASSES:
             raise ValueError("model catalog is invalid")
+        if model_name.casefold().endswith(":cloud") and cost_class != "paid-cloud":
+            raise ValueError("model catalog is invalid")
         seen.add(model_name)
         entries.append(ModelCatalogEntry(display_name, model_name, provider, capability, cost_class))
     return entries

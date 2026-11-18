@@ -405,6 +405,69 @@ def test_local_catalog_addition_updates_configuration_web_and_transport(tmp_path
     assert model not in {option["id"] for option in _model_options()}
 
 
+def test_mislabelled_cloud_catalog_fails_closed_across_selection_and_dispatch(
+    tmp_path,
+    root_context,
+    monkeypatch,
+):
+    from hedge_fund.llm import registry
+    from hedge_fund.runtime.dispatch import ProviderDispatch
+    from hedge_fund.runtime.endpoints import validate_provider_target
+    from hedge_fund.runtime.policy import (
+        approved_local_ollama_chat_models,
+        AuthorizationDenied,
+        classify_provider,
+        OperationScope,
+        ProviderClass,
+        ProviderTarget,
+    )
+    from hedge_fund.web.services import _model_options
+
+    model = "synthetic-local:cloud"
+    catalog = json.loads(registry.API_MODELS_PATH.read_text(encoding="utf-8"))
+    catalog.append(
+        {
+            "display_name": "Synthetic local cloud label",
+            "model_name": model,
+            "provider": "Ollama",
+            "capability": "chat",
+            "cost_class": "local",
+        }
+    )
+    catalog_path = tmp_path / "api_models.json"
+    catalog_path.write_text(json.dumps(catalog), encoding="utf-8")
+    monkeypatch.setattr(registry, "API_MODELS_PATH", catalog_path)
+    target = ProviderTarget(
+        kind="llm",
+        provider="ollama",
+        model=model,
+        endpoint="http://127.0.0.1:11434",
+    )
+
+    with pytest.raises(ValueError, match="model catalog is invalid"):
+        registry._validated_entries(catalog)
+    assert model not in {entry.model_name for entry in registry.load_api_model_entries()}
+    assert model not in approved_local_ollama_chat_models()
+    assert model not in {option["id"] for option in _model_options()}
+    assert classify_provider(target, approved_local_models={model}) is ProviderClass.PAID_CLOUD
+    with pytest.raises(ConfigurationError, match="not in the supported provider catalog"):
+        resolve_settings(root_context, launch={"model": model})
+    with pytest.raises(AuthorizationDenied, match="Ollama model is not an approved chat model"):
+        validate_provider_target(target, allow_paid_cloud=True)
+    with pytest.raises(AuthorizationDenied, match="Ollama model is not an approved chat model"):
+        ProviderDispatch(
+            scope=OperationScope.MANUAL_ONE_SHOT,
+            root_id="synthetic-root",
+            subject_id="research-1",
+            capture_digest="capture-digest",
+            operation_id="operation-1",
+            operation_digest="b" * 64,
+            targets=(target,),
+            network_authorized=True,
+            approved_local_models=frozenset({model}),
+        )
+
+
 def test_environment_cannot_elevate_root_writes_network_or_paid_policy(root_context, tmp_path):
     decoy_root = tmp_path / "decoy"
     settings = resolve_settings(root_context)

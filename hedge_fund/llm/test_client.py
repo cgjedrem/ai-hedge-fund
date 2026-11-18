@@ -201,35 +201,28 @@ def test_ollama_receives_captured_generation_context_and_endpoint(monkeypatch):
     assert llm._chat.base_url == "http://127.0.0.1:11434"
 
 
-def test_ollama_context_size_uses_catalog_cost_class_not_tag_suffix(tmp_path, monkeypatch):
+def test_ollama_cloud_suffix_must_be_paid_cloud_in_catalog(tmp_path, monkeypatch):
     model = "synthetic-local:cloud"
     original = json.loads(registry_module.API_MODELS_PATH.read_text(encoding="utf-8"))
+    catalog = original + [
+        {
+            "display_name": "Synthetic local model",
+            "model_name": model,
+            "provider": "Ollama",
+            "capability": "chat",
+            "cost_class": "local",
+        }
+    ]
+
+    with pytest.raises(ValueError, match="model catalog is invalid"):
+        registry_module._validated_entries(catalog)
+
     catalog_path = tmp_path / "api_models.json"
-    catalog_path.write_text(
-        json.dumps(
-            original
-            + [
-                {
-                    "display_name": "Synthetic local model",
-                    "model_name": model,
-                    "provider": "Ollama",
-                    "capability": "chat",
-                    "cost_class": "local",
-                }
-            ]
-        ),
-        encoding="utf-8",
-    )
+    catalog_path.write_text(json.dumps(catalog), encoding="utf-8")
     monkeypatch.setattr(registry_module, "API_MODELS_PATH", catalog_path)
 
-    llm = _authorized_make_llm(
-        model,
-        endpoint="http://127.0.0.1:11434",
-        context_size=8192,
-        use_environment=False,
-    )
-
-    assert llm._chat.num_ctx == 8192
+    assert registry_module.load_api_models() == [("Gemma 3 4B", "gemma3:4b", "Ollama")]
+    assert registry_module.catalog_entry_for(model) is None
 
 
 def test_typesafe_accepts_and_ignores_temperature(monkeypatch):
