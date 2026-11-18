@@ -50,6 +50,7 @@ Cloud-labelled Ollama tags are deliberately classified paid/cloud even via loopb
 
 - **Decision**: add the cost-model entry for `kimi-k3.1-pro:cloud` with operator-declared pricing sourced from the Ollama model page: $2.00 per 1M input tokens, $0.20 per 1M cached-input tokens, $10.00 per 1M output tokens; 1M-token context. Record it as operator-declared with that provenance and date. Entry for `kimi-k3.1-pro:cloud` only; other cloud tags remain without verified cost models and keep refusing dispatch.
 - **Consequence (QA caveat M-7)**: adding a verified cost model makes authorized one-shot dispatch technically reachable; the transport/authorization/budget path and `llm/client.py:308` authorization propagation MUST be re-reviewed together before this is considered enabled.
+- **Recorded assumption (QA delta review I-2, 2026-11-18)**: the $3.31072 upper bound assumes the Ollama cloud service enforces `num_predict` as the billed output cap for `:cloud` models, and that reasoning/thinking tokens are billed within it. Neither is verified against the live service. Mitigation: hard per-attempt and per-operation budget caps apply regardless; if Ollama bills beyond `num_predict`, the bound underestimates. Operator accepts this assumption pending live observation.
 - **Superseded text (2026-11-17)**: pricing unavailable at planning time; refusal mechanism required until operator supplies it.
 
 ### D6: Prior art — extend within policy, never restore pre-4177741 behavior

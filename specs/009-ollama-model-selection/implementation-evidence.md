@@ -27,14 +27,14 @@
 
 | Scenario | Evidence | Result |
 |---|---|---|
-| V1 acceptance consistency (FR-001/002) | `hedge_fund/runtime/test_capture.py`, `web/test_settings.py` — kimi-k3:cloud accepted across CLI/env/persisted/web | PASS (targeted suites green) |
+| V1 acceptance consistency (FR-001/002) | `hedge_fund/runtime/test_capture.py`, `web/test_settings.py` — cloud tag accepted across CLI/env/persisted/web | PASS (targeted suites green). Target superseded 2026-11-18: rows citing `kimi-k3:cloud` apply equally to `kimi-k3.1-pro:cloud` per the delta evidence below. |
 | V2 no silent substitution (FR-003) | `hedge_fund/tui/test_home.py` — invalid preset yields explicit notice, no substitution | PASS |
 | V3 capability filtering (FR-006) | `test_capture.py` — embedding/OCR tags rejected with capability reason | PASS |
 | V4 paid/cloud governance (FR-007) | `runtime/test_policy.py`, `runtime/test_dispatch.py` — scheduled refusal regardless of credentials; unauthorized one-shot refusal; "no verified cost model" refusal (D7 mechanism) | PASS |
 | V5 picker presentation (FR-004) | `web/test_settings.py` — classifier fields in models/catalog payloads; rejection contract C2 | PASS |
 | V6 precedence + persistence (FR-005) | `test_capture.py` — launch > env > persisted > default; restart persistence | PASS |
 | V7 safe failure, no secrets (FR-008/010) | `test_dispatch.py` loopback guardrails unchanged; rejection messages contain no credential material | PASS |
-| V8 non-Ollama unchanged (FR-011) | full-suite diff vs baseline shows no new failures outside pre-existing set | PASS |
+| V8 non-Ollama unchanged (FR-011) | full-suite diff vs baseline shows no new failures outside pre-existing set | INCONCLUSIVE — superseded by the cycle-3 full-suite section below (2 failures outside the documented baseline IDs on 05b228d, pending baseline-suite classification) |
 
 ## QA rework targeted evidence (cycle 1)
 
@@ -57,7 +57,7 @@ Results recorded 2026-11-18 02:32:55 +01:00. Implementation code in the Python t
 | 6 frontend types | `(cwd=frontend) npx tsc --noEmit` | **PASS** — exit 0, no emitted files. |
 | 6 frontend lint | `(cwd=frontend) npm run` | **N/A** — configured scripts contain no lint script; toolchain available. |
 
-V4.5 (authorized one-shot dispatch with a real verified cost model) remains **blocked on D7**: operator pricing/budget input not yet supplied; mechanism refuses with the explicit reason until then.
+V4.5 (authorized one-shot dispatch with a real verified cost model): **mechanism enabled 2026-11-18** — D7 resolved with operator-declared pricing for `kimi-k3.1-pro:cloud` (see delta section below); authorized+budgeted one-shot dispatch reaches mocked client construction on the web path and via the CLI factory. Live walk not performed (requires explicit operator authorization at run time). QA delta review caveat I-1: the full CLI `main()` path has an unresolved credential-store lookup question for keyless Ollama — tracked for the current rework cycle.
 
 ## QA rework targeted evidence (cycle 2: I-2, I-3)
 
