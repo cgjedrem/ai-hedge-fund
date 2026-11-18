@@ -2133,7 +2133,7 @@ class DeskService:
             )
         except PaidCloudAuthorizationDenied as exc:
             raise ServiceError(
-                403,
+                422,
                 str(exc),
                 code="readiness-denied",
             ) from None
