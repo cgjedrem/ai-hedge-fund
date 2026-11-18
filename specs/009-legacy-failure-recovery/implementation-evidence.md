@@ -311,3 +311,19 @@
 - QA flagged: batch-of-46 bound to 26161f2 + 769-byte isort-only dirty diff; equivalence to committed 4818fb0/1ff3114 unverified.
 - Closure: `git diff 26161f2 1ff3114 -- hedge_fund` touches exactly one file, hedge_fund/runtime/test_reconciliation.py, a 5-line isort-only import rewrap (no behavior); memory/evidence/tasks files are documentation. The tested source and final committed source are behaviorally identical; the dirty diff QA referenced is the same rewrap.
 - Residual open items for the solo-suite window (QA caveats): rerun test_paper_reconciliation_blocks_post_effect_failure_set on final source; run test_paper_operations.py::test_corruption_receipt_does_not_resolve_later_identical_line and ::test_reconciled_corruption_allows_resume_after_manual_halt on final source; frontend tsc/build after optional-field change; then T024 isolated full suite with per-test baseline attribution for every failure.
+
+### QA rework cycle 2 — finding 1 discriminator gate
+
+- Result: **BLOCKED** at finding 1. No source or regression-test changes were made. User-directed stop applies because legacy unkeyed `tick_failed` events have no positive per-failure no-effect discriminator in the inspected code; choosing to make them permanently non-resolvable requires a spec-owner decision.
+- Recorded: `2026-11-18T13:16:51.1769008+01:00`.
+- Source: `HEAD` `0c1278b65a6396002d701ac425f595a24aeb0ad8`; worktree clean before this evidence entry; source diff `0` bytes / SHA-256 `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`.
+- Environment: Microsoft Windows; no test environment or artifact used.
+- Static evidence:
+  - `hedge_fund/paper/tick.py:792-796` keeps `effect_state["started"]` in memory. The `tick_failed` write at `:994-1005` records `session`, `error`, `expected_head`, and optional operation context; it does not persist effect state.
+  - `tick_aborted` with `no_effects=True` is a separate attempt-keyed outcome (`:504-522`); legacy unkeyed `tick_failed` records have no attempt identity to bind to it.
+  - `paper_effect_registry` reserves a process-local `_PaperObservationWindow`; it does not persist per-failure effect accounting. `PaperBroker` persists the current book after fills, not an append-only per-failure effect history.
+  - The classifier's current absence-of-post-effect-fields check therefore cannot distinguish an old no-effect failure from an unmarked post-effect failure.
+- Process blocker: the following command at the recorded time found five active processes whose command lines contained pytest: `Get-CimInstance Win32_Process -Filter "Name like 'python%' or Name like 'pytest%'" | Where-Object { $_.CommandLine -match 'pytest' }`. PIDs `32556`, `61776`, `26196`, `32240`, and `74272` were running `poetry run pytest hedge_fund -q --tb=line` / `pytest hedge_fund -q --tb=line`. No process was stopped.
+- Tests/builds: no pytest, frontend unit test, TypeScript check, or frontend build was started. This includes the requested Scenario B rerun and both `test_paper_operations.py` residual tests. No failing-first regression was added because the required policy change is blocked.
+- Findings 2–4: not implemented or revalidated; work stopped at finding 1 as directed. Existing acceptance rows above remain unchanged; no Scenario A–D row was rerun in this cycle.
+- Provenance: code/spec static inspection only. No provider, LLM, broker, paid-credit, or production-root access.
