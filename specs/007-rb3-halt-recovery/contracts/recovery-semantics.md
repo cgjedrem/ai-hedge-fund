@@ -14,6 +14,8 @@ Internal contract between the ledger/runtime layer and the web desk surface. Ext
 
 **Output**: entries for every reconciliation-required condition — recorded failures, orphaned tick intents (PR #11), and unmatched approval-consumption entries (new, FR-002) — each with operation identity, ledger head, broker-book digest, fill digest, reason; plus `resume_allowed` and `denial_reason`.
 
+Spec009's legacy-failure decision adds a reconciliation condition for historical `tick_failed` events without request IDs: the complete previewed digest set qualifies only when replay is verified, chain continuity across each failure holds, corrupt-event count is zero, the local book matches replay, and no post-effect fields are present. The append-only, operator-attested decision binds the current ledger head and book digest, does not retry ticks or create broker effects, and leaves unrelated gates intact; see [Spec009's contract](../../009-legacy-failure-recovery/contracts/legacy-failure-recovery.md).
+
 **`resume_allowed` semantics** (clarifies PR review R1): the flag governs whether the desk offers the reviewed Resume/confirmation action; it does not require a pre-existing receipt (the confirmed Resume creates the receipt). Eligibility to *submit* review and *authorization* of the write are distinct: the write path re-verifies at commit time.
 
 ## Unresolved-State Gate (enforcement, all ordinary-work callers)

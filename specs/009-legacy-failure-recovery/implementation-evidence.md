@@ -216,11 +216,42 @@
   - `poetry run pytest hedge_fund/runtime/test_writer_map.py -q` — `119 passed in 4.71s`, command elapsed `12.31s`, exit `0`; started `2026-11-17T13:43:12.3162761+01:00`, ended `2026-11-17T13:43:24.6308605+01:00`.
 - Provenance: static checks ran against the eight touched Python files; writer-map tests use synthetic test roots and local fakes. Style-only edits reorder imports and match Black formatting; no new raw writer was added. No provider/LLM/broker/paid-credit calls or production-root access.
 
+### T024 full-suite gate — BLOCKED
+
+- Result: **BLOCKED** for final acceptance. The first completed run is **INCONCLUSIVE** after concurrency was reported; no completed suite is bound to the final source revision.
+- First run source/environment: `HEAD` `9914ef4d893f62e606378ada4585e1d0f299cfd1`, clean worktree, source diff `0` bytes / SHA-256 `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`; Poetry ran working-tree source, no wheel. Windows NT `10.0.26200.0`; Python `3.11.15`; Poetry `2.5.1`; pytest `7.4.4`; Pydantic `2.13.4`; environment `C:\Users\ChristianGjedrem\AppData\Local\pypoetry\Cache\virtualenvs\aihf-BhBKDBt4-py3.11`.
+- First run time/command: `2026-11-17T21:37:14.4005763+01:00` to `2026-11-17T23:17:03.5077813+01:00`; `poetry run pytest hedge_fund -q`; **28 failed, 3029 passed, 62 skipped in 5966.77s (1:39:26)**, exit `1`. Initial isolation check reported clear. The retained output is `C:\Users\CHRIST~1\AppData\Local\Temp\1794953821126-copilot-tool-output-23852-6dfd4914-fa78-4b64-b91c-edaa70feab8b.txt`.
+- Diagnostic failure IDs from that run:
+  - `hedge_fund/test_run.py::test_saxo_demo_execution_refuses_before_ledger_or_execution[argv0]`, `[argv1]`, `[argv2]`, `[argv3]`.
+  - `hedge_fund/test_run.py::test_saxo_guard_preserves_nonexecuting_verdicts_and_oauth_paper_approvals[saxo-False-approve-True]`, `[saxo-False-approve-False]`, `[saxo-True-approve-False]`, `[saxo-True-reject-False]`, `[paper-True-approve-True]`, `[paper-False-approve-True]`.
+  - `hedge_fund/data/test_yfinance_client.py::test_news_falls_back_to_search_when_ticker_endpoint_is_down`, `::test_news_preserves_failure_when_search_is_empty_after_outage`, `::test_news_raises_when_search_also_fails`.
+  - `hedge_fund/paper/test_deployed_broker.py::test_saxo_reconciliation_uses_accounting_cash_and_refuses_mismatch`.
+  - `hedge_fund/paper/test_saxo_e2e.py::test_fake_transport_saxo_client_deferral_reaches_the_session_ledger`, `::test_saxo_external_adapter_records_order_fill_in_ledger`.
+  - `hedge_fund/paper/test_tick.py::test_cli_shaped_tick_races_web_logical_operation_submission`.
+  - `hedge_fund/runtime/test_inventory_cache_race.py::test_approval_waiting_for_sibling_publication_does_not_block_halt`.
+  - `hedge_fund/runtime/test_writer_inventory.py::test_every_production_writer_is_classified_by_admission_class`.
+  - `hedge_fund/web/test_actions.py::test_nonlocal_broker_mutations_stop_before_ledger_adapter[approve]`, `[halt]`, `[resume]`, `[runner-stop]`, `::test_saxo_web_routes_deny_before_provider_or_writer_effects`, `::test_saxo_accept_routes_reject_previews_before_worker_or_ledger_effects`.
+  - `hedge_fund/web/test_paper_operations.py::test_corruption_receipt_does_not_resolve_later_identical_line`, `::test_reconciled_corruption_allows_resume_after_manual_halt`, `::test_crashed_owned_runner_requires_offline_stale_review_before_restart`.
+- Baseline note: prior-session reports state that clean `e6f04d2` reproduced `24 failed / 4 passed` on Python `3.13.7` and `23 failed / 5 passed` on Python `3.11.15`; the per-test baseline log is unavailable here, so no failure is marked baseline-matched from those counts. The two corruption-reconciliation regressions were addressed in `a238062`; its reported focused `8 passed` result was not rerun in this session.
+- Second run: `HEAD` `a238062254dad8fa19dfdfef76e22af3d532d530`, reported clean at start; `poetry run pytest hedge_fund -q` started `2026-11-17T23:35:09.7879077+01:00`. It was stopped at 57% after another suite appeared. No final summary or exit code; **INCONCLUSIVE**, not acceptance evidence.
+- Active-process blocker: process enumeration at `2026-11-18T01:15:30.9250634+01:00` found `pytest.exe` PID `10544` in `aihf-FuzY57Jh-py3.13`, started `2026-11-18T01:09:59`; its worktree, source revision, dirty-diff identity, owner and output were unavailable. An earlier process in the same environment, started `2026-11-17T23:47:31.9598740+01:00`, was observed active at `2026-11-18T01:04:18.5801715+01:00`. Neither process is used as acceptance evidence. No new pytest was started in this session.
+- Open Scenario B shape check: static review of `hedge_fund/web/services.py` shows the legacy `failures` and `confirm_offered` fields are returned when unresolved failures coexist with corrupt audit events. Spec009 requires the existing corrupt state to expose no legacy failures array or confirmation. No implementation change was made without a runnable discriminating test.
+- Smallest falsification experiment: after process enumeration finds no active pytest, add/run a synthetic GET test using `_legacy_failure_recovery_fixture` plus `_append_corrupt_legacy_audit_event`; assert the existing corruption `intent_preview` remains available while the response contains neither `failures` nor `confirm_offered`. If it fails, suppress only Spec009 preview fields for unresolved corrupt audit while preserving the intent preview, rerun Scenario B, then run T024 alone on the final source and baseline every remaining failure.
+
+### T025 recovery-semantics cross-reference
+
+- Result: **PASS** for the Spec007 contract pointer; Spec005's 423 row remains unchanged because denial-until-ready semantics still hold after an eligible decision.
+- Recorded: `2026-11-18T01:05:02.7457129+01:00`.
+- Source: `HEAD` `a238062254dad8fa19dfdfef76e22af3d532d530`; `specs/007-rb3-halt-recovery/contracts/recovery-semantics.md` diff SHA-256 `a6cd54dd12b2cfe2d4297446425dd6e5842644c934965e0f959e62458acef03f` (`1739` bytes).
+- Artifact/environment: contract Markdown only; no build or runtime artifact. Windows NT `10.0.26200.0`.
+- Validation: `git diff --check` passed; the relative Spec009 contract link target exists. Static review confirmed the Spec005 423 row still describes the unchanged deny state; Spec009 states the guard stops firing once readiness passes.
+- Provenance: static contract/link review only. No test or implementation behavior changed in T025.
+
 ## Acceptance scenarios
 
 | Scenario | Status | Evidence |
 |---|---|---|
 | A — multiple unkeyed failures, confirm, replay byte identity | PASS | T022 post-style-source revalidation |
-| B — ambiguity, corruption, mismatch, stale preview, contention refusals | PASS | T022 post-style-source revalidation |
+| B — ambiguity, corruption, mismatch, stale preview, contention refusals | INCONCLUSIVE | `a238062` changed corrupt-audit preview behavior; final response-shape test pending |
 | C — durable append interruption and retry | PASS | T022 post-style-source revalidation |
-| D — full suite and baseline comparison | INCONCLUSIVE | T024 not run |
+| D — full suite and baseline comparison | BLOCKED | No isolated final run; external pytest process active with source identity unavailable |
