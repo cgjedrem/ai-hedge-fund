@@ -32,6 +32,7 @@ from hedge_fund.llm.registry import (
     provider_for,
     SUPPORTED_PROVIDERS,
 )
+from hedge_fund.runtime.costs import MAX_LLM_OUTPUT_TOKENS
 from hedge_fund.runtime.dispatch import (
     blocked_async_httpx_client,
     DenyingAsyncHTTPTransport,
@@ -273,7 +274,7 @@ def make_llm(
         raise ValueError("environment policy is invalid")
     if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or not 0 < timeout <= 300:
         raise ValueError("timeout is invalid")
-    if type(max_tokens) is not int or not 1 <= max_tokens <= 131072:
+    if type(max_tokens) is not int or not 1 <= max_tokens <= MAX_LLM_OUTPUT_TOKENS:
         raise ValueError("max tokens is invalid")
     if model is not None and (not isinstance(model, str) or not model or model != model.strip() or any(ord(char) < 32 or ord(char) == 127 for char in model)):
         raise ValueError("model is invalid")
@@ -305,13 +306,17 @@ def make_llm(
         model=model,
         endpoint=endpoint,
     )
-    validate_llm_transport(target)
+    authorization_supplied = isinstance(dispatch, ProviderDispatch) and dispatch.has_one_shot_authorization(target)
+    validate_llm_transport(
+        target,
+        per_operation_authorization_supplied=authorization_supplied,
+    )
     if not isinstance(dispatch, ProviderDispatch):
         raise AuthorizationDenied("provider operation authorization is required")
     dispatch.validate_target(target)
     catalog_entry = catalog_entry_for(model)
-    if context_size is not None and (provider != "Ollama" or catalog_entry is None or catalog_entry.cost_class != "local"):
-        raise ValueError("context size is supported only by local Ollama.")
+    if context_size is not None and (provider != "Ollama" or catalog_entry is None or catalog_entry.cost_class not in {"local", "paid-cloud"}):
+        raise ValueError("context size is supported only by approved Ollama models.")
 
     if api_key is None:
         if provider in KEYLESS_PROVIDERS:
@@ -347,7 +352,10 @@ def make_llm(
             timeout=timeout,
             max_retries=0,
             max_tokens=max_tokens,
-            base_url=provider_base_url(target),
+            base_url=provider_base_url(
+                target,
+                per_operation_authorization_supplied=authorization_supplied,
+            ),
             http_client=dispatch.httpx_client(target, timeout=timeout),
             http_async_client=blocked_async_httpx_client(timeout=timeout),
             **sampling,
@@ -361,7 +369,10 @@ def make_llm(
             timeout=timeout,
             max_retries=0,
             max_tokens=max_tokens,
-            base_url=provider_base_url(target),
+            base_url=provider_base_url(
+                target,
+                per_operation_authorization_supplied=authorization_supplied,
+            ),
             http_client=dispatch.httpx_client(target, timeout=timeout),
             http_async_client=blocked_async_httpx_client(timeout=timeout),
             **sampling,
@@ -375,7 +386,10 @@ def make_llm(
             timeout=timeout,
             max_retries=0,
             max_tokens=max_tokens,
-            xai_api_base=provider_base_url(target),
+            xai_api_base=provider_base_url(
+                target,
+                per_operation_authorization_supplied=authorization_supplied,
+            ),
             http_client=dispatch.httpx_client(target, timeout=timeout),
             http_async_client=blocked_async_httpx_client(timeout=timeout),
             **sampling,
@@ -389,7 +403,10 @@ def make_llm(
             timeout=timeout,
             max_retries=0,
             max_tokens=max_tokens,
-            base_url=provider_base_url(target),
+            base_url=provider_base_url(
+                target,
+                per_operation_authorization_supplied=authorization_supplied,
+            ),
             http_client=dispatch.httpx_client(target, timeout=timeout),
             http_async_client=blocked_async_httpx_client(timeout=timeout),
             **sampling,
@@ -399,7 +416,10 @@ def make_llm(
 
         chat = ChatOllama(
             model=model,
-            base_url=provider_base_url(target),
+            base_url=provider_base_url(
+                target,
+                per_operation_authorization_supplied=authorization_supplied,
+            ),
             num_ctx=(context_size if context_size is not None else 8192),
             num_predict=max_tokens,
             client_kwargs={

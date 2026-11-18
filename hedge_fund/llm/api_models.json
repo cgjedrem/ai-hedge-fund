@@ -57,5 +57,12 @@
     "provider": "Ollama",
     "capability": "chat",
     "cost_class": "paid-cloud"
+  },
+  {
+    "display_name": "Kimi K3.1 Pro Cloud",
+    "model_name": "kimi-k3.1-pro:cloud",
+    "provider": "Ollama",
+    "capability": "chat",
+    "cost_class": "paid-cloud"
   }
 ]

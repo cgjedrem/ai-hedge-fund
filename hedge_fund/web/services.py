@@ -3339,36 +3339,37 @@ class DeskService:
             if paid_targets:
                 target = paid_targets[0][0]
                 provider_id = target.provider.casefold()
-                if payload.credential_source == "external-runtime":
-                    runtime_store = self._external_credential_store
-                    if runtime_store is None:
-                        raise ServiceError(422, "External runtime credential delivery is unavailable.", code="readiness-denied")
-                    try:
-                        runtime_handle = runtime_store.current_handle(provider_id, destination=provider_id)
-                    except ExternalCredentialError:
-                        raise ServiceError(422, "Selected external runtime credential is unavailable.", code="readiness-denied") from None
-                    credential_versions[provider_id] = runtime_handle.generation
-                    credential_handles[provider_id] = CredentialHandle(
-                        root_id=runtime_handle.root_id,
-                        provider_id=runtime_handle.provider_id,
-                        version=runtime_handle.generation,
-                        source="external-runtime",
-                        instance_id=runtime_handle.instance_id,
-                        destination=runtime_handle.destination,
-                    )
-                else:
-                    status = next(
-                        (value for name, value in self._credential_status_map().items() if name.casefold() == provider_id),
-                        None,
-                    )
-                    if not status or not status["configured"]:
-                        raise ServiceError(422, "Selected provider credential is not configured.", code="readiness-denied")
-                    credential_versions[provider_id] = status["version"]
-                    credential_handles[provider_id] = CredentialHandle(
-                        root_id=root_identity_id(self.root_context),
-                        provider_id=provider_id,
-                        version=status["version"],
-                    )
+                if provider_id not in {provider.casefold() for provider in KEYLESS_PROVIDERS}:
+                    if payload.credential_source == "external-runtime":
+                        runtime_store = self._external_credential_store
+                        if runtime_store is None:
+                            raise ServiceError(422, "External runtime credential delivery is unavailable.", code="readiness-denied")
+                        try:
+                            runtime_handle = runtime_store.current_handle(provider_id, destination=provider_id)
+                        except ExternalCredentialError:
+                            raise ServiceError(422, "Selected external runtime credential is unavailable.", code="readiness-denied") from None
+                        credential_versions[provider_id] = runtime_handle.generation
+                        credential_handles[provider_id] = CredentialHandle(
+                            root_id=runtime_handle.root_id,
+                            provider_id=provider_id,
+                            version=runtime_handle.generation,
+                            source="external-runtime",
+                            instance_id=runtime_handle.instance_id,
+                            destination=runtime_handle.destination,
+                        )
+                    else:
+                        status = next(
+                            (value for name, value in self._credential_status_map().items() if name.casefold() == provider_id),
+                            None,
+                        )
+                        if not status or not status["configured"]:
+                            raise ServiceError(422, "Selected provider credential is not configured.", code="readiness-denied")
+                        credential_versions[provider_id] = status["version"]
+                        credential_handles[provider_id] = CredentialHandle(
+                            root_id=root_identity_id(self.root_context),
+                            provider_id=provider_id,
+                            version=status["version"],
+                        )
             now = _utcnow()
             operation_payload = payload.model_dump(mode="json")
             operation_payload.pop("credential_source", None)

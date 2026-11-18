@@ -182,10 +182,14 @@ class ProviderDispatch:
         self._require_target(target)
         if not isinstance(method, str) or not method or not method.isascii():
             raise AuthorizationDenied("provider method is invalid")
-        host, port, local = validate_request_url(target, url)
+        one_shot = self._one_shot.get(target.identity)
+        host, port, local = validate_request_url(
+            target,
+            url,
+            per_operation_authorization_supplied=one_shot is not None,
+        )
         if host_header is not None and not _host_header_matches(host_header, host, port):
             raise AuthorizationDenied("provider host header does not match destination")
-        one_shot = self._one_shot.get(target.identity)
         cost = one_shot.upper_bound_cost if one_shot is not None else Decimal("0")
         provider_class = classify_provider(
             target,
@@ -258,6 +262,10 @@ class ProviderDispatch:
 
     def validate_target(self, target: ProviderTarget) -> None:
         self._require_target(target)
+
+    def has_one_shot_authorization(self, target: ProviderTarget) -> bool:
+        """Whether target has bound one-shot authority."""
+        return self.scope is OperationScope.MANUAL_ONE_SHOT and isinstance(target, ProviderTarget) and self._targets.get(target.identity) == target and isinstance(self._one_shot.get(target.identity), OneShotAuthorization)
 
     def httpx_client(
         self,
