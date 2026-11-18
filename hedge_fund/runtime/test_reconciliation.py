@@ -264,7 +264,10 @@ def test_legacy_failure_recorded_after_decision_remains_unresolved(tmp_path):
 
 
 def test_legacy_receipt_and_resume_before_decision_resolve_mixed_set(tmp_path):
-    from hedge_fund.runtime.reconciliation import ReconciliationReceipt, unresolved_tick_failures
+    from hedge_fund.runtime.reconciliation import (
+        ReconciliationReceipt,
+        unresolved_tick_failures,
+    )
 
     fixture = _legacy_failure_recovery_fixture(tmp_path, failure_count=2)
     first_failure, second_failure = fixture["failures"]
