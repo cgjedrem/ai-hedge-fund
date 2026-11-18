@@ -107,9 +107,9 @@
 
 **Purpose**: Evidence, invariants, and suite-level proof
 
-- [ ] T022 Run quickstart.md Scenarios A–D and record exact commands, outputs, test IDs, platform, and recorded times in specs/009-legacy-failure-recovery/implementation-evidence.md (Scenarios A–C are INCONCLUSIVE on findings 1–4 source pending final reruns; Scenario D BLOCKED pending coordinator-managed T024)
+- [x] T022 Run quickstart.md Scenarios A–D and record exact commands, outputs, test IDs, platform, and recorded times in specs/009-legacy-failure-recovery/implementation-evidence.md — Scenarios A–C PASS on the source snapshot committed as `aeffcd3`; Scenario D PASS with all 23 T024 failures individually reproduced on baseline `e6f04d2`
 - [x] T023 [P] Verify writer-map scan passes (hedge_fund/runtime/test_writer_map.py) and black/isort/flake8 are clean on touched files (line-length 420; do not reformat unrelated code) — writer map, Black, isort, and Black-compatible flake8 pass; default flake8 reports only four E203 findings reproduced on baseline
-- [ ] T024 Run full suite `poetry run pytest hedge_fund -q` alone in this worktree (memory: concurrent pytest runs cause runner timeouts); every failure individually evidenced against baseline `e6f04d2` reproduction or fixed; record in implementation-evidence.md — **BLOCKED**: the prior `9914ef4` run ended `28 failed, 3029 passed, 62 skipped` but became inconclusive after overlap; coordinator owns the final full-suite run
+- [x] T024 Run full suite `poetry run pytest hedge_fund -q` alone in this worktree; all 23 failures individually reproduced with matching substantive signatures on clean baseline `e6f04d2`; record and attribution table in implementation-evidence.md
 - [x] T025 Update specs/007-rb3-halt-recovery/contracts/recovery-semantics.md with a one-paragraph pointer to the new decision-record condition (spec007 calls for entries for every reconciliation condition); Spec005's 423 row remains unchanged because denial-until-ready semantics still hold after a valid decision
 
 ---

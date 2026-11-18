@@ -300,10 +300,10 @@
 
 | Scenario | Status | Evidence |
 |---|---|---|
-| A — multiple unkeyed failures, confirm, replay byte identity | PASS | Backend/recovery and residual tests passed; final paper UI tests 36/36, build, and writer-map passed; see attestation-close verification |
-| B — ambiguity, corruption, mismatch, stale preview, contention refusals | PASS | Backend refusal tests and mixed three-way evidence UI test passed; final paper UI tests 36/36, build, and writer-map passed; see attestation-close verification |
-| C — durable append interruption and retry | PASS | Backend append-interruption/retry test passed; final paper UI tests 36/36, build, and writer-map passed; see attestation-close verification |
-| D — full suite and baseline comparison | BLOCKED | T024 is coordinator-managed and was not run here; isolated diagnostic tests do not replace the full-suite gate |
+| A — multiple unkeyed failures, confirm, replay byte identity | PASS | Backend/recovery and residual tests passed; final paper UI tests 36/36, build, and writer-map passed on the source snapshot committed as `aeffcd3`; see attestation-close verification |
+| B — ambiguity, corruption, mismatch, stale preview, contention refusals | PASS | Backend refusal tests and mixed three-way evidence UI test passed; final paper UI tests 36/36, build, and writer-map passed on the source snapshot committed as `aeffcd3`; see attestation-close verification |
+| C — durable append interruption and retry | PASS | Backend append-interruption/retry test passed; final paper UI tests 36/36, build, and writer-map passed on the source snapshot committed as `aeffcd3`; see attestation-close verification |
+| D — full suite and baseline comparison | PASS | T024 ran on `aeffcd3`; all 23 failures reproduced individually with matching substantive failure signatures on clean baseline `e6f04d2`; see attribution table below |
 
 ### Coordinator revision-binding closure (QA cycle-1 re-review)
 
@@ -433,5 +433,74 @@
   - Pre-pytest gate: exact `Get-CimInstance Win32_Process -Filter "Name like 'python%' or Name like 'pytest%'" | Where-Object { $_.CommandLine -match 'pytest' }` returned `COUNT=0`.
   - `poetry run pytest hedge_fund/runtime/test_writer_map.py -q` — `119 passed in 10.32s`, exit `0`.
 - Style: Black/isort/flake8 not run; no Python source changed. `git diff --check` passed, exit `0`.
-- Acceptance: Scenarios A–C **PASS** on the tested source identity above. Scenario D **BLOCKED**; no T024 full-suite run is claimed.
+- Acceptance at this checkpoint: Scenarios A–C **PASS** on the tested source identity above; Scenario D was pending then. The final T024 result below establishes Scenario D **PASS**.
 - Provenance: synthetic backend roots, frontend fetch fakes, and writer-map unit tests only; no provider, LLM, broker, paid-credit, production-root, or real-money access.
+
+### T024 full suite — complete; Scenario D PASS
+
+- Result: `poetry run pytest hedge_fund -q` completed with **23 failed, 3052 passed, 62 skipped** (`3137` collected), duration `4326.24s` (`1:12:06`), exit `1`. All 23 failures reproduced individually on the clean baseline with matching substantive signatures; no branch-only failure found. Scenario D **PASS** under the specified baseline-attribution rule.
+- Recorded: pre-run process gate `2026-11-18T17:51:58.9874304+01:00`, `COUNT=0`; suite started `2026-11-18T17:51:59.5328067+01:00`, ended `2026-11-18T19:04:11.2214745+01:00`.
+- Source identity: checkout `C:\Users\ChristianGjedrem\source\repos\copilot-worktrees\ai-hedge-fund\cgjedrem-effective-winner`; clean `HEAD` `aeffcd3e4452cc6addf398513adde493ec3449a2` before run; source dirty-diff SHA-256 `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855` (empty). Poetry ran checkout source; no built artifact.
+- Baseline identity/environment: clean worktree `C:\Users\ChristianGjedrem\AppData\Local\Temp\aihf-spec009-baseline-e6f04d2`, `HEAD` `e6f04d2c76d761a0403f24c4b6adf40db48a8346`, clean before and after comparison. Windows 11 Enterprise `10.0.26200`, build `26200`; Python `3.11.15`, Poetry `2.5.1`, pytest `7.4.4`. Baseline tests used the branch Poetry venv's Python executable from baseline cwd; import probe resolved `hedge_fund.__file__` inside the baseline worktree.
+- Exact command: `poetry run pytest hedge_fund -q`; started immediately after the recorded zero-process gate. No provider, LLM, broker, or production-root access.
+- Foreign-process monitor: monitor anchored to the suite process tree from `2026-11-18T17:52:22.4928619+01:00` through `19:04:25.2572165+01:00`; final `FOREIGN_PID_COUNT=0`. At `18:17:33` two Python test-child processes referenced the active checkout's pytest temporary paths; they disappeared by `18:18:33`. No independent pytest process was observed.
+- Full-suite failing test IDs (all individually attributed below):
+  - `hedge_fund/test_run.py::test_saxo_demo_execution_refuses_before_ledger_or_execution[argv0]`
+  - `hedge_fund/test_run.py::test_saxo_demo_execution_refuses_before_ledger_or_execution[argv1]`
+  - `hedge_fund/test_run.py::test_saxo_demo_execution_refuses_before_ledger_or_execution[argv2]`
+  - `hedge_fund/test_run.py::test_saxo_demo_execution_refuses_before_ledger_or_execution[argv3]`
+  - `hedge_fund/test_run.py::test_saxo_guard_preserves_nonexecuting_verdicts_and_oauth_paper_approvals[saxo-False-approve-True]`
+  - `hedge_fund/test_run.py::test_saxo_guard_preserves_nonexecuting_verdicts_and_oauth_paper_approvals[saxo-False-approve-False]`
+  - `hedge_fund/test_run.py::test_saxo_guard_preserves_nonexecuting_verdicts_and_oauth_paper_approvals[saxo-True-approve-False]`
+  - `hedge_fund/test_run.py::test_saxo_guard_preserves_nonexecuting_verdicts_and_oauth_paper_approvals[saxo-True-reject-False]`
+  - `hedge_fund/test_run.py::test_saxo_guard_preserves_nonexecuting_verdicts_and_oauth_paper_approvals[paper-True-approve-True]`
+  - `hedge_fund/test_run.py::test_saxo_guard_preserves_nonexecuting_verdicts_and_oauth_paper_approvals[paper-False-approve-True]`
+  - `hedge_fund/data/test_yfinance_client.py::test_news_falls_back_to_search_when_ticker_endpoint_is_down`
+  - `hedge_fund/data/test_yfinance_client.py::test_news_preserves_failure_when_search_is_empty_after_outage`
+  - `hedge_fund/data/test_yfinance_client.py::test_news_raises_when_search_also_fails`
+  - `hedge_fund/paper/test_deployed_broker.py::test_saxo_reconciliation_uses_accounting_cash_and_refuses_mismatch`
+  - `hedge_fund/paper/test_saxo_e2e.py::test_fake_transport_saxo_client_deferral_reaches_the_session_ledger`
+  - `hedge_fund/paper/test_saxo_e2e.py::test_saxo_external_adapter_records_order_fill_in_ledger`
+  - `hedge_fund/runtime/test_writer_inventory.py::test_every_production_writer_is_classified_by_admission_class`
+  - `hedge_fund/web/test_actions.py::test_nonlocal_broker_mutations_stop_before_ledger_adapter[approve]`
+  - `hedge_fund/web/test_actions.py::test_nonlocal_broker_mutations_stop_before_ledger_adapter[halt]`
+  - `hedge_fund/web/test_actions.py::test_nonlocal_broker_mutations_stop_before_ledger_adapter[resume]`
+  - `hedge_fund/web/test_actions.py::test_nonlocal_broker_mutations_stop_before_ledger_adapter[runner-stop]`
+  - `hedge_fund/web/test_actions.py::test_saxo_web_routes_deny_before_provider_or_writer_effects`
+  - `hedge_fund/web/test_actions.py::test_saxo_accept_routes_reject_previews_before_worker_or_ledger_effects`
+
+#### Individual branch/baseline attribution
+
+- Process gate before every individual branch and baseline invocation: `Get-CimInstance Win32_Process -Filter "Name like 'python%' or Name like 'pytest%'" | Where-Object { $_.CommandLine -match 'pytest' }`; every recorded gate returned `COUNT=0`.
+- Commands: branch `poetry run pytest <test-id> -q --tb=line`; baseline from the baseline worktree `C:\Users\ChristianGjedrem\AppData\Local\pypoetry\Cache\virtualenvs\aihf-BhBKDBt4-py3.11\Scripts\python.exe -m pytest <test-id> -q --tb=line`. Times are local ISO-8601 with `+01:00`; exit codes shown for each run.
+- Failure signatures are identical after normalizing checkout paths. The yfinance regex failures were also rerun with `--tb=long`; their exact regex and input lines matched on both revisions. Full traceback comparison differed only in process-local object addresses.
+- Comparator note: the first comparison attempt treated Python's repr-escaped checkout path in the `argv1` `AttributeError` as a mismatch. The `argv0` and `argv1` pairs were rerun below; both produced the same path-neutral error as baseline. No test or product source changed during attribution.
+- Retained outputs: full T024 output `C:\Users\ChristianGjedrem\AppData\Local\Temp\1795025049561-copilot-tool-output-13336-5e381804-00af-4d0e-9ad1-82fc8df6cd81.txt`; 21 branch/baseline pair summary `C:\Users\ChristianGjedrem\AppData\Local\Temp\1795025471251-copilot-tool-output-13336-0afd5247-8bd0-42ef-954c-47107d642c78.txt`; detailed yfinance comparison `C:\Users\ChristianGjedrem\AppData\Local\Temp\1795025778404-copilot-tool-output-13336-135a1486-a4be-40fc-bbfc-52030105dbcb.txt`.
+
+| Test ID | Branch run (start–end; exit) | Baseline run (start–end; exit) | Matching result |
+|---|---|---|---|
+| `hedge_fund/test_run.py::test_saxo_demo_execution_refuses_before_ledger_or_execution[argv0]` | `2026-11-18T19:14:52.0382548+01:00`–`2026-11-18T19:14:56.1912296+01:00`; 1 | `2026-11-18T19:14:56.7714273+01:00`–`2026-11-18T19:14:59.5469792+01:00`; 1 | `AttributeError`: `hedge_fund.run` has no attribute `apply_credentials` |
+| `hedge_fund/test_run.py::test_saxo_demo_execution_refuses_before_ledger_or_execution[argv1]` | `2026-11-18T19:15:00.1421157+01:00`–`2026-11-18T19:15:04.4836817+01:00`; 1 | `2026-11-18T19:15:05.0377759+01:00`–`2026-11-18T19:15:07.9562499+01:00`; 1 | `AttributeError`: `hedge_fund.run` has no attribute `apply_credentials` |
+| `hedge_fund/test_run.py::test_saxo_demo_execution_refuses_before_ledger_or_execution[argv2]` | `2026-11-18T19:09:53.0573985+01:00`–`2026-11-18T19:09:57.1548098+01:00`; 1 | `2026-11-18T19:09:57.7579901+01:00`–`2026-11-18T19:10:00.5332724+01:00`; 1 | `AttributeError`: `hedge_fund.run` has no attribute `apply_credentials` |
+| `hedge_fund/test_run.py::test_saxo_demo_execution_refuses_before_ledger_or_execution[argv3]` | `2026-11-18T19:10:01.1360964+01:00`–`2026-11-18T19:10:05.2637833+01:00`; 1 | `2026-11-18T19:10:05.7873096+01:00`–`2026-11-18T19:10:08.5597825+01:00`; 1 | `AttributeError`: `hedge_fund.run` has no attribute `apply_credentials` |
+| `hedge_fund/test_run.py::test_saxo_guard_preserves_nonexecuting_verdicts_and_oauth_paper_approvals[saxo-False-approve-True]` | `2026-11-18T19:10:09.1553088+01:00`–`2026-11-18T19:10:13.1410729+01:00`; 1 | `2026-11-18T19:10:13.6948068+01:00`–`2026-11-18T19:10:16.5165503+01:00`; 1 | `AttributeError`: `hedge_fund.run` has no attribute `apply_credentials` |
+| `hedge_fund/test_run.py::test_saxo_guard_preserves_nonexecuting_verdicts_and_oauth_paper_approvals[saxo-False-approve-False]` | `2026-11-18T19:10:17.0618819+01:00`–`2026-11-18T19:10:21.1504437+01:00`; 1 | `2026-11-18T19:10:21.6702443+01:00`–`2026-11-18T19:10:24.3476899+01:00`; 1 | `AttributeError`: `hedge_fund.run` has no attribute `apply_credentials` |
+| `hedge_fund/test_run.py::test_saxo_guard_preserves_nonexecuting_verdicts_and_oauth_paper_approvals[saxo-True-approve-False]` | `2026-11-18T19:10:24.9326592+01:00`–`2026-11-18T19:10:29.0439141+01:00`; 1 | `2026-11-18T19:10:29.5611203+01:00`–`2026-11-18T19:10:32.3149713+01:00`; 1 | `AttributeError`: `hedge_fund.run` has no attribute `apply_credentials` |
+| `hedge_fund/test_run.py::test_saxo_guard_preserves_nonexecuting_verdicts_and_oauth_paper_approvals[saxo-True-reject-False]` | `2026-11-18T19:10:32.9029391+01:00`–`2026-11-18T19:10:36.9154536+01:00`; 1 | `2026-11-18T19:10:37.4285355+01:00`–`2026-11-18T19:10:40.1480685+01:00`; 1 | `AttributeError`: `hedge_fund.run` has no attribute `apply_credentials` |
+| `hedge_fund/test_run.py::test_saxo_guard_preserves_nonexecuting_verdicts_and_oauth_paper_approvals[paper-True-approve-True]` | `2026-11-18T19:10:40.7229024+01:00`–`2026-11-18T19:10:44.7526646+01:00`; 1 | `2026-11-18T19:10:45.2787000+01:00`–`2026-11-18T19:10:48.0001177+01:00`; 1 | `AttributeError`: `hedge_fund.run` has no attribute `apply_credentials` |
+| `hedge_fund/test_run.py::test_saxo_guard_preserves_nonexecuting_verdicts_and_oauth_paper_approvals[paper-False-approve-True]` | `2026-11-18T19:10:48.5695848+01:00`–`2026-11-18T19:10:52.5598148+01:00`; 1 | `2026-11-18T19:10:53.0963099+01:00`–`2026-11-18T19:10:55.8651458+01:00`; 1 | `AttributeError`: `hedge_fund.run` has no attribute `apply_credentials` |
+| `hedge_fund/data/test_yfinance_client.py::test_news_falls_back_to_search_when_ticker_endpoint_is_down` | `2026-11-18T19:10:56.4288165+01:00`–`2026-11-18T19:11:00.3286027+01:00`; 1 | `2026-11-18T19:11:00.8989842+01:00`–`2026-11-18T19:11:03.6389881+01:00`; 1 | `DataClientError: yfinance data error on TEST news` |
+| `hedge_fund/data/test_yfinance_client.py::test_news_preserves_failure_when_search_is_empty_after_outage` | `2026-11-18T19:11:04.1514048+01:00`–`2026-11-18T19:11:08.0991960+01:00`; 1 | `2026-11-18T19:11:08.6040578+01:00`–`2026-11-18T19:11:11.2467316+01:00`; 1 | `AssertionError`; regex `ticker news unavailable`, input `yfinance data error on TEST news` |
+| `hedge_fund/data/test_yfinance_client.py::test_news_raises_when_search_also_fails` | `2026-11-18T19:11:11.8077678+01:00`–`2026-11-18T19:11:15.6592078+01:00`; 1 | `2026-11-18T19:11:16.2005496+01:00`–`2026-11-18T19:11:18.8397239+01:00`; 1 | `AssertionError`; regex `search unavailable`, input `yfinance data error on TEST news` |
+| `hedge_fund/paper/test_deployed_broker.py::test_saxo_reconciliation_uses_accounting_cash_and_refuses_mismatch` | `2026-11-18T19:11:19.3816417+01:00`–`2026-11-18T19:11:23.4899217+01:00`; 1 | `2026-11-18T19:11:23.9699440+01:00`–`2026-11-18T19:11:26.6642538+01:00`; 1 | `SaxoReconcileError: Saxo broker requires an explicitly selected account identifier` |
+| `hedge_fund/paper/test_saxo_e2e.py::test_fake_transport_saxo_client_deferral_reaches_the_session_ledger` | `2026-11-18T19:11:27.1987311+01:00`–`2026-11-18T19:11:31.5873469+01:00`; 1 | `2026-11-18T19:11:32.1325945+01:00`–`2026-11-18T19:11:34.9676378+01:00`; 1 | `SaxoReconcileError: Saxo broker requires an explicitly selected account identifier` |
+| `hedge_fund/paper/test_saxo_e2e.py::test_saxo_external_adapter_records_order_fill_in_ledger` | `2026-11-18T19:11:35.5126513+01:00`–`2026-11-18T19:11:40.0159424+01:00`; 1 | `2026-11-18T19:11:40.5751320+01:00`–`2026-11-18T19:11:43.3397731+01:00`; 1 | `SaxoReconcileError: Saxo broker requires an explicitly selected account identifier` |
+| `hedge_fund/runtime/test_writer_inventory.py::test_every_production_writer_is_classified_by_admission_class` | `2026-11-18T19:11:43.8632222+01:00`–`2026-11-18T19:11:53.1012494+01:00`; 1 | `2026-11-18T19:11:53.6714336+01:00`–`2026-11-18T19:11:59.6777566+01:00`; 1 | `AssertionError`: six unclassified raw writers (`runtime/build_identity.py`, `runtime/credential_delivery.py`; same six-entry list on both revisions) |
+| `hedge_fund/web/test_actions.py::test_nonlocal_broker_mutations_stop_before_ledger_adapter[approve]` | `2026-11-18T19:12:00.2350587+01:00`–`2026-11-18T19:12:08.7338375+01:00`; 1 | `2026-11-18T19:12:09.2545937+01:00`–`2026-11-18T19:12:15.6571242+01:00`; 1 | `HandoverError: paper inventory is invalid (ValueError)` |
+| `hedge_fund/web/test_actions.py::test_nonlocal_broker_mutations_stop_before_ledger_adapter[halt]` | `2026-11-18T19:12:16.2167686+01:00`–`2026-11-18T19:12:24.3626436+01:00`; 1 | `2026-11-18T19:12:24.9410724+01:00`–`2026-11-18T19:12:32.9193304+01:00`; 1 | `HandoverError: paper inventory is invalid (ValueError)` |
+| `hedge_fund/web/test_actions.py::test_nonlocal_broker_mutations_stop_before_ledger_adapter[resume]` | `2026-11-18T19:12:33.4575066+01:00`–`2026-11-18T19:12:41.6767644+01:00`; 1 | `2026-11-18T19:12:42.2381263+01:00`–`2026-11-18T19:12:48.9010467+01:00`; 1 | `HandoverError: paper inventory is invalid (ValueError)` |
+| `hedge_fund/web/test_actions.py::test_nonlocal_broker_mutations_stop_before_ledger_adapter[runner-stop]` | `2026-11-18T19:12:49.4475893+01:00`–`2026-11-18T19:12:57.5272526+01:00`; 1 | `2026-11-18T19:12:58.0343637+01:00`–`2026-11-18T19:13:05.3757218+01:00`; 1 | `HandoverError: paper inventory is invalid (ValueError)` |
+| `hedge_fund/web/test_actions.py::test_saxo_web_routes_deny_before_provider_or_writer_effects` | `2026-11-18T19:13:05.9123276+01:00`–`2026-11-18T19:13:14.8493786+01:00`; 1 | `2026-11-18T19:13:15.4079077+01:00`–`2026-11-18T19:13:22.6630764+01:00`; 1 | `HandoverError: paper inventory is invalid (ValueError)` |
+| `hedge_fund/web/test_actions.py::test_saxo_accept_routes_reject_previews_before_worker_or_ledger_effects` | `2026-11-18T19:13:23.2217617+01:00`–`2026-11-18T19:13:36.3448095+01:00`; 1 | `2026-11-18T19:13:36.9384515+01:00`–`2026-11-18T19:13:46.7630444+01:00`; 1 | `HandoverError: paper inventory is invalid (ValueError)` |
+
+The two yfinance assertion results were corroborated with full tracebacks: `test_news_preserves_failure_when_search_is_empty_after_outage` branch `2026-11-18T19:15:59.0083430+01:00`–`2026-11-18T19:16:04.0491559+01:00`, baseline `2026-11-18T19:16:04.6528692+01:00`–`2026-11-18T19:16:07.7329734+01:00`; `test_news_raises_when_search_also_fails` branch `2026-11-18T19:16:08.4913629+01:00`–`2026-11-18T19:16:13.6995146+01:00`, baseline `2026-11-18T19:16:14.3020868+01:00`–`2026-11-18T19:16:18.2561098+01:00`. Both runs exited `1`; baseline and branch reported the exact regex/input pairs in the table.
