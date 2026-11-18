@@ -794,6 +794,44 @@ def test_legacy_failure_confirm_rejects_book_mismatch_without_writes(tmp_path):
     assert _legacy_fixture_file_bytes(fixture) == before
 
 
+@pytest.mark.parametrize(
+    ("book_status", "reason"),
+    [
+        ("broker-book-invalid", "Local paper book could not be verified."),
+        ("broker-book-changed", "Local paper book changed during confirmation."),
+    ],
+)
+def test_legacy_failure_confirm_reports_distinct_book_status_reason(tmp_path, monkeypatch, book_status, reason):
+    from hedge_fund.runtime.test_reconciliation import (
+        _legacy_failure_recovery_fixture,
+        _legacy_fixture_file_bytes,
+    )
+
+    fixture = _legacy_failure_recovery_fixture(tmp_path)
+    name = fixture["spec"].name
+    body = _legacy_failure_reconciliation_payload(fixture)
+    before = _legacy_fixture_file_bytes(fixture)
+
+    with TestClient(create_app(root=tmp_path, allow_writes=True), client=("127.0.0.1", 50000)) as client:
+        service = client.app.state.service
+        monkeypatch.setattr(
+            service,
+            "_legacy_failure_book_evidence",
+            lambda *_args: (body["preview_book_digest"], False, book_status),
+        )
+        response = client.post(
+            f"/api/paper/{name}/reconcile-legacy-failures",
+            headers=_legacy_failure_write_headers(client),
+            json=body,
+        )
+
+    assert response.status_code == 422
+    assert response.json()["code"] == "readiness-denied"
+    assert reason in response.json()["detail"]
+    assert "Local paper book does not match replay." not in response.json()["detail"]
+    assert _legacy_fixture_file_bytes(fixture) == before
+
+
 def test_legacy_failure_confirm_rejects_post_effect_set_without_writes(tmp_path):
     from hedge_fund.runtime.test_reconciliation import (
         _legacy_failure_recovery_fixture,

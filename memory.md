@@ -155,3 +155,4 @@
 
 [2026-11-18] [high] Source: spec009 QA cycle-1 (claude-opus-5.5) on 5dbc9d7; a238062 removed the preview's corrupt-audit 423 to restore the corruption-receipt flow, leaving the preview emitting failures/confirm_offered while corruption is outstanding, which the spec009 contract forbids; fix suppresses spec009 fields when corrupt_event_digests is non-empty.
 [2026-11-18] [high] Source: frontend/src/pages/paper.tsx:168,171,492; the desk preview type declares failures/confirm_offered always present and preview?.failures.map throws when the backend omits them — frontend must tolerate missing spec009 fields.
+[2026-11-18] [high] Source: hedge_fund/runtime/reconciliation.py:497-499 at HEAD 4f2302c; decision replay covers only failures recorded earlier in ledger order, and a failure resolved by receipt+Resume before a decision is excluded from that decision's expected failure set.

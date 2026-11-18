@@ -1059,3 +1059,33 @@ def test_paper_reconciliation_blocks_post_effect_failure_set(tmp_path):
     assert preview["failures"][1]["checks"]["no_post_effect_fields"] is False
     assert preview["failures"][1]["reason"] == "Post-effect metadata is present on this failure."
     assert preview["failures"][2]["classification"] == "resolvable"
+
+
+def test_corrupt_audit_suppresses_legacy_failure_preview_fields(tmp_path):
+    from hedge_fund.runtime.admission import AdmissionCoordinator, RootOwnerLease
+    from hedge_fund.runtime.root import RootContext
+    from hedge_fund.runtime.test_reconciliation import (
+        _append_corrupt_legacy_audit_event,
+        _legacy_failure_recovery_fixture,
+    )
+
+    fixture = _legacy_failure_recovery_fixture(tmp_path)
+    with RootContext.open(tmp_path) as root:
+        with RootOwnerLease.acquire(root) as owner:
+            _append_corrupt_legacy_audit_event(fixture, AdmissionCoordinator(root, owner_lease=owner))
+
+    service = DeskService(tmp_path)
+    try:
+        preview = service.paper_reconciliation(fixture["spec"].name)
+    finally:
+        service.close()
+
+    assert preview["intent_preview"]["required"] is True
+    assert preview["intent_preview"]["corrupt_event_digests"]
+    assert not {
+        "failures",
+        "preview_head",
+        "preview_book_digest",
+        "confirm_offered",
+        "set_reason",
+    }.intersection(preview)

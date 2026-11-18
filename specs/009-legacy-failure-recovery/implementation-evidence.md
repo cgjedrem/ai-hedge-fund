@@ -247,6 +247,18 @@
 - Validation: `git diff --check` passed; the relative Spec009 contract link target exists. Static review confirmed the Spec005 423 row still describes the unchanged deny state; Spec009 states the guard stops firing once readiness passes.
 - Provenance: static contract/link review only. No test or implementation behavior changed in T025.
 
+### QA rework cycle 1 — tests authored; execution blocked
+
+- Result: **BLOCKED** for failing-first and post-fix tests, and for per-test branch/baseline isolation. No test was run after authoring these regressions.
+- Recorded: `2026-11-18T01:30:36.1214555+01:00`.
+- Source: `HEAD` `4f2302c6fcc39bdc6ab9ee726eb3fb702d6cd870`; dirty test diff SHA-256 `883d96a984625cb72b90e25a6134733231ddc7f0d774b98dfa33b08ca3908a6a` (`6283` bytes). Only the three test files were modified at this checkpoint.
+- Environment: Windows NT `10.0.26200.0`. Process enumeration found active `poetry run pytest hedge_fund -q` trees: Python 3.11 process PID `43752` (started `2026-11-18T01:09:57`) and Python 3.13 `pytest.exe` PID `10544` (started `2026-11-18T01:09:59`); both were still active at observation time. Ownership/source identity were not established; neither process was stopped or used as evidence. No pytest process was started by this cycle.
+- Authored regressions: `test_corrupt_audit_suppresses_legacy_failure_preview_fields` in `hedge_fund/web/test_services.py`; `test_legacy_failure_recorded_after_decision_remains_unresolved` and `test_legacy_receipt_and_resume_before_decision_resolve_mixed_set` in `hedge_fund/runtime/test_reconciliation.py`; parameterized `test_legacy_failure_confirm_reports_distinct_book_status_reason` in `hedge_fund/web/test_recovery.py`. They use synthetic roots and fixtures. The corrupt-audit test preserves `intent_preview` assertions while requiring all five Spec009 extension fields absent. No provider, LLM, broker, paid-credit, or production-root access.
+- Static status: `git diff --check` passed. Source inspection shows current corrupt-audit responses still include the Spec009 fields, and current confirm classification uses the generic book/replay reason for invalid/changed statuses. This predicts the new response/reason tests should distinguish the reported gaps; it is not failing-first runtime evidence.
+- T024 failure triage: retained output for clean `9914ef4` / Python `3.11.15` records `test_cli_shaped_tick_races_web_logical_operation_submission` failing with `WriterConflict` while acquiring an admission lane after a 5-second wait; `test_approval_waiting_for_sibling_publication_does_not_block_halt` observing `2.655999999959022s` against a `<2.0s` bound; and `test_crashed_owned_runner_requires_offline_stale_review_before_restart` receiving `worker-failed` with `OwnedRunnerError` during runner readiness. Static diff found no changes in `runtime/admission.py`, `runtime/operations.py`, `runtime/owned_runner.py`, `paper/tick.py`, or those tests; no causal link is established. Aggregate baseline counts do not identify per-test outcomes. Branch and baseline single-test runs remain **BLOCKED** by the active pytest processes.
+- Blocker recheck: `2026-11-18T01:37:06.0480211+01:00`; both process trees remained active. `git diff --check` exited `0`; no test was started.
+- Next check: after process enumeration finds no active pytest, run the corrupt-audit and confirm-reason regressions against unchanged production code to capture red evidence; run the two replay-order tests, then implement only the proven response/reason fixes and rerun affected focused tests. Recheck process state before each branch/baseline diagnostic test.
+
 ## Acceptance scenarios
 
 | Scenario | Status | Evidence |

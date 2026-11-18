@@ -246,6 +246,53 @@ def test_legacy_failure_decision_resolves_the_exact_unkeyed_set(tmp_path):
     assert unresolved_tick_failures([*fixture["failures"], event]) == []
 
 
+def test_legacy_failure_recorded_after_decision_remains_unresolved(tmp_path):
+    from hedge_fund.runtime.reconciliation import unresolved_tick_failures
+
+    fixture = _legacy_failure_recovery_fixture(tmp_path, failure_count=1)
+    decision_event = {
+        "kind": "legacy_failure_reconciliation",
+        "decision": _legacy_failure_decision(fixture).model_dump(mode="json"),
+    }
+    later_failure = {
+        **fixture["failures"][0],
+        "session": "2024-06-07",
+        "error": "synthetic failure after decision",
+    }
+
+    assert unresolved_tick_failures([fixture["failures"][0], decision_event, later_failure]) == [later_failure]
+
+
+def test_legacy_receipt_and_resume_before_decision_resolve_mixed_set(tmp_path):
+    from hedge_fund.runtime.reconciliation import ReconciliationReceipt, unresolved_tick_failures
+
+    fixture = _legacy_failure_recovery_fixture(tmp_path, failure_count=2)
+    first_failure, second_failure = fixture["failures"]
+    receipt = ReconciliationReceipt.create(
+        failure_event=first_failure,
+        request_id="legacy-receipt-before-decision",
+        current_head=fixture["latest"].hash,
+        broker_book_sha256="b" * 64,
+        fill_identity_sha256="c" * 64,
+        operator="web",
+        recorded_at="2024-06-03T00:00:00+00:00",
+    )
+    legacy_receipt = _legacy_receipt(receipt)
+    reconciliation_event = {
+        "kind": "reconciliation",
+        "receipt": legacy_receipt.model_dump(mode="json", exclude={"issued_at", "valid_until"}),
+    }
+    resume_event = {
+        "kind": "resume",
+        "reconciliation_id": legacy_receipt.receipt_id,
+        "time": "2024-06-03T00:01:00+00:00",
+    }
+    decision = _legacy_failure_decision(fixture, failure_digests=[failure_digest(second_failure)])
+    decision_event = {"kind": "legacy_failure_reconciliation", "decision": decision.model_dump(mode="json")}
+
+    assert unresolved_tick_failures([first_failure, second_failure, reconciliation_event, resume_event, decision_event]) == []
+
+
 def test_legacy_failure_decision_replay_deduplicates_and_rejects_invalid_sets(tmp_path):
     from hedge_fund.runtime.reconciliation import unresolved_tick_failures
 
