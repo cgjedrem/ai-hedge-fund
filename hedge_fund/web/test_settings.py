@@ -45,9 +45,17 @@ def test_settings_and_catalog_expose_ollama_model_classifiers(tmp_path):
 
         for response in (settings, catalog):
             ollama = next(item for item in response["models"] if item["id"] == "kimi-k3:cloud")
+            ollama_pro = next(item for item in response["models"] if item["id"] == "kimi-k3.1-pro:cloud")
             assert ollama == {
                 "label": "Kimi K3 Cloud",
                 "id": "kimi-k3:cloud",
+                "provider": "Ollama",
+                "capability": "chat",
+                "cost_class": "paid-cloud",
+            }
+            assert ollama_pro == {
+                "label": "Kimi K3.1 Pro Cloud",
+                "id": "kimi-k3.1-pro:cloud",
                 "provider": "Ollama",
                 "capability": "chat",
                 "cost_class": "paid-cloud",

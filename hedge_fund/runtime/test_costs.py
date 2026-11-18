@@ -1,8 +1,10 @@
+import json
 from decimal import Decimal
 
 import pytest
 
 from hedge_fund.runtime.costs import (
+    cost_model_description,
     cost_model_identity,
     COST_MODEL_VERSION,
     has_verified_cost_model,
@@ -70,6 +72,44 @@ def test_ollama_cloud_has_no_verified_cost_model_without_operator_pricing():
         )
         is None
     )
+
+
+def test_kimi_k3_1_pro_ollama_cost_model_uses_operator_rates_and_context_bound():
+    target = ProviderTarget(kind="llm", provider="ollama", model="kimi-k3.1-pro:cloud")
+    default_request = json.dumps(
+        {
+            "model": target.model,
+            "messages": [],
+            "options": {"num_ctx": 8192, "num_predict": 4096},
+        },
+        separators=(",", ":"),
+    ).encode("utf-8")
+    maximum_request = json.dumps(
+        {
+            "model": target.model,
+            "messages": [],
+            "options": {"num_ctx": 1_000_000, "num_predict": 131_072},
+        },
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+    assert has_verified_cost_model(target)
+    assert cost_model_identity(target) == "ollama-kimi-k3.1-pro-1m-context-v1"
+    assert minimum_attempt_cost(target) == Decimal("3.31072")
+    assert "$2.00/1M input ($0.20 cached), $10.00/1M output" in cost_model_description(target)
+    assert request_cost_upper_bound(
+        target,
+        url="http://127.0.0.1:11434/api/chat",
+        method="POST",
+        body=default_request,
+    ) == Decimal("2.04096")
+    assert request_cost_upper_bound(
+        target,
+        url="http://127.0.0.1:11434/api/chat",
+        method="POST",
+        body=maximum_request,
+    ) == Decimal("3.31072")
+    assert not has_verified_cost_model(ProviderTarget(kind="llm", provider="ollama", model="kimi-k3:cloud"))
 
 
 @pytest.mark.parametrize(

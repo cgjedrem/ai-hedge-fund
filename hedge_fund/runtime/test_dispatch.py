@@ -457,10 +457,67 @@ def test_ollama_cloud_one_shot_refuses_without_verified_cost_model():
         _dispatch(
             target,
             max_calls=1,
-            max_cost=Decimal("0"),
-            upper_bound_cost=Decimal("0"),
+            max_cost=Decimal("10.00"),
+            upper_bound_cost=Decimal("1.00"),
             approved_local_models={target.model},
         )
+
+
+def test_verified_kimi_cloud_one_shot_reserves_max_cost_with_mock_transport():
+    from hedge_fund.runtime.costs import minimum_attempt_cost
+
+    target = ProviderTarget(kind="llm", provider="ollama", model="kimi-k3.1-pro:cloud")
+    cost = minimum_attempt_cost(target)
+    assert cost == Decimal("3.31072")
+    dispatch = _dispatch(
+        target,
+        max_calls=1,
+        max_cost=cost,
+        upper_bound_cost=cost,
+    )
+    calls = []
+
+    def respond(request):
+        calls.append(request)
+        return httpx.Response(200, json={}, request=request)
+
+    body = b'{"model":"kimi-k3.1-pro:cloud","messages":[],"options":{"num_ctx":1000000,"num_predict":131072}}'
+    with _client(dispatch, target, respond) as client:
+        response = client.post(
+            "http://127.0.0.1:11434/api/chat",
+            content=body,
+        )
+
+    assert response.status_code == 200
+    assert len(calls) == 1
+    assert _authorization(dispatch, target).calls_reserved == 1
+    assert _authorization(dispatch, target).cost_reserved == cost
+
+
+def test_verified_kimi_cloud_underbound_refuses_before_mock_transport():
+    target = ProviderTarget(kind="llm", provider="ollama", model="kimi-k3.1-pro:cloud")
+    dispatch = _dispatch(
+        target,
+        max_calls=1,
+        max_cost=Decimal("3.31071"),
+        upper_bound_cost=Decimal("3.31071"),
+    )
+    calls = []
+
+    def respond(request):
+        calls.append(request)
+        return httpx.Response(200, json={}, request=request)
+
+    body = b'{"model":"kimi-k3.1-pro:cloud","messages":[],"options":{"num_ctx":1000000,"num_predict":131072}}'
+    with _client(dispatch, target, respond) as client:
+        with pytest.raises(BudgetDenied, match="provider request cost exceeds authorization"):
+            client.post(
+                "http://127.0.0.1:11434/api/chat",
+                content=body,
+            )
+
+    assert calls == []
+    assert _authorization(dispatch, target).calls_reserved == 0
 
 
 def test_paid_cloud_dispatch_without_one_shot_authorization_names_requirement():
@@ -577,6 +634,39 @@ def test_scheduled_cloud_refusal_branch_reports_model_specific_reason(
         )
 
     assert str(refusal.value) == "Model 'kimi-k3:cloud' is paid/cloud and cannot be used in scheduled runs."
+
+
+def test_verified_kimi_cloud_is_refused_for_scheduled_dispatch():
+    target = ProviderTarget(kind="llm", provider="ollama", model="kimi-k3.1-pro:cloud")
+    runner = RunnerAuthorization(
+        root_id="synthetic-root",
+        deployment_id="deployment-1",
+        capture_digest="capture-digest",
+        operation_id="operation-1",
+        operation_digest="b" * 64,
+        provider_ids=(target.identity,),
+        expires_at=_NOW + timedelta(minutes=5),
+        max_sessions=1,
+        max_calls=1,
+        max_resources=1,
+    )
+
+    with pytest.raises(PaidCloudAuthorizationDenied) as refusal:
+        ProviderDispatch(
+            scope=OperationScope.SCHEDULED,
+            root_id="synthetic-root",
+            subject_id="deployment-1",
+            capture_digest="capture-digest",
+            operation_id="operation-1",
+            operation_digest="b" * 64,
+            targets=(target,),
+            network_authorized=True,
+            runner=runner,
+            approved_local_models=frozenset({target.model}),
+            clock=lambda: _NOW,
+        )
+
+    assert str(refusal.value) == "Model 'kimi-k3.1-pro:cloud' is paid/cloud and cannot be used in scheduled runs."
 
 
 def test_ollama_endpoint_guard_still_rejects_non_loopback_destinations():

@@ -170,6 +170,64 @@ def test_ollama_needs_no_key(monkeypatch):
     assert hasattr(llm, "complete")
 
 
+def test_ollama_paid_cloud_client_requires_bound_one_shot_authorization(monkeypatch):
+    import langchain_ollama
+
+    constructed = []
+    monkeypatch.setattr(langchain_ollama, "ChatOllama", lambda **kwargs: constructed.append(kwargs))
+
+    with pytest.raises(AuthorizationDenied, match="requires explicit per-operation authorization"):
+        make_llm("kimi-k3.1-pro:cloud", use_environment=False)
+
+    assert constructed == []
+
+
+def test_ollama_paid_cloud_client_constructs_with_budgeted_operation_dispatch(monkeypatch):
+    import langchain_ollama
+
+    from hedge_fund.runtime.costs import minimum_attempt_cost
+
+    model = "kimi-k3.1-pro:cloud"
+    target = ProviderTarget(kind="llm", provider="ollama", model=model)
+    cost = minimum_attempt_cost(target)
+    now = datetime.now(timezone.utc)
+    dispatch = make_one_shot_dispatch(
+        root_id="llm-test-root",
+        subject_id="llm-test",
+        capture_digest="a" * 64,
+        operation_id="llm-kimi-operation",
+        operation_digest="b" * 64,
+        expires_at=now + timedelta(minutes=5),
+        targets=(target,),
+        max_calls=1,
+        max_cost=cost,
+        max_resources=1,
+        upper_bound_costs={target.identity: cost},
+        per_target_bounds={target.identity: (1, cost, 1)},
+        clock=lambda: now,
+    )
+    constructed = []
+
+    class FakeChatOllama:
+        def __init__(self, **kwargs):
+            constructed.append(kwargs)
+
+    monkeypatch.setattr(langchain_ollama, "ChatOllama", FakeChatOllama)
+    client = make_llm(
+        model,
+        context_size=8192,
+        use_environment=False,
+        dispatch=dispatch,
+    )
+
+    assert client.model == model
+    assert dispatch.has_one_shot_authorization(target)
+    assert len(constructed) == 1
+    assert constructed[0]["model"] == model
+    assert constructed[0]["num_ctx"] == 8192
+    assert constructed[0]["client_kwargs"]["transport"] is not None
+
+
 def test_temperature_reaches_the_chat_model(keyed):
     """make_llm's temperature lands on the underlying chat model."""
     llm = _authorized_make_llm(_BY_PROVIDER["Kimi"], temperature=0.7)
@@ -259,12 +317,18 @@ def test_provider_for_reads_the_registry():
 
 def test_ollama_catalog_exposes_chat_and_paid_cloud_classifiers():
     entry = registry_module.catalog_entry_for("kimi-k3:cloud")
+    pro_entry = registry_module.catalog_entry_for("kimi-k3.1-pro:cloud")
 
     assert entry.model_name == "kimi-k3:cloud"
     assert entry.provider == "Ollama"
     assert entry.capability == "chat"
     assert entry.cost_class == "paid-cloud"
     assert provider_for("kimi-k3:cloud") == "Ollama"
+    assert pro_entry.model_name == "kimi-k3.1-pro:cloud"
+    assert pro_entry.provider == "Ollama"
+    assert pro_entry.capability == "chat"
+    assert pro_entry.cost_class == "paid-cloud"
+    assert provider_for("kimi-k3.1-pro:cloud") == "Ollama"
 
 
 def test_non_ollama_registry_entries_keep_existing_model_semantics():

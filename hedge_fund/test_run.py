@@ -6,7 +6,7 @@ import json
 import os
 import sys
 from contextlib import nullcontext
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -1046,6 +1046,119 @@ def test_cli_backtest_paid_cloud_authorization_reports_missing_cost_model(
     assert "requires explicit per-operation authorization" not in output.err
     assert not (root / "research").exists()
     assert not (root / "paper").exists()
+
+
+@pytest.mark.parametrize(
+    ("budget_args", "expected_error"),
+    [
+        (
+            ["--paid-max-calls", "1"],
+            "Model 'kimi-k3.1-pro:cloud' is paid/cloud and requires explicit per-operation authorization.",
+        ),
+        (
+            [
+                "--paid-max-calls",
+                "1",
+                "--paid-max-cost-usd",
+                "10",
+                "--paid-max-attempt-cost-usd",
+                "3.31071",
+            ],
+            "per-attempt cost bound is below the provider's verified maximum",
+        ),
+    ],
+)
+def test_cli_backtest_paid_kimi_cloud_requires_verified_budget(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    offline,
+    budget_args,
+    expected_error,
+):
+    root = tmp_path / "cli-kimi-cloud-budget"
+    root.mkdir()
+    _enroll_test_root(root)
+    path = _mandate(root, name="kimi-cloud-underbound")
+    monkeypatch.setattr(run, "PAPER_DIR", root / "paper")
+    monkeypatch.setenv("HEDGE_FUND_LLM_MODEL", "gemma3:4b")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "aihf",
+            "--root",
+            str(root),
+            "--enable-network",
+            "--model",
+            "kimi-k3.1-pro:cloud",
+            "backtest",
+            str(path),
+            "--universe",
+            "AAPL",
+            "--start",
+            "2025-01-06",
+            "--end",
+            "2025-01-07",
+            "--authorize-paid-provider",
+            "ollama",
+            *budget_args,
+        ],
+    )
+
+    with pytest.raises(SystemExit) as rejected:
+        run.main()
+
+    output = capsys.readouterr()
+    assert rejected.value.code == 2
+    assert expected_error in output.err
+    assert not (root / "research").exists()
+    assert not (root / "paper").exists()
+
+
+def test_cli_kimi_cloud_factory_constructs_client_from_budgeted_dispatch(monkeypatch):
+    import langchain_ollama
+
+    from hedge_fund.runtime.configuration import RuntimeSettings
+    from hedge_fund.runtime.costs import minimum_attempt_cost
+    from hedge_fund.runtime.dispatch import make_one_shot_dispatch
+    from hedge_fund.runtime.policy import ProviderTarget
+
+    model = "kimi-k3.1-pro:cloud"
+    target = ProviderTarget(kind="llm", provider="ollama", model=model)
+    cost = minimum_attempt_cost(target)
+    now = datetime.now(timezone.utc)
+    dispatch = make_one_shot_dispatch(
+        root_id="cli-kimi-root",
+        subject_id="cli-kimi",
+        capture_digest="a" * 64,
+        operation_id="cli-kimi-operation",
+        operation_digest="b" * 64,
+        expires_at=now + timedelta(minutes=5),
+        targets=(target,),
+        max_calls=1,
+        max_cost=cost,
+        max_resources=1,
+        upper_bound_costs={target.identity: cost},
+        per_target_bounds={target.identity: (1, cost, 1)},
+        clock=lambda: now,
+    )
+    constructed = []
+
+    class FakeChatOllama:
+        def __init__(self, **kwargs):
+            constructed.append(kwargs)
+
+    monkeypatch.setattr(langchain_ollama, "ChatOllama", FakeChatOllama)
+    settings = RuntimeSettings(model=model, llm_provider="Ollama")
+    client = run._cli_llm_factory(settings, dispatch, None)(None)
+
+    assert client.model == model
+    assert dispatch.has_one_shot_authorization(target)
+    assert len(constructed) == 1
+    assert constructed[0]["model"] == model
+    assert constructed[0]["num_ctx"] == 8192
+    assert constructed[0]["client_kwargs"]["transport"] is not None
 
 
 def test_cli_unknown_model_fails_with_catalog_reason(tmp_path, capsys):
