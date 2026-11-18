@@ -92,3 +92,62 @@ The heading count is the cycle-1 observed total; the list includes baseline case
 - `hedge_fund/runtime/test_writer_inventory.py::test_every_production_writer_is_classified_by_admission_class`
 - `hedge_fund/runtime/test_writer_races.py::test_two_process_audit_appends_are_complete_and_uninterleaved`
 - `hedge_fund/web/test_actions.py::test_nonlocal_broker_mutations_stop_before_ledger_adapter` (4), `test_saxo_web_routes_deny_before_provider_or_writer_effects`, `test_saxo_accept_routes_reject_previews_before_worker_or_ledger_effects`
+
+## D7 resolution and governed dispatch activation (cycle 3)
+
+This section supersedes Cycle-2's D7-blocked status for commit `05b228df246d1b0a8ebcdb44db92b963a3b0f387`. Pricing remains operator-declared; no live Ollama page fetch or inference call was made.
+
+### Identity and environment
+
+- **Source revision**: `05b228df246d1b0a8ebcdb44db92b963a3b0f387`; branch `cgjedrem-cuddly-winner`.
+- **Dirty diff**: none; worktree clean before the final targeted run and full suite.
+- **Artifact mapping**: no wheel/container built; Poetry invoked the committed source checkout directly. Python 3.13.7; Poetry 2.5.1; Windows; venv `C:\Users\ChristianGjedrem\AppData\Local\pypoetry\Cache\virtualenvs\aihf-FuzY57Jh-py3.13`.
+- **Provenance**: implementation owner; local pytest and static checks. New transport paths use fake clients / `httpx.MockTransport`; no live provider call. Command outputs retained in this session transcript; no separate persistent log was written.
+
+### D7 pricing
+
+- **Operator declaration (2026-11-18)**: Ollama model page rates for `kimi-k3.1-pro:cloud`: $2.00 / 1M input tokens, $0.20 / 1M cached-input tokens, $10.00 / 1M output tokens; 1M-token context.
+- **Cost model identity**: `ollama-kimi-k3.1-pro-1m-context-v1`. Only this exact Ollama model/approved loopback target has a verified cost model; `kimi-k3:cloud` remains unpriced.
+- **Maximum attempt reservation**: `(1,000,000 × $2.00 + 131,072 × $10.00) / 1,000,000 = $3.31072`. Bound assumes no cached-input discount. The 4,096-output-token request bound is $2.04096.
+
+### Final focused acceptance tests
+
+Ran on the clean committed source revision above, 2026-11-18 11:18:15.2319027–11:19:28.9043295 +01:00. Exact command:
+
+```powershell
+poetry run pytest hedge_fund/runtime/test_costs.py::test_kimi_k3_1_pro_ollama_cost_model_uses_operator_rates_and_context_bound hedge_fund/runtime/test_dispatch.py::test_ollama_cloud_one_shot_refuses_without_verified_cost_model hedge_fund/runtime/test_dispatch.py::test_verified_kimi_cloud_one_shot_reserves_max_cost_with_mock_transport hedge_fund/runtime/test_dispatch.py::test_verified_kimi_cloud_underbound_refuses_before_mock_transport hedge_fund/runtime/test_dispatch.py::test_paid_cloud_dispatch_without_one_shot_authorization_names_requirement hedge_fund/runtime/test_dispatch.py::test_scheduled_cloud_refusal_branch_reports_model_specific_reason hedge_fund/runtime/test_dispatch.py::test_verified_kimi_cloud_is_refused_for_scheduled_dispatch hedge_fund/runtime/test_policy.py::test_transport_check_accepts_priced_kimi_cloud_with_operation_authorization hedge_fund/runtime/test_policy.py::test_transport_check_with_paid_authorization_reports_missing_cost_model hedge_fund/llm/test_client.py::test_ollama_paid_cloud_client_requires_bound_one_shot_authorization hedge_fund/llm/test_client.py::test_ollama_paid_cloud_client_constructs_with_budgeted_operation_dispatch hedge_fund/llm/test_client.py::test_ollama_catalog_exposes_chat_and_paid_cloud_classifiers hedge_fund/llm/test_client.py::test_non_ollama_registry_entries_keep_existing_model_semantics hedge_fund/runtime/test_capture.py::test_cloud_ollama_model_is_selectable_from_all_configuration_sources hedge_fund/runtime/test_capture.py::test_mislabelled_cloud_catalog_fails_closed_across_selection_and_dispatch hedge_fund/test_run.py::test_cli_backtest_paid_cloud_reports_transport_refusal hedge_fund/test_run.py::test_cli_backtest_paid_cloud_authorization_reports_missing_cost_model hedge_fund/test_run.py::test_cli_backtest_paid_kimi_cloud_requires_verified_budget hedge_fund/test_run.py::test_cli_kimi_cloud_factory_constructs_client_from_budgeted_dispatch hedge_fund/web/test_jobs.py::test_web_backtest_preview_reports_paid_cloud_refusal_at_route hedge_fund/web/test_jobs.py::test_web_backtest_preview_with_paid_authorization_reports_missing_cost_model hedge_fund/web/test_jobs.py::test_web_backtest_preview_enforces_verified_kimi_cost_bound hedge_fund/web/test_jobs.py::test_web_kimi_cloud_factory_constructs_client_from_budgeted_dispatch hedge_fund/web/test_settings.py::test_settings_and_catalog_expose_ollama_model_classifiers -q --tb=short
+```
+
+- **Result**: PASS — 28 passed in 65.08s; exit 0.
+- **Observed cases**: exact-rate request bounds; authorized + budgeted CLI/web factory construction with fake `ChatOllama`; underbound refusal before mocked transport; missing/unauthorized budget refusal; scheduled paid-cloud refusal; old `kimi-k3:cloud` refusal with `no verified cost model`; non-Ollama catalog semantics unchanged.
+- Web request-schema denial for absent paid bounds remains the existing sanitized `400 invalid-request` / `Invalid request.` envelope. CLI without complete bounds reports the explicit per-operation authorization requirement.
+- **Development diagnostics**: initial web success assertion expected HTTP 200; preview correctly returned 201. A later missing-budget assertion expected the Pydantic cause, but CLI refuses earlier with the authorization reason and web sanitizes request-validation details. Test assertions now match those contracts; the final committed focused run above passes.
+
+### Static and writer-map checks
+
+On `05b228df246d1b0a8ebcdb44db92b963a3b0f387`, Windows / Python 3.13.7 / Poetry 2.5.1:
+
+| Check | Exact command | Result |
+|---|---|---|
+| Black | `poetry run black --check --line-length 420 hedge_fund/llm/client.py hedge_fund/llm/test_client.py hedge_fund/runtime/costs.py hedge_fund/runtime/dispatch.py hedge_fund/runtime/endpoints.py hedge_fund/runtime/test_costs.py hedge_fund/runtime/test_dispatch.py hedge_fund/runtime/test_policy.py hedge_fund/test_run.py hedge_fund/web/services.py hedge_fund/web/test_jobs.py hedge_fund/web/test_settings.py` | PASS — 12 files unchanged; exit 0; 2026-11-18 12:59:49.5631671–12:59:54.9742416 +01:00. |
+| isort | `poetry run isort --check-only --profile black hedge_fund/llm/client.py hedge_fund/llm/test_client.py hedge_fund/runtime/costs.py hedge_fund/runtime/dispatch.py hedge_fund/runtime/endpoints.py hedge_fund/runtime/test_costs.py hedge_fund/runtime/test_dispatch.py hedge_fund/runtime/test_policy.py hedge_fund/test_run.py hedge_fund/web/services.py hedge_fund/web/test_jobs.py hedge_fund/web/test_settings.py` | PASS — exit 0; 2026-11-18 12:59:49.5046513–12:59:55.5545580 +01:00. |
+| flake8 | `poetry run flake8 --max-line-length=420 --extend-ignore=E203 hedge_fund/llm/client.py hedge_fund/llm/test_client.py hedge_fund/runtime/costs.py hedge_fund/runtime/dispatch.py hedge_fund/runtime/endpoints.py hedge_fund/runtime/test_costs.py hedge_fund/runtime/test_dispatch.py hedge_fund/runtime/test_policy.py hedge_fund/test_run.py hedge_fund/web/services.py hedge_fund/web/test_jobs.py hedge_fund/web/test_settings.py` | PASS — no findings; exit 0; 2026-11-18 12:59:49.6045037–12:59:57.8821574 +01:00. |
+| Writer map | `poetry run pytest hedge_fund/runtime/test_writer_map.py -q --tb=short` | PASS — 119 passed in 9.52s; exit 0; 2026-11-18 12:59:49.6430270–13:00:09.5047890 +01:00. |
+
+### Required full suite and baseline comparison
+
+- **Exact command**: `poetry run pytest hedge_fund -q`.
+- **Source / scenario**: clean commit `05b228df246d1b0a8ebcdb44db92b963a3b0f387`; full `hedge_fund` suite; no wheel/container artifact.
+- **Time**: started 2026-11-18 11:20:21.4618024 +01:00; ended 12:57:38.7323643 +01:00; pytest reported 5829.41s (1:37:09); exit 1.
+- **Execution result**: FAIL — 26 failed, 3064 passed, 62 skipped.
+- **Known baseline comparison**: 24 of the documented failure IDs above occurred; `runtime/test_inventory_cache_race.py::test_approval_waiting_for_sibling_publication_does_not_block_halt` did not fail. Two additional IDs were not in the documented baseline list:
+  - `hedge_fund/web/test_saxo_inspection.py::test_http_loss_during_result_redaction_prevents_publication[owner-inspect]`
+  - `hedge_fund/web/test_saxo_inspection.py::test_http_loss_during_result_redaction_prevents_publication[root-inspect]`
+- Both failures were `started.wait(timeout=5)` assertions. Isolated diagnostic command on the same commit, 2026-11-18 12:58:20.3133430–12:58:49.3583386 +01:00:
+
+```powershell
+poetry run pytest 'hedge_fund/web/test_saxo_inspection.py::test_http_loss_during_result_redaction_prevents_publication[owner-inspect]' 'hedge_fund/web/test_saxo_inspection.py::test_http_loss_during_result_redaction_prevents_publication[root-inspect]' -q --tb=short
+```
+
+- **Diagnostic result**: PASS — 2 passed in 15.79s; exit 0. This does not establish pre-change baseline status. Full-suite baseline equivalence is **INCONCLUSIVE**; the required “only documented baseline IDs fail” condition was not met. No second full-suite run was made.
+- **Next falsification step**: reproduce those two exact IDs against the pre-change artifact or obtain a documented baseline comparison in an approved isolated environment. No unrelated code/test edits were made.
