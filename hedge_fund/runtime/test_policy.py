@@ -177,6 +177,23 @@ def test_transport_check_reports_paid_cloud_classification_reason():
     assert str(refusal.value) == ("Model 'kimi-k3:cloud' is paid/cloud and requires explicit per-operation authorization.")
 
 
+def test_transport_check_with_paid_authorization_reports_missing_cost_model():
+    from hedge_fund.runtime.endpoints import validate_provider_target
+
+    target = ProviderTarget(
+        kind="llm",
+        provider="ollama",
+        model="kimi-k3:cloud",
+        endpoint="http://127.0.0.1:11434",
+    )
+
+    with pytest.raises(PaidCloudAuthorizationDenied, match="no verified cost model"):
+        validate_provider_target(
+            target,
+            per_operation_authorization_supplied=True,
+        )
+
+
 def test_paid_provider_requires_matching_manual_one_shot_authorization():
     now = datetime(2026, 10, 31, 12, 0, tzinfo=timezone.utc)
     target = ProviderTarget(kind="data", provider="fd")

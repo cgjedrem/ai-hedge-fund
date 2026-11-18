@@ -148,11 +148,12 @@ def validate_provider_target(
     target: ProviderTarget,
     *,
     allow_paid_cloud: bool = False,
+    per_operation_authorization_supplied: bool = False,
 ) -> None:
     """Reject unsupported transport, origin or Ollama model."""
     if not isinstance(target, ProviderTarget):
         raise AuthorizationDenied("provider target is invalid")
-    if type(allow_paid_cloud) is not bool:
+    if type(allow_paid_cloud) is not bool or type(per_operation_authorization_supplied) is not bool:
         raise AuthorizationDenied("paid-cloud allowance is invalid")
     endpoint = _validate_configured_endpoint(target)
     if target.kind == "llm" and target.provider == "ollama":
@@ -162,9 +163,15 @@ def validate_provider_target(
             raise AuthorizationDenied("Ollama model is not an approved chat model")
         cost_class = ollama_cost_class(target.model)
         if cost_class == "paid-cloud":
-            if not allow_paid_cloud:
-                raise PaidCloudAuthorizationDenied(f"Model '{target.model}' is paid/cloud and requires explicit per-operation authorization.")
-            return
+            if allow_paid_cloud:
+                return
+            if per_operation_authorization_supplied:
+                from hedge_fund.runtime.costs import has_verified_cost_model
+
+                if not has_verified_cost_model(target):
+                    raise PaidCloudAuthorizationDenied("no verified cost model")
+                return
+            raise PaidCloudAuthorizationDenied(f"Model '{target.model}' is paid/cloud and requires explicit per-operation authorization.")
         if cost_class != "local" or target.model not in approved_local_ollama_chat_models():
             raise AuthorizationDenied("Ollama model is not an approved local chat model")
         return

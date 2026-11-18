@@ -996,6 +996,58 @@ def test_cli_backtest_paid_cloud_reports_transport_refusal(
     assert not (root / "paper").exists()
 
 
+def test_cli_backtest_paid_cloud_authorization_reports_missing_cost_model(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    offline,
+):
+    root = tmp_path / "cli-cloud-authorized-run"
+    root.mkdir()
+    _enroll_test_root(root)
+    path = _mandate(root, name="cloud-authorized-run")
+    monkeypatch.setattr(run, "PAPER_DIR", root / "paper")
+    monkeypatch.setenv("HEDGE_FUND_LLM_MODEL", "gemma3:4b")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "aihf",
+            "--root",
+            str(root),
+            "--enable-network",
+            "--model",
+            "kimi-k3:cloud",
+            "backtest",
+            str(path),
+            "--universe",
+            "AAPL",
+            "--start",
+            "2025-01-06",
+            "--end",
+            "2025-01-07",
+            "--authorize-paid-provider",
+            "ollama",
+            "--paid-max-calls",
+            "1",
+            "--paid-max-cost-usd",
+            "1",
+            "--paid-max-attempt-cost-usd",
+            "0.25",
+        ],
+    )
+
+    with pytest.raises(SystemExit) as rejected:
+        run.main()
+
+    output = capsys.readouterr()
+    assert rejected.value.code == 2
+    assert "no verified cost model" in output.err
+    assert "requires explicit per-operation authorization" not in output.err
+    assert not (root / "research").exists()
+    assert not (root / "paper").exists()
+
+
 def test_cli_unknown_model_fails_with_catalog_reason(tmp_path, capsys):
     from hedge_fund.runtime.root import RootContext
 

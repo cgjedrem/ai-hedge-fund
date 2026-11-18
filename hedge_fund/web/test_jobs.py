@@ -294,6 +294,51 @@ def test_web_backtest_preview_reports_paid_cloud_refusal_at_route(demo_root):
     assert response.json()["code"] == "capability-denied"
 
 
+def test_web_backtest_preview_with_paid_authorization_reports_missing_cost_model(demo_root):
+    app = create_app(
+        root=demo_root,
+        allow_writes=True,
+        network_enabled=True,
+        demo=True,
+    )
+    with TestClient(app, client=("127.0.0.1", 50000)) as client:
+        headers = _write_headers(client)
+        settings = client.get("/api/settings", headers={"host": "127.0.0.1"}).json()
+        selected = client.post(
+            "/api/settings/model",
+            headers=headers,
+            json={"model": "kimi-k3:cloud", "expected_version": settings["version"]},
+        )
+        assert selected.status_code == 200, selected.text
+        mandate_digest = _mandate_fingerprint(demo_root)
+        response = client.post(
+            "/api/operations/preview",
+            headers=headers,
+            json={
+                "action": "backtest",
+                "subject_id": "demo-quality",
+                "expected_head": mandate_digest,
+                "payload": {
+                    "fund": "demo-quality",
+                    "universe": ["AAPL"],
+                    "start": "2024-06-03",
+                    "end": "2024-06-07",
+                    "provider": "yfinance",
+                    "model": "kimi-k3:cloud",
+                    "mandate_hash": mandate_digest,
+                    "authorize_paid_provider": True,
+                    "paid_max_calls": 1,
+                    "paid_max_cost_usd": "1",
+                    "paid_max_attempt_cost_usd": "0.25",
+                },
+            },
+        )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "no verified cost model"
+    assert response.json()["code"] == "capability-denied"
+
+
 def test_builder_canonical_validation_conflicts_and_deployment(tmp_path):
     enroll_synthetic_root(tmp_path)
     service = DeskService(tmp_path, allow_writes=True)

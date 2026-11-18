@@ -3273,7 +3273,10 @@ class DeskService:
                 endpoint=settings.endpoint,
             )
             try:
-                validate_llm_transport(llm_target)
+                validate_llm_transport(
+                    llm_target,
+                    per_operation_authorization_supplied=payload.authorize_paid_provider,
+                )
                 data_class = classify_provider(data_target)
                 llm_class = classify_provider(
                     llm_target,
@@ -3808,7 +3811,10 @@ class DeskService:
             endpoint=capture.endpoint,
         )
         try:
-            validate_llm_transport(llm_target)
+            validate_llm_transport(
+                llm_target,
+                per_operation_authorization_supplied=request.authorize_paid_provider,
+            )
             data_class = classify_provider(data_target)
             llm_class = classify_provider(
                 llm_target,

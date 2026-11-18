@@ -1082,12 +1082,28 @@ def _authorize_cli_operation(
         model=settings.model,
         endpoint=settings.endpoint,
     )
+    authorized_provider = getattr(args, "authorize_paid_provider", None)
+    paid_authorization_supplied = (
+        isinstance(authorized_provider, str)
+        and authorized_provider.casefold() == llm_target.provider.casefold()
+        and all(
+            getattr(args, field, None) is not None
+            for field in (
+                "paid_max_calls",
+                "paid_max_cost_usd",
+                "paid_max_attempt_cost_usd",
+            )
+        )
+    )
     targets = [data_target, breakpoints_target]
     try:
         data_class = classify_provider(data_target)
         llm_class = None
         if llm_call_bound:
-            validate_llm_transport(llm_target)
+            validate_llm_transport(
+                llm_target,
+                per_operation_authorization_supplied=paid_authorization_supplied,
+            )
             llm_class = classify_provider(
                 llm_target,
                 approved_local_models={settings.model},
@@ -1119,7 +1135,6 @@ def _authorize_cli_operation(
     fd_pricing_confirmation = getattr(args, "confirm_fd_self_service_pricing", False)
     if type(fd_pricing_confirmation) is not bool:
         parser.error("Financial Datasets pricing confirmation is invalid")
-    authorized_provider = getattr(args, "authorize_paid_provider", None)
     paid_max_calls = getattr(args, "paid_max_calls", None)
     paid_total_text = getattr(args, "paid_max_cost_usd", None)
     paid_attempt_text = getattr(args, "paid_max_attempt_cost_usd", None)

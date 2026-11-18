@@ -428,11 +428,18 @@ def make_llm(
     )
 
 
-def validate_llm_transport(target: ProviderTarget) -> None:
+def validate_llm_transport(
+    target: ProviderTarget,
+    *,
+    per_operation_authorization_supplied: bool = False,
+) -> None:
     """Reject providers without a guarded synchronous production transport."""
     if not isinstance(target, ProviderTarget) or target.kind != "llm":
         raise AuthorizationDenied("LLM provider target is invalid")
-    validate_provider_target(target)
+    validate_provider_target(
+        target,
+        per_operation_authorization_supplied=per_operation_authorization_supplied,
+    )
     if target.provider not in _GUARDED_PROVIDERS:
         raise AuthorizationDenied("provider transport is unsupported")
 
