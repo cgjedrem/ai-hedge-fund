@@ -40,21 +40,28 @@ Cloud-labelled Ollama tags are deliberately classified paid/cloud even via loopb
 - **Rationale**: FR-003; silent fallback is how misconfiguration becomes invisible spend.
 - **Alternatives considered**: keep TUI fallback (rejected — violates FR-003).
 
-### D5: Target identifier = `kimi-k3:cloud` (Ollama), not Moonshot `kimi-k3`
+### D5: Target identifier = `kimi-k3.1-pro:cloud` (Ollama), not Moonshot `kimi-k3`
 
-- **Decision**: The approved-list addition is the Ollama tag `kimi-k3:cloud`. The Moonshot provider's `kimi-k3` is a different provider and out of scope.
-- **Rationale**: Operator decision 2026-11-17. The requested "Kimi K3.1" has no known identifier; we do not invent tags.
+- **Decision (2026-11-18, supersedes the 2026-11-17 choice of `kimi-k3:cloud`)**: The operator's target is the Ollama cloud tag `kimi-k3.1-pro:cloud` (Kimi K3.1 Pro). `kimi-k3:cloud` stays in the approved catalog; the Moonshot provider's `kimi-k3` remains out of scope.
+- **Rationale**: Operator decision 2026-11-18 — K3.1 Pro is the model the operator originally meant by "Kimi K3.1" and is cheaper for their use.
+- **Note**: the exact daemon tag must exist on the host daemon (earlier metadata listed `kimi-k3:cloud` but not `kimi-k3.1-pro:cloud`; the operator may need to pull it).
+
+### D7: Ollama cloud cost model — operator-supplied pricing (2026-11-18)
+
+- **Decision**: add the cost-model entry for `kimi-k3.1-pro:cloud` with operator-declared pricing sourced from the Ollama model page: $2.00 per 1M input tokens, $0.20 per 1M cached-input tokens, $10.00 per 1M output tokens; 1M-token context. Record it as operator-declared with that provenance and date. Entry for `kimi-k3.1-pro:cloud` only; other cloud tags remain without verified cost models and keep refusing dispatch.
+- **Consequence (QA caveat M-7)**: adding a verified cost model makes authorized one-shot dispatch technically reachable; the transport/authorization/budget path and `llm/client.py:308` authorization propagation MUST be re-reviewed together before this is considered enabled.
+- **Superseded text (2026-11-17)**: pricing unavailable at planning time; refusal mechanism required until operator supplies it.
 
 ### D6: Prior art — extend within policy, never restore pre-4177741 behavior
 
 - **Decision**: Commit `3f7bea8` (tree contained the four Ollama cloud tags) and `487091d`/`70da073` (ChatOllama integration, empty-content retry) are reference patterns. `4177741` removed cloud tags to enforce provider dispatch authority with verified cost models — this feature re-adds cloud tags **with** cost-class metadata and policy gating, reconciling rather than reverting.
 - **Rationale**: Preserves the dispatch-authority invariant that `4177741` established.
 
-### D7: Ollama cloud cost model is an operator-input dependency
+### D7-original (2026-11-17): Ollama cloud cost model is an operator-input dependency — SUPERSEDED by D7 (2026-11-18) above
 
-- **Decision**: `runtime/costs.py` currently has no verified Ollama cost model, and paid dispatch is limited to verified cost models (per `4177741`). Enabling authorized one-shot dispatch of `kimi-k3:cloud` requires a cost-model entry. Pricing cannot be verified from source alone; the implementation MUST either (a) add the entry with operator-declared pricing recorded as such, or (b) keep cloud-tag dispatch refused with a clear "no verified cost model" reason until the operator supplies it. Configuration acceptance (catalog/settings/picker) does not depend on this.
+- **Decision (historical)**: `runtime/costs.py` currently has no verified Ollama cost model, and paid dispatch is limited to verified cost models (per `4177741`). Enabling authorized one-shot dispatch of `kimi-k3:cloud` requires a cost-model entry. Pricing cannot be verified from source alone; the implementation MUST either (a) add the entry with operator-declared pricing recorded as such, or (b) keep cloud-tag dispatch refused with a clear "no verified cost model" reason until the operator supplies it. Configuration acceptance (catalog/settings/picker) does not depend on this.
 - **Rationale**: No implicit paid fallback; no invented pricing.
-- **Open item**: operator to confirm pricing/budget source before any live bounded test.
+- **Resolution (2026-11-18)**: the operator supplied pricing for `kimi-k3.1-pro:cloud`; see D7 above.
 
 ## Configuration Precedence (verified, to preserve)
 

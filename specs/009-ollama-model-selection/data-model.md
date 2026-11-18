@@ -27,8 +27,9 @@ Existing catalog entries (`llm/api_models.json`) gain two classifier fields; all
 |---|---|---|
 | `gemma3:4b` | chat | local |
 | `kimi-k3:cloud` | chat | paid-cloud |
+| `kimi-k3.1-pro:cloud` | chat | paid-cloud |
 
-(Additional daemon-listed tags — `glm-5.3:cloud`, `glm-5.3-flash:cloud`, `minimax-m3:cloud` — are NOT added unless the operator approves them; `nomic-embed-text:latest` and `glm-ocr:latest` are non-chat capabilities and excluded from the chat catalog.)
+(Operator target as of 2026-11-18: `kimi-k3.1-pro:cloud`. Additional daemon-listed tags — `glm-5.3:cloud`, `glm-5.3-flash:cloud`, `minimax-m3:cloud` — are NOT added unless the operator approves them; `nomic-embed-text:latest` and `glm-ocr:latest` are non-chat capabilities and excluded from the chat catalog.)
 
 ### Model Selection (existing, behavior specified)
 
