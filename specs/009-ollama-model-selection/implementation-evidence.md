@@ -34,7 +34,7 @@
 | V5 picker presentation (FR-004) | `web/test_settings.py` — classifier fields in models/catalog payloads; rejection contract C2 | PASS |
 | V6 precedence + persistence (FR-005) | `test_capture.py` — launch > env > persisted > default; restart persistence | PASS |
 | V7 safe failure, no secrets (FR-008/010) | `test_dispatch.py` loopback guardrails unchanged; rejection messages contain no credential material | PASS |
-| V8 non-Ollama unchanged (FR-011) | full-suite diff vs baseline shows no new failures outside pre-existing set | PASS (2026-11-18) — authoritative baseline full suite at `e6f04d2` (log: `$TEMP\baseline-suite3.log`, 26 failed / 3010 passed / 62 skipped in 5679s) matches the documented 26-ID failure set exactly; the 2 extra delta-run failures (`web/test_saxo_inspection.py::test_http_loss_during_result_redaction_prevents_publication[owner-inspect|root-inspect]`) did NOT reproduce at baseline and QA's static trace found no path from the delta to them — classified as load/timing flakes (same class as the known-flaky `test_inventory_cache_race`, which itself flipped between runs) |
+| V8 non-Ollama unchanged (FR-011) | full-suite diff vs baseline shows no new failures outside pre-existing set | PASS (2026-11-18) — authoritative baseline full suite at `e6f04d2` (archived log: `specs/009-ollama-model-selection/baseline-suite-e6f04d2.log`, SHA256 23C9DEB51D2E66E8476D60B09386D01F5DF71A88AC5C29BF45770479098CA78D; 26 failed / 3010 passed / 62 skipped in 5679s) matches the documented 26-ID failure set exactly; the 2 extra delta-run failures (`web/test_saxo_inspection.py::test_http_loss_during_result_redaction_prevents_publication[owner-inspect|root-inspect]`) did NOT reproduce at baseline and QA's static trace found no path from the delta to them — classified as load/timing flakes (same class as the known-flaky `test_inventory_cache_race`, which itself flipped between runs) |
 
 ## QA rework targeted evidence (cycle 1)
 
@@ -149,7 +149,7 @@ On `05b228df246d1b0a8ebcdb44db92b963a3b0f387`, Windows / Python 3.13.7 / Poetry 
 poetry run pytest 'hedge_fund/web/test_saxo_inspection.py::test_http_loss_during_result_redaction_prevents_publication[owner-inspect]' 'hedge_fund/web/test_saxo_inspection.py::test_http_loss_during_result_redaction_prevents_publication[root-inspect]' -q --tb=short
 ```
 
-- **Diagnostic result**: PASS — 2 passed in 15.79s; exit 0. This does not establish pre-change baseline status. Full-suite baseline equivalence is **INCONCLUSIVE**; the required “only documented baseline IDs fail” condition was not met. No second full-suite run was made.
+- **Diagnostic result**: PASS — 2 passed in 15.79s; exit 0. This does not establish pre-change baseline status. ~~Full-suite baseline equivalence is **INCONCLUSIVE**~~ **SUPERSEDED (2026-11-18)**: the authoritative baseline full suite at `e6f04d2` (see V8 row above) reproduced exactly the 26 documented baseline IDs and did NOT reproduce the 2 saxo_inspection failures — baseline equivalence is established and those 2 are classified as load/timing flakes.
 - **Next falsification step**: reproduce those two exact IDs against the pre-change artifact or obtain a documented baseline comparison in an approved isolated environment. No unrelated code/test edits were made.
 
 ## QA delta I-1 and loopback cost-model follow-up
