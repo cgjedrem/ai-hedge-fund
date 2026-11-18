@@ -1,3 +1,7 @@
+import hashlib
+import json
+from datetime import date, datetime, timedelta
+
 import pytest
 from pydantic import ValidationError
 
@@ -13,6 +17,201 @@ from hedge_fund.runtime.reconciliation import (
     unresolved_tick_failures,
     verify_reconciliation_receipt,
 )
+
+
+def _append_legacy_fixture_session(ledger, spec, admission, session: str, *, decision=None):
+    from hedge_fund.pipeline.session import mandate_hash, SessionRecord
+
+    with admission.manual_session(spec.name, timeout=0):
+        latest = ledger.latest()
+        record = SessionRecord(
+            fund=spec.name,
+            session=session,
+            universe=["AAPL"],
+            nav=spec.capital,
+            cash=spec.capital,
+            positions={},
+            marks={},
+            benchmark=spec.benchmark,
+            benchmark_close=100,
+            rebalance=False,
+            decision=decision,
+            prev_hash=latest.hash if latest is not None else None,
+            code_version="synthetic-recovery-fixture",
+            mandate_hash=mandate_hash(spec),
+        )
+        record.hash = record.compute_hash()
+        ledger.append(record)
+        ledger.log_event(
+            "tick",
+            session=record.session,
+            result={"session": record.session, "hash": record.hash},
+        )
+    return record
+
+
+def _legacy_failure_recovery_fixture(
+    tmp_path,
+    *,
+    failure_count: int = 3,
+    post_effect_indices: set[int] | None = None,
+    pending_at_failure: bool = False,
+    rebalance: str | None = None,
+):
+    from hedge_fund.paper import deploy
+    from hedge_fund.paper.ledger import Ledger
+    from hedge_fund.pipeline.models import DecisionRecord
+    from hedge_fund.runtime.admission import AdmissionCoordinator, RootOwnerLease
+    from hedge_fund.runtime.root import RootContext
+    from hedge_fund.test_support.handover import enroll_synthetic_root
+
+    if type(failure_count) is not int or not 1 <= failure_count <= 10:
+        raise ValueError("failure_count must be an integer from 1 to 10")
+    if type(pending_at_failure) is not bool:
+        raise ValueError("pending_at_failure must be a bool")
+    if rebalance not in {None, "minute", "daily", "weekly", "monthly"}:
+        raise ValueError("rebalance is invalid")
+    post_effect_indices = set() if post_effect_indices is None else post_effect_indices
+    if not isinstance(post_effect_indices, set) or any(type(index) is not int or index < 0 or index >= failure_count for index in post_effect_indices):
+        raise ValueError("post_effect_indices must identify fixture failures")
+    enroll_synthetic_root(tmp_path)
+    spec_fields = {
+        "schema_version": 2,
+        "name": "legacy-paper",
+        "strategies": [{"name": "solo", "models": [{"name": "graham"}], "blend": {"mode": "long_short"}}],
+        "risk": {"max_position_pct": 1, "max_gross_exposure": 1},
+        "capital": 100_000,
+        "costs": {"spread_bps": 0, "commission_per_share": 0},
+    }
+    if rebalance is not None:
+        spec_fields["rebalance"] = rebalance
+    if rebalance == "minute":
+        spec_fields.update(interval=1.0, window={"start": "09:30", "end": "16:00"})
+    spec = FundSpec(**spec_fields)
+    with RootContext.open(tmp_path) as root:
+        with RootOwnerLease.acquire(root) as owner:
+            admission = AdmissionCoordinator(root, owner_lease=owner)
+            with admission.deployment_lock(spec.name, timeout=0):
+                directory = deploy(spec.name, spec, ["AAPL"], root=root.path / "paper")
+            ledger = Ledger(directory)
+            base_session = "2024-06-03T09:30:00" if rebalance == "minute" else "2024-06-01"
+            base_decision = (
+                DecisionRecord(
+                    fund=spec.name,
+                    as_of=base_session,
+                    spec=spec,
+                    universe=["AAPL"],
+                    marks={},
+                    skipped=[],
+                    strategies=[],
+                    target_weights={},
+                    clamps=[],
+                    final_weights={},
+                )
+                if pending_at_failure
+                else None
+            )
+            base_record = _append_legacy_fixture_session(
+                ledger,
+                spec,
+                admission,
+                base_session,
+                decision=base_decision,
+            )
+            if rebalance == "minute":
+                base_time = datetime.fromisoformat(base_session)
+                failure_sessions = [(base_time + timedelta(minutes=index + 1)).isoformat(timespec="seconds") for index in range(failure_count)]
+                later_sessions = [(base_time + timedelta(minutes=failure_count + index + 1)).isoformat(timespec="seconds") for index in range(2)]
+            else:
+                first_failure = date(2024, 6, 2)
+                failure_sessions = [(first_failure + timedelta(days=index)).isoformat() for index in range(failure_count)]
+                later_start = first_failure + timedelta(days=failure_count)
+                later_sessions = [(later_start + timedelta(days=index)).isoformat() for index in range(2)]
+            with admission.manual_session(spec.name, timeout=0):
+                for index, failed_session in enumerate(failure_sessions):
+                    fields = {
+                        "session": failed_session,
+                        "error": f"synthetic legacy failure {index}",
+                        "expected_head": base_record.hash,
+                    }
+                    if index in post_effect_indices:
+                        fields["transmitted_fills"] = [{"synthetic": True}]
+                    ledger.log_event("tick_failed", **fields)
+            later_records = [_append_legacy_fixture_session(ledger, spec, admission, session) for session in later_sessions]
+            verified_records = []
+            state = ledger.replay(spec.capital, full=True, on_verified=verified_records.append)
+
+    events = ledger.events()
+    failures = [event for event in events if event.get("kind") == "tick_failed"]
+    return {
+        "root": tmp_path,
+        "spec": spec,
+        "directory": directory,
+        "ledger": ledger,
+        "base_record": base_record,
+        "later_records": later_records,
+        "verified_records": verified_records,
+        "state": state,
+        "latest": verified_records[-1] if verified_records else None,
+        "failures": failures,
+        "events": events,
+    }
+
+
+def _legacy_failure_decision(fixture, *, failure_digests=None):
+    from hedge_fund.runtime.reconciliation import (
+        classify_legacy_failure_evidence,
+        failure_digest,
+        LegacyFailureReconciliationDecision,
+    )
+    from hedge_fund.runtime.root import RootContext
+
+    relative = f"paper/{fixture['spec'].name}/broker.json"
+    with RootContext.open(fixture["root"]) as root:
+        book_digest = hashlib.sha256(root.read_bytes(relative)).hexdigest()
+    events = fixture["ledger"].events()
+    audit_bytes = fixture["ledger"].audit_history_bytes()
+    evidence = classify_legacy_failure_evidence(
+        events,
+        fixture["verified_records"],
+        replay_verified=True,
+        corrupt_events_zero=True,
+        book_matches_replay=True,
+    )
+    selected_digests = failure_digests or [failure_digest(event) for event in fixture["failures"]]
+    attestable_digests = [item["failure_digest"] for item in evidence if item["classification"] == "attestable" and item["failure_digest"] in selected_digests]
+    return LegacyFailureReconciliationDecision.create(
+        failure_digests=selected_digests,
+        ledger_head=fixture["latest"].hash,
+        book_digest=book_digest,
+        audit_history_digest=hashlib.sha256(audit_bytes).hexdigest(),
+        audit_history_length=len(audit_bytes),
+        operator="synthetic-operator",
+        recorded_time="2026-11-17T11:05:00+01:00",
+        attested_failure_digests=attestable_digests,
+    )
+
+
+def _legacy_fixture_file_bytes(fixture):
+    from hedge_fund.runtime.root import RootContext
+
+    with RootContext.open(fixture["root"]) as root:
+        return {path.relative_to(fixture["root"]).as_posix(): root.read_bytes(path.relative_to(fixture["root"]).as_posix()) for path in fixture["directory"].rglob("*") if path.is_file()}
+
+
+def _perturb_legacy_fixture_book(fixture, admission):
+    with admission.manual_session(fixture["spec"].name, timeout=0):
+        broker = PaperBroker(fixture["directory"] / "broker.json", fixture["spec"].costs)
+        broker.place_order(Order(ticker="AAPL", side="buy", quantity=1, price=100))
+
+
+def _append_corrupt_legacy_audit_event(fixture, admission):
+    from hedge_fund.runtime.root import RootContext
+
+    relative = f"paper/{fixture['spec'].name}/events.jsonl"
+    with admission.manual_session(fixture["spec"].name, timeout=0):
+        with RootContext.open(fixture["root"]) as root:
+            root.append_bytes(relative, b"{corrupt synthetic audit event}\n")
 
 
 def _failure_recovery_context(tmp_path, monkeypatch):
@@ -49,6 +248,395 @@ def _failure_recovery_context(tmp_path, monkeypatch):
     latest = ledger.latest()
     snapshot = build_reconciliation_snapshot(directory, deployed, ledger, state, latest)
     return spec, directory, deployed, ledger, state, latest, snapshot
+
+
+def test_legacy_failure_fixture_is_enrolled_and_replays_later_sessions(tmp_path):
+    fixture = _legacy_failure_recovery_fixture(tmp_path)
+    failures = fixture["failures"]
+    records = fixture["verified_records"]
+
+    assert len(failures) == 3
+    assert all(event.get("request_id") is None for event in failures)
+    assert all("transmitted_fills" not in event for event in failures)
+    assert all(event["expected_head"] == fixture["base_record"].hash for event in failures)
+    assert [record.session for record in records] == [
+        "2024-06-01",
+        "2024-06-05",
+        "2024-06-06",
+    ]
+    assert fixture["state"].prev_hash == fixture["latest"].hash
+    assert fixture["state"].positions == {}
+    assert fixture["state"].cash == fixture["spec"].capital
+
+
+def test_legacy_failure_fixture_supports_post_effect_variant(tmp_path):
+    fixture = _legacy_failure_recovery_fixture(tmp_path, post_effect_indices={1})
+
+    assert "transmitted_fills" not in fixture["failures"][0]
+    assert fixture["failures"][1]["transmitted_fills"] == [{"synthetic": True}]
+
+
+def test_legacy_failure_fixture_supports_corrupt_book_and_head_variants(tmp_path):
+    from hedge_fund.pipeline.session import BookMismatch, reconcile
+    from hedge_fund.runtime.admission import AdmissionCoordinator, RootOwnerLease
+    from hedge_fund.runtime.root import RootContext
+
+    fixture = _legacy_failure_recovery_fixture(tmp_path)
+    original_head = fixture["latest"].hash
+    with RootContext.open(tmp_path) as root:
+        with RootOwnerLease.acquire(root) as owner:
+            admission = AdmissionCoordinator(root, owner_lease=owner)
+            advanced = _append_legacy_fixture_session(fixture["ledger"], fixture["spec"], admission, "2024-06-07")
+            assert advanced.prev_hash == original_head
+            state = fixture["ledger"].replay(fixture["spec"].capital, full=True)
+            _perturb_legacy_fixture_book(fixture, admission)
+            broker = PaperBroker(fixture["directory"] / "broker.json", fixture["spec"].costs)
+            with pytest.raises(BookMismatch):
+                reconcile(state, broker, fixture["spec"].name)
+            _append_corrupt_legacy_audit_event(fixture, admission)
+
+    _events, corrupt_digests = fixture["ledger"].recovery_events_with_unresolved_corruption()
+    assert corrupt_digests
+
+
+def test_legacy_failure_decision_resolves_the_exact_unkeyed_set(tmp_path):
+    from hedge_fund.runtime.reconciliation import unresolved_tick_failures
+
+    fixture = _legacy_failure_recovery_fixture(tmp_path)
+    decision = _legacy_failure_decision(fixture)
+    event = {"kind": "legacy_failure_reconciliation", "decision": decision.model_dump(mode="json")}
+
+    assert decision.failure_digests == [failure_digest(failure) for failure in fixture["failures"]]
+    assert unresolved_tick_failures([*fixture["failures"], event]) == []
+
+
+def test_legacy_failure_recorded_after_decision_remains_unresolved(tmp_path):
+    from hedge_fund.runtime.reconciliation import unresolved_tick_failures
+
+    fixture = _legacy_failure_recovery_fixture(tmp_path, failure_count=1)
+    decision_event = {
+        "kind": "legacy_failure_reconciliation",
+        "decision": _legacy_failure_decision(fixture).model_dump(mode="json"),
+    }
+    later_failure = {
+        **fixture["failures"][0],
+        "session": "2024-06-07",
+        "error": "synthetic failure after decision",
+    }
+
+    assert unresolved_tick_failures([fixture["failures"][0], decision_event, later_failure]) == [later_failure]
+
+
+def test_legacy_receipt_and_resume_before_decision_resolve_mixed_set(tmp_path):
+    from hedge_fund.runtime.reconciliation import (
+        ReconciliationReceipt,
+        unresolved_tick_failures,
+    )
+
+    fixture = _legacy_failure_recovery_fixture(tmp_path, failure_count=2)
+    first_failure, second_failure = fixture["failures"]
+    receipt = ReconciliationReceipt.create(
+        failure_event=first_failure,
+        request_id="legacy-receipt-before-decision",
+        current_head=fixture["latest"].hash,
+        broker_book_sha256="b" * 64,
+        fill_identity_sha256="c" * 64,
+        operator="web",
+        recorded_at="2024-06-03T00:00:00+00:00",
+    )
+    legacy_receipt = _legacy_receipt(receipt)
+    reconciliation_event = {
+        "kind": "reconciliation",
+        "receipt": legacy_receipt.model_dump(mode="json", exclude={"issued_at", "valid_until"}),
+    }
+    resume_event = {
+        "kind": "resume",
+        "reconciliation_id": legacy_receipt.receipt_id,
+        "time": "2024-06-03T00:01:00+00:00",
+    }
+    decision = _legacy_failure_decision(fixture, failure_digests=[failure_digest(second_failure)])
+    decision_event = {"kind": "legacy_failure_reconciliation", "decision": decision.model_dump(mode="json")}
+
+    assert unresolved_tick_failures([first_failure, second_failure, reconciliation_event, resume_event, decision_event]) == []
+
+
+def test_legacy_failure_decision_replay_deduplicates_and_rejects_invalid_sets(tmp_path):
+    from hedge_fund.runtime.reconciliation import unresolved_tick_failures
+
+    fixture = _legacy_failure_recovery_fixture(tmp_path)
+    decision_event = {
+        "kind": "legacy_failure_reconciliation",
+        "decision": _legacy_failure_decision(fixture).model_dump(mode="json"),
+    }
+
+    assert unresolved_tick_failures([*fixture["failures"], decision_event, decision_event]) == []
+    invalid = _legacy_failure_decision(
+        fixture,
+        failure_digests=[failure_digest(fixture["failures"][0]), "f" * 64],
+    )
+    invalid_event = {"kind": "legacy_failure_reconciliation", "decision": invalid.model_dump(mode="json")}
+    assert unresolved_tick_failures([*fixture["failures"], invalid_event]) == fixture["failures"]
+    partial = _legacy_failure_decision(fixture, failure_digests=[failure_digest(fixture["failures"][0])])
+    partial_event = {"kind": "legacy_failure_reconciliation", "decision": partial.model_dump(mode="json")}
+    assert unresolved_tick_failures([*fixture["failures"], partial_event]) == fixture["failures"]
+
+
+def test_legacy_failure_decision_requires_valid_attestations_digest_and_aware_time(tmp_path):
+    from hedge_fund.runtime.reconciliation import LegacyFailureReconciliationDecision
+
+    fixture = _legacy_failure_recovery_fixture(tmp_path)
+    fields = _legacy_failure_decision(fixture).model_dump(mode="json", exclude={"schema_version", "decision_id"})
+
+    with pytest.raises(ValidationError):
+        LegacyFailureReconciliationDecision.create(**{**fields, "attested_failure_digests": ["e" * 64]})
+    with pytest.raises(ValidationError):
+        LegacyFailureReconciliationDecision.create(**{**fields, "failure_digests": [fields["failure_digests"][0]] * 2})
+    with pytest.raises(ValidationError):
+        LegacyFailureReconciliationDecision.create(**{**fields, "recorded_time": "2026-11-17T11:05:00"})
+    with pytest.raises(ValidationError):
+        LegacyFailureReconciliationDecision.create(**{**fields, "audit_history_digest": "invalid"})
+
+
+def test_legacy_failure_decision_replay_accepts_schema_one_attestation(tmp_path):
+    from hedge_fund.runtime.reconciliation import LegacyFailureReconciliationDecision
+
+    fixture = _legacy_failure_recovery_fixture(tmp_path, failure_count=1)
+    legacy_payload = {
+        "schema_version": 1,
+        "failure_digests": [failure_digest(fixture["failures"][0])],
+        "ledger_head": fixture["latest"].hash,
+        "book_digest": "b" * 64,
+        "operator": "synthetic-operator",
+        "recorded_time": "2026-11-17T11:05:00+01:00",
+        "attestation": True,
+    }
+    legacy_payload["decision_id"] = hashlib.sha256(json.dumps(legacy_payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")).hexdigest()
+
+    decision = LegacyFailureReconciliationDecision.model_validate(legacy_payload)
+
+    assert decision.schema_version == 1
+    assert unresolved_tick_failures([*fixture["failures"], {"kind": "legacy_failure_reconciliation", "decision": legacy_payload}]) == []
+
+
+def test_legacy_failure_decision_append_preserves_existing_bytes(tmp_path):
+    from hedge_fund.runtime.admission import AdmissionCoordinator, RootOwnerLease
+    from hedge_fund.runtime.root import RootContext
+
+    fixture = _legacy_failure_recovery_fixture(tmp_path)
+    before = _legacy_fixture_file_bytes(fixture)
+    decision = _legacy_failure_decision(fixture)
+    with RootContext.open(tmp_path) as root:
+        with RootOwnerLease.acquire(root) as owner:
+            admission = AdmissionCoordinator(root, owner_lease=owner)
+            with admission.control_lane(fixture["spec"].name, timeout=0):
+                fixture["ledger"].record_legacy_failure_reconciliation(decision)
+
+    after = _legacy_fixture_file_bytes(fixture)
+    event_path = f"paper/{fixture['spec'].name}/events.jsonl"
+    assert set(before) == set(after)
+    for relative, old_bytes in before.items():
+        if relative == event_path:
+            assert after[relative].startswith(old_bytes)
+            assert after[relative].count(b"\n", len(old_bytes)) == 1
+        else:
+            assert after[relative] == old_bytes
+
+
+def test_legacy_failure_decision_append_validates_input_and_requires_lane(tmp_path):
+    from hedge_fund.runtime.admission import AdmissionCoordinator, RootOwnerLease
+    from hedge_fund.runtime.root import RootContext
+
+    fixture = _legacy_failure_recovery_fixture(tmp_path)
+    before = _legacy_fixture_file_bytes(fixture)
+    decision = _legacy_failure_decision(fixture)
+
+    with pytest.raises(LedgerError):
+        fixture["ledger"].record_legacy_failure_reconciliation(decision)
+
+    with RootContext.open(tmp_path) as root:
+        with RootOwnerLease.acquire(root) as owner:
+            admission = AdmissionCoordinator(root, owner_lease=owner)
+            with admission.control_lane(fixture["spec"].name, timeout=0):
+                with pytest.raises(LedgerError):
+                    fixture["ledger"].record_legacy_failure_reconciliation({"invalid": True})
+                mutated = _legacy_failure_decision(fixture)
+                mutated.failure_digests.append("f" * 64)
+                with pytest.raises(LedgerError):
+                    fixture["ledger"].record_legacy_failure_reconciliation(mutated)
+
+    assert _legacy_fixture_file_bytes(fixture) == before
+
+
+def test_legacy_failure_classification_does_not_use_error_text(tmp_path):
+    from hedge_fund.runtime.reconciliation import classify_legacy_failure_evidence
+
+    fixture = _legacy_failure_recovery_fixture(tmp_path)
+    events = fixture["ledger"].events()
+    changed_errors = [{**event, "error": "BookMismatch: changed synthetic message"} if event.get("kind") == "tick_failed" else event for event in events]
+    evidence = classify_legacy_failure_evidence(
+        events,
+        fixture["verified_records"],
+        replay_verified=True,
+        corrupt_events_zero=True,
+        book_matches_replay=True,
+    )
+    changed_evidence = classify_legacy_failure_evidence(
+        changed_errors,
+        fixture["verified_records"],
+        replay_verified=True,
+        corrupt_events_zero=True,
+        book_matches_replay=True,
+    )
+
+    assert [item["classification"] for item in evidence] == ["verified"] * len(fixture["failures"])
+    assert [item["classification"] for item in changed_evidence] == ["verified"] * len(fixture["failures"])
+    assert [item["checks"] for item in changed_evidence] == [item["checks"] for item in evidence]
+    assert [item["error_summary"] for item in changed_evidence] != [item["error_summary"] for item in evidence]
+
+
+def test_legacy_failure_classification_rejects_non_object_events():
+    from hedge_fund.runtime.reconciliation import classify_legacy_failure_evidence
+
+    with pytest.raises(ValueError, match="event objects"):
+        classify_legacy_failure_evidence(
+            [None],
+            [],
+            replay_verified=True,
+            corrupt_events_zero=True,
+            book_matches_replay=True,
+        )
+
+
+def test_legacy_failure_classification_marks_unmarked_pending_decision_as_attestable(tmp_path):
+    from hedge_fund.runtime.reconciliation import classify_legacy_failure_evidence
+
+    fixture = _legacy_failure_recovery_fixture(tmp_path, pending_at_failure=True)
+    evidence = classify_legacy_failure_evidence(
+        fixture["events"],
+        fixture["verified_records"],
+        replay_verified=True,
+        corrupt_events_zero=True,
+        book_matches_replay=True,
+    )
+
+    assert all("transmitted_fills" not in failure for failure in fixture["failures"])
+    assert [item["classification"] for item in evidence] == ["attestable"] * len(fixture["failures"])
+    assert all(item["effect_evidence"]["pending_decision_at_head"] is True for item in evidence)
+
+
+def test_legacy_failure_classification_does_not_infer_missing_pending_state(tmp_path):
+    from hedge_fund.runtime.reconciliation import classify_legacy_failure_evidence
+
+    fixture = _legacy_failure_recovery_fixture(tmp_path)
+    records = [
+        {
+            "hash": record.hash,
+            "prev_hash": record.prev_hash,
+            "session": record.session,
+        }
+        for record in fixture["verified_records"]
+    ]
+    evidence = classify_legacy_failure_evidence(
+        fixture["events"],
+        records,
+        replay_verified=True,
+        corrupt_events_zero=True,
+        book_matches_replay=True,
+    )
+
+    assert evidence[0]["classification"] == "attestable"
+    assert evidence[0]["effect_evidence"]["pending_decision_at_head"] is None
+
+
+def test_legacy_failure_classification_marks_session_already_recorded_as_attestable(tmp_path):
+    from hedge_fund.runtime.reconciliation import classify_legacy_failure_evidence
+
+    fixture = _legacy_failure_recovery_fixture(tmp_path, failure_count=1)
+    target = fixture["failures"][0]
+    events = [
+        {
+            **event,
+            "error": "LedgerError: legacy-paper: session 2024-06-02 is already recorded",
+        }
+        if event == target
+        else event
+        for event in fixture["events"]
+    ]
+    evidence = classify_legacy_failure_evidence(
+        events,
+        fixture["verified_records"],
+        replay_verified=True,
+        corrupt_events_zero=True,
+        book_matches_replay=True,
+    )
+
+    assert evidence[0]["classification"] == "attestable"
+    assert evidence[0]["effect_evidence"]["post_advance_failure_shape"] is True
+
+
+def test_legacy_failure_continuity_requires_success_after_failure_stream_position(tmp_path):
+    from hedge_fund.runtime.reconciliation import (
+        classify_legacy_failure_evidence,
+        failure_digest,
+    )
+
+    fixture = _legacy_failure_recovery_fixture(tmp_path, failure_count=1)
+    late_failure = {
+        "kind": "tick_failed",
+        "time": "2024-06-07T00:00:00+00:00",
+        "session": fixture["failures"][0]["session"],
+        "error": "synthetic late failure with old session label",
+        "expected_head": fixture["base_record"].hash,
+    }
+    evidence = classify_legacy_failure_evidence(
+        [*fixture["events"], late_failure],
+        fixture["verified_records"],
+        replay_verified=True,
+        corrupt_events_zero=True,
+        book_matches_replay=True,
+    )
+    late_result = next(item for item in evidence if item["failure_digest"] == failure_digest(late_failure))
+
+    assert late_result["classification"] == "not_resolvable"
+    assert late_result["checks"]["chain_continuity_across_failure"] is False
+
+
+def test_legacy_failure_continuity_uses_last_duplicate_failure_position(tmp_path):
+    from hedge_fund.runtime.reconciliation import classify_legacy_failure_evidence
+
+    fixture = _legacy_failure_recovery_fixture(tmp_path, failure_count=1)
+    evidence = classify_legacy_failure_evidence(
+        [*fixture["events"], fixture["failures"][0]],
+        fixture["verified_records"],
+        replay_verified=True,
+        corrupt_events_zero=True,
+        book_matches_replay=True,
+    )
+
+    assert evidence[0]["classification"] == "not_resolvable"
+    assert evidence[0]["checks"]["chain_continuity_across_failure"] is False
+
+
+def test_minute_fund_legacy_failure_keeps_intraday_session_order(tmp_path):
+    from hedge_fund.runtime.reconciliation import classify_legacy_failure_evidence
+
+    fixture = _legacy_failure_recovery_fixture(
+        tmp_path,
+        failure_count=1,
+        rebalance="minute",
+    )
+    evidence = classify_legacy_failure_evidence(
+        fixture["events"],
+        fixture["verified_records"],
+        replay_verified=True,
+        corrupt_events_zero=True,
+        book_matches_replay=True,
+    )
+
+    assert fixture["base_record"].session == "2024-06-03T09:30:00"
+    assert fixture["failures"][0]["session"] == "2024-06-03T09:31:00"
+    assert fixture["later_records"][0].session == "2024-06-03T09:32:00"
+    assert evidence[0]["classification"] == "verified"
 
 
 def test_reconciliation_receipt_binds_failure_head_book_capture_and_operator():

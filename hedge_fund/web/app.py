@@ -24,6 +24,7 @@ from hedge_fund.web.schemas import (
     DeployRequest,
     error_payload,
     HaltRequest,
+    LegacyFailureReconciliationRequest,
     LifecycleAcceptRequest,
     LifecyclePreviewRequest,
     MandateCreateRequest,
@@ -329,6 +330,10 @@ def create_app(
             request_id=request.request_id,
             subject_id=name,
         )
+
+    @app.post("/api/paper/{name}/reconcile-legacy-failures")
+    def reconcile_legacy_failures(name: str, request: LegacyFailureReconciliationRequest):
+        return service.reconcile_legacy_failures(name, request)
 
     @app.post("/api/paper/{name}/tick/preview", status_code=201)
     def paper_tick_preview(name: str, request: PaperTickPreviewRequest, http_request: Request):
