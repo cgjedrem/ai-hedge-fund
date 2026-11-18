@@ -165,11 +165,11 @@ interface LegacyFailureEvidence {
 }
 
 type PaperReconciliationWithLegacyFailures = PaperReconciliation & {
-  failures: LegacyFailureEvidence[];
-  preview_head: string | null;
-  preview_book_digest: string | null;
-  confirm_offered: boolean;
-  set_reason: string | null;
+  failures?: LegacyFailureEvidence[];
+  preview_head?: string | null;
+  preview_book_digest?: string | null;
+  confirm_offered?: boolean;
+  set_reason?: string | null;
 };
 
 export function PaperDetailPage() {
@@ -489,7 +489,7 @@ export function PaperDetailPage() {
   async function submitLegacyFailureReconciliation(): Promise<void> {
     const preview = recovery;
     const operator = legacyOperator.trim();
-    const failureDigests = preview?.failures.map((failure) => failure.failure_digest) ?? [];
+    const failureDigests = preview?.failures?.map((failure) => failure.failure_digest) ?? [];
     if (
       !canWritePaper
       || !preview?.confirm_offered

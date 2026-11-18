@@ -879,7 +879,7 @@ class DeskService:
         set_reason = None
         if not confirm_offered:
             set_reason = self._legacy_failure_set_reason(failures, book_status)
-        return {
+        response = {
             "name": normalized,
             "halted": halted,
             "resume_allowed": resume_allowed,
@@ -888,12 +888,16 @@ class DeskService:
             "preview": preview.model_dump(mode="json"),
             "intent_preview": intent_preview.model_dump(mode="json"),
             "intent_targets": intent_targets,
-            "failures": failures,
-            "preview_head": latest.hash if latest is not None else None,
-            "preview_book_digest": preview_book_digest,
-            "confirm_offered": confirm_offered,
-            "set_reason": set_reason,
         }
+        if not corrupt_event_digests:
+            response.update(
+                failures=failures,
+                preview_head=latest.hash if latest is not None else None,
+                preview_book_digest=preview_book_digest,
+                confirm_offered=confirm_offered,
+                set_reason=set_reason,
+            )
+        return response
 
     def reconcile_legacy_failures(self, name: str, request: LegacyFailureReconciliationRequest) -> dict:
         self._require_writes()
@@ -973,7 +977,10 @@ class DeskService:
                         if failure is None:
                             refused.append((digest, "failure evidence is unavailable"))
                         elif failure["classification"] != "resolvable":
-                            refused.append((digest, failure["reason"] or "failure is not resolvable"))
+                            reason = failure["reason"] or "failure is not resolvable"
+                            if reason == "Local paper book does not match replay.":
+                                reason = self._legacy_failure_confirmation_book_reason(book_status) or reason
+                            refused.append((digest, reason))
                     if refused:
                         detail = "; ".join(f"{digest}: {reason}" for digest, reason in refused)
                         raise ServiceError(422, f"Legacy failure confirmation refused: {detail}.", code="readiness-denied")
@@ -1063,6 +1070,16 @@ class DeskService:
         if book_status in book_reasons:
             return book_reasons[book_status]
         return next((failure["reason"] for failure in failures if failure["classification"] != "resolvable"), "Legacy failure set is not resolvable.")
+
+    @staticmethod
+    def _legacy_failure_confirmation_book_reason(book_status):
+        return {
+            "broker-not-local-paper": "Deployment is not a local paper broker.",
+            "broker-book-unavailable": "Local paper book could not be read.",
+            "broker-book-invalid": "Local paper book could not be verified.",
+            "broker-book-changed": "Local paper book changed during confirmation.",
+            "broker-book-mismatch": "Local paper book does not match replay.",
+        }.get(book_status)
 
     def reconcile_tick_request(
         self,

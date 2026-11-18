@@ -257,13 +257,24 @@
 - Static status: `git diff --check` passed. Source inspection shows current corrupt-audit responses still include the Spec009 fields, and current confirm classification uses the generic book/replay reason for invalid/changed statuses. This predicts the new response/reason tests should distinguish the reported gaps; it is not failing-first runtime evidence.
 - T024 failure triage: retained output for clean `9914ef4` / Python `3.11.15` records `test_cli_shaped_tick_races_web_logical_operation_submission` failing with `WriterConflict` while acquiring an admission lane after a 5-second wait; `test_approval_waiting_for_sibling_publication_does_not_block_halt` observing `2.655999999959022s` against a `<2.0s` bound; and `test_crashed_owned_runner_requires_offline_stale_review_before_restart` receiving `worker-failed` with `OwnedRunnerError` during runner readiness. Static diff found no changes in `runtime/admission.py`, `runtime/operations.py`, `runtime/owned_runner.py`, `paper/tick.py`, or those tests; no causal link is established. Aggregate baseline counts do not identify per-test outcomes. Branch and baseline single-test runs remain **BLOCKED** by the active pytest processes.
 - Blocker recheck: `2026-11-18T01:37:06.0480211+01:00`; both process trees remained active. `git diff --check` exited `0`; no test was started.
-- Next check: after process enumeration finds no active pytest, run the corrupt-audit and confirm-reason regressions against unchanged production code to capture red evidence; run the two replay-order tests, then implement only the proven response/reason fixes and rerun affected focused tests. Recheck process state before each branch/baseline diagnostic test.
+- Next check: coordinator message after machine clears; failing-first capture is moot after the static fixes land. Run the new regression tests, Scenario A/B selections, and frontend `paper.test.tsx` tests on the final source; run branch/baseline diagnostic IDs only with no active pytest.
+
+### QA rework cycle 1 — static-only fixes (unverified)
+
+- Result: **INCONCLUSIVE** for runtime behavior. Corrupt-preview suppression, optional frontend fields, and confirm book-status reasons are implemented in source but unverified by any test, build, or runtime run.
+- Recorded: `2026-11-18T01:39:18.9245078+01:00`.
+- Source: `HEAD` `d44fb9e2564f17ae0e43102c2c4cdd0c4450588b`; dirty source diff SHA-256 `c4b9840f92b4790d5d73d3ec148a13fe1ee6a0e399b1189dea54ff76b175d030` (`4430` bytes), covering `hedge_fund/web/services.py` and `frontend/src/pages/paper.tsx`.
+- Artifact/environment: working-tree source only; no Vite build, installed bundle, or runtime artifact. Windows NT `10.0.26200.0`.
+- Static changes: `paper_reconciliation` retains `preview`, `intent_preview`, and `intent_targets` but omits all five Spec009 extension fields when `corrupt_event_digests` is non-empty; the frontend models those fields as optional and guards the `failures` map. Confirm refusal replaces the generic book/replay reason with a status-specific reason for invalid, changed, unavailable, mismatch, and non-local-paper book states; the existing mismatch 423 path and preview set-level messages remain unchanged.
+- Validation: manual diff review and `git diff --check` passed (exit `0`). No pytest, frontend test, lint, build, or runtime command was run. Existing regression tests remain unexecuted.
+- Acceptance freshness: Scenarios A and B are **INCONCLUSIVE** pending reruns because the frontend recovery contract and corrupt/refusal responses changed. Scenario C remains PASS: static diff does not touch successful append/retry or idempotency behavior. Scenario D remains BLOCKED under coordinator-managed T024. `tasks.md` checkboxes unchanged.
+- Provenance/next owner: static review only; coordinator owns execution after machine clearance. Next run: new regression tests, Scenario A/B selections, and `frontend` `paper.test.tsx` on final source. No provider, LLM, broker, paid-credit, or production-root access.
 
 ## Acceptance scenarios
 
 | Scenario | Status | Evidence |
 |---|---|---|
-| A — multiple unkeyed failures, confirm, replay byte identity | PASS | T022 post-style-source revalidation |
+| A — multiple unkeyed failures, confirm, replay byte identity | INCONCLUSIVE | QA cycle-1 frontend source change; rerun pending |
 | B — ambiguity, corruption, mismatch, stale preview, contention refusals | INCONCLUSIVE | `a238062` changed corrupt-audit preview behavior; final response-shape test pending |
 | C — durable append interruption and retry | PASS | T022 post-style-source revalidation |
 | D — full suite and baseline comparison | BLOCKED | No isolated final run; external pytest process active with source identity unavailable |
