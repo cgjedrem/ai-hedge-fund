@@ -344,7 +344,7 @@ export function PaperDetailPage() {
     setPaperPreviewKind(null);
     setLegacyRecoveryOpen(false);
     setLegacyOperator("");
-    setLegacyAttestation(false);
+    setLegacyAttestationDigests([]);
     recoveryRequest.current = null;
     intentRecoveryRequest.current = null;
   }, [name]);
@@ -934,7 +934,6 @@ export function PaperDetailPage() {
                         <Button
                           onClick={() => {
                             setLegacyOperator("");
-                            setLegacyAttestationDigests([]);
                             setLegacyRecoveryOpen(true);
                           }}
                           disabled={!recovery.confirm_offered || !canWritePaper || busy || !recovery.preview_head || !recovery.preview_book_digest || !recovery.preview_audit_digest}
@@ -1388,7 +1387,16 @@ export function PaperDetailPage() {
             Verified failures need no attestation. Each attestable failure must be acknowledged in its evidence row.
           </p>
           <DialogFooter>
-            <Button variant="ghost" onClick={() => setLegacyRecoveryOpen(false)} disabled={busy}>Cancel</Button>
+            <Button
+              variant="ghost"
+              onClick={() => {
+                setLegacyAttestationDigests([]);
+                setLegacyRecoveryOpen(false);
+              }}
+              disabled={busy}
+            >
+              Cancel
+            </Button>
             <Button
               onClick={() => void submitLegacyFailureReconciliation()}
               disabled={
