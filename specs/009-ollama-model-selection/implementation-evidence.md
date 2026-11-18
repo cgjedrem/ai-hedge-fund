@@ -57,7 +57,7 @@ Results recorded 2026-11-18 02:32:55 +01:00. Implementation code in the Python t
 | 6 frontend types | `(cwd=frontend) npx tsc --noEmit` | **PASS** — exit 0, no emitted files. |
 | 6 frontend lint | `(cwd=frontend) npm run` | **N/A** — configured scripts contain no lint script; toolchain available. |
 
-V4.5 (authorized one-shot dispatch with a real verified cost model): **mechanism enabled 2026-11-18** — D7 resolved with operator-declared pricing for `kimi-k3.1-pro:cloud` (see delta section below); authorized+budgeted one-shot dispatch reaches mocked client construction on the web path and via the CLI factory. Live walk not performed (requires explicit operator authorization at run time). QA delta review caveat I-1: the full CLI `main()` path has an unresolved credential-store lookup question for keyless Ollama — tracked for the current rework cycle.
+V4.5 (authorized one-shot dispatch with a real verified cost model): **mechanism enabled 2026-11-18** — D7 resolved with operator-declared pricing for `kimi-k3.1-pro:cloud` (see delta section below); authorized+budgeted one-shot dispatch reaches mocked client construction on the web path and via the CLI factory. Live walk not performed (requires explicit operator authorization at run time). QA delta review caveat I-1 is resolved by the final CLI `main()` regression evidence below.
 
 ## QA rework targeted evidence (cycle 2: I-2, I-3)
 
@@ -151,3 +151,46 @@ poetry run pytest 'hedge_fund/web/test_saxo_inspection.py::test_http_loss_during
 
 - **Diagnostic result**: PASS — 2 passed in 15.79s; exit 0. This does not establish pre-change baseline status. Full-suite baseline equivalence is **INCONCLUSIVE**; the required “only documented baseline IDs fail” condition was not met. No second full-suite run was made.
 - **Next falsification step**: reproduce those two exact IDs against the pre-change artifact or obtain a documented baseline comparison in an approved isolated environment. No unrelated code/test edits were made.
+
+## QA delta I-1 and loopback cost-model follow-up
+
+- **Finding / disposition**: PASS — CLI `main()` now skips credential-store lookup for providers in `KEYLESS_PROVIDERS`. Authorized, budgeted `kimi-k3.1-pro:cloud` reaches the guarded `ChatOllama` constructor without credential access. Missing authorization and missing budget still refuse.
+- **Adjacent cost-model finding**: PASS — the cost-model endpoint identity uses the same normalization as `runtime/endpoints.py`; all endpoint spellings accepted by that validator resolve to the same verified model. Non-loopback endpoint remains rejected.
+- **Revision movement**: during the user-controlled baseline run, HEAD advanced from `5284584` to `b1fa7d7` in a user-authored, evidence-only commit. Tests ran on `b1fa7d7`; no prior work was reset or overwritten.
+- **Test source identity**: HEAD `b1fa7d7dee4b1c9147bf146c664c331b36f749f9` plus dirty-diff SHA-256 `873cebef6156da7c1168db15b10870e7779f7b73e0199ff75da018faec4a9797`. At test time, dirty diff contained only `hedge_fund/run.py`, `hedge_fund/runtime/costs.py`, `hedge_fund/test_run.py`, and `hedge_fund/runtime/test_costs.py`.
+- **Artifact mapping**: direct Poetry checkout; no wheel/container built. Windows 10.0.26200.0, Python 3.13.7, Poetry 2.5.1, pytest 7.4.4.
+- **Gate / provenance**: user-provided gate marker appeared 2026-11-18 16:51:19.2614682 +01:00. Implementation owner ran the exact commands below after the marker. Console output retained in the execution transcript; no separate log file.
+
+### Requested targeted modules
+
+Exact command:
+
+```powershell
+poetry run pytest hedge_fund/test_run.py hedge_fund/runtime/test_costs.py hedge_fund/runtime/test_dispatch.py hedge_fund/llm/test_client.py hedge_fund/web/test_jobs.py -q --tb=line
+```
+
+- **Observation**: started 2026-11-18 17:03:37.6715312 +01:00; ended 17:13:30.6351587 +01:00; pytest reported 584.12s; exit 1.
+- **Execution result**: FAIL — 10 failed, 382 passed, 0 skipped.
+- **Failure classification**: all 10 IDs are in the authoritative baseline list above: four `test_saxo_demo_execution_refuses_before_ledger_or_execution` cases and six `test_saxo_guard_preserves_nonexecuting_verdicts_and_oauth_paper_approvals` cases. Each failed on missing `run.apply_credentials`; no new failure remained after the test-only assertion correction below.
+- No full suite was run. No live network or Ollama request occurred.
+
+### New regression IDs
+
+Exact command:
+
+```powershell
+poetry run pytest 'hedge_fund/test_run.py::test_cli_backtest_paid_kimi_cloud_main_constructs_guarded_client_without_credentials' 'hedge_fund/test_run.py::test_cli_backtest_paid_kimi_cloud_main_refuses_without_authorization_or_budget[no-authorization]' 'hedge_fund/test_run.py::test_cli_backtest_paid_kimi_cloud_main_refuses_without_authorization_or_budget[no-budget]' 'hedge_fund/runtime/test_costs.py::test_kimi_cost_model_normalizes_approved_loopback_endpoints[default]' 'hedge_fund/runtime/test_costs.py::test_kimi_cost_model_normalizes_approved_loopback_endpoints[host-only]' 'hedge_fund/runtime/test_costs.py::test_kimi_cost_model_normalizes_approved_loopback_endpoints[host-slash]' 'hedge_fund/runtime/test_costs.py::test_kimi_cost_model_normalizes_approved_loopback_endpoints[port]' 'hedge_fund/runtime/test_costs.py::test_kimi_cost_model_normalizes_approved_loopback_endpoints[port-slash]' 'hedge_fund/runtime/test_costs.py::test_kimi_cost_model_rejects_non_loopback_endpoint' -q --tb=short
+```
+
+- **Observation**: started 2026-11-18 17:14:08.5973790 +01:00; ended 17:14:15.1597266 +01:00.
+- **Result**: PASS — 9 passed in 1.52s; exit 0.
+- **IDs**: `test_cli_backtest_paid_kimi_cloud_main_constructs_guarded_client_without_credentials`; refusal cases `[no-authorization]` and `[no-budget]`; endpoint variants `[default]`, `[host-only]`, `[host-slash]`, `[port]`, `[port-slash]`; `test_kimi_cost_model_rejects_non_loopback_endpoint`.
+- CLI construction used fake `ChatOllama` and a guarded transport with `httpx.MockTransport` beneath it; tests made no provider request.
+
+### Repair and static checks
+
+- Initial five-module run: 11 failed, 381 passed, 0 skipped in 622.41s; started 2026-11-18 16:52:09.9955259 +01:00, ended 17:02:42.3483410 +01:00. Ten failures were the same baseline Saxo IDs; one new endpoint test expected `Ollama destination`, while the validator returned `configured Ollama endpoint is not approved`. Diagnostic command `poetry run pytest hedge_fund/runtime/test_costs.py::test_kimi_cost_model_rejects_non_loopback_endpoint -q --tb=short` ran 17:03:05.4616509–17:03:16.4379450 +01:00 and confirmed the mismatch. Corrected only the test regex. Final five-module rerun above has no new failures.
+- Black: `poetry run black --check --line-length 420 hedge_fund/run.py hedge_fund/runtime/costs.py hedge_fund/test_run.py hedge_fund/runtime/test_costs.py` — PASS, 4 unchanged.
+- isort: `poetry run isort --check-only --profile black hedge_fund/run.py hedge_fund/runtime/costs.py hedge_fund/test_run.py hedge_fund/runtime/test_costs.py` — PASS.
+- flake8: `poetry run flake8 --max-line-length=420 --extend-ignore=E203 hedge_fund/run.py hedge_fund/runtime/costs.py hedge_fund/test_run.py hedge_fund/runtime/test_costs.py` — PASS.
+- `git diff --check` and BOM check — PASS. No production raw writes added; no writer-map entry required.

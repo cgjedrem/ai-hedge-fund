@@ -1013,6 +1013,7 @@ def _authorize_cli_operation(
     resolver=None,
 ):
     from hedge_fund.llm.client import validate_llm_transport
+    from hedge_fund.llm.registry import KEYLESS_PROVIDERS
     from hedge_fund.pipeline.session import code_version, mandate_hash
     from hedge_fund.pipeline.session import SessionRecord as CapturedSessionRecord
     from hedge_fund.runtime.capture import freeze_capture
@@ -1190,21 +1191,22 @@ def _authorize_cli_operation(
     if paid_targets:
         target = paid_targets[0][0]
         provider_id = target.provider.casefold()
-        try:
-            credentials = CredentialStore(root, admission)
-            version, configured = credentials.version(provider_id)
-            if not configured or version <= 0:
-                parser.error("paid provider credential is not saved under this root")
-            credential = credentials.read_version(provider_id, version)
-        except CredentialStoreError:
-            parser.error("paid provider credential is unavailable")
-        if not isinstance(credential, str) or not credential:
-            parser.error("paid provider credential is unavailable")
-        credential_versions[provider_id] = version
-        if target.kind == "data":
-            data_key = credential
-        else:
-            llm_key = credential
+        if provider_id not in {provider.casefold() for provider in KEYLESS_PROVIDERS}:
+            try:
+                credentials = CredentialStore(root, admission)
+                version, configured = credentials.version(provider_id)
+                if not configured or version <= 0:
+                    parser.error("paid provider credential is not saved under this root")
+                credential = credentials.read_version(provider_id, version)
+            except CredentialStoreError:
+                parser.error("paid provider credential is unavailable")
+            if not isinstance(credential, str) or not credential:
+                parser.error("paid provider credential is unavailable")
+            credential_versions[provider_id] = version
+            if target.kind == "data":
+                data_key = credential
+            else:
+                llm_key = credential
 
     try:
         capture = freeze_capture(

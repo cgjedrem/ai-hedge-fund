@@ -11,7 +11,7 @@ from hedge_fund.runtime.costs import (
     minimum_attempt_cost,
     request_cost_upper_bound,
 )
-from hedge_fund.runtime.policy import ProviderTarget
+from hedge_fund.runtime.policy import AuthorizationDenied, ProviderTarget
 
 
 def test_financial_datasets_bound_uses_maximum_published_self_service_rate():
@@ -110,6 +110,50 @@ def test_kimi_k3_1_pro_ollama_cost_model_uses_operator_rates_and_context_bound()
         body=maximum_request,
     ) == Decimal("3.31072")
     assert not has_verified_cost_model(ProviderTarget(kind="llm", provider="ollama", model="kimi-k3:cloud"))
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        None,
+        "http://127.0.0.1",
+        "http://127.0.0.1/",
+        "http://127.0.0.1:11434",
+        "http://127.0.0.1:11434/",
+    ],
+    ids=["default", "host-only", "host-slash", "port", "port-slash"],
+)
+def test_kimi_cost_model_normalizes_approved_loopback_endpoints(endpoint):
+    from hedge_fund.runtime.endpoints import validate_provider_target
+
+    target = ProviderTarget(
+        kind="llm",
+        provider="ollama",
+        model="kimi-k3.1-pro:cloud",
+        endpoint=endpoint,
+    )
+
+    validate_provider_target(target, per_operation_authorization_supplied=True)
+
+    assert has_verified_cost_model(target)
+    assert cost_model_identity(target) == "ollama-kimi-k3.1-pro-1m-context-v1"
+    assert minimum_attempt_cost(target) == Decimal("3.31072")
+
+
+def test_kimi_cost_model_rejects_non_loopback_endpoint():
+    from hedge_fund.runtime.endpoints import validate_provider_target
+
+    target = ProviderTarget(
+        kind="llm",
+        provider="ollama",
+        model="kimi-k3.1-pro:cloud",
+        endpoint="http://127.0.0.2:11434",
+    )
+
+    assert not has_verified_cost_model(target)
+    assert cost_model_identity(target) is None
+    with pytest.raises(AuthorizationDenied, match="Ollama endpoint"):
+        validate_provider_target(target, per_operation_authorization_supplied=True)
 
 
 @pytest.mark.parametrize(

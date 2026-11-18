@@ -6,7 +6,7 @@ import json
 from decimal import Decimal, ROUND_CEILING
 from urllib.parse import urlsplit
 
-from hedge_fund.runtime.policy import ProviderTarget
+from hedge_fund.runtime.policy import AuthorizationDenied, ProviderTarget
 
 COST_MODEL_VERSION = "2026-11-01-v2"
 FD_PRICING_SOURCE = "https://www.financialdatasets.ai/pricing.md"
@@ -22,7 +22,7 @@ _TYPESAFE_MAX_ATTEMPT_COST = (_TYPESAFE_MAX_CONTEXT_TOKENS * _TYPESAFE_INPUT_TOK
 # Operator-declared: Ollama model page, 2026-11-18.
 # Rates per 1M input/cached-input/output: $2.00/$0.20/$10.00; context 1M.
 _OLLAMA_KIMI_K3_1_PRO_MODEL = "kimi-k3.1-pro:cloud"
-_OLLAMA_KIMI_K3_1_PRO_ENDPOINT = "http://127.0.0.1:11434"
+_OLLAMA_LOOPBACK_ENDPOINT = ("127.0.0.1", 11434, "http")
 _OLLAMA_KIMI_K3_1_PRO_INPUT_PER_MILLION = Decimal("2.00")
 _OLLAMA_KIMI_K3_1_PRO_CACHED_INPUT_PER_MILLION = Decimal("0.20")
 _OLLAMA_KIMI_K3_1_PRO_OUTPUT_PER_MILLION = Decimal("10.00")
@@ -30,6 +30,15 @@ _OLLAMA_KIMI_K3_1_PRO_CONTEXT_TOKENS = Decimal("1000000")
 _OLLAMA_PRICE_PER_MILLION = Decimal("1000000")
 _OLLAMA_KIMI_K3_1_PRO_MAX_ATTEMPT_COST = (_OLLAMA_KIMI_K3_1_PRO_CONTEXT_TOKENS * _OLLAMA_KIMI_K3_1_PRO_INPUT_PER_MILLION + Decimal(MAX_LLM_OUTPUT_TOKENS) * _OLLAMA_KIMI_K3_1_PRO_OUTPUT_PER_MILLION) / _OLLAMA_PRICE_PER_MILLION
 _OLLAMA_KIMI_K3_1_PRO_MAX_ATTEMPT_COST = _OLLAMA_KIMI_K3_1_PRO_MAX_ATTEMPT_COST.quantize(Decimal("0.000001"), rounding=ROUND_CEILING)
+
+
+def _normalized_ollama_endpoint(target: ProviderTarget) -> tuple[str, int, str] | None:
+    from hedge_fund.runtime.endpoints import _validate_configured_endpoint
+
+    try:
+        return _validate_configured_endpoint(target)
+    except AuthorizationDenied:
+        return None
 
 
 def has_verified_cost_model(target: ProviderTarget) -> bool:
@@ -41,7 +50,7 @@ def has_verified_cost_model(target: ProviderTarget) -> bool:
     if target.kind != "llm":
         return False
     if target.provider == "ollama":
-        return target.model == _OLLAMA_KIMI_K3_1_PRO_MODEL and target.endpoint in (None, _OLLAMA_KIMI_K3_1_PRO_ENDPOINT)
+        return target.model == _OLLAMA_KIMI_K3_1_PRO_MODEL and _normalized_ollama_endpoint(target) == _OLLAMA_LOOPBACK_ENDPOINT
     return target.endpoint is None and target.provider == "typesafe" and target.model == "jev-1.13.0"
 
 

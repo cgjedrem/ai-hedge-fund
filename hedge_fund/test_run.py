@@ -1116,6 +1116,188 @@ def test_cli_backtest_paid_kimi_cloud_requires_verified_budget(
     assert not (root / "paper").exists()
 
 
+def test_cli_backtest_paid_kimi_cloud_main_constructs_guarded_client_without_credentials(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    offline,
+):
+    import httpx
+    import langchain_ollama
+
+    from hedge_fund.runtime import credentials
+    from hedge_fund.runtime.dispatch import ProviderDispatch
+    from hedge_fund.runtime.policy import ProviderTarget
+
+    model = "kimi-k3.1-pro:cloud"
+    root = tmp_path / "cli-kimi-cloud-authorized"
+    root.mkdir()
+    _enroll_test_root(root)
+    path = _mandate(root, name="cli-kimi-cloud-authorized")
+    monkeypatch.setattr(run, "PAPER_DIR", root / "paper")
+    monkeypatch.setenv("HEDGE_FUND_LLM_MODEL", "gemma3:4b")
+    credential_store = Mock(side_effect=AssertionError("keyless provider credential lookup"))
+    monkeypatch.setattr(credentials, "CredentialStore", credential_store)
+
+    constructed = []
+
+    class FakeChatOllama:
+        def __init__(self, **kwargs):
+            constructed.append(kwargs)
+
+    monkeypatch.setattr(langchain_ollama, "ChatOllama", FakeChatOllama)
+
+    transport_constructions = []
+    original_httpx_transport = ProviderDispatch.httpx_transport
+
+    def httpx_transport_with_mock_inner(dispatch, target, *, inner_transport=None):
+        mock_inner = httpx.MockTransport(lambda request: httpx.Response(200, request=request))
+        guarded_transport = original_httpx_transport(dispatch, target, inner_transport=mock_inner)
+        transport_constructions.append((dispatch, target, guarded_transport, mock_inner))
+        return guarded_transport
+
+    monkeypatch.setattr(ProviderDispatch, "httpx_transport", httpx_transport_with_mock_inner)
+
+    funds = []
+
+    class ClientConstructingFund:
+        def __init__(self, spec, *, blind, llm_factory, breakpoints_dispatch):
+            self.spec = spec
+            self.blind = blind
+            self.dispatch = breakpoints_dispatch
+            self.llm = llm_factory(None)
+            funds.append(self)
+
+    monkeypatch.setattr(run, "Fund", ClientConstructingFund)
+
+    class BacktestReached(Exception):
+        pass
+
+    def stop_after_client_construction(fund, *_args):
+        assert fund is funds[0]
+        raise BacktestReached
+
+    monkeypatch.setattr(run, "backtest_fund", stop_after_client_construction)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "aihf",
+            "--root",
+            str(root),
+            "--enable-network",
+            "--model",
+            model,
+            "backtest",
+            str(path),
+            "--universe",
+            "AAPL",
+            "--start",
+            "2025-01-06",
+            "--end",
+            "2025-01-07",
+            "--authorize-paid-provider",
+            "ollama",
+            "--paid-max-calls",
+            "1",
+            "--paid-max-cost-usd",
+            "10",
+            "--paid-max-attempt-cost-usd",
+            "3.31072",
+        ],
+    )
+
+    with pytest.raises(BacktestReached):
+        run.main()
+
+    output = capsys.readouterr()
+    assert "Paid dispatch authorized: ollama" in output.err
+    assert credential_store.call_count == 0
+    assert len(funds) == 1
+    assert funds[0].blind is True
+    assert len(constructed) == 1
+    assert constructed[0]["model"] == model
+    assert len(transport_constructions) == 1
+    dispatch, target, guarded_transport, mock_inner = transport_constructions[0]
+    assert isinstance(target, ProviderTarget)
+    assert target.provider == "ollama"
+    assert target.model == model
+    assert dispatch.has_one_shot_authorization(target)
+    assert funds[0].dispatch is dispatch
+    assert constructed[0]["client_kwargs"]["transport"] is guarded_transport
+    assert isinstance(mock_inner, httpx.MockTransport)
+
+
+@pytest.mark.parametrize(
+    "paid_args",
+    [
+        [
+            "--paid-max-calls",
+            "1",
+            "--paid-max-cost-usd",
+            "10",
+            "--paid-max-attempt-cost-usd",
+            "3.31072",
+        ],
+        ["--authorize-paid-provider", "ollama"],
+    ],
+    ids=["no-authorization", "no-budget"],
+)
+def test_cli_backtest_paid_kimi_cloud_main_refuses_without_authorization_or_budget(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    offline,
+    paid_args,
+):
+    import langchain_ollama
+
+    model = "kimi-k3.1-pro:cloud"
+    root = tmp_path / "cli-kimi-cloud-refused"
+    root.mkdir()
+    _enroll_test_root(root)
+    path = _mandate(root, name="cli-kimi-cloud-refused")
+    monkeypatch.setattr(run, "PAPER_DIR", root / "paper")
+    monkeypatch.setenv("HEDGE_FUND_LLM_MODEL", "gemma3:4b")
+    forbidden = Mock(side_effect=AssertionError("paid provider dispatched without full authorization"))
+    monkeypatch.setattr(run, "Fund", forbidden)
+    monkeypatch.setattr(run, "backtest_fund", forbidden)
+    monkeypatch.setattr(run, "make_data_client", forbidden)
+    monkeypatch.setattr(langchain_ollama, "ChatOllama", forbidden)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "aihf",
+            "--root",
+            str(root),
+            "--enable-network",
+            "--model",
+            model,
+            "backtest",
+            str(path),
+            "--universe",
+            "AAPL",
+            "--start",
+            "2025-01-06",
+            "--end",
+            "2025-01-07",
+            *paid_args,
+        ],
+    )
+
+    with pytest.raises(SystemExit) as rejected:
+        run.main()
+
+    output = capsys.readouterr()
+    assert rejected.value.code == 2
+    assert "requires explicit per-operation authorization" in output.err
+    assert "paid provider credential" not in output.err
+    assert forbidden.call_count == 0
+    assert not (root / "research").exists()
+    assert not (root / "paper").exists()
+
+
 def test_cli_kimi_cloud_factory_constructs_client_from_budgeted_dispatch(monkeypatch):
     import langchain_ollama
 
