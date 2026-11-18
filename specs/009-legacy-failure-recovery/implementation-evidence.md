@@ -304,3 +304,10 @@
 | B — ambiguity, corruption, mismatch, stale preview, contention refusals | PASS | QA cycle-1 verification: corrupt-audit regression and refusal/replay tests, `46 passed`; frontend `paper.test.tsx`, `35 passed` |
 | C — durable append interruption and retry | PASS | QA cycle-1 verification: retry selection, `1 passed`; included in final recovery batch, `46 passed` |
 | D — full suite and baseline comparison | BLOCKED | T024 is coordinator-managed and was not run here; isolated diagnostic tests do not replace the full-suite gate |
+
+### Coordinator revision-binding closure (QA cycle-1 re-review)
+
+- Recorded: 2026-11-18T03:0x+01:00 (post QA re-review).
+- QA flagged: batch-of-46 bound to 26161f2 + 769-byte isort-only dirty diff; equivalence to committed 4818fb0/1ff3114 unverified.
+- Closure: `git diff 26161f2 1ff3114 -- hedge_fund` touches exactly one file, hedge_fund/runtime/test_reconciliation.py, a 5-line isort-only import rewrap (no behavior); memory/evidence/tasks files are documentation. The tested source and final committed source are behaviorally identical; the dirty diff QA referenced is the same rewrap.
+- Residual open items for the solo-suite window (QA caveats): rerun test_paper_reconciliation_blocks_post_effect_failure_set on final source; run test_paper_operations.py::test_corruption_receipt_does_not_resolve_later_identical_line and ::test_reconciled_corruption_allows_resume_after_manual_halt on final source; frontend tsc/build after optional-field change; then T024 isolated full suite with per-test baseline attribution for every failure.
