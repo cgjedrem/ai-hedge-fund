@@ -19,7 +19,7 @@
 - **QA rework final (f7e41b7)**: `poetry run pytest hedge_fund -q`, 2026-11-18 01:09:56–02:29:22 +01:00 → **25 failed, 3047 passed, 62 skipped** in 4757.91s (1:19:17), exit 1. Final source diff SHA-256 and environment are recorded above.
 - **Verdict**: full pytest execution is **FAIL** because baseline tests still fail. Regression verdict is **PASS**: all 25 final failures are in the documented baseline set; no new failure remains. `runtime/test_inventory_cache_race.py` did not fail in this final run. The baseline set spans `test_run.py`, `data/test_yfinance_client.py`, `paper/test_deployed_broker.py`, `paper/test_saxo_e2e.py`, `runtime/test_inventory_cache_race.py`, `runtime/test_process_identity.py`, `runtime/test_writer_inventory.py`, `runtime/test_writer_races.py`, and `web/test_actions.py`.
 
-## Targeted evidence per acceptance scenario (T021, test-level)
+## Targeted evidence per acceptance scenario (T021, test-level — no live-surface walk; a live walk requires the D7 cost-model input and explicit operator authorization and is deferred)
 
 | Scenario | Evidence | Result |
 |---|---|---|
