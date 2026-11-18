@@ -1033,13 +1033,14 @@ def test_paper_reconciliation_exposes_evidence_for_unkeyed_failures(tmp_path):
     failures = preview["failures"]
     assert preview["preview_head"] == decision.ledger_head
     assert preview["preview_book_digest"] == decision.book_digest
+    assert preview["preview_audit_digest"] == decision.audit_history_digest
     assert preview["confirm_offered"] is True
     assert preview["set_reason"] is None
     assert [failure["failure_digest"] for failure in failures] == [failure_digest(event) for event in fixture["failures"]]
     assert [failure["time"] for failure in failures] == [event["time"] for event in fixture["failures"]]
     assert [failure["error_summary"] for failure in failures] == [event["error"] for event in fixture["failures"]]
     assert all(failure["has_request_id"] is False for failure in failures)
-    assert all(failure["classification"] == "resolvable" for failure in failures)
+    assert all(failure["classification"] == "verified" for failure in failures)
     assert all(failure["checks"] == expected_checks for failure in failures)
 
 
@@ -1053,12 +1054,13 @@ def test_paper_reconciliation_blocks_post_effect_failure_set(tmp_path):
     finally:
         service.close()
 
-    assert preview["confirm_offered"] is False
-    assert preview["failures"][0]["classification"] == "resolvable"
-    assert preview["failures"][1]["classification"] == "not_resolvable"
+    assert preview["confirm_offered"] is True
+    assert preview["failures"][0]["classification"] == "verified"
+    assert preview["failures"][1]["classification"] == "attestable"
     assert preview["failures"][1]["checks"]["no_post_effect_fields"] is False
-    assert preview["failures"][1]["reason"] == "Post-effect metadata is present on this failure."
-    assert preview["failures"][2]["classification"] == "resolvable"
+    assert preview["failures"][1]["effect_evidence"]["post_effect_fields_present"] is True
+    assert preview["failures"][1]["reason"] == "Effect metadata prevents proof of no effect; operator attestation is required."
+    assert preview["failures"][2]["classification"] == "verified"
 
 
 def test_corrupt_audit_suppresses_legacy_failure_preview_fields(tmp_path):
@@ -1086,6 +1088,7 @@ def test_corrupt_audit_suppresses_legacy_failure_preview_fields(tmp_path):
         "failures",
         "preview_head",
         "preview_book_digest",
+        "preview_audit_digest",
         "confirm_offered",
         "set_reason",
     }.intersection(preview)

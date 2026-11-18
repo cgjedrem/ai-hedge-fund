@@ -832,7 +832,8 @@ class DeskService:
         )
         self._safe_child("paper", normalized, "broker.json")
         try:
-            events, corrupt_event_digests = ledger.recovery_events_with_unresolved_corruption()
+            events, corrupt_event_digests, audit_history_bytes = ledger.recovery_events_with_unresolved_corruption_and_audit_bytes()
+            preview_audit_digest = hashlib.sha256(audit_history_bytes).hexdigest()
             snapshot = build_reconciliation_snapshot(directory, deployed, ledger, state, latest)
             intent_snapshot = build_tick_intent_reconciliation_snapshot(
                 directory,
@@ -875,7 +876,7 @@ class DeskService:
         resume_completion_allowed = resume_completion_required and not unresolved_state.failures and not unresolved_state.tick_intents and not unresolved_state.approval_consumptions
         normal_resume_allowed = halted is not None and not unresolved_state.tick_intents and not unresolved_state.resume_intents and not unresolved_state.approval_consumptions and (failure_review_allowed or no_failure_review_required)
         resume_allowed = resume_completion_allowed or normal_resume_allowed
-        confirm_offered = bool(failures) and all(failure["classification"] == "resolvable" for failure in failures)
+        confirm_offered = bool(failures) and all(failure["classification"] != "not_resolvable" for failure in failures)
         set_reason = None
         if not confirm_offered:
             set_reason = self._legacy_failure_set_reason(failures, book_status)
@@ -894,6 +895,7 @@ class DeskService:
                 failures=failures,
                 preview_head=latest.hash if latest is not None else None,
                 preview_book_digest=preview_book_digest,
+                preview_audit_digest=preview_audit_digest,
                 confirm_offered=confirm_offered,
                 set_reason=set_reason,
             )
@@ -907,125 +909,167 @@ class DeskService:
         self._guard_protected(normalized)
         with self._fund_lock(normalized):
             with self._paper_control_lane(normalized):
-                verified_records = []
-                directory, deployed, ledger, state, latest = self._paper_state(
-                    normalized,
-                    local_paper_only=True,
-                    on_verified=verified_records.append,
-                )
-                try:
-                    events, corrupt_event_digests = ledger.recovery_events_with_unresolved_corruption()
-                    if corrupt_event_digests:
-                        raise ServiceError(423, "Paper audit history is invalid (LedgerError).", code="replay-corrupt")
-                    unresolved = unresolved_tick_failures(events)
-                    unresolved_digests = [failure_digest(failure) for failure in unresolved]
-                    current_head = latest.hash if latest is not None else None
-                    book_digest, book_matches_replay, book_status = self._legacy_failure_book_evidence(normalized, deployed, state)
-                    if current_head != request.preview_head or book_digest != request.preview_book_digest:
-                        raise ServiceError(
-                            409,
-                            "Paper state changed after legacy failure review.",
-                            code="stale-preview",
-                            current_head=current_head,
-                        )
-
-                    previous = self._matching_legacy_failure_decision(events, request, unresolved_digests)
-                    if previous is not None:
-                        return {
-                            "name": normalized,
-                            "status": "already-resolved",
-                            "decision_id": previous.decision_id,
-                        }
-
-                    known_digests = {failure_digest(event) for event in events if event.get("kind") == "tick_failed"}
-                    unresolved_set = set(unresolved_digests)
-                    invalid_digests = []
-                    for digest in request.failure_digests:
-                        if digest not in known_digests:
-                            invalid_digests.append((digest, "unknown failure digest"))
-                        elif digest not in unresolved_set:
-                            invalid_digests.append((digest, "failure is already resolved"))
-                    if invalid_digests:
-                        detail = "; ".join(f"{digest}: {reason}" for digest, reason in invalid_digests)
-                        raise ServiceError(422, f"Legacy failure confirmation refused: {detail}.", code="readiness-denied")
-                    if request.failure_digests != unresolved_digests:
-                        raise ServiceError(
-                            409,
-                            "The unresolved failure set changed after legacy failure review.",
-                            code="stale-preview",
-                            current_head=current_head,
-                        )
-                    if book_status == "broker-book-mismatch":
-                        raise ServiceError(
-                            423,
-                            "The current local paper book does not match replay; legacy failure reconciliation is refused.",
-                            code="reconciliation-required",
-                        )
-
-                    replay_verified = state is not None and state.prev_hash == current_head
-                    evidence = classify_legacy_failure_evidence(
-                        events,
-                        verified_records,
-                        replay_verified=replay_verified,
-                        corrupt_events_zero=not corrupt_event_digests,
-                        book_matches_replay=book_matches_replay,
-                    )
-                    evidence_by_digest = {failure["failure_digest"]: failure for failure in evidence}
-                    refused = []
-                    for digest in request.failure_digests:
-                        failure = evidence_by_digest.get(digest)
-                        if failure is None:
-                            refused.append((digest, "failure evidence is unavailable"))
-                        elif failure["classification"] != "resolvable":
-                            reason = failure["reason"] or "failure is not resolvable"
-                            if reason == "Local paper book does not match replay.":
-                                reason = self._legacy_failure_confirmation_book_reason(book_status) or reason
-                            refused.append((digest, reason))
-                    if refused:
-                        detail = "; ".join(f"{digest}: {reason}" for digest, reason in refused)
-                        raise ServiceError(422, f"Legacy failure confirmation refused: {detail}.", code="readiness-denied")
-
-                    decision = LegacyFailureReconciliationDecision.create(
-                        failure_digests=request.failure_digests,
-                        ledger_head=current_head,
-                        book_digest=book_digest,
-                        operator=request.operator,
-                        recorded_time=_utcnow().isoformat(),
-                        attestation=request.attestation,
+                with self._paper_audit_lane(normalized):
+                    verified_records = []
+                    directory, deployed, ledger, state, latest = self._paper_state(
+                        normalized,
+                        local_paper_only=True,
+                        on_verified=verified_records.append,
                     )
                     try:
-                        ledger.record_legacy_failure_reconciliation(decision)
+                        events, corrupt_event_digests, audit_history_bytes = ledger.recovery_events_with_unresolved_corruption_and_audit_bytes()
+                        current_audit_digest = hashlib.sha256(audit_history_bytes).hexdigest()
+                        current_head = latest.hash if latest is not None else None
+                        if corrupt_event_digests:
+                            if current_audit_digest != request.preview_audit_digest:
+                                raise ServiceError(
+                                    409,
+                                    "Paper state or audit history changed after legacy failure review.",
+                                    code="stale-preview",
+                                    current_head=current_head,
+                                )
+                            raise ServiceError(423, "Paper audit history is invalid (LedgerError).", code="replay-corrupt")
+                        unresolved = unresolved_tick_failures(events)
+                        unresolved_digests = [failure_digest(failure) for failure in unresolved]
+                        book_digest, book_matches_replay, book_status = self._legacy_failure_book_evidence(normalized, deployed, state)
+
+                        if current_head == request.preview_head and book_digest == request.preview_book_digest:
+                            previous = self._matching_legacy_failure_decision(
+                                events,
+                                request,
+                                unresolved_digests,
+                                audit_history_bytes,
+                            )
+                            if previous is not None:
+                                return {
+                                    "name": normalized,
+                                    "status": "already-resolved",
+                                    "decision_id": previous.decision_id,
+                                }
+                        if current_head != request.preview_head or book_digest != request.preview_book_digest or current_audit_digest != request.preview_audit_digest:
+                            raise ServiceError(
+                                409,
+                                "Paper state or audit history changed after legacy failure review.",
+                                code="stale-preview",
+                                current_head=current_head,
+                            )
+
+                        known_digests = {failure_digest(event) for event in events if event.get("kind") == "tick_failed"}
+                        unresolved_set = set(unresolved_digests)
+                        invalid_digests = []
+                        for digest in request.failure_digests:
+                            if digest not in known_digests:
+                                invalid_digests.append((digest, "unknown failure digest"))
+                            elif digest not in unresolved_set:
+                                invalid_digests.append((digest, "failure is already resolved"))
+                        if invalid_digests:
+                            detail = "; ".join(f"{digest}: {reason}" for digest, reason in invalid_digests)
+                            raise ServiceError(422, f"Legacy failure confirmation refused: {detail}.", code="readiness-denied")
+                        if request.failure_digests != unresolved_digests:
+                            raise ServiceError(
+                                409,
+                                "The unresolved failure set changed after legacy failure review.",
+                                code="stale-preview",
+                                current_head=current_head,
+                            )
+                        if book_status == "broker-book-mismatch":
+                            raise ServiceError(
+                                423,
+                                "The current local paper book does not match replay; legacy failure reconciliation is refused.",
+                                code="reconciliation-required",
+                            )
+
+                        replay_verified = state is not None and state.prev_hash == current_head
+                        evidence = classify_legacy_failure_evidence(
+                            events,
+                            verified_records,
+                            replay_verified=replay_verified,
+                            corrupt_events_zero=not corrupt_event_digests,
+                            book_matches_replay=book_matches_replay,
+                        )
+                        evidence_by_digest = {failure["failure_digest"]: failure for failure in evidence}
+                        refused = []
+                        required_attestations = set()
+                        for digest in request.failure_digests:
+                            failure = evidence_by_digest.get(digest)
+                            if failure is None:
+                                refused.append((digest, "failure evidence is unavailable"))
+                            elif failure["classification"] == "not_resolvable":
+                                reason = failure["reason"] or "failure is not resolvable"
+                                if reason == "Local paper book does not match replay.":
+                                    reason = self._legacy_failure_confirmation_book_reason(book_status) or reason
+                                refused.append((digest, reason))
+                            elif failure["classification"] == "attestable":
+                                required_attestations.add(digest)
+                        if refused:
+                            detail = "; ".join(f"{digest}: {reason}" for digest, reason in refused)
+                            raise ServiceError(422, f"Legacy failure confirmation refused: {detail}.", code="readiness-denied")
+                        if set(request.attested_failure_digests) != required_attestations:
+                            missing = sorted(required_attestations.difference(request.attested_failure_digests))
+                            extra = sorted(set(request.attested_failure_digests).difference(required_attestations))
+                            details = []
+                            if missing:
+                                details.append(f"missing attestations for {', '.join(missing)}")
+                            if extra:
+                                details.append(f"unneeded attestations for {', '.join(extra)}")
+                            raise ServiceError(
+                                422,
+                                f"Legacy failure confirmation requires exactly the attestable members: {'; '.join(details)}.",
+                                code="readiness-denied",
+                            )
+
+                        decision = LegacyFailureReconciliationDecision.create(
+                            failure_digests=request.failure_digests,
+                            ledger_head=current_head,
+                            book_digest=book_digest,
+                            audit_history_digest=request.preview_audit_digest,
+                            audit_history_length=len(audit_history_bytes),
+                            operator=request.operator,
+                            recorded_time=_utcnow().isoformat(),
+                            attested_failure_digests=request.attested_failure_digests,
+                        )
+                        try:
+                            ledger.record_legacy_failure_reconciliation(decision)
+                        except (LedgerError, OSError, ValueError):
+                            raise ServiceError(
+                                423,
+                                "Legacy failure decision outcome is uncertain; inspect paper state before retrying.",
+                                code="reconciliation-required",
+                            ) from None
+                    except PaperReconciliationRequired:
+                        raise ServiceError(423, "Paper work requires reconciliation before it can continue.", code="reconciliation-required") from None
+                    except ServiceError:
+                        raise
                     except (LedgerError, OSError, ValueError):
-                        raise ServiceError(
-                            423,
-                            "Legacy failure decision outcome is uncertain; inspect paper state before retrying.",
-                            code="reconciliation-required",
-                        ) from None
-                except PaperReconciliationRequired:
-                    raise ServiceError(423, "Paper work requires reconciliation before it can continue.", code="reconciliation-required") from None
-                except ServiceError:
-                    raise
-                except (LedgerError, OSError, ValueError):
-                    raise ServiceError(423, "Paper state is invalid (LedgerError).", code="replay-corrupt") from None
+                        raise ServiceError(423, "Paper state is invalid (LedgerError).", code="replay-corrupt") from None
         return {
             "name": normalized,
             "status": "reconciled",
             "decision_id": decision.decision_id,
         }
 
-    def _matching_legacy_failure_decision(self, events, request, unresolved_digests):
-        if unresolved_digests:
+    def _matching_legacy_failure_decision(self, events, request, unresolved_digests, audit_history_bytes):
+        if unresolved_digests or not events:
             return None
-        for index, event in enumerate(events):
-            if event.get("kind") != "legacy_failure_reconciliation":
-                continue
-            try:
-                decision = LegacyFailureReconciliationDecision.model_validate(event.get("decision"))
-            except (TypeError, ValueError):
-                continue
-            if decision.failure_digests == request.failure_digests and decision.ledger_head == request.preview_head and decision.book_digest == request.preview_book_digest and decision.operator == request.operator and decision.attestation == request.attestation and [failure_digest(failure) for failure in unresolved_tick_failures(events[:index])] == request.failure_digests:
-                return decision
-        return None
+        event = events[-1]
+        if event.get("kind") != "legacy_failure_reconciliation":
+            return None
+        try:
+            decision = LegacyFailureReconciliationDecision.model_validate(event.get("decision"))
+        except (TypeError, ValueError):
+            return None
+        if decision.schema_version != 2 or decision.audit_history_digest != request.preview_audit_digest or decision.audit_history_length is None:
+            return None
+        if decision.failure_digests != request.failure_digests or decision.ledger_head != request.preview_head or decision.book_digest != request.preview_book_digest or decision.operator != request.operator or decision.attested_failure_digests != request.attested_failure_digests or [failure_digest(failure) for failure in unresolved_tick_failures(events[:-1])] != request.failure_digests:
+            return None
+        prefix = audit_history_bytes[: decision.audit_history_length]
+        if hashlib.sha256(prefix).hexdigest() != decision.audit_history_digest:
+            return None
+        event_line = json.dumps(event, default=str).encode("utf-8") + b"\n"
+        suffix = audit_history_bytes[decision.audit_history_length :]
+        if suffix not in (event_line, b"\n" + event_line):
+            return None
+        return decision
 
     def _legacy_failure_book_evidence(self, name, deployed, state):
         from hedge_fund.brokers.paper import PaperBroker
@@ -1069,7 +1113,7 @@ class DeskService:
             return "No unresolved legacy failures require confirmation."
         if book_status in book_reasons:
             return book_reasons[book_status]
-        return next((failure["reason"] for failure in failures if failure["classification"] != "resolvable"), "Legacy failure set is not resolvable.")
+        return next((failure["reason"] for failure in failures if failure["classification"] == "not_resolvable"), "Legacy failure set is not resolvable.")
 
     @staticmethod
     def _legacy_failure_confirmation_book_reason(book_status):
@@ -4293,6 +4337,14 @@ class DeskService:
             except AdmissionError:
                 raise ServiceError(409, "Paper control admission is unavailable.") from None
             return
+
+    @contextmanager
+    def _paper_audit_lane(self, name: str) -> Iterator[None]:
+        try:
+            with self._admission.audit_lane(name, timeout=0.1):
+                yield
+        except AdmissionError:
+            raise ServiceError(409, "Paper audit admission is unavailable.", code="writer-conflict") from None
 
     @contextmanager
     def _paper_execution_lane(self, name: str) -> Iterator[None]:

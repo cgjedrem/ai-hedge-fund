@@ -50,9 +50,10 @@ def _legacy_failure_reconciliation_payload(fixture):
     return {
         "preview_head": decision.ledger_head,
         "preview_book_digest": decision.book_digest,
+        "preview_audit_digest": decision.audit_history_digest,
         "failure_digests": decision.failure_digests,
         "operator": "synthetic-operator",
-        "attestation": True,
+        "attested_failure_digests": decision.attested_failure_digests,
     }
 
 
@@ -645,9 +646,10 @@ def test_corrupt_replay_stays_distinct_from_reconciliation_required(write_client
         json={
             "preview_head": latest.hash,
             "preview_book_digest": "b" * 64,
+            "preview_audit_digest": "d" * 64,
             "failure_digests": ["c" * 64],
             "operator": "synthetic-operator",
-            "attestation": True,
+            "attested_failure_digests": [],
         },
     )
     after = {path: path.read_bytes() for path in directory.rglob("*") if path.is_file()}
@@ -692,6 +694,129 @@ def test_legacy_failure_confirm_restores_work_readiness(tmp_path):
         service._require_paper_work_ready(deployed, ledger, state)
         assert unresolved_tick_failures(ledger.events()) == []
         assert sum(event["kind"] == "legacy_failure_reconciliation" for event in ledger.events()) == 1
+
+
+def test_legacy_failure_confirm_requires_exact_attestable_members(tmp_path):
+    from hedge_fund.runtime.test_reconciliation import (
+        _legacy_failure_recovery_fixture,
+        _legacy_fixture_file_bytes,
+    )
+
+    fixture = _legacy_failure_recovery_fixture(tmp_path, pending_at_failure=True)
+    name = fixture["spec"].name
+    before = _legacy_fixture_file_bytes(fixture)
+
+    with TestClient(create_app(root=tmp_path, allow_writes=True), client=("127.0.0.1", 50000)) as client:
+        preview = client.get(f"/api/paper/{name}/reconciliation", headers={"host": "127.0.0.1"}).json()
+        failures = preview["failures"]
+        expected_attestations = [failure["failure_digest"] for failure in failures if failure["classification"] == "attestable"]
+        body = {
+            "preview_head": preview["preview_head"],
+            "preview_book_digest": preview["preview_book_digest"],
+            "preview_audit_digest": preview["preview_audit_digest"],
+            "failure_digests": [failure["failure_digest"] for failure in failures],
+            "operator": "synthetic-operator",
+            "attested_failure_digests": [],
+        }
+        missing = client.post(
+            f"/api/paper/{name}/reconcile-legacy-failures",
+            headers=_legacy_failure_write_headers(client),
+            json=body,
+        )
+        assert _legacy_fixture_file_bytes(fixture) == before
+        partial = client.post(
+            f"/api/paper/{name}/reconcile-legacy-failures",
+            headers=_legacy_failure_write_headers(client),
+            json={**body, "attested_failure_digests": expected_attestations[:-1]},
+        )
+        assert _legacy_fixture_file_bytes(fixture) == before
+        exact = client.post(
+            f"/api/paper/{name}/reconcile-legacy-failures",
+            headers=_legacy_failure_write_headers(client),
+            json={**body, "attested_failure_digests": expected_attestations},
+        )
+
+    assert preview["confirm_offered"] is True
+    assert expected_attestations == body["failure_digests"]
+    assert missing.status_code == 422
+    assert partial.status_code == 422
+    assert exact.status_code == 200
+    decision_event = next(event for event in fixture["ledger"].events() if event["kind"] == "legacy_failure_reconciliation")
+    decision = decision_event["decision"]
+    assert decision["attested_failure_digests"] == expected_attestations
+    after = _legacy_fixture_file_bytes(fixture)
+    event_path = f"paper/{name}/events.jsonl"
+    assert all(after[path] == value for path, value in before.items() if path != event_path)
+    assert after[event_path].startswith(before[event_path])
+
+
+def test_legacy_failure_confirm_stales_after_halt_audit_append(tmp_path):
+    from hedge_fund.runtime.test_reconciliation import (
+        _legacy_failure_recovery_fixture,
+        _legacy_fixture_file_bytes,
+    )
+
+    fixture = _legacy_failure_recovery_fixture(tmp_path)
+    name = fixture["spec"].name
+
+    with TestClient(create_app(root=tmp_path, allow_writes=True), client=("127.0.0.1", 50000)) as client:
+        headers = _legacy_failure_write_headers(client)
+        preview = client.get(f"/api/paper/{name}/reconciliation", headers={"host": "127.0.0.1"}).json()
+        body = {
+            "preview_head": preview["preview_head"],
+            "preview_book_digest": preview["preview_book_digest"],
+            "preview_audit_digest": preview["preview_audit_digest"],
+            "failure_digests": [failure["failure_digest"] for failure in preview["failures"]],
+            "operator": "synthetic-operator",
+            "attested_failure_digests": [],
+        }
+        client.app.state.service.halt_fund(name, "synthetic halt after preview", "legacy-halt-stale-001")
+        before_confirm = _legacy_fixture_file_bytes(fixture)
+        response = client.post(
+            f"/api/paper/{name}/reconcile-legacy-failures",
+            headers=headers,
+            json=body,
+        )
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "stale-preview"
+    assert _legacy_fixture_file_bytes(fixture) == before_confirm
+    assert not any(event["kind"] == "legacy_failure_reconciliation" for event in fixture["ledger"].events())
+
+
+def test_legacy_failure_confirm_holds_audit_lane_through_append(tmp_path, monkeypatch):
+    from hedge_fund.runtime.test_reconciliation import _legacy_failure_recovery_fixture
+
+    fixture = _legacy_failure_recovery_fixture(tmp_path)
+    name = fixture["spec"].name
+    original = Ledger.record_legacy_failure_reconciliation
+
+    with TestClient(create_app(root=tmp_path, allow_writes=True), client=("127.0.0.1", 50000)) as client:
+        service = client.app.state.service
+        preview = client.get(f"/api/paper/{name}/reconciliation", headers={"host": "127.0.0.1"}).json()
+        body = {
+            "preview_head": preview["preview_head"],
+            "preview_book_digest": preview["preview_book_digest"],
+            "preview_audit_digest": preview["preview_audit_digest"],
+            "failure_digests": [failure["failure_digest"] for failure in preview["failures"]],
+            "operator": "synthetic-operator",
+            "attested_failure_digests": [],
+        }
+        observed_lane = []
+
+        def verify_audit_lane(ledger, decision):
+            observed_lane.append(service._admission.lane_is_held("audit", name))
+            return original(ledger, decision)
+
+        monkeypatch.setattr(Ledger, "record_legacy_failure_reconciliation", verify_audit_lane)
+        response = client.post(
+            f"/api/paper/{name}/reconcile-legacy-failures",
+            headers=_legacy_failure_write_headers(client),
+            json=body,
+        )
+
+    assert response.status_code == 200
+    assert observed_lane == [True]
 
 
 def test_legacy_failure_confirm_is_append_only_and_idempotent(tmp_path):
@@ -746,6 +871,7 @@ def test_legacy_failure_confirm_rejects_corrupt_audit_without_writes(tmp_path):
     with RootContext.open(tmp_path) as root:
         with RootOwnerLease.acquire(root) as owner:
             _append_corrupt_legacy_audit_event(fixture, AdmissionCoordinator(root, owner_lease=owner))
+    body["preview_audit_digest"] = fixture["ledger"].audit_history_digest()
     before = _legacy_fixture_file_bytes(fixture)
 
     with TestClient(create_app(root=tmp_path, allow_writes=True), client=("127.0.0.1", 50000)) as client:
@@ -758,6 +884,46 @@ def test_legacy_failure_confirm_rejects_corrupt_audit_without_writes(tmp_path):
     assert response.status_code == 423
     assert response.json()["code"] == "replay-corrupt"
     assert _legacy_fixture_file_bytes(fixture) == before
+
+
+def test_legacy_failure_confirm_stales_after_corrupt_audit_append(tmp_path):
+    from hedge_fund.runtime.admission import AdmissionCoordinator, RootOwnerLease
+    from hedge_fund.runtime.root import RootContext
+    from hedge_fund.runtime.test_reconciliation import (
+        _append_corrupt_legacy_audit_event,
+        _legacy_failure_recovery_fixture,
+        _legacy_fixture_file_bytes,
+    )
+
+    fixture = _legacy_failure_recovery_fixture(tmp_path)
+    name = fixture["spec"].name
+
+    with TestClient(create_app(root=tmp_path, allow_writes=True), client=("127.0.0.1", 50000)) as client:
+        preview = client.get(f"/api/paper/{name}/reconciliation", headers={"host": "127.0.0.1"}).json()
+        body = {
+            "preview_head": preview["preview_head"],
+            "preview_book_digest": preview["preview_book_digest"],
+            "preview_audit_digest": preview["preview_audit_digest"],
+            "failure_digests": [failure["failure_digest"] for failure in preview["failures"]],
+            "operator": "synthetic-operator",
+            "attested_failure_digests": [failure["failure_digest"] for failure in preview["failures"] if failure["classification"] == "attestable"],
+        }
+
+    with RootContext.open(tmp_path) as root:
+        with RootOwnerLease.acquire(root) as owner:
+            _append_corrupt_legacy_audit_event(fixture, AdmissionCoordinator(root, owner_lease=owner))
+    before_confirm = _legacy_fixture_file_bytes(fixture)
+
+    with TestClient(create_app(root=tmp_path, allow_writes=True), client=("127.0.0.1", 50000)) as client:
+        response = client.post(
+            f"/api/paper/{name}/reconcile-legacy-failures",
+            headers=_legacy_failure_write_headers(client),
+            json=body,
+        )
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "stale-preview"
+    assert _legacy_fixture_file_bytes(fixture) == before_confirm
 
 
 def test_legacy_failure_confirm_rejects_book_mismatch_without_writes(tmp_path):
@@ -832,7 +998,7 @@ def test_legacy_failure_confirm_reports_distinct_book_status_reason(tmp_path, mo
     assert _legacy_fixture_file_bytes(fixture) == before
 
 
-def test_legacy_failure_confirm_rejects_post_effect_set_without_writes(tmp_path):
+def test_legacy_failure_confirm_records_post_effect_set_with_exact_attestations(tmp_path):
     from hedge_fund.runtime.test_reconciliation import (
         _legacy_failure_recovery_fixture,
         _legacy_fixture_file_bytes,
@@ -851,10 +1017,58 @@ def test_legacy_failure_confirm_rejects_post_effect_set_without_writes(tmp_path)
         )
 
     effect_digest = body["failure_digests"][1]
+    assert response.status_code == 200
+    assert response.json()["status"] == "reconciled"
+    decision_event = next(event for event in fixture["ledger"].events() if event["kind"] == "legacy_failure_reconciliation")
+    assert effect_digest in decision_event["decision"]["attested_failure_digests"]
+    after = _legacy_fixture_file_bytes(fixture)
+    event_path = f"paper/{name}/events.jsonl"
+    assert all(after[path] == value for path, value in before.items() if path != event_path)
+    assert after[event_path].startswith(before[event_path])
+
+
+def test_legacy_failure_confirm_rejects_not_resolvable_set_without_writes(tmp_path):
+    from hedge_fund.runtime.admission import AdmissionCoordinator, RootOwnerLease
+    from hedge_fund.runtime.root import RootContext
+    from hedge_fund.runtime.test_reconciliation import (
+        _legacy_failure_recovery_fixture,
+        _legacy_fixture_file_bytes,
+    )
+
+    fixture = _legacy_failure_recovery_fixture(tmp_path, failure_count=1)
+    name = fixture["spec"].name
+    with RootContext.open(tmp_path) as root:
+        with RootOwnerLease.acquire(root) as owner:
+            admission = AdmissionCoordinator(root, owner_lease=owner)
+            with admission.manual_session(name, timeout=0):
+                fixture["ledger"].log_event(
+                    "tick_failed",
+                    session=fixture["failures"][0]["session"],
+                    error="late legacy failure with old session label",
+                    expected_head=fixture["base_record"].hash,
+                )
+
+    before = _legacy_fixture_file_bytes(fixture)
+    with TestClient(create_app(root=tmp_path, allow_writes=True), client=("127.0.0.1", 50000)) as client:
+        preview = client.get(f"/api/paper/{name}/reconciliation", headers={"host": "127.0.0.1"}).json()
+        assert preview["confirm_offered"] is False
+        body = {
+            "preview_head": preview["preview_head"],
+            "preview_book_digest": preview["preview_book_digest"],
+            "preview_audit_digest": preview["preview_audit_digest"],
+            "failure_digests": [failure["failure_digest"] for failure in preview["failures"]],
+            "operator": "synthetic-operator",
+            "attested_failure_digests": [failure["failure_digest"] for failure in preview["failures"] if failure["classification"] == "attestable"],
+        }
+        response = client.post(
+            f"/api/paper/{name}/reconcile-legacy-failures",
+            headers=_legacy_failure_write_headers(client),
+            json=body,
+        )
+
     assert response.status_code == 422
     assert response.json()["code"] == "readiness-denied"
-    assert effect_digest in response.json()["detail"]
-    assert "Post-effect metadata is present" in response.json()["detail"]
+    assert any(failure["classification"] == "not_resolvable" for failure in preview["failures"])
     assert _legacy_fixture_file_bytes(fixture) == before
 
 
@@ -1012,7 +1226,7 @@ def test_legacy_failure_confirm_retry_deduplicates_after_append_interruption(tmp
     assert unresolved_tick_failures(fixture["ledger"].events()) == []
 
 
-def test_legacy_failure_request_requires_true_attestation_and_unique_digests():
+def test_legacy_failure_request_requires_audit_digest_and_unique_failure_attestations():
     from pydantic import ValidationError
 
     from hedge_fund.web.schemas import LegacyFailureReconciliationRequest
@@ -1020,15 +1234,16 @@ def test_legacy_failure_request_requires_true_attestation_and_unique_digests():
     request = {
         "preview_head": "a" * 64,
         "preview_book_digest": "b" * 64,
+        "preview_audit_digest": "d" * 64,
         "failure_digests": ["c" * 64],
         "operator": "synthetic-operator",
-        "attestation": True,
+        "attested_failure_digests": [],
     }
 
-    assert LegacyFailureReconciliationRequest.model_validate(request).attestation is True
+    assert LegacyFailureReconciliationRequest.model_validate(request).attested_failure_digests == []
     with pytest.raises(ValidationError):
-        LegacyFailureReconciliationRequest.model_validate({**request, "attestation": False})
+        LegacyFailureReconciliationRequest.model_validate({**request, "preview_audit_digest": "bad"})
     with pytest.raises(ValidationError):
-        LegacyFailureReconciliationRequest.model_validate({**request, "attestation": "true"})
+        LegacyFailureReconciliationRequest.model_validate({**request, "attested_failure_digests": ["e" * 64] * 2})
     with pytest.raises(ValidationError):
         LegacyFailureReconciliationRequest.model_validate({**request, "failure_digests": ["c" * 64] * 2})

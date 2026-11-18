@@ -12,23 +12,23 @@ All findings below trace to the discovery-phase read-only code analysis at basel
 
 ## Decision 2: Evidence classification standard (the core safety rule)
 
-- **Decision**: A failure is classified **resolvable** only when ALL hold at preview time:
-  1. Full replay verifies; zero corrupt audit events; broker-book digest matches replay (`web/services.py:4126-4167` already computes these).
-  2. The failure's position in the event stream is an ancestor of the current verified head, and at least one later session for the fund verified in the same replay (chain continuity across the failure).
-  3. The event carries no fields indicating post-effect state (no transmitted fills, no post-effect metadata; cf. `tick.py:525-543` fields when present).
-  4. The operator records an explicit attestation in the decision, accepting the residual uncertainty the durable record cannot exclude.
-  Otherwise: **not resolvable**, with the specific failing check reported.
-- **Rationale**: Discovery established that legacy error text alone cannot prove no effects: a news `DataClientError` proves the ledger append did not complete *at that point* but not that no broker order or approval consumption preceded it (`pipeline/session.py:197-240` executes orders before assessment; `tick.py:810-855,983-1008` approval consumption can cross the effect boundary before `advance()`; `ledger.py:586-605` "session already recorded" is raised after `advance()`). Checks 1–3 are the strongest durable-evidence screen the existing records support; check 4 makes the unavoidable residual an explicit, audited operator decision rather than a silent system assumption.
+- **Decision**: Use a three-way per-failure classification:
+  - **`verified`**: every structural check passes; replay at `expected_head` shows no pending decision; no post-effect fields or post-advance failure shape contradict no-effect proof. No operator attestation required.
+  - **`attestable`**: every structural check passes, but positive no-effect proof is unavailable. Examples: a pending decision existed at `expected_head`, effect metadata exists, or the failure has a session-already-recorded append shape. Confirm requires explicit attestation for this digest.
+  - **`not_resolvable`**: any structural check fails (full replay, corruption, book match, or stream continuity). A set containing one is refused with zero writes.
+- **Verified code facts**: Session records rebuild `FundState` through replay (`paper/ledger.py:4-5`). Orders execute only when `state.pending is not None`; assessment follows execution (`pipeline/session.py:198-206`). Therefore a verified expected head with no pending decision proves no orders could execute. Conversely, `LedgerError` for "session already recorded" occurs at append after `advance()` returned (`paper/ledger.py:599`), so that failure shape is attestable, never verified. Legacy `tick_failed` events persist session/error/expected-head and optional operation context, not in-memory `effect_state` (`paper/tick.py:983-1008`).
+- **Continuity rule**: Anchor the failure at its index in the verified audit-event stream. Require a later successful `tick` event after that index to match a verified successor record in the expected-head chain. Session labels alone do not prove ordering. Preserve complete naive session keys: minute `YYYY-MM-DDTHH:MM:SS`, other cadences `YYYY-MM-DD` (`pipeline/session.py:154-156`).
+- **Rationale**: Error text alone cannot prove no effects: execution may precede assessment (`pipeline/session.py:198-240`), while a session-already-recorded append error is post-advance. The no-pending discriminator provides positive proof only at the expected head; legacy post-advance uncertainty requires an explicit per-failure operator decision.
 - **Alternatives considered**: (a) Exception-type allowlist (DataClientError = no effects) — rejected explicitly by the user directive and by the discovery trace. (b) Require positive pre-effect metadata — rejected as sole rule: legacy events predate effect classification (`9c1f5b8`, merged `b6aefe5` 2026-11-09), so nothing would ever be resolvable and the feature would be dead on arrival. (c) Latest-mutable-bytes-as-proof — rejected per user directive; the verified hash chain, not mutable bytes, is the evidence.
 
 ## Decision 3: Preview/confirm binding and staleness
 
-- **Decision**: Preview computes and returns the classification set plus the ledger head and book digest it was computed against; confirm must present the same head + digest + failure set and re-verify before writing. Any drift → stale refusal, zero writes (FR-006).
-- **Rationale**: Receipts already bind failure digest + head + book + operator (`reconciliation.py:109-185,371-405`); the decision record extends the same binding discipline to the set case. Preview-then-confirm against a moved head is the classic TOCTOU hole.
+- **Decision**: Preview returns SHA-256 of exact `events.jsonl` bytes alongside the head, book digest, and classifications. Confirm presents that digest and rechecks it while holding control and audit lanes through the append. Any audit append, including Halt, invalidates the preview; drift → 409 stale-preview, zero writes. Decision schema v2 stores the preview digest and byte length.
+- **Rationale**: Control lane alone does not exclude Halt audit writes. The audit lane closes the preview-confirm-append race; an exact byte digest covers any appended audit event, not only session or failure events.
 
 ## Decision 4: Idempotency and crash safety
 
-- **Decision**: The decision record is written through the existing anchored audit append boundary (`ledger.py:2200-2254`, `runtime/root.py:1984-2027`) with the decision's identity derived from its content (failure-set digest + head + book + recorded time). Replay dedups identical decisions; a second confirm over an already-resolved set is an explicit already-resolved refusal, not a second effect.
+- **Decision**: The decision record is written through the existing anchored audit append boundary (`ledger.py:2200-2254`, `runtime/root.py:1984-2027`) with identity derived from the failure set, head, book, pre-append audit digest/length, operator, attestations, and recorded time. Replay keeps schema-v1 decisions valid and applies schema-v2 records. An identical retry is already-resolved only when the matching decision is the sole append since its bound preview revision.
 - **Rationale**: Matches existing receipt/replay dedup philosophy (`reconciliation.py:365-405` whole-event digest identity collapses duplicates) and the anchored-append discipline.
 
 ## Decision 5: Surface and lanes

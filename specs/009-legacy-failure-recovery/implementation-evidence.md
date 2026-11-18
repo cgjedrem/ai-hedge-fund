@@ -300,9 +300,9 @@
 
 | Scenario | Status | Evidence |
 |---|---|---|
-| A — multiple unkeyed failures, confirm, replay byte identity | PASS | QA cycle-1 verification: Scenario A selection, `3 passed`; final recovery batch, `46 passed` |
-| B — ambiguity, corruption, mismatch, stale preview, contention refusals | PASS | QA cycle-1 verification: corrupt-audit regression and refusal/replay tests, `46 passed`; frontend `paper.test.tsx`, `35 passed` |
-| C — durable append interruption and retry | PASS | QA cycle-1 verification: retry selection, `1 passed`; included in final recovery batch, `46 passed` |
+| A — multiple unkeyed failures, confirm, replay byte identity | INCONCLUSIVE | Prior PASS runs predate findings 1–4; no run on current source because active pytest processes blocked the required gate |
+| B — ambiguity, corruption, mismatch, stale preview, contention refusals | INCONCLUSIVE | Prior PASS runs predate findings 1–4; no run on current source because active pytest processes blocked the required gate |
+| C — durable append interruption and retry | INCONCLUSIVE | Prior PASS runs predate findings 1–4; no run on current source because active pytest processes blocked the required gate |
 | D — full suite and baseline comparison | BLOCKED | T024 is coordinator-managed and was not run here; isolated diagnostic tests do not replace the full-suite gate |
 
 ### Coordinator revision-binding closure (QA cycle-1 re-review)
@@ -327,3 +327,29 @@
 - Tests/builds: no pytest, frontend unit test, TypeScript check, or frontend build was started. This includes the requested Scenario B rerun and both `test_paper_operations.py` residual tests. No failing-first regression was added because the required policy change is blocked.
 - Findings 2–4: not implemented or revalidated; work stopped at finding 1 as directed. Existing acceptance rows above remain unchanged; no Scenario A–D row was rerun in this cycle.
 - Provenance: code/spec static inspection only. No provider, LLM, broker, paid-credit, or production-root access.
+
+### QA rework cycle 2 — Copilot findings 1–4
+
+- Result: **INCONCLUSIVE** for runtime acceptance. Findings 1–4 and requested regressions are implemented; no pytest, frontend unit test, TypeScript check, or build ran on this source. This entry supersedes the earlier finding-1 stop; Scenario A–C rows above are invalidated until rerun. Scenario D remains coordinator-owned and **BLOCKED**.
+- Recorded: process gate `2026-11-18T14:58:47.2102369+01:00`; final static checks `2026-11-18T15:07:08.7395200+01:00`–`2026-11-18T15:07:30.0905603+01:00`.
+- Source: starting `HEAD` `11ea2f8023b1950f24d167ae25865a8a25790212`; implementation diff SHA-256 `aa7bc8674fe2fc1eccaf14e540cfb4efcbbea1c9e594b7d9423188c30f0ac1da` (`137304` bytes), over all 14 modified paths except this evidence file. It includes Python, frontend, spec, and memory edits; final commit revision binds this evidence entry.
+- Environment/artifact: Windows NT `10.0.26200.0`; Python `3.11.15`; Poetry `2.5.1`; working-tree source only. No wheel, frontend bundle, or runtime artifact was built.
+- Process blocker: exact command `Get-CimInstance Win32_Process -Filter "Name like 'python%' or Name like 'pytest%'" | Where-Object { $_.CommandLine -match 'pytest' }` found five active processes: PIDs `17824`, `23672`, `8668`, `12496`, and `25096`, each running `poetry run pytest hedge_fund -q --tb=line` or its pytest child. No process was stopped; no pytest command was started.
+- Implemented:
+  - `verified` requires passing structural checks and replay at `expected_head` with no pending decision; `attestable` covers structural-but-ambiguous evidence and requires exact per-failure attestation; any `not_resolvable` member blocks the set.
+  - Continuity uses the failure event's stream index, requires a later successful tick tied to a verified successor, and uses the latest occurrence for duplicate identical failure digests. Session ordering preserves naive intraday time.
+  - Preview/confirm/decision bind SHA-256 of exact audit-history bytes. Confirm holds the audit lane through digest recheck and append; any append, including Halt, stales the preview.
+  - Regression tests cover pending-at-head, no-pending verified, missing pending-state evidence, invalid event shapes, post-effect and session-already-recorded attestable cases, late stream-position failures (including duplicate identity), intraday minute ordering, stale Halt/corrupt-event appends, exact attestations, and audit-lane ownership.
+- Tests/builds not started under the active-process gate; exit code **N/A**:
+  - `poetry run pytest hedge_fund/runtime/test_reconciliation.py hedge_fund/web/test_recovery.py hedge_fund/web/test_services.py -q`
+  - `poetry run pytest hedge_fund/web/test_services.py::test_paper_reconciliation_blocks_post_effect_failure_set -q`
+  - `poetry run pytest hedge_fund/web/test_paper_operations.py::test_corruption_receipt_does_not_resolve_later_identical_line hedge_fund/web/test_paper_operations.py::test_reconciled_corruption_allows_resume_after_manual_halt -q`
+  - `Set-Location frontend; npm test`
+  - `Set-Location frontend; npm run build`
+  - T024 full suite was not run; coordinator-owned.
+- Static checks on the final Python source:
+  - `poetry run black --check --line-length 420 hedge_fund/runtime/reconciliation.py hedge_fund/runtime/test_reconciliation.py hedge_fund/paper/ledger.py hedge_fund/web/schemas.py hedge_fund/web/services.py hedge_fund/web/test_services.py hedge_fund/web/test_recovery.py` — 7 files unchanged, exit `0`; `15:07:08.7395200+01:00`–`15:07:14.8341961+01:00`.
+  - `poetry run isort --check-only --profile black hedge_fund/runtime/reconciliation.py hedge_fund/runtime/test_reconciliation.py hedge_fund/paper/ledger.py hedge_fund/web/schemas.py hedge_fund/web/services.py hedge_fund/web/test_services.py hedge_fund/web/test_recovery.py` — no findings, exit `0`; `15:07:14.8341961+01:00`–`15:07:20.3628618+01:00`.
+  - `poetry run flake8 --max-line-length=420 --extend-ignore=E203 hedge_fund/runtime/reconciliation.py hedge_fund/runtime/test_reconciliation.py hedge_fund/paper/ledger.py hedge_fund/web/schemas.py hedge_fund/web/services.py hedge_fund/web/test_services.py hedge_fund/web/test_recovery.py` — no findings, exit `0`; `15:07:20.3628618+01:00`–`15:07:29.9620316+01:00`.
+  - `git diff --check` — no whitespace findings, exit `0`; `15:07:29.9620316+01:00`–`15:07:30.0905603+01:00`. Git emitted LF-to-CRLF normalization warnings for `memory.md` and this evidence file.
+- Provenance: static review and style tools only. Tests and frontend build remain unexecuted; no provider, LLM, broker, paid-credit, or production-root access.

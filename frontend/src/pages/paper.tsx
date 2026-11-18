@@ -154,13 +154,20 @@ interface LegacyFailureEvidenceChecks {
   no_post_effect_fields: boolean;
 }
 
+interface LegacyFailureEffectEvidence {
+  pending_decision_at_head: boolean | null;
+  post_advance_failure_shape: boolean;
+  post_effect_fields_present: boolean;
+}
+
 interface LegacyFailureEvidence {
   failure_digest: string;
   time: string | null;
   error_summary: string;
   has_request_id: boolean;
-  classification: "resolvable" | "not_resolvable";
+  classification: "verified" | "attestable" | "not_resolvable";
   checks: LegacyFailureEvidenceChecks;
+  effect_evidence: LegacyFailureEffectEvidence;
   reason: string | null;
 }
 
@@ -168,6 +175,7 @@ type PaperReconciliationWithLegacyFailures = PaperReconciliation & {
   failures?: LegacyFailureEvidence[];
   preview_head?: string | null;
   preview_book_digest?: string | null;
+  preview_audit_digest?: string | null;
   confirm_offered?: boolean;
   set_reason?: string | null;
 };
@@ -206,7 +214,7 @@ export function PaperDetailPage() {
   const [intentRecoveryOpen, setIntentRecoveryOpen] = useState(false);
   const [legacyRecoveryOpen, setLegacyRecoveryOpen] = useState(false);
   const [legacyOperator, setLegacyOperator] = useState("");
-  const [legacyAttestation, setLegacyAttestation] = useState(false);
+  const [legacyAttestationDigests, setLegacyAttestationDigests] = useState<string[]>([]);
   const [haltDialogOpen, setHaltDialogOpen] = useState(false);
   const [haltReason, setHaltReason] = useState("");
   const [busy, setBusy] = useState(false);
@@ -237,6 +245,12 @@ export function PaperDetailPage() {
   const data = resource.data;
   const recovery = reconciliationResource.data?.name === name ? reconciliationResource.data : null;
   const legacyFailures = recovery?.failures ?? [];
+  const legacyAttestableDigests = legacyFailures
+    .filter((failure) => failure.classification === "attestable")
+    .map((failure) => failure.failure_digest);
+  const selectedLegacyAttestations = new Set(legacyAttestationDigests);
+  const legacyAttestationsComplete = selectedLegacyAttestations.size === legacyAttestableDigests.length
+    && legacyAttestableDigests.every((digest) => selectedLegacyAttestations.has(digest));
   const writeUnavailable = capabilities?.write_unavailable_reason != null;
   const enrollmentState = capabilities?.enrollment_state ?? "unenrolled";
   const runner = runnerResource.data ?? data?.runner;
@@ -490,14 +504,18 @@ export function PaperDetailPage() {
     const preview = recovery;
     const operator = legacyOperator.trim();
     const failureDigests = preview?.failures?.map((failure) => failure.failure_digest) ?? [];
+    const attestedFailureDigests = preview?.failures
+      ?.filter((failure) => failure.classification === "attestable")
+      .map((failure) => failure.failure_digest) ?? [];
     if (
       !canWritePaper
       || !preview?.confirm_offered
       || !preview.preview_head
       || !preview.preview_book_digest
+      || !preview.preview_audit_digest
       || failureDigests.length === 0
       || !operator
-      || !legacyAttestation
+      || !legacyAttestationsComplete
     ) {
       setFeedback({ tone: "danger", message: "Legacy failure confirmation is unavailable. Review a current eligible preview before confirming." });
       reconciliationResource.refresh();
@@ -510,13 +528,14 @@ export function PaperDetailPage() {
       const result = await apiPost<{ status: "reconciled" | "already-resolved" }>(`/api/paper/${encodeURIComponent(name)}/reconcile-legacy-failures`, {
         preview_head: preview.preview_head,
         preview_book_digest: preview.preview_book_digest,
+        preview_audit_digest: preview.preview_audit_digest,
         failure_digests: failureDigests,
         operator,
-        attestation: true,
+        attested_failure_digests: attestedFailureDigests,
       });
       setLegacyRecoveryOpen(false);
       setLegacyOperator("");
-      setLegacyAttestation(false);
+      setLegacyAttestationDigests([]);
       setFeedback({
         tone: "neutral",
         message: result.status === "already-resolved"
@@ -527,7 +546,7 @@ export function PaperDetailPage() {
     } catch (cause) {
       fail(cause, "Legacy failure reconciliation failed.");
       setLegacyRecoveryOpen(false);
-      setLegacyAttestation(false);
+      setLegacyAttestationDigests([]);
       resource.refresh();
       reconciliationResource.refresh();
     } finally {
@@ -842,19 +861,20 @@ export function PaperDetailPage() {
                         <div>
                           <p className="font-medium">Legacy failure evidence</p>
                           <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
-                            Review every unresolved failure. Confirmation binds the full set to the previewed ledger head and local paper book.
+                            Review each failure. Attestable entries need individual acknowledgment; any audit append, including Halt, invalidates this preview.
                           </p>
                         </div>
                         <div className="grid gap-2 text-xs">
                           <p className="break-all">Preview ledger head: <span className="mono">{recovery.preview_head ?? "unavailable"}</span></p>
                           <p className="break-all">Preview book digest: <span className="mono">{recovery.preview_book_digest ?? "unavailable"}</span></p>
+                          <p className="break-all">Preview audit digest: <span className="mono">{recovery.preview_audit_digest ?? "unavailable"}</span></p>
                         </div>
                         <ul className="space-y-2">
                           {legacyFailures.map((failure) => (
                             <li key={failure.failure_digest} className="space-y-3 rounded-lg border border-border bg-black/10 p-3" data-testid="legacy-failure">
                               <div className="flex flex-wrap items-center justify-between gap-2">
-                                <Badge variant={failure.classification === "resolvable" ? "positive" : "negative"}>
-                                  {failure.classification === "resolvable" ? "Resolvable" : "Not resolvable"}
+                                <Badge variant={failure.classification === "verified" ? "positive" : failure.classification === "attestable" ? "warning" : "negative"}>
+                                  {failure.classification === "verified" ? "Verified — no effect proven" : failure.classification === "attestable" ? "Attestation required" : "Not resolvable"}
                                 </Badge>
                                 <span className="text-[10px] text-muted-foreground">{failure.has_request_id ? "Request ID recorded" : "Unkeyed legacy failure"}</span>
                               </div>
@@ -874,25 +894,50 @@ export function PaperDetailPage() {
                                   ))}
                                 </ul>
                               </div>
+                              <div className="space-y-1 text-[10px]">
+                                <p>Pending decision at expected head: <span>{failure.effect_evidence.pending_decision_at_head === null ? "unknown" : failure.effect_evidence.pending_decision_at_head ? "yes" : "no"}</span></p>
+                                <p>Post-advance failure shape: <span>{failure.effect_evidence.post_advance_failure_shape ? "present" : "absent"}</span></p>
+                                <p>Post-effect fields: <span>{failure.effect_evidence.post_effect_fields_present ? "present" : "absent"}</span></p>
+                              </div>
                               <p className="text-xs leading-relaxed">
-                                Reason: <span>{failure.reason ?? (failure.classification === "resolvable" ? "All durable evidence checks passed." : "Evidence gap unavailable.")}</span>
+                                Reason: <span>{failure.reason ?? (failure.classification === "verified" ? "Replay at expected head found no pending decision; no orders could execute." : "Evidence gap unavailable.")}</span>
                               </p>
+                              {failure.classification === "attestable" ? (
+                                <div className="flex items-start gap-2 border-t border-border pt-3">
+                                  <input
+                                    id={`legacy-attest-${failure.failure_digest}`}
+                                    type="checkbox"
+                                    className="mt-0.5"
+                                    checked={selectedLegacyAttestations.has(failure.failure_digest)}
+                                    onChange={(event) => {
+                                      const checked = event.target.checked;
+                                      setLegacyAttestationDigests((current) => checked
+                                        ? [...new Set([...current, failure.failure_digest])]
+                                        : current.filter((digest) => digest !== failure.failure_digest));
+                                    }}
+                                    disabled={busy || !recovery.confirm_offered}
+                                  />
+                                  <Label htmlFor={`legacy-attest-${failure.failure_digest}`} className="leading-relaxed">
+                                    I attest to this failure's unresolved effect uncertainty.
+                                  </Label>
+                                </div>
+                              ) : null}
                             </li>
                           ))}
                         </ul>
                         {recovery.set_reason ? <Alert tone="danger">{recovery.set_reason}</Alert> : null}
                         {recovery.confirm_offered ? (
                           <Alert tone="warning">
-                            One audited decision will resolve this entire failure set. It will not rewrite historical records, clear Halt or tick intents, retry a tick, or create broker effects.
+                            One audited decision will resolve this entire failure set. Attestable failures require explicit per-failure acknowledgment. It will not rewrite history, clear Halt or tick intents, retry a tick, or create broker effects.
                           </Alert>
                         ) : null}
                         <Button
                           onClick={() => {
                             setLegacyOperator("");
-                            setLegacyAttestation(false);
+                            setLegacyAttestationDigests([]);
                             setLegacyRecoveryOpen(true);
                           }}
-                          disabled={!recovery.confirm_offered || !canWritePaper || busy || !recovery.preview_head || !recovery.preview_book_digest}
+                          disabled={!recovery.confirm_offered || !canWritePaper || busy || !recovery.preview_head || !recovery.preview_book_digest || !recovery.preview_audit_digest}
                         >
                           Confirm legacy failure reconciliation
                         </Button>
@@ -1301,24 +1346,27 @@ export function PaperDetailPage() {
         open={legacyRecoveryOpen}
         onOpenChange={(open) => {
           setLegacyRecoveryOpen(open);
-          if (!open) setLegacyAttestation(false);
+          if (!open) setLegacyAttestationDigests([]);
         }}
       >
         <DialogContent>
           <DialogHeader>
             <DialogTitle>Confirm legacy failure reconciliation</DialogTitle>
             <DialogDescription>
-              The server rechecks this entire failure set, ledger head, and local book before appending one decision. No historical records are rewritten and no tick is retried.
+              The server rechecks this entire failure set, ledger head, local book, and audit history before appending one decision. Any audit append, including Halt, makes this preview stale.
             </DialogDescription>
           </DialogHeader>
           {recovery?.confirm_offered ? (
             <div className="space-y-2 rounded-lg border border-border bg-black/10 p-3 text-xs">
               <p className="break-all">Ledger head: <span className="mono">{recovery.preview_head}</span></p>
               <p className="break-all">Local book digest: <span className="mono">{recovery.preview_book_digest}</span></p>
+              <p className="break-all">Audit history digest: <span className="mono">{recovery.preview_audit_digest}</span></p>
               <p>Failures covered: <span className="mono">{legacyFailures.length}</span></p>
               <ul className="max-h-28 space-y-1 overflow-y-auto">
                 {legacyFailures.map((failure) => (
-                  <li key={failure.failure_digest} className="break-all mono">{failure.failure_digest}</li>
+                  <li key={failure.failure_digest} className="break-all mono">
+                    {failure.classification}: {failure.failure_digest}
+                  </li>
                 ))}
               </ul>
             </div>
@@ -1336,19 +1384,9 @@ export function PaperDetailPage() {
               disabled={busy}
             />
           </div>
-          <div className="flex items-start gap-2">
-            <input
-              id="legacy-failure-attestation"
-              type="checkbox"
-              className="mt-0.5"
-              checked={legacyAttestation}
-              onChange={(event) => setLegacyAttestation(event.target.checked)}
-              disabled={busy || !recovery?.confirm_offered}
-            />
-            <Label htmlFor="legacy-failure-attestation" className="leading-relaxed">
-              I reviewed every listed failure and accept that durable evidence cannot exclude every historical effect.
-            </Label>
-          </div>
+          <p className="text-xs leading-relaxed text-muted-foreground">
+            Verified failures need no attestation. Each attestable failure must be acknowledged in its evidence row.
+          </p>
           <DialogFooter>
             <Button variant="ghost" onClick={() => setLegacyRecoveryOpen(false)} disabled={busy}>Cancel</Button>
             <Button
@@ -1359,9 +1397,10 @@ export function PaperDetailPage() {
                 || !recovery?.confirm_offered
                 || !recovery.preview_head
                 || !recovery.preview_book_digest
+                || !recovery.preview_audit_digest
                 || legacyFailures.length === 0
                 || !legacyOperator.trim()
-                || !legacyAttestation
+                || !legacyAttestationsComplete
               }
             >
               {busy ? "Recording…" : "Record legacy failure reconciliation"}

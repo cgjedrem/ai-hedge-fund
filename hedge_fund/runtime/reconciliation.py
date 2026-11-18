@@ -10,7 +10,14 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator, StrictBool
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    model_validator,
+    StrictBool,
+    StrictInt,
+)
 
 _REQUEST_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _HEX_ID = re.compile(r"^[a-f0-9]{32}$")
@@ -203,14 +210,17 @@ class ReconciliationReceipt(BaseModel):
 class LegacyFailureReconciliationDecision(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, revalidate_instances="always")
 
-    schema_version: Literal[1] = 1
+    schema_version: Literal[1, 2] = 1
     decision_id: str = Field(pattern=_SHA256.pattern)
     failure_digests: list[str] = Field(min_length=1)
     ledger_head: str = Field(pattern=_SHA256.pattern)
     book_digest: str = Field(pattern=_SHA256.pattern)
+    audit_history_digest: str | None = Field(default=None, pattern=_SHA256.pattern)
+    audit_history_length: StrictInt | None = Field(default=None, ge=0)
     operator: str = Field(min_length=1, max_length=180)
     recorded_time: str
-    attestation: StrictBool
+    attested_failure_digests: list[str] | None = None
+    attestation: StrictBool | None = Field(default=None, exclude=True)
 
     @model_validator(mode="after")
     def _validate_decision(self) -> LegacyFailureReconciliationDecision:
@@ -221,8 +231,18 @@ class LegacyFailureReconciliationDecision(BaseModel):
         if self.operator != self.operator.strip() or any(ord(char) < 32 or ord(char) == 127 for char in self.operator):
             raise ValueError("operator identity is invalid")
         _parse_aware_timestamp(self.recorded_time, "recorded_time")
-        if self.attestation is not True:
-            raise ValueError("operator attestation is required")
+        if self.schema_version == 1:
+            if self.attestation is not True or self.audit_history_digest is not None or self.audit_history_length is not None or self.attested_failure_digests is not None:
+                raise ValueError("legacy reconciliation decision fields are invalid")
+        else:
+            if self.attestation is not None or self.audit_history_digest is None or self.audit_history_length is None or self.attested_failure_digests is None:
+                raise ValueError("audit revision and per-failure attestations are required")
+            if any(_SHA256.fullmatch(digest) is None for digest in self.attested_failure_digests):
+                raise ValueError("attested failure digests must be SHA-256 identities")
+            if len(set(self.attested_failure_digests)) != len(self.attested_failure_digests):
+                raise ValueError("attested failure digests must be unique")
+            if not set(self.attested_failure_digests).issubset(self.failure_digests):
+                raise ValueError("attested failures must belong to the reconciled set")
         if self.decision_id != self.compute_decision_id():
             raise ValueError("decision_id does not match the decision contents")
         return self
@@ -234,24 +254,44 @@ class LegacyFailureReconciliationDecision(BaseModel):
         failure_digests: list[str],
         ledger_head: str,
         book_digest: str,
+        audit_history_digest: str,
+        audit_history_length: int,
         operator: str,
         recorded_time: str,
-        attestation: bool,
+        attested_failure_digests: list[str],
     ) -> LegacyFailureReconciliationDecision:
         payload = {
-            "schema_version": 1,
+            "schema_version": 2,
             "failure_digests": failure_digests,
             "ledger_head": ledger_head,
             "book_digest": book_digest,
+            "audit_history_digest": audit_history_digest,
+            "audit_history_length": audit_history_length,
             "operator": operator,
             "recorded_time": recorded_time,
-            "attestation": attestation,
+            "attested_failure_digests": attested_failure_digests,
         }
         payload["decision_id"] = _receipt_digest(payload)
         return cls.model_validate(payload)
 
     def compute_decision_id(self) -> str:
-        return _receipt_digest(self.model_dump(mode="json", exclude={"decision_id"}))
+        payload = {
+            "schema_version": self.schema_version,
+            "failure_digests": self.failure_digests,
+            "ledger_head": self.ledger_head,
+            "book_digest": self.book_digest,
+            "operator": self.operator,
+            "recorded_time": self.recorded_time,
+        }
+        if self.schema_version == 1:
+            payload["attestation"] = self.attestation
+        else:
+            payload.update(
+                audit_history_digest=self.audit_history_digest,
+                audit_history_length=self.audit_history_length,
+                attested_failure_digests=self.attested_failure_digests,
+            )
+        return _receipt_digest(payload)
 
 
 class TickIntentReconciliationPreview(BaseModel):
@@ -512,6 +552,8 @@ def classify_legacy_failure_evidence(
 ) -> list[dict]:
     if not isinstance(events, list) or not isinstance(verified_records, list):
         raise ValueError("legacy failure evidence requires event and replay lists")
+    if any(not isinstance(event, dict) for event in events):
+        raise ValueError("legacy failure evidence requires event objects")
     if any(type(value) is not bool for value in (replay_verified, corrupt_events_zero, book_matches_replay)):
         raise ValueError("legacy failure evidence checks must be bools")
 
@@ -520,38 +562,66 @@ def classify_legacy_failure_evidence(
         "corrupt_events_zero": "Corrupt audit events are present.",
         "book_matches_replay": "Local paper book does not match replay.",
         "chain_continuity_across_failure": "No later verified session proves continuity across this failure.",
-        "no_post_effect_fields": "Post-effect metadata is present on this failure.",
     }
+    failure_positions = {}
+    for event_index, event in enumerate(events):
+        if event.get("kind") == "tick_failed":
+            failure_positions[failure_digest(event)] = event_index
+
     results = []
     for failure in unresolved_tick_failures(events):
+        digest = failure_digest(failure)
+        failure_index = failure_positions.get(digest)
+        pending_at_head = _pending_decision_at_head(failure, verified_records)
+        post_advance_shape = _has_post_advance_failure_shape(failure)
+        no_effect_fields = not _has_post_effect_failure_fields(failure)
         checks = {
             "replay_verified": replay_verified,
             "corrupt_events_zero": corrupt_events_zero,
             "book_matches_replay": book_matches_replay,
-            "chain_continuity_across_failure": _legacy_failure_chain_continuity(failure, verified_records),
-            "no_post_effect_fields": not _has_post_effect_failure_fields(failure),
+            "chain_continuity_across_failure": (failure_index is not None and _legacy_failure_chain_continuity(failure, verified_records, events, failure_index)),
+            "no_post_effect_fields": no_effect_fields,
         }
-        classification = "resolvable" if all(checks.values()) else "not_resolvable"
+        structural_checks = ("replay_verified", "corrupt_events_zero", "book_matches_replay", "chain_continuity_across_failure")
+        if not all(checks[name] for name in structural_checks):
+            classification = "not_resolvable"
+            reason = next(reasons[name] for name in structural_checks if not checks[name])
+        elif no_effect_fields and not post_advance_shape and pending_at_head is False:
+            classification = "verified"
+            reason = None
+        else:
+            classification = "attestable"
+            if pending_at_head is True:
+                reason = "A pending decision existed at the expected ledger head; operator attestation is required."
+            elif post_advance_shape:
+                reason = "Failure matches a post-advance append error; operator attestation is required."
+            else:
+                reason = "Effect metadata prevents proof of no effect; operator attestation is required."
         request_id = failure.get("request_id")
         error_summary = failure.get("error")
         results.append(
             {
-                "failure_digest": failure_digest(failure),
+                "failure_digest": digest,
                 "time": failure.get("time") if isinstance(failure.get("time"), str) else None,
                 "error_summary": error_summary[:500] if isinstance(error_summary, str) else "",
                 "has_request_id": isinstance(request_id, str) and bool(request_id.strip()),
                 "classification": classification,
                 "checks": checks,
-                "reason": next((reasons[name] for name, passed in checks.items() if not passed), None),
+                "effect_evidence": {
+                    "pending_decision_at_head": pending_at_head,
+                    "post_advance_failure_shape": post_advance_shape,
+                    "post_effect_fields_present": not no_effect_fields,
+                },
+                "reason": reason,
             }
         )
     return results
 
 
-def _legacy_failure_chain_continuity(failure: dict, verified_records: list) -> bool:
+def _legacy_failure_chain_continuity(failure: dict, verified_records: list, events: list[dict], failure_index: int) -> bool:
     expected_head = failure.get("expected_head")
     failure_session = _session_date(failure.get("session"))
-    if not isinstance(expected_head, str) or _SHA256.fullmatch(expected_head) is None or failure_session is None or not verified_records:
+    if not isinstance(expected_head, str) or _SHA256.fullmatch(expected_head) is None or failure_session is None or not verified_records or type(failure_index) is not int or failure_index < 0 or failure_index >= len(events) or events[failure_index].get("kind") != "tick_failed" or failure_digest(events[failure_index]) != failure_digest(failure):
         return False
 
     records = []
@@ -568,7 +638,7 @@ def _legacy_failure_chain_continuity(failure: dict, verified_records: list) -> b
             return False
         if previous_hash is not None and (not isinstance(previous_hash, str) or _SHA256.fullmatch(previous_hash) is None):
             return False
-        records.append((record_hash, previous_hash, _session_date(session)))
+        records.append((record_hash, previous_hash, session, _session_date(session)))
 
     hashes = [record[0] for record in records]
     if len(set(hashes)) != len(hashes):
@@ -581,21 +651,56 @@ def _legacy_failure_chain_continuity(failure: dict, verified_records: list) -> b
     if len(anchor_indexes) != 1:
         return False
     anchor_index = anchor_indexes[0]
-    anchor_session = records[anchor_index][2]
+    anchor_session = records[anchor_index][3]
     if anchor_session is None or failure_session <= anchor_session:
         return False
-    later_start = anchor_index + 1
-    later_records = records[later_start:]
-    return any(session is not None and session > failure_session for _record_hash, _previous_hash, session in later_records)
+    for event_index, event in enumerate(events):
+        if event_index <= failure_index or event.get("kind") != "tick":
+            continue
+        event_session = event.get("session")
+        if not isinstance(event_session, str):
+            continue
+        result = event.get("result")
+        result_session = result.get("session") if isinstance(result, dict) else None
+        result_hash = result.get("hash") if isinstance(result, dict) else None
+        if result_session is not None and result_session != event_session:
+            continue
+        if result_hash is not None and (not isinstance(result_hash, str) or _SHA256.fullmatch(result_hash) is None):
+            continue
+        matching_successors = [record for record in records[anchor_index + 1 :] if record[2] == event_session and record[3] is not None and record[3] > failure_session and (result_hash is None or record[0] == result_hash)]
+        if len(matching_successors) == 1:
+            return True
+    return False
 
 
 def _session_date(value: object):
     if not isinstance(value, str):
         return None
     try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00")).date()
+        parsed = datetime.fromisoformat(value)
     except ValueError:
         return None
+    return parsed if parsed.tzinfo is None else None
+
+
+def _pending_decision_at_head(failure: dict, verified_records: list) -> bool | None:
+    expected_head = failure.get("expected_head")
+    if not isinstance(expected_head, str) or _SHA256.fullmatch(expected_head) is None:
+        return None
+    missing = object()
+    matching = []
+    for record in verified_records:
+        if isinstance(record, dict):
+            record_hash = record.get("hash")
+            decision = record.get("decision", missing)
+        else:
+            record_hash = getattr(record, "hash", None)
+            decision = getattr(record, "decision", missing)
+        if record_hash == expected_head:
+            matching.append(decision)
+    if len(matching) != 1 or matching[0] is missing:
+        return None
+    return matching[0] is not None
 
 
 def _has_post_effect_failure_fields(failure: dict) -> bool:
@@ -606,6 +711,14 @@ def _has_post_effect_failure_fields(failure: dict) -> bool:
         if normalized in _POST_EFFECT_FAILURE_FIELDS or normalized.startswith(("post_effect", "transmitted_", "effect_", "effects_", "broker_effect")):
             return True
     return False
+
+
+def _has_post_advance_failure_shape(failure: dict) -> bool:
+    error = failure.get("error")
+    if not isinstance(error, str):
+        return False
+    normalized = error.casefold()
+    return "session" in normalized and "already recorded" in normalized
 
 
 def build_reconciliation_snapshot(

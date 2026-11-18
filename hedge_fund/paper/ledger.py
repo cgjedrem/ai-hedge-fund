@@ -2234,27 +2234,44 @@ class Ledger:
         return events, tuple(item.identity for item in corrupt_occurrences)
 
     def recovery_events_with_unresolved_corruption(self) -> tuple[list[dict], tuple[str, ...]]:
-        events, corrupt_occurrences, event_offsets = self._recovery_events_with_offsets()
+        events, unresolved, _raw = self.recovery_events_with_unresolved_corruption_and_audit_bytes()
+        return events, unresolved
+
+    def recovery_events_with_unresolved_corruption_and_audit_bytes(self) -> tuple[list[dict], tuple[str, ...], bytes]:
+        events, corrupt_occurrences, event_offsets, raw = self._recovery_history_snapshot()
         _resolved_intents, resolved_corrupt, _resolved_approval_events = _tick_intent_resolution_state(events, corrupt_occurrences, event_offsets, self.directory.name)
         outstanding = tuple(item.identity for item in corrupt_occurrences if item.identity not in resolved_corrupt)
-        return events, outstanding
+        return events, outstanding, raw
+
+    def audit_history_bytes(self) -> bytes:
+        return self._recovery_history_snapshot()[3]
+
+    def audit_history_digest(self) -> str:
+        return hashlib.sha256(self.audit_history_bytes()).hexdigest()
 
     def _recovery_events_with_offsets(
         self,
     ) -> tuple[list[dict], tuple[_CorruptEventOccurrence, ...], tuple[int, ...]]:
+        events, corrupt_occurrences, event_offsets, _raw = self._recovery_history_snapshot()
+        return events, corrupt_occurrences, event_offsets
+
+    def _recovery_history_snapshot(
+        self,
+    ) -> tuple[list[dict], tuple[_CorruptEventOccurrence, ...], tuple[int, ...], bytes]:
         from hedge_fund.runtime.admission import (
             AdmissionError,
             paper_audit_snapshot,
             PaperAuditObservationBusy,
         )
 
-        def read() -> tuple[list[dict], tuple[_CorruptEventOccurrence, ...], tuple[int, ...]]:
+        def read() -> tuple[list[dict], tuple[_CorruptEventOccurrence, ...], tuple[int, ...], bytes]:
             try:
                 with self._event_root() as (root, relative):
                     raw = root.read_bytes(relative)
             except FileNotFoundError:
-                return [], (), ()
-            return _parse_event_history_with_offsets(raw)
+                raw = b""
+            events, corrupt_occurrences, event_offsets = _parse_event_history_with_offsets(raw)
+            return events, corrupt_occurrences, event_offsets, raw
 
         try:
             return paper_audit_snapshot(self.directory, self.directory.name, read)

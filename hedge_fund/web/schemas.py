@@ -311,9 +311,10 @@ class PaperResumeRequest(RequestModel):
 class LegacyFailureReconciliationRequest(RequestModel):
     preview_head: str = Field(pattern=r"^[a-f0-9]{64}$")
     preview_book_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+    preview_audit_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
     failure_digests: list[StrictStr] = Field(min_length=1)
+    attested_failure_digests: list[StrictStr]
     operator: StrictStr = Field(min_length=1, max_length=180)
-    attestation: StrictBool
 
     @field_validator("failure_digests")
     @classmethod
@@ -324,6 +325,15 @@ class LegacyFailureReconciliationRequest(RequestModel):
             raise ValueError("failure digests must be unique")
         return value
 
+    @field_validator("attested_failure_digests")
+    @classmethod
+    def _valid_attested_failure_digests(cls, value: list[str]) -> list[str]:
+        if any(re.fullmatch(r"[a-f0-9]{64}", digest) is None for digest in value):
+            raise ValueError("attested failure digests must be SHA-256 identities")
+        if len(set(value)) != len(value):
+            raise ValueError("attested failure digests must be unique")
+        return value
+
     @field_validator("operator")
     @classmethod
     def _valid_operator(cls, value: str) -> str:
@@ -332,9 +342,9 @@ class LegacyFailureReconciliationRequest(RequestModel):
         return value
 
     @model_validator(mode="after")
-    def _require_attestation(self) -> LegacyFailureReconciliationRequest:
-        if self.attestation is not True:
-            raise ValueError("operator attestation is required")
+    def _validate_attestation_set(self) -> LegacyFailureReconciliationRequest:
+        if not set(self.attested_failure_digests).issubset(self.failure_digests):
+            raise ValueError("attestations must belong to the requested failure set")
         return self
 
 

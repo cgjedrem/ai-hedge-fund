@@ -1170,6 +1170,7 @@ function legacyFailureRecovery(failures: unknown[], confirmOffered: boolean) {
     failures,
     preview_head: HEAD,
     preview_book_digest: "c".repeat(64),
+    preview_audit_digest: "d".repeat(64),
     confirm_offered: confirmOffered,
     set_reason: confirmOffered ? null : "At least one legacy failure is not resolvable.",
   };
@@ -1177,9 +1178,11 @@ function legacyFailureRecovery(failures: unknown[], confirmOffered: boolean) {
 
 function legacyFailureEvidence(
   failureDigest: string,
-  classification: "resolvable" | "not_resolvable",
+  classification: "verified" | "attestable" | "not_resolvable",
   reason: string | null,
 ) {
+  const postEffectFieldsPresent = reason?.includes("Post-effect metadata") ?? false;
+  const continuityFailed = reason?.includes("No later verified session") ?? false;
   return {
     failure_digest: failureDigest,
     time: "2026-11-03T05:05:03Z",
@@ -1190,8 +1193,13 @@ function legacyFailureEvidence(
       replay_verified: true,
       corrupt_events_zero: true,
       book_matches_replay: true,
-      chain_continuity_across_failure: true,
-      no_post_effect_fields: classification === "resolvable",
+      chain_continuity_across_failure: !continuityFailed,
+      no_post_effect_fields: !postEffectFieldsPresent,
+    },
+    effect_evidence: {
+      pending_decision_at_head: classification === "attestable" ? true : false,
+      post_advance_failure_shape: false,
+      post_effect_fields_present: postEffectFieldsPresent,
     },
     reason,
   };
@@ -1206,22 +1214,22 @@ function legacyFailureSnapshot(): PaperSnapshot & { recovery_state: "reconciliat
 }
 
 it("shows mixed legacy failure evidence and disables confirmation when the set is not offered", async () => {
-  const resolvable = legacyFailureEvidence("1".repeat(64), "resolvable", null);
-  const notResolvable = legacyFailureEvidence("2".repeat(64), "not_resolvable", "Post-effect metadata is present on this failure.");
+  const verified = legacyFailureEvidence("1".repeat(64), "verified", null);
+  const notResolvable = legacyFailureEvidence("2".repeat(64), "not_resolvable", "No later verified session proves continuity across this failure.");
   const calls = renderDesk(stoppedRunner, {
     [`GET /api/paper/${FUND}`]: () => json(legacyFailureSnapshot()),
-    [`GET /api/paper/${FUND}/reconciliation`]: () => json(legacyFailureRecovery([resolvable, notResolvable], false)),
+    [`GET /api/paper/${FUND}/reconciliation`]: () => json(legacyFailureRecovery([verified, notResolvable], false)),
   });
 
   const section = await screen.findByTestId("legacy-failure-reconciliation");
-  expect(section).toHaveTextContent(resolvable.failure_digest);
+  expect(section).toHaveTextContent(verified.failure_digest);
   expect(section).toHaveTextContent(notResolvable.failure_digest);
   expect(section).toHaveTextContent("2026-11-03T05:05:03Z");
   expect(section).toHaveTextContent("Synthetic historical failure summary.");
-  expect(section).toHaveTextContent("Resolvable");
+  expect(section).toHaveTextContent("Verified — no effect proven");
   expect(section).toHaveTextContent("Not resolvable");
   expect(within(section).getAllByText("chain_continuity_across_failure")[0].closest("li")).toHaveTextContent("passed");
-  expect(within(section).getAllByText("no_post_effect_fields")[1].closest("li")).toHaveTextContent("failed");
+  expect(within(section).getAllByText("chain_continuity_across_failure")[1].closest("li")).toHaveTextContent("failed");
   expect(section).toHaveTextContent("Post-effect metadata is present on this failure.");
   expect(section).toHaveTextContent("At least one legacy failure is not resolvable.");
   expect(screen.getByRole("button", { name: "Confirm legacy failure reconciliation" })).toBeDisabled();
@@ -1241,9 +1249,9 @@ it.each([
     retry_policy: "none",
     detail: "Legacy failure confirmation refused: synthetic evidence gap.",
   },
-])("submits an attested preview and displays the $status refusal verbatim", async ({ status, code, retry_policy, detail }) => {
+])("submits a verified preview and displays the $status refusal verbatim", async ({ status, code, retry_policy, detail }) => {
   const user = userEvent.setup();
-  const failure = legacyFailureEvidence("1".repeat(64), "resolvable", null);
+  const failure = legacyFailureEvidence("1".repeat(64), "verified", null);
   const recovery = legacyFailureRecovery([failure], true);
   const calls = renderDesk(stoppedRunner, {
     [`GET /api/paper/${FUND}`]: () => json(legacyFailureSnapshot()),
@@ -1262,7 +1270,6 @@ it.each([
   const submit = within(dialog).getByRole("button", { name: "Record legacy failure reconciliation" });
   expect(submit).toBeDisabled();
   await user.type(within(dialog).getByLabelText("Operator identity"), "synthetic-operator");
-  await user.click(within(dialog).getByRole("checkbox", { name: /I reviewed every listed failure/ }));
   await user.click(submit);
 
   await waitFor(() => expect(mutations(calls)).toHaveLength(1));
@@ -1271,12 +1278,54 @@ it.each([
     body: {
       preview_head: HEAD,
       preview_book_digest: "c".repeat(64),
+      preview_audit_digest: "d".repeat(64),
       failure_digests: [failure.failure_digest],
       operator: "synthetic-operator",
-      attestation: true,
+      attested_failure_digests: [],
     },
   });
   expect(await screen.findByText(detail)).toBeInTheDocument();
+});
+
+it("requires and submits per-failure attestations for attestable failures", async () => {
+  const user = userEvent.setup();
+  const attestable = legacyFailureEvidence("1".repeat(64), "attestable", "A pending decision existed at the expected ledger head.");
+  const verified = legacyFailureEvidence("2".repeat(64), "verified", null);
+  const calls = renderDesk(stoppedRunner, {
+    [`GET /api/paper/${FUND}`]: () => json(legacyFailureSnapshot()),
+    [`GET /api/paper/${FUND}/reconciliation`]: () => json(legacyFailureRecovery([attestable, verified], true)),
+    [`POST /api/paper/${FUND}/reconcile-legacy-failures`]: () => json({
+      name: FUND,
+      status: "reconciled",
+      decision_id: "3".repeat(64),
+    }),
+  });
+
+  const section = await screen.findByTestId("legacy-failure-reconciliation");
+  const attest = within(section).getByRole("checkbox", { name: /I attest to this failure/ });
+  await user.click(await enabledButton("Confirm legacy failure reconciliation"));
+  const dialog = await screen.findByRole("dialog", { name: "Confirm legacy failure reconciliation" });
+  let submit = within(dialog).getByRole("button", { name: "Record legacy failure reconciliation" });
+  await user.type(within(dialog).getByLabelText("Operator identity"), "synthetic-operator");
+  expect(submit).toBeDisabled();
+  await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
+  await user.click(attest);
+  await user.click(await enabledButton("Confirm legacy failure reconciliation"));
+  const reviewedDialog = await screen.findByRole("dialog", { name: "Confirm legacy failure reconciliation" });
+  submit = within(reviewedDialog).getByRole("button", { name: "Record legacy failure reconciliation" });
+  await user.type(within(reviewedDialog).getByLabelText("Operator identity"), "synthetic-operator");
+  expect(submit).toBeEnabled();
+  await user.click(submit);
+
+  await waitFor(() => expect(mutations(calls)).toHaveLength(1));
+  expect(mutations(calls)[0].body).toMatchObject({
+    preview_head: HEAD,
+    preview_book_digest: "c".repeat(64),
+    preview_audit_digest: "d".repeat(64),
+    failure_digests: [attestable.failure_digest, verified.failure_digest],
+    operator: "synthetic-operator",
+    attested_failure_digests: [attestable.failure_digest],
+  });
 });
 
 it.each([
@@ -1290,7 +1339,7 @@ it.each([
   },
 ] as const)("reports the legacy reconciliation result $status", async ({ status, message }) => {
   const user = userEvent.setup();
-  const failure = legacyFailureEvidence("1".repeat(64), "resolvable", null);
+  const failure = legacyFailureEvidence("1".repeat(64), "verified", null);
   const calls = renderDesk(stoppedRunner, {
     [`GET /api/paper/${FUND}`]: () => json(legacyFailureSnapshot()),
     [`GET /api/paper/${FUND}/reconciliation`]: () => json(legacyFailureRecovery([failure], true)),
@@ -1304,7 +1353,6 @@ it.each([
   await user.click(await enabledButton("Confirm legacy failure reconciliation"));
   const dialog = await screen.findByRole("dialog", { name: "Confirm legacy failure reconciliation" });
   await user.type(within(dialog).getByLabelText("Operator identity"), "synthetic-operator");
-  await user.click(within(dialog).getByRole("checkbox", { name: /I reviewed every listed failure/ }));
   await user.click(within(dialog).getByRole("button", { name: "Record legacy failure reconciliation" }));
 
   await waitFor(() => expect(mutations(calls)).toHaveLength(1));
