@@ -224,23 +224,247 @@ def test_runtime_configuration_import_does_not_load_provider_clients(owned_test_
 
 def test_runtime_provider_catalog_matches_engine_registry():
     from hedge_fund.llm.client import DEFAULT_MODEL
-    from hedge_fund.llm.registry import load_api_models, SUPPORTED_PROVIDERS
+    from hedge_fund.llm.registry import load_api_model_entries, SUPPORTED_PROVIDERS
     from hedge_fund.runtime import configuration
 
     assert configuration.DEFAULT_MODEL == DEFAULT_MODEL
     assert set(configuration._PROVIDERS.values()) == SUPPORTED_PROVIDERS
-    assert configuration._MODEL_PROVIDERS == {model: provider for _, model, provider in load_api_models() if provider in SUPPORTED_PROVIDERS}
+    assert configuration._model_catalog() == {entry.model_name: entry for entry in load_api_model_entries()}
 
 
-def test_cloud_ollama_models_are_not_selectable_or_resolvable(root_context):
-    from hedge_fund.llm.registry import load_api_models
+def test_cloud_ollama_model_is_selectable_from_all_configuration_sources(root_context):
+    default = resolve_settings(root_context)
+    persisted = resolve_settings(
+        root_context,
+        persisted={"model": "kimi-k3:cloud"},
+    )
+    environment = resolve_settings(
+        root_context,
+        environment={"model": "kimi-k3:cloud"},
+    )
+    launch = resolve_settings(
+        root_context,
+        launch={"model": "kimi-k3:cloud"},
+    )
 
-    models = {model for _, model, _provider in load_api_models()}
-    assert not any(model.endswith(":cloud") for model in models)
-    with pytest.raises(ConfigurationError, match="supported catalog"):
+    assert default.model == "gemma3:4b"
+    for settings in (persisted, environment, launch):
+        assert settings.model == "kimi-k3:cloud"
+        assert settings.llm_provider == "Ollama"
+    assert persisted.provenance["model"] == "persisted"
+    assert environment.provenance["model"] == "environment"
+    assert launch.provenance["model"] == "launch"
+
+
+def test_unknown_model_has_explicit_catalog_reason(root_context):
+    model = "kimi-k3.1:latest"
+
+    with pytest.raises(ConfigurationError) as caught:
         resolve_settings(
             root_context,
-            launch={"model": "glm-5.3:cloud"},
+            launch={"model": model},
+        )
+
+    assert str(caught.value) == f"Model '{model}' is not in the supported provider catalog."
+
+
+def test_unknown_model_reason_is_provider_independent(root_context):
+    model = "synthetic-unknown-model"
+
+    with pytest.raises(ConfigurationError) as caught:
+        resolve_settings(
+            root_context,
+            environment={"llm_provider": "OpenAI"},
+            launch={"model": model},
+        )
+
+    assert str(caught.value) == f"Model '{model}' is not in the supported provider catalog."
+
+
+@pytest.mark.parametrize(
+    ("model", "capability"),
+    [
+        ("nomic-embed-text:latest", "embedding"),
+        ("glm-ocr:latest", "ocr"),
+    ],
+)
+def test_non_chat_ollama_metadata_is_rejected_with_capability_reason(
+    model,
+    capability,
+    root_context,
+    monkeypatch,
+):
+    from hedge_fund.llm import registry
+    from hedge_fund.llm.registry import ModelCatalogEntry
+
+    catalog = registry.load_api_model_entries()
+    catalog.append(
+        ModelCatalogEntry(
+            display_name=model,
+            model_name=model,
+            provider="Ollama",
+            capability=capability,
+            cost_class="local",
+        )
+    )
+    monkeypatch.setattr(
+        registry,
+        "load_api_model_entries",
+        lambda: catalog,
+    )
+
+    with pytest.raises(ConfigurationError) as caught:
+        resolve_settings(
+            root_context,
+            launch={"llm_provider": "Ollama", "model": model},
+        )
+
+    assert str(caught.value) == f"Model '{model}' is not chat-capable ({capability})."
+
+
+def test_paid_context_size_uses_catalog_cost_class(root_context, monkeypatch):
+    from hedge_fund.llm import registry
+    from hedge_fund.llm.registry import ModelCatalogEntry
+
+    catalog = registry.load_api_model_entries()
+    catalog.append(
+        ModelCatalogEntry(
+            display_name="Synthetic paid model",
+            model_name="synthetic-paid-remote",
+            provider="Ollama",
+            capability="chat",
+            cost_class="paid-cloud",
+        )
+    )
+    monkeypatch.setattr(
+        registry,
+        "load_api_model_entries",
+        lambda: catalog,
+    )
+
+    with pytest.raises(ConfigurationError, match="context size is supported only by local Ollama"):
+        resolve_settings(
+            root_context,
+            launch={
+                "llm_provider": "Ollama",
+                "model": "synthetic-paid-remote",
+                "parameters": {"context_size": 8192},
+            },
+        )
+
+
+def test_local_catalog_addition_updates_configuration_web_and_transport(tmp_path, root_context, monkeypatch):
+    from hedge_fund.llm import registry
+    from hedge_fund.runtime.endpoints import (
+        validate_provider_target,
+        validate_request_url,
+    )
+    from hedge_fund.runtime.policy import (
+        approved_local_ollama_chat_models,
+        classify_provider,
+        ProviderClass,
+        ProviderTarget,
+    )
+    from hedge_fund.web.services import _model_options
+
+    model = "synthetic-local:latest"
+    original = json.loads(registry.API_MODELS_PATH.read_text(encoding="utf-8"))
+    catalog_path = tmp_path / "api_models.json"
+    catalog_path.write_text(
+        json.dumps(
+            original
+            + [
+                {
+                    "display_name": "Synthetic local model",
+                    "model_name": model,
+                    "provider": "Ollama",
+                    "capability": "chat",
+                    "cost_class": "local",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(registry, "API_MODELS_PATH", catalog_path)
+
+    settings = resolve_settings(root_context, launch={"model": model})
+    target = ProviderTarget("llm", "Ollama", model)
+    validate_provider_target(target)
+    assert validate_request_url(target, "http://127.0.0.1:11434/api/chat") == ("127.0.0.1", 11434, True)
+
+    assert settings.model == model
+    assert model in approved_local_ollama_chat_models()
+    assert classify_provider(target, approved_local_models=approved_local_ollama_chat_models()) is ProviderClass.LOCAL
+    assert model in {option["id"] for option in _model_options()}
+
+    catalog_path.write_text(json.dumps(original), encoding="utf-8")
+
+    with pytest.raises(ConfigurationError, match=f"Model '{model}' is not in the supported provider catalog"):
+        resolve_settings(root_context, launch={"model": model})
+    assert model not in approved_local_ollama_chat_models()
+    assert model not in {option["id"] for option in _model_options()}
+
+
+def test_mislabelled_cloud_catalog_fails_closed_across_selection_and_dispatch(
+    tmp_path,
+    root_context,
+    monkeypatch,
+):
+    from hedge_fund.llm import registry
+    from hedge_fund.runtime.dispatch import ProviderDispatch
+    from hedge_fund.runtime.endpoints import validate_provider_target
+    from hedge_fund.runtime.policy import (
+        approved_local_ollama_chat_models,
+        AuthorizationDenied,
+        classify_provider,
+        OperationScope,
+        ProviderClass,
+        ProviderTarget,
+    )
+    from hedge_fund.web.services import _model_options
+
+    model = "synthetic-local:cloud"
+    catalog = json.loads(registry.API_MODELS_PATH.read_text(encoding="utf-8"))
+    catalog.append(
+        {
+            "display_name": "Synthetic local cloud label",
+            "model_name": model,
+            "provider": "Ollama",
+            "capability": "chat",
+            "cost_class": "local",
+        }
+    )
+    catalog_path = tmp_path / "api_models.json"
+    catalog_path.write_text(json.dumps(catalog), encoding="utf-8")
+    monkeypatch.setattr(registry, "API_MODELS_PATH", catalog_path)
+    target = ProviderTarget(
+        kind="llm",
+        provider="ollama",
+        model=model,
+        endpoint="http://127.0.0.1:11434",
+    )
+
+    with pytest.raises(ValueError, match="model catalog is invalid"):
+        registry._validated_entries(catalog)
+    assert model not in {entry.model_name for entry in registry.load_api_model_entries()}
+    assert model not in approved_local_ollama_chat_models()
+    assert model not in {option["id"] for option in _model_options()}
+    assert classify_provider(target, approved_local_models={model}) is ProviderClass.PAID_CLOUD
+    with pytest.raises(ConfigurationError, match="not in the supported provider catalog"):
+        resolve_settings(root_context, launch={"model": model})
+    with pytest.raises(AuthorizationDenied, match="Ollama model is not an approved chat model"):
+        validate_provider_target(target, allow_paid_cloud=True)
+    with pytest.raises(AuthorizationDenied, match="Ollama model is not an approved chat model"):
+        ProviderDispatch(
+            scope=OperationScope.MANUAL_ONE_SHOT,
+            root_id="synthetic-root",
+            subject_id="research-1",
+            capture_digest="capture-digest",
+            operation_id="operation-1",
+            operation_digest="b" * 64,
+            targets=(target,),
+            network_authorized=True,
+            approved_local_models=frozenset({model}),
         )
 
 

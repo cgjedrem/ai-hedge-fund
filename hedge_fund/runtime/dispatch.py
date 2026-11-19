@@ -14,7 +14,7 @@ import httpcore
 import httpx
 from httpcore._backends.sync import SyncBackend
 
-from hedge_fund.runtime.costs import request_cost_upper_bound
+from hedge_fund.runtime.costs import has_verified_cost_model, request_cost_upper_bound
 from hedge_fund.runtime.endpoints import (
     PinnedAddress,
     resolve_destination,
@@ -27,8 +27,10 @@ from hedge_fund.runtime.policy import (
     BudgetDenied,
     classify_provider,
     DispatchBudget,
+    ollama_cost_class,
     OneShotAuthorization,
     OperationScope,
+    PaidCloudAuthorizationDenied,
     ProviderTarget,
     RunnerAuthorization,
 )
@@ -117,7 +119,10 @@ class ProviderDispatch:
         for target in targets:
             if not isinstance(target, ProviderTarget) or target.identity in self._targets:
                 raise AuthorizationDenied("provider targets are invalid")
-            validate_provider_target(target)
+            cost_class = ollama_cost_class(target.model) if target.kind == "llm" and target.provider == "ollama" else None
+            paid_ollama_cloud = cost_class == "paid-cloud"
+            unverified_ollama_cloud = paid_ollama_cloud and not has_verified_cost_model(target)
+            validate_provider_target(target, allow_paid_cloud=paid_ollama_cloud)
             provider_class = classify_provider(
                 target,
                 approved_local_models=self.approved_local_models,
@@ -125,17 +130,23 @@ class ProviderDispatch:
             if scope is OperationScope.MANUAL_ONE_SHOT:
                 authorization = self._one_shot.get(target.identity)
                 if not isinstance(authorization, OneShotAuthorization):
+                    if paid_ollama_cloud:
+                        raise PaidCloudAuthorizationDenied(f"Model '{target.model}' requires explicit per-operation authorization.")
                     raise AuthorizationDenied("operation-bound provider authorization is required")
                 if authorization.provider_id != target.identity or authorization.operation_id != operation_id or authorization.operation_digest != operation_digest:
                     raise AuthorizationDenied("provider authorization scope does not match")
                 if authorization.root_id != root_id or authorization.subject_id != subject_id or authorization.capture_digest != capture_digest:
                     raise AuthorizationDenied("provider authorization inputs do not match")
+                if provider_class.value == "paid-cloud" and unverified_ollama_cloud:
+                    raise PaidCloudAuthorizationDenied("no verified cost model")
                 if provider_class.value == "paid-cloud" and authorization.upper_bound_cost <= 0:
                     raise AuthorizationDenied("paid upper-bound cost is unknown")
                 if provider_class.value != "paid-cloud" and authorization.upper_bound_cost != 0:
                     raise AuthorizationDenied("free/local provider cost bound must be zero")
             elif scope is OperationScope.SCHEDULED:
                 if runner is None or target.identity not in runner.provider_ids or provider_class.value == "paid-cloud":
+                    if paid_ollama_cloud and provider_class.value == "paid-cloud":
+                        raise PaidCloudAuthorizationDenied(f"Model '{target.model}' is paid/cloud and cannot be used in scheduled runs.")
                     raise AuthorizationDenied("scheduled provider is not authorized")
             self._targets[target.identity] = target
         if scope is OperationScope.MANUAL_ONE_SHOT and set(self._one_shot) != set(self._targets):
@@ -171,10 +182,14 @@ class ProviderDispatch:
         self._require_target(target)
         if not isinstance(method, str) or not method or not method.isascii():
             raise AuthorizationDenied("provider method is invalid")
-        host, port, local = validate_request_url(target, url)
+        one_shot = self._one_shot.get(target.identity)
+        host, port, local = validate_request_url(
+            target,
+            url,
+            per_operation_authorization_supplied=one_shot is not None,
+        )
         if host_header is not None and not _host_header_matches(host_header, host, port):
             raise AuthorizationDenied("provider host header does not match destination")
-        one_shot = self._one_shot.get(target.identity)
         cost = one_shot.upper_bound_cost if one_shot is not None else Decimal("0")
         provider_class = classify_provider(
             target,
@@ -247,6 +262,10 @@ class ProviderDispatch:
 
     def validate_target(self, target: ProviderTarget) -> None:
         self._require_target(target)
+
+    def has_one_shot_authorization(self, target: ProviderTarget) -> bool:
+        """Whether target has bound one-shot authority."""
+        return self.scope is OperationScope.MANUAL_ONE_SHOT and isinstance(target, ProviderTarget) and self._targets.get(target.identity) == target and isinstance(self._one_shot.get(target.identity), OneShotAuthorization)
 
     def httpx_client(
         self,

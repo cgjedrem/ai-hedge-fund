@@ -50,7 +50,12 @@ from hedge_fund.llm import (
     PROVIDER_ENV_VARS,
 )
 from hedge_fund.llm.client import validate_llm_transport
-from hedge_fund.llm.registry import is_supported, KEYLESS_PROVIDERS, load_api_models
+from hedge_fund.llm.registry import (
+    catalog_entry_for,
+    is_supported,
+    KEYLESS_PROVIDERS,
+    load_api_model_entries,
+)
 from hedge_fund.paper.deployed import (
     deploy,
     DeployedFund,
@@ -168,6 +173,7 @@ from hedge_fund.runtime.policy import (
     BudgetDenied,
     classify_provider,
     KEN_FRENCH_BREAKPOINTS_TARGET,
+    PaidCloudAuthorizationDenied,
     ProviderClass,
     ProviderTarget,
 )
@@ -575,7 +581,7 @@ class DeskService:
         }
 
     def catalog(self) -> dict:
-        models = [{"label": label, "id": model_id, "provider": provider} for label, model_id, provider in load_api_models() if is_supported(provider)]
+        models = _model_options()
         strategies = []
         from hedge_fund.signals import (
             ALPHA_MODEL_REGISTRY,
@@ -2014,6 +2020,8 @@ class DeskService:
             )
             if data_class is not ProviderClass.FREE_DATA or llm_class is not ProviderClass.LOCAL:
                 raise AuthorizationDenied("manual paper providers are not local/free")
+        except PaidCloudAuthorizationDenied as exc:
+            raise ServiceError(403, str(exc)) from None
         except AuthorizationDenied:
             raise ServiceError(403, "Paper operations require free market data and a local model.") from None
         if operation is None:
@@ -2046,6 +2054,8 @@ class DeskService:
                         capture,
                     ),
                 )
+            except PaidCloudAuthorizationDenied as exc:
+                raise ServiceError(403, str(exc)) from None
             except AuthorizationDenied:
                 raise ServiceError(403, "Paper preview provider authorization could not be established.") from None
         calls = min(10000, max(100, model_calls + 100 * len(capture.universe)))
@@ -2087,6 +2097,8 @@ class DeskService:
                     paper=True,
                 ),
             )
+        except PaidCloudAuthorizationDenied as exc:
+            raise ServiceError(403, str(exc)) from None
         except AuthorizationDenied:
             raise ServiceError(403, "Paper provider authorization could not be established.") from None
 
@@ -2119,6 +2131,12 @@ class DeskService:
                 llm,
                 approved_local_models={settings.model},
             )
+        except PaidCloudAuthorizationDenied as exc:
+            raise ServiceError(
+                422,
+                str(exc),
+                code="readiness-denied",
+            ) from None
         except AuthorizationDenied:
             raise ServiceError(
                 422,
@@ -2547,7 +2565,7 @@ class DeskService:
         }
 
     def settings(self) -> dict:
-        model_options = [{"label": label, "id": model_id, "provider": provider} for label, model_id, provider in load_api_models() if is_supported(provider)]
+        model_options = _model_options()
         credential_status = self._credential_status_map()
         with self._settings_lock:
             effective = self._runtime_settings
@@ -2691,14 +2709,13 @@ class DeskService:
 
     def set_model(self, request: ModelRequest) -> dict:
         self._require_writes()
-        provider = _supported_model_providers().get(request.model)
-        if provider is None:
-            raise ServiceError(400, "Model is not in the supported provider catalog.")
+        provider = _model_provider_for_selection(request.model)
+        model_entry = catalog_entry_for(request.model)
         values: dict[str, object] = {
             "model": request.model,
             "llm_provider": provider,
         }
-        if provider != "Ollama" and "context_size" in self._runtime_settings.parameters:
+        if "context_size" in self._runtime_settings.parameters and (provider != "Ollama" or model_entry is None or model_entry.cost_class != "local"):
             values["parameters"] = {name: value for name, value in self._runtime_settings.parameters.items() if name != "context_size"}
         _persisted, updated = self._persist_runtime_settings(
             values,
@@ -2708,9 +2725,7 @@ class DeskService:
 
     def save_runtime_settings(self, request: RuntimeSettingsRequest) -> dict:
         self._require_writes()
-        provider = _supported_model_providers().get(request.model)
-        if provider is None:
-            raise ServiceError(400, "Model is not in the supported provider catalog.")
+        provider = _model_provider_for_selection(request.model)
         values = request.model_dump(exclude={"expected_version"})
         values["llm_provider"] = provider
         _persisted, updated = self._persist_runtime_settings(
@@ -3259,12 +3274,17 @@ class DeskService:
                 endpoint=settings.endpoint,
             )
             try:
-                validate_llm_transport(llm_target)
+                validate_llm_transport(
+                    llm_target,
+                    per_operation_authorization_supplied=payload.authorize_paid_provider,
+                )
                 data_class = classify_provider(data_target)
                 llm_class = classify_provider(
                     llm_target,
                     approved_local_models={settings.model},
                 )
+            except PaidCloudAuthorizationDenied as exc:
+                raise ServiceError(403, str(exc), code="capability-denied") from None
             except AuthorizationDenied:
                 raise ServiceError(422, "Provider configuration has no guarded production transport.", code="readiness-denied") from None
             paid_targets = [
@@ -3320,36 +3340,37 @@ class DeskService:
             if paid_targets:
                 target = paid_targets[0][0]
                 provider_id = target.provider.casefold()
-                if payload.credential_source == "external-runtime":
-                    runtime_store = self._external_credential_store
-                    if runtime_store is None:
-                        raise ServiceError(422, "External runtime credential delivery is unavailable.", code="readiness-denied")
-                    try:
-                        runtime_handle = runtime_store.current_handle(provider_id, destination=provider_id)
-                    except ExternalCredentialError:
-                        raise ServiceError(422, "Selected external runtime credential is unavailable.", code="readiness-denied") from None
-                    credential_versions[provider_id] = runtime_handle.generation
-                    credential_handles[provider_id] = CredentialHandle(
-                        root_id=runtime_handle.root_id,
-                        provider_id=runtime_handle.provider_id,
-                        version=runtime_handle.generation,
-                        source="external-runtime",
-                        instance_id=runtime_handle.instance_id,
-                        destination=runtime_handle.destination,
-                    )
-                else:
-                    status = next(
-                        (value for name, value in self._credential_status_map().items() if name.casefold() == provider_id),
-                        None,
-                    )
-                    if not status or not status["configured"]:
-                        raise ServiceError(422, "Selected provider credential is not configured.", code="readiness-denied")
-                    credential_versions[provider_id] = status["version"]
-                    credential_handles[provider_id] = CredentialHandle(
-                        root_id=root_identity_id(self.root_context),
-                        provider_id=provider_id,
-                        version=status["version"],
-                    )
+                if provider_id not in {provider.casefold() for provider in KEYLESS_PROVIDERS}:
+                    if payload.credential_source == "external-runtime":
+                        runtime_store = self._external_credential_store
+                        if runtime_store is None:
+                            raise ServiceError(422, "External runtime credential delivery is unavailable.", code="readiness-denied")
+                        try:
+                            runtime_handle = runtime_store.current_handle(provider_id, destination=provider_id)
+                        except ExternalCredentialError:
+                            raise ServiceError(422, "Selected external runtime credential is unavailable.", code="readiness-denied") from None
+                        credential_versions[provider_id] = runtime_handle.generation
+                        credential_handles[provider_id] = CredentialHandle(
+                            root_id=runtime_handle.root_id,
+                            provider_id=provider_id,
+                            version=runtime_handle.generation,
+                            source="external-runtime",
+                            instance_id=runtime_handle.instance_id,
+                            destination=runtime_handle.destination,
+                        )
+                    else:
+                        status = next(
+                            (value for name, value in self._credential_status_map().items() if name.casefold() == provider_id),
+                            None,
+                        )
+                        if not status or not status["configured"]:
+                            raise ServiceError(422, "Selected provider credential is not configured.", code="readiness-denied")
+                        credential_versions[provider_id] = status["version"]
+                        credential_handles[provider_id] = CredentialHandle(
+                            root_id=root_identity_id(self.root_context),
+                            provider_id=provider_id,
+                            version=status["version"],
+                        )
             now = _utcnow()
             operation_payload = payload.model_dump(mode="json")
             operation_payload.pop("credential_source", None)
@@ -3792,12 +3813,17 @@ class DeskService:
             endpoint=capture.endpoint,
         )
         try:
-            validate_llm_transport(llm_target)
+            validate_llm_transport(
+                llm_target,
+                per_operation_authorization_supplied=request.authorize_paid_provider,
+            )
             data_class = classify_provider(data_target)
             llm_class = classify_provider(
                 llm_target,
                 approved_local_models={capture.model},
             )
+        except PaidCloudAuthorizationDenied as exc:
+            raise OperationError(str(exc)) from None
         except AuthorizationDenied:
             raise OperationError("captured provider transport is unavailable") from None
         paid_targets = [
@@ -3916,6 +3942,8 @@ class DeskService:
                     paper=False,
                 ),
             )
+        except PaidCloudAuthorizationDenied as exc:
+            raise OperationError(str(exc)) from None
         except AuthorizationDenied:
             raise OperationError("provider authorization could not be established") from None
 
@@ -5219,8 +5247,33 @@ def _credential_provider(value: str) -> str:
     return provider
 
 
-def _supported_model_providers() -> dict[str, str]:
-    return {model_id: provider for _label, model_id, provider in load_api_models() if is_supported(provider)}
+def _model_options() -> list[dict[str, object]]:
+    options = []
+    for entry in load_api_model_entries():
+        if not is_supported(entry.provider) or (entry.provider == "Ollama" and entry.capability != "chat"):
+            continue
+        option: dict[str, object] = {
+            "label": entry.display_name,
+            "id": entry.model_name,
+            "provider": entry.provider,
+        }
+        if entry.provider == "Ollama":
+            option["capability"] = entry.capability
+            option["cost_class"] = entry.cost_class
+        options.append(option)
+    return options
+
+
+def _model_provider_for_selection(model_id: str) -> str:
+    entry = catalog_entry_for(model_id)
+    if entry is None:
+        raise ServiceError(400, f"Model '{model_id}' is not in the supported provider catalog.")
+    if entry.provider == "Ollama" and entry.capability != "chat":
+        capability = entry.capability or "unknown"
+        raise ServiceError(400, f"Model '{model_id}' is not chat-capable ({capability}).")
+    if not is_supported(entry.provider):
+        raise ServiceError(400, f"Model '{model_id}' is not in the supported provider catalog.")
+    return entry.provider
 
 
 def _is_loopback_endpoint(value: str | None) -> bool:

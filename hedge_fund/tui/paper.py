@@ -51,10 +51,11 @@ from hedge_fund.runtime.configuration import resolve_settings, RuntimeSettings
 from hedge_fund.runtime.defaults import BOARD_REFRESH
 from hedge_fund.runtime.dispatch import make_one_shot_dispatch
 from hedge_fund.runtime.policy import (
-    APPROVED_LOCAL_MODELS,
+    approved_local_ollama_chat_models,
     AuthorizationDenied,
     classify_provider,
     KEN_FRENCH_BREAKPOINTS_TARGET,
+    PaidCloudAuthorizationDenied,
     ProviderClass,
     ProviderTarget,
 )
@@ -994,7 +995,7 @@ def _tui_capture(root, deployed: DeployedFund, settings: RuntimeSettings) -> Fro
 def _require_tui_providers(settings: RuntimeSettings) -> None:
     if not isinstance(settings, RuntimeSettings):
         raise AdmissionError("Captured paper settings are unavailable.")
-    if settings.data_provider != "yfinance" or settings.llm_provider != "Ollama" or settings.model not in APPROVED_LOCAL_MODELS:
+    if settings.data_provider != "yfinance" or settings.llm_provider != "Ollama":
         raise AuthorizationDenied("TUI paper runs require free yfinance and an approved local Ollama model.")
     data_target = ProviderTarget(kind="data", provider=settings.data_provider)
     llm_target = ProviderTarget(
@@ -1006,10 +1007,13 @@ def _require_tui_providers(settings: RuntimeSettings) -> None:
     try:
         validate_llm_transport(llm_target)
         data_class = classify_provider(data_target)
+        approved_models = approved_local_ollama_chat_models()
         llm_class = classify_provider(
             llm_target,
-            approved_local_models=APPROVED_LOCAL_MODELS,
+            approved_local_models=approved_models,
         )
+    except PaidCloudAuthorizationDenied:
+        raise
     except AuthorizationDenied:
         raise AuthorizationDenied("TUI paper runs require free yfinance and an approved local Ollama model.") from None
     if data_class is not ProviderClass.FREE_DATA or llm_class is not ProviderClass.LOCAL:
@@ -1047,12 +1051,12 @@ def _make_tui_run_dispatch(
             model=capture.model,
             endpoint=capture.endpoint,
         )
-        if classify_provider(llm_target, approved_local_models=APPROVED_LOCAL_MODELS) is not ProviderClass.LOCAL:
+        approved_models = approved_local_ollama_chat_models()
+        if classify_provider(llm_target, approved_local_models=approved_models) is not ProviderClass.LOCAL:
             raise AuthorizationDenied("TUI local-model authorization is unavailable.")
         if classify_provider(KEN_FRENCH_BREAKPOINTS_TARGET) is not ProviderClass.FREE_DATA:
             raise AuthorizationDenied("TUI free-data authorization is unavailable.")
         targets.extend((llm_target, KEN_FRENCH_BREAKPOINTS_TARGET))
-        approved_models = APPROVED_LOCAL_MODELS
     bounds = {target.identity: (10000, Decimal("0"), 10000) for target in targets}
     return make_one_shot_dispatch(
         root_id=capture.root_id,

@@ -148,7 +148,10 @@ def main(argv: list[str] | None = None) -> None:
             except (RootPathError, UnicodeError, ValueError) as exc:
                 parser.error(str(exc))
             _load_runtime()
-            from hedge_fund.runtime.policy import AuthorizationDenied
+            from hedge_fund.runtime.policy import (
+                AuthorizationDenied,
+                PaidCloudAuthorizationDenied,
+            )
 
             if not (args.command == "paper" and args.action == "halt"):
                 try:
@@ -176,6 +179,9 @@ def main(argv: list[str] | None = None) -> None:
                 console.print(f"[red]{exc}[/]")
                 sys.exit(1)
             except PaperWriterDenied as exc:
+                console.print(f"[red]{exc}[/]")
+                sys.exit(1)
+            except PaidCloudAuthorizationDenied as exc:
                 console.print(f"[red]{exc}[/]")
                 sys.exit(1)
             except AuthorizationDenied:
@@ -966,7 +972,11 @@ def _verify_enrolled_head(participant, name: str) -> None:
 
 def _cli_settings(root: RootContext, args, parser: argparse.ArgumentParser):
     from hedge_fund.runtime.admission import AdmissionCoordinator, AdmissionError
-    from hedge_fund.runtime.configuration import ConfigurationError, resolve_settings
+    from hedge_fund.runtime.configuration import (
+        ConfigurationError,
+        ModelSelectionError,
+        resolve_settings,
+    )
 
     admission = AdmissionCoordinator(root)
     launch = {"model": args.model} if args.model else None
@@ -976,6 +986,8 @@ def _cli_settings(root: RootContext, args, parser: argparse.ArgumentParser):
             admission=admission,
             launch=launch,
         )
+    except ModelSelectionError as exc:
+        parser.error(str(exc))
     except (AdmissionError, ConfigurationError, OSError, ValueError):
         parser.error("captured runtime settings are unavailable")
     return settings, admission
@@ -1001,6 +1013,7 @@ def _authorize_cli_operation(
     resolver=None,
 ):
     from hedge_fund.llm.client import validate_llm_transport
+    from hedge_fund.llm.registry import KEYLESS_PROVIDERS
     from hedge_fund.pipeline.session import code_version, mandate_hash
     from hedge_fund.pipeline.session import SessionRecord as CapturedSessionRecord
     from hedge_fund.runtime.capture import freeze_capture
@@ -1023,6 +1036,7 @@ def _authorize_cli_operation(
         AuthorizationDenied,
         classify_provider,
         KEN_FRENCH_BREAKPOINTS_TARGET,
+        PaidCloudAuthorizationDenied,
         ProviderClass,
         ProviderTarget,
     )
@@ -1069,12 +1083,28 @@ def _authorize_cli_operation(
         model=settings.model,
         endpoint=settings.endpoint,
     )
+    authorized_provider = getattr(args, "authorize_paid_provider", None)
+    paid_authorization_supplied = (
+        isinstance(authorized_provider, str)
+        and authorized_provider.casefold() == llm_target.provider.casefold()
+        and all(
+            getattr(args, field, None) is not None
+            for field in (
+                "paid_max_calls",
+                "paid_max_cost_usd",
+                "paid_max_attempt_cost_usd",
+            )
+        )
+    )
     targets = [data_target, breakpoints_target]
     try:
         data_class = classify_provider(data_target)
         llm_class = None
         if llm_call_bound:
-            validate_llm_transport(llm_target)
+            validate_llm_transport(
+                llm_target,
+                per_operation_authorization_supplied=paid_authorization_supplied,
+            )
             llm_class = classify_provider(
                 llm_target,
                 approved_local_models={settings.model},
@@ -1082,6 +1112,8 @@ def _authorize_cli_operation(
             targets.append(llm_target)
         if classify_provider(breakpoints_target) is not ProviderClass.FREE_DATA:
             parser.error("breakpoints provider is not approved free data")
+    except PaidCloudAuthorizationDenied as exc:
+        parser.error(str(exc))
     except AuthorizationDenied:
         parser.error("captured provider has no guarded production transport")
     paid_targets = [
@@ -1104,7 +1136,6 @@ def _authorize_cli_operation(
     fd_pricing_confirmation = getattr(args, "confirm_fd_self_service_pricing", False)
     if type(fd_pricing_confirmation) is not bool:
         parser.error("Financial Datasets pricing confirmation is invalid")
-    authorized_provider = getattr(args, "authorize_paid_provider", None)
     paid_max_calls = getattr(args, "paid_max_calls", None)
     paid_total_text = getattr(args, "paid_max_cost_usd", None)
     paid_attempt_text = getattr(args, "paid_max_attempt_cost_usd", None)
@@ -1160,21 +1191,22 @@ def _authorize_cli_operation(
     if paid_targets:
         target = paid_targets[0][0]
         provider_id = target.provider.casefold()
-        try:
-            credentials = CredentialStore(root, admission)
-            version, configured = credentials.version(provider_id)
-            if not configured or version <= 0:
-                parser.error("paid provider credential is not saved under this root")
-            credential = credentials.read_version(provider_id, version)
-        except CredentialStoreError:
-            parser.error("paid provider credential is unavailable")
-        if not isinstance(credential, str) or not credential:
-            parser.error("paid provider credential is unavailable")
-        credential_versions[provider_id] = version
-        if target.kind == "data":
-            data_key = credential
-        else:
-            llm_key = credential
+        if provider_id not in {provider.casefold() for provider in KEYLESS_PROVIDERS}:
+            try:
+                credentials = CredentialStore(root, admission)
+                version, configured = credentials.version(provider_id)
+                if not configured or version <= 0:
+                    parser.error("paid provider credential is not saved under this root")
+                credential = credentials.read_version(provider_id, version)
+            except CredentialStoreError:
+                parser.error("paid provider credential is unavailable")
+            if not isinstance(credential, str) or not credential:
+                parser.error("paid provider credential is unavailable")
+            credential_versions[provider_id] = version
+            if target.kind == "data":
+                data_key = credential
+            else:
+                llm_key = credential
 
     try:
         capture = freeze_capture(
@@ -1330,6 +1362,8 @@ def _authorize_cli_operation(
             boundary_check=boundary_check,
             resolver=resolver,
         )
+    except PaidCloudAuthorizationDenied as exc:
+        parser.error(str(exc))
     except AuthorizationDenied:
         parser.error("operation provider authorization could not be established")
     return {

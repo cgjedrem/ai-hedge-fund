@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 from pydantic import SecretStr
 
 from hedge_fund.llm import DEFAULT_MODEL, load_api_models
-from hedge_fund.llm.registry import is_supported
+from hedge_fund.llm.registry import is_supported, ModelCatalogEntry
 from hedge_fund.runtime.capture import (
     CredentialHandle,
     freeze_capture,
@@ -35,6 +35,34 @@ from hedge_fund.test_support.network_guard import (
 from hedge_fund.web.app import create_app
 from hedge_fund.web.schemas import CredentialRequest, ModelRequest
 from hedge_fund.web.services import DeskService, ServiceError
+
+
+def test_settings_and_catalog_expose_ollama_model_classifiers(tmp_path):
+    service = DeskService(tmp_path)
+    try:
+        settings = service.settings()
+        catalog = service.catalog()
+
+        for response in (settings, catalog):
+            ollama = next(item for item in response["models"] if item["id"] == "kimi-k3:cloud")
+            ollama_pro = next(item for item in response["models"] if item["id"] == "kimi-k3.1-pro:cloud")
+            assert ollama == {
+                "label": "Kimi K3 Cloud",
+                "id": "kimi-k3:cloud",
+                "provider": "Ollama",
+                "capability": "chat",
+                "cost_class": "paid-cloud",
+            }
+            assert ollama_pro == {
+                "label": "Kimi K3.1 Pro Cloud",
+                "id": "kimi-k3.1-pro:cloud",
+                "provider": "Ollama",
+                "capability": "chat",
+                "cost_class": "paid-cloud",
+            }
+            assert all(set(item) == {"label", "id", "provider"} for item in response["models"] if item["provider"] != "Ollama")
+    finally:
+        service.close()
 
 
 def test_settings_expose_presence_not_provider_values(tmp_path, monkeypatch):
@@ -334,11 +362,7 @@ def test_service_does_not_load_root_environment_implicitly(tmp_path, monkeypatch
     monkeypatch.setenv("ANTHROPIC_API_KEY", shell_secret)
     second_service = DeskService(tmp_path, network_enabled=True)
     assert os.environ["ANTHROPIC_API_KEY"] == shell_secret
-    assert not next(
-        item
-        for item in second_service.settings()["providers"]
-        if item["provider"] == "Anthropic"
-    )["configured"]
+    assert not next(item for item in second_service.settings()["providers"] if item["provider"] == "Anthropic")["configured"]
     second_service.close()
 
 
@@ -422,7 +446,7 @@ def test_model_setting_is_catalog_allowlisted_and_persisted_by_root(tmp_path, mo
         with pytest.raises(ServiceError) as unknown:
             service.set_model(ModelRequest(model="unregistered-model", expected_version=1))
         assert unknown.value.status_code == 400
-        assert "unregistered-model" not in unknown.value.detail
+        assert unknown.value.detail == "Model 'unregistered-model' is not in the supported provider catalog."
     finally:
         service.close()
 
@@ -432,6 +456,189 @@ def test_model_setting_is_catalog_allowlisted_and_persisted_by_root(tmp_path, mo
         assert restarted.settings()["version"] == 1
     finally:
         restarted.close()
+
+
+def test_model_write_api_uses_specific_credential_free_rejections(tmp_path, monkeypatch):
+    from hedge_fund.web import services as web_services
+
+    enroll_synthetic_root(tmp_path)
+    unknown_model = "unregistered-model"
+    embedding_model = "nomic-embed-text:latest"
+    unsupported_provider_model = "synthetic-google-model"
+    lookup = getattr(web_services, "catalog_entry_for", lambda _model_id: None)
+
+    def catalog_entry_for(model_id):
+        if model_id == embedding_model:
+            return ModelCatalogEntry(
+                "Nomic Embed",
+                embedding_model,
+                "Ollama",
+                "embedding",
+                "local",
+            )
+        if model_id == unsupported_provider_model:
+            return ModelCatalogEntry(
+                "Synthetic Google model",
+                unsupported_provider_model,
+                "Google",
+                "chat",
+            )
+        return lookup(model_id)
+
+    monkeypatch.setattr(web_services, "catalog_entry_for", catalog_entry_for, raising=False)
+    app = create_app(root=tmp_path, allow_writes=True)
+    with TestClient(app, client=("127.0.0.1", 50000)) as client:
+        token = client.get("/api/capabilities", headers={"host": "127.0.0.1"}).json()["mutation_token"]
+        headers = {
+            "host": "127.0.0.1",
+            "origin": "http://127.0.0.1",
+            "x-csrf-token": token,
+        }
+        unknown_post = client.post(
+            "/api/settings/model",
+            headers=headers,
+            json={"model": unknown_model, "expected_version": 0},
+        )
+        unknown_put = client.put(
+            "/api/settings",
+            headers=headers,
+            json={
+                "data_provider": "yfinance",
+                "model": unknown_model,
+                "endpoint": None,
+                "timeout_seconds": 60.0,
+                "parameters": {},
+                "expected_version": 0,
+            },
+        )
+        embedding_post = client.post(
+            "/api/settings/model",
+            headers=headers,
+            json={"model": embedding_model, "expected_version": 0},
+        )
+        unsupported_provider_post = client.post(
+            "/api/settings/model",
+            headers=headers,
+            json={"model": unsupported_provider_model, "expected_version": 0},
+        )
+
+    assert unknown_post.status_code == unknown_put.status_code == 400
+    assert unknown_post.json()["detail"] == unknown_put.json()["detail"] == f"Model '{unknown_model}' is not in the supported provider catalog."
+    assert embedding_post.status_code == 400
+    assert embedding_post.json()["detail"] == f"Model '{embedding_model}' is not chat-capable (embedding)."
+    assert unsupported_provider_post.status_code == 400
+    assert unsupported_provider_post.json()["detail"] == (f"Model '{unsupported_provider_model}' is not in the supported provider catalog.")
+    assert "secret" not in json.dumps([unknown_post.json(), unknown_put.json(), embedding_post.json(), unsupported_provider_post.json()]).casefold()
+
+
+def test_settings_routes_accept_and_persist_cloud_tag_across_restart(tmp_path, monkeypatch):
+    enroll_synthetic_root(tmp_path)
+    monkeypatch.delenv("HEDGE_FUND_LLM_MODEL", raising=False)
+    app = create_app(root=tmp_path, allow_writes=True)
+    with TestClient(app, client=("127.0.0.1", 50000)) as client:
+        token = client.get(
+            "/api/capabilities",
+            headers={"host": "127.0.0.1"},
+        ).json()["mutation_token"]
+        headers = {
+            "host": "127.0.0.1",
+            "origin": "http://127.0.0.1",
+            "x-csrf-token": token,
+        }
+        post = client.post(
+            "/api/settings/model",
+            headers=headers,
+            json={"model": "kimi-k3:cloud", "expected_version": 0},
+        )
+        put = client.put(
+            "/api/settings",
+            headers=headers,
+            json={
+                "data_provider": "yfinance",
+                "model": "kimi-k3:cloud",
+                "endpoint": None,
+                "timeout_seconds": 60,
+                "parameters": {},
+                "expected_version": 1,
+            },
+        )
+
+    assert post.status_code == 200
+    assert post.json() == {"model": "kimi-k3:cloud", "scope": "root", "version": 1}
+    assert put.status_code == 200
+    assert put.json()["model"] == "kimi-k3:cloud"
+    assert put.json()["llm_provider"] == "Ollama"
+    assert put.json()["version"] == 2
+    persisted = tmp_path / "runtime" / "private" / "v1" / "settings.json"
+    assert json.loads(persisted.read_text(encoding="utf-8"))["model"] == "kimi-k3:cloud"
+
+    restarted = create_app(root=tmp_path)
+    with TestClient(restarted, client=("127.0.0.1", 50000)) as client:
+        settings = client.get("/api/settings", headers={"host": "127.0.0.1"})
+
+    assert settings.status_code == 200
+    assert settings.json()["model"] == "kimi-k3:cloud"
+    assert settings.json()["version"] == 2
+
+
+def test_model_switch_to_paid_cloud_ollama_removes_local_context_size(tmp_path, monkeypatch):
+    enroll_synthetic_root(tmp_path)
+    monkeypatch.delenv("HEDGE_FUND_LLM_MODEL", raising=False)
+    app = create_app(root=tmp_path, allow_writes=True)
+    with TestClient(app, client=("127.0.0.1", 50000)) as client:
+        token = client.get(
+            "/api/capabilities",
+            headers={"host": "127.0.0.1"},
+        ).json()["mutation_token"]
+        headers = {
+            "host": "127.0.0.1",
+            "origin": "http://127.0.0.1",
+            "x-csrf-token": token,
+        }
+        configured = client.put(
+            "/api/settings",
+            headers=headers,
+            json={
+                "data_provider": "yfinance",
+                "model": "gemma3:4b",
+                "endpoint": None,
+                "timeout_seconds": 60,
+                "parameters": {
+                    "context_size": 8192,
+                    "max_tokens": 4096,
+                    "temperature": 0.4,
+                    "top_p": 0.8,
+                },
+                "expected_version": 0,
+            },
+        )
+        assert configured.status_code == 200
+        before = client.get("/api/settings", headers={"host": "127.0.0.1"})
+        selected = client.post(
+            "/api/settings/model",
+            headers=headers,
+            json={
+                "model": "kimi-k3.1-pro:cloud",
+                "expected_version": configured.json()["version"],
+            },
+        )
+        after = client.get("/api/settings", headers={"host": "127.0.0.1"})
+
+    assert before.status_code == 200
+    assert before.json()["parameters"]["context_size"] == 8192
+    assert selected.status_code == 200
+    assert selected.json() == {
+        "model": "kimi-k3.1-pro:cloud",
+        "scope": "root",
+        "version": 2,
+    }
+    assert after.status_code == 200
+    assert after.json()["model"] == "kimi-k3.1-pro:cloud"
+    assert after.json()["parameters"] == {
+        "max_tokens": 4096,
+        "temperature": 0.4,
+        "top_p": 0.8,
+    }
 
 
 def test_effective_settings_resolve_environment_precedence(tmp_path, monkeypatch):
@@ -494,11 +701,7 @@ def test_settings_can_change_without_mutating_existing_capture_snapshot(tmp_path
 def test_runtime_settings_api_persists_validated_effective_values(tmp_path):
     enroll_synthetic_root(tmp_path)
     app = create_app(root=tmp_path, allow_writes=True)
-    model = next(
-        model_id
-        for _, model_id, provider in load_api_models()
-        if provider == "Ollama" and is_supported(provider) and not model_id.endswith(":cloud")
-    )
+    model = next(model_id for _, model_id, provider in load_api_models() if provider == "Ollama" and is_supported(provider) and not model_id.endswith(":cloud"))
     with TestClient(app, client=("127.0.0.1", 50000)) as client:
         token = client.get("/api/capabilities", headers={"host": "127.0.0.1"}).json()["mutation_token"]
         response = client.put(

@@ -47,6 +47,22 @@
   {
     "display_name": "Gemma 3 4B",
     "model_name": "gemma3:4b",
-    "provider": "Ollama"
+    "provider": "Ollama",
+    "capability": "chat",
+    "cost_class": "local"
+  },
+  {
+    "display_name": "Kimi K3 Cloud",
+    "model_name": "kimi-k3:cloud",
+    "provider": "Ollama",
+    "capability": "chat",
+    "cost_class": "paid-cloud"
+  },
+  {
+    "display_name": "Kimi K3.1 Pro Cloud",
+    "model_name": "kimi-k3.1-pro:cloud",
+    "provider": "Ollama",
+    "capability": "chat",
+    "cost_class": "paid-cloud"
   }
 ]

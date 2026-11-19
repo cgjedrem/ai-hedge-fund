@@ -26,15 +26,6 @@ DEFAULT_DATA_PROVIDER = "yfinance"
 DEFAULT_MODEL = "gemma3:4b"
 DEFAULT_TIMEOUT_SECONDS = 60.0
 _PROVIDERS = {provider.casefold(): provider for provider in ("OpenAI", "xAI", "DeepSeek", "Kimi", "TypeSafe", "Ollama")}
-_MODEL_PROVIDERS = {
-    "gpt-6-sol": "OpenAI",
-    "gpt-6-astra": "OpenAI",
-    "jev-1.13.0": "TypeSafe",
-    "grok-4.7": "xAI",
-    "deepseek-flash": "DeepSeek",
-    "kimi-k3": "Kimi",
-    "gemma3:4b": "Ollama",
-}
 _DEFAULT_LLM_PROVIDER = "Ollama"
 _DATA_PROVIDERS = {
     "fd": "fd",
@@ -63,8 +54,19 @@ _PARAMETER_FIELDS = frozenset({"context_size", "max_tokens", "temperature", "top
 _PROVENANCE_VALUES = frozenset({"default", "persisted", "environment", "launch"})
 
 
+def _model_catalog():
+    """Return current validated entries from shared registry parser."""
+    from hedge_fund.llm.registry import load_api_model_entries
+
+    return {entry.model_name: entry for entry in load_api_model_entries()}
+
+
 class ConfigurationError(ValueError):
     """Settings input or persisted data is invalid."""
+
+
+class ModelSelectionError(ConfigurationError):
+    """Model selection failed validation."""
 
 
 class SettingsConflict(RuntimeError):
@@ -497,8 +499,10 @@ def _derive_model_provider(overrides: dict[str, object]) -> None:
     if "model" not in overrides or "llm_provider" in overrides:
         return
     model = overrides["model"]
-    if isinstance(model, str) and model in _MODEL_PROVIDERS:
-        overrides["llm_provider"] = _MODEL_PROVIDERS[model]
+    if isinstance(model, str):
+        entry = _model_catalog().get(model)
+        if entry is not None and entry.provider.casefold() in _PROVIDERS:
+            overrides["llm_provider"] = _PROVIDERS[entry.provider.casefold()]
 
 
 def _parse_persisted(
@@ -534,15 +538,20 @@ def _normalize_settings(values: Mapping[str, object]) -> dict[str, object]:
         raise ConfigurationError("LLM provider is unsupported")
     normalized_provider = _PROVIDERS[llm_provider.casefold()]
     model = _validate_text(values["model"], maximum=256, message="model is invalid")
-    registered_provider = _MODEL_PROVIDERS.get(model)
+    catalog_entry = _model_catalog().get(model)
+    if catalog_entry is None:
+        raise ModelSelectionError(f"Model '{model}' is not in the supported provider catalog.")
+    registered_provider = _PROVIDERS.get(catalog_entry.provider.casefold())
     if registered_provider is None:
         raise ConfigurationError("model is not in the supported catalog")
     if registered_provider != normalized_provider:
+        if "Ollama" in {registered_provider, normalized_provider}:
+            raise ModelSelectionError("model and provider do not match")
         raise ConfigurationError("model and provider do not match")
+    if registered_provider == "Ollama" and catalog_entry is not None and catalog_entry.capability != "chat":
+        raise ModelSelectionError(f"Model '{model}' is not chat-capable ({catalog_entry.capability}).")
     parameters = _normalize_parameters(values["parameters"])
-    if "context_size" in parameters and (
-        normalized_provider != "Ollama" or model.casefold().endswith(":cloud")
-    ):
+    if "context_size" in parameters and (normalized_provider != "Ollama" or catalog_entry.cost_class != "local"):
         raise ConfigurationError("context size is supported only by local Ollama")
     endpoint = _normalize_endpoint(values["endpoint"])
     timeout = values["timeout_seconds"]

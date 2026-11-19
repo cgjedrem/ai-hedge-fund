@@ -22,6 +22,10 @@ class BudgetDenied(AuthorizationDenied):
     """Call, cost or resource bound would be exceeded."""
 
 
+class PaidCloudAuthorizationDenied(AuthorizationDenied):
+    """Paid-cloud provider needs operation-bound authority."""
+
+
 class ProviderClass(str, Enum):
     FREE_DATA = "free-data"
     LOCAL = "local"
@@ -31,9 +35,6 @@ class ProviderClass(str, Enum):
 class OperationScope(str, Enum):
     MANUAL_ONE_SHOT = "manual-one-shot"
     SCHEDULED = "scheduled"
-
-
-APPROVED_LOCAL_MODELS = frozenset({"gemma3:4b"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -249,7 +250,7 @@ def classify_provider(
     *,
     approved_local_models: set[str] | frozenset[str] = frozenset(),
 ) -> ProviderClass:
-    """Classify provider from identity and literal endpoint, never key absence."""
+    """Classify provider from catalog and literal endpoint, never credential state."""
     if not isinstance(target, ProviderTarget):
         raise AuthorizationDenied("provider target is invalid")
     if not isinstance(approved_local_models, (set, frozenset)) or any(not isinstance(model, str) or not _safe_text(model, maximum=256) for model in approved_local_models):
@@ -268,7 +269,10 @@ def classify_provider(
     if target.kind != "llm":
         raise AuthorizationDenied("provider kind is unknown")
     if target.provider == "ollama":
-        if target.model in APPROVED_LOCAL_MODELS and target.model in approved_local_models and not _cloud_labelled(target.model or "") and _literal_local_ollama_endpoint(target.endpoint):
+        cost_class = ollama_cost_class(target.model)
+        if cost_class == "paid-cloud":
+            return ProviderClass.PAID_CLOUD
+        if cost_class == "local" and target.model in approved_local_ollama_chat_models() and target.model in approved_local_models and _literal_local_ollama_endpoint(target.endpoint):
             return ProviderClass.LOCAL
         return ProviderClass.PAID_CLOUD
     if target.provider in {
@@ -282,6 +286,35 @@ def classify_provider(
     }:
         return ProviderClass.PAID_CLOUD
     raise AuthorizationDenied("LLM provider is unknown")
+
+
+def approved_local_ollama_chat_models() -> frozenset[str]:
+    """Return local Ollama chat ids from current catalog."""
+    from hedge_fund.llm.registry import load_api_model_entries
+
+    return frozenset(entry.model_name for entry in load_api_model_entries() if entry.provider.casefold() == "ollama" and entry.capability == "chat" and entry.cost_class == "local")
+
+
+def is_ollama_chat_model(model_id: str | None) -> bool:
+    """Whether current catalog marks id as an Ollama chat model."""
+    if not isinstance(model_id, str) or not model_id:
+        return False
+    from hedge_fund.llm.registry import catalog_entry_for
+
+    entry = catalog_entry_for(model_id)
+    return entry is not None and entry.provider.casefold() == "ollama" and entry.capability == "chat"
+
+
+def ollama_cost_class(model_id: str | None) -> str | None:
+    """Return exact Ollama catalog cost class. Unknown id → None."""
+    if not isinstance(model_id, str) or not model_id:
+        return None
+    from hedge_fund.llm.registry import catalog_entry_for
+
+    entry = catalog_entry_for(model_id)
+    if entry is None or entry.provider.casefold() != "ollama":
+        return None
+    return entry.cost_class
 
 
 def authorize_session(
@@ -361,6 +394,8 @@ def authorize_dispatch(
         if runner is not None:
             raise AuthorizationDenied("runner authority cannot authorize manual work")
         if not isinstance(one_shot, OneShotAuthorization):
+            if _is_paid_ollama_cloud(target):
+                raise PaidCloudAuthorizationDenied(f"Model '{target.model}' requires explicit per-operation authorization.")
             raise AuthorizationDenied("operation-bound provider authorization is required")
         _validate_one_shot_identity(
             one_shot,
@@ -390,6 +425,8 @@ def authorize_dispatch(
     if one_shot is not None or not isinstance(runner, RunnerAuthorization):
         raise AuthorizationDenied("finite runner authorization is required")
     if provider_class is ProviderClass.PAID_CLOUD:
+        if _is_paid_ollama_cloud(target):
+            raise PaidCloudAuthorizationDenied(f"Model '{target.model}' is paid/cloud and cannot be used in scheduled runs.")
         raise AuthorizationDenied("scheduled paid providers are prohibited")
     _validate_runner_identity(
         runner,
@@ -410,6 +447,10 @@ def authorize_dispatch(
         resource_units=resource_units,
     )
     return provider_class
+
+
+def _is_paid_ollama_cloud(target: ProviderTarget) -> bool:
+    return target.kind == "llm" and target.provider == "ollama" and ollama_cost_class(target.model) == "paid-cloud"
 
 
 _SAFE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
@@ -495,11 +536,6 @@ def _literal_local_ollama_endpoint(endpoint: str | None) -> bool:
     except ValueError:
         return False
     return parts.scheme == "http" and address.is_loopback and port == 11434 and parts.username is None and parts.password is None and not parts.query and not parts.fragment
-
-
-def _cloud_labelled(model: str) -> bool:
-    labels = set(re.split(r"[/:\s_-]+", model.casefold()))
-    return bool(labels.intersection({"cloud", "hosted", "remote"}))
 
 
 def _safe_text(value: str, *, maximum: int) -> bool:

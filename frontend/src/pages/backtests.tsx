@@ -108,21 +108,32 @@ export function BacktestsPage() {
   const activeOperation = currentOperation.data?.id === operationId ? currentOperation.data : null;
   const selectedMandate = mandates.data?.items.find((item) => item.name === fund) ?? null;
   const selectedModel = settings.data?.models.find((item) => item.id === settings.data?.model) ?? null;
+  const paidLlmModel = Boolean(
+    selectedModel
+    && (selectedModel.provider !== "Ollama" || selectedModel.cost_class === "paid-cloud"),
+  );
+  const hasKimiCloudCostModel = selectedModel?.provider === "Ollama"
+    && selectedModel.cost_class === "paid-cloud"
+    && selectedModel.id === "kimi-k3.1-pro:cloud";
   const paidProviderNames = [
     ...(settings.data?.data_provider === "fd" ? ["Financial Datasets"] : []),
-    ...(settings.data && settings.data.llm_provider !== "Ollama" ? [settings.data.llm_provider] : []),
+    ...(settings.data && paidLlmModel ? [settings.data.llm_provider] : []),
   ];
   const paidOperation = paidProviderNames.length > 0;
   const minimumAttemptCost = settings.data?.data_provider === "fd"
     ? 0.16
-    : selectedModel?.provider === "TypeSafe" && selectedModel.id === "jev-1.13.0"
-      ? 0.002688
-      : paidOperation ? Number.POSITIVE_INFINITY : 0;
+    : hasKimiCloudCostModel
+      ? 3.31072
+      : selectedModel?.provider === "TypeSafe" && selectedModel.id === "jev-1.13.0"
+        ? 0.002688
+        : paidOperation ? Number.POSITIVE_INFINITY : 0;
   const costModelDescription = settings.data?.data_provider === "fd"
     ? "Financial Datasets public self-service maximum, including the 8× Credits premium multiplier; custom Enterprise pricing is unsupported."
-    : selectedModel?.provider === "TypeSafe" && selectedModel.id === "jev-1.13.0"
-      ? "Jev 1.13.0 published input-token rate with a 64K context ceiling; output tokens free; 1 MiB local request cap."
-      : "No verified paid cost model; this provider is denied.";
+    : hasKimiCloudCostModel
+      ? "Operator-declared Ollama rates: $2.00/1M input ($0.20 cached) and $10.00/1M output; $3.310720 bound assumes uncached 1M input and a cloud-enforced 131,072-token output cap."
+      : selectedModel?.provider === "TypeSafe" && selectedModel.id === "jev-1.13.0"
+        ? "Jev 1.13.0 published input-token rate with a 64K context ceiling; output tokens free; 1 MiB local request cap."
+        : "No verified paid cost model; this provider is denied.";
   const paidBudgetValid =
     /^\d+$/.test(paidMaxCalls)
     && Number(paidMaxCalls) >= 1
@@ -477,7 +488,7 @@ export function BacktestsPage() {
                   </div>
                   <div className="space-y-1">
                     <Label htmlFor="paid-max-attempt">Worst-case / attempt ($)</Label>
-                    <Input id="paid-max-attempt" type="number" min="0.000001" max="10" step="0.01" value={paidMaxAttemptCost} onChange={(event) => setPaidMaxAttemptCost(event.target.value)} disabled={!canRun || running} />
+                    <Input id="paid-max-attempt" type="number" min={hasKimiCloudCostModel ? minimumAttemptCost : 0.000001} max="10" step={hasKimiCloudCostModel ? "0.000001" : "0.01"} value={paidMaxAttemptCost} onChange={(event) => setPaidMaxAttemptCost(event.target.value)} disabled={!canRun || running} />
                   </div>
                   <div className="space-y-1">
                     <Label htmlFor="paid-max-cost">Total operation cap ($)</Label>

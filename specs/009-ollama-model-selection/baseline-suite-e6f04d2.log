@@ -1,0 +1,72 @@
+﻿........................................................................ [  2%]
+...................................ss................................... [  4%]
+.....................................................FFFFFFFFFF......... [  6%]
+........................................................................ [  9%]
+........................................................................ [ 11%]
+........................................................................ [ 13%]
+........................................................................ [ 16%]
+.........ssssssssssssssssssssssssssssssssssss........................... [ 18%]
+...............................FFF...................................... [ 20%]
+........................................................................ [ 23%]
+........................................................................ [ 25%]
+........................................................................ [ 27%]
+........................................................................ [ 30%]
+........................................................................ [ 32%]
+........................................................................ [ 34%]
+...................F.................................................... [ 37%]
+...............................................................FF....... [ 39%]
+........................................................................ [ 41%]
+........................................................................ [ 44%]
+........................................................................ [ 46%]
+........................................................................ [ 48%]
+....s..s..s........ssss................................................. [ 51%]
+........................................................................ [ 53%]
+...........................................................s.......sssss [ 55%]
+sss..................................................................... [ 58%]
+.........F.......................................s..s.......s........... [ 60%]
+........................................................................ [ 62%]
+........................................................................ [ 65%]
+.........................F......................ss....................s. [ 67%]
+........................................................................ [ 69%]
+........................................................................ [ 72%]
+.......F................................................................ [ 74%]
+........................................................................ [ 76%]
+...............F........................................................ [ 79%]
+........................................................................ [ 81%]
+........................................................................ [ 83%]
+........................................................................ [ 85%]
+....................................FFFFFF.............................. [ 88%]
+........................................................................ [ 90%]
+........................................................................ [ 92%]
+........................................................................ [ 95%]
+........................................................................ [ 97%]
+...........s..........................................s................. [ 99%]
+..                                                                       [100%]
+=========================== short test summary info ===========================
+FAILED hedge_fund/test_run.py::test_saxo_demo_execution_refuses_before_ledger_or_execution[argv0]
+FAILED hedge_fund/test_run.py::test_saxo_demo_execution_refuses_before_ledger_or_execution[argv1]
+FAILED hedge_fund/test_run.py::test_saxo_demo_execution_refuses_before_ledger_or_execution[argv2]
+FAILED hedge_fund/test_run.py::test_saxo_demo_execution_refuses_before_ledger_or_execution[argv3]
+FAILED hedge_fund/test_run.py::test_saxo_guard_preserves_nonexecuting_verdicts_and_oauth_paper_approvals[saxo-False-approve-True]
+FAILED hedge_fund/test_run.py::test_saxo_guard_preserves_nonexecuting_verdicts_and_oauth_paper_approvals[saxo-False-approve-False]
+FAILED hedge_fund/test_run.py::test_saxo_guard_preserves_nonexecuting_verdicts_and_oauth_paper_approvals[saxo-True-approve-False]
+FAILED hedge_fund/test_run.py::test_saxo_guard_preserves_nonexecuting_verdicts_and_oauth_paper_approvals[saxo-True-reject-False]
+FAILED hedge_fund/test_run.py::test_saxo_guard_preserves_nonexecuting_verdicts_and_oauth_paper_approvals[paper-True-approve-True]
+FAILED hedge_fund/test_run.py::test_saxo_guard_preserves_nonexecuting_verdicts_and_oauth_paper_approvals[paper-False-approve-True]
+FAILED hedge_fund/data/test_yfinance_client.py::test_news_falls_back_to_search_when_ticker_endpoint_is_down
+FAILED hedge_fund/data/test_yfinance_client.py::test_news_preserves_failure_when_search_is_empty_after_outage
+FAILED hedge_fund/data/test_yfinance_client.py::test_news_raises_when_search_also_fails
+FAILED hedge_fund/paper/test_deployed_broker.py::test_saxo_reconciliation_uses_accounting_cash_and_refuses_mismatch
+FAILED hedge_fund/paper/test_saxo_e2e.py::test_fake_transport_saxo_client_deferral_reaches_the_session_ledger
+FAILED hedge_fund/paper/test_saxo_e2e.py::test_saxo_external_adapter_records_order_fill_in_ledger
+FAILED hedge_fund/runtime/test_inventory_cache_race.py::test_approval_waiting_for_sibling_publication_does_not_block_halt
+FAILED hedge_fund/runtime/test_process_identity.py::test_linux_process_identity_parses_pid1_stat_with_parenthesized_command
+FAILED hedge_fund/runtime/test_writer_inventory.py::test_every_production_writer_is_classified_by_admission_class
+FAILED hedge_fund/runtime/test_writer_races.py::test_two_process_audit_appends_are_complete_and_uninterleaved
+FAILED hedge_fund/web/test_actions.py::test_nonlocal_broker_mutations_stop_before_ledger_adapter[approve]
+FAILED hedge_fund/web/test_actions.py::test_nonlocal_broker_mutations_stop_before_ledger_adapter[halt]
+FAILED hedge_fund/web/test_actions.py::test_nonlocal_broker_mutations_stop_before_ledger_adapter[resume]
+FAILED hedge_fund/web/test_actions.py::test_nonlocal_broker_mutations_stop_before_ledger_adapter[runner-stop]
+FAILED hedge_fund/web/test_actions.py::test_saxo_web_routes_deny_before_provider_or_writer_effects
+FAILED hedge_fund/web/test_actions.py::test_saxo_accept_routes_reject_previews_before_worker_or_ledger_effects
+26 failed, 3010 passed, 62 skipped in 5678.74s (1:34:38)

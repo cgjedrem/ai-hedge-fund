@@ -8,8 +8,11 @@ from ipaddress import ip_address
 from urllib.parse import parse_qsl, urlsplit
 
 from hedge_fund.runtime.policy import (
-    APPROVED_LOCAL_MODELS,
+    approved_local_ollama_chat_models,
     AuthorizationDenied,
+    is_ollama_chat_model,
+    ollama_cost_class,
+    PaidCloudAuthorizationDenied,
     ProviderTarget,
 )
 
@@ -103,9 +106,16 @@ class PinnedAddress:
     local: bool
 
 
-def provider_base_url(target: ProviderTarget) -> str:
+def provider_base_url(
+    target: ProviderTarget,
+    *,
+    per_operation_authorization_supplied: bool = False,
+) -> str:
     """Return canonical default or validated configured endpoint."""
-    validate_provider_target(target)
+    validate_provider_target(
+        target,
+        per_operation_authorization_supplied=per_operation_authorization_supplied,
+    )
     if target.endpoint is not None:
         return target.endpoint
     try:
@@ -114,10 +124,17 @@ def provider_base_url(target: ProviderTarget) -> str:
         raise AuthorizationDenied("provider transport is unsupported") from None
 
 
-def validate_request_url(target: ProviderTarget, url: str) -> tuple[str, int, bool]:
+def validate_request_url(
+    target: ProviderTarget,
+    url: str,
+    *,
+    per_operation_authorization_supplied: bool = False,
+) -> tuple[str, int, bool]:
     """Return approved host, port, locality; reject origin or credential drift."""
     if not isinstance(target, ProviderTarget) or not isinstance(url, str):
         raise AuthorizationDenied("provider destination is invalid")
+    if type(per_operation_authorization_supplied) is not bool:
+        raise AuthorizationDenied("paid-cloud allowance is invalid")
     try:
         parts = urlsplit(url)
         port = parts.port
@@ -130,8 +147,15 @@ def validate_request_url(target: ProviderTarget, url: str) -> tuple[str, int, bo
         raise AuthorizationDenied("provider URL cannot carry credentials")
     endpoint = _validate_configured_endpoint(target)
     if target.kind == "llm" and target.provider == "ollama":
-        if target.model not in APPROVED_LOCAL_MODELS or endpoint != (_OLLAMA_HOST, _OLLAMA_PORT, "http") or host != _OLLAMA_HOST or parts.scheme.casefold() != "http" or port not in (None, _OLLAMA_PORT):
+        if endpoint != (_OLLAMA_HOST, _OLLAMA_PORT, "http") or host != _OLLAMA_HOST or parts.scheme.casefold() != "http" or port not in (None, _OLLAMA_PORT):
             raise AuthorizationDenied("Ollama destination is not the approved loopback endpoint")
+        if target.model not in approved_local_ollama_chat_models():
+            if ollama_cost_class(target.model) != "paid-cloud" or not per_operation_authorization_supplied:
+                raise AuthorizationDenied("Ollama destination is not the approved loopback endpoint")
+            from hedge_fund.runtime.costs import has_verified_cost_model
+
+            if not has_verified_cost_model(target):
+                raise PaidCloudAuthorizationDenied("no verified cost model")
         return host, _OLLAMA_PORT, True
     allowed_hosts = _REMOTE_HOSTS.get((target.kind, target.provider))
     if not allowed_hosts:
@@ -141,14 +165,36 @@ def validate_request_url(target: ProviderTarget, url: str) -> tuple[str, int, bo
     return host, 443, False
 
 
-def validate_provider_target(target: ProviderTarget) -> None:
-    """Reject unsupported provider transports and configured origins."""
+def validate_provider_target(
+    target: ProviderTarget,
+    *,
+    allow_paid_cloud: bool = False,
+    per_operation_authorization_supplied: bool = False,
+) -> None:
+    """Reject unsupported transport, origin or Ollama model."""
     if not isinstance(target, ProviderTarget):
         raise AuthorizationDenied("provider target is invalid")
+    if type(allow_paid_cloud) is not bool or type(per_operation_authorization_supplied) is not bool:
+        raise AuthorizationDenied("paid-cloud allowance is invalid")
     endpoint = _validate_configured_endpoint(target)
     if target.kind == "llm" and target.provider == "ollama":
-        if target.model not in APPROVED_LOCAL_MODELS or endpoint != (_OLLAMA_HOST, _OLLAMA_PORT, "http"):
+        if endpoint != (_OLLAMA_HOST, _OLLAMA_PORT, "http"):
             raise AuthorizationDenied("Ollama destination is not the approved loopback endpoint")
+        if not is_ollama_chat_model(target.model):
+            raise AuthorizationDenied("Ollama model is not an approved chat model")
+        cost_class = ollama_cost_class(target.model)
+        if cost_class == "paid-cloud":
+            if allow_paid_cloud:
+                return
+            if per_operation_authorization_supplied:
+                from hedge_fund.runtime.costs import has_verified_cost_model
+
+                if not has_verified_cost_model(target):
+                    raise PaidCloudAuthorizationDenied("no verified cost model")
+                return
+            raise PaidCloudAuthorizationDenied(f"Model '{target.model}' is paid/cloud and requires explicit per-operation authorization.")
+        if cost_class != "local" or target.model not in approved_local_ollama_chat_models():
+            raise AuthorizationDenied("Ollama model is not an approved local chat model")
         return
     if (target.kind, target.provider) not in _REMOTE_HOSTS:
         raise AuthorizationDenied("provider transport is unsupported")

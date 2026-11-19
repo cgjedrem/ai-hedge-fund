@@ -6,7 +6,7 @@ import json
 import os
 import sys
 from contextlib import nullcontext
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -933,6 +933,497 @@ def test_paid_provider_requires_explicit_consent_even_with_network_and_env_key(
     assert forbidden.call_count == 0
     assert not (root / "research").exists()
     assert not (root / "paper").exists()
+
+
+def test_cli_model_flag_accepts_catalog_ollama_cloud_tag(tmp_path, monkeypatch):
+    from hedge_fund.runtime.root import RootContext
+
+    root = tmp_path / "cli-cloud-model"
+    root.mkdir()
+    monkeypatch.setenv("HEDGE_FUND_LLM_MODEL", "gemma3:4b")
+    parser = run._parser()
+    args = parser.parse_args(["--root", str(root), "--model", "kimi-k3:cloud"])
+
+    with RootContext.open(root) as context:
+        settings, _admission = run._cli_settings(context, args, parser)
+
+    assert settings.model == "kimi-k3:cloud"
+    assert settings.llm_provider == "Ollama"
+    assert settings.provenance["model"] == "launch"
+
+
+def test_cli_backtest_paid_cloud_reports_transport_refusal(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    offline,
+):
+    root = tmp_path / "cli-cloud-run"
+    root.mkdir()
+    _enroll_test_root(root)
+    path = _mandate(root, name="cloud-run")
+    monkeypatch.setattr(run, "PAPER_DIR", root / "paper")
+    monkeypatch.setenv("HEDGE_FUND_LLM_MODEL", "gemma3:4b")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "aihf",
+            "--root",
+            str(root),
+            "--enable-network",
+            "--model",
+            "kimi-k3:cloud",
+            "backtest",
+            str(path),
+            "--universe",
+            "AAPL",
+            "--start",
+            "2025-01-06",
+            "--end",
+            "2025-01-07",
+        ],
+    )
+
+    with pytest.raises(SystemExit) as rejected:
+        run.main()
+
+    output = capsys.readouterr()
+    assert rejected.value.code == 2
+    assert "Model 'kimi-k3:cloud' is paid/cloud and requires explicit per-operation authorization." in output.err
+    assert "no guarded production transport" not in output.err
+    assert not (root / "research").exists()
+    assert not (root / "paper").exists()
+
+
+def test_cli_backtest_paid_cloud_authorization_reports_missing_cost_model(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    offline,
+):
+    root = tmp_path / "cli-cloud-authorized-run"
+    root.mkdir()
+    _enroll_test_root(root)
+    path = _mandate(root, name="cloud-authorized-run")
+    monkeypatch.setattr(run, "PAPER_DIR", root / "paper")
+    monkeypatch.setenv("HEDGE_FUND_LLM_MODEL", "gemma3:4b")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "aihf",
+            "--root",
+            str(root),
+            "--enable-network",
+            "--model",
+            "kimi-k3:cloud",
+            "backtest",
+            str(path),
+            "--universe",
+            "AAPL",
+            "--start",
+            "2025-01-06",
+            "--end",
+            "2025-01-07",
+            "--authorize-paid-provider",
+            "ollama",
+            "--paid-max-calls",
+            "1",
+            "--paid-max-cost-usd",
+            "1",
+            "--paid-max-attempt-cost-usd",
+            "0.25",
+        ],
+    )
+
+    with pytest.raises(SystemExit) as rejected:
+        run.main()
+
+    output = capsys.readouterr()
+    assert rejected.value.code == 2
+    assert "no verified cost model" in output.err
+    assert "requires explicit per-operation authorization" not in output.err
+    assert not (root / "research").exists()
+    assert not (root / "paper").exists()
+
+
+@pytest.mark.parametrize(
+    ("budget_args", "expected_error"),
+    [
+        (
+            ["--paid-max-calls", "1"],
+            "Model 'kimi-k3.1-pro:cloud' is paid/cloud and requires explicit per-operation authorization.",
+        ),
+        (
+            [
+                "--paid-max-calls",
+                "1",
+                "--paid-max-cost-usd",
+                "10",
+                "--paid-max-attempt-cost-usd",
+                "3.31071",
+            ],
+            "per-attempt cost bound is below the provider's verified maximum",
+        ),
+    ],
+)
+def test_cli_backtest_paid_kimi_cloud_requires_verified_budget(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    offline,
+    budget_args,
+    expected_error,
+):
+    root = tmp_path / "cli-kimi-cloud-budget"
+    root.mkdir()
+    _enroll_test_root(root)
+    path = _mandate(root, name="kimi-cloud-underbound")
+    monkeypatch.setattr(run, "PAPER_DIR", root / "paper")
+    monkeypatch.setenv("HEDGE_FUND_LLM_MODEL", "gemma3:4b")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "aihf",
+            "--root",
+            str(root),
+            "--enable-network",
+            "--model",
+            "kimi-k3.1-pro:cloud",
+            "backtest",
+            str(path),
+            "--universe",
+            "AAPL",
+            "--start",
+            "2025-01-06",
+            "--end",
+            "2025-01-07",
+            "--authorize-paid-provider",
+            "ollama",
+            *budget_args,
+        ],
+    )
+
+    with pytest.raises(SystemExit) as rejected:
+        run.main()
+
+    output = capsys.readouterr()
+    assert rejected.value.code == 2
+    assert expected_error in output.err
+    assert not (root / "research").exists()
+    assert not (root / "paper").exists()
+
+
+def test_cli_backtest_paid_kimi_cloud_main_constructs_guarded_client_without_credentials(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    offline,
+):
+    import httpx
+    import langchain_ollama
+
+    from hedge_fund.runtime import credentials
+    from hedge_fund.runtime.dispatch import ProviderDispatch
+    from hedge_fund.runtime.policy import ProviderTarget
+
+    model = "kimi-k3.1-pro:cloud"
+    root = tmp_path / "cli-kimi-cloud-authorized"
+    root.mkdir()
+    _enroll_test_root(root)
+    path = _mandate(root, name="cli-kimi-cloud-authorized")
+    monkeypatch.setattr(run, "PAPER_DIR", root / "paper")
+    monkeypatch.setenv("HEDGE_FUND_LLM_MODEL", "gemma3:4b")
+    credential_store = Mock(side_effect=AssertionError("keyless provider credential lookup"))
+    monkeypatch.setattr(credentials, "CredentialStore", credential_store)
+
+    constructed = []
+
+    class FakeChatOllama:
+        def __init__(self, **kwargs):
+            constructed.append(kwargs)
+
+    monkeypatch.setattr(langchain_ollama, "ChatOllama", FakeChatOllama)
+
+    transport_constructions = []
+    original_httpx_transport = ProviderDispatch.httpx_transport
+
+    def httpx_transport_with_mock_inner(dispatch, target, *, inner_transport=None):
+        mock_inner = httpx.MockTransport(lambda request: httpx.Response(200, request=request))
+        guarded_transport = original_httpx_transport(dispatch, target, inner_transport=mock_inner)
+        transport_constructions.append((dispatch, target, guarded_transport, mock_inner))
+        return guarded_transport
+
+    monkeypatch.setattr(ProviderDispatch, "httpx_transport", httpx_transport_with_mock_inner)
+
+    funds = []
+
+    class ClientConstructingFund:
+        def __init__(self, spec, *, blind, llm_factory, breakpoints_dispatch):
+            self.spec = spec
+            self.blind = blind
+            self.dispatch = breakpoints_dispatch
+            self.llm = llm_factory(None)
+            funds.append(self)
+
+    monkeypatch.setattr(run, "Fund", ClientConstructingFund)
+
+    class BacktestReached(Exception):
+        pass
+
+    def stop_after_client_construction(fund, *_args):
+        assert fund is funds[0]
+        raise BacktestReached
+
+    monkeypatch.setattr(run, "backtest_fund", stop_after_client_construction)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "aihf",
+            "--root",
+            str(root),
+            "--enable-network",
+            "--model",
+            model,
+            "backtest",
+            str(path),
+            "--universe",
+            "AAPL",
+            "--start",
+            "2025-01-06",
+            "--end",
+            "2025-01-07",
+            "--authorize-paid-provider",
+            "ollama",
+            "--paid-max-calls",
+            "1",
+            "--paid-max-cost-usd",
+            "10",
+            "--paid-max-attempt-cost-usd",
+            "3.31072",
+        ],
+    )
+
+    with pytest.raises(BacktestReached):
+        run.main()
+
+    output = capsys.readouterr()
+    assert "Paid dispatch authorized: ollama" in output.err
+    assert credential_store.call_count == 0
+    assert len(funds) == 1
+    assert funds[0].blind is True
+    assert len(constructed) == 1
+    assert constructed[0]["model"] == model
+    assert len(transport_constructions) == 1
+    dispatch, target, guarded_transport, mock_inner = transport_constructions[0]
+    assert isinstance(target, ProviderTarget)
+    assert target.provider == "ollama"
+    assert target.model == model
+    assert dispatch.has_one_shot_authorization(target)
+    assert funds[0].dispatch is dispatch
+    assert constructed[0]["client_kwargs"]["transport"] is guarded_transport
+    assert isinstance(mock_inner, httpx.MockTransport)
+
+
+@pytest.mark.parametrize(
+    "paid_args",
+    [
+        [
+            "--paid-max-calls",
+            "1",
+            "--paid-max-cost-usd",
+            "10",
+            "--paid-max-attempt-cost-usd",
+            "3.31072",
+        ],
+        ["--authorize-paid-provider", "ollama"],
+    ],
+    ids=["no-authorization", "no-budget"],
+)
+def test_cli_backtest_paid_kimi_cloud_main_refuses_without_authorization_or_budget(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    offline,
+    paid_args,
+):
+    import langchain_ollama
+
+    model = "kimi-k3.1-pro:cloud"
+    root = tmp_path / "cli-kimi-cloud-refused"
+    root.mkdir()
+    _enroll_test_root(root)
+    path = _mandate(root, name="cli-kimi-cloud-refused")
+    monkeypatch.setattr(run, "PAPER_DIR", root / "paper")
+    monkeypatch.setenv("HEDGE_FUND_LLM_MODEL", "gemma3:4b")
+    forbidden = Mock(side_effect=AssertionError("paid provider dispatched without full authorization"))
+    monkeypatch.setattr(run, "Fund", forbidden)
+    monkeypatch.setattr(run, "backtest_fund", forbidden)
+    monkeypatch.setattr(run, "make_data_client", forbidden)
+    monkeypatch.setattr(langchain_ollama, "ChatOllama", forbidden)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "aihf",
+            "--root",
+            str(root),
+            "--enable-network",
+            "--model",
+            model,
+            "backtest",
+            str(path),
+            "--universe",
+            "AAPL",
+            "--start",
+            "2025-01-06",
+            "--end",
+            "2025-01-07",
+            *paid_args,
+        ],
+    )
+
+    with pytest.raises(SystemExit) as rejected:
+        run.main()
+
+    output = capsys.readouterr()
+    assert rejected.value.code == 2
+    assert "requires explicit per-operation authorization" in output.err
+    assert "paid provider credential" not in output.err
+    assert forbidden.call_count == 0
+    assert not (root / "research").exists()
+    assert not (root / "paper").exists()
+
+
+def test_cli_kimi_cloud_factory_constructs_client_from_budgeted_dispatch(monkeypatch):
+    import langchain_ollama
+
+    from hedge_fund.runtime.configuration import RuntimeSettings
+    from hedge_fund.runtime.costs import minimum_attempt_cost
+    from hedge_fund.runtime.dispatch import make_one_shot_dispatch
+    from hedge_fund.runtime.policy import ProviderTarget
+
+    model = "kimi-k3.1-pro:cloud"
+    target = ProviderTarget(kind="llm", provider="ollama", model=model)
+    cost = minimum_attempt_cost(target)
+    now = datetime.now(timezone.utc)
+    dispatch = make_one_shot_dispatch(
+        root_id="cli-kimi-root",
+        subject_id="cli-kimi",
+        capture_digest="a" * 64,
+        operation_id="cli-kimi-operation",
+        operation_digest="b" * 64,
+        expires_at=now + timedelta(minutes=5),
+        targets=(target,),
+        max_calls=1,
+        max_cost=cost,
+        max_resources=1,
+        upper_bound_costs={target.identity: cost},
+        per_target_bounds={target.identity: (1, cost, 1)},
+        clock=lambda: now,
+    )
+    constructed = []
+
+    class FakeChatOllama:
+        def __init__(self, **kwargs):
+            constructed.append(kwargs)
+
+    monkeypatch.setattr(langchain_ollama, "ChatOllama", FakeChatOllama)
+    settings = RuntimeSettings(model=model, llm_provider="Ollama")
+    client = run._cli_llm_factory(settings, dispatch, None)(None)
+
+    assert client.model == model
+    assert dispatch.has_one_shot_authorization(target)
+    assert len(constructed) == 1
+    assert constructed[0]["model"] == model
+    assert constructed[0]["num_ctx"] == 8192
+    assert constructed[0]["client_kwargs"]["transport"] is not None
+
+
+def test_cli_unknown_model_fails_with_catalog_reason(tmp_path, capsys):
+    from hedge_fund.runtime.root import RootContext
+
+    root = tmp_path / "cli-unknown-model"
+    root.mkdir()
+    model = "kimi-k3.1:latest"
+    parser = run._parser()
+    args = parser.parse_args(["--root", str(root), "--model", model])
+
+    with RootContext.open(root) as context:
+        with pytest.raises(SystemExit) as rejected:
+            run._cli_settings(context, args, parser)
+
+    output = capsys.readouterr()
+    assert rejected.value.code == 2
+    assert f"Model '{model}' is not in the supported provider catalog." in output.err
+    assert "captured runtime settings are unavailable" not in output.err
+
+
+def test_cli_unknown_model_with_non_ollama_provider_reports_catalog_reason(tmp_path, monkeypatch, capsys):
+    from hedge_fund.runtime.root import RootContext
+
+    root = tmp_path / "cli-unknown-openai-model"
+    root.mkdir()
+    model = "synthetic-unknown-model"
+    monkeypatch.setenv("HEDGE_FUND_LLM_PROVIDER", "OpenAI")
+    parser = run._parser()
+    args = parser.parse_args(["--root", str(root), "--model", model])
+
+    with RootContext.open(root) as context:
+        with pytest.raises(SystemExit) as rejected:
+            run._cli_settings(context, args, parser)
+
+    output = capsys.readouterr()
+    assert rejected.value.code == 2
+    assert f"Model '{model}' is not in the supported provider catalog." in output.err
+    assert "captured runtime settings are unavailable" not in output.err
+
+
+def test_cli_settings_failure_keeps_generic_capture_message(tmp_path, monkeypatch, capsys):
+    from hedge_fund.runtime import configuration
+    from hedge_fund.runtime.root import RootContext
+
+    root = tmp_path / "cli-invalid-settings"
+    root.mkdir()
+    monkeypatch.setattr(
+        configuration,
+        "resolve_settings",
+        Mock(side_effect=configuration.ConfigurationError("settings record is invalid")),
+    )
+    parser = run._parser()
+    args = parser.parse_args(["--root", str(root), "--model", "kimi-k3:cloud"])
+
+    with RootContext.open(root) as context:
+        with pytest.raises(SystemExit) as rejected:
+            run._cli_settings(context, args, parser)
+
+    output = capsys.readouterr()
+    assert rejected.value.code == 2
+    assert "captured runtime settings are unavailable" in output.err
+    assert "settings record is invalid" not in output.err
+
+
+def test_cli_non_ollama_provider_mismatch_keeps_existing_capture_message(tmp_path, monkeypatch, capsys):
+    from hedge_fund.runtime.root import RootContext
+
+    root = tmp_path / "cli-provider-mismatch"
+    root.mkdir()
+    monkeypatch.setenv("HEDGE_FUND_LLM_MODEL", "gpt-6-sol")
+    monkeypatch.setenv("HEDGE_FUND_LLM_PROVIDER", "Kimi")
+    parser = run._parser()
+    args = parser.parse_args(["--root", str(root)])
+
+    with RootContext.open(root) as context:
+        with pytest.raises(SystemExit) as rejected:
+            run._cli_settings(context, args, parser)
+
+    output = capsys.readouterr()
+    assert rejected.value.code == 2
+    assert "captured runtime settings are unavailable" in output.err
+    assert "model and provider do not match" not in output.err
 
 
 def test_paid_fd_cli_backtest_uses_guarded_client_and_fake_transport(

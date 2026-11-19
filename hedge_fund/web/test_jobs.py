@@ -253,6 +253,209 @@ def _mandate_fingerprint(root, name="demo-quality"):
     return mandate_hash(load_spec(root / "mandates" / f"{name}.yaml"))
 
 
+def test_web_backtest_preview_reports_paid_cloud_refusal_at_route(demo_root):
+    app = create_app(
+        root=demo_root,
+        allow_writes=True,
+        network_enabled=True,
+        demo=True,
+    )
+    with TestClient(app, client=("127.0.0.1", 50000)) as client:
+        headers = _write_headers(client)
+        settings = client.get("/api/settings", headers={"host": "127.0.0.1"}).json()
+        selected = client.post(
+            "/api/settings/model",
+            headers=headers,
+            json={"model": "kimi-k3:cloud", "expected_version": settings["version"]},
+        )
+        assert selected.status_code == 200, selected.text
+        mandate_digest = _mandate_fingerprint(demo_root)
+        response = client.post(
+            "/api/operations/preview",
+            headers=headers,
+            json={
+                "action": "backtest",
+                "subject_id": "demo-quality",
+                "expected_head": mandate_digest,
+                "payload": {
+                    "fund": "demo-quality",
+                    "universe": ["AAPL"],
+                    "start": "2024-06-03",
+                    "end": "2024-06-07",
+                    "provider": "yfinance",
+                    "model": "kimi-k3:cloud",
+                    "mandate_hash": mandate_digest,
+                },
+            },
+        )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == ("Model 'kimi-k3:cloud' is paid/cloud and requires explicit per-operation authorization.")
+    assert response.json()["code"] == "capability-denied"
+
+
+def test_web_backtest_preview_with_paid_authorization_reports_missing_cost_model(demo_root):
+    app = create_app(
+        root=demo_root,
+        allow_writes=True,
+        network_enabled=True,
+        demo=True,
+    )
+    with TestClient(app, client=("127.0.0.1", 50000)) as client:
+        headers = _write_headers(client)
+        settings = client.get("/api/settings", headers={"host": "127.0.0.1"}).json()
+        selected = client.post(
+            "/api/settings/model",
+            headers=headers,
+            json={"model": "kimi-k3:cloud", "expected_version": settings["version"]},
+        )
+        assert selected.status_code == 200, selected.text
+        mandate_digest = _mandate_fingerprint(demo_root)
+        response = client.post(
+            "/api/operations/preview",
+            headers=headers,
+            json={
+                "action": "backtest",
+                "subject_id": "demo-quality",
+                "expected_head": mandate_digest,
+                "payload": {
+                    "fund": "demo-quality",
+                    "universe": ["AAPL"],
+                    "start": "2024-06-03",
+                    "end": "2024-06-07",
+                    "provider": "yfinance",
+                    "model": "kimi-k3:cloud",
+                    "mandate_hash": mandate_digest,
+                    "authorize_paid_provider": True,
+                    "paid_max_calls": 1,
+                    "paid_max_cost_usd": "1",
+                    "paid_max_attempt_cost_usd": "0.25",
+                },
+            },
+        )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "no verified cost model"
+    assert response.json()["code"] == "capability-denied"
+
+
+@pytest.mark.parametrize(
+    ("budget", "expected_status", "expected_detail"),
+    [
+        ({"paid_max_calls": 1, "paid_max_cost_usd": "10", "paid_max_attempt_cost_usd": "3.31071"}, 422, "Per-attempt cost bound is below the provider's verified maximum."),
+        ({"paid_max_calls": 1, "paid_max_cost_usd": "10", "paid_max_attempt_cost_usd": "3.31072"}, 201, None),
+        ({}, 400, "Invalid request."),
+    ],
+)
+def test_web_backtest_preview_enforces_verified_kimi_cost_bound(demo_root, budget, expected_status, expected_detail):
+    app = create_app(
+        root=demo_root,
+        allow_writes=True,
+        network_enabled=True,
+        demo=True,
+    )
+    with TestClient(app, client=("127.0.0.1", 50000)) as client:
+        headers = _write_headers(client)
+        settings = client.get("/api/settings", headers={"host": "127.0.0.1"}).json()
+        selected = client.post(
+            "/api/settings/model",
+            headers=headers,
+            json={"model": "kimi-k3.1-pro:cloud", "expected_version": settings["version"]},
+        )
+        assert selected.status_code == 200, selected.text
+        mandate_digest = _mandate_fingerprint(demo_root)
+        response = client.post(
+            "/api/operations/preview",
+            headers=headers,
+            json={
+                "action": "backtest",
+                "subject_id": "demo-quality",
+                "expected_head": mandate_digest,
+                "payload": {
+                    "fund": "demo-quality",
+                    "universe": ["AAPL"],
+                    "start": "2024-06-03",
+                    "end": "2024-06-07",
+                    "provider": "yfinance",
+                    "model": "kimi-k3.1-pro:cloud",
+                    "mandate_hash": mandate_digest,
+                    "authorize_paid_provider": True,
+                    **budget,
+                },
+            },
+        )
+
+    assert response.status_code == expected_status, response.text
+    if expected_status == 422:
+        assert expected_detail in response.text
+        if expected_detail.startswith("Per-attempt"):
+            assert response.json()["code"] == "readiness-denied"
+    elif expected_status == 400:
+        assert response.json()["code"] == "invalid-request"
+        assert response.json()["message"] == expected_detail
+    else:
+        assert response.json()["estimate"]["cost_model_id"] == "ollama-kimi-k3.1-pro-1m-context-v1"
+        assert response.json()["estimate"]["maximum_attempt_cost_usd"] == pytest.approx(3.31072)
+
+
+def test_web_kimi_cloud_factory_constructs_client_from_budgeted_dispatch(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    import langchain_ollama
+
+    from hedge_fund.runtime.costs import minimum_attempt_cost
+    from hedge_fund.runtime.dispatch import make_one_shot_dispatch
+    from hedge_fund.runtime.policy import ProviderTarget
+
+    model = "kimi-k3.1-pro:cloud"
+    target = ProviderTarget(kind="llm", provider="ollama", model=model)
+    cost = minimum_attempt_cost(target)
+    now = datetime.now(timezone.utc)
+    dispatch = make_one_shot_dispatch(
+        root_id="web-kimi-root",
+        subject_id="web-kimi",
+        capture_digest="a" * 64,
+        operation_id="web-kimi-operation",
+        operation_digest="b" * 64,
+        expires_at=now + timedelta(minutes=5),
+        targets=(target,),
+        max_calls=1,
+        max_cost=cost,
+        max_resources=1,
+        upper_bound_costs={target.identity: cost},
+        per_target_bounds={target.identity: (1, cost, 1)},
+        clock=lambda: now,
+    )
+    raw_spec = _spec("web-kimi")
+    raw_spec["strategies"] = [custom_strategy(["buffett"]).model_dump(mode="json")]
+    spec = FundSpec.model_validate(raw_spec)
+    capture = SimpleNamespace(
+        llm_provider="Ollama",
+        model=model,
+        timeout_seconds=60.0,
+        parameters={},
+        endpoint=None,
+    )
+    constructed = []
+
+    class FakeChatOllama:
+        def __init__(self, **kwargs):
+            constructed.append(kwargs)
+
+    monkeypatch.setattr(langchain_ollama, "ChatOllama", FakeChatOllama)
+    service = DeskService(tmp_path)
+    try:
+        service._default_fund_factory(spec, capture, dispatch)
+    finally:
+        service.close()
+
+    assert dispatch.has_one_shot_authorization(target)
+    assert len(constructed) == 1
+    assert constructed[0]["model"] == model
+    assert constructed[0]["num_ctx"] == 8192
+    assert constructed[0]["client_kwargs"]["transport"] is not None
+
+
 def test_builder_canonical_validation_conflicts_and_deployment(tmp_path):
     enroll_synthetic_root(tmp_path)
     service = DeskService(tmp_path, allow_writes=True)

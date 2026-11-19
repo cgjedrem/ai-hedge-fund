@@ -32,13 +32,15 @@ from hedge_fund.llm import (
     prompt_key,
     PromptCache,
     provider_for,
-    SUPPORTED_PROVIDERS,
 )
+from hedge_fund.llm import registry as registry_module
+from hedge_fund.llm import SUPPORTED_PROVIDERS
 from hedge_fund.llm.client import _flatten, JevLLM
 from hedge_fund.llm.registry import PROVIDER_ENV_VARS
 from hedge_fund.llm.test_contract import _response
 from hedge_fund.runtime.dispatch import make_one_shot_dispatch, ProviderDispatch
 from hedge_fund.runtime.policy import (
+    approved_local_ollama_chat_models,
     AuthorizationDenied,
     classify_provider,
     ProviderTarget,
@@ -168,6 +170,141 @@ def test_ollama_needs_no_key(monkeypatch):
     assert hasattr(llm, "complete")
 
 
+def test_ollama_paid_cloud_client_requires_bound_one_shot_authorization(monkeypatch):
+    import langchain_ollama
+
+    constructed = []
+    monkeypatch.setattr(langchain_ollama, "ChatOllama", lambda **kwargs: constructed.append(kwargs))
+
+    with pytest.raises(AuthorizationDenied, match="requires explicit per-operation authorization"):
+        make_llm("kimi-k3.1-pro:cloud", use_environment=False)
+
+    assert constructed == []
+
+
+def test_ollama_paid_cloud_client_constructs_with_budgeted_operation_dispatch(monkeypatch):
+    import langchain_ollama
+
+    from hedge_fund.runtime.costs import minimum_attempt_cost
+
+    model = "kimi-k3.1-pro:cloud"
+    target = ProviderTarget(kind="llm", provider="ollama", model=model)
+    cost = minimum_attempt_cost(target)
+    now = datetime.now(timezone.utc)
+    dispatch = make_one_shot_dispatch(
+        root_id="llm-test-root",
+        subject_id="llm-test",
+        capture_digest="a" * 64,
+        operation_id="llm-kimi-operation",
+        operation_digest="b" * 64,
+        expires_at=now + timedelta(minutes=5),
+        targets=(target,),
+        max_calls=1,
+        max_cost=cost,
+        max_resources=1,
+        upper_bound_costs={target.identity: cost},
+        per_target_bounds={target.identity: (1, cost, 1)},
+        clock=lambda: now,
+    )
+    constructed = []
+
+    class FakeChatOllama:
+        def __init__(self, **kwargs):
+            constructed.append(kwargs)
+
+    monkeypatch.setattr(langchain_ollama, "ChatOllama", FakeChatOllama)
+    client = make_llm(
+        model,
+        context_size=8192,
+        use_environment=False,
+        dispatch=dispatch,
+    )
+
+    assert client.model == model
+    assert dispatch.has_one_shot_authorization(target)
+    assert len(constructed) == 1
+    assert constructed[0]["model"] == model
+    assert constructed[0]["num_ctx"] == 8192
+    assert constructed[0]["client_kwargs"]["transport"] is not None
+
+
+def test_ollama_paid_cloud_serializes_cost_bound_request_under_guarded_transport(monkeypatch):
+    from hedge_fund.runtime.costs import minimum_attempt_cost
+
+    model = "kimi-k3.1-pro:cloud"
+    target = ProviderTarget(kind="llm", provider="ollama", model=model)
+    expected_bound = minimum_attempt_cost(target)
+    assert expected_bound == Decimal("3.310720")
+    now = datetime.now(timezone.utc)
+    wire_requests = []
+
+    def handle(request):
+        wire_requests.append(request)
+        response = {
+            "model": model,
+            "created_at": "2026-11-19T08:00:00Z",
+            "message": {"role": "assistant", "content": "offline answer"},
+            "done": True,
+            "done_reason": "stop",
+        }
+        return httpx.Response(
+            200,
+            content=(json.dumps(response) + "\n").encode("utf-8"),
+            headers={"content-type": "application/x-ndjson"},
+            request=request,
+        )
+
+    original_transport = ProviderDispatch.httpx_transport
+
+    def guarded_transport(dispatch, selected_target, *, inner_transport=None):
+        assert inner_transport is None
+        return original_transport(
+            dispatch,
+            selected_target,
+            inner_transport=httpx.MockTransport(handle),
+        )
+
+    monkeypatch.setattr(ProviderDispatch, "httpx_transport", guarded_transport)
+    dispatch = make_one_shot_dispatch(
+        root_id="llm-test-root",
+        subject_id="llm-test",
+        capture_digest="a" * 64,
+        operation_id="llm-kimi-wire-operation",
+        operation_digest="b" * 64,
+        expires_at=now + timedelta(minutes=5),
+        targets=(target,),
+        max_calls=1,
+        max_cost=expected_bound,
+        max_resources=1,
+        upper_bound_costs={target.identity: expected_bound},
+        per_target_bounds={target.identity: (1, expected_bound, 1)},
+        clock=lambda: now,
+        resolver=lambda _host, _port: ["127.0.0.1"],
+    )
+    client = make_llm(
+        model,
+        context_size=131_072,
+        max_tokens=131_072,
+        use_environment=False,
+        dispatch=dispatch,
+    )
+
+    assert client.complete("system prompt", "user prompt") == "offline answer"
+    assert len(wire_requests) == 1
+    request = wire_requests[0]
+    body = json.loads(request.content)
+    options = body["options"]
+    assert request.method == "POST"
+    assert str(request.url) == "http://127.0.0.1:11434/api/chat"
+    assert body["model"] == model
+    assert type(options["num_ctx"]) is int and options["num_ctx"] == 131_072
+    assert type(options["num_predict"]) is int and options["num_predict"] == 131_072
+
+    reservation = dispatch._one_shot[target.identity]
+    assert reservation.calls_reserved == 1
+    assert reservation.cost_reserved == expected_bound
+
+
 def test_temperature_reaches_the_chat_model(keyed):
     """make_llm's temperature lands on the underlying chat model."""
     llm = _authorized_make_llm(_BY_PROVIDER["Kimi"], temperature=0.7)
@@ -197,6 +334,30 @@ def test_ollama_receives_captured_generation_context_and_endpoint(monkeypatch):
     assert llm._chat.temperature == 0.4
     assert llm._chat.top_p == 0.8
     assert llm._chat.base_url == "http://127.0.0.1:11434"
+
+
+def test_ollama_cloud_suffix_must_be_paid_cloud_in_catalog(tmp_path, monkeypatch):
+    model = "synthetic-local:cloud"
+    original = json.loads(registry_module.API_MODELS_PATH.read_text(encoding="utf-8"))
+    catalog = original + [
+        {
+            "display_name": "Synthetic local model",
+            "model_name": model,
+            "provider": "Ollama",
+            "capability": "chat",
+            "cost_class": "local",
+        }
+    ]
+
+    with pytest.raises(ValueError, match="model catalog is invalid"):
+        registry_module._validated_entries(catalog)
+
+    catalog_path = tmp_path / "api_models.json"
+    catalog_path.write_text(json.dumps(catalog), encoding="utf-8")
+    monkeypatch.setattr(registry_module, "API_MODELS_PATH", catalog_path)
+
+    assert registry_module.load_api_models() == [("Gemma 3 4B", "gemma3:4b", "Ollama")]
+    assert registry_module.catalog_entry_for(model) is None
 
 
 def test_typesafe_accepts_and_ignores_temperature(monkeypatch):
@@ -229,6 +390,38 @@ def test_provider_for_reads_the_registry():
     assert provider_for("gpt-6-sol") == "OpenAI"
     assert provider_for("gpt-6-astra") == "OpenAI"
     assert provider_for("not-a-model") is None
+
+
+def test_ollama_catalog_exposes_chat_and_paid_cloud_classifiers():
+    entry = registry_module.catalog_entry_for("kimi-k3:cloud")
+    pro_entry = registry_module.catalog_entry_for("kimi-k3.1-pro:cloud")
+
+    assert entry.model_name == "kimi-k3:cloud"
+    assert entry.provider == "Ollama"
+    assert entry.capability == "chat"
+    assert entry.cost_class == "paid-cloud"
+    assert provider_for("kimi-k3:cloud") == "Ollama"
+    assert pro_entry.model_name == "kimi-k3.1-pro:cloud"
+    assert pro_entry.provider == "Ollama"
+    assert pro_entry.capability == "chat"
+    assert pro_entry.cost_class == "paid-cloud"
+    assert provider_for("kimi-k3.1-pro:cloud") == "Ollama"
+
+
+def test_non_ollama_registry_entries_keep_existing_model_semantics():
+    entries = [(display, model, provider) for display, model, provider in load_api_models() if provider != "Ollama"]
+
+    assert entries == [
+        ("Opus 5.5", "claude-opus-5-5", "Anthropic"),
+        ("Fable 5.1", "claude-fable-5-1", "Anthropic"),
+        ("GPT-6 Sol", "gpt-6-sol", "OpenAI"),
+        ("GPT-6 Astra", "gpt-6-astra", "OpenAI"),
+        ("Jev", "jev-1.13.0", "TypeSafe"),
+        ("Grok 4.7", "grok-4.7", "xAI"),
+        ("DeepSeek V4.1 Flash", "deepseek-flash", "DeepSeek"),
+        ("Kimi K3", "kimi-k3", "Kimi"),
+        ("Gemini 3.8 Flash", "gemini-3.8-flash", "Google"),
+    ]
 
 
 class FakeChunk:
@@ -390,10 +583,11 @@ def _authorized_target(model, endpoint=None):
 
 
 def _dispatch(target):
+    approved_models = approved_local_ollama_chat_models()
     local = (
         classify_provider(
             target,
-            approved_local_models={"gemma3:4b"},
+            approved_local_models=approved_models,
         ).value
         == "local"
     )
@@ -410,7 +604,7 @@ def _dispatch(target):
         max_cost=Decimal("10.00"),
         max_resources=100,
         upper_bound_costs={target.identity: cost},
-        approved_local_models={"gemma3:4b"},
+        approved_local_models=approved_models,
         clock=lambda: _NOW,
         resolver=lambda _host, _port: ["8.8.8.8"],
     )
