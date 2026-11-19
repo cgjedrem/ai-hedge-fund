@@ -70,6 +70,13 @@ result, blocker and next stop condition at meaningful boundaries, without idle p
 Verify governed source/installed parity separately from actual loaded prompt identity.
 Do not overwrite local customization or force active sessions to reload.
 
+For long-running model or data jobs, persist the approved inputs, process identity,
+and authoritative progress-artifact path. On a user status request, reread the latest
+status and append-only progress events and verify process liveness; report the event
+timestamp, completed/expected counts, current work item, and errors. Do not start a
+duplicate while the recorded process is active. Give an ETA only when based on recent
+observed throughput, label it conditional, and omit it when progress is too variable.
+
 ## Operational Principles
 
 - **Workflow execution.** When a request matches a named workflow in `~/.agents/workflows/` and no pipeline trigger takes precedence, follow it task by task.
