@@ -2710,11 +2710,12 @@ class DeskService:
     def set_model(self, request: ModelRequest) -> dict:
         self._require_writes()
         provider = _model_provider_for_selection(request.model)
+        model_entry = catalog_entry_for(request.model)
         values: dict[str, object] = {
             "model": request.model,
             "llm_provider": provider,
         }
-        if provider != "Ollama" and "context_size" in self._runtime_settings.parameters:
+        if "context_size" in self._runtime_settings.parameters and (provider != "Ollama" or model_entry is None or model_entry.cost_class != "local"):
             values["parameters"] = {name: value for name, value in self._runtime_settings.parameters.items() if name != "context_size"}
         _persisted, updated = self._persist_runtime_settings(
             values,

@@ -581,6 +581,66 @@ def test_settings_routes_accept_and_persist_cloud_tag_across_restart(tmp_path, m
     assert settings.json()["version"] == 2
 
 
+def test_model_switch_to_paid_cloud_ollama_removes_local_context_size(tmp_path, monkeypatch):
+    enroll_synthetic_root(tmp_path)
+    monkeypatch.delenv("HEDGE_FUND_LLM_MODEL", raising=False)
+    app = create_app(root=tmp_path, allow_writes=True)
+    with TestClient(app, client=("127.0.0.1", 50000)) as client:
+        token = client.get(
+            "/api/capabilities",
+            headers={"host": "127.0.0.1"},
+        ).json()["mutation_token"]
+        headers = {
+            "host": "127.0.0.1",
+            "origin": "http://127.0.0.1",
+            "x-csrf-token": token,
+        }
+        configured = client.put(
+            "/api/settings",
+            headers=headers,
+            json={
+                "data_provider": "yfinance",
+                "model": "gemma3:4b",
+                "endpoint": None,
+                "timeout_seconds": 60,
+                "parameters": {
+                    "context_size": 8192,
+                    "max_tokens": 4096,
+                    "temperature": 0.4,
+                    "top_p": 0.8,
+                },
+                "expected_version": 0,
+            },
+        )
+        assert configured.status_code == 200
+        before = client.get("/api/settings", headers={"host": "127.0.0.1"})
+        selected = client.post(
+            "/api/settings/model",
+            headers=headers,
+            json={
+                "model": "kimi-k3.1-pro:cloud",
+                "expected_version": configured.json()["version"],
+            },
+        )
+        after = client.get("/api/settings", headers={"host": "127.0.0.1"})
+
+    assert before.status_code == 200
+    assert before.json()["parameters"]["context_size"] == 8192
+    assert selected.status_code == 200
+    assert selected.json() == {
+        "model": "kimi-k3.1-pro:cloud",
+        "scope": "root",
+        "version": 2,
+    }
+    assert after.status_code == 200
+    assert after.json()["model"] == "kimi-k3.1-pro:cloud"
+    assert after.json()["parameters"] == {
+        "max_tokens": 4096,
+        "temperature": 0.4,
+        "top_p": 0.8,
+    }
+
+
 def test_effective_settings_resolve_environment_precedence(tmp_path, monkeypatch):
     monkeypatch.setenv("HEDGE_FUND_DATA_PROVIDER", "fd")
     monkeypatch.setenv("HEDGE_FUND_LLM_MODEL", DEFAULT_MODEL)

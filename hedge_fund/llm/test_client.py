@@ -228,6 +228,83 @@ def test_ollama_paid_cloud_client_constructs_with_budgeted_operation_dispatch(mo
     assert constructed[0]["client_kwargs"]["transport"] is not None
 
 
+def test_ollama_paid_cloud_serializes_cost_bound_request_under_guarded_transport(monkeypatch):
+    from hedge_fund.runtime.costs import minimum_attempt_cost
+
+    model = "kimi-k3.1-pro:cloud"
+    target = ProviderTarget(kind="llm", provider="ollama", model=model)
+    expected_bound = minimum_attempt_cost(target)
+    assert expected_bound == Decimal("3.310720")
+    now = datetime.now(timezone.utc)
+    wire_requests = []
+
+    def handle(request):
+        wire_requests.append(request)
+        response = {
+            "model": model,
+            "created_at": "2026-11-19T08:00:00Z",
+            "message": {"role": "assistant", "content": "offline answer"},
+            "done": True,
+            "done_reason": "stop",
+        }
+        return httpx.Response(
+            200,
+            content=(json.dumps(response) + "\n").encode("utf-8"),
+            headers={"content-type": "application/x-ndjson"},
+            request=request,
+        )
+
+    original_transport = ProviderDispatch.httpx_transport
+
+    def guarded_transport(dispatch, selected_target, *, inner_transport=None):
+        assert inner_transport is None
+        return original_transport(
+            dispatch,
+            selected_target,
+            inner_transport=httpx.MockTransport(handle),
+        )
+
+    monkeypatch.setattr(ProviderDispatch, "httpx_transport", guarded_transport)
+    dispatch = make_one_shot_dispatch(
+        root_id="llm-test-root",
+        subject_id="llm-test",
+        capture_digest="a" * 64,
+        operation_id="llm-kimi-wire-operation",
+        operation_digest="b" * 64,
+        expires_at=now + timedelta(minutes=5),
+        targets=(target,),
+        max_calls=1,
+        max_cost=expected_bound,
+        max_resources=1,
+        upper_bound_costs={target.identity: expected_bound},
+        per_target_bounds={target.identity: (1, expected_bound, 1)},
+        clock=lambda: now,
+        resolver=lambda _host, _port: ["127.0.0.1"],
+    )
+    client = make_llm(
+        model,
+        context_size=131_072,
+        max_tokens=131_072,
+        use_environment=False,
+        dispatch=dispatch,
+    )
+
+    assert client.complete("system prompt", "user prompt") == "offline answer"
+    assert len(wire_requests) == 1
+    request = wire_requests[0]
+    body = json.loads(request.content)
+    options = body["options"]
+    assert request.method == "POST"
+    assert str(request.url) == "http://127.0.0.1:11434/api/chat"
+    assert body["model"] == model
+    assert type(options["num_ctx"]) is int and options["num_ctx"] == 131_072
+    assert type(options["num_predict"]) is int and options["num_predict"] == 131_072
+
+    reservation = dispatch._one_shot[target.identity]
+    assert reservation.calls_reserved == 1
+    assert reservation.cost_reserved == expected_bound
+
+
 def test_temperature_reaches_the_chat_model(keyed):
     """make_llm's temperature lands on the underlying chat model."""
     llm = _authorized_make_llm(_BY_PROVIDER["Kimi"], temperature=0.7)
