@@ -194,3 +194,13 @@ poetry run pytest 'hedge_fund/test_run.py::test_cli_backtest_paid_kimi_cloud_mai
 - isort: `poetry run isort --check-only --profile black hedge_fund/run.py hedge_fund/runtime/costs.py hedge_fund/test_run.py hedge_fund/runtime/test_costs.py` — PASS.
 - flake8: `poetry run flake8 --max-line-length=420 --extend-ignore=E203 hedge_fund/run.py hedge_fund/runtime/costs.py hedge_fund/test_run.py hedge_fund/runtime/test_costs.py` — PASS.
 - `git diff --check` and BOM check — PASS. No production raw writes added; no writer-map entry required.
+
+## Post-PR rebase and Copilot review fixes (2026-11-19)
+
+- **Rebase**: branch rebased onto origin/main at `df759ad` (PR #14, spec009 T024 sibling work). Conflicts: `.specify/feature.json` (kept spec009 pointer), `memory.md` (both append-only streams kept), `web/services.py` (auto-merged, PR #14 legacy-recovery code preserved).
+- **Copilot PR #15 review fixes** (commit `4b36182`):
+  1. `frontend/src/pages/backtests.tsx` — authorization/budget controls now driven by model `cost_class` so paid-cloud Ollama models show them; recognizes the verified 3.31072 bound. New `frontend/src/pages/backtests.test.tsx`.
+  2. `hedge_fund/llm/test_client.py` — offline guarded-serialization test: real ChatOllama request construction under httpx.MockTransport, asserting exact model id, integer `num_ctx`/`num_predict`, and cost reservation.
+  3. `hedge_fund/web/services.py` — `set_model()` clears `parameters.context_size` based on the selected entry's local cost class as well as provider; regression test for switching to a cloud tag with an inherited context_size.
+- **Focused evidence on rebased tree**: UI tests 3 passed; model-switch regression 1 passed; guarded serialization 1 passed; broader targeted set incl. PR #14 recovery suites **466 passed, 1 skipped** (1046s); frontend `npm test` **250 passed**, `npx tsc --noEmit` exit 0; black/isort/flake8/BOM/writer-map (119) clean.
+- **Full suite on rebased HEAD: NOT RUN — user-directed skip (2026-11-19)**. Prior full-suite evidence applies to pre-rebase revisions only. The rebase merged disjoint PR #14 changes (legacy-recovery services, T024 tests) plus three small review fixes; targeted suites covering all touched areas pass, but suite-level regression on the rebased tree is UNVERIFIED. Operator accepts this at merge, or CI runs it.
