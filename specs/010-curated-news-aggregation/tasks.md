@@ -122,7 +122,7 @@ description: "Task list for curated financial news aggregation"
 - [x] T046 Run Black line-length-420, isort Black-profile, and flake8 checks on every changed Python path and record results in `specs/010-curated-news-aggregation/acceptance-evidence.md`.
 - [x] T047 Perform Standards-axis and Spec-axis review of the merge-base diff and resolve hard findings in `hedge_fund/news/`, `hedge_fund/run.py`, `hedge_fund/runtime/`, `hedge_fund/data/models.py`, and `hedge_fund/web/services.py` before delivery.
 - [x] T048 Record verified acceptance scenarios, unperformed live/deployment checks, and final artifact/test references in `specs/010-curated-news-aggregation/acceptance-evidence.md`.
-- [ ] T049 Record the approved implementation outcome, verification evidence, remaining limitations, and no-PR delivery state in `memory.md` and inspect the final diff for `specs/010-curated-news-aggregation/`.
+- [x] T049 Record the approved implementation outcome, verification evidence, remaining limitations, and no-PR delivery state in `memory.md` and inspect the final diff for `specs/010-curated-news-aggregation/`.
 
 ---
 
