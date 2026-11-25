@@ -39,7 +39,7 @@ No other source fields are accepted in version 1.
 | `code` | Yes | String; apply shared `normalize_ticker` (`strip().upper()`); canonical result must be non-empty |
 | `name` | Yes | String, non-empty after trimming; preserve original text |
 | `exchange` | Yes | String, non-empty after trimming; preserve original text |
-| `currency` | Yes | Exactly three uppercase ASCII letters; preserve original text |
+| `currency` | Yes | Exactly three uppercase ASCII letters; preserve original text; format-only, with no ISO 4217 membership validation |
 | `trading_status` | Yes | Exactly `active` or `suspended` |
 | `price` | Yes | Built-in finite int/float greater than zero |
 | `change_pct` | Yes | Built-in finite int/float greater than or equal to -1; values above 1 are permitted |
@@ -100,6 +100,10 @@ There is no partial success state. An empty snapshot dictionary is never a valid
 | `reason` | One stable value from the vocabulary below |
 | `message` | Deterministic human-readable explanation; consumers must not parse it |
 | `related_locations` | Tuple of other relevant locations; normally empty, populated for duplicate rows |
+
+Locations are rendered from structured object-key and array-index segments, never by joining already-rendered strings. Object keys matching `[A-Za-z_][A-Za-z0-9_]*` use dotted notation. Every other object key uses a bracketed JSON-string segment with standard JSON escaping for quotes, backslashes, and control characters; use `$` as the root prefix when the first segment requires brackets. Array indices remain unquoted numeric brackets.
+
+For example, a top-level unknown key `source.extra` renders as `$["source.extra"]`, an unknown `extra` key inside `source` renders as `source.extra`, and an unknown key `bad.key` in the first instrument renders as `instruments[0]["bad.key"]`. These locations remain distinct even when arbitrary unknown keys contain dots, brackets, quotes, or other punctuation.
 
 ### Reason vocabulary
 

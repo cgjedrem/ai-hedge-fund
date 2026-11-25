@@ -36,7 +36,7 @@ No technical unknowns remain. The design uses only the repository's existing Pyt
 
 ## D4 — Adapt internal errors to the public issue contract
 
-**Decision**: Translate Pydantic error `type` and structured `loc`, never its message or documentation URL, into `ValidationIssue(location, reason, message, related_locations)`. Render root as `$` and nested fields as paths such as `instruments[0].price`. Deduplicate identical issues and sort object keys lexicographically and array indices numerically before rendering.
+**Decision**: Translate Pydantic error `type` and structured `loc`, never its message or documentation URL, into `ValidationIssue(location, reason, message, related_locations)`. Render root as `$` and nested fields as paths such as `instruments[0].price`. Use dotted segments only for object keys matching `[A-Za-z_][A-Za-z0-9_]*`; encode every other key as a bracketed JSON string, with `$` prefixing a bracketed root key. Deduplicate identical issues and sort structured object keys lexicographically and array indices numerically before rendering.
 
 **Rationale**: Pydantic messages and URLs can vary by release. The specification owns the stable reason vocabulary and deterministic ordering. A malformed schema version therefore yields `invalid_type` at `schema_version`; a missing one yields `missing_field`; a valid non-1 integer yields `unsupported_schema_version`.
 
@@ -93,3 +93,13 @@ No technical unknowns remain. The design uses only the repository's existing Pyt
 **Rationale**: This proves end-to-end contract behavior without files, network, credentials, providers, or wall-clock state. Expected issues compare locations and reasons; canonical snapshots compare complete field content, including null optional fields.
 
 **Alternatives considered**: Live provider samples and persisted fixture files add unrelated I/O. Numeric score expectations belong to feature 011, not this contract.
+
+## D10 — Keep currency validation format-only for the MVP
+
+**Decision**: Require exactly three uppercase ASCII letters for `currency`, without checking membership in an ISO 4217 registry. Accept a synthetic `ZZZ` fixture as format-valid and reject lowercase or non-ASCII forms.
+
+**Rationale**: Version 1 needs a stable syntactic identifier, not a maintained currency reference dataset. Format-only validation keeps the feature offline, deterministic, and dependency-free while making the limited guarantee explicit.
+
+**Alternatives considered**: An embedded ISO 4217 allowlist would reject unassigned codes but introduce a curated dataset and update policy unrelated to the snapshot-validation MVP. A new registry dependency is outside the approved scope.
+
+**Sources**: specification FR-004 and Assumptions; `data-model.md`.

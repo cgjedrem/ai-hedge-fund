@@ -45,8 +45,10 @@ Expected result for every command: exit code zero. Do not accept the feature usi
 5. **Expected**: every optional field appears explicitly with null when unavailable; no undeclared normalization, zero substitution, clipping, or numeric string conversion occurs.
 6. Serialize equivalent canonical values with different key order/whitespace in the test comparison.
 7. **Expected**: comparisons depend on field content, not byte formatting.
+8. Validate format-only currency cases independently, including `ZZZ` and lowercase `usd`.
+9. **Expected**: `ZZZ` is accepted without an ISO 4217 membership claim; lowercase or non-ASCII forms return `invalid_value` at the instrument's `currency` location.
 
-### V2 — All-or-nothing invalid rejection (US-2, FR-008, FR-010, FR-013–FR-015)
+### V2 — All-or-nothing invalid rejection (US-1, FR-007–FR-010, FR-013–FR-015)
 
 1. Load a combined invalid fixture with independently detectable errors: missing required values, explicit nulls, wrong types, unknown fields, a non-positive price, an out-of-range change, non-finite numbers, an incomplete optional pair, and duplicate canonical codes.
 2. Validate once.
@@ -68,6 +70,8 @@ Exercise each case independently:
 | Numeric strings, booleans as numeric fields | `invalid_type` at the exact field |
 | NaN or positive/negative infinity | `invalid_value` at the exact field |
 | Unknown fields at each object level | `unknown_field` at each exact field |
+| Top-level key `source.extra` plus key `extra` inside `source` | Distinct `unknown_field` locations `$["source.extra"]` and `source.extra` |
+| Unknown keys containing quotes, backslashes, brackets, or dots | Bracketed JSON-string segments with unambiguous escaping |
 | Non-string object key or non-JSON Python value | `invalid_type` at the containing/exact location |
 | Null required field | `null_value` at the exact field |
 | Unsupported unknown fields or versions combined with other errors | All independent issues; no migration or silent field ignoring |
@@ -83,7 +87,9 @@ Exercise each case independently:
 7. Set `retrieved_at` exactly equal to and then earlier than `snapshot_at`.
 8. **Expected**: equality succeeds; earlier retrieval returns `invalid_timestamp_order`.
 
-### V5 — Explicit freshness (US-3, FR-004, FR-011)
+### V5 — Explicit freshness (US-2, FR-011)
+
+At the interim US1-only checkpoint, any supplied freshness argument must instead fail closed with `invalid_value` at each supplied argument; the complete behavior below is required after US2.
 
 1. Validate a historical snapshot without policy arguments.
 2. **Expected**: historical age alone does not fail; no current-time lookup occurs.

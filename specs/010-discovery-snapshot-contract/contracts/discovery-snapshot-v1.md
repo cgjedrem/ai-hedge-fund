@@ -52,6 +52,7 @@ The complete field schema, constraints, optional-field behavior, and timestamp b
 6. Valid timestamps canonicalize to UTC RFC 3339 strings ending in `Z` while preserving supplied fraction digits.
 7. Canonical output is compared by JSON-compatible field content. Byte serialization, object-key order, and insignificant whitespace are not contractual.
 8. A successful result contains the five top-level fields and every declared instrument/source field; a failed result contains no partial snapshot.
+9. Currency identifiers contain exactly three uppercase ASCII letters. Validation is format-only and does not claim ISO 4217 assigned-code membership.
 
 ## Freshness contract
 
@@ -83,6 +84,8 @@ inconsistent_optional_fields
 ```
 
 Use `$` for a root type error. Use dotted object fields and bracketed zero-based indices elsewhere, for example `source.provider`, `instruments[0].code`, `reference_time`, and `max_age_seconds`.
+
+Locations are encoded from structured segments so arbitrary unknown keys cannot collide. Object keys matching `[A-Za-z_][A-Za-z0-9_]*` use dotted notation. Every other key uses a bracketed JSON-string segment with standard JSON escaping for quotes, backslashes, and control characters; prefix `$` when the first segment requires brackets. A top-level unknown key `source.extra` therefore renders as `$["source.extra"]`, while an unknown `extra` key inside `source` renders as `source.extra`. An unknown `bad.key` on the first instrument renders as `instruments[0]["bad.key"]`. Sorting uses the structured segments before this rendering.
 
 A malformed `schema_version` uses `invalid_type` at `schema_version`; a missing version uses `missing_field`; an integer other than 1 uses `unsupported_schema_version`. Location plus reason is the compatibility contract; human messages are not intended for parsing.
 
