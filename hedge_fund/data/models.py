@@ -6,8 +6,7 @@ All models use ``extra="ignore"`` for forward-compatibility.
 
 from __future__ import annotations
 
-from pydantic import BaseModel
-
+from pydantic import BaseModel, Field
 
 _IGNORE = {"extra": "ignore"}
 
@@ -15,6 +14,7 @@ _IGNORE = {"extra": "ignore"}
 # ---------------------------------------------------------------------------
 # Prices
 # ---------------------------------------------------------------------------
+
 
 class Price(BaseModel):
     """Single OHLCV bar from /prices."""
@@ -49,6 +49,7 @@ class PriceSnapshot(BaseModel):
 # ---------------------------------------------------------------------------
 # Financial Metrics
 # ---------------------------------------------------------------------------
+
 
 class FinancialMetrics(BaseModel):
     """Financial ratios and per-share metrics from /financial-metrics.
@@ -137,6 +138,7 @@ class FinancialMetrics(BaseModel):
 # Insider Trades
 # ---------------------------------------------------------------------------
 
+
 class InsiderTrade(BaseModel):
     """Single insider transaction from /insider-trades."""
 
@@ -162,6 +164,20 @@ class InsiderTrade(BaseModel):
 # News
 # ---------------------------------------------------------------------------
 
+
+class NewsAttribution(BaseModel):
+    """Public, feed-supplied provenance for one logical news item."""
+
+    model_config = _IGNORE
+
+    source_id: str
+    publisher: str
+    original_id: str | None = None
+    original_url: str | None = None
+    published_at: str | None = None
+    fetched_at: str | None = None
+
+
 class CompanyNews(BaseModel):
     """Single news article from /news."""
 
@@ -172,11 +188,17 @@ class CompanyNews(BaseModel):
     source: str
     date: str | None = None
     url: str | None = None
+    news_id: str | None = None
+    fetched_at: str | None = None
+    category: str | None = None
+    attributions: list[NewsAttribution] = Field(default_factory=list)
+    source_state: str | None = None
 
 
 # ---------------------------------------------------------------------------
 # Company Facts
 # ---------------------------------------------------------------------------
+
 
 class CompanyFacts(BaseModel):
     """Company metadata from /company/facts."""
@@ -201,6 +223,7 @@ class CompanyFacts(BaseModel):
 # ---------------------------------------------------------------------------
 # Earnings
 # ---------------------------------------------------------------------------
+
 
 class EarningsData(BaseModel):
     """Financial data for a single earnings period (quarterly or annual)."""
@@ -285,6 +308,7 @@ class EarningsRecord(BaseModel):
 # ---------------------------------------------------------------------------
 # SEC Filings
 # ---------------------------------------------------------------------------
+
 
 class Filing(BaseModel):
     """Single SEC filing from /filings."""

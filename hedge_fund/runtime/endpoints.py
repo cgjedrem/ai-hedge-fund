@@ -17,6 +17,8 @@ from hedge_fund.runtime.policy import (
 )
 
 _REMOTE_HOSTS = {
+    # Curated news uses the frozen target endpoint as its exact per-origin allowlist.
+    ("data", "curated-news"): frozenset(),
     ("data", "fd"): frozenset({"api.financialdatasets.ai"}),
     ("data", "ken-french-breakpoints"): frozenset({"mba.tuck.dartmouth.edu"}),
     ("data", "yfinance"): frozenset(
@@ -157,6 +159,10 @@ def validate_request_url(
             if not has_verified_cost_model(target):
                 raise PaidCloudAuthorizationDenied("no verified cost model")
         return host, _OLLAMA_PORT, True
+    if target.kind == "data" and target.provider == "curated-news":
+        if endpoint != (host, 443, "https") or parts.scheme.casefold() != "https" or port not in (None, 443):
+            raise AuthorizationDenied("curated news destination does not match its exact origin")
+        return host, 443, False
     allowed_hosts = _REMOTE_HOSTS.get((target.kind, target.provider))
     if not allowed_hosts:
         raise AuthorizationDenied("provider transport is unsupported")
@@ -198,6 +204,8 @@ def validate_provider_target(
         return
     if (target.kind, target.provider) not in _REMOTE_HOSTS:
         raise AuthorizationDenied("provider transport is unsupported")
+    if target.kind == "data" and target.provider == "curated-news" and endpoint is None:
+        raise AuthorizationDenied("curated news requires an exact configured origin")
 
 
 def resolve_destination(
@@ -260,6 +268,10 @@ def _validate_configured_endpoint(target: ProviderTarget) -> tuple[str, int, str
     except ValueError:
         raise AuthorizationDenied("configured provider endpoint is invalid") from None
     host = parts.hostname.casefold() if parts.hostname else ""
+    if target.kind == "data" and target.provider == "curated-news":
+        if parts.scheme.casefold() != "https" or not host or parts.username is not None or parts.password is not None or port not in (None, 443) or parts.path not in ("", "/") or parts.query or parts.fragment:
+            raise AuthorizationDenied("configured curated news endpoint is not an exact HTTPS origin")
+        return host, 443, "https"
     allowed_hosts = _REMOTE_HOSTS.get((target.kind, target.provider))
     if not allowed_hosts or parts.scheme.casefold() != "https" or host not in allowed_hosts or port not in (None, 443) or parts.query or parts.fragment:
         raise AuthorizationDenied("configured provider endpoint is not approved")

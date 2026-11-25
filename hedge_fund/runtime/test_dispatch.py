@@ -285,6 +285,25 @@ def test_redirect_is_not_followed():
     assert len(calls) == 1
 
 
+def test_curated_redirect_response_requires_explicit_manual_opt_in():
+    target = ProviderTarget(kind="data", provider="curated-news", endpoint="https://example.com")
+    dispatch = _dispatch(target, upper_bound_cost=Decimal("0"))
+
+    def respond(request):
+        return httpx.Response(302, headers={"Location": "/next"}, request=request)
+
+    transport = dispatch.httpx_transport(
+        target,
+        inner_transport=httpx.MockTransport(respond),
+        allow_manual_redirects=True,
+    )
+    with httpx.Client(transport=transport, trust_env=False, follow_redirects=False) as client:
+        response = client.get("https://example.com/feed.xml")
+
+    assert response.status_code == 302
+    assert response.headers["Location"] == "/next"
+
+
 def test_unknown_paid_cost_denies_before_fake_transport():
     target = ProviderTarget(kind="llm", provider="openai", model="gpt-6-sol")
     dispatch = _dispatch(target)

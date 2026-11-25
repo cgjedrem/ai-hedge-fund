@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>Synthetic Example Company investor relations</title>
+  <id>https://ir.example.com/</id>
+  <updated>2026-01-06T14:30:00Z</updated>
+  <entry>
+    <title>Example Company expands chip production</title>
+    <link href="HTTPS://NEWS.EXAMPLE.COM:443/a/../story?id=42&amp;utm_medium=fixture" />
+    <id>ir-story-42</id>
+    <updated>2026-01-06T14:30:00Z</updated>
+    <summary type="html">Synthetic investor-relations summary.</summary>
+  </entry>
+</feed>

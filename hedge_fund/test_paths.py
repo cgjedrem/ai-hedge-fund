@@ -69,6 +69,22 @@ def test_write_atomic_uses_a_unique_temp_path_per_write(tmp_path: Path, monkeypa
     assert path.read_text(encoding="utf-8") == "second"
 
 
+def test_root_atomic_write_preserves_the_legacy_replace_lane(tmp_path: Path, monkeypatch) -> None:
+    target = tmp_path / "ledger" / "state.json"
+
+    with RootContext.open(tmp_path) as root:
+        enroll_fresh(root)
+        monkeypatch.setattr(
+            RootContext,
+            "replace_file",
+            lambda *_args: (_ for _ in ()).throw(AssertionError("news replacement primitive must not be used")),
+        )
+        with paths.bound_root(root):
+            write_atomic(target, '{"status":"unchanged"}')
+
+        assert target.read_bytes() == b'{"status":"unchanged"}'
+
+
 def test_root_path_writer_denies_when_admission_is_unavailable_without_changing_bytes(tmp_path: Path) -> None:
     target = tmp_path / "cache" / "answer.json"
 

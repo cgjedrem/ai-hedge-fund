@@ -148,6 +148,11 @@ def main(argv: list[str] | None = None) -> None:
             except (RootPathError, UnicodeError, ValueError) as exc:
                 parser.error(str(exc))
             _load_runtime()
+            if args.command == "news":
+                from hedge_fund.news.cli import execute
+
+                execute(args, parser, context)
+                return
             from hedge_fund.runtime.policy import (
                 AuthorizationDenied,
                 PaidCloudAuthorizationDenied,
@@ -345,6 +350,16 @@ def _parser() -> argparse.ArgumentParser:
         help="enable bounded provider requests for this invocation; no paid call is implied",
     )
     commands = parser.add_subparsers(dest="command")
+
+    news = commands.add_parser("news", help="manual curated-news refresh and offline local health")
+    news_actions = news.add_subparsers(dest="news_action", required=True)
+    news_refresh = news_actions.add_parser("refresh", help="fetch one explicitly bounded source plan")
+    news_refresh.add_argument("--source", action="append", help="select one reviewed enabled source; repeatable")
+    news_refresh.add_argument("--ticker", action="append", help="select configured company sources for this ticker; repeatable")
+    news_refresh.add_argument("--json", action="store_true", help="emit stable sorted JSON")
+    news_status = news_actions.add_parser("status", help="read local source health without network authority")
+    news_status.add_argument("--source", action="append", help="select one reviewed source; repeatable")
+    news_status.add_argument("--json", action="store_true", help="emit stable sorted JSON")
 
     saxo = commands.add_parser("saxo", help="read-only Saxo SIM inspection")
     saxo_actions = saxo.add_subparsers(dest="saxo_action", required=True)
@@ -1548,7 +1563,13 @@ def _run_cli_tick(
             dispatch=provider_authority["dispatch"],
             api_key=provider_authority["data_key"],
         ) as raw:
-            data = CachedDataClient(raw, live=deployed.spec.is_intraday)
+            from hedge_fund.news.client import CuratedNewsDataClient
+            from hedge_fund.news.store import NewsStore
+
+            data = CuratedNewsDataClient(
+                CachedDataClient(raw, live=deployed.spec.is_intraday),
+                NewsStore(paths.root_context()),
+            )
             verb = "running the latest session again" if again else "advancing one session"
             with console.status(
                 f"[cyan]{deployed.name}: {verb} over {', '.join(deployed.universe)}…",
@@ -1664,7 +1685,10 @@ def _backtest(
         dispatch=provider_authority["dispatch"],
         api_key=provider_authority["data_key"],
     ) as raw:
-        fd = CachedDataClient(raw)
+        from hedge_fund.news.client import CuratedNewsDataClient
+        from hedge_fund.news.store import NewsStore
+
+        fd = CuratedNewsDataClient(CachedDataClient(raw), NewsStore(paths.root_context()))
         with console.status(
             f"[cyan]{spec.name}: backtesting {start} → {end} " f"({spec.rebalance} rebalance vs {spec.benchmark}) " f"over {', '.join(universe)}…",
             spinner="dots",

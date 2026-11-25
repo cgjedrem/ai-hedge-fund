@@ -58,6 +58,16 @@ def authorize_session(authorization, *args, **kwargs):
     )
 
 
+def test_curated_news_is_free_data_not_a_paid_provider():
+    target = ProviderTarget(
+        kind="data",
+        provider="curated-news",
+        endpoint="https://www.federalreserve.gov",
+    )
+
+    assert classify_provider(target) is ProviderClass.FREE_DATA
+
+
 def test_unknown_keyless_ollama_model_is_not_classified_as_local():
     cloud_target = ProviderTarget(
         kind="llm",

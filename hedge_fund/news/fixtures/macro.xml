@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Synthetic official macro and regulatory releases</title>
+    <link>https://www.example.com/</link>
+    <description>Offline fixture collection. Tests select one item per authority.</description>
+    <item>
+      <title>Federal Reserve issues synthetic policy statement</title>
+      <link>https://www.federalreserve.gov/newsevents/pressreleases/synthetic.htm</link>
+      <guid>fed-synthetic-20260108</guid>
+      <pubDate>Thu, 08 Jan 2026 19:00:00 GMT</pubDate>
+      <description>Synthetic Federal Reserve metadata.</description>
+    </item>
+    <item>
+      <title>SEC issues synthetic regulatory release</title>
+      <link>https://www.sec.gov/newsroom/press-releases/synthetic</link>
+      <guid>sec-synthetic-20260108</guid>
+      <pubDate>Thu, 08 Jan 2026 18:00:00 GMT</pubDate>
+      <description>Synthetic SEC metadata.</description>
+    </item>
+    <item>
+      <title>BLS publishes synthetic employment situation</title>
+      <link>https://www.bls.gov/news.release/synthetic.nr0.htm</link>
+      <guid>bls-synthetic-20260109</guid>
+      <pubDate>Fri, 09 Jan 2026 13:30:00 GMT</pubDate>
+      <description>Synthetic BLS metadata.</description>
+    </item>
+    <item>
+      <title>BEA publishes synthetic GDP estimate</title>
+      <link>https://www.bea.gov/news/synthetic</link>
+      <guid>bea-synthetic-20260109</guid>
+      <pubDate>Fri, 09 Jan 2026 12:30:00 GMT</pubDate>
+      <description>Synthetic BEA metadata.</description>
+    </item>
+  </channel>
+</rss>
