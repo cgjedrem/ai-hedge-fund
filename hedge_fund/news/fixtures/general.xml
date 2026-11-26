@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Synthetic general financial news</title>
+    <link>https://news.example.com/</link>
+    <description>Offline fixture; no real publisher or article body.</description>
+    <item>
+      <title>Example Company expands chip production</title>
+      <link>https://news.example.com/story?id=42&amp;utm_source=fixture#details</link>
+      <guid>general-story-42</guid>
+      <pubDate>Tue, 06 Jan 2026 14:30:00 GMT</pubDate>
+      <description>Synthetic summary with &lt;script&gt;denied()&lt;/script&gt; markup.</description>
+    </item>
+    <item>
+      <title>Example Company expands chip production</title>
+      <link>https://news.example.com/different-event</link>
+      <guid>general-different-event</guid>
+      <pubDate>Wed, 07 Jan 2026 14:30:00 GMT</pubDate>
+      <description>A separate same-title event must remain distinct.</description>
+    </item>
+  </channel>
+</rss>

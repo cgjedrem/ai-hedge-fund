@@ -94,6 +94,25 @@ warning and tries Yahoo search news, with the same date filters. If search
 also fails or returns nothing after that outage, the error is preserved;
 the provider never silently switches to paid data.
 
+### Curated financial news
+
+Reviewed RSS/Atom, company investor-relations, SEC filing, and Fed/SEC/BLS/BEA
+metadata is stored under the selected root and read locally by analyst workflows.
+Refresh is manual and finite; scheduled runners do not refresh news implicitly.
+Use only a synthetic root for validation:
+
+```powershell
+aihf --root $env:AIHF_ROOT --enable-network news refresh --json
+aihf --root $env:AIHF_ROOT --enable-network news refresh --source federal-reserve-all-press --json
+aihf --root $env:AIHF_ROOT news status --json
+```
+
+Any selected SEC endpoint requires `HEDGE_FUND_NEWS_SEC_IDENTITY` containing a
+descriptive application/organization and contact email or HTTPS URL. Operators
+must review source rights and `catalog.json`; the feature stores feed-supplied
+metadata and links, not third-party article bodies, and grants no republication
+rights. `news status` is offline even if `--enable-network` is present.
+
 ## How to Run
 
 ### Interactive app

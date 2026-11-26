@@ -255,10 +255,16 @@ class ProviderDispatch:
         target: ProviderTarget,
         *,
         inner_transport: httpx.BaseTransport | None = None,
+        allow_manual_redirects: bool = False,
     ) -> httpx.BaseTransport:
         """Create guarded transport; optional inner transport stays below guard."""
         self._require_target(target)
-        return AuthorizedHTTPTransport(self, target, inner_transport=inner_transport)
+        return AuthorizedHTTPTransport(
+            self,
+            target,
+            inner_transport=inner_transport,
+            allow_manual_redirects=allow_manual_redirects,
+        )
 
     def validate_target(self, target: ProviderTarget) -> None:
         self._require_target(target)
@@ -273,6 +279,7 @@ class ProviderDispatch:
         *,
         timeout: float = 60.0,
         inner_transport: httpx.BaseTransport | None = None,
+        allow_manual_redirects: bool = False,
     ) -> httpx.Client:
         if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout <= 0:
             raise AuthorizationDenied("provider timeout is invalid")
@@ -280,6 +287,7 @@ class ProviderDispatch:
             transport=self.httpx_transport(
                 target,
                 inner_transport=inner_transport,
+                allow_manual_redirects=allow_manual_redirects,
             ),
             timeout=float(timeout),
             trust_env=False,
@@ -308,11 +316,15 @@ class AuthorizedHTTPTransport(httpx.BaseTransport):
         target: ProviderTarget,
         *,
         inner_transport: httpx.BaseTransport | None = None,
+        allow_manual_redirects: bool = False,
     ) -> None:
         if not isinstance(dispatch, ProviderDispatch) or not isinstance(target, ProviderTarget):
             raise AuthorizationDenied("guarded HTTP transport is invalid")
+        if type(allow_manual_redirects) is not bool:
+            raise AuthorizationDenied("manual redirect policy is invalid")
         self._dispatch = dispatch
         self._target = target
+        self._allow_manual_redirects = allow_manual_redirects
         self._backend = None
         if inner_transport is None:
             self._backend = _PinnedSyncBackend()
@@ -341,7 +353,7 @@ class AuthorizedHTTPTransport(httpx.BaseTransport):
         finally:
             if self._backend is not None:
                 self._backend.unpin(token)
-        if 300 <= response.status_code < 400:
+        if 300 <= response.status_code < 400 and not self._allow_manual_redirects:
             response.close()
             raise AuthorizationDenied("provider redirects are disabled")
         return response

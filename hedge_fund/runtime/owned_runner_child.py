@@ -610,9 +610,15 @@ def _client_context(root, capture, factory, dispatch):
                 dispatch=dispatch,
             )
             self._client = self._raw_client.__enter__()
-            return CachedDataClient(
-                self._client,
-                cache_dir=root.resolve("cache"),
+            from hedge_fund.news.client import CuratedNewsDataClient
+            from hedge_fund.news.store import NewsStore
+
+            return CuratedNewsDataClient(
+                CachedDataClient(
+                    self._client,
+                    cache_dir=root.resolve("cache"),
+                ),
+                NewsStore(root),
             )
 
         def __exit__(self, exc_type, exc, traceback):

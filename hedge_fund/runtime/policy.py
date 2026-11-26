@@ -257,6 +257,7 @@ def classify_provider(
         raise AuthorizationDenied("local model allowlist is invalid")
     if target.kind == "data":
         if target.provider in {
+            "curated-news",
             "ken-french-breakpoints",
             "yfinance",
             "yf",

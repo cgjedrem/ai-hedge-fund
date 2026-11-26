@@ -107,6 +107,12 @@ WRITER_MAP: dict[tuple[str, str, str], Writer] = {
     # fund storage
     ("hedge_fund.fund.storage", "save_spec", "mkdir"): Writer(ROOT, "denial", ("hedge_fund/fund/test_storage.py::test_save_spec_uses_root_context_and_registry_lane", "hedge_fund/fund/test_storage.py::test_save_spec_fails_closed_when_shared_admission_is_unavailable")),
     ("hedge_fund.fund.storage", "save_spec", "write_bytes"): Writer(ROOT, "denial", ("hedge_fund/fund/test_storage.py::test_save_spec_denial_preserves_existing_bytes", "hedge_fund/fund/test_spec.py::test_save_spec_round_trips_and_never_overwrites")),
+    # curated news persistence and offline EDGAR scratch
+    ("hedge_fund.news.filings", "IsolatedEdgarSubmissionParser.parse", "mkdir"): Writer(ROOT, "denial", ("hedge_fund/news/test_filings.py::test_existing_worker_scratch_conflict_is_not_masked_by_write_admission", "hedge_fund/news/test_filings.py::test_worker_process_runs_outside_root_writer_admission")),
+    ("hedge_fund.news.filings", "IsolatedEdgarSubmissionParser.parse", "rmtree"): Writer(ROOT, "denial", ("hedge_fund/news/test_filings.py::test_worker_cleanup_failure_is_fail_visible",)),
+    ("hedge_fund.news.store", "NewsStore.commit", "mkdir"): Writer(ROOT, "denial", ("hedge_fund/news/test_store.py::test_failed_replacement_preserves_previous_state", "hedge_fund/news/test_store.py::test_store_merges_by_url_and_is_idempotent_across_restart")),
+    ("hedge_fund.news.store", "NewsStore.commit", "write_bytes"): Writer(ROOT, "denial", ("hedge_fund/news/test_store.py::test_failed_replacement_preserves_previous_state", "hedge_fund/news/test_store.py::test_replay_is_write_free_and_conflicting_revisions_fail")),
+    ("hedge_fund.news.store", "NewsStore.commit", "unlink_file"): Writer(ROOT, "denial", ("hedge_fund/news/test_store.py::test_failed_replacement_preserves_previous_state",), "temporary-file cleanup under the same news-local writer admission"),
     # paper deployment
     ("hedge_fund.paper.deployed", "deploy", "mkdir"): Writer(TRANSITION, "race", (M + "test_authority_flip_inside_deploy_creates_no_fund", ICR + "test_external_drift_during_deploy_is_not_published"), "transition branch when enrolled; raw directory.mkdir only on unenrolled roots"),
     ("hedge_fund.paper.deployed", "deploy", "write_bytes"): Writer(TRANSITION, "race", (M + "test_authority_flip_between_deploy_effects_denies_the_next_effect",), "transition branch when enrolled; raw write only on unenrolled roots"),
@@ -293,6 +299,7 @@ WRITER_MAP: dict[tuple[str, str, str], Writer] = {
     ("hedge_fund.runtime.root", "_posix_write_relative", "fdopen:wb"): Writer(PRIMITIVE, "primitive", ROOT_TESTS),
     ("hedge_fund.runtime.root", "_posix_write_relative", "replace"): Writer(PRIMITIVE, "primitive", ROOT_TESTS),
     ("hedge_fund.runtime.root", "_posix_write_relative", "unlink"): Writer(PRIMITIVE, "primitive", ROOT_TESTS),
+    ("hedge_fund.runtime.root", "_posix_rename_relative", "replace"): Writer(PRIMITIVE, "primitive", ROOT_TESTS, "POSIX-only handle-relative replacement; not executed on the Windows evidence host"),
     # web
     ("hedge_fund.web.__main__", "main", "mkdir"): Writer(BOOTSTRAP, "none", (), "creates the explicit demo root before RootContext opens it; no enrolled data exists yet"),
     ("hedge_fund.web.demo", "seed_demo", "mkdir"): Writer(BOOTSTRAP, "none", (), "creates an empty synthetic demo root before enroll_fresh"),

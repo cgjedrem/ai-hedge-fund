@@ -593,6 +593,34 @@ class RootContext:
         self.revalidate()
         return self.path.joinpath(*destination_parts)
 
+    def replace_file(
+        self,
+        source: str | os.PathLike[str],
+        destination: str | os.PathLike[str],
+    ) -> Path:
+        """Atomically replace a confined regular file. Caller holds the writer lane."""
+        source_parts = self._path_parts(source, write=True)
+        destination_parts = self._path_parts(destination, write=True)
+        if source_parts == destination_parts:
+            raise ValueError("source and destination must differ")
+        self.revalidate()
+        if os.name == "nt":
+            _windows_rename_relative(
+                self._handles[-1],
+                source_parts,
+                destination_parts,
+                replace=True,
+            )
+        else:
+            _posix_rename_relative(
+                self._fd,
+                source_parts,
+                destination_parts,
+                replace=True,
+            )
+        self.revalidate()
+        return self.path.joinpath(*destination_parts)
+
     def rename_directory(
         self,
         source: str | os.PathLike[str],
@@ -814,6 +842,7 @@ def _posix_rename_relative(
     destination_parts: tuple[str, ...],
     *,
     directory: bool = False,
+    replace: bool = False,
 ) -> None:
     source_parent = _posix_parent_fd(root_fd, source_parts[:-1])
     destination_parent = None
@@ -827,6 +856,26 @@ def _posix_rename_relative(
         expected = stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode)
         if not expected:
             raise RootPathError("root rename source has the wrong type")
+        if replace:
+            try:
+                info = os.stat(
+                    destination_parts[-1],
+                    dir_fd=destination_parent,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                pass
+            else:
+                expected = stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode)
+                if not expected:
+                    raise RootPathError("root replacement target has the wrong type")
+            os.replace(
+                source_parts[-1],
+                destination_parts[-1],
+                src_dir_fd=source_parent,
+                dst_dir_fd=destination_parent,
+            )
+            return
         if not sys.platform.startswith("linux"):
             raise UnsupportedFilesystemError("atomic no-replace rename is unsupported")
         libc = ctypes.CDLL(None, use_errno=True)
@@ -1636,11 +1685,13 @@ def _windows_rename_relative(
     destination_parts: tuple[str, ...],
     *,
     directory: bool = False,
+    replace: bool = False,
 ) -> None:
     source_parent = root_handle
     source_owned = None
     destination_parent = root_handle
     destination_owned = None
+    destination_handle = None
     handle = None
     try:
         source_parent, source_owned = _windows_open_parent(
@@ -1659,13 +1710,27 @@ def _windows_rename_relative(
             share_delete=True,
         )
         _validate_windows_handle(handle, directory=directory)
+        if replace:
+            try:
+                destination_handle = _nt_open_child(
+                    destination_parent,
+                    destination_parts[-1],
+                    directory=directory,
+                    share_delete=True,
+                )
+            except FileNotFoundError:
+                pass
+            else:
+                _validate_windows_handle(destination_handle, directory=directory)
         _windows_rename_handle(
             handle,
             destination_parent,
             destination_parts[-1],
-            replace=False,
+            replace=replace,
         )
     finally:
+        if destination_handle is not None:
+            _close_windows_handles((destination_handle,))
         if handle is not None:
             _close_windows_handles((handle,))
         if destination_owned is not None:

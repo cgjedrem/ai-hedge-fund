@@ -4831,7 +4831,13 @@ class DeskService:
             dispatch=dispatch,
             api_key=api_key,
         ) as client:
-            yield CachedDataClient(client, cache_dir=cache)
+            from hedge_fund.news.client import CuratedNewsDataClient
+            from hedge_fund.news.store import NewsStore
+
+            yield CuratedNewsDataClient(
+                CachedDataClient(client, cache_dir=cache),
+                NewsStore(self.root_context),
+            )
 
     def _runner_state(self, name: str) -> dict:
         try:
