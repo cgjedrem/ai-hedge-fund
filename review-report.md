@@ -30,7 +30,18 @@ The final Minor deadline finding was also remediated:
 
 - `hedge_fund/news/refresh.py:304-320`, `hedge_fund/news/filings.py:163-170,339` — EDGAR worker timeout is now resolved after the SEC submissions download from the remaining source/run deadline, capped at 30 seconds, with no-budget and invalid-budget failure handling. The public-refresh regression failed with `[30.0] != [10.0]` before the fix and passed afterward. Independent narrow follow-up: **M1 fixed; no Critical or Important issue introduced.**
 
-No open Important findings remain.
+No open Important findings remain from the independent review.
+
+## PR #18 Copilot review remediation
+
+Four additional Copilot findings were confirmed against the implementation and corrected on the PR branch:
+
+- `news/normalize.py` preserves the directory trailing slash implied by final literal or percent-decoded `.`/`..` path segments; `/a` and `/a/` remain distinct.
+- `news/store.py` rejects ambiguous title-only candidates when retained clusters have conflicting SEC identities or same-source native IDs. Strong-key matches remain authoritative, and an ambiguous third-publisher observation becomes a separate item instead of bridging incompatible clusters.
+- `news/refresh.py` checks the deadline again after feed parsing and before retaining entries or accepted/rejected counts.
+- `NewsStore.commit()` now derives per-source and run-level new/merged counts from actual merge decisions before constructing health and history. `NewsRefresher.refresh()` returns the normalized committed run, removing the separate approximate disposition algorithm.
+
+Each finding has a public-seam regression that reproduced the defect before its fix and passes afterward. The tests use synthetic roots, injected clocks/transports, and no network or real sleeps. Final suite and style evidence is recorded in `specs/010-curated-news-aggregation/acceptance-evidence.md`.
 
 ## Minor
 

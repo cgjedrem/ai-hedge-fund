@@ -54,6 +54,7 @@ def normalize_url(value: str) -> str:
         raise ValueError("news links must use HTTPS on the default port")
     host = _decode_unreserved(parsed.hostname).encode("idna").decode("ascii").lower()
     path = quote(_decode_unreserved(parsed.path), safe="/%:@!$&'()*+,;=-._~")
+    preserve_trailing_slash = path.endswith(("/.", "/.."))
     segments: list[str] = []
     for segment in path.split("/"):
         if segment == "..":
@@ -62,6 +63,8 @@ def normalize_url(value: str) -> str:
         elif segment != ".":
             segments.append(segment)
     path = "/".join(segments)
+    if preserve_trailing_slash and not path.endswith("/"):
+        path += "/"
     if not path.startswith("/"):
         path = "/" + path
     if not path:

@@ -49,6 +49,13 @@ Historical results above are not represented as a single clean final suite. Fres
 | Full `poetry run pytest hedge_fund -q --tb=short` | **47 failed, 3,239 passed, 62 skipped, 506 warnings in 13,290.23s (3:41:30)**; feature writer-map omissions were subsequently corrected as detailed below |
 | Focused `pytest hedge_fund/runtime/test_writer_map.py -q --tb=short` after registration fix | **125 passed in 8.23s** |
 | Focused writer inventory/map run after registration fix | **1 failed, 126 passed in 13.79s**; the sole inventory failure contains only six unchanged build-identity/credential-delivery omissions, with every feature-owned write now classified |
+| Post-Copilot-review `poetry run pytest hedge_fund/news -q` | **147 passed, 524 feedparser deprecation warnings in 290.73s**; includes final-dot URL semantics, conflict-safe title fallback, post-parse deadline rejection, and storage-backed run/health accounting regressions |
+
+### PR #18 Copilot review remediation
+
+All four confirmed findings were implemented with red-green public-seam regressions. Final-dot normalization covers literal and percent-encoded paths; native-ID and SEC cluster tests prove ambiguous third-publisher observations remain separate; the existing strong-key convergence test still passes. Deadline tests prove both late downloads and late parsing persist failed health without entries. The accounting regression proves two conflicting same-source entries produce two new items, zero merges, matching returned/persisted run totals, and `stored_count == 2`; ordering and repeat-refresh tests also pass.
+
+The final 147-test news run postdates all four production fixes. Black reformatted `store.py`; subsequent isort and flake8 checks passed for all six changed Python files. This is a focused feature-suite result, not a fresh repository-wide suite or live/deployment validation.
 
 ## Acceptance scenario coverage
 

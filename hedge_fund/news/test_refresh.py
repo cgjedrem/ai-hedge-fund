@@ -140,6 +140,47 @@ def test_refresh_orders_outcomes_and_duplicate_dispositions_by_source_id(tmp_pat
     assert result.total_merged_items == 1
 
 
+def test_refresh_counts_actual_conflict_aware_merge_decisions(tmp_path):
+    configured = source(source_id="conflicts", url="https://one.example/feed.xml", allowed_hosts=["one.example"], scope="market", tickers=[])
+    catalog_path = tmp_path / "catalog.json"
+    catalog_path.write_bytes(catalog_bytes(configured))
+    content = b"<rss><channel><item><title>Results</title><link>https://one.example/first</link><guid>release-1</guid><pubDate>Wed, 25 Nov 2026 12:00:00 +0000</pubDate></item><item><title>Results</title><link>https://one.example/second</link><guid>release-2</guid><pubDate>Wed, 25 Nov 2026 12:00:00 +0000</pubDate></item></channel></rss>"
+
+    class ConflictTransport(FakeTransport):
+        def fetch(self, request):
+            with self.gate(request.url):
+                pass
+            return FetchResponse(request.url, 200, "application/rss+xml", content, 0, len(content), len(content))
+
+    root_path = tmp_path / "synthetic-desk"
+    root_path.mkdir()
+    with RootContext.open(root_path) as root:
+        enroll_fresh(root)
+        with paths.bound_root(root):
+            result = NewsRefresher().refresh(
+                RefreshRequest(
+                    run_id="run-conflict-counts",
+                    catalog=load_catalog(catalog_path),
+                    source_ids=("conflicts",),
+                    root=root,
+                    dispatch=object(),
+                    limits=RefreshLimits(global_concurrency=1),
+                    wall_clock=lambda: NOW,
+                    monotonic_clock=lambda: 0.0,
+                    waiter=lambda _seconds: None,
+                    transport_factory=lambda source, targets, gate: ConflictTransport(gate),
+                )
+            )
+            state = NewsStore(root).load()
+
+    assert len(state.items) == 2
+    assert result.outcomes[0].accepted_count == 2
+    assert (result.outcomes[0].new_count, result.outcomes[0].merged_count) == (2, 0)
+    assert (result.total_new_items, result.total_merged_items) == (2, 0)
+    assert state.health["conflicts"].stored_count == 2
+    assert state.recent_runs[0] == result
+
+
 def test_repeated_refresh_deduplicates_and_reopens_committed_state(tmp_path):
     configured = source(source_id="repeatable", url="https://one.example/feed.xml", allowed_hosts=["one.example"], scope="market", tickers=[])
     catalog_path = tmp_path / "catalog.json"
@@ -446,6 +487,58 @@ def test_response_arriving_after_run_deadline_persists_only_failed_health(tmp_pa
     assert state.health["slow"].reason_code == "source-deadline"
     assert state.health["slow"].last_attempt_at == NOW
     assert state.health["slow"].last_success_at is None
+
+
+def test_parse_finishing_after_run_deadline_persists_only_failed_health(tmp_path, monkeypatch):
+    from hedge_fund.news import refresh as refresh_module
+
+    definition = source(
+        source_id="slow-parse",
+        url="https://one.example/feed.xml",
+        allowed_hosts=["one.example"],
+        scope="market",
+        tickers=[],
+    )
+    catalog_path = tmp_path / "catalog.json"
+    catalog_path.write_bytes(catalog_bytes(definition))
+    clock = Clock()
+    real_parse = refresh_module.parse_feed
+
+    def slow_parse(*args, **kwargs):
+        document = real_parse(*args, **kwargs)
+        clock.wait(10)
+        return document
+
+    monkeypatch.setattr(refresh_module, "parse_feed", slow_parse)
+    root_path = tmp_path / "synthetic-desk"
+    root_path.mkdir()
+    with RootContext.open(root_path) as root:
+        enroll_fresh(root)
+        with paths.bound_root(root):
+            result = NewsRefresher().refresh(
+                RefreshRequest(
+                    run_id="run-late-parse",
+                    catalog=load_catalog(catalog_path),
+                    source_ids=("slow-parse",),
+                    root=root,
+                    dispatch=object(),
+                    limits=RefreshLimits(run_deadline_seconds=5, max_requests_per_source=1),
+                    wall_clock=lambda: NOW,
+                    monotonic_clock=clock.time,
+                    waiter=clock.wait,
+                    transport_factory=lambda source, targets, gate: FakeTransport(gate),
+                )
+            )
+            state = NewsStore(root).load()
+
+    assert result.status == "failed"
+    assert result.outcomes[0].reason_code == "source-deadline"
+    assert result.outcomes[0].accepted_count == 0
+    assert result.outcomes[0].rejected_count == 0
+    assert state.items == {}
+    assert state.health["slow-parse"].status == "failed"
+    assert state.health["slow-parse"].reason_code == "source-deadline"
+    assert state.health["slow-parse"].last_success_at is None
 
 
 def test_run_expiry_preserves_earlier_success_and_later_failed_health(tmp_path):

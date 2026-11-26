@@ -16,6 +16,14 @@ def test_normalization_preserves_semantics_and_removes_tracking_noise():
     assert normalize_title("  The   FED&#x2019;s   Move  ") == "the fed’s move"
 
 
+def test_final_dot_segments_preserve_the_directory_trailing_slash():
+    assert normalize_url("https://example.com/a/.") == "https://example.com/a/"
+    assert normalize_url("https://example.com/a/b/..") == "https://example.com/a/"
+    assert normalize_url("https://example.com/a/%2E") == "https://example.com/a/"
+    assert normalize_url("https://example.com/a/b/%2E%2E") == "https://example.com/a/"
+    assert normalize_url("https://example.com/a") != normalize_url("https://example.com/a/")
+
+
 def test_timestamp_precision_and_identity_are_conservative():
     precise = parse_publication_time("2026-11-25T12:34:56-05:00")
     assert parse_publication_time("25 Nov 2026 17:34:56 +0000") == precise

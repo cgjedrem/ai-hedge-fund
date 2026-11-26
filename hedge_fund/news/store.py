@@ -31,6 +31,21 @@ class NewsRevisionConflict(DataClientError):
     """The caller read a different revision from the one being replaced."""
 
 
+def _clusters_conflict(first: NewsItem, second: NewsItem) -> bool:
+    first_sec = {key for key in first.dedupe_keys if key.startswith("sec:")}
+    second_sec = {key for key in second.dedupe_keys if key.startswith("sec:")}
+    if first_sec and second_sec and first_sec.isdisjoint(second_sec):
+        return True
+    first_sources = {value.source_id for value in first.attributions if value.original_id}
+    second_sources = {value.source_id for value in second.attributions if value.original_id}
+    for source_id in first_sources.intersection(second_sources):
+        first_ids = {value.original_id for value in first.attributions if value.source_id == source_id and value.original_id}
+        second_ids = {value.original_id for value in second.attributions if value.source_id == source_id and value.original_id}
+        if first_ids.isdisjoint(second_ids):
+            return True
+    return False
+
+
 class NewsStore:
     def __init__(self, root: RootContext, *, clock: Callable[[], datetime] | None = None):
         self.root = root
@@ -135,8 +150,20 @@ class NewsStore:
             items = dict(previous.items)
             aliases = dict(previous.aliases)
             merge_conflicts = 0
+            dispositions: dict[str, dict[str, int]] = {}
             for parsed in sorted(entries, key=lambda item: (item.attribution.source_id, item.attribution.original_id or "", item.attribution.normalized_url or "", item.dedupe_keys)):
-                merge_conflicts += self._merge(items, aliases, parsed)
+                conflicts, merged = self._merge(items, aliases, parsed)
+                merge_conflicts += conflicts
+                counts = dispositions.setdefault(parsed.attribution.source_id, {"new_count": 0, "merged_count": 0})
+                counts["merged_count" if merged else "new_count"] += 1
+            outcomes = tuple(outcome.model_copy(update=dispositions.get(outcome.source_id, {"new_count": 0, "merged_count": 0})) for outcome in run.outcomes)
+            run = run.model_copy(
+                update={
+                    "outcomes": outcomes,
+                    "total_new_items": sum(outcome.new_count for outcome in outcomes),
+                    "total_merged_items": sum(outcome.merged_count for outcome in outcomes),
+                }
+            )
             health = dict(previous.health)
             for source_id, definition in definitions.items():
                 old = health.get(source_id)
@@ -192,7 +219,7 @@ class NewsStore:
                 raise
             return state
 
-    def _merge(self, items: dict[str, NewsItem], aliases: dict[str, str], parsed: ParsedNewsEntry) -> int:
+    def _merge(self, items: dict[str, NewsItem], aliases: dict[str, str], parsed: ParsedNewsEntry) -> tuple[int, bool]:
         keys = set(parsed.dedupe_keys)
         strong_keys = {key for key in keys if not key.startswith("title:")}
         title_keys = keys - strong_keys
@@ -201,6 +228,7 @@ class NewsStore:
         matching = {aliases[key] for key in strong_keys if aliases.get(key) in items}
         matching.update(item_id for item_id, item in items.items() if strong_keys.intersection(item.dedupe_keys))
         if title_keys:
+            title_candidates = set()
             for item_id, item in items.items():
                 if not title_keys.intersection(item.dedupe_keys):
                     continue
@@ -213,8 +241,14 @@ class NewsStore:
                 if incoming_native and existing_native and incoming_native not in existing_native:
                     merge_conflicts += 1
                     continue
-                matching.add(item_id)
+                if item_id not in matching:
+                    title_candidates.add(item_id)
+            candidate_context = matching | title_candidates
+            ambiguous = {item_id for item_id in title_candidates if any(_clusters_conflict(items[item_id], items[other_id]) for other_id in candidate_context if other_id != item_id)}
+            matching.update(title_candidates - ambiguous)
+            merge_conflicts += len(ambiguous)
         news_id = min(matching) if matching else "news_" + hashlib.sha256(parsed.dedupe_keys[0].encode("utf-8")).hexdigest()
+        merged = bool(matching)
         clusters = [items[item_id] for item_id in sorted(matching)]
         attribution = parsed.attribution
         attributions = {(value.source_id, value.original_id, value.normalized_url): value for cluster in clusters for value in cluster.attributions}
@@ -276,4 +310,4 @@ class NewsStore:
         for key in item.dedupe_keys:
             aliases[key] = news_id
         aliases[news_id] = news_id
-        return merge_conflicts
+        return merge_conflicts, merged

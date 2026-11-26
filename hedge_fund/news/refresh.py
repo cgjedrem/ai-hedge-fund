@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass, field
@@ -203,11 +203,7 @@ class NewsRefresher:
                 item.dedupe_keys,
             )
         )
-        counts = self._dispositions(previous, entries)
-        outcomes = sorted(
-            (outcome.model_copy(update=counts.get(outcome.source_id, {"new_count": 0, "merged_count": 0})) for outcome in outcomes),
-            key=lambda outcome: outcome.source_id,
-        )
+        outcomes = sorted(outcomes, key=lambda outcome: outcome.source_id)
         ended_at = request.wall_clock()
         successful = [item for item in outcomes if item.status != "failed"]
         status = "succeeded" if len(successful) == len(outcomes) and all(item.status != "degraded" for item in outcomes) else "partial" if successful else "failed"
@@ -224,8 +220,8 @@ class NewsRefresher:
             total_new_items=sum(item.new_count for item in outcomes),
             total_merged_items=sum(item.merged_count for item in outcomes),
         )
-        store.commit(expected_revision=previous.revision, run=run, entries=tuple(entries), sources=selected)
-        return run
+        state = store.commit(expected_revision=previous.revision, run=run, entries=tuple(entries), sources=selected)
+        return next(committed for committed in state.recent_runs if committed.run_id == request.run_id)
 
     def _selected(self, request: RefreshRequest) -> tuple[SourceDefinition, ...]:
         by_id = {source.source_id: source for source in request.catalog.sources}
@@ -294,6 +290,7 @@ class NewsRefresher:
                 )
                 controller.check_deadline(source, source_started)
                 document = parse_feed(response.content, source, started_at, max_entries=limits.max_entries)
+                controller.check_deadline(source, source_started)
                 parsed = document.entries
                 accepted = len(parsed)
                 rejected = document.rejected_count
@@ -361,17 +358,3 @@ class NewsRefresher:
             reason_code=reason,
         )
         return outcome, parsed
-
-    def _dispositions(self, previous, entries: Sequence[ParsedNewsEntry]) -> dict[str, dict[str, int]]:
-        known = set(previous.aliases)
-        for item in previous.items.values():
-            known.update(item.dedupe_keys)
-        counts: dict[str, dict[str, int]] = {}
-        for parsed in entries:
-            source_counts = counts.setdefault(parsed.attribution.source_id, {"new_count": 0, "merged_count": 0})
-            if known.intersection(parsed.dedupe_keys):
-                source_counts["merged_count"] += 1
-            else:
-                source_counts["new_count"] += 1
-            known.update(parsed.dedupe_keys)
-        return counts

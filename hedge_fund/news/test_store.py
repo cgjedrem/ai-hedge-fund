@@ -161,6 +161,66 @@ def test_bridging_observation_converges_existing_clusters(tmp_path):
         assert all(converged.aliases[key] == retained_id for key in item.dedupe_keys)
 
 
+def test_title_fallback_does_not_bridge_conflicting_native_id_clusters(tmp_path):
+    with synthetic_store(tmp_path) as (store, _root):
+        configured = definition()
+        third = definition(source_id="example-wire", publisher="Wire", url="https://wire.example.com/news.xml", allowed_hosts=["wire.example.com"], sequence=300)
+        initial = store.commit(
+            expected_revision=0,
+            run=run(accepted_count=2, new_count=2),
+            entries=(
+                entry(configured, url="https://ir.example.com/first", title="Results", original_id="release-1"),
+                entry(configured, url="https://ir.example.com/second", title="Results", original_id="release-2"),
+            ),
+            sources=(configured,),
+        )
+        assert len(initial.items) == 2
+
+        observed = store.commit(
+            expected_revision=1,
+            run=run(run_id="run-2", source_id=third.source_id),
+            entries=(entry(third, url="https://wire.example.com/results", title="Results"),),
+            sources=(third,),
+        )
+
+        assert len(observed.items) == 3
+        wire_items = [item for item in observed.items.values() if any(value.source_id == third.source_id for value in item.attributions)]
+        assert len(wire_items) == 1
+        assert len(wire_items[0].attributions) == 1
+        native_ids = {tuple(value.original_id for value in item.attributions if value.source_id == configured.source_id) for item in observed.items.values() if any(value.source_id == configured.source_id for value in item.attributions)}
+        assert native_ids == {("release-1",), ("release-2",)}
+
+
+def test_title_fallback_does_not_bridge_conflicting_sec_clusters(tmp_path):
+    with synthetic_store(tmp_path) as (store, _root):
+        configured = definition()
+        syndicated = definition(source_id="example-syndicated", publisher="Syndicated IR", sequence=200)
+        third = definition(source_id="example-wire", publisher="Wire", url="https://wire.example.com/news.xml", allowed_hosts=["wire.example.com"], sequence=300)
+        initial = store.commit(
+            expected_revision=0,
+            run=run(accepted_count=2, new_count=2),
+            entries=(
+                entry(configured, url="https://ir.example.com/first", title="Results", original_id="0001193125-26-000001"),
+                entry(syndicated, url="https://ir.example.com/second", title="Results", original_id="0001193125-26-000002"),
+            ),
+            sources=(configured, syndicated),
+        )
+        assert len(initial.items) == 2
+
+        observed = store.commit(
+            expected_revision=1,
+            run=run(run_id="run-2", source_id=third.source_id),
+            entries=(entry(third, url="https://wire.example.com/results", title="Results"),),
+            sources=(third,),
+        )
+
+        assert len(observed.items) == 3
+        wire_items = [item for item in observed.items.values() if any(value.source_id == third.source_id for value in item.attributions)]
+        assert len(wire_items) == 1
+        sec_identities = {tuple(key for key in item.dedupe_keys if key.startswith("sec:")) for item in observed.items.values() if any(key.startswith("sec:") for key in item.dedupe_keys)}
+        assert sec_identities == {("sec:000119312526000001",), ("sec:000119312526000002",)}
+
+
 def test_title_fallback_merges_matching_minute_and_scope_without_native_ids(tmp_path):
     with synthetic_store(tmp_path) as (store, _root):
         first_source = definition(scope="market")
