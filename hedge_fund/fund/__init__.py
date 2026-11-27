@@ -12,6 +12,7 @@ from hedge_fund.fund.spec import (
     MIN_INTERVAL_SECONDS,
     model_call_bounds,
     ModelSpec,
+    normalize_ticker,
     normalize_universe,
     PortfolioMode,
     StrategySpec,
@@ -36,6 +37,7 @@ __all__ = [
     "format_interval",
     "load_spec",
     "load_strategy",
+    "normalize_ticker",
     "normalize_universe",
     "save_spec",
 ]

@@ -18,7 +18,7 @@ def validate_snapshot(
 
 Import from `hedge_fund.discovery`. The function accepts Python field content rather than a JSON document or byte stream. Callers remain responsible for any parsing. Expected data-validation failures return a failure result; they do not expose Pydantic exceptions.
 
-The two freshness arguments are both absent or both present. Their incomplete/invalid behavior is defined in [Data model — Freshness policy](../data-model.md#freshness-policy-not-part-of-canonical-output).
+Freshness is disabled when both arguments are `None`, whether omitted or explicit. A single non-`None` argument is an incomplete policy. Details are defined in [Data model — Freshness policy](../data-model.md#freshness-policy-not-part-of-canonical-output).
 
 ## Result contract
 
@@ -36,7 +36,7 @@ The two freshness arguments are both absent or both present. Their incomplete/in
 | `location` | `str` | Exact root/field location |
 | `reason` | `str` | Stable machine-readable reason |
 | `message` | `str` | Deterministic human-readable explanation |
-| `related_locations` | `tuple[str, ...]` | Other conflicting locations; empty unless applicable |
+| `related_locations` | `tuple[str, ...]` | First 10 conflicting locations; empty unless applicable |
 
 Success means `snapshot is not None` and `issues == ()`. Failure means `snapshot is None` and `issues` is non-empty. Callers must test the result rather than treating a partial dictionary as usable.
 
@@ -53,15 +53,17 @@ The complete field schema, constraints, optional-field behavior, and timestamp b
 7. Canonical output is compared by JSON-compatible field content. Byte serialization, object-key order, and insignificant whitespace are not contractual.
 8. A successful result contains the five top-level fields and every declared instrument/source field; a failed result contains no partial snapshot.
 9. Currency identifiers contain exactly three uppercase ASCII letters. Validation is format-only and does not claim ISO 4217 assigned-code membership.
+10. Only exact built-in JSON field types are accepted. Container and scalar subclasses yield `invalid_type`.
 
 ## Freshness contract
 
 Freshness is opt-in and deterministic:
 
 - No policy: validate structure and timestamp order only, including for arbitrarily historical snapshots.
+- No policy means both arguments are `None`, whether omitted or explicit. A single non-`None` argument reports the missing companion.
 - Complete policy: reject future observations and ages strictly greater than `max_age_seconds`.
 - Exact age boundary: accept.
-- Invalid/incomplete policy: report policy argument issues, never silently use the wall clock or disable an enabled check.
+- Invalid/incomplete policy: report issues at `argument.reference_time` or `argument.max_age_seconds`; never silently use the wall clock.
 
 The freshness arguments and policy issues are not added to canonical snapshot content.
 
@@ -83,13 +85,25 @@ future_snapshot
 inconsistent_optional_fields
 ```
 
-Use `$` for a root type error. Use dotted object fields and bracketed zero-based indices elsewhere, for example `source.provider`, `instruments[0].code`, `reference_time`, and `max_age_seconds`.
+Use `$` for a root type error. Use dotted object fields and bracketed zero-based indices elsewhere, for example `source.provider`, `instruments[0].code`, `argument.reference_time`, and `argument.max_age_seconds`.
 
 Locations are encoded from structured segments so arbitrary unknown keys cannot collide. Object keys matching `[A-Za-z_][A-Za-z0-9_]*` use dotted notation. Every other key uses a bracketed JSON-string segment with standard JSON escaping for quotes, backslashes, and control characters; prefix `$` when the first segment requires brackets. A top-level unknown key `source.extra` therefore renders as `$["source.extra"]`, while an unknown `extra` key inside `source` renders as `source.extra`. An unknown `bad.key` on the first instrument renders as `instruments[0]["bad.key"]`. Sorting uses the structured segments before this rendering.
 
-A malformed `schema_version` uses `invalid_type` at `schema_version`; a missing version uses `missing_field`; an integer other than 1 uses `unsupported_schema_version`. Location plus reason is the compatibility contract; human messages are not intended for parsing.
+A null `schema_version` uses `null_value`; other malformed types use `invalid_type`. A missing version uses `missing_field`; an integer other than 1 uses `unsupported_schema_version`. Location plus reason is the compatibility contract; human messages are not intended for parsing.
 
-For duplicate canonical codes, every conflicting row receives an issue at its own `code` location and lists every other conflicting row in `related_locations`.
+For duplicate canonical codes, every conflicting row receives an issue at its own `code` location. `related_locations` contains at most the first 10 other code locations in numeric row order; the issue message states how many additional locations were omitted.
+
+## Approved clarifications
+
+- **2026-11-26, user approval at 10:27:21+01:00 (D1)**: bounded duplicate locations supersede the earlier requirement to list every conflicting row.
+- **2026-11-26, user approval at 10:27:21+01:00 (D2)**: policy argument locations use the `argument.` prefix, superseding bare argument locations.
+- **2026-11-26, user approval at 10:27:21+01:00 (D3)**: integer magnitudes remain unbounded. Standard `json.dumps` may reject integers above Python's default 4300-digit conversion limit; validation adds no numeric bound.
+- **2026-11-26, user approval at 10:27:21+01:00 (D4)**: freshness is disabled when both arguments are `None`, whether omitted or explicit. `None` never enables a policy; no sentinel is used.
+- **2026-11-26**: `schema_version=null` is classified as `null_value`. Repeated Python container references, including cycles, are rejected as `invalid_type` because JSON has no identity aliases.
+- **2026-11-26**: Unpaired-surrogate object keys remain unknown fields and render with ASCII JSON escapes; independent validation issues remain visible.
+- **2026-11-26**: Fractional timestamps compare by whole seconds then exact decimal digits. Fraction length and integer magnitude have no validator-imposed cap.
+
+`SnapshotValidationResult` contains canonical values, not a serialization guarantee. Its `snapshot` may contain an integer that standard `json.dumps` cannot convert under Python's active digit limit.
 
 ## Aggregation and ordering
 

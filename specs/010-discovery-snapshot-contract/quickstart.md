@@ -7,7 +7,8 @@ These scenarios become runnable after implementation. They use only synthetic in
 ## Prerequisites
 
 - Work from the repository root on the app-managed feature worktree.
-- Python 3.11 and the existing Poetry environment are available. If dependencies are not installed, run `poetry install`.
+- Project target is Python 3.11. **BLOCKED** on this host: only CPython 3.13.7 is available. Unblock by providing a Python 3.11 Poetry environment and rerunning the documented acceptance checks.
+- Poetry 2.5.1 and locked dependencies are available. If dependencies are not installed, run `poetry install`.
 - No environment credentials or network access are needed. The repository's test setup supplies isolation.
 
 ## Commands
@@ -23,7 +24,7 @@ Run focused style checks:
 ```powershell
 poetry run black --check hedge_fund/discovery hedge_fund/fund/spec.py hedge_fund/fund/__init__.py hedge_fund/fund/test_spec.py
 poetry run isort --check-only hedge_fund/discovery hedge_fund/fund/spec.py hedge_fund/fund/__init__.py hedge_fund/fund/test_spec.py
-poetry run flake8 hedge_fund/discovery hedge_fund/fund/spec.py hedge_fund/fund/__init__.py hedge_fund/fund/test_spec.py
+poetry run flake8 --isolated --max-line-length 420 --extend-ignore E203 hedge_fund/discovery hedge_fund/fund/spec.py hedge_fund/fund/__init__.py hedge_fund/fund/test_spec.py
 ```
 
 Before implementation acceptance, run the constitution-required full suite:
@@ -32,7 +33,7 @@ Before implementation acceptance, run the constitution-required full suite:
 poetry run pytest hedge_fund -q
 ```
 
-Expected result for every command: exit code zero. Do not accept the feature using only a narrowed final suite.
+Expected result: focused tests and style checks exit zero. Full suite must complete; compare each failure against the clean base with matching interpreter and dependencies. Treat only reproduced baseline failures as unchanged. Do not accept the feature using only a narrowed final suite.
 
 ## Validation scenarios
 
@@ -52,11 +53,13 @@ Expected result for every command: exit code zero. Do not accept the feature usi
 
 1. Load a combined invalid fixture with independently detectable errors: missing required values, explicit nulls, wrong types, unknown fields, a non-positive price, an out-of-range change, non-finite numbers, an incomplete optional pair, and duplicate canonical codes.
 2. Validate once.
-3. **Expected**: failure with `snapshot=None`; all independently detectable issues are present with exact locations and reasons; duplicate issues identify every conflicting row.
+3. **Expected**: failure with `snapshot=None`; all independently detectable issues are present with exact locations and reasons; duplicate issues identify their row and include at most the first 10 other rows, with the omitted count in the message.
 4. Repeat with a second fixture containing at least ten instruments and errors at indices 2 and 10.
 5. **Expected**: index 2 sorts before index 10; issue order and messages are deterministic.
 6. Attempt to consume the result as a canonical snapshot.
 7. **Expected**: no partial snapshot exists to consume.
+8. Validate 10,000 rows with one duplicate canonical code.
+9. **Expected**: at most 10 related locations per row, exact omitted counts, and completion within 5 seconds in the focused regression.
 
 ### V3 — Strict version and JSON-type boundaries (FR-002, FR-007, FR-010, SC-005)
 
@@ -65,14 +68,17 @@ Exercise each case independently:
 | Input | Expected issue |
 |---|---|
 | Missing `schema_version` | `missing_field` at `schema_version` |
+| `schema_version=null` | `null_value` at `schema_version` |
 | `schema_version=True` or `1.0` | `invalid_type` at `schema_version` |
 | `schema_version=2` | `unsupported_schema_version` at `schema_version` |
 | Numeric strings, booleans as numeric fields | `invalid_type` at the exact field |
 | NaN or positive/negative infinity | `invalid_value` at the exact field |
 | Unknown fields at each object level | `unknown_field` at each exact field |
 | Top-level key `source.extra` plus key `extra` inside `source` | Distinct `unknown_field` locations `$["source.extra"]` and `source.extra` |
-| Unknown keys containing quotes, backslashes, brackets, or dots | Bracketed JSON-string segments with unambiguous escaping |
+| Unknown keys containing quotes, backslashes, brackets, dots, or an unpaired surrogate | Bracketed JSON-string segments with unambiguous ASCII escaping; independent errors remain visible |
 | Non-string object key or non-JSON Python value | `invalid_type` at the containing/exact location |
+| Dict, list, or integer subclass | Deterministic `invalid_type`; subclass getters are not invoked |
+| Repeated Python container reference or cycle | `invalid_type` at each repeated location; no alias expansion |
 | Null required field | `null_value` at the exact field |
 | Unsupported unknown fields or versions combined with other errors | All independent issues; no migration or silent field ignoring |
 
@@ -89,37 +95,43 @@ Exercise each case independently:
 
 ### V5 — Explicit freshness (US-2, FR-011)
 
-At the interim US1-only checkpoint, any supplied freshness argument must instead fail closed with `invalid_value` at each supplied argument; the complete behavior below is required after US2.
-
 1. Validate a historical snapshot without policy arguments.
 2. **Expected**: historical age alone does not fail; no current-time lookup occurs.
-3. Supply `reference_time` and `max_age_seconds` so snapshot age equals the limit exactly.
-4. **Expected**: success at the boundary.
-5. Increase the reference instant by the smallest fixture fraction beyond the boundary.
-6. **Expected**: `stale_snapshot` at `snapshot_at`, using exact arithmetic rather than microsecond rounding.
-7. Set `snapshot_at` later than `reference_time`.
-8. **Expected**: `future_snapshot`; a future observation is not also reported as stale.
-9. Supply only one policy argument, a malformed reference, a negative age, a boolean age, and a float age in separate cases.
-10. **Expected**: `missing_field`, `invalid_value`, or `invalid_type` at `reference_time`/`max_age_seconds` as applicable; freshness is neither silently disabled nor evaluated from invalid policy data.
+3. Repeat with both freshness arguments explicitly set to `None`.
+4. **Expected**: same result; `None` never enables freshness.
+5. Supply `reference_time` and `max_age_seconds` so snapshot age equals the limit exactly.
+6. **Expected**: success at the boundary.
+7. Increase the reference instant by the smallest fixture fraction beyond the boundary.
+8. **Expected**: `stale_snapshot` at `snapshot_at`, using exact arithmetic rather than microsecond rounding.
+9. Set `snapshot_at` later than `reference_time`.
+10. **Expected**: `future_snapshot`; a future observation is not also reported as stale.
+11. Supply only one policy argument, a malformed reference, a negative age, a boolean age, and a float age in separate cases.
+12. **Expected**: `missing_field`, `invalid_value`, or `invalid_type` at `argument.reference_time`/`argument.max_age_seconds` as applicable; invalid policy data produces no freshness claim.
+13. Add a root `max_age_seconds` key while supplying `reference_time` only.
+14. **Expected**: one missing-policy issue at `argument.max_age_seconds` plus one unknown root field at `max_age_seconds`.
+15. Run a complete policy with a wall-clock trap installed.
+16. **Expected**: no wall-clock access.
 
 ### V6 — Valid structural extremes (FR-005, FR-007, FR-010)
 
 1. Validate snapshots with an empty instrument list, a suspended instrument, zero allowed numeric values, negative valuation ratios, and large finite numbers.
 2. **Expected**: structural success with values preserved.
 3. **Expected**: no eligibility, ranking, or sampling decision is made by this feature.
+4. Validate an integer above 4,300 decimal digits.
+5. **Expected**: exact integer preservation; standard `json.dumps` may reject serialization under Python's default conversion limit.
 
 ### V7 — Shared normalization and deterministic replay (FR-006, FR-014, SC-004)
 
 1. Run existing `normalize_universe` examples, including mixed case, surrounding whitespace, embedded punctuation, duplicates, and empty-universe behavior.
 2. **Expected**: existing behavior is unchanged after extracting the shared single-ticker helper.
 3. Validate every named fixture twice and compare canonical content/issues.
-4. **Expected**: identical results. Instrument-list duplicates remain validation errors rather than inheriting universe-list deduplication.
+4. **Expected**: identical results. Instrument-list duplicates remain validation errors rather than inheriting universe-list deduplication. US3 unit- and meaning-change fixtures alter distinct field values and require compatibility review.
 
 ### V8 — Offline and regression acceptance (SC-001–SC-005)
 
 1. Run the focused tests with provider credentials absent and the existing network guard active.
 2. **Expected**: all scenarios pass without network or external state.
 3. Run `poetry run pytest hedge_fund -q`.
-4. **Expected**: full suite passes; existing fund, ledger, backtest, paper-trading, and UI behavior is unchanged.
+4. **Expected**: full suite completes. Every failure is individually compared against the clean base with matching interpreter and dependencies; only reproduced baseline failures are unchanged. Existing fund, ledger, backtest, paper-trading, and UI behavior remains unchanged.
 
 Detailed field expectations and reason semantics live in [data-model.md](data-model.md) and the [public contract](contracts/discovery-snapshot-v1.md); this guide intentionally contains no implementation bodies.

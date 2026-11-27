@@ -17,6 +17,7 @@ from hedge_fund.fund import (
     FundSpec,
     load_spec,
     load_strategy,
+    normalize_ticker,
     normalize_universe,
     save_spec,
     StrategySpec,
@@ -286,6 +287,17 @@ def test_unversioned_files_are_rejected_without_changes(tmp_path):
 
 def test_normalize_universe():
     assert normalize_universe(["aapl", " msft ", "AAPL"]) == ["AAPL", "MSFT"]
+    with pytest.raises(ValueError, match="universe is empty"):
+        normalize_universe([])
+    with pytest.raises(ValueError, match="universe is empty"):
+        normalize_universe(["  "])
+
+
+def test_normalize_ticker_matches_universe_canonicalization():
+    assert normalize_ticker("aapl") == "AAPL"
+    assert normalize_ticker(" MSFT ") == "MSFT"
+    assert normalize_ticker("BRK.B") == "BRK.B"
+    assert normalize_universe(["aapl", " msft ", "AAPL", "BRK.B"]) == ["AAPL", "MSFT", "BRK.B"]
     with pytest.raises(ValueError, match="universe is empty"):
         normalize_universe([])
     with pytest.raises(ValueError, match="universe is empty"):

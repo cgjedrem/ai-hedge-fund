@@ -68,9 +68,9 @@ No technical unknowns remain. The design uses only the repository's existing Pyt
 
 ## D7 — Use exact arithmetic for ordering and freshness
 
-**Decision**: Parse each valid timestamp into an exact standard-library `Fraction`: whole UTC seconds plus the fraction digits over their power-of-ten denominator. Use this value only for comparison; retain the separately canonicalized string for output. Evaluate `reference_time - snapshot_at` against integer `max_age_seconds`, with equality accepted.
+**Decision**: Parse each valid timestamp into whole UTC seconds plus its original fraction-digit string. Compare whole seconds first, then compare fractional digits exactly with zero extension; compare age by adding integer `max_age_seconds` to the observation whole seconds. Keep canonical text separately. Do not convert fraction digits to integers or floats.
 
-**Rationale**: Fraction arithmetic avoids float and microsecond rounding at arbitrary precision. It supports timestamp order, future detection, and exact freshness boundaries without changing canonical text.
+**Rationale**: Decimal-string comparison preserves arbitrary precision with linear work. It supports timestamp order, future detection, and exact freshness boundaries without changing canonical text or imposing a digit cap.
 
 **Alternatives considered**: Datetime microseconds and floats can change boundary outcomes. Decimal arithmetic needs a deliberately managed precision context for arbitrary fractions. Lexicographic timestamp comparison alone does not calculate age.
 

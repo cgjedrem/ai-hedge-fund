@@ -15,6 +15,7 @@ All persisted-looking structures below are in-memory only. The public canonical 
 | `instruments` | Required list of instrument objects; may be empty | List in input order |
 
 Only these five top-level fields are accepted.
+`schema_version=null` yields `null_value`; booleans, floats, strings, and other wrong types yield `invalid_type`.
 
 ### Timestamp value semantics
 
@@ -22,7 +23,7 @@ Only these five top-level fields are accepted.
 - Validate calendar fields and offsets with Python `datetime`; the MVP rejects leap-second `:60`, year 0000, and UTC conversions outside years 0001–9999.
 - Normalize the whole-second portion to UTC, preserve every supplied fraction digit verbatim, and emit uppercase `T` and trailing `Z`. Do not round, pad, or add a zero fraction.
 - Treat `-00:00` as the same instant as UTC for this instant-only contract.
-- Keep an exact `Fraction` representation separately for comparisons; it is never emitted.
+- Keep whole UTC seconds and original fraction digits separately for exact comparisons; neither is emitted.
 
 ## Source
 
@@ -57,8 +58,9 @@ Rules applying to every instrument:
 
 - Reject unknown fields. Emit all seven optional fields explicitly, using null when absent or null in input. A blank `industry` also canonicalizes to null; preserve nonblank industry text.
 - Preserve numeric type and value; do not convert integers to floats, clip extremes, or replace unavailable values with zero.
+- Integer magnitude has no validator-imposed bound. Standard `json.dumps` may reject integers above Python's default 4300-digit conversion limit.
 - `avg_amount_usd` and `avg_amount_usd_window_days` must both be present and non-null or both be absent/null. One without the other yields `inconsistent_optional_fields` at `avg_amount_usd_window_days`.
-- After code normalization, duplicate codes are invalid. Emit one `duplicate_code` issue for every conflicting row; each issue's `related_locations` contains the other rows' code locations.
+- After code normalization, duplicate codes are invalid. Emit one `duplicate_code` issue for every conflicting row; `related_locations` contains at most the first 10 other code locations in numeric row order, and the message states the omitted count.
 - Suspension and an empty instrument list affect no structural validity rule. Ranking eligibility belongs to feature 011.
 
 ## Freshness policy (not part of canonical output)
@@ -70,7 +72,7 @@ Freshness is represented by the validator's two keyword arguments:
 | `reference_time` | RFC 3339 string under the same parser and exact-instant semantics as snapshot timestamps |
 | `max_age_seconds` | Built-in integer greater than or equal to zero; booleans and floats are invalid |
 
-The arguments must be supplied together. If one is absent, report `missing_field` at that argument name. Invalid supplied values use `invalid_type` or `invalid_value` at the argument name; no new reason is introduced.
+The arguments are disabled when both are `None`, whether omitted or explicit. A single non-`None` argument enables an incomplete policy and reports `missing_field` at the `argument.`-prefixed location for its missing companion. Invalid supplied values use `invalid_type` or `invalid_value` at `argument.reference_time` or `argument.max_age_seconds`; no new reason is introduced. `None` never enables freshness.
 
 With no policy, perform no age or future check and never read the wall clock. With a complete valid policy and valid snapshot timestamps:
 
@@ -96,10 +98,10 @@ There is no partial success state. An empty snapshot dictionary is never a valid
 
 | Field | Meaning |
 |---|---|
-| `location` | `$` for the root; otherwise a dotted field path with numeric list indices, such as `instruments[0].price` |
+| `location` | `$` for the root; otherwise a dotted field path with numeric list indices, such as `instruments[0].price` or `argument.reference_time` |
 | `reason` | One stable value from the vocabulary below |
 | `message` | Deterministic human-readable explanation; consumers must not parse it |
-| `related_locations` | Tuple of other relevant locations; normally empty, populated for duplicate rows |
+| `related_locations` | Tuple of at most 10 other duplicate-code locations; omitted count is in the message |
 
 Locations are rendered from structured object-key and array-index segments, never by joining already-rendered strings. Object keys matching `[A-Za-z_][A-Za-z0-9_]*` use dotted notation. Every other object key uses a bracketed JSON-string segment with standard JSON escaping for quotes, backslashes, and control characters; use `$` as the root prefix when the first segment requires brackets. Array indices remain unquoted numeric brackets.
 

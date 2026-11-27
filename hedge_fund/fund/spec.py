@@ -415,6 +415,11 @@ def format_interval(seconds: int) -> str:
     return "".join(parts)
 
 
+def normalize_ticker(ticker: str) -> str:
+    """Trim and uppercase ticker; preserve embedded characters."""
+    return ticker.strip().upper()
+
+
 def normalize_universe(tickers: list[str]) -> list[str]:
     """Strip, uppercase, and deduplicate tickers while preserving their order.
 
@@ -422,7 +427,7 @@ def normalize_universe(tickers: list[str]) -> list[str]:
     """
     universe: list[str] = []
     for ticker in tickers:
-        upper = ticker.strip().upper()
+        upper = normalize_ticker(ticker)
         if upper and upper not in universe:
             universe.append(upper)
     if not universe:
