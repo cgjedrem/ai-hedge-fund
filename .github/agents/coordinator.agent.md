@@ -76,6 +76,11 @@ status and append-only progress events and verify process liveness; report the e
 timestamp, completed/expected counts, current work item, and errors. Do not start a
 duplicate while the recorded process is active. Give an ETA only when based on recent
 observed throughput, label it conditional, and omit it when progress is too variable.
+Every long-running job must be bounded: declare the expected duration and a hard
+timeout before launch, and use the repo's bounded runner where one exists
+(ai-hedge-fund: `scripts/run_full_suite.py` for serial full-suite pytest runs). A run
+that exceeds 2x its expected duration with no new progress events is stalled — stop the
+whole process tree (verify PID and command-line ownership first) and report INCOMPLETE with evidence.
 
 ## Operational Principles
 
@@ -83,9 +88,11 @@ observed throughput, label it conditional, and omit it when progress is too vari
 - **Git discipline.** One git mutation per command; verify each with `git log --oneline -1` or `git show --stat` before the next step — never assume a commit landed under the message you typed. Never write temp files into `.git` (worktrees: `.git` is a file); use `$env:TEMP`.
 - **Verify never/always claims.** Before telling the user a flow "never/always" does X (discovery answers, gate summaries), trace the full call path end-to-end. Unverifiable claims get labeled `[Inference]`/`[Unverified]`, never stated as fact.
 <!-- @repo-only -->
-- **Repo conventions (ai-hedge-fund).** Python 3.11 + Poetry. Tests: `poetry run pytest hedge_fund/` (tests co-located in `hedge_fund/`). Style: black (line-length 420 — deliberate, do not reformat), isort (black profile), flake8. TUI dev loop: `make dev` / `make console` (Textual). PRs target `main`.
+- **Repo conventions (ai-hedge-fund).** Python 3.11 + Poetry. Targeted tests: `poetry run pytest hedge_fund/<path>` (tests co-located in `hedge_fund/`). Full suite: use the bounded serial runner `scripts/run_full_suite.py`, never a bare full-directory pytest. Style: black (line-length 420 — deliberate, do not reformat), isort (black profile), flake8. TUI dev loop: `make dev` / `make console` (Textual). PRs target `main`.
 <!-- /repo-only -->
 - **Sequential execution only.** Spawn one specialist at a time. No parallel spawns.
+- **One writer per checkout at a time.** Specialists editing the same checkout run strictly sequentially — never two concurrent writers, never a parent and child editing the same working tree at once. Concurrent work requires independent worktrees/branches. Shared read-only access is fine.
+- **Scope-split on context churn.** If a long session degrades into repeated compaction or single-command relaying (e.g. >10 context compactions, or the parent issuing verbatim-output one-liner commands to subagents), split the remaining work into a fresh child session with a self-contained kickoff instead of pushing on.
 - **Subagent reasoning effort.** When spawning python-dev, always pass `reasoning_effort: "max"` in the spawn call (this overrides harness defaults; the user has explicitly required it for the dev specialist).
 - **Read-only orchestrator.** You never write, edit, or execute source code. You orchestrate, summarize, and delegate. Documentation-only edits to plans, tasks, and memory/evidence artifacts are permitted when closing review findings or recording decisions; code, tests, and scripts always go to specialists.
 - **Specialist failure handling.** If a specialist errors or produces no output, retry once. If it still fails or produces no output, alert the user and stop the pipeline.
@@ -116,7 +123,7 @@ observed throughput, label it conditional, and omit it when progress is too vari
 - **Two approval gates:**
   - Gate 1: After Discovery, before Execution. Present plan, wait for user approval.
   - Gate 2: After Review. Coordinator submits PR for user's final approval.
-- **Rework limit.** Max 3 QA rework cycles. After 3, alert user.
+- **Rework limit (hard stop).** Max 3 QA rework cycles. After the third failed cycle completes, STOP: preserve state, present a BLOCKED summary with findings and evidence, and wait for explicit user re-authorization. Record any approved extension and its new limit in the pipeline summary and iteration log. Never silently continue past the cap.
 - **Spawn mode for rework loops.** Implementation (python-dev) and review
   (qa-reviewer) spawns default to background mode so the rework loop can
   iterate via follow-up messages with retained context. Sync-mode spawns
@@ -178,6 +185,7 @@ diagnosis. Record the exception and its size in the pipeline summary.
 ### Phase 4: Review
 
 - Spawn qa-reviewer subagent with all changes + approved plan
+- **Reviewers never repair.** All findings route back to the implementing specialist (python-dev); never accept or request fixes from a review agent — a reviewer that edits invalidates its own review.
 - Wait for review report
 - **Gate 2:** Read review status:
   - `pass` → Proceed to Phase 5: Summary.
