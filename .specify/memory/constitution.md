@@ -65,7 +65,7 @@ Follow-up TODOs:
 
 - Recorded clocks, seeded randomness -> any session replayable.
 - Tests co-located under `hedge_fund/`, run `poetry run pytest hedge_fund -q`.
-- Change is done when full suite passes, or each remaining failure individually evidenced as unchanged baseline (test ID, expected/observed, platform, timestamp, repro on pre-change revision). Inconclusive suite != pass.
+- Change is done when full suite passes, or each remaining failure individually evidenced as unchanged baseline: exact test ID, expected/observed result, source/build identity, platform, recorded time, fixture provenance, and reproduction on the pre-change revision. Inconclusive or interrupted suites != pass. Historically reported anomalies are candidates to reproduce, not blanket exemptions. No new failure is excused; do not repair unrelated baseline defects. Required platform/runtime evidence that is blocked remains blocked.
 - Full suite MUST finish under 10 minutes on the dev machine. Any test file over 60s is marked slow and investigated. Targeted per-file runs = dev loop; full suite = merge gate.
 - Why: evidence rule is scar tissue from real false-green claims. Budget stops suite re-bloat (was ~40 min).
 
@@ -115,5 +115,15 @@ Follow-up TODOs:
 - Versioning semver: MAJOR = principle removal/redefinition; MINOR = new principle/section; PATCH = clarification.
 - Every PR review verifies principle compliance; complexity challenged per Principle VII.
 - Historical record: 2026-10-31 web-migration amendment SUPERSEDED (direction dead: web stays but trimmed; no engine migration).
+
+### Operator-directed adoption exception — 2026-11-27
+
+The operator expressly authorized this v2.0.0 rewrite as a documentation-only governance
+change (grill session, same date). For this adoption only, the spec-plus-full-suite
+requirement is replaced by documentation validation, this recorded exception, and an
+open main-targeting PR. The 10-minute suite budget takes effect as a merge gate starting
+with the trim spec's implementation PRs; until then, pre-existing suite-evidence
+obligations apply unchanged. This exception authorizes no code changes, no paid
+operations, and no merges beyond this constitution amendment.
 
 **Version**: 2.0.0 | **Ratified**: 2026-11-27 | **Last Amended**: 2026-11-27
