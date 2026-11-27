@@ -714,3 +714,52 @@ def test_list_and_integer_subclasses_are_deterministic_invalid_types():
 
     assert _issue_signature(list_result.issues) == (("instruments", "invalid_type", ()),)
     assert _issue_signature(int_result.issues) == (("instruments[0].price", "invalid_type", ()),)
+
+
+def test_rejected_key_equality_never_blocks_retained_string_keys():
+    calls = []
+
+    class CollidingKey:
+        armed = False
+
+        def __hash__(self):
+            return hash("provider")
+
+        def __eq__(self, other):
+            if self.armed:
+                calls.append("eq")
+                raise RuntimeError("rejected key equality called")
+            return NotImplemented
+
+    source = {}
+    dict.__setitem__(source, CollidingKey(), "collides with provider")
+    dict.__setitem__(source, "provider", "synthetic-fixture")
+    CollidingKey.armed = True
+    raw = deepcopy(VALID_V1_RAW)
+    raw["source"] = source
+
+    result = validate_snapshot(raw)
+
+    assert calls == []
+    assert result.snapshot is None
+    assert _issue_signature(result.issues) == (("source", "invalid_type", ()),)
+
+
+def test_metaclass_equality_never_influences_exact_type_guards():
+    calls = []
+
+    class AdversarialMeta(type):
+        def __eq__(cls, other):
+            calls.append("eq")
+            return True
+
+    class Adversarial(metaclass=AdversarialMeta):
+        pass
+
+    raw = deepcopy(VALID_V1_RAW)
+    raw["source"] = Adversarial()
+
+    result = validate_snapshot(raw)
+
+    assert calls == []
+    assert _issue_signature(result.issues) == (("source", "invalid_type", ()),)

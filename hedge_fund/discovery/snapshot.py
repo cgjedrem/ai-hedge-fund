@@ -237,8 +237,8 @@ def _prewalk_json(value: object) -> tuple[object, list[_IssueDraft], set[tuple[s
     seen_containers = {id(value)}
 
     def dict_entries(container: dict, path: _PathRef | None):
-        keys = []
-        for key in dict.keys(container):
+        retained = []
+        for key, child in dict.items(container):
             if type(key) is not str:
                 location = _path_segments(path)
                 invalid_paths.add(location)
@@ -247,8 +247,8 @@ def _prewalk_json(value: object) -> tuple[object, list[_IssueDraft], set[tuple[s
                 location = _path_segments(_PathRef(path, key))
                 drafts.append(_issue_draft(location, "unknown_field"))
             else:
-                keys.append(key)
-        return iter((key, dict.__getitem__(container, key), _PathRef(path, key)) for key in sorted(keys))
+                retained.append((key, child))
+        return iter((key, child, _PathRef(path, key)) for key, child in sorted(retained))
 
     stack = [(value, sanitized, root_path, dict_entries(value, root_path))]
     while stack:
@@ -265,9 +265,10 @@ def _prewalk_json(value: object) -> tuple[object, list[_IssueDraft], set[tuple[s
             key, child = item
             child_path = _PathRef(path, key)
 
-        if child is None or type(child) in (str, bool, int, float):
+        child_type = type(child)
+        if child is None or child_type is str or child_type is bool or child_type is int or child_type is float:
             safe_child = child
-        elif type(child) in (dict, list):
+        elif child_type is dict or child_type is list:
             identity = id(child)
             if identity in seen_containers:
                 location = _path_segments(child_path)
