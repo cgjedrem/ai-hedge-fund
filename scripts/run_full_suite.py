@@ -32,6 +32,12 @@ LOCK_COMMAND_LINE_MAX_CHARS = 64
 _SUMMARY_DURATION_RE = re.compile(r"\bin\s+\d+(?:\.\d+)?s\b")
 _SUMMARY_COUNT_RE = re.compile(r"(?<![\w-])(?P<count>\d+)\s+(?P<kind>passed|failed|skipped|deselected|errors?|xfailed|xpassed)\b")
 _NO_TESTS_SUMMARY_RE = re.compile(r"^\s*no tests (?:ran|collected)(?:\s+in\s+\d+(?:\.\d+)?s)?\s*$", re.IGNORECASE)
+_SUMMARY_DECORATION_RE = re.compile(r"^=+\s*(?P<summary>.*?)\s*=+$")
+_SUMMARY_COUNT_KINDS = r"(?:passed|failed|skipped|deselected|errors?|xfailed|xpassed|warnings?)"
+_PYTEST_COUNT_SUMMARY_RE = re.compile(
+    rf"^\d+\s+{_SUMMARY_COUNT_KINDS}(?:,\s*\d+\s+{_SUMMARY_COUNT_KINDS})*\s+in\s+\d+(?:\.\d+)?s$",
+    re.IGNORECASE,
+)
 
 
 class RunnerError(RuntimeError):
@@ -258,11 +264,20 @@ def discover_test_files(repo_root: Path = REPO_ROOT) -> list[Path]:
 
 def _final_summary_line(output: str) -> str | None:
     for line in reversed(output.splitlines()):
-        if _NO_TESTS_SUMMARY_RE.fullmatch(line.strip()):
-            return line
-        if _SUMMARY_DURATION_RE.search(line) and _SUMMARY_COUNT_RE.search(line):
-            return line
+        summary_line = line.strip()
+        if summary_line.startswith("=") or summary_line.endswith("="):
+            decorated = _SUMMARY_DECORATION_RE.fullmatch(summary_line)
+            if decorated is None:
+                continue
+            summary_line = decorated.group("summary").strip()
+        if _NO_TESTS_SUMMARY_RE.fullmatch(summary_line) or _PYTEST_COUNT_SUMMARY_RE.fullmatch(summary_line):
+            return summary_line
     return None
+
+
+def _is_zero_count_summary(summary_line: str) -> bool:
+    counts = list(_SUMMARY_COUNT_RE.finditer(summary_line))
+    return bool(counts) and all(int(match.group("count")) == 0 for match in counts)
 
 
 def parse_pytest_summary(output: str) -> TestCounts | None:
@@ -272,7 +287,7 @@ def parse_pytest_summary(output: str) -> TestCounts | None:
     summary_line = _final_summary_line(output)
     if summary_line is None:
         return None
-    if _NO_TESTS_SUMMARY_RE.fullmatch(summary_line.strip()):
+    if _NO_TESTS_SUMMARY_RE.fullmatch(summary_line):
         return TestCounts()
     if not _SUMMARY_DURATION_RE.search(summary_line):
         return None
@@ -556,7 +571,7 @@ def _classify_pytest_result(counts: TestCounts | None, returncode: int | None, o
     if counts.errors and returncode in {0, 1}:
         return "error", None
     summary_line = _final_summary_line(output)
-    no_tests = bool(summary_line and _NO_TESTS_SUMMARY_RE.fullmatch(summary_line.strip()))
+    no_tests = bool(summary_line is not None and (_NO_TESTS_SUMMARY_RE.fullmatch(summary_line) or _is_zero_count_summary(summary_line)))
     deselected_only = counts.deselected > 0 and not any((counts.passed, counts.failed, counts.skipped, counts.errors))
     if returncode == 0:
         if no_tests:
@@ -925,6 +940,7 @@ def build_parser(repo_root: Path = REPO_ROOT) -> argparse.ArgumentParser:
             "Exit codes: 0 = chunks completed without reported failures/errors; 1 = pytest summaries report failures/errors; 2 = runner error or timeout. "
             "Pass pytest options after --, for example: -- -q -k runtime. Do not pass -qq; it suppresses summary counts. --color=no keeps summaries parseable. "
             "Timeout termination can overrun its deadline by about 15-20 s. Timed-out chunks can leave outputs/spec005-test-* roots because conftest cleanup does not run. "
+            "completed_chunks counts chunks with pytest summaries; chunk_index gives run position. "
             "Summary replaces atomically only when this invocation finalizes; compare its run_id/started_at with latest run_started to identify a newer started-but-stopped run."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,

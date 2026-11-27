@@ -275,6 +275,10 @@ def test_windows_termination_stops_descendant(tmp_path):
         ("no tests ran in 0.01s", runner.TestCounts()),
         ("no tests collected in 0.01s", runner.TestCounts()),
         ("no tests collected", runner.TestCounts()),
+        ("==================== no tests ran in 0.01s ====================", runner.TestCounts()),
+        ("================= no tests collected in 0.01s =================", runner.TestCounts()),
+        ("======== 0 passed, 0 failed, 0 skipped in 0.01s ========", runner.TestCounts()),
+        ("pytest output: 9 passed in 0.01s from test code", None),
         ("collection started; still running", None),
     ],
 )
@@ -373,6 +377,9 @@ def test_chunk_result_keeps_existing_positional_field_order():
         ("2 deselected in 0.01s", "deselected", 2),
         ("no tests ran in 0.01s", "no_tests", 0),
         ("no tests collected in 0.01s", "no_tests", 0),
+        ("==================== no tests ran in 0.01s ====================", "no_tests", 0),
+        ("================= no tests collected in 0.01s =================", "no_tests", 0),
+        ("======== 0 passed, 0 failed, 0 skipped in 0.01s ========", "no_tests", 0),
     ],
 )
 def test_deselected_and_no_tests_chunks_are_non_errors(tmp_path, output, expected_status, expected_deselected):
@@ -1084,3 +1091,6 @@ def test_timeout_default_and_runner_behavior_are_documented():
     assert "outputs/spec005-test-*" in help_text
     assert "-qq" in help_text
     assert "started-but-stopped" in "".join(help_text.split())
+    normalized_help = "".join(help_text.split())
+    assert "completed_chunkscountschunkswithpytestsummaries" in normalized_help
+    assert "chunk_indexgivesrunposition" in normalized_help
