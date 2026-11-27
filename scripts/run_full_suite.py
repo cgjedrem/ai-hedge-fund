@@ -1,4 +1,4 @@
-"""Run pytest files serially; bound subprocess lifetimes."""
+"""Run pytest files serially; expected suite time ~3.7 h, default wall bound 300 min."""
 
 from __future__ import annotations
 
@@ -23,13 +23,15 @@ from pathlib import Path
 from typing import Callable, Iterable, Sequence
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_TIMEOUT_MINUTES = 90.0
+DEFAULT_TIMEOUT_MINUTES = 300.0
 DEFAULT_CHUNK_TIMEOUT_MINUTES = 10.0
 POETRY_RESOLVE_TIMEOUT_SECONDS = 10.0
 TERMINATE_GRACE_SECONDS = 5.0
 POST_TERMINATE_WAIT_SECONDS = 5.0
+WINDOWS_LOCK_OFFSET = 1024
 _SUMMARY_DURATION_RE = re.compile(r"\bin\s+\d+(?:\.\d+)?s\b")
-_SUMMARY_COUNT_RE = re.compile(r"(?<![\w-])(?P<count>\d+)\s+(?P<kind>passed|failed|skipped|errors?|xfailed|xpassed)\b")
+_SUMMARY_COUNT_RE = re.compile(r"(?<![\w-])(?P<count>\d+)\s+(?P<kind>passed|failed|skipped|deselected|errors?|xfailed|xpassed)\b")
+_NO_TESTS_RE = re.compile(r"\bno tests (?:ran|collected)\b", re.IGNORECASE)
 
 
 class RunnerError(RuntimeError):
@@ -46,6 +48,7 @@ class TestCounts:
     failed: int = 0
     skipped: int = 0
     errors: int = 0
+    deselected: int = 0
 
 
 @dataclass
@@ -60,6 +63,7 @@ class ChunkResult:
     returncode: int | None = None
     timeout_scope: str | None = None
     summary_found: bool = False
+    deselected: int | None = None
 
 
 @dataclass
@@ -91,9 +95,15 @@ class InstanceLock:
             return
         handle, self._handle = self._handle, None
         try:
-            _unlock_file(handle)
+            handle.seek(0)
+            handle.truncate()
+            handle.flush()
+            os.fsync(handle.fileno())
         finally:
-            handle.close()
+            try:
+                _unlock_file(handle)
+            finally:
+                handle.close()
 
 
 def default_state_dir(repo_root: Path = REPO_ROOT) -> Path:
@@ -129,7 +139,7 @@ def _try_lock_file(handle) -> bool:
             handle.seek(0)
             handle.write(b"\0")
             handle.flush()
-        handle.seek(0)
+        handle.seek(WINDOWS_LOCK_OFFSET)
         try:
             msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
         except OSError as exc:
@@ -153,7 +163,7 @@ def _unlock_file(handle) -> None:
     if os.name == "nt":
         import msvcrt
 
-        handle.seek(0)
+        handle.seek(WINDOWS_LOCK_OFFSET)
         msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
         return
 
@@ -202,17 +212,15 @@ def acquire_instance_lock(
     command_line: str,
     *,
     pid: int | None = None,
-    is_alive: Callable[[int], bool] | None = None,
     notice: Callable[[str], None] | None = None,
 ) -> InstanceLock:
-    """Acquire lock; reclaim only records whose PID is dead."""
+    """Acquire OS lock; reclaim record only after acquiring lock."""
     lock_path = Path(path).expanduser().resolve()
     owner_pid = os.getpid() if pid is None else pid
     if type(owner_pid) is not int or owner_pid <= 0:
         raise ValueError("pid must be a positive integer")
     if not isinstance(command_line, str) or not command_line:
         raise ValueError("command_line must be a non-empty string")
-    alive = _pid_is_alive if is_alive is None else is_alive
     notify = (lambda message: print(message, file=sys.stderr, flush=True)) if notice is None else notice
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
@@ -225,9 +233,7 @@ def acquire_instance_lock(
         existing = _read_lock_record(handle)
         if existing is not None:
             existing_pid = int(existing["pid"])
-            if alive(existing_pid):
-                raise AlreadyRunningError(f"runner lock belongs to live PID {existing_pid}: {existing['command_line']}")
-            notify(f"Reclaiming stale runner lock for dead PID {existing_pid}.")
+            notify(f"Reclaiming unlocked runner lock record for PID {existing_pid}.")
         record = json.dumps({"pid": owner_pid, "command_line": command_line}, sort_keys=True).encode("utf-8")
         handle.seek(0)
         handle.write(record)
@@ -285,14 +291,17 @@ def discover_test_files(repo_root: Path = REPO_ROOT) -> list[Path]:
 
 
 def parse_pytest_summary(output: str) -> TestCounts | None:
-    """Parse final pytest count line; ignore child exit status."""
+    """Parse final pytest count line."""
     if not isinstance(output, str):
         raise TypeError("output must be a string")
     parsed: TestCounts | None = None
     for line in output.splitlines():
+        if _NO_TESTS_RE.search(line):
+            parsed = TestCounts()
+            continue
         if not _SUMMARY_DURATION_RE.search(line):
             continue
-        counts = {"passed": 0, "failed": 0, "skipped": 0, "errors": 0}
+        counts = {"passed": 0, "failed": 0, "skipped": 0, "errors": 0, "deselected": 0}
         found = False
         for match in _SUMMARY_COUNT_RE.finditer(line):
             kind = match.group("kind")
@@ -307,7 +316,7 @@ def parse_pytest_summary(output: str) -> TestCounts | None:
 
 def aggregate_counts(chunks: Iterable[ChunkResult]) -> dict[str, int]:
     """Sum known pytest counts; unknown timed-out counts add zero."""
-    totals = {"passed": 0, "failed": 0, "skipped": 0, "errors": 0}
+    totals = {"passed": 0, "failed": 0, "skipped": 0, "errors": 0, "deselected": 0}
     for chunk in chunks:
         for key in totals:
             count = getattr(chunk, key)
@@ -345,13 +354,106 @@ def _process_group_exists(pid: int) -> bool:
     return True
 
 
+def _windows_kernel32():
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p]
+    kernel32.CreateJobObjectW.restype = ctypes.c_void_p
+    kernel32.SetInformationJobObject.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
+    kernel32.SetInformationJobObject.restype = ctypes.c_int
+    kernel32.AssignProcessToJobObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    kernel32.AssignProcessToJobObject.restype = ctypes.c_int
+    kernel32.TerminateJobObject.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+    kernel32.TerminateJobObject.restype = ctypes.c_int
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = ctypes.c_int
+    return kernel32
+
+
+def _attach_windows_job(process) -> None:
+    if os.name != "nt" or not isinstance(process, subprocess.Popen):
+        return
+    kernel32 = _windows_kernel32()
+
+    class BasicLimitInformation(ctypes.Structure):
+        _fields_ = [
+            ("PerProcessUserTimeLimit", ctypes.c_longlong),
+            ("PerJobUserTimeLimit", ctypes.c_longlong),
+            ("LimitFlags", ctypes.c_uint32),
+            ("MinimumWorkingSetSize", ctypes.c_size_t),
+            ("MaximumWorkingSetSize", ctypes.c_size_t),
+            ("ActiveProcessLimit", ctypes.c_uint32),
+            ("Affinity", ctypes.c_size_t),
+            ("PriorityClass", ctypes.c_uint32),
+            ("SchedulingClass", ctypes.c_uint32),
+        ]
+
+    class IoCounters(ctypes.Structure):
+        _fields_ = [
+            ("ReadOperationCount", ctypes.c_uint64),
+            ("WriteOperationCount", ctypes.c_uint64),
+            ("OtherOperationCount", ctypes.c_uint64),
+            ("ReadTransferCount", ctypes.c_uint64),
+            ("WriteTransferCount", ctypes.c_uint64),
+            ("OtherTransferCount", ctypes.c_uint64),
+        ]
+
+    class ExtendedLimitInformation(ctypes.Structure):
+        _fields_ = [
+            ("BasicLimitInformation", BasicLimitInformation),
+            ("IoInfo", IoCounters),
+            ("ProcessMemoryLimit", ctypes.c_size_t),
+            ("JobMemoryLimit", ctypes.c_size_t),
+            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+            ("PeakJobMemoryUsed", ctypes.c_size_t),
+        ]
+
+    job_handle = kernel32.CreateJobObjectW(None, None)
+    if not job_handle:
+        raise OSError(ctypes.get_last_error(), "CreateJobObjectW failed")
+    try:
+        limits = ExtendedLimitInformation()
+        limits.BasicLimitInformation.LimitFlags = 0x2000
+        if not kernel32.SetInformationJobObject(job_handle, 9, ctypes.byref(limits), ctypes.sizeof(limits)):
+            raise OSError(ctypes.get_last_error(), "SetInformationJobObject failed")
+        if not kernel32.AssignProcessToJobObject(job_handle, process._handle):
+            raise OSError(ctypes.get_last_error(), "AssignProcessToJobObject failed")
+        process._runner_job_handle = job_handle
+    except Exception:
+        kernel32.CloseHandle(job_handle)
+        raise
+
+
+def _close_windows_job(process) -> None:
+    job_handle = getattr(process, "_runner_job_handle", None)
+    if job_handle is None:
+        return
+    process._runner_job_handle = None
+    _windows_kernel32().CloseHandle(job_handle)
+
+
 def terminate_process_tree(process, launched_pid: int) -> None:
     """Terminate launched pytest process and descendants."""
     if type(launched_pid) is not int or launched_pid <= 0 or process.pid != launched_pid:
         raise RunnerError("refusing to terminate a PID not returned by the launched pytest process")
-    if process.poll() is not None:
-        return
     if os.name == "nt":
+        job_handle = getattr(process, "_runner_job_handle", None)
+        if job_handle is not None:
+            kernel32 = _windows_kernel32()
+            try:
+                if not kernel32.TerminateJobObject(job_handle, 1):
+                    raise RunnerError(f"could not terminate pytest job for PID {launched_pid}")
+                try:
+                    process.wait(timeout=POST_TERMINATE_WAIT_SECONDS)
+                except subprocess.TimeoutExpired as exc:
+                    process.kill()
+                    try:
+                        process.wait(timeout=POST_TERMINATE_WAIT_SECONDS)
+                    except subprocess.TimeoutExpired as wait_exc:
+                        raise RunnerError(f"pytest PID {launched_pid} did not terminate") from wait_exc
+                    raise RunnerError(f"pytest process tree termination exceeded its bound for PID {launched_pid}") from exc
+            finally:
+                _close_windows_job(process)
+            return
         try:
             result = subprocess.run(
                 ["taskkill", "/PID", str(launched_pid), "/T", "/F"],
@@ -428,25 +530,51 @@ def append_progress_event(path: Path, event: dict[str, object]) -> None:
 
 def _result_counts(counts: TestCounts | None) -> dict[str, int | None]:
     if counts is None:
-        return {"passed": None, "failed": None, "skipped": None, "errors": None}
+        return {"passed": None, "failed": None, "skipped": None, "errors": None, "deselected": None}
     return asdict(counts)
 
 
-def _result_event(run_id: str, result: ChunkResult) -> dict[str, object]:
+def _result_event(run_id: str, result: ChunkResult, completed_chunks: int, expected_chunks: int) -> dict[str, object]:
     event: dict[str, object] = {
         "run_id": run_id,
         "timestamp": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
         "chunk": result.chunk,
+        "current_chunk": result.chunk,
+        "completed_chunks": completed_chunks,
+        "expected_chunks": expected_chunks,
         "status": result.status,
         "passed": result.passed,
         "failed": result.failed,
         "skipped": result.skipped,
         "errors": result.errors,
+        "deselected": result.deselected,
         "duration_seconds": round(result.duration_seconds, 3),
     }
     if result.timeout_scope is not None:
         event["timeout_scope"] = result.timeout_scope
     return event
+
+
+def _classify_pytest_result(counts: TestCounts | None, returncode: int | None, output: str) -> tuple[str, str | None]:
+    if counts is None:
+        return "error", f"pytest summary missing; return code {returncode}"
+    if counts.failed and returncode in {0, 1}:
+        return "failed", None
+    if counts.errors and returncode in {0, 1}:
+        return "error", None
+    no_tests = bool(_NO_TESTS_RE.search(output))
+    deselected_only = counts.deselected > 0 and not any((counts.passed, counts.failed, counts.skipped, counts.errors))
+    if returncode == 0:
+        if no_tests:
+            return "no_tests", None
+        if deselected_only:
+            return "deselected", None
+        return "passed", None
+    if returncode == 5 and no_tests:
+        return "no_tests", None
+    if returncode == 5 and deselected_only:
+        return "deselected", None
+    return "error", f"pytest exited with code {returncode} despite a summary"
 
 
 def run_chunks(
@@ -463,6 +591,7 @@ def run_chunks(
     monotonic: Callable[[], float] | None = None,
     terminator: Callable[[object, int], None] | None = None,
     progress_writer: Callable[[Path, dict[str, object]], None] | None = None,
+    result: ExecutionResult | None = None,
 ) -> ExecutionResult:
     """Run each file once; stop on runner errors or any timeout."""
     for value, name in ((timeout_seconds, "timeout_seconds"), (chunk_timeout_seconds, "chunk_timeout_seconds")):
@@ -472,19 +601,26 @@ def run_chunks(
         raise ValueError("python_executable must not be empty")
     if not run_id:
         raise ValueError("run_id must not be empty")
+    if result is not None and not isinstance(result, ExecutionResult):
+        raise TypeError("result must be an ExecutionResult or None")
     popen = subprocess.Popen if process_factory is None else process_factory
     clock = time.monotonic if monotonic is None else monotonic
     stop_tree = terminate_process_tree if terminator is None else terminator
     write_event = append_progress_event if progress_writer is None else progress_writer
     repo = Path(repo_root).resolve()
-    result = ExecutionResult()
+    result = ExecutionResult() if result is None else result
+    completed_chunks = 0
+    expected_chunks = len(test_files)
     started = clock()
     wall_deadline = started + timeout_seconds
 
-    def record(chunk_result: ChunkResult) -> bool:
+    def record(chunk_result: ChunkResult, *, completed: bool = False) -> bool:
+        nonlocal completed_chunks
+        if completed:
+            completed_chunks += 1
         result.chunks.append(chunk_result)
         try:
-            write_event(progress_file, _result_event(run_id, chunk_result))
+            write_event(progress_file, _result_event(run_id, chunk_result, completed_chunks, expected_chunks))
         except OSError as exc:
             result.incomplete = True
             result.runner_errors.append(f"could not append progress event for {chunk_result.chunk}: {exc}")
@@ -502,7 +638,7 @@ def run_chunks(
             chunk_name = Path(test_file).resolve().relative_to(repo).as_posix()
         except ValueError:
             chunk_name = str(Path(test_file))
-        command = [python_executable, "-m", "pytest", *pytest_args, str(test_file)]
+        command = [python_executable, "-m", "pytest", *pytest_args, "--color=no", str(test_file)]
         process_options: dict[str, object] = {
             "cwd": str(repo),
             "stdout": subprocess.PIPE,
@@ -529,6 +665,36 @@ def run_chunks(
             record(chunk_result)
             break
 
+        try:
+            _attach_windows_job(process)
+        except Exception as exc:
+            try:
+                subprocess.run(
+                    ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                    capture_output=True,
+                    text=True,
+                    timeout=TERMINATE_GRACE_SECONDS,
+                    check=False,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+            try:
+                if process.poll() is None:
+                    process.kill()
+                process.wait(timeout=POST_TERMINATE_WAIT_SECONDS)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+            chunk_result = ChunkResult(
+                chunk=chunk_name,
+                status="error",
+                duration_seconds=max(0.0, clock() - chunk_started),
+                returncode=process.poll(),
+            )
+            result.incomplete = True
+            result.runner_errors.append(f"could not assign pytest process tree for {chunk_name}: {exc}")
+            record(chunk_result)
+            break
+
         launched_pid = process.pid
         current_time = clock()
         wait_seconds, timeout_scope = calculate_timeout_budget(
@@ -541,9 +707,12 @@ def run_chunks(
             output, _ = process.communicate(timeout=wait_seconds)
         except subprocess.TimeoutExpired as exc:
             output = ""
+            parent_exited = process.poll() is not None
+            termination_failed = False
             try:
                 stop_tree(process, launched_pid)
             except Exception as terminate_exc:
+                termination_failed = True
                 result.runner_errors.append(f"failed to terminate pytest process tree for PID {launched_pid}: {terminate_exc}")
                 try:
                     if process.poll() is None:
@@ -562,19 +731,49 @@ def run_chunks(
             _emit_output(output)
             counts = parse_pytest_summary(output)
             count_values = _result_counts(counts)
+            returncode = process.poll()
+            if parent_exited and counts is not None:
+                status, status_error = _classify_pytest_result(counts, returncode, output)
+                if termination_failed:
+                    status = "error"
+                    result.incomplete = True
+                    timeout_scope = None
+                if status_error is not None:
+                    result.runner_errors.append(f"{status_error} in {chunk_name}")
+                result.last_completed_chunk = chunk_name
+                chunk_result = ChunkResult(
+                    chunk=chunk_name,
+                    status=status,
+                    **count_values,
+                    duration_seconds=max(0.0, clock() - chunk_started),
+                    returncode=returncode,
+                    summary_found=True,
+                )
+                if not record(chunk_result, completed=True):
+                    break
+                continue
+            if parent_exited and counts is None:
+                status = "error"
+                result.incomplete = True
+                result.runner_errors.append(f"pytest summary missing after process exit in {chunk_name}; return code {returncode}")
+                timeout_scope = None
+            else:
+                status = "timeout"
+                result.incomplete = True
+                timeout_label = "wall-clock" if timeout_scope == "wall" else "per-chunk"
+                result.runner_errors.append(f"{timeout_label} timeout in {chunk_name}; last completed chunk: {result.last_completed_chunk or 'none'}")
             chunk_result = ChunkResult(
                 chunk=chunk_name,
-                status="timeout",
+                status=status,
                 **count_values,
                 duration_seconds=max(0.0, clock() - chunk_started),
-                returncode=process.poll(),
+                returncode=returncode,
                 timeout_scope=timeout_scope,
                 summary_found=counts is not None,
             )
-            result.incomplete = True
-            timeout_label = "wall-clock" if timeout_scope == "wall" else "per-chunk"
-            result.runner_errors.append(f"{timeout_label} timeout in {chunk_name}; last completed chunk: {result.last_completed_chunk or 'none'}")
             record(chunk_result)
+            if parent_exited:
+                continue
             break
         except KeyboardInterrupt:
             try:
@@ -601,8 +800,7 @@ def run_chunks(
             break
         except Exception as exc:
             try:
-                if process.poll() is None:
-                    stop_tree(process, launched_pid)
+                stop_tree(process, launched_pid)
             except Exception as terminate_exc:
                 result.runner_errors.append(f"failed to terminate pytest PID {launched_pid}: {terminate_exc}")
             chunk_result = ChunkResult(
@@ -615,23 +813,21 @@ def run_chunks(
             result.runner_errors.append(f"pytest execution failed for {chunk_name}: {exc}")
             record(chunk_result)
             break
+        finally:
+            _close_windows_job(process)
 
         output = _as_text(output)
         _emit_output(output)
         counts = parse_pytest_summary(output)
-        returncode = process.returncode
-        if counts is None:
-            status = "error"
-            result.incomplete = True
-            result.runner_errors.append(f"pytest summary missing for {chunk_name}; return code {returncode}")
-        elif counts.failed:
-            status = "failed"
-            result.last_completed_chunk = chunk_name
-        elif counts.errors:
-            status = "error"
-            result.last_completed_chunk = chunk_name
-        else:
-            status = "passed"
+        returncode = process.poll()
+        status, status_error = _classify_pytest_result(counts, returncode, output)
+        if status_error is not None:
+            if counts is None:
+                result.incomplete = True
+                result.runner_errors.append(f"{status_error} for {chunk_name}")
+            else:
+                result.runner_errors.append(f"{status_error} in {chunk_name}")
+        if counts is not None:
             result.last_completed_chunk = chunk_name
         chunk_result = ChunkResult(
             chunk=chunk_name,
@@ -641,7 +837,7 @@ def run_chunks(
             returncode=returncode,
             summary_found=counts is not None,
         )
-        if not record(chunk_result):
+        if not record(chunk_result, completed=counts is not None):
             break
     return result
 
@@ -676,14 +872,31 @@ def summary_exit_code(summary: dict[str, object]) -> int:
 
 
 def write_summary(path: Path, summary: dict[str, object]) -> None:
-    """Write final JSON summary."""
+    """Atomically replace final JSON summary."""
     summary_path = Path(path).expanduser()
     summary_path.parent.mkdir(parents=True, exist_ok=True)
-    with summary_path.open("w", encoding="utf-8", newline="\n") as handle:
-        json.dump(summary, handle, indent=2, sort_keys=True)
-        handle.write("\n")
-        handle.flush()
-        os.fsync(handle.fileno())
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{summary_path.name}.",
+        suffix=".tmp",
+        dir=str(summary_path.parent),
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+            json.dump(summary, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_name, summary_path)
+    except BaseException:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        try:
+            os.unlink(temporary_name)
+        except OSError:
+            pass
+        raise
 
 
 def _positive_minutes(value: str) -> float:
@@ -699,8 +912,13 @@ def _positive_minutes(value: str) -> float:
 def build_parser(repo_root: Path = REPO_ROOT) -> argparse.ArgumentParser:
     state_dir = default_state_dir(repo_root)
     parser = argparse.ArgumentParser(
-        description="Run hedge_fund pytest files serially with per-file and whole-run deadlines.",
-        epilog=("Exit codes: 0 = all chunks produced summaries with no reported failures/errors; " "1 = pytest summaries report failures/errors; 2 = runner error or timeout. " "Summary counts override anomalous pytest process exit codes. " "Pass pytest options after --, for example: -- -q -k runtime."),
+        description="Run hedge_fund pytest files serially; expected full-suite duration ~3.7 hours; default wall bound 300 minutes.",
+        epilog=(
+            "Exit codes: 0 = chunks completed without reported failures/errors; 1 = pytest summaries report failures/errors; 2 = runner error or timeout. "
+            "Pass pytest options after --, for example: -- -q -k runtime. Do not pass -qq; it suppresses summary counts. --color=no keeps summaries parseable. "
+            "Timeout termination can overrun its deadline by about 15-20 s. Timed-out chunks can leave outputs/spec005-test-* roots because conftest cleanup does not run. "
+            "Summary replaces atomically only when this invocation finalizes; compare its run_id/started_at with latest run_started to identify a newer started-but-stopped run."
+        ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
@@ -708,7 +926,7 @@ def build_parser(repo_root: Path = REPO_ROOT) -> argparse.ArgumentParser:
         type=_positive_minutes,
         default=DEFAULT_TIMEOUT_MINUTES,
         metavar="N",
-        help="Hard wall-clock limit for the full run.",
+        help="Full-run hard limit; expected suite duration ~3.7 hours.",
     )
     parser.add_argument(
         "--chunk-timeout-minutes",
@@ -777,14 +995,31 @@ def main(argv: Sequence[str] | None = None) -> int:
         started_at = _timestamp()
         started_monotonic = time.monotonic()
         run_id = uuid.uuid4().hex
+        result = ExecutionResult()
         try:
             test_files = discover_test_files(REPO_ROOT)
+            started_event = {
+                "run_id": run_id,
+                "timestamp": started_at,
+                "status": "run_started",
+                "pid": os.getpid(),
+                "progress_path": str(progress_file),
+                "summary_path": str(summary_file),
+                "lock_path": str(lock_file.resolve()),
+                "total_chunks": len(test_files),
+                "completed_chunks": 0,
+                "expected_chunks": len(test_files),
+                "current_chunk": None,
+            }
+            print(json.dumps(started_event, sort_keys=True), flush=True)
+            append_progress_event(progress_file, started_event)
             if not test_files:
                 raise RunnerError("no pytest files found under hedge_fund")
             python_executable = resolve_poetry_python(REPO_ROOT)
             remaining_timeout = args.timeout_minutes * 60.0 - (time.monotonic() - started_monotonic)
             if remaining_timeout <= 0:
-                result = ExecutionResult(incomplete=True, runner_errors=["wall-clock timeout before first pytest chunk"])
+                result.incomplete = True
+                result.runner_errors.append("wall-clock timeout before first pytest chunk")
             else:
                 result = run_chunks(
                     REPO_ROOT,
@@ -795,11 +1030,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                     args.chunk_timeout_minutes * 60.0,
                     progress_file,
                     run_id,
+                    result=result,
                 )
         except KeyboardInterrupt:
-            result = ExecutionResult(incomplete=True, runner_errors=["runner interrupted before suite completion"])
+            result.incomplete = True
+            result.runner_errors.append("runner interrupted before suite completion")
         except Exception as exc:
-            result = ExecutionResult(incomplete=True, runner_errors=[f"runner error: {exc}"])
+            result.incomplete = True
+            result.runner_errors.append(f"runner error: {exc}")
         finished_at = _timestamp()
         summary = build_summary(
             run_id,

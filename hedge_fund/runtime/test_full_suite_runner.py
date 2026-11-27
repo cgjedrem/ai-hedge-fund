@@ -1,8 +1,11 @@
+import importlib.util
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -11,7 +14,14 @@ from hedge_fund.test_support.network_guard import (
     child_test_environment,
     guarded_test_python_command,
 )
-from scripts import run_full_suite as runner
+
+_RUNNER_PATH = Path(__file__).resolve().parents[2] / "scripts" / "run_full_suite.py"
+_RUNNER_SPEC = importlib.util.spec_from_file_location("_aihf_test_run_full_suite", _RUNNER_PATH)
+if _RUNNER_SPEC is None or _RUNNER_SPEC.loader is None:
+    raise ImportError(f"could not load test runner from {_RUNNER_PATH}")
+runner = importlib.util.module_from_spec(_RUNNER_SPEC)
+sys.modules[_RUNNER_SPEC.name] = runner
+_RUNNER_SPEC.loader.exec_module(runner)
 
 
 def _write_lock(path, pid, command_line):
@@ -21,26 +31,31 @@ def _write_lock(path, pid, command_line):
     )
 
 
-def test_lock_refuses_live_pid_without_overwriting_record(tmp_path):
+def test_lock_reclaims_unlocked_live_pid_record(tmp_path):
     lock_path = tmp_path / "runner.lock"
-    _write_lock(lock_path, 8123, "python active_runner.py")
+    owner_pid = os.getpid()
+    _write_lock(lock_path, owner_pid, "python active_runner.py")
+    notices = []
 
-    with pytest.raises(runner.AlreadyRunningError, match="8123"):
-        runner.acquire_instance_lock(
-            lock_path,
-            "python new_runner.py",
-            pid=9001,
-            is_alive=lambda pid: pid == 8123,
-            notice=lambda message: None,
-        )
+    lock = runner.acquire_instance_lock(
+        lock_path,
+        "python new_runner.py",
+        pid=9001,
+        notice=notices.append,
+    )
+    try:
+        assert notices == [f"Reclaiming unlocked runner lock record for PID {owner_pid}."]
+        assert json.loads(lock_path.read_text(encoding="utf-8")) == {
+            "pid": 9001,
+            "command_line": "python new_runner.py",
+        }
+    finally:
+        lock.release()
 
-    assert json.loads(lock_path.read_text(encoding="utf-8")) == {
-        "pid": 8123,
-        "command_line": "python active_runner.py",
-    }
+    assert lock_path.read_bytes() == b""
 
 
-def test_lock_reclaims_dead_pid_with_notice(tmp_path):
+def test_lock_reclaims_existing_record_with_notice(tmp_path):
     lock_path = tmp_path / "runner.lock"
     _write_lock(lock_path, 8123, "python dead_runner.py")
     notices = []
@@ -49,18 +64,14 @@ def test_lock_reclaims_dead_pid_with_notice(tmp_path):
         lock_path,
         "python new_runner.py",
         pid=9001,
-        is_alive=lambda pid: False,
         notice=notices.append,
     )
     try:
-        assert notices == ["Reclaiming stale runner lock for dead PID 8123."]
+        assert notices == ["Reclaiming unlocked runner lock record for PID 8123."]
     finally:
         lock.release()
 
-    assert json.loads(lock_path.read_text(encoding="utf-8")) == {
-        "pid": 9001,
-        "command_line": "python new_runner.py",
-    }
+    assert lock_path.read_bytes() == b""
 
 
 def test_lock_refuses_held_advisory_lock(tmp_path):
@@ -69,7 +80,6 @@ def test_lock_refuses_held_advisory_lock(tmp_path):
         lock_path,
         "python first_runner.py",
         pid=os.getpid(),
-        is_alive=lambda pid: True,
         notice=lambda message: None,
     )
     try:
@@ -78,11 +88,38 @@ def test_lock_refuses_held_advisory_lock(tmp_path):
                 lock_path,
                 "python second_runner.py",
                 pid=os.getpid() + 1,
-                is_alive=lambda pid: False,
                 notice=lambda message: None,
             )
     finally:
         first.release()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows byte-range lock reader")
+def test_external_reader_can_read_lock_record_while_runner_holds_lock(tmp_path):
+    lock_path = tmp_path / "runner.lock"
+    lock = runner.acquire_instance_lock(
+        lock_path,
+        "python active_runner.py",
+        pid=os.getpid(),
+        notice=lambda message: None,
+    )
+    try:
+        code = f"from pathlib import Path; print(Path({str(lock_path)!r}).read_text(encoding='utf-8'))"
+        result = subprocess.run(
+            guarded_test_python_command("-c", code),
+            env=child_test_environment(),
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
+        assert json.loads(result.stdout) == {
+            "pid": os.getpid(),
+            "command_line": "python active_runner.py",
+        }
+    finally:
+        lock.release()
 
 
 def test_terminate_refuses_pid_not_returned_by_process():
@@ -94,6 +131,33 @@ def test_terminate_refuses_pid_not_returned_by_process():
 
     with pytest.raises(runner.RunnerError, match="refusing to terminate"):
         runner.terminate_process_tree(Process(), 4321)
+
+
+def test_posix_termination_signals_group_after_parent_exits(monkeypatch):
+    calls = []
+
+    class Process:
+        pid = 1234
+        waited = False
+
+        def poll(self):
+            return 0
+
+        def wait(self, timeout=None):
+            self.waited = True
+
+    def killpg(pid, sig):
+        calls.append((pid, sig))
+        if sig == 0:
+            raise ProcessLookupError
+
+    process = Process()
+    monkeypatch.setattr(runner, "os", SimpleNamespace(name="posix", killpg=killpg))
+
+    runner.terminate_process_tree(process, process.pid)
+
+    assert calls[0] == (process.pid, signal.SIGTERM)
+    assert process.waited is True
 
 
 def test_terminate_stops_launched_process():
@@ -174,12 +238,138 @@ def test_windows_termination_stops_descendant(tmp_path):
         ("3 errors in 0.01s", runner.TestCounts(errors=3)),
         ("2 passed, 1 error in 1.2s", runner.TestCounts(passed=2, errors=1)),
         ("2 xfailed in 0.02s", runner.TestCounts()),
-        ("no tests ran in 0.01s", None),
+        ("no tests ran in 0.01s", runner.TestCounts()),
+        ("no tests collected in 0.01s", runner.TestCounts()),
+        ("no tests collected", runner.TestCounts()),
         ("collection started; still running", None),
     ],
 )
 def test_parse_pytest_summary(output, expected):
     assert runner.parse_pytest_summary(output) == expected
+
+
+def test_parse_pytest_summary_tracks_deselected_counts():
+    counts = runner.parse_pytest_summary("2 deselected in 0.01s")
+
+    assert counts is not None
+    assert getattr(counts, "deselected", None) == 2
+
+
+def test_chunk_result_keeps_existing_positional_field_order():
+    result = runner.ChunkResult(
+        "hedge_fund/test_one.py",
+        "passed",
+        1,
+        2,
+        3,
+        4,
+        1.25,
+        17,
+        None,
+        True,
+    )
+
+    assert result.duration_seconds == 1.25
+    assert result.returncode == 17
+    assert result.timeout_scope is None
+    assert result.summary_found is True
+    assert result.deselected is None
+
+
+@pytest.mark.parametrize(
+    ("output", "expected_status", "expected_deselected"),
+    [
+        ("2 deselected in 0.01s", "deselected", 2),
+        ("no tests ran in 0.01s", "no_tests", 0),
+        ("no tests collected in 0.01s", "no_tests", 0),
+    ],
+)
+def test_deselected_and_no_tests_chunks_are_non_errors(tmp_path, output, expected_status, expected_deselected):
+    repo = tmp_path / "repo"
+    chunk = repo / "hedge_fund" / "test_empty.py"
+    chunk.parent.mkdir(parents=True)
+    chunk.write_text("", encoding="utf-8")
+
+    class Process:
+        pid = 1234
+        returncode = 5
+
+        def communicate(self, timeout=None):
+            return output, None
+
+        def poll(self):
+            return self.returncode
+
+    commands = []
+
+    def process_factory(command, **kwargs):
+        commands.append(command)
+        return Process()
+
+    events = []
+    result = runner.run_chunks(
+        repo,
+        [chunk],
+        sys.executable,
+        [],
+        60.0,
+        10.0,
+        tmp_path / "progress.jsonl",
+        "run-empty",
+        process_factory=process_factory,
+        monotonic=lambda: 0.0,
+        progress_writer=lambda path, event: events.append(event),
+    )
+
+    chunk_result = result.chunks[0]
+    assert chunk_result.status == expected_status
+    assert chunk_result.deselected == expected_deselected
+    assert result.incomplete is False
+    assert result.runner_errors == []
+    summary = runner.build_summary("run-empty", "start", "finish", 1.0, result)
+    assert summary["deselected"] == expected_deselected
+    assert runner.summary_exit_code(summary) == 0
+    assert "--color=no" in commands[0]
+    assert events[0]["completed_chunks"] == 1
+    assert events[0]["expected_chunks"] == 1
+    assert events[0]["current_chunk"] == "hedge_fund/test_empty.py"
+
+
+def test_nonzero_pytest_exit_with_summary_is_an_error(tmp_path):
+    repo = tmp_path / "repo"
+    chunk = repo / "hedge_fund" / "test_nonzero.py"
+    chunk.parent.mkdir(parents=True)
+    chunk.write_text("", encoding="utf-8")
+
+    class Process:
+        pid = 1234
+        returncode = 1
+
+        def communicate(self, timeout=None):
+            return "2 passed in 0.1s\n", None
+
+        def poll(self):
+            return self.returncode
+
+    result = runner.run_chunks(
+        repo,
+        [chunk],
+        sys.executable,
+        [],
+        60.0,
+        10.0,
+        tmp_path / "progress.jsonl",
+        "run-nonzero",
+        process_factory=lambda command, **kwargs: Process(),
+        monotonic=lambda: 0.0,
+        progress_writer=lambda path, event: None,
+    )
+
+    assert result.chunks[0].status == "error"
+    assert result.chunks[0].summary_found is True
+    assert result.runner_errors
+    summary = runner.build_summary("run-nonzero", "start", "finish", 1.0, result)
+    assert runner.summary_exit_code(summary) == 2
 
 
 def test_timeout_budget_uses_earliest_deadline():
@@ -241,6 +431,177 @@ def test_timeout_records_partial_counts_and_last_completed_chunk(tmp_path):
     assert terminated == [(process, process.pid)]
     assert events[0]["status"] == "timeout"
     assert events[0]["chunk"] == "hedge_fund/test_one.py"
+    assert events[0]["completed_chunks"] == 0
+    assert events[0]["expected_chunks"] == 1
+    assert events[0]["current_chunk"] == "hedge_fund/test_one.py"
+
+
+def test_wall_clock_timeout_through_run_chunks(tmp_path):
+    class TimedOutProcess:
+        pid = 4568
+        returncode = None
+
+        def __init__(self):
+            self.communications = 0
+
+        def communicate(self, timeout=None):
+            self.communications += 1
+            if self.communications == 1:
+                raise subprocess.TimeoutExpired(["python", "-m", "pytest"], timeout)
+            return "", None
+
+        def poll(self):
+            return self.returncode
+
+        def kill(self):
+            self.returncode = -9
+
+    process = TimedOutProcess()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    chunk = repo / "hedge_fund" / "test_wall.py"
+    chunk.parent.mkdir()
+    chunk.write_text("", encoding="utf-8")
+
+    result = runner.run_chunks(
+        repo,
+        [chunk],
+        sys.executable,
+        [],
+        1.0,
+        60.0,
+        tmp_path / "progress.jsonl",
+        "run-wall",
+        process_factory=lambda command, **kwargs: process,
+        monotonic=lambda: 0.0,
+        terminator=lambda child, pid: setattr(child, "returncode", -15),
+        progress_writer=lambda path, event: None,
+    )
+
+    assert result.incomplete is True
+    assert result.chunks[0].status == "timeout"
+    assert result.chunks[0].timeout_scope == "wall"
+    assert "wall-clock timeout" in result.runner_errors[0]
+
+
+def _pid_is_running(pid):
+    if os.name == "posix":
+        stat_path = Path("/proc") / str(pid) / "stat"
+        if stat_path.is_file():
+            try:
+                return stat_path.read_text(encoding="utf-8").split()[2] != "Z"
+            except (OSError, IndexError):
+                return False
+    return runner._pid_is_alive(pid)
+
+
+def test_timeout_kills_descendant_holding_stdout_after_parent_exits(tmp_path):
+    child_pid_path = tmp_path / "child.pid"
+    child_code = "import time; time.sleep(60)"
+    parent_code = "import subprocess, sys\n" f"child = subprocess.Popen([sys.executable, '-S', '-c', {child_code!r}])\n" f"open({str(child_pid_path)!r}, 'w', encoding='utf-8').write(str(child.pid))\n" "print('1 passed in 0.1s', flush=True)\n"
+    repo = tmp_path / "repo"
+    chunk = repo / "hedge_fund" / "test_descendant.py"
+    chunk.parent.mkdir(parents=True)
+    chunk.write_text("", encoding="utf-8")
+    launched = []
+
+    def process_factory(command, **kwargs):
+        process = subprocess.Popen(
+            guarded_test_python_command("-c", parent_code),
+            env=child_test_environment(),
+            **kwargs,
+        )
+        launched.append(process)
+        return process
+
+    child_pid = None
+    try:
+        result = runner.run_chunks(
+            repo,
+            [chunk],
+            sys.executable,
+            [],
+            10.0,
+            2.0,
+            tmp_path / "progress.jsonl",
+            "run-descendant",
+            process_factory=process_factory,
+            progress_writer=lambda path, event: None,
+        )
+        assert child_pid_path.exists()
+        child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+        assert launched[0].poll() is not None
+        assert result.chunks[0].status == "passed"
+        assert result.chunks[0].returncode == 0
+        assert result.incomplete is False
+        assert result.runner_errors == []
+
+        deadline = time.monotonic() + 5.0
+        while _pid_is_running(child_pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not _pid_is_running(child_pid)
+    finally:
+        if child_pid is None and child_pid_path.exists():
+            child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+        if child_pid is not None and _pid_is_running(child_pid):
+            if os.name == "nt":
+                subprocess.run(
+                    ["taskkill", "/PID", str(child_pid), "/T", "/F"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                    check=False,
+                )
+            else:
+                try:
+                    os.kill(child_pid, signal.SIGKILL)
+                except OSError:
+                    pass
+        for process in launched:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=5)
+
+
+def test_exited_pytest_with_unterminated_descendant_is_not_labeled_timeout(tmp_path):
+    class Process:
+        pid = 4570
+        returncode = 0
+
+        def communicate(self, timeout=None):
+            raise subprocess.TimeoutExpired(["python", "-m", "pytest"], timeout, output="1 passed in 0.1s\n")
+
+        def poll(self):
+            return self.returncode
+
+    repo = tmp_path / "repo"
+    chunk = repo / "hedge_fund" / "test_descendant_cleanup.py"
+    chunk.parent.mkdir(parents=True)
+    chunk.write_text("", encoding="utf-8")
+
+    def failed_terminator(process, launched_pid):
+        raise runner.RunnerError("descendant cleanup failed")
+
+    result = runner.run_chunks(
+        repo,
+        [chunk],
+        sys.executable,
+        [],
+        60.0,
+        1.0,
+        tmp_path / "progress.jsonl",
+        "run-cleanup-error",
+        process_factory=lambda command, **kwargs: Process(),
+        monotonic=lambda: 0.0,
+        terminator=failed_terminator,
+        progress_writer=lambda path, event: None,
+    )
+
+    assert result.chunks[0].status == "error"
+    assert result.chunks[0].timeout_scope is None
+    assert result.chunks[0].passed == 1
+    assert result.incomplete is True
+    assert any("descendant cleanup failed" in message for message in result.runner_errors)
 
 
 def test_summary_aggregates_counts_and_timeout_is_incomplete():
@@ -289,12 +650,12 @@ def test_summary_aggregates_counts_and_timeout_is_incomplete():
     assert runner.summary_exit_code(summary) == 2
 
 
-def test_summary_counts_override_pytest_return_code():
+def test_summary_exit_code_keeps_unexplained_pytest_exit_as_runner_error():
     result = runner.ExecutionResult(
         chunks=[
             runner.ChunkResult(
                 chunk="hedge_fund/test_a.py",
-                status="passed",
+                status="error",
                 passed=3,
                 failed=0,
                 skipped=0,
@@ -303,6 +664,7 @@ def test_summary_counts_override_pytest_return_code():
                 summary_found=True,
             )
         ],
+        runner_errors=["pytest exited with code 1 despite a clean summary"],
         last_completed_chunk="hedge_fund/test_a.py",
     )
     summary = runner.build_summary(
@@ -313,7 +675,7 @@ def test_summary_counts_override_pytest_return_code():
         result,
     )
 
-    assert runner.summary_exit_code(summary) == 0
+    assert runner.summary_exit_code(summary) == 2
 
 
 def test_failure_summary_maps_to_exit_one():
@@ -378,8 +740,164 @@ def test_summary_writer_persists_json(tmp_path):
     assert json.loads(summary_path.read_text(encoding="utf-8")) == summary
 
 
+def test_summary_writer_failure_preserves_previous_summary(tmp_path, monkeypatch):
+    summary_path = tmp_path / "summary.json"
+    previous_summary = b'{"run_id": "previous"}\n'
+    summary_path.write_bytes(previous_summary)
+
+    def fail_dump(summary, handle, **kwargs):
+        raise RuntimeError("serialization failed")
+
+    monkeypatch.setattr(runner.json, "dump", fail_dump)
+
+    with pytest.raises(RuntimeError, match="serialization failed"):
+        runner.write_summary(summary_path, {"run_id": "new"})
+
+    assert summary_path.read_bytes() == previous_summary
+    assert list(tmp_path.iterdir()) == [summary_path]
+
+
+def _configure_main_test(monkeypatch, tmp_path, run_chunks):
+    repo_root = tmp_path / "repo"
+    test_root = repo_root / "hedge_fund"
+    test_root.mkdir(parents=True)
+    test_file = test_root / "test_one.py"
+    test_file.write_text("", encoding="utf-8")
+    state_dir = tmp_path / "state"
+    progress_file = tmp_path / "progress.jsonl"
+    summary_file = tmp_path / "summary.json"
+    monkeypatch.setattr(runner, "REPO_ROOT", repo_root)
+    monkeypatch.setattr(runner, "default_state_dir", lambda repo_root=repo_root: state_dir)
+    monkeypatch.setattr(runner, "resolve_poetry_python", lambda repo_root: sys.executable)
+    monkeypatch.setattr(runner, "run_chunks", run_chunks)
+    argv = [
+        "--timeout-minutes",
+        "1",
+        "--progress-file",
+        str(progress_file),
+        "--summary-file",
+        str(summary_file),
+    ]
+    return repo_root, test_file, state_dir, progress_file, summary_file, argv
+
+
+def test_main_writes_start_event_summary_and_exit_code(tmp_path, monkeypatch, capfd):
+    def fake_run_chunks(repo_root, test_files, python_executable, pytest_args, timeout_seconds, chunk_timeout_seconds, progress_file, run_id, **kwargs):
+        assert repo_root == tmp_path / "repo"
+        assert list(test_files) == [tmp_path / "repo" / "hedge_fund" / "test_one.py"]
+        return runner.ExecutionResult(
+            chunks=[
+                runner.ChunkResult(
+                    chunk="hedge_fund/test_one.py",
+                    status="failed",
+                    passed=2,
+                    failed=1,
+                    skipped=0,
+                    errors=0,
+                    returncode=1,
+                    summary_found=True,
+                )
+            ],
+            last_completed_chunk="hedge_fund/test_one.py",
+        )
+
+    _, _, state_dir, progress_file, summary_file, argv = _configure_main_test(monkeypatch, tmp_path, fake_run_chunks)
+
+    assert runner.main(argv) == 1
+
+    progress_events = [json.loads(line) for line in progress_file.read_text(encoding="utf-8").splitlines()]
+    started_event = progress_events[0]
+    assert started_event["status"] == "run_started"
+    assert started_event["pid"] == os.getpid()
+    assert started_event["progress_path"] == str(progress_file.resolve())
+    assert started_event["summary_path"] == str(summary_file.resolve())
+    assert started_event["lock_path"] == str((state_dir / "runner.lock").resolve())
+    assert started_event["total_chunks"] == 1
+    assert started_event["completed_chunks"] == 0
+    assert started_event["expected_chunks"] == 1
+    summary = json.loads(summary_file.read_text(encoding="utf-8"))
+    assert summary["run_id"] == started_event["run_id"]
+    assert summary["failed"] == 1
+    assert summary["started_at"]
+    assert (state_dir / "runner.lock").read_bytes() == b""
+    stdout_lines = capfd.readouterr().out.splitlines()
+    assert json.loads(stdout_lines[0]) == started_event
+
+
+def test_main_run_twice_releases_lock_record_without_stale_warning(tmp_path, monkeypatch, capfd):
+    def fake_run_chunks(repo_root, test_files, python_executable, pytest_args, timeout_seconds, chunk_timeout_seconds, progress_file, run_id, **kwargs):
+        return runner.ExecutionResult(
+            chunks=[
+                runner.ChunkResult(
+                    chunk="hedge_fund/test_one.py",
+                    status="passed",
+                    passed=1,
+                    failed=0,
+                    skipped=0,
+                    errors=0,
+                    returncode=0,
+                    summary_found=True,
+                )
+            ],
+            last_completed_chunk="hedge_fund/test_one.py",
+        )
+
+    _, _, state_dir, progress_file, summary_file, argv = _configure_main_test(monkeypatch, tmp_path, fake_run_chunks)
+
+    assert runner.main(argv) == 0
+    assert runner.main(argv) == 0
+
+    started_events = [json.loads(line) for line in progress_file.read_text(encoding="utf-8").splitlines() if json.loads(line)["status"] == "run_started"]
+    assert len(started_events) == 2
+    assert started_events[0]["run_id"] != started_events[1]["run_id"]
+    assert json.loads(summary_file.read_text(encoding="utf-8"))["run_id"] == started_events[1]["run_id"]
+    assert (state_dir / "runner.lock").read_bytes() == b""
+    assert "Reclaiming" not in capfd.readouterr().err
+
+
+@pytest.mark.parametrize("exception_type", [KeyboardInterrupt, RuntimeError])
+def test_main_preserves_partial_counts_when_chunk_runner_raises(tmp_path, monkeypatch, exception_type):
+    def fake_run_chunks(repo_root, test_files, python_executable, pytest_args, timeout_seconds, chunk_timeout_seconds, progress_file, run_id, *, result, **kwargs):
+        result.chunks.append(
+            runner.ChunkResult(
+                chunk="hedge_fund/test_one.py",
+                status="passed",
+                passed=3,
+                failed=0,
+                skipped=0,
+                errors=0,
+                returncode=0,
+                summary_found=True,
+            )
+        )
+        result.last_completed_chunk = "hedge_fund/test_one.py"
+        raise exception_type("interrupted")
+
+    _, _, _, _, summary_file, argv = _configure_main_test(monkeypatch, tmp_path, fake_run_chunks)
+
+    assert runner.main(argv) == 2
+
+    summary = json.loads(summary_file.read_text(encoding="utf-8"))
+    assert summary["passed"] == 3
+    assert summary["incomplete"] is True
+    assert summary["runner_errors"]
+
+
 def test_parse_arguments_splits_pytest_passthrough():
     args, pytest_args = runner.parse_arguments(["--timeout-minutes", "2", "--", "-q", "-k", "runtime"])
 
     assert args.timeout_minutes == 2.0
     assert pytest_args == ["-q", "-k", "runtime"]
+
+
+def test_timeout_default_and_runner_behavior_are_documented():
+    args, _ = runner.parse_arguments([])
+    help_text = runner.build_parser().format_help()
+
+    assert args.timeout_minutes == 300.0
+    assert "--timeout-minutes" in help_text
+    assert "3.7 hours" in help_text
+    assert "15-20 s" in help_text
+    assert "outputs/spec005-test-*" in help_text
+    assert "-qq" in help_text
+    assert "started-but-stopped" in "".join(help_text.split())
