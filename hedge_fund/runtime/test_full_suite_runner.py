@@ -1,4 +1,7 @@
+import ctypes
+import errno
 import importlib.util
+import io
 import json
 import os
 import signal
@@ -97,9 +100,10 @@ def test_lock_refuses_held_advisory_lock(tmp_path):
 @pytest.mark.skipif(os.name != "nt", reason="Windows byte-range lock reader")
 def test_external_reader_can_read_lock_record_while_runner_holds_lock(tmp_path):
     lock_path = tmp_path / "runner.lock"
+    command_line = "python active_runner.py --deselect " + ("hedge_fund/test_example.py::test_case " * 100)
     lock = runner.acquire_instance_lock(
         lock_path,
-        "python active_runner.py",
+        command_line,
         pid=os.getpid(),
         notice=lambda message: None,
     )
@@ -114,12 +118,42 @@ def test_external_reader_can_read_lock_record_while_runner_holds_lock(tmp_path):
             check=False,
         )
         assert result.returncode == 0, result.stderr
-        assert json.loads(result.stdout) == {
-            "pid": os.getpid(),
-            "command_line": "python active_runner.py",
-        }
+        record = json.loads(result.stdout)
+        assert record["pid"] == os.getpid()
+        assert len(record["command_line"]) <= 64
     finally:
         lock.release()
+
+
+def test_lock_record_caps_long_command_line_before_windows_lock_byte(tmp_path):
+    lock_path = tmp_path / "runner.lock"
+    command_line = "python run_full_suite.py --deselect " + ("test_case " * 500)
+    lock = runner.acquire_instance_lock(
+        lock_path,
+        command_line,
+        pid=9001,
+        notice=lambda message: None,
+    )
+    try:
+        raw_record = lock_path.read_bytes()
+        record = json.loads(raw_record)
+
+        assert len(raw_record) < runner.WINDOWS_LOCK_OFFSET
+        assert record["pid"] == 9001
+        assert record["command_line"] == command_line[:64]
+    finally:
+        lock.release()
+
+
+def test_command_line_uses_short_script_identity(monkeypatch, tmp_path):
+    script_path = tmp_path / "scripts" / "run_full_suite.py"
+    monkeypatch.setattr(
+        runner.sys,
+        "argv",
+        [str(script_path), "--", "-k", "many pytest args"],
+    )
+
+    assert runner._command_line() == "run_full_suite.py"
 
 
 def test_terminate_refuses_pid_not_returned_by_process():
@@ -208,9 +242,9 @@ def test_windows_termination_stops_descendant(tmp_path):
 
         assert process.poll() is not None
         deadline = time.monotonic() + 5.0
-        while runner._pid_is_alive(child_pid) and time.monotonic() < deadline:
+        while _pid_is_running(child_pid) and time.monotonic() < deadline:
             time.sleep(0.05)
-        assert not runner._pid_is_alive(child_pid)
+        assert not _pid_is_running(child_pid)
     finally:
         if process.poll() is None:
             try:
@@ -218,7 +252,7 @@ def test_windows_termination_stops_descendant(tmp_path):
             except runner.RunnerError:
                 process.kill()
                 process.wait(timeout=5)
-        if child_pid is not None and runner._pid_is_alive(child_pid):
+        if child_pid is not None and _pid_is_running(child_pid):
             subprocess.run(
                 ["taskkill", "/PID", str(child_pid), "/T", "/F"],
                 capture_output=True,
@@ -253,6 +287,63 @@ def test_parse_pytest_summary_tracks_deselected_counts():
 
     assert counts is not None
     assert getattr(counts, "deselected", None) == 2
+
+
+def test_chunk_started_event_precedes_each_process_launch(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    chunk_paths = [
+        repo / "hedge_fund" / "test_first.py",
+        repo / "hedge_fund" / "test_second.py",
+    ]
+    chunk_paths[0].parent.mkdir(parents=True)
+    for chunk_path in chunk_paths:
+        chunk_path.write_text("", encoding="utf-8")
+    progress_path = tmp_path / "progress.jsonl"
+    stdout = io.StringIO()
+    monkeypatch.setattr(runner.sys, "stdout", stdout)
+    launched_events = []
+
+    def process_factory(command, **kwargs):
+        records = [json.loads(line) for line in progress_path.read_text(encoding="utf-8").splitlines()]
+        event = records[-1]
+        assert event["status"] == "chunk_started"
+        assert event["chunk_index"] == len(launched_events) + 1
+        assert event["expected_chunks"] == 2
+        assert event["total_chunks"] == 2
+        assert event["completed_chunks"] == len(launched_events)
+        assert json.loads(stdout.getvalue().splitlines()[-1]) == event
+        launched_events.append(event)
+
+        process = SimpleNamespace(pid=5100 + len(launched_events), returncode=0)
+        process.communicate = lambda timeout=None: ("1 passed in 0.01s\n", None)
+        process.poll = lambda: process.returncode
+        return process
+
+    result = runner.run_chunks(
+        repo,
+        chunk_paths,
+        sys.executable,
+        [],
+        60.0,
+        10.0,
+        progress_path,
+        "run-start-events",
+        process_factory=process_factory,
+        monotonic=lambda: 0.0,
+    )
+
+    progress_events = [json.loads(line) for line in progress_path.read_text(encoding="utf-8").splitlines()]
+    started_events = [event for event in progress_events if event["status"] == "chunk_started"]
+    printed_events = [json.loads(line) for line in stdout.getvalue().splitlines() if line.startswith("{")]
+    assert result.incomplete is False
+    assert [event["chunk"] for event in started_events] == [
+        "hedge_fund/test_first.py",
+        "hedge_fund/test_second.py",
+    ]
+    assert [event["chunk_index"] for event in started_events] == [1, 2]
+    assert [event["completed_chunks"] for event in started_events] == [0, 1]
+    assert [event["expected_chunks"] for event in started_events] == [2, 2]
+    assert printed_events == started_events
 
 
 def test_chunk_result_keeps_existing_positional_field_order():
@@ -330,9 +421,54 @@ def test_deselected_and_no_tests_chunks_are_non_errors(tmp_path, output, expecte
     assert summary["deselected"] == expected_deselected
     assert runner.summary_exit_code(summary) == 0
     assert "--color=no" in commands[0]
-    assert events[0]["completed_chunks"] == 1
+    assert events[0]["status"] == "chunk_started"
+    assert events[0]["completed_chunks"] == 0
     assert events[0]["expected_chunks"] == 1
-    assert events[0]["current_chunk"] == "hedge_fund/test_empty.py"
+    assert events[1]["completed_chunks"] == 1
+    assert events[1]["current_chunk"] == "hedge_fund/test_empty.py"
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        "captured output says no tests ran\n1 passed in 0.1s\n",
+        "captured output says no tests collected\n1 passed in 0.1s\n",
+        "captured output says 5 deselected in 0.1s\n1 passed in 0.2s\n",
+    ],
+)
+def test_chunk_status_uses_final_pytest_summary_line(tmp_path, output):
+    repo = tmp_path / "repo"
+    chunk = repo / "hedge_fund" / "test_output.py"
+    chunk.parent.mkdir(parents=True)
+    chunk.write_text("", encoding="utf-8")
+
+    class Process:
+        pid = 1235
+        returncode = 0
+
+        def communicate(self, timeout=None):
+            return output, None
+
+        def poll(self):
+            return self.returncode
+
+    result = runner.run_chunks(
+        repo,
+        [chunk],
+        sys.executable,
+        [],
+        60.0,
+        10.0,
+        tmp_path / "progress.jsonl",
+        "run-output-summary",
+        process_factory=lambda command, **kwargs: Process(),
+        monotonic=lambda: 0.0,
+        progress_writer=lambda path, event: None,
+    )
+
+    assert result.chunks[0].status == "passed"
+    assert result.chunks[0].passed == 1
+    assert result.chunks[0].deselected == 0
 
 
 def test_nonzero_pytest_exit_with_summary_is_an_error(tmp_path):
@@ -429,11 +565,12 @@ def test_timeout_records_partial_counts_and_last_completed_chunk(tmp_path):
     assert result.chunks[0].passed == 1
     assert result.chunks[0].timeout_scope == "chunk"
     assert terminated == [(process, process.pid)]
-    assert events[0]["status"] == "timeout"
-    assert events[0]["chunk"] == "hedge_fund/test_one.py"
-    assert events[0]["completed_chunks"] == 0
-    assert events[0]["expected_chunks"] == 1
-    assert events[0]["current_chunk"] == "hedge_fund/test_one.py"
+    assert events[0]["status"] == "chunk_started"
+    assert events[1]["status"] == "timeout"
+    assert events[1]["chunk"] == "hedge_fund/test_one.py"
+    assert events[1]["completed_chunks"] == 0
+    assert events[1]["expected_chunks"] == 1
+    assert events[1]["current_chunk"] == "hedge_fund/test_one.py"
 
 
 def test_wall_clock_timeout_through_run_chunks(tmp_path):
@@ -485,6 +622,8 @@ def test_wall_clock_timeout_through_run_chunks(tmp_path):
 
 
 def _pid_is_running(pid):
+    if type(pid) is not int or pid <= 0:
+        return False
     if os.name == "posix":
         stat_path = Path("/proc") / str(pid) / "stat"
         if stat_path.is_file():
@@ -492,7 +631,43 @@ def _pid_is_running(pid):
                 return stat_path.read_text(encoding="utf-8").split()[2] != "Z"
             except (OSError, IndexError):
                 return False
-    return runner._pid_is_alive(pid)
+        try:
+            os.kill(pid, 0)
+        except OSError as exc:
+            if exc.errno == errno.ESRCH:
+                return False
+            if exc.errno == errno.EPERM:
+                return True
+            raise
+        return True
+
+    if pid > 0xFFFFFFFF:
+        return False
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    open_process = kernel32.OpenProcess
+    open_process.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+    open_process.restype = ctypes.c_void_p
+    get_exit_code_process = kernel32.GetExitCodeProcess
+    get_exit_code_process.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)]
+    get_exit_code_process.restype = ctypes.c_int
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = [ctypes.c_void_p]
+    close_handle.restype = ctypes.c_int
+    handle = open_process(0x1000, 0, pid)
+    if handle:
+        try:
+            exit_code = ctypes.c_uint32()
+            if not get_exit_code_process(handle, ctypes.byref(exit_code)):
+                raise OSError(ctypes.get_last_error(), "GetExitCodeProcess failed while checking test PID", pid)
+            return exit_code.value == 259
+        finally:
+            close_handle(handle)
+    error_code = ctypes.get_last_error()
+    if error_code == 5:
+        return True
+    if error_code in {6, 87}:
+        return False
+    raise OSError(error_code, "OpenProcess failed while checking test PID", pid)
 
 
 def test_timeout_kills_descendant_holding_stdout_after_parent_exits(tmp_path):
@@ -514,6 +689,12 @@ def test_timeout_kills_descendant_holding_stdout_after_parent_exits(tmp_path):
         launched.append(process)
         return process
 
+    timeout_terminations = []
+
+    def terminate_after_timeout(process, pid):
+        timeout_terminations.append(pid)
+        runner.terminate_process_tree(process, pid)
+
     child_pid = None
     try:
         result = runner.run_chunks(
@@ -526,6 +707,7 @@ def test_timeout_kills_descendant_holding_stdout_after_parent_exits(tmp_path):
             tmp_path / "progress.jsonl",
             "run-descendant",
             process_factory=process_factory,
+            terminator=terminate_after_timeout,
             progress_writer=lambda path, event: None,
         )
         assert child_pid_path.exists()
@@ -535,6 +717,7 @@ def test_timeout_kills_descendant_holding_stdout_after_parent_exits(tmp_path):
         assert result.chunks[0].returncode == 0
         assert result.incomplete is False
         assert result.runner_errors == []
+        assert timeout_terminations == [launched[0].pid]
 
         deadline = time.monotonic() + 5.0
         while _pid_is_running(child_pid) and time.monotonic() < deadline:

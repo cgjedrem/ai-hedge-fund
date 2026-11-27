@@ -10,7 +10,6 @@ import json
 import math
 import os
 import re
-import shlex
 import signal
 import subprocess
 import sys
@@ -29,9 +28,10 @@ POETRY_RESOLVE_TIMEOUT_SECONDS = 10.0
 TERMINATE_GRACE_SECONDS = 5.0
 POST_TERMINATE_WAIT_SECONDS = 5.0
 WINDOWS_LOCK_OFFSET = 1024
+LOCK_COMMAND_LINE_MAX_CHARS = 64
 _SUMMARY_DURATION_RE = re.compile(r"\bin\s+\d+(?:\.\d+)?s\b")
 _SUMMARY_COUNT_RE = re.compile(r"(?<![\w-])(?P<count>\d+)\s+(?P<kind>passed|failed|skipped|deselected|errors?|xfailed|xpassed)\b")
-_NO_TESTS_RE = re.compile(r"\bno tests (?:ran|collected)\b", re.IGNORECASE)
+_NO_TESTS_SUMMARY_RE = re.compile(r"^\s*no tests (?:ran|collected)(?:\s+in\s+\d+(?:\.\d+)?s)?\s*$", re.IGNORECASE)
 
 
 class RunnerError(RuntimeError):
@@ -172,41 +172,6 @@ def _unlock_file(handle) -> None:
     fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
-def _pid_is_alive(pid: int) -> bool:
-    if type(pid) is not int or pid <= 0:
-        return False
-    if os.name != "nt":
-        try:
-            os.kill(pid, 0)
-        except OSError as exc:
-            if exc.errno == errno.ESRCH:
-                return False
-            if exc.errno == errno.EPERM:
-                return True
-            raise
-        return True
-
-    if pid > 0xFFFFFFFF:
-        return False
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    open_process = kernel32.OpenProcess
-    open_process.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
-    open_process.restype = ctypes.c_void_p
-    close_handle = kernel32.CloseHandle
-    close_handle.argtypes = [ctypes.c_void_p]
-    close_handle.restype = ctypes.c_int
-    handle = open_process(0x1000, 0, pid)
-    if handle:
-        close_handle(handle)
-        return True
-    error_code = ctypes.get_last_error()
-    if error_code == 5:
-        return True
-    if error_code in {6, 87}:
-        return False
-    raise OSError(error_code, "OpenProcess failed while checking runner PID", pid)
-
-
 def acquire_instance_lock(
     path: Path,
     command_line: str,
@@ -234,13 +199,14 @@ def acquire_instance_lock(
         if existing is not None:
             existing_pid = int(existing["pid"])
             notify(f"Reclaiming unlocked runner lock record for PID {existing_pid}.")
-        record = json.dumps({"pid": owner_pid, "command_line": command_line}, sort_keys=True).encode("utf-8")
+        record_command_line = command_line[:LOCK_COMMAND_LINE_MAX_CHARS]
+        record = json.dumps({"pid": owner_pid, "command_line": record_command_line}, sort_keys=True).encode("utf-8")
         handle.seek(0)
         handle.write(record)
         handle.truncate()
         handle.flush()
         os.fsync(handle.fileno())
-        return InstanceLock(lock_path, handle, owner_pid, command_line)
+        return InstanceLock(lock_path, handle, owner_pid, record_command_line)
     except Exception:
         if locked:
             try:
@@ -290,28 +256,35 @@ def discover_test_files(repo_root: Path = REPO_ROOT) -> list[Path]:
     return sorted(files, key=lambda path: path.as_posix().casefold())
 
 
+def _final_summary_line(output: str) -> str | None:
+    for line in reversed(output.splitlines()):
+        if _NO_TESTS_SUMMARY_RE.fullmatch(line.strip()):
+            return line
+        if _SUMMARY_DURATION_RE.search(line) and _SUMMARY_COUNT_RE.search(line):
+            return line
+    return None
+
+
 def parse_pytest_summary(output: str) -> TestCounts | None:
     """Parse final pytest count line."""
     if not isinstance(output, str):
         raise TypeError("output must be a string")
-    parsed: TestCounts | None = None
-    for line in output.splitlines():
-        if _NO_TESTS_RE.search(line):
-            parsed = TestCounts()
-            continue
-        if not _SUMMARY_DURATION_RE.search(line):
-            continue
-        counts = {"passed": 0, "failed": 0, "skipped": 0, "errors": 0, "deselected": 0}
-        found = False
-        for match in _SUMMARY_COUNT_RE.finditer(line):
-            kind = match.group("kind")
-            key = "errors" if kind in {"error", "errors"} else kind
-            if key in counts:
-                counts[key] += int(match.group("count"))
-            found = True
-        if found:
-            parsed = TestCounts(**counts)
-    return parsed
+    summary_line = _final_summary_line(output)
+    if summary_line is None:
+        return None
+    if _NO_TESTS_SUMMARY_RE.fullmatch(summary_line.strip()):
+        return TestCounts()
+    if not _SUMMARY_DURATION_RE.search(summary_line):
+        return None
+    counts = {"passed": 0, "failed": 0, "skipped": 0, "errors": 0, "deselected": 0}
+    found = False
+    for match in _SUMMARY_COUNT_RE.finditer(summary_line):
+        kind = match.group("kind")
+        key = "errors" if kind in {"error", "errors"} else kind
+        if key in counts:
+            counts[key] += int(match.group("count"))
+        found = True
+    return TestCounts(**counts) if found else None
 
 
 def aggregate_counts(chunks: Iterable[ChunkResult]) -> dict[str, int]:
@@ -555,6 +528,26 @@ def _result_event(run_id: str, result: ChunkResult, completed_chunks: int, expec
     return event
 
 
+def _chunk_started_event(
+    run_id: str,
+    chunk_name: str,
+    chunk_index: int,
+    completed_chunks: int,
+    expected_chunks: int,
+) -> dict[str, object]:
+    return {
+        "run_id": run_id,
+        "timestamp": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+        "status": "chunk_started",
+        "chunk": chunk_name,
+        "current_chunk": chunk_name,
+        "chunk_index": chunk_index,
+        "completed_chunks": completed_chunks,
+        "expected_chunks": expected_chunks,
+        "total_chunks": expected_chunks,
+    }
+
+
 def _classify_pytest_result(counts: TestCounts | None, returncode: int | None, output: str) -> tuple[str, str | None]:
     if counts is None:
         return "error", f"pytest summary missing; return code {returncode}"
@@ -562,7 +555,8 @@ def _classify_pytest_result(counts: TestCounts | None, returncode: int | None, o
         return "failed", None
     if counts.errors and returncode in {0, 1}:
         return "error", None
-    no_tests = bool(_NO_TESTS_RE.search(output))
+    summary_line = _final_summary_line(output)
+    no_tests = bool(summary_line and _NO_TESTS_SUMMARY_RE.fullmatch(summary_line.strip()))
     deselected_only = counts.deselected > 0 and not any((counts.passed, counts.failed, counts.skipped, counts.errors))
     if returncode == 0:
         if no_tests:
@@ -627,7 +621,7 @@ def run_chunks(
             return False
         return True
 
-    for test_file in test_files:
+    for chunk_index, test_file in enumerate(test_files, start=1):
         chunk_started = clock()
         if wall_deadline - chunk_started <= 0:
             result.incomplete = True
@@ -638,6 +632,20 @@ def run_chunks(
             chunk_name = Path(test_file).resolve().relative_to(repo).as_posix()
         except ValueError:
             chunk_name = str(Path(test_file))
+        started_event = _chunk_started_event(
+            run_id,
+            chunk_name,
+            chunk_index,
+            completed_chunks,
+            expected_chunks,
+        )
+        try:
+            write_event(progress_file, started_event)
+        except OSError as exc:
+            result.incomplete = True
+            result.runner_errors.append(f"could not append chunk-start progress event for {chunk_name}: {exc}")
+            break
+        print(json.dumps(started_event, sort_keys=True), flush=True)
         command = [python_executable, "-m", "pytest", *pytest_args, "--color=no", str(test_file)]
         process_options: dict[str, object] = {
             "cwd": str(repo),
@@ -962,8 +970,7 @@ def parse_arguments(argv: Sequence[str] | None = None) -> tuple[argparse.Namespa
 
 
 def _command_line() -> str:
-    command = [sys.executable, *sys.argv]
-    return subprocess.list2cmdline(command) if os.name == "nt" else shlex.join(command)
+    return Path(sys.argv[0]).name or "run_full_suite.py"
 
 
 def _timestamp() -> str:
