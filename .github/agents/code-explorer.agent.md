@@ -1,10 +1,11 @@
 ---
 name: code-explorer
+model: ["73192633-e8b9-4870-90db-123a98a64cc1/glm-5.3-flash:cloud", "glm-5.3-flash:cloud", "claude-haiku-4.5"]
+reasoningEffort: low
 description: Read-only codebase analyst. Use when user wants to understand architecture, trace execution paths, map dependencies, or identify key files before implementing a feature. Never writes code — produces architecture summaries and key file lists.
 tools:
   ["vscode", "execute", "read", "agent", "search", "web", "browser", "todo"]
 user-invocable: true
-model: gpt-6.1-terra
 ---
 
 # Code Explorer

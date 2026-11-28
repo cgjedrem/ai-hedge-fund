@@ -69,3 +69,7 @@ outputs/
 
 # Local-only release tooling
 scripts/release.sh
+
+
+# APM dependencies
+apm_modules/

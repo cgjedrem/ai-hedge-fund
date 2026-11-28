@@ -5,10 +5,10 @@ description: Assess a bug report (pasted text or URL) against the codebase and p
 compatibility: Requires spec-kit project structure with .specify/ directory
 metadata:
   author: github-spec-kit
-  source: extension:bug
+  source: preset:agent-team
 ---
 
-# Bug Assess Skill
+# Speckit Bug Assess Skill
 
 # Assess Bug
 
@@ -104,6 +104,25 @@ Do not attempt to validate the URL by issuing a preflight `HEAD` (or any other) 
    - Identify files to change and the shape of the change (without writing the patch yet — that is `/speckit-bug-fix`'s job).
    - Call out tests that should exist or be added to lock the fix in.
    - Flag risks: API breakage, migrations, performance, security, observability.
+   - Assign criterion IDs and record baseline evidence with revision plus local
+     changes (diff identity), or build ID/digest; environment, scenario, timestamp,
+     provenance and quoted observations. Distinguish static, build, runtime and
+     user report evidence. Unknown identity or ambiguous reproduction is
+     `INCONCLUSIVE`; missing access/tooling is `BLOCKED`, not a pass.
+   - For integrations, define an adjacent-state and negative-path regression
+     matrix before patching: initial state, event/transition, expected state and
+     side effects, forbidden behavior, measurable threshold/duration, execution
+     owner and check mode (automatic/manual). Cover denial/failure, recovery,
+     cancellation/release and pending work. Mocks establish reaction to injected
+     events, not that an OS or external service emits those events.
+   - For mobile audio interruptions, cover permanent loss with other playback
+     active/paused/stopped; transient loss with no music stream; duck/gain; focus
+     denial/retry/recovery/warning cleanup; phase transition, retry, pause/resume,
+     mute/unmute and release while blocked; pending poll followed by transient
+     loss, silence or release. Record loop, timer, focus requests, warnings and
+     recovery expectations. Separate fake-driven decision tests from device OS
+     event checks; no focus requests before the allowed restore is an explicit
+     negative-path criterion, not an inference from a successful build.
 
 6. **Write the assessment file**
 
@@ -162,6 +181,24 @@ Do not attempt to validate the URL by issuing a preflight `HEAD` (or any other) 
    - <risk>
    - <risk>
 
+   ## Evidence Baseline
+
+   | Criterion | Revision + local changes / build identity | Environment / scenario | Type / provenance / timestamp | Quoted observation | Status |
+   |-----------|-------------------------------------------|------------------------|-------------------------------|--------------------|--------|
+   | <ID> | <commit + diff identity OR build ID/digest> | <exact context> | <static/build/runtime/user report; source; time> | <observed, not inferred> | <PASS/FAIL/BLOCKED/INCONCLUSIVE> |
+
+   ## Integration Regression Matrix
+
+   | Criterion | Initial state / transition | Expected and forbidden behavior | Threshold / duration | Owner / check mode |
+   |-----------|----------------------------|---------------------------------|----------------------|--------------------|
+   | <ID> | <state + event> | <state, side effects, negative path> | <measurable bound> | <executor; automatic/manual> |
+
+   ## Handoff and Stop Condition
+
+   <Symptom/repro, revision/environment, failed attempts, quoted evidence,
+   hypothesis, unknowns and smallest falsification check. Name task, owner,
+   check mode, latest observed result, blocker and stop condition.>
+
    ## Open Questions
 
    - [NEEDS CLARIFICATION: …]
@@ -177,5 +214,9 @@ Do not attempt to validate the URL by issuing a preflight `HEAD` (or any other) 
 
 - Never modify source files during assessment — this command only reads and writes inside `.specify/bugs/<slug>/`.
 - Never invent reproduction steps or file paths that are not supported by either the report or the codebase.
+- Route by capability and risk, without hardcoded model names or unrequested
+  model/effort changes. Before switching owner/model, supply the handoff above.
+- Require new diagnostic evidence before a second patch attempt; after two
+  failed attempts stop patching and reassess root cause. Do not repeat guesses.
 - Never overwrite an existing `assessment.md` without confirmation.
 - If the bug report cannot be understood at all (empty, unrelated, spam), set verdict to `invalid` with a clear reason and stop.

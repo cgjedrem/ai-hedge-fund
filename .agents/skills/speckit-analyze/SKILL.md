@@ -59,7 +59,7 @@ Canonical pattern: `.specify/docs/subsession-delegation.md`. Adaptation for this
 1. **Recursion guard**: if the current input contains the exact token `DELEGATED_WORKER`, skip this section and run inline.
 2. **Resolve mode** (default `subagent`; degrade to `inline` when no subagent capability exists; invalid/missing config falls back silently). `inline` → skip the rest of this section.
 3. **Stays inline**: Pre-Execution Checks above and Execution Steps 1 (prerequisites / FEATURE_DIR resolution).
-4. **Delegate** Execution Steps 2–8 (load artifacts → detection passes → report → remediation offer) to a read-only subagent. Kickoff contains ONLY: the `DELEGATED_WORKER` token, this skill's name, the repo root, absolute SPEC/PLAN/TASKS paths, the constitution path, and an instruction to read `.agents/skills/speckit-analyze/SKILL.md` and execute Execution Steps 2–8. No conversation history.
+4. **Delegate** Execution Steps 2–8 (load artifacts → detection passes → report → remediation offer) to a read-only subagent. Kickoff contains ONLY: the `DELEGATED_WORKER` token, this skill's name, the repo root, absolute SPEC/PLAN/TASKS paths, the constitution path, and an instruction to read `.github/skills/speckit-analyze/SKILL.md` and execute Execution Steps 2–8. No conversation history.
 5. **Orchestrator** validates the report shape (findings table, coverage summary, metrics), presents it to the user, then runs Execution Step 9 (hooks) itself.
 
 ## Goal
