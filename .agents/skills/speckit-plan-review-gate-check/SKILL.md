@@ -19,7 +19,7 @@ Canonical pattern: `.specify/docs/subsession-delegation.md`. Adaptation for this
 
 1. **Recursion guard**: if the current input contains the exact token `DELEGATED_WORKER`, skip this section and run inline.
 2. **Default `inline`** — this gate is a deterministic git-state check; delegating costs more than it saves. Only delegate when `.specify/extensions/delegation.yml` explicitly overrides this skill to `subagent` and a subagent capability exists; invalid/missing config falls back silently to `inline`.
-3. **When delegated**: Steps 1–4 run in a read-only subagent whose kickoff contains ONLY the `DELEGATED_WORKER` token, this skill's name, the repo root, and an instruction to read `.agents/skills/speckit-plan-review-gate-check/SKILL.md` and execute Steps 1–4. The orchestrator emits the gate decision (Step 5) and performs any waiver bookkeeping (Step 3, writes `gate-waivers.md`) itself.
+3. **When delegated**: Steps 1–4 run in a read-only subagent whose kickoff contains ONLY the `DELEGATED_WORKER` token, this skill's name, the repo root, and an instruction to read `.github/skills/speckit-plan-review-gate-check/SKILL.md` and execute Steps 1–4. The orchestrator emits the gate decision (Step 5) and performs any waiver bookkeeping (Step 3, writes `gate-waivers.md`) itself.
 
 ## Steps
 

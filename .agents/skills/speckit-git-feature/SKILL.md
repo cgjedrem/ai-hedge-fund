@@ -70,16 +70,14 @@ Run the appropriate script based on your platform:
 - **PowerShell (timestamp)**: `.specify/extensions/git/scripts/powershell/create-new-feature-branch.ps1 -Json -Timestamp -ShortName "<short-name>" "<feature description>"`
 
 **IMPORTANT**:
-- Do NOT pass `--number` — the script determines the correct next number automatically
+- NEVER hand-derive the feature number by scanning local `specs/` directories — always let the script resolve it. The script checks local specs, local and remote branches, live remote heads, and spec directories merged into the remote default branch; a local-only scan misses numbers claimed elsewhere, and parallel sessions then collide on the same number.
+- Do NOT pass `--number` when creating a branch — the script determines the correct next number automatically.
+- If branch creation must be skipped (for example in an agent worktree/session that commits to its own session branch), still resolve the number with this script: run it with `--dry-run`/`-DryRun` (numbering only — creates no branch), parse `FEATURE_NUM` from the JSON output, and pass that number explicitly to the core spec workflow (`--number`/`-Number` on `create-new-feature`, or as the `NNN` prefix of `SPECIFY_FEATURE_DIRECTORY`).
+- The resolved number is a best-effort claim at resolution time — a parallel session can take the same number before you commit. If the spec directory or branch already exists when you try to create it, re-run the resolution and take the next number; do not force-reuse a taken number.
 - Always include the JSON flag (`--json` for Bash, `-Json` for PowerShell) so the output can be parsed reliably
-- You must only ever run this script once per feature
+- Run this script only once per feature for branch creation; a `--dry-run` numbering re-check after a conflict is the allowed exception
 - The JSON output will contain `BRANCH_NAME` and `FEATURE_NUM`
 - Do not manually expand `branch_template`; the script reads the git extension config and applies it consistently
-
-**App-managed worktrees**: when the session context indicates an app-managed worktree or session branch (e.g. a Copilot workspace with a dedicated branch already assigned), the harness owns the branch lifecycle — never create or switch branches.
-- **PowerShell**: add `-NoBranch`, e.g. `.specify/extensions/git/scripts/powershell/create-new-feature-branch.ps1 -Json -NoBranch -ShortName "<short-name>" "<feature description>"`. Computes `BRANCH_NAME`/`FEATURE_NUM` only (numbering still fetches remotes); the JSON adds `"DRY_RUN": true` — expected.
-- **Bash**: the twin has **no** `--no-branch` flag, and unknown flags are not rejected — they join the feature description and the branch is still created. Use `--dry-run` instead (same no-checkout result; it skips the remote fetch, so numbering sees only already-fetched remote refs).
-- Record the deviation in the spec's `**Feature Branch**` header: session branch name plus `(app-managed worktree; branch creation skipped, numbering applied)`.
 
 ## Graceful Degradation
 

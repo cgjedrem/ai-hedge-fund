@@ -34,7 +34,7 @@ Canonical pattern: `.specify/docs/subsession-delegation.md`. Adaptation for this
 1. **Recursion guard**: if the current input contains the exact token `DELEGATED_WORKER`, skip this section and run inline.
 2. **Resolve mode** (default `subagent`; degrade to `inline` when no subagent capability exists; invalid/missing config falls back silently). `inline` → skip the rest of this section.
 3. **Stays inline**: the Prerequisites above.
-4. **Delegate** the entire Outline (read-only verification + report) to a subagent. Kickoff contains ONLY: the `DELEGATED_WORKER` token, this skill's name, the repo root and absolute feature directory, the bug scope (`$ARGUMENTS`, e.g. a bug ID or "all"), and an instruction to read `.agents/skills/speckit-bugfix-verify/SKILL.md` and execute the Outline. No conversation history.
+4. **Delegate** the entire Outline (read-only verification + report) to a subagent. Kickoff contains ONLY: the `DELEGATED_WORKER` token, this skill's name, the repo root and absolute feature directory, the bug scope (`$ARGUMENTS`, e.g. a bug ID or "all"), and an instruction to read `.github/skills/speckit-bugfix-verify/SKILL.md` and execute the Outline. No conversation history.
 5. **Orchestrator** relays the worker's verification report to the user unchanged.
 
 ## Outline

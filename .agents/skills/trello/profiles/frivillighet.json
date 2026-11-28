@@ -1,0 +1,12 @@
+{
+  "name": "frivillighet",
+  "description": "Frivilligheten Norge: Ungfritid.no / Frivillig.no board shared with Tieto",
+  "op": {
+    "key_ref": "op://Frivilligheten Norge/TrelloAPIKey/password",
+    "token_ref": "op://Frivilligheten Norge/TrelloToken/password"
+  },
+  "board": "ouxp4RRC",
+  "board_name": "Ungfritid.no/Frivillig.no med Tieto",
+  "default_list": "Godkjent til utvikling",
+  "labels": ["Q4 2026", "Frivillig.no", "Ungfritid", "Prioritert"]
+}

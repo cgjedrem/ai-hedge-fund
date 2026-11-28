@@ -1,6 +1,6 @@
 ---
 name: spec-to-implementation
-description: Implement a spec or ticket test-first with the red-green TDD loop in vertical slices plus two-axis review. Use when asked to implement an approved spec/plan/ticket.
+description: 'Implement a spec or ticket test-first with the red-green TDD loop in vertical slices plus two-axis review. Use when asked to implement an approved spec, plan or ticket.'
 ---
 
 # Workflow: spec-to-implementation
@@ -11,12 +11,15 @@ description: Implement a spec or ticket test-first with the red-green TDD loop i
 - {requesting_user} asks to implement an approved plan
 
 ## Purpose
-Implement a spec or ticket test-first: agree seams up front, run the red→green TDD loop in vertical slices, diagnose failures systematically instead of guess-patching, and finish with a two-axis review before commit.
+Implement a spec or ticket test-first: agree seams up front, run the red→green TDD loop in vertical slices, diagnose failures systematically instead of guess-patching, and deliver reviewed work at the authorized stopping point.
 
 ## Prerequisites
 - A spec, ticket, or approved plan with acceptance criteria exists
 - Repository builds and test suite runs locally
 - Clean working tree on a feature branch (create one if needed)
+- Record the requested deliverable and permitted mutations before implementation.
+  Implementation or review approval does not authorize commit, amend, push or PR
+  creation; each action requires specific user authorization.
 
 **Parameters:**
 - `{requesting_user}` — user who confirms seams and receives gate decisions (required)
@@ -26,6 +29,21 @@ Implement a spec or ticket test-first: agree seams up front, run the red→green
 - `{reserved_spec_number}`, `{reservation_ref}`, `{reservation_oid}`, `{allocation_remote}` — confirmed allocation receipt for a new numbered spec; pass unchanged to every child working on that spec
 
 ## Steps
+
+### task-preflight-authority-and-gates
+
+Before reserving a number, creating a branch, spawning children, or editing files,
+record the requested scope, workspace/base branch, existing user changes, spec
+identity, hard workflow gates, runtime owner, and explicit authority for branch
+creation, remote reservation/push, commit, PR, merge, deployment, migration, and
+live/private data access. Implementation authorization does not imply these other
+actions. Autopilot or a continuation message does not override a gate.
+
+If the exact mandatory gate or remote allocation cannot be satisfied within the
+authorized scope, stop before the affected action and report the blocker. Preserve
+existing user changes; do not require a globally clean checkout when the host gives
+an in-place workspace. Concurrent work is permitted only after shared resources and
+spec-number conflicts are addressed.
 
 ### task0-reserve-spec-numbers-before-spawning
 - **Purpose:** Prevent independent sessions/worktrees from assigning the same number to different specs. Existing numbered specs retain their identity; verify their spec reference instead of allocating again. Unnumbered tickets that do not create a numbered spec need no allocation.
@@ -56,8 +74,14 @@ Implement a spec or ticket test-first: agree seams up front, run the red→green
   2. Write only enough code to pass it (green)
   3. Repeat — one seam, one test, one minimal implementation per cycle
 - **Discipline:** No horizontal slicing (all tests first), no tautological assertions, no implementation-coupled tests. Run typechecking regularly and single test files per cycle
-- **Output:** Passing tests + implementation, slice by slice
+- **Output:** Passing tests + implementation, slice by slice, with a named
+  diff/checkpoint and change manifest for recovery without requiring a commit
 - **Success:** All acceptance criteria covered by at least one test that failed first
+
+After the first missing-path or patch expected-lines failure, resolve the actual
+path inside the authorized workspace and reread the narrow current context before
+retrying. Reconcile stale text and local edits; do not guess paths or replay a patch
+blindly. Stop if ownership or intended source remains ambiguous.
 
 ### task4-diagnose-failures
 - **Purpose:** Handle stuck failures systematically, not by guess-patching
@@ -65,14 +89,25 @@ Implement a spec or ticket test-first: agree seams up front, run the red→green
 - **Trigger:** Any failure that survives one obvious fix attempt
 - **Success:** Root cause identified and stated before the fix lands; no "changed things until it passed" commits
 
-### task5-review-and-commit
+### task5-review-and-deliver
 - **Purpose:** Verify the work before it lands
 - **Action:** Run the full test suite once. Then apply `code-review` two-axis review of the branch diff against its merge-base — Standards axis (repo standards + smell baseline) and Spec axis (does the diff implement `{spec_ref}`)
 - **Handoff:** In the completion summary, explain non-obvious implementation and data-model choices, citing relevant repository precedent where available. Separate verified facts from assumptions and identify any deployment or environment checks that were not performed.
 - **Gate:** 
-  - Clean or judgement-call-only findings → commit to `{branch}` with messages referencing the ticket
-  - Hard violations or spec gaps → fix, re-run affected tests, re-review
-- **Success:** Full suite green, review findings addressed, work committed
+  - Clean or judgement-call-only findings → deliver the reviewed uncommitted
+    implementation with its named diff/checkpoint and change manifest. Only with
+    specific commit authorization, create a new commit on `{branch}` referencing
+    the ticket; amend only with explicit amend approval. Push/PR actions require
+    their own authorization and are not implied by commit approval.
+  - Hard violations or spec gaps → carry exact current source text/identity and
+    finding text into the repair brief with confirmed decisions and prohibited
+    changes. Fix within scope, sweep the entire touched artifact and dependent
+    normative statements for contradictions, re-run affected tests, then re-review.
+    Preserve the invoking workflow's cumulative rework count and approved limit;
+    no reset for agent changes or explicitly approved scope changes.
+- **Success:** Full suite green, review findings addressed, and the reviewed
+  deliverable retained at the authorized stopping point, uncommitted unless a
+  commit was specifically authorized
 
 ## Skills/Tools Used
 - **[tdd]({ENSO_ROOT}/skills/mattpocock/tdd/SKILL.md)** — seams, red→green loop, test anti-patterns
@@ -83,10 +118,13 @@ Implement a spec or ticket test-first: agree seams up front, run the red→green
 
 ## Outputs
 - Tests at confirmed seams (failed first, now green)
-- Implementation committed to `{branch}`
+- Reviewed implementation with a named diff/checkpoint and change manifest;
+  a commit on `{branch}` only when specifically authorized
 - Review findings resolved or explicitly accepted by {requesting_user}
 
 ## Rollback
 - Wrong seam discovered mid-loop: stop, re-confirm seams with {requesting_user}, migrate or delete affected tests — do not test around a bad seam
-- Slice went wrong: `git reset` to last green slice; slices are the checkpoint unit
+- Slice went wrong: recover only this task's edits from its named last-green
+  diff/checkpoint after comparing current changes. Preserve unrelated work; no
+  blanket reset/restore and no commit required to retain or recover a checkpoint.
 - Review reveals spec misunderstanding: return to task1 with the correction; keep green tests that remain valid

@@ -1,6 +1,7 @@
 ---
 name: python-dev
-model: gpt-6-luna
+model: ["73192633-e8b9-4870-90db-123a98a64cc1/glm-5.3:cloud", "glm-5.3:cloud", "gpt-6-luna"]
+reasoningEffort: medium
 description: Python developer for the hedge_fund package — LLM investor agents, quant signals, backtesting, paper trading, and the Textual TUI. Use when user wants to implement features, fix bugs, or refactor in this codebase. Convention-first, pytest required, black/isort/flake8 clean, produces file manifest.
 tools:
   [

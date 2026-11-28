@@ -44,7 +44,7 @@ Canonical pattern: `.specify/docs/subsession-delegation.md`. Adaptation for this
 1. **Recursion guard**: if the current input contains the exact token `DELEGATED_WORKER`, skip this section and run inline.
 2. **Resolve mode** (default `subagent`; degrade to `inline` when no subagent capability exists; invalid/missing config falls back silently). `inline` → skip the rest of this section.
 3. **Stays inline**: the Prerequisites above (spec existence, test-directory detection).
-4. **Delegate** the entire Outline to a subagent on the SAME tree (the single write target `.specify/trace.md` must land here). Kickoff contains ONLY: the `DELEGATED_WORKER` token, this skill's name, the repo root, the spec path and test directory, the user's `$ARGUMENTS` (output path / glob / filters), and an instruction to read `.agents/skills/speckit-trace-build/SKILL.md` and execute the Outline. No conversation history.
+4. **Delegate** the entire Outline to a subagent on the SAME tree (the single write target `.specify/trace.md` must land here). Kickoff contains ONLY: the `DELEGATED_WORKER` token, this skill's name, the repo root, the spec path and test directory, the user's `$ARGUMENTS` (output path / glob / filters), and an instruction to read `.github/skills/speckit-trace-build/SKILL.md` and execute the Outline. No conversation history.
 5. **Orchestrator** verifies the matrix file was written and relays the one-paragraph summary.
 
 ## Outline

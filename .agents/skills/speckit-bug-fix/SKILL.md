@@ -4,10 +4,10 @@ description: Apply the remediation from a bug assessment and record what was cha
 compatibility: Requires spec-kit project structure with .specify/ directory
 metadata:
   author: github-spec-kit
-  source: extension:bug
+  source: preset:agent-team
 ---
 
-# Bug Fix Skill
+# Speckit Bug Fix Skill
 
 # Fix Bug
 
@@ -56,10 +56,31 @@ Once resolved, set `BUG_SLUG` and `BUG_DIR = .specify/bugs/<BUG_SLUG>`, and brie
    - Add or update the tests called out in the assessment so the bug cannot regress silently.
    - Keep the change minimal — do not refactor unrelated code, do not introduce dependencies that the assessment did not call for.
    - If you discover the assessment was wrong (the proposed fix does not work, the root cause is elsewhere), STOP modifying code, document the new finding in the fix report under **Deviations from Assessment**, and recommend re-running `/speckit-bug-assess`.
+   - Before a second patch attempt, obtain new diagnostic evidence and record
+     how it changes or falsifies the hypothesis. After two failed attempts,
+     stop patching and reassess root cause; no third speculative patch.
+   - Any behavior-affecting change, including a review fix, invalidates affected
+     acceptance rows and final evidence approval pending rerun. Mark them
+     `INCONCLUSIVE` and preserve the superseded evidence; record why any
+     unaffected rows remain applicable. Do not overwrite an existing test report
+     without permission: record invalidation in this fix report and hand it to
+     the verification owner.
 
 3. **Run local checks**
    - If the project has obvious test commands (e.g., `pytest`, `npm test`, `cargo test`), run the tests that exercise the changed paths. Capture pass/fail and key output.
    - Do not run destructive or network-dependent suites without the user's consent.
+   - Exercise the assessment's adjacent-state and negative-path integration
+     matrix, including changed decision logic. Capture expected thresholds and
+     durations and actual observations. Mocks prove reactions to injected
+     events, not that Android or another OS emits those events.
+   - Bind each criterion to revision plus local changes (diff identity), or
+     build ID/digest; environment, scenario, timestamp, provenance and quoted
+     output. Keep static, build, runtime and user report evidence distinct.
+     `BLOCKED` means missing access/tooling; `INCONCLUSIVE` means stale,
+     ambiguous or insufficient evidence. Neither establishes acceptance.
+   - Delegate native Android/device checks to an execution-capable runtime
+     owner with the necessary access. QA remains read-only: it reviews evidence,
+     never substitutes static analysis for a runtime run.
 
 4. **Write the fix report**
 
@@ -97,6 +118,22 @@ Once resolved, set `BUG_SLUG` and `BUG_DIR = .specify/bugs/<BUG_SLUG>`, and brie
    - Commands run: `<command>` → <result, brief>
    - Manual checks: <what was verified by hand, if anything>
 
+   | Criterion | Revision + local changes / build identity | Environment / scenario | Type / provenance / timestamp | Expected threshold / duration | Observed values / quoted evidence | Result |
+   |-----------|-------------------------------------------|------------------------|-------------------------------|-------------------------------|-----------------------------------|--------|
+   | <ID> | <commit + diff identity OR build ID/digest> | <exact context> | <static/build/runtime/user report; source; time> | <bound> | <measurement + log reference> | <PASS/FAIL/BLOCKED/INCONCLUSIVE> |
+
+   ## Invalidated Evidence
+
+   <Affected criterion IDs, behavior change, superseded evidence identity,
+   rerun owner and status; justify retention of unaffected rows.>
+
+   ## Attempt History and Handoff
+
+   <Symptom/repro, revision/environment, failed attempts, quoted evidence,
+   hypothesis, unknowns and smallest falsification check. Before switching
+   owner/model provide this packet; route by capability and risk without
+   hardcoded models or unrequested model/effort changes.>
+
    ## Deviations from Assessment
 
    <Empty if none. Otherwise, list any places where the actual fix departed from the proposed remediation and why.>
@@ -110,6 +147,10 @@ Once resolved, set `BUG_SLUG` and `BUG_DIR = .specify/bugs/<BUG_SLUG>`, and brie
    - The slug and `BUG_DIR/fix.md` path.
    - The status (`applied`, `partial`, `not-applied`).
    - The next suggested step: `/speckit-bug-test slug=<BUG_SLUG>`.
+   - Bounded progress: task, execution owner, automatic/manual check, latest
+     observed result, blocker and stop condition. No unsupported ETA or idle
+     polling. Applied is not verified; final QA evidence approval is not
+     automatic runtime proof or commit, publish, or release consent.
 
 ## Guardrails
 

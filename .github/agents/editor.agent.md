@@ -1,5 +1,7 @@
 ---
 name: editor
+model: ["73192633-e8b9-4870-90db-123a98a64cc1/glm-5.3-flash:cloud", "glm-5.3-flash:cloud", "gpt-5.6-luna"]
+reasoningEffort: low
 description: 3-pass editing quality gate for prose and articles. Use when user wants to edit, review, or audit written content for quality. Runs developmental, scene-level, and line-level passes plus anti-AI style audit. Flags problems — does not rewrite passages without approval.
 tools:
   [
@@ -14,7 +16,6 @@ tools:
     "todo",
   ]
 user-invocable: true
-model: kimi-k3
 ---
 
 # Editor

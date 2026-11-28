@@ -76,6 +76,12 @@ Given that feature description, do this:
 
    If the user explicitly provided `GIT_BRANCH_NAME`, pass it through to the hook so the branch script uses the exact value as the branch name (bypassing all prefix/suffix generation).
 
+   If no hook ran (for example in an agent worktree/session where branch creation is intentionally skipped), resolve the feature number anyway — never hand-derive it by scanning `specs/`. Run the git extension's branch script in dry-run mode (numbering only, creates no branch) and parse `FEATURE_NUM` from the JSON output:
+   - Bash: `.specify/extensions/git/scripts/bash/create-new-feature-branch.sh --json --dry-run --short-name "<short-name>" "<feature description>"`
+   - PowerShell: `.specify/extensions/git/scripts/powershell/create-new-feature-branch.ps1 -Json -DryRun -ShortName "<short-name>" "<feature description>"`
+
+   The script checks local specs, local and remote branches, live remote heads, and spec directories merged into the remote default branch; a local-only `specs/` scan misses numbers claimed by parallel sessions or merged PRs, which causes duplicate numbers. If the git extension is not installed, use the core `create-new-feature` script with `--dry-run`/`-DryRun` instead. The resolved number is a best-effort claim at resolution time — if a parallel session took it before you commit (directory or branch already exists), re-run the resolution and take the next number.
+
 3. **Create the spec feature directory**:
 
    Specs live under the default `specs/` directory unless the user explicitly provides `SPECIFY_FEATURE_DIRECTORY`.
@@ -85,7 +91,7 @@ Given that feature description, do this:
    2. Otherwise, auto-generate it under `specs/`:
       - Check `.specify/init-options.json` for `feature_numbering` (preferred) or `branch_numbering` (deprecated, migration only — will be removed in a future release)
       - If `"timestamp"`: prefix is `YYYYMMDD-HHMMSS` (current timestamp)
-      - If `"sequential"` or absent: prefix is `NNN` (next available 3-digit number after scanning existing directories in `specs/`)
+      - If `"sequential"` or absent: prefix is `NNN` (the `FEATURE_NUM` resolved in step 2 — from the hook, or from the dry-run numbering call; never hand-derived from a local `specs/` scan)
       - Construct the directory name: `<prefix>-<short-name>` (e.g., `003-user-auth` or `20260319-143022-user-auth`)
       - Set `SPECIFY_FEATURE_DIRECTORY` to `specs/<directory-name>`
       - If `branch_numbering` was used (and `feature_numbering` was absent), emit a one-line warning: "⚠️ `branch_numbering` in init-options.json is deprecated. Rename to `feature_numbering`."
